@@ -6,8 +6,10 @@
 //! 這一層不產生 SQL，也不接觸資料庫（CLAUDE.md 約束 3）。
 
 pub mod identity;
+pub mod schema_diff;
 
 pub use identity::{Blocker, Context, Resolution, resolve};
+pub use schema_diff::{DiffError, diff};
 
 #[cfg(test)]
 // 測試中用 catch-all 搭配 panic 來表達「不該走到這裡」是恰當的；

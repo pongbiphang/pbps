@@ -158,10 +158,114 @@ mod tests {
         );
     }
 
+    fn ty(s: &str) -> ColumnType {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn minimal_dialect_treats_shrinking_as_narrowing() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.type_change_risk(&ty("nvarchar(100)"), &ty("nvarchar(50)")),
+            TypeChangeRisk::Narrowing
+        );
+        assert_eq!(
+            d.type_change_risk(&ty("nvarchar(50)"), &ty("nvarchar(100)")),
+            TypeChangeRisk::Safe
+        );
+        assert_eq!(
+            d.type_change_risk(&ty("bigint"), &ty("bigint")),
+            TypeChangeRisk::Safe
+        );
+        assert_eq!(
+            d.type_change_risk(&ty("bigint"), &ty("nvarchar(10)")),
+            TypeChangeRisk::Incompatible
+        );
+    }
+
+    /// max 是「無上限」而不是長度 0，方向判斷不能反過來。
+    #[test]
+    fn minimal_dialect_handles_max_length() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.type_change_risk(&ty("nvarchar(max)"), &ty("nvarchar(100)")),
+            TypeChangeRisk::Narrowing
+        );
+        assert_eq!(
+            d.type_change_risk(&ty("nvarchar(100)"), &ty("nvarchar(max)")),
+            TypeChangeRisk::Safe
+        );
+    }
+
     #[test]
     fn statements_default_to_shared_batch() {
         let s = Statement::new("ALTER TABLE t ADD c INT");
         assert!(!s.own_batch);
         assert!(s.own_batch().own_batch);
+    }
+}
+
+/// 測試與 Phase 1 使用的最小方言。
+///
+/// **不是任何真實資料庫。** 它只實作型別比較所需的保守規則，讓不依賴特定
+/// 資料庫的邏輯（diff、風險分類）可以被測試。真正的 MSSQL 實作在 Phase 2。
+///
+/// 保守的意思是：拿不準就當成危險。寧可要求使用者多按一次放行，
+/// 也不要漏放一個會截斷資料的變更。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MinimalDialect;
+
+impl Dialect for MinimalDialect {
+    fn name(&self) -> &'static str {
+        "minimal"
+    }
+
+    /// 不做別名展開 —— 哪些名字互為別名是真實方言的知識。
+    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+        Ok(ty.clone())
+    }
+
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+        if from == to {
+            return TypeChangeRisk::Safe;
+        }
+        if from.base != to.base {
+            return TypeChangeRisk::Incompatible;
+        }
+        match (from.is_max(), to.is_max()) {
+            // 從無上限縮到有上限一定可能截斷
+            (true, false) => TypeChangeRisk::Narrowing,
+            // 放寬成無上限是安全的
+            (false, true) => TypeChangeRisk::Safe,
+            _ => match (from.first_int_arg(), to.first_int_arg()) {
+                (Some(a), Some(b)) if b < a => TypeChangeRisk::Narrowing,
+                (Some(_), Some(_)) => TypeChangeRisk::Safe,
+                // 參數有無不一致（例如 decimal → decimal(18,2)）語意不明，
+                // 保守地當成窄化。
+                _ => TypeChangeRisk::Narrowing,
+            },
+        }
+    }
+
+    fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed(ident)
+    }
+
+    fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
+        if ident.contains('"') {
+            return Err(DialectError::UnquotableIdent(ident.to_owned()));
+        }
+        Ok(format!("\"{ident}\""))
+    }
+
+    fn validate_table(&self, _name: &TableName, _table: &Table) -> Vec<DialectError> {
+        Vec::new()
+    }
+
+    fn emit(&self, _change: &Change) -> Result<Vec<Statement>, DialectError> {
+        Err(DialectError::Unsupported {
+            dialect: "minimal",
+            feature: "SQL 生成（真正的 emitter 在 Phase 2）".to_owned(),
+        })
     }
 }
