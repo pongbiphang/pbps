@@ -388,6 +388,7 @@ name = "pbps-config"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "serde-saphyr",
  "thiserror",
 ]
 
@@ -412,6 +413,7 @@ dependencies = [
 name = "pbps-load"
 version = "0.0.0"
 dependencies = [
+ "indexmap",
  "miette",
  "pbps-model",
  "serde",

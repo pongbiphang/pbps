@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 pbps-model.workspace = true
+indexmap.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
 miette.workspace = true
@@ -16,3 +17,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+miette = { workspace = true, features = ["fancy"] }
