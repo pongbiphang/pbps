@@ -1,4 +1,4 @@
-//! `pbps` —— 宣告式資料庫 schema 版控工具。
+//! `pbps` — declarative database schema version control.
 
 mod baseline;
 mod report;
@@ -14,9 +14,14 @@ use pbps_diff::{Context, Side};
 use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
 
 #[derive(Parser)]
-#[command(name = "pbps", version, about = "宣告式資料庫 schema 版控工具")]
+#[command(
+    name = "pbps",
+    version,
+    about = "Declarative database schema version control"
+)]
 struct Cli {
-    /// 專案目錄（含 pbps.yml）。預設從目前目錄逐層向上尋找。
+    /// Project directory containing pbps.yml. Defaults to searching upwards from
+    /// the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
 
@@ -26,56 +31,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 比對宣告檔與基準，產出變更計畫
+    /// Compare the declarations against a baseline and produce a change plan
     Plan {
-        /// 基準取自 git 的哪一版
+        /// Which git revision to use as the baseline
         #[arg(long, default_value = "HEAD")]
         since: String,
 
-        /// 改用指定的狀態快照檔當基準（沒有 git 時使用）
+        /// Use the named state snapshot as the baseline instead (for use without git)
         #[arg(long, conflicts_with = "since")]
         base: Option<PathBuf>,
 
-        /// CI 模式：不修改任何檔案，身份檔未同步即失敗
+        /// CI mode: change no files, and fail if the identity file is out of date
         #[arg(long)]
         check: bool,
 
-        /// 把變更集寫成 JSON
+        /// Write the change set out as JSON
         #[arg(long)]
         out: Option<PathBuf>,
     },
 
-    /// 只檢查宣告檔是否合法，不比對基準
+    /// Check that the declarations are valid, without comparing to a baseline
     Validate,
 
-    /// 把宣告檔重寫成正規化格式
+    /// Rewrite the declarations in canonical form
     Fmt {
-        /// 只檢查，有檔案需要重寫就以非零退出（不修改任何檔案）
+        /// Only check; exit non-zero if any file needs rewriting, and change nothing
         #[arg(long)]
         check: bool,
     },
 
-    /// 記錄一次欄位改名
+    /// Record a column rename
     Rename {
-        /// 舊的完整欄位名，如 dbo.customer.customer_name
+        /// The old fully qualified column name, e.g. dbo.customer.customer_name
         from: String,
-        /// 新的欄位名（不含表名）
+        /// The new column name, without the table
         to: String,
     },
 
-    /// 記錄一次表改名
+    /// Record a table rename
     RenameTable { from: String, to: String },
 
-    /// 記錄一次欄位刪除
+    /// Record a column drop
     Drop {
-        /// 完整欄位名，如 dbo.customer.national_id
+        /// The fully qualified column name, e.g. dbo.customer.national_id
         column: String,
-        /// 刪除原因，稽核要求
+        /// Why it is being dropped; required for audit
         #[arg(long)]
         reason: String,
     },
 
-    /// 記錄一次表刪除
+    /// Record a table drop
     DropTable {
         table: String,
         #[arg(long)]
@@ -85,7 +90,7 @@ enum Command {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("錯誤：{e:#}");
+        eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -149,17 +154,17 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
-/// 載入宣告檔，把錯誤一次印完。
+/// Loads the declarations, printing every error in one pass.
 fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
     let dir = project.schema_dir();
     if !dir.is_dir() {
-        bail!("找不到宣告檔目錄 `{}`", dir.display());
+        bail!("no declarations directory at `{}`", dir.display());
     }
     pbps_load::load_schema_dir(&dir).map_err(|errs| {
         for e in &errs {
             eprintln!("{:?}", miette::Report::msg(format!("{e}")));
         }
-        anyhow::anyhow!("宣告檔有 {} 個問題", errs.len())
+        anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
     })
 }
 
@@ -169,9 +174,9 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
         return Ok(IdsFile::default());
     }
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("無法讀取身份檔 `{}`", path.display()))?;
+        .with_context(|| format!("cannot read identity file `{}`", path.display()))?;
     let ids: IdsFile = serde_json::from_str(&text)
-        .with_context(|| format!("身份檔 `{}` 格式錯誤", path.display()))?;
+        .with_context(|| format!("identity file `{}` is malformed", path.display()))?;
     ids.validate()?;
     Ok(ids)
 }
@@ -181,9 +186,11 @@ fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    // 尾端換行，讓檔案在 diff 中不會出現「\ No newline at end of file」
+    // A trailing newline, so the file never shows "\ No newline at end of file" in
+    // a diff.
     let json = format!("{}\n", serde_json::to_string_pretty(ids)?);
-    std::fs::write(&path, json).with_context(|| format!("無法寫入身份檔 `{}`", path.display()))?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("cannot write identity file `{}`", path.display()))?;
     Ok(())
 }
 
@@ -197,7 +204,7 @@ fn context() -> Context {
 fn cmd_validate(project: &Project) -> anyhow::Result<()> {
     let loaded = load(project)?;
     println!(
-        "宣告檔合法：{} 張表、{} 個欄位。",
+        "Declarations are valid: {} table(s), {} column(s).",
         loaded.schema.tables.len(),
         loaded
             .schema
@@ -209,24 +216,25 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 正規化所有宣告檔。
+/// Canonicalizes every declaration file.
 ///
-/// 這會重寫整份檔案，一般 YAML 註解因此會遺失 —— 說明文字要寫在
-/// `description` 欄位裡（SPEC §4.2「工具擁有檔案格式」）。
+/// This rewrites each file in full, so ordinary YAML comments are lost —
+/// explanatory prose belongs in a `description` field (SPEC §4.2, "the tool owns
+/// the file format").
 fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     let dir = project.schema_dir();
-    let files =
-        pbps_load::schema_files(&dir).with_context(|| format!("無法列出 `{}`", dir.display()))?;
+    let files = pbps_load::schema_files(&dir)
+        .with_context(|| format!("cannot list `{}`", dir.display()))?;
 
     let mut changed = Vec::new();
     for path in &files {
         let original = std::fs::read_to_string(path)
-            .with_context(|| format!("無法讀取 `{}`", path.display()))?;
+            .with_context(|| format!("cannot read `{}`", path.display()))?;
         let loaded = pbps_load::load_table_str(path, &original).map_err(|errs| {
             for e in &errs {
                 eprintln!("{:?}", miette::Report::msg(format!("{e}")));
             }
-            anyhow::anyhow!("`{}` 無法解析", path.display())
+            anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
 
         let rendered = pbps_load::render(&loaded.name, &loaded.table, &loaded.intents);
@@ -236,28 +244,32 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
         changed.push(path.clone());
         if !check {
             std::fs::write(path, &rendered)
-                .with_context(|| format!("無法寫入 `{}`", path.display()))?;
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
         }
     }
 
     if changed.is_empty() {
-        println!("{} 個檔案都已是正規格式。", files.len());
+        println!("All {} file(s) are already in canonical form.", files.len());
         return Ok(());
     }
 
     if check {
         for p in &changed {
-            eprintln!("  需要重寫：{}", p.display());
+            eprintln!("  needs rewriting: {}", p.display());
         }
-        bail!("有 {} 個檔案不是正規格式，請執行 `pbps fmt`", changed.len());
+        bail!(
+            "{} file(s) are not in canonical form; run `pbps fmt`",
+            changed.len()
+        );
     }
     for p in &changed {
-        println!("已重寫 {}", p.display());
+        println!("rewrote {}", p.display());
     }
     Ok(())
 }
 
-/// 記錄一則意圖：以它重新解析身份，然後寫回身份檔。
+/// Records one intent: re-resolves identity with it, then writes the identity
+/// file back.
 fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
     let loaded = load(project)?;
     let ids = read_ids(project)?;
@@ -267,16 +279,18 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
     match pbps_diff::resolve(&loaded.schema, &ids, &intents, &context()) {
         Ok(res) => {
             if res.ids == ids {
-                println!("身份檔沒有變化 —— 這則意圖可能已經生效過了。");
+                println!(
+                    "The identity file is unchanged; this intent may have taken effect already."
+                );
                 return Ok(());
             }
             write_ids(project, &res.ids)?;
-            println!("已更新 {}", project.ids_file().display());
+            println!("updated {}", project.ids_file().display());
             Ok(())
         }
         Err(blockers) => {
             eprintln!("{}", report::blockers(&blockers));
-            bail!("身份無法解析")
+            bail!("identity could not be resolved")
         }
     }
 }
@@ -294,25 +308,27 @@ fn cmd_plan(
         Ok(r) => r,
         Err(blockers) => {
             eprintln!("{}", report::blockers(&blockers));
-            bail!("有無法自動判定的變更，請用上面的指令表達意圖後重試");
+            bail!(
+                "some changes could not be decided automatically; express the intent with the commands above and retry"
+            );
         }
     };
 
     if res.ids != ids {
         if check {
             bail!(
-                "身份檔未同步。請在本地執行 `pbps plan` 並將 `{}` 一併 commit。",
+                "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_file().display()
             );
         }
         write_ids(project, &res.ids)?;
-        println!("已更新 {}", project.ids_file().display());
+        println!("updated {}", project.ids_file().display());
     }
 
     let base = baseline::load(project, source)?;
     if base.is_empty_fallback {
         eprintln!(
-            "警告：基準為空（{}）。所有東西都會被列成新建 —— 這不是對既有資料庫的真實計畫。",
+            "warning: the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
             base.description
         );
     }
@@ -332,21 +348,22 @@ fn cmd_plan(
         for e in &errs {
             eprintln!("  {e}");
         }
-        anyhow::anyhow!("有 {} 個變更無法表達", errs.len())
+        anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
 
-    println!("基準：{}", base.description);
+    println!("Baseline: {}", base.description);
     print!("{}", report::plan(&cs));
 
     if let Some(path) = out {
         std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&cs)?))
-            .with_context(|| format!("無法寫入 `{}`", path.display()))?;
-        println!("\n已寫入 {}", path.display());
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        println!("\nwrote {}", path.display());
     }
     Ok(())
 }
 
-/// 操作者。稽核要回答「誰做的」，git 的設定是最貼近事實的來源。
+/// The operator. An audit asks "who did this", and git's configuration is the
+/// closest thing to the truth available.
 fn operator() -> String {
     std::process::Command::new("git")
         .args(["config", "user.name"])
@@ -359,10 +376,11 @@ fn operator() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// 今天的日期（UTC，`YYYY-MM-DD`）。
+/// Today's date in UTC, as `YYYY-MM-DD`.
 ///
-/// 不引入日期函式庫 —— 只需要這一個功能，而這個工具會被稽核，依賴樹愈短愈好。
-/// 演算法是 Howard Hinnant 的 civil_from_days。
+/// No date library is pulled in: this is the only thing needed from one, and this
+/// tool gets audited, where a shorter dependency tree is worth more. The
+/// algorithm is Howard Hinnant's civil_from_days.
 fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -393,7 +411,7 @@ mod tests {
     fn civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
-        // 閏日
+        // Leap day.
         assert_eq!(civil_from_days(20_513), (2026, 3, 1));
         assert_eq!(civil_from_days(20_512), (2026, 2, 28));
     }

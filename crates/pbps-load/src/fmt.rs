@@ -1,23 +1,26 @@
-//! 正規化輸出。
+//! Canonical rendering.
 //!
-//! 工具擁有宣告檔的格式（SPEC §4.2）：`pbps fmt` 會重寫整份檔案，因此一般
-//! YAML 註解會遺失，說明文字要寫在 `description` 欄位裡。
+//! The tool owns the format of the declaration files (SPEC §4.2): `pbps fmt`
+//! rewrites each file in full, so ordinary YAML comments are lost and any
+//! explanatory prose belongs in a `description` field.
 //!
-//! # 引號規則不是美觀問題
+//! # The quoting rules are not about looks
 //!
-//! YAML 會把裸的 `no` / `yes` / `on` / `off` 解析成布林、`null` 與 `~` 解析成
-//! 空值、`0123` 解析成數字。如果輸出時不加引號，工具寫出來的檔案下一次就讀成
-//! 別的型別 —— 也就是說它自己產生了讀不回來的檔案。因此凡是可能被誤讀的
-//! 純量一律加引號（見 ADR-0001 的實測）。
+//! YAML parses a bare `no` / `yes` / `on` / `off` as a boolean, `null` and `~` as
+//! nulls, and `0123` as a number. Without quoting on output, a file the tool
+//! wrote would come back as a different type on the next read — that is, the tool
+//! would produce files it cannot read back. So every scalar that could be
+//! misread is quoted (see the experiments in ADR-0001).
 
 use std::fmt::Write as _;
 
 use pbps_model::{Intent, PrimaryKey, Table, TableName};
 
-/// 把一張表輸出成正規化的 YAML。
+/// Renders one table as canonical YAML.
 ///
-/// `intents` 中與這張表相關的改名會還原成 `renamed_from` 註記 —— 它們是
-/// 一次性的輸入，不在模型裡，但重寫檔案時不能弄丟。
+/// Renames in `intents` that concern this table are written back out as
+/// `renamed_from` annotations: they are one-shot input and do not live in the
+/// model, but rewriting the file must not lose them.
 pub fn render(name: &TableName, table: &Table, intents: &[Intent]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.to_string()));
@@ -168,13 +171,14 @@ fn seq(items: &[String]) -> String {
     )
 }
 
-/// 會被 YAML 誤讀成布林的字面量。YAML 1.1 的集合比 1.2 大，兩者都涵蓋。
+/// Literals YAML would misread as booleans. YAML 1.1's set is larger than 1.2's;
+/// this covers both.
 const BOOLISH: &[&str] = &["y", "n", "yes", "no", "true", "false", "on", "off"];
 
-/// 會被誤讀成空值的字面量。
+/// Literals that would be misread as null.
 const NULLISH: &[&str] = &["null", "~"];
 
-/// 輸出一個純量，必要時加引號。
+/// Renders a scalar, quoting it when necessary.
 fn scalar(s: &str) -> String {
     if needs_quotes(s) {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -191,11 +195,11 @@ fn needs_quotes(s: &str) -> bool {
     if BOOLISH.contains(&lower.as_str()) || NULLISH.contains(&lower.as_str()) {
         return true;
     }
-    // 看起來像數字的字串
+    // Strings that look like numbers.
     if s.parse::<f64>().is_ok() || s.parse::<i64>().is_ok() {
         return true;
     }
-    // 會影響 YAML 結構的字元
+    // Characters that would affect YAML structure.
     if s.contains([
         ':', '#', '\n', '\r', '\t', '"', '\'', ',', '[', ']', '{', '}',
     ]) {
@@ -214,17 +218,18 @@ mod tests {
 
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)
-            .unwrap_or_else(|e| panic!("原始檔案載入失敗：{e:?}"));
+            .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
         let out = render(&a.name, &a.table, &a.intents);
-        let b = crate::load_table_str(Path::new("t.yml"), &out)
-            .unwrap_or_else(|e| panic!("重寫後讀不回來：{e:?}\n輸出：\n{out}"));
-        assert_eq!(a.name, b.name, "輸出：\n{out}");
-        assert_eq!(a.table, b.table, "輸出：\n{out}");
-        assert_eq!(a.intents, b.intents, "輸出：\n{out}");
+        let b = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|e| {
+            panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
+        });
+        assert_eq!(a.name, b.name, "output:\n{out}");
+        assert_eq!(a.table, b.table, "output:\n{out}");
+        assert_eq!(a.intents, b.intents, "output:\n{out}");
 
-        // 冪等：格式化過的檔案再格式化一次不該改變
+        // Idempotence: formatting an already-formatted file must change nothing.
         let out2 = render(&b.name, &b.table, &b.intents);
-        assert_eq!(out, out2, "fmt 不是冪等的");
+        assert_eq!(out, out2, "fmt is not idempotent");
     }
 
     #[test]
@@ -232,7 +237,7 @@ mod tests {
         round_trip(
             r#"
 table: dbo.customer
-description: 客戶主檔
+description: Customer master
 columns:
   customer_id:
     type: bigint
@@ -241,7 +246,7 @@ columns:
   full_name:
     type: NVARCHAR(100)
     nullable: false
-    description: 客戶全名
+    description: The customer's full name
     renamed_from: customer_name
   region_id:
     type: int
@@ -251,7 +256,7 @@ columns:
     default: "0"
   legacy:
     type: varchar(20)
-    deprecated: 改用 email 識別
+    deprecated: superseded by email as the identifier
 primary_key: [customer_id]
 unique:
   uq_a: [region_id]
@@ -284,8 +289,8 @@ indexes:
         round_trip("table: dbo.b\nrenamed_from: dbo.a\ncolumns:\n  a: {type: int}\n");
     }
 
-    /// 這是引號規則存在的理由：欄位叫 `no`、預設值是 `yes`，
-    /// 不加引號的話重新讀取時會變成布林。
+    /// This is why the quoting rules exist: a column named `no` with a default of
+    /// `yes` would come back as booleans on the next read if left unquoted.
     #[test]
     fn boolish_scalars_survive_a_round_trip() {
         round_trip(
@@ -311,7 +316,7 @@ indexes:
     fn quoting_decisions_are_as_expected() {
         assert_eq!(scalar("customer_id"), "customer_id");
         assert_eq!(scalar("nvarchar(100)"), "nvarchar(100)");
-        assert_eq!(scalar("客戶主檔"), "客戶主檔");
+        assert_eq!(scalar("Café clientèle"), "Café clientèle");
 
         assert_eq!(scalar("no"), "\"no\"");
         assert_eq!(scalar("YES"), "\"YES\"");
@@ -325,7 +330,8 @@ indexes:
         assert_eq!(scalar(" x"), "\" x\"");
     }
 
-    /// 輸出必須穩定，否則 fmt 會在每次執行時製造假的 git diff。
+    /// Output must be stable, or fmt would manufacture a phantom git diff on
+    /// every run.
     #[test]
     fn output_is_stable() {
         let yaml = "table: dbo.t\ncolumns:\n  b: {type: int}\n  a: {type: int}\n";
@@ -334,7 +340,7 @@ indexes:
         for _ in 0..10 {
             assert_eq!(render(&t.name, &t.table, &t.intents), first);
         }
-        // 欄位順序照宣告，不重排
+        // Column order follows the declaration; nothing is reordered.
         assert!(first.find("  b:").unwrap() < first.find("  a:").unwrap());
     }
 }

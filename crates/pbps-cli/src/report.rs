@@ -1,15 +1,20 @@
-//! 把結果變成人看得懂、而且知道下一步該做什麼的文字。
+//! Turning results into text a person can read and act on.
 //!
-//! 這裡的原則是：**每一個擋下來的情況都要附上可以直接複製的指令**。非互動
-//! 環境下絕不 prompt（CLAUDE.md 約束 6），所以錯誤訊息本身就得是操作指南 ——
-//! 否則使用者在 CI log 裡看到「有歧義」卻不知道要打什麼。
+//! The principle here is that **every blocked situation comes with a command you
+//! can copy and paste**. Non-interactive environments are never prompted
+//! (constraint 6 in CLAUDE.md), so the error message itself has to be the
+//! instructions — otherwise a user reading a CI log sees "this is ambiguous" with
+//! no idea what to type.
 
 use pbps_diff::Blocker;
 use pbps_model::{Change, ChangeSet, RiskClass};
 
 pub fn blockers(list: &[Blocker]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("有 {} 個變更無法自動判定\n", list.len()));
+    out.push_str(&format!(
+        "{} change(s) could not be decided automatically\n",
+        list.len()
+    ));
     for b in list {
         out.push('\n');
         out.push_str(&one_blocker(b));
@@ -25,18 +30,18 @@ fn one_blocker(b: &Blocker) -> String {
             appeared,
         } => {
             let mut s = format!(
-                "  {table}：{} 消失、{} 是新的\n\n",
-                disappeared.join("、"),
-                appeared.join("、")
+                "  {table}: {} disappeared, {} is new\n\n",
+                disappeared.join(", "),
+                appeared.join(", ")
             );
             for from in disappeared {
                 for to in appeared {
                     s.push_str(&format!(
-                        "    若 {from} 改名為 {to}：pbps rename {table}.{from} {to}\n"
+                        "    if {from} was renamed to {to}:  pbps rename {table}.{from} {to}\n"
                     ));
                 }
                 s.push_str(&format!(
-                    "    若要刪除 {from}：      pbps drop {table}.{from} --reason \"<原因>\"\n"
+                    "    to drop {from}:                pbps drop {table}.{from} --reason \"<why>\"\n"
                 ));
             }
             s
@@ -46,30 +51,32 @@ fn one_blocker(b: &Blocker) -> String {
             appeared,
         } => {
             let mut s = format!(
-                "  表 {} 消失、{} 是新的\n\n",
+                "  table {} disappeared, {} is new\n\n",
                 join(disappeared),
                 join(appeared)
             );
             for from in disappeared {
                 for to in appeared {
                     s.push_str(&format!(
-                        "    若 {from} 改名為 {to}：pbps rename-table {from} {to}\n"
+                        "    if {from} was renamed to {to}:  pbps rename-table {from} {to}\n"
                     ));
                 }
                 s.push_str(&format!(
-                    "    若要刪除 {from}：      pbps drop-table {from} --reason \"<原因>\"\n"
+                    "    to drop {from}:                pbps drop-table {from} --reason \"<why>\"\n"
                 ));
             }
             s
         }
         Blocker::DropColumnNeedsReason { column } => format!(
-            "  {column} 從宣告檔消失了，但刪除必須留下原因（稽核要回答「為什麼」）\n\n    pbps drop {column} --reason \"<原因>\"\n"
+            "  {column} disappeared from the declarations, but a drop must record why (an audit asks for it)\n\n    pbps drop {column} --reason \"<why>\"\n"
         ),
         Blocker::DropTableNeedsReason { table } => format!(
-            "  表 {table} 從宣告檔消失了，但刪除必須留下原因\n\n    pbps drop-table {table} --reason \"<原因>\"\n"
+            "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason \"<why>\"\n"
         ),
         Blocker::UnusedIntent { intent } => {
-            format!("  這則意圖在宣告檔與身份檔中都對不上，可能是打錯字：\n    {intent:?}\n")
+            format!(
+                "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {intent:?}\n"
+            )
         }
     }
 }
@@ -78,12 +85,12 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
     v.iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join("、")
+        .join(", ")
 }
 
 pub fn plan(cs: &ChangeSet) -> String {
     if cs.is_empty() {
-        return "沒有變更。\n".to_owned();
+        return "No changes.\n".to_owned();
     }
 
     let mut out = String::new();
@@ -112,7 +119,7 @@ pub fn plan(cs: &ChangeSet) -> String {
     let risks = cs.risks();
     if !risks.is_empty() {
         out.push_str(&format!(
-            "\n  此計畫含風險變更，套用時需要放行：--allow {}\n",
+            "\n  This plan contains risky changes and needs approval to apply: --allow {}\n",
             risks
                 .iter()
                 .map(|r| r.as_str())
@@ -120,7 +127,7 @@ pub fn plan(cs: &ChangeSet) -> String {
                 .join(",")
         ));
         if risks.contains(&RiskClass::Destructive) {
-            out.push_str("  其中含破壞性變更，會造成資料遺失。\n");
+            out.push_str("  Some of them are destructive and will lose data.\n");
         }
     }
     out
@@ -129,52 +136,48 @@ pub fn plan(cs: &ChangeSet) -> String {
 fn describe(c: &Change) -> String {
     match c {
         Change::CreateTable { name, table, .. } => {
-            format!("+ 建立表 {name}（{} 個欄位）", table.columns.len())
+            format!("+ create table {name} ({} columns)", table.columns.len())
         }
-        Change::DropTable { name, .. } => format!("- 刪除表 {name}"),
-        Change::RenameTable { from, to, .. } => format!("~ 表改名 {from} → {to}"),
+        Change::DropTable { name, .. } => format!("- drop table {name}"),
+        Change::RenameTable { from, to, .. } => format!("~ rename table {from} -> {to}"),
         Change::AddColumn { name, column, .. } => {
-            format!("+ 新增欄位 {name} {}", column.ty)
+            format!("+ add column {name} {}", column.ty)
         }
-        Change::DropColumn { column, .. } => format!("- 刪除欄位 {}", column.name),
-        Change::RenameColumn { from, to, .. } => format!("~ 欄位改名 {from} → {to}"),
+        Change::DropColumn { column, .. } => format!("- drop column {}", column.name),
+        Change::RenameColumn { from, to, .. } => format!("~ rename column {from} -> {to}"),
         Change::AlterColumnType {
             column, from, to, ..
         } => {
-            format!("~ {} 型別 {from} → {to}", column.name)
+            format!("~ {} type {from} -> {to}", column.name)
         }
         Change::AlterColumnNullability {
             column,
             to_nullable,
             ..
         } => format!(
-            "~ {} 改為 {}",
+            "~ {} becomes {}",
             column.name,
-            if *to_nullable {
-                "可為 NULL"
-            } else {
-                "NOT NULL"
-            }
+            if *to_nullable { "nullable" } else { "NOT NULL" }
         ),
         Change::AlterColumnDefault { column, to, .. } => match to {
-            Some(v) => format!("~ {} 預設值 → {v}", column.name),
-            None => format!("~ {} 移除預設值", column.name),
+            Some(v) => format!("~ {} default -> {v}", column.name),
+            None => format!("~ {} default removed", column.name),
         },
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
-            Some(r) => format!("~ {} 標記棄用：{r}", column.name),
-            None => format!("~ {} 取消棄用標記", column.name),
+            Some(r) => format!("~ {} marked deprecated: {r}", column.name),
+            None => format!("~ {} no longer deprecated", column.name),
         },
         Change::SetPrimaryKey { to, .. } => match to {
-            Some(pk) => format!("~ 主鍵 → ({})", pk.columns.join(", ")),
-            None => "- 移除主鍵".to_owned(),
+            Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
+            None => "- drop primary key".to_owned(),
         },
-        Change::AddUnique { name, .. } => format!("+ 唯一約束 {name}"),
-        Change::DropUnique { name, .. } => format!("- 唯一約束 {name}"),
-        Change::AddForeignKey { name, .. } => format!("+ 外鍵 {name}"),
-        Change::DropForeignKey { name, .. } => format!("- 外鍵 {name}"),
-        Change::AddCheck { name, .. } => format!("+ 檢查約束 {name}"),
-        Change::DropCheck { name, .. } => format!("- 檢查約束 {name}"),
-        Change::AddIndex { name, .. } => format!("+ 索引 {name}"),
-        Change::DropIndex { name, .. } => format!("- 索引 {name}"),
+        Change::AddUnique { name, .. } => format!("+ unique constraint {name}"),
+        Change::DropUnique { name, .. } => format!("- unique constraint {name}"),
+        Change::AddForeignKey { name, .. } => format!("+ foreign key {name}"),
+        Change::DropForeignKey { name, .. } => format!("- foreign key {name}"),
+        Change::AddCheck { name, .. } => format!("+ check constraint {name}"),
+        Change::DropCheck { name, .. } => format!("- check constraint {name}"),
+        Change::AddIndex { name, .. } => format!("+ index {name}"),
+        Change::DropIndex { name, .. } => format!("- index {name}"),
     }
 }

@@ -1,8 +1,9 @@
-//! 專案設定（`pbps.yml`）與路徑解析。
+//! Project configuration (`pbps.yml`) and path resolution.
 //!
-//! 設定檔的位置定義了「專案根目錄」，其餘所有相對路徑都以它為基準。這讓
-//! `pbps` 可以在子目錄中執行 —— 跟 `git` 與 `cargo` 的行為一致，使用者不需要
-//! 記得自己站在哪一層。
+//! The location of the config file defines the project root, and every other
+//! relative path is resolved against it. That is what lets `pbps` run from a
+//! subdirectory — the same behaviour as `git` and `cargo`, so users never have to
+//! remember which level they are standing on.
 
 use std::path::{Path, PathBuf};
 
@@ -10,24 +11,25 @@ pub const CONFIG_FILE: &str = "pbps.yml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("找不到 {CONFIG_FILE}（已從 `{start}` 逐層向上尋找到檔案系統根目錄）")]
+    #[error("no {CONFIG_FILE} found (searched upwards from `{start}` to the filesystem root)")]
     NotFound { start: PathBuf },
 
-    #[error("無法讀取 `{path}`：{source}")]
+    #[error("cannot read `{path}`: {source}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("`{path}` 格式錯誤：{message}")]
+    #[error("`{path}` is malformed: {message}")]
     Parse { path: PathBuf, message: String },
 }
 
-/// 目標資料庫方言。
+/// The target database dialect.
 ///
-/// 一份專案綁定一個方言 —— 「支援多資料庫」指的是工具能操作不同資料庫，
-/// 不是同一份宣告檔能部署到兩者（SPEC §1.3）。
+/// A project is bound to exactly one dialect. "Supports multiple databases" means
+/// the tool can drive different databases, not that one set of declarations
+/// deploys to both (SPEC §1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DialectName {
@@ -79,7 +81,7 @@ impl Config {
     }
 }
 
-/// 一個已定位的專案：根目錄加上設定。
+/// A located project: its root directory plus its configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub root: PathBuf,
@@ -87,7 +89,7 @@ pub struct Project {
 }
 
 impl Project {
-    /// 從 `start` 逐層向上尋找 `pbps.yml`。
+    /// Searches upwards from `start` for `pbps.yml`.
     pub fn discover(start: &Path) -> Result<Self, ConfigError> {
         let mut dir = Some(start);
         while let Some(d) = dir {
@@ -102,19 +104,21 @@ impl Project {
         })
     }
 
-    /// 直接載入指定的設定檔。
+    /// Loads a specific config file directly.
     pub fn load(config_path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(config_path).map_err(|source| ConfigError::Read {
             path: config_path.to_owned(),
             source,
         })?;
         let config = Config::parse(&text, config_path)?;
-        // 設定檔一定在某個目錄裡；沒有 parent 只可能是傳入了空路徑。
+        // A config file is always inside some directory; the only way to have no
+        // parent is to have been handed an empty path.
         let root = config_path.parent().unwrap_or(Path::new(".")).to_owned();
         Ok(Self { root, config })
     }
 
-    /// 宣告檔目錄的絕對（或相對於呼叫端 cwd 的）路徑。
+    /// Path to the declarations directory, absolute or relative to the caller's
+    /// working directory.
     pub fn schema_dir(&self) -> PathBuf {
         self.root.join(&self.config.schema_dir)
     }
@@ -147,7 +151,8 @@ mod tests {
         assert_eq!(c.schema_dir, PathBuf::from("db/tables"));
     }
 
-    /// dialect 沒有預設值 —— 猜錯方言會產生語法正確但語意錯誤的 SQL。
+    /// `dialect` has no default: guessing wrong produces SQL that is
+    /// syntactically valid and semantically wrong.
     #[test]
     fn dialect_is_required() {
         assert!(Config::parse("schema_dir: schema\n", Path::new("pbps.yml")).is_err());
@@ -158,14 +163,14 @@ mod tests {
         assert!(Config::parse("dialect: oracle\n", Path::new("pbps.yml")).is_err());
     }
 
-    /// 拼錯的欄位名要擋下，不能默默使用預設值。
+    /// A misspelled field name must be rejected, never silently defaulted.
     #[test]
     fn unknown_fields_are_rejected() {
         let err =
             Config::parse("dialect: mssql\nschema_dirs: x\n", Path::new("pbps.yml")).unwrap_err();
         assert!(
             err.to_string().contains("schema_dirs"),
-            "錯誤訊息應指出拼錯的欄位：{err}"
+            "the error should name the misspelled field: {err}"
         );
     }
 
@@ -188,7 +193,7 @@ mod tests {
     fn discovery_reports_where_it_looked() {
         let tmp = std::env::temp_dir().join(format!("pbps-none-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        // 這個目錄沒有 pbps.yml，且 /tmp 之上也不會有
+        // This directory has no pbps.yml, and nothing above /tmp will either.
         let err = Project::discover(&tmp).unwrap_err();
         assert!(matches!(err, ConfigError::NotFound { .. }));
         std::fs::remove_dir_all(&tmp).unwrap();

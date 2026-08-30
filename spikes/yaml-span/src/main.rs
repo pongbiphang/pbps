@@ -1,16 +1,18 @@
-//! Phase 0 spike — YAML crate 選型驗證。
+//! Phase 0 spike - evaluating candidate YAML crates.
 //!
-//! 驗收條件（依 docs/SPEC.md §13.1）：
-//!   A. 語法錯誤        → 是否給出行號
-//!   B. 型別錯誤        → 是否給出行號（值的位置，不是文件開頭）
-//!   C. 未知欄位        → 是否給出行號
-//!   D. 重複 key        → 是否偵測得到（兩個同名欄位）
-//!   E. **語意錯誤的 span** → 文件合法，但某個值在業務上無效
-//!      （未知型別、uid 重複…）能否取得該值的行號 —— 這是 Linter 的核心需求
+//! Acceptance criteria (per docs/SPEC.md §13.1):
+//!   A. syntax error      -> is a line number reported?
+//!   B. type error        -> is a line number reported (the value's position, not
+//!                           the start of the document)?
+//!   C. unknown field     -> is a line number reported?
+//!   D. duplicate key     -> is it detected at all (two fields with one name)?
+//!   E. **span of a semantic error** -> the document is valid but some value is
+//!      invalid for the domain (an unknown type, a duplicate uid, …). Can the line
+//!      number of that value be obtained? This is the linter's core requirement.
 
 use std::collections::BTreeMap;
 
-// ---------------------------------------------------------------- 測試素材
+// ------------------------------------------------------------------- fixtures
 
 const GOOD: &str = r#"table: dbo.customer
 columns:
@@ -24,7 +26,7 @@ columns:
     type: nvarchar(255)
 "#;
 
-/// A. 語法錯誤：縮排壞掉
+/// A. Syntax error: broken indentation.
 const SYNTAX_ERR: &str = r#"table: dbo.customer
 columns:
   customer_id:
@@ -32,7 +34,7 @@ columns:
    nullable: false
 "#;
 
-/// B. 型別錯誤：null 期望 bool，給了字串
+/// B. Type error: a bool was expected, a string was given.
 const TYPE_ERR: &str = r#"table: dbo.customer
 columns:
   customer_id:
@@ -43,7 +45,7 @@ columns:
     nullable: maybe
 "#;
 
-/// C. 未知欄位：nullabel 拼錯
+/// C. Unknown field: `nullabel` is a typo.
 const UNKNOWN_FIELD: &str = r#"table: dbo.customer
 columns:
   customer_id:
@@ -51,7 +53,7 @@ columns:
     nullabel: false
 "#;
 
-/// D. 重複 key：同一張表出現兩個 email
+/// D. Duplicate key: one table with two `email` columns.
 const DUP_KEY: &str = r#"table: dbo.customer
 columns:
   email:
@@ -60,8 +62,8 @@ columns:
     type: varchar(50)
 "#;
 
-/// E. 語意錯誤：YAML 完全合法，但 `bigInt(9)` 不是有效的 MSSQL 型別。
-///    Linter 必須能指到第 7 行。
+/// E. Semantic error: the YAML is perfectly valid, but `bigInt(9)` is not a
+///    valid MSSQL type. The linter has to be able to point at line 7.
 const SEMANTIC_ERR: &str = r#"table: dbo.customer
 columns:
   customer_id:
@@ -72,7 +74,7 @@ columns:
     nullable: false
 "#;
 
-// ---------------------------------------------------------------- 資料模型
+// ---------------------------------------------------------------- data model
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,7 +114,8 @@ mod saphyr_probe {
     use super::*;
     use serde_saphyr::Spanned;
 
-    /// E 的模型：型別欄位包在 Spanned 裡，取得該值在原始檔中的位置
+    /// The model for E: the type field is wrapped in `Spanned` to recover that
+    /// value's position in the source.
     #[derive(Debug, serde::Deserialize)]
     struct SpannedTable {
         #[allow(dead_code)]
@@ -130,12 +133,12 @@ mod saphyr_probe {
         banner("serde-saphyr");
 
         case("good", serde_saphyr::from_str::<Table>(GOOD));
-        case("A. 語法錯誤", serde_saphyr::from_str::<Table>(SYNTAX_ERR));
-        case("B. 型別錯誤", serde_saphyr::from_str::<Table>(TYPE_ERR));
-        case("C. 未知欄位", serde_saphyr::from_str::<Table>(UNKNOWN_FIELD));
-        case("D. 重複 key", serde_saphyr::from_str::<Table>(DUP_KEY));
+        case("A. syntax error", serde_saphyr::from_str::<Table>(SYNTAX_ERR));
+        case("B. type error", serde_saphyr::from_str::<Table>(TYPE_ERR));
+        case("C. unknown field", serde_saphyr::from_str::<Table>(UNKNOWN_FIELD));
+        case("D. duplicate key", serde_saphyr::from_str::<Table>(DUP_KEY));
 
-        println!("\n--- E. 語意錯誤的 span ---");
+        println!("\n--- E. span of a semantic error ---");
         match serde_saphyr::from_str::<SpannedTable>(SEMANTIC_ERR) {
             Err(e) => println!("ERR: {e}"),
             Ok(t) => {
@@ -173,12 +176,12 @@ mod marked_probe {
         banner("marked-yaml");
 
         case("good", marked_yaml::from_yaml::<Table>(0, GOOD));
-        case("A. 語法錯誤", marked_yaml::from_yaml::<Table>(0, SYNTAX_ERR));
-        case("B. 型別錯誤", marked_yaml::from_yaml::<Table>(0, TYPE_ERR));
-        case("C. 未知欄位", marked_yaml::from_yaml::<Table>(0, UNKNOWN_FIELD));
-        case("D. 重複 key", marked_yaml::from_yaml::<Table>(0, DUP_KEY));
+        case("A. syntax error", marked_yaml::from_yaml::<Table>(0, SYNTAX_ERR));
+        case("B. type error", marked_yaml::from_yaml::<Table>(0, TYPE_ERR));
+        case("C. unknown field", marked_yaml::from_yaml::<Table>(0, UNKNOWN_FIELD));
+        case("D. duplicate key", marked_yaml::from_yaml::<Table>(0, DUP_KEY));
 
-        println!("\n--- E. 語意錯誤的 span ---");
+        println!("\n--- E. span of a semantic error ---");
         match marked_yaml::from_yaml::<SpannedTable>(0, SEMANTIC_ERR) {
             Err(e) => println!("ERR: {e}"),
             Ok(t) => {
@@ -191,8 +194,8 @@ mod marked_probe {
     }
 }
 
-/// F. Norway problem：YAML 1.1 把 no/yes/on/off 當布林。
-///    欄位名 `no`、值 `no_action` 是否安全？
+/// F. The Norway problem: YAML 1.1 reads no/yes/on/off as booleans.
+///    Are a column named `no` and a value of `no_action` safe?
 const NORWAY: &str = r#"table: dbo.region
 columns:
   no:

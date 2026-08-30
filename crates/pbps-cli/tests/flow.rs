@@ -1,7 +1,8 @@
-//! 端到端流程測試。
+//! End-to-end flow tests.
 //!
-//! 單元測試涵蓋各層的邏輯，但使用者實際遇到的是「指令跑起來會怎樣」——
-//! 退出碼、訊息、有沒有寫檔。CI 完全依賴退出碼，這裡把它們釘死。
+//! Unit tests cover the logic of each layer, but what a user actually meets is
+//! what happens when a command runs: the exit code, the message, and whether a
+//! file was written. CI depends entirely on exit codes, so they are pinned here.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -33,7 +34,7 @@ impl Demo {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?} 失敗");
+        assert!(out.status.success(), "git {args:?} failed");
     }
 
     fn commit(&self) {
@@ -84,13 +85,13 @@ fn first_run_creates_the_ids_file_and_warns_about_the_empty_baseline() {
 
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(d.ids_path().exists(), "應建立身份檔");
+    assert!(d.ids_path().exists(), "the identity file should be created");
     assert!(
-        stderr(&o).contains("基準為空"),
-        "空基準必須大聲警告，否則會被誤讀成真實計畫：{}",
+        stderr(&o).contains("the baseline is empty"),
+        "an empty baseline must warn loudly, or it reads as a real plan: {}",
         stderr(&o)
     );
-    assert!(stdout(&o).contains("建立表 dbo.t"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("create table dbo.t"), "{}", stdout(&o));
 }
 
 #[test]
@@ -103,15 +104,19 @@ fn an_ambiguous_rename_is_blocked_and_the_exact_command_is_printed() {
     d.table("table: dbo.t\ncolumns:\n  ident: {type: bigint, nullable: false}\n");
     let o = d.run(&["plan"]);
 
-    assert_eq!(code(&o), 1, "有歧義必須以非零退出，CI 才擋得住");
+    assert_eq!(
+        code(&o),
+        1,
+        "an ambiguity must exit non-zero, or CI cannot block on it"
+    );
     let msg = stderr(&o);
     assert!(
         msg.contains("pbps rename dbo.t.id ident"),
-        "訊息必須包含可直接複製的指令：{msg}"
+        "the message must contain a copy-pastable command: {msg}"
     );
     assert!(
         msg.contains("pbps drop dbo.t.id"),
-        "也要給刪除的選項：{msg}"
+        "the drop option must be offered too: {msg}"
     );
 }
 
@@ -128,9 +133,14 @@ fn recording_the_intent_resolves_the_rename() {
 
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("欄位改名 id → ident"), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("rename column id -> ident"),
+        "{}",
+        stdout(&o)
+    );
 
-    // 身份檔的改名只該動一行 —— 這是它在 review 中可讀的關鍵
+    // A rename should touch exactly one line of the identity file; that is what
+    // makes it reviewable.
     let after = std::fs::read_to_string(d.ids_path()).unwrap();
     let changed = before
         .lines()
@@ -139,7 +149,7 @@ fn recording_the_intent_resolves_the_rename() {
         .count();
     assert_eq!(
         changed, 1,
-        "改名應只改動身份檔的一行\n前:\n{before}\n後:\n{after}"
+        "a rename should change exactly one line of the identity file\nbefore:\n{before}\nafter:\n{after}"
     );
 }
 
@@ -152,7 +162,7 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
 
     d.table(ONE_COLUMN);
     let o = d.run(&["plan"]);
-    assert_eq!(code(&o), 1, "刪除缺原因必須擋下");
+    assert_eq!(code(&o), 1, "a drop without a reason must be blocked");
     assert!(stderr(&o).contains("--reason"), "{}", stderr(&o));
 
     assert_eq!(
@@ -160,13 +170,19 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
         0
     );
     let ids = std::fs::read_to_string(d.ids_path()).unwrap();
-    assert!(ids.contains("tombstones"), "應留下墓碑：{ids}");
-    assert!(ids.contains("REG-2026-042"), "墓碑要記錄原因：{ids}");
+    assert!(
+        ids.contains("tombstones"),
+        "a tombstone should be left: {ids}"
+    );
+    assert!(
+        ids.contains("REG-2026-042"),
+        "the tombstone must record the reason: {ids}"
+    );
     assert!(
         !std::fs::read_to_string(d.dir.join("schema/dbo.t.yml"))
             .unwrap()
             .contains("pii"),
-        "宣告檔不該留下殭屍欄位"
+        "the declarations must not keep a zombie column"
     );
 
     let o = d.run(&["plan"]);
@@ -181,7 +197,7 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
     d.run(&["plan"]);
     d.commit();
 
-    // 開發者加了欄位卻沒在本地跑 plan
+    // A developer added a column without running plan locally.
     d.table(
         "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
     );
@@ -189,14 +205,18 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
 
     let o = d.run(&["plan", "--check"]);
     assert_eq!(code(&o), 1);
-    assert!(stderr(&o).contains("身份檔未同步"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("the identity file is out of date"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(
         std::fs::read_to_string(d.ids_path()).unwrap(),
         before,
-        "--check 絕不可寫檔"
+        "--check must never write a file"
     );
 
-    // 本地跑過之後就通過
+    // It passes once plan has been run locally.
     assert_eq!(code(&d.run(&["plan"])), 0);
     assert_eq!(code(&d.run(&["plan", "--check"])), 0);
 }
@@ -213,7 +233,10 @@ fn narrowing_a_type_is_reported_as_a_risk() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("narrowing"), "{s}");
-    assert!(s.contains("--allow narrowing"), "要告訴使用者怎麼放行：{s}");
+    assert!(
+        s.contains("--allow narrowing"),
+        "the user must be told how to approve it: {s}"
+    );
 }
 
 #[test]
@@ -256,8 +279,9 @@ fn a_directory_without_a_project_file_is_reported_clearly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 跳版部署：環境落後好幾版時，改名仍須被判定為改名。
-/// 這是 uid 配對設計要保護的性質，在真實檔案上再驗一次。
+/// A jump-version deploy: with an environment several versions behind, a rename
+/// must still read as a rename. This is the property the uid matching design
+/// exists to protect, checked once more against real files.
 #[test]
 fn a_rename_survives_across_versions() {
     let d = Demo::new("jump");
@@ -277,26 +301,29 @@ fn a_rename_survives_across_versions() {
     .trim()
     .to_owned();
 
-    // v2：改名
+    // v2: the rename.
     d.table("table: dbo.t\ncolumns:\n  new_name: {type: nvarchar(50)}\n");
     d.run(&["rename", "dbo.t.old_name", "new_name"]);
     d.run(&["plan"]);
     d.commit();
 
-    // v3：只是加長，沒有任何意圖
+    // v3: just a longer column, with no intent at all.
     d.table("table: dbo.t\ncolumns:\n  new_name: {type: nvarchar(200)}\n");
     d.run(&["plan"]);
     d.commit();
 
-    // 對停在 v1 的環境算計畫
+    // Compute a plan for an environment stuck at v1.
     let o = d.run(&["plan", "--since", &v1]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let s = stdout(&o);
     assert!(
-        s.contains("欄位改名 old_name → new_name"),
-        "跳版時改名仍須判為改名：{s}"
+        s.contains("rename column old_name -> new_name"),
+        "across versions a rename must still read as a rename: {s}"
     );
-    assert!(!s.contains("刪除欄位"), "絕不能退化成掉資料的計畫：{s}");
+    assert!(
+        !s.contains("drop column"),
+        "it must never degrade into a data-losing plan: {s}"
+    );
 }
 
 #[test]
@@ -305,7 +332,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     d.table(ONE_COLUMN);
     d.run(&["plan"]);
 
-    // 手工組一份狀態快照（Phase 3 會由 pbps snapshot 產生）
+    // Assemble a state snapshot by hand; Phase 3's pbps snapshot will produce it.
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
@@ -325,7 +352,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     );
     let o = d.run(&["plan", "--base", path.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("新增欄位 extra"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("add column extra"), "{}", stdout(&o));
 }
 
 #[test]
@@ -335,20 +362,31 @@ fn fmt_normalises_and_check_mode_never_writes() {
     d.table(messy);
 
     let o = d.run(&["fmt", "--check"]);
-    assert_eq!(code(&o), 1, "未正規化的檔案應以非零退出");
+    assert_eq!(
+        code(&o),
+        1,
+        "a file that is not canonical should exit non-zero"
+    );
     assert_eq!(
         std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
         messy,
-        "--check 絕不可寫檔"
+        "--check must never write a file"
     );
 
     assert_eq!(code(&d.run(&["fmt"])), 0);
     let after = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
-    assert!(after.contains("type: bigint"), "型別應正規化：{after}");
-    assert_eq!(code(&d.run(&["fmt", "--check"])), 0, "重寫後應通過");
+    assert!(
+        after.contains("type: bigint"),
+        "the type should be normalized: {after}"
+    );
+    assert_eq!(
+        code(&d.run(&["fmt", "--check"])),
+        0,
+        "it should pass once rewritten"
+    );
 }
 
-/// 工具寫出來的檔案必須讀得回來 —— 裸的 `no` 會被 YAML 讀成布林。
+/// A file the tool writes must read back: a bare `no` is a boolean to YAML.
 #[test]
 fn fmt_quotes_scalars_that_yaml_would_misread() {
     let d = Demo::new("quote");
@@ -359,7 +397,7 @@ fn fmt_quotes_scalars_that_yaml_would_misread() {
     assert!(after.contains(r#"default: "no""#), "{after}");
     assert!(after.contains(r#"description: "0123""#), "{after}");
 
-    // 讀得回來，而且值沒有變
+    // It reads back, and the values are unchanged.
     let o = d.run(&["validate"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }

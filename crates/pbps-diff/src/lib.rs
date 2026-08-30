@@ -1,9 +1,11 @@
-//! 宣告狀態的比對。
+//! Comparison of declared states.
 //!
-//! 目前包含**身份解析**（[`identity`]）：把宣告檔中的名稱對應回 UID，判定
-//! 哪些是新增、哪些是改名、哪些是刪除，以及哪些情況必須由人裁決。
+//! This currently covers **identity resolution** ([`identity`]): mapping the names
+//! in the declarations back to UIDs, deciding what was added, renamed and
+//! dropped, and which situations a human has to adjudicate.
 //!
-//! 這一層不產生 SQL，也不接觸資料庫（CLAUDE.md 約束 3）。
+//! This layer produces no SQL and touches no database (constraint 3 in
+//! CLAUDE.md).
 
 pub mod identity;
 pub mod schema_diff;
@@ -12,8 +14,9 @@ pub use identity::{Blocker, Context, Resolution, resolve};
 pub use schema_diff::{DiffError, Side, diff};
 
 #[cfg(test)]
-// 測試中用 catch-all 搭配 panic 來表達「不該走到這裡」是恰當的；
-// 這條 lint 的價值在產品程式碼的窮舉性（新增 Change 變體時強制處理）。
+// In tests, a catch-all arm with a panic is the right way to say "this should be
+// unreachable". The value of this lint is exhaustiveness in product code, where
+// it forces a new Change variant to be handled.
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
@@ -31,8 +34,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// 用 `表名 -> [欄位名]` 快速造一個 schema。型別一律 int，因為身份解析
-    /// 不看屬性。
+    /// Builds a schema quickly from `table -> [columns]`. Every type is int,
+    /// because identity resolution does not look at attributes.
     fn schema(spec: &[(&str, &[&str])]) -> Schema {
         let mut s = Schema::default();
         for (name, cols) in spec {
@@ -54,14 +57,15 @@ mod tests {
         s
     }
 
-    /// 先把一份 schema 登記進身份檔，作為「上次已知狀態」。
+    /// Registers a schema into an identity file first, as the "last known
+    /// state".
     fn baseline(spec: &[(&str, &[&str])]) -> (Schema, IdsFile) {
         let s = schema(spec);
         let r = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap();
         (s, r.ids)
     }
 
-    // ---- 第一次執行 ----
+    // ---- first run ----
 
     #[test]
     fn first_run_creates_everything() {
@@ -76,7 +80,8 @@ mod tests {
         r.ids.validate().unwrap();
     }
 
-    /// 沒有變化時不該產生任何身份層級的動作 —— 否則每次執行都會有假的變更。
+    /// No change must produce no identity-level action at all, or every run would
+    /// show phantom changes.
     #[test]
     fn unchanged_schema_produces_nothing() {
         let (s, ids) = baseline(&[("dbo.customer", &["id", "email"])]);
@@ -89,10 +94,13 @@ mod tests {
                 ..Default::default()
             }
         );
-        assert_eq!(r.ids, ids, "身份檔不應被無謂地改寫");
+        assert_eq!(
+            r.ids, ids,
+            "the identity file must not be rewritten needlessly"
+        );
     }
 
-    // ---- 新增與刪除 ----
+    // ---- additions and deletions ----
 
     #[test]
     fn pure_addition_needs_no_intent() {
@@ -104,7 +112,8 @@ mod tests {
         assert_eq!(r.added_columns[0].1.name, "mobile");
     }
 
-    /// 刪除在操作上沒有歧義，但墓碑要回答「為什麼」，那是演算法生不出來的。
+    /// Deletion is unambiguous as an operation, but the tombstone has to answer
+    /// "why", and no algorithm can produce that.
     #[test]
     fn deletion_without_a_reason_is_blocked() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "legacy"])]);
@@ -124,7 +133,7 @@ mod tests {
         let s = schema(&[("dbo.customer", &["id"])]);
         let intent = Intent::DropColumn {
             column: "dbo.customer.national_id".parse().unwrap(),
-            reason: "REG-2026-042 PII 刪除要求".into(),
+            reason: "REG-2026-042 PII erasure request".into(),
         };
         let r = resolve(&s, &ids, &[intent], &ctx()).unwrap();
 
@@ -132,13 +141,14 @@ mod tests {
         assert_eq!(r.ids.tombstones.len(), 1);
         let tomb = r.ids.tombstones.values().next().unwrap();
         assert_eq!(tomb.was, "dbo.customer.national_id");
-        assert_eq!(tomb.reason, "REG-2026-042 PII 刪除要求");
+        assert_eq!(tomb.reason, "REG-2026-042 PII erasure request");
         assert_eq!(tomb.operator, "leon");
         assert_eq!(tomb.dropped_at, "2026-08-30");
         r.ids.validate().unwrap();
     }
 
-    /// 墓碑留在身份檔，宣告檔因此永遠只有「你要的東西」，不會累積殭屍欄位。
+    /// Tombstones stay in the identity file, so the declarations only ever hold
+    /// what you want and never accumulate zombie columns.
     #[test]
     fn tombstoned_column_does_not_reappear_as_a_change() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "national_id"])]);
@@ -154,9 +164,9 @@ mod tests {
         assert!(again.added_columns.is_empty());
     }
 
-    // ---- 改名 ----
+    // ---- renames ----
 
-    /// 這是整個工具存在的理由：沒有意圖時，絕不猜。
+    /// This is the whole reason the tool exists: with no intent, never guess.
     #[test]
     fn rename_without_intent_is_ambiguous() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
@@ -174,7 +184,7 @@ mod tests {
                 assert_eq!(disappeared, &["customer_name"]);
                 assert_eq!(appeared, &["full_name"]);
             }
-            other => panic!("預期欄位歧義，得到 {other:?}"),
+            other => panic!("expected a column ambiguity, got {other:?}"),
         }
     }
 
@@ -196,15 +206,27 @@ mod tests {
 
         assert_eq!(r.renamed_columns.len(), 1);
         let (uid, from, to) = &r.renamed_columns[0];
-        assert_eq!(uid, &before_uid, "改名必須保留原本的身份");
+        assert_eq!(
+            uid, &before_uid,
+            "a rename must preserve the original identity"
+        );
         assert_eq!(from.name, "customer_name");
         assert_eq!(to.name, "full_name");
-        assert!(r.added_columns.is_empty(), "改名不該同時算成新增");
-        assert!(r.dropped_columns.is_empty(), "改名不該同時算成刪除");
-        assert!(r.ids.tombstones.is_empty(), "改名不該留下墓碑");
+        assert!(
+            r.added_columns.is_empty(),
+            "a rename must not also count as an addition"
+        );
+        assert!(
+            r.dropped_columns.is_empty(),
+            "a rename must not also count as a deletion"
+        );
+        assert!(
+            r.ids.tombstones.is_empty(),
+            "a rename must not leave a tombstone"
+        );
     }
 
-    /// 一次同時改名與新增，兩者都要正確分開。
+    /// A rename and an addition in one revision must be told apart correctly.
     #[test]
     fn rename_and_addition_together() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
@@ -221,7 +243,7 @@ mod tests {
         assert_eq!(r.added_columns[0].1.name, "mobile");
     }
 
-    // ---- 表層級 ----
+    // ---- table level ----
 
     #[test]
     fn table_rename_moves_its_columns() {
@@ -241,12 +263,12 @@ mod tests {
         assert_eq!(r.renamed_tables.len(), 1);
         assert!(
             r.added_columns.is_empty() && r.dropped_columns.is_empty(),
-            "表改名不該讓底下的欄位被看成全新的"
+            "a table rename must not make its columns look brand new"
         );
         assert_eq!(
             r.ids.columns.get(&col_uid).unwrap().to_string(),
             "dbo.client.email",
-            "欄位的限定名稱要跟著表名更新"
+            "a column's qualified name must follow the table rename"
         );
     }
 
@@ -256,12 +278,16 @@ mod tests {
         let s = Schema::default();
         let intent = Intent::DropTable {
             table: t("dbo.customer"),
-            reason: "不再使用".into(),
+            reason: "no longer in use".into(),
         };
         let r = resolve(&s, &ids, &[intent], &ctx()).unwrap();
 
         assert_eq!(r.dropped_tables.len(), 1);
-        assert_eq!(r.ids.tombstones.len(), 3, "表本身加上兩個欄位");
+        assert_eq!(
+            r.ids.tombstones.len(),
+            3,
+            "the table itself plus its two columns"
+        );
         assert!(r.ids.tables.is_empty());
         assert!(r.ids.columns.is_empty());
         r.ids.validate().unwrap();
@@ -275,16 +301,17 @@ mod tests {
         assert!(matches!(errs[0], Blocker::AmbiguousTables { .. }));
     }
 
-    // ---- 意圖本身出錯 ----
+    // ---- faulty intents ----
 
-    /// 打錯字的意圖若被靜默忽略，使用者接著會看到一個他不理解的歧義錯誤。
+    /// A mistyped intent, if silently ignored, leaves the user facing an
+    /// ambiguity error they cannot explain.
     #[test]
     fn a_typo_in_an_intent_is_reported() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
         let s = schema(&[("dbo.customer", &["id", "full_name"])]);
         let intent = Intent::RenameColumn {
             table: t("dbo.customer"),
-            from: "custmer_name".into(), // 打錯
+            from: "custmer_name".into(), // typo
             to: "full_name".into(),
         };
         let errs = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx()).unwrap_err();
@@ -292,12 +319,12 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|b| matches!(b, Blocker::UnusedIntent { intent: i } if i == &intent)),
-            "應指出這則意圖沒有對應到任何東西：{errs:?}"
+            "the intent matching nothing should be reported: {errs:?}"
         );
     }
 
-    /// 意圖必須冪等：改名成功之後，宣告檔裡還留著的 renamed_from 註記
-    /// 不該讓下一次執行失敗。
+    /// Intents must be idempotent: after a successful rename, the renamed_from
+    /// annotation still sitting in the file must not fail the next run.
     #[test]
     fn an_already_applied_intent_is_not_an_error() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
@@ -311,9 +338,12 @@ mod tests {
             .unwrap()
             .ids;
 
-        // 註記還留在檔案裡，再跑一次
+        // The annotation is still in the file; run again.
         let again = resolve(&s, &after, std::slice::from_ref(&intent), &ctx()).unwrap();
-        assert!(again.renamed_columns.is_empty(), "不該重複改名");
+        assert!(
+            again.renamed_columns.is_empty(),
+            "the rename must not be applied twice"
+        );
     }
 
     #[test]
@@ -328,16 +358,17 @@ mod tests {
             .unwrap()
             .ids;
         resolve(&s, &after, std::slice::from_ref(&intent), &ctx())
-            .expect("已生效的刪除意圖不該報錯");
+            .expect("a drop intent that already took effect must not error");
     }
 
-    // ---- 不變式 ----
+    // ---- invariants ----
 
-    /// 解析後的身份檔必須自洽，否則下一次比對會建立在壞掉的基準上。
+    /// The resolved identity file must be self-consistent, or the next comparison
+    /// would build on a broken baseline.
     #[test]
     fn resulting_ids_file_is_always_valid() {
         let (_, ids) = baseline(&[("dbo.a", &["x", "y"]), ("dbo.b", &["z"])]);
-        // dbo.b 保留、dbo.c 是純新增；dbo.a 的欄位改名。
+        // dbo.b stays, dbo.c is a pure addition, and dbo.a has a column rename.
         let s = schema(&[
             ("dbo.a", &["x", "y2"]),
             ("dbo.b", &["z"]),
@@ -352,7 +383,8 @@ mod tests {
         r.ids.validate().unwrap();
     }
 
-    /// 套用一次之後再解析同一份宣告檔，應該完全沒有動作 —— 收斂性。
+    /// Resolving the same declarations again after applying once must do nothing
+    /// at all — convergence.
     #[test]
     fn resolution_converges() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
@@ -371,17 +403,21 @@ mod tests {
                 ids: after.clone(),
                 ..Default::default()
             },
-            "第二次解析不應有任何動作"
+            "the second resolution must produce no actions"
         );
     }
 
-    /// 多個問題要一次報完，不要修一個跑一次。
+    /// Every problem should be reported at once, not fix-one-run-again.
     #[test]
     fn multiple_blockers_are_all_reported() {
         let (_, ids) = baseline(&[("dbo.a", &["x", "gone"]), ("dbo.b", &["y", "old"])]);
         let s = schema(&[("dbo.a", &["x"]), ("dbo.b", &["y", "new"])]);
         let errs = resolve(&s, &ids, &[], &ctx()).unwrap_err();
 
-        assert_eq!(errs.len(), 2, "應同時回報刪除缺理由與欄位歧義：{errs:?}");
+        assert_eq!(
+            errs.len(),
+            2,
+            "the missing drop reason and the column ambiguity should both be reported: {errs:?}"
+        );
     }
 }

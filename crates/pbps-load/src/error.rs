@@ -1,12 +1,15 @@
-//! 載入期的診斷。
+//! Load-time diagnostics.
 //!
-//! 分成兩類，刻意用不同的呈現方式：
+//! There are two kinds, deliberately presented differently:
 //!
-//! - **YAML 結構錯誤**（語法、未知欄位、型別不符、重複 key）由 `serde-saphyr`
-//!   偵測。它的訊息已經包含行號、欄號與帶 caret 的原始碼片段，品質很好，
-//!   直接沿用即可 —— 再包一層 miette 只會讓同一段原始碼被印兩次。
-//! - **語意錯誤**（型別名無效、表名格式錯誤…）是我們自己的檢查。YAML 本身
-//!   合法，錯的是值的內容，因此要自己標出位置，走完整的 miette 診斷。
+//! - **YAML structural errors** (syntax, unknown fields, type mismatches,
+//!   duplicate keys) are detected by `serde-saphyr`. Its messages already carry
+//!   line, column and a caret-annotated source excerpt, and they are good, so we
+//!   pass them through — wrapping them in miette as well would only print the
+//!   same source twice.
+//! - **Semantic errors** (an invalid type name, a malformed table name, …) are
+//!   our own checks. The YAML itself is valid and it is the value that is wrong,
+//!   so we locate it ourselves and render a full miette diagnostic.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +17,7 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 
 #[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum LoadError {
-    #[error("無法讀取 `{path}`")]
+    #[error("cannot read `{path}`")]
     #[diagnostic(code(pbps::load::io))]
     Io {
         path: PathBuf,
@@ -22,7 +25,7 @@ pub enum LoadError {
         source: std::io::Error,
     },
 
-    #[error("`{path}` 的 YAML 有問題\n\n{message}")]
+    #[error("there is a problem with the YAML in `{path}`\n\n{message}")]
     #[diagnostic(code(pbps::load::yaml))]
     Yaml { path: PathBuf, message: String },
 
@@ -31,7 +34,8 @@ pub enum LoadError {
     Semantic(#[from] Box<Semantic>),
 }
 
-/// 值在語意上無效 —— YAML 讀得懂，但內容不對。
+/// A value that is semantically invalid: the YAML parses, but its content is
+/// wrong.
 #[derive(Debug, thiserror::Error, Diagnostic)]
 #[error("{message}")]
 #[diagnostic(code(pbps::load::semantic))]
@@ -74,7 +78,7 @@ impl LoadError {
     }
 }
 
-/// 一份原始檔的內容與名稱，供診斷引用。
+/// The name and content of one source file, for diagnostics to quote.
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     pub name: String,
@@ -94,11 +98,12 @@ impl SourceFile {
     }
 }
 
-/// 把 `serde-saphyr` 的位置轉成 miette 的 span。
+/// Converts a `serde-saphyr` location into a miette span.
 ///
-/// **必須用位元組偏移。** `Span::offset()` 回傳的是字元偏移，miette 期待的是
-/// 位元組偏移；只要檔案裡有任何非 ASCII 字元（`description` 幾乎一定有中文），
-/// 兩者就會分歧，標記會落在錯誤的位置上。
+/// **Byte offsets are mandatory.** `Span::offset()` returns a character offset
+/// while miette expects a byte offset; the moment a file contains any non-ASCII
+/// character (a `description` very often will), the two diverge and the label
+/// lands in the wrong place.
 pub fn to_span(loc: &serde_saphyr::Location) -> SourceSpan {
     let s = loc.span();
     let offset = s.byte_offset().unwrap_or_else(|| s.offset()) as usize;

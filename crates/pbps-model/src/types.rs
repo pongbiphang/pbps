@@ -1,44 +1,47 @@
-//! 欄位型別的**語法**表示。
+//! The **syntactic** representation of a column type.
 //!
-//! 這一層只回答「這個字串的結構長什麼樣」：型別名加上零到多個參數。
-//! 它刻意不知道 `nvarchar` 是否為合法型別、`int → bigint` 算不算安全 ——
-//! 那些是 `pbps-dialect` 的職責（SPEC §11.2）。
+//! This layer answers only "what shape does this string have?": a type name plus
+//! zero or more arguments. It deliberately does not know whether `nvarchar` is a
+//! valid type, or whether `int → bigint` is safe — those belong to
+//! `pbps-dialect` (SPEC §11.2).
 //!
-//! 這樣切的好處是：`Schema` 可以被解析、比較、序列化，而完全不需要方言在場。
+//! The payoff of drawing the line here is that a `Schema` can be parsed,
+//! compared and serialized without any dialect being present at all.
 
 use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TypeParseError {
-    #[error("型別不可為空")]
+    #[error("a type must not be empty")]
     Empty,
 
-    #[error("型別 `{0}` 的括號未閉合")]
+    #[error("unclosed parenthesis in type `{0}`")]
     UnclosedParen(String),
 
-    #[error("型別 `{0}` 在右括號之後還有內容")]
+    #[error("type `{0}` has trailing content after the closing parenthesis")]
     TrailingContent(String),
 
-    #[error("型別 `{0}` 的參數為空")]
+    #[error("type `{0}` has an empty argument")]
     EmptyArg(String),
 
-    #[error("型別名 `{0}` 不是合法的識別名")]
+    #[error("the type name in `{0}` is not a valid identifier")]
     BadBaseName(String),
 }
 
-/// 型別參數。
+/// A type argument.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TypeArg {
-    /// `nvarchar(100)` 的 100、`decimal(18, 2)` 的 18 與 2
+    /// The 100 of `nvarchar(100)`; the 18 and 2 of `decimal(18, 2)`.
     Int(i64),
-    /// `nvarchar(max)`。獨立成一個變體，因為它在長度比較上的語意是「無上限」，
-    /// 讓方言判斷窄化時不必去解析字串。
+    /// The `max` of `nvarchar(max)`. It gets its own variant because in a length
+    /// comparison it means "no upper bound", which spares the dialect from
+    /// parsing strings when judging narrowing.
     Max,
-    /// 其他具名參數，保留原樣（小寫化）
+    /// Any other named argument, kept as written (lowercased).
     Ident(String),
 }
 
@@ -52,10 +55,12 @@ impl fmt::Display for TypeArg {
     }
 }
 
-/// 已做語法正規化的型別，如 `nvarchar(100)`、`decimal(18,2)`、`bigint`。
+/// A syntactically normalized type, such as `nvarchar(100)`, `decimal(18,2)` or
+/// `bigint`.
 ///
-/// 正規化只做兩件事：大小寫統一為小寫、去除空白。**別名不在此展開**
-/// （`integer` 不會變成 `int`），因為哪些名字互為別名是方言知識。
+/// Normalization does exactly two things: lowercase everything and strip
+/// whitespace. **Aliases are not expanded here** (`integer` does not become
+/// `int`), because which names alias which is dialect knowledge.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -73,13 +78,14 @@ impl ColumnType {
         }
     }
 
-    /// 無參數型別，如 `bigint`。
+    /// A type with no arguments, such as `bigint`.
     pub fn simple(base: impl Into<String>) -> Self {
         Self::new(base, Vec::new())
     }
 
-    /// 第一個整數參數，方言判斷長度窄化時最常用到。
-    /// `nvarchar(max)` 回傳 `None`（無上限，不是長度為 0）。
+    /// The first integer argument, which is what a dialect most often needs when
+    /// judging length narrowing. `nvarchar(max)` returns `None` — no upper
+    /// bound, not a length of zero.
     pub fn first_int_arg(&self) -> Option<i64> {
         match self.args.first() {
             Some(TypeArg::Int(n)) => Some(*n),
@@ -151,8 +157,9 @@ impl FromStr for ColumnType {
 
 fn finish_base(whole: &str, base: &str, args: Vec<TypeArg>) -> Result<ColumnType, TypeParseError> {
     let base = base.trim();
-    // 型別名允許空白（`double precision`、`timestamp with time zone`），
-    // 但不允許括號、逗號等結構字元混進來。
+    // Type names may contain spaces (`double precision`, `timestamp with time
+    // zone`), but structural characters such as parentheses and commas must not
+    // sneak in.
     let ok = !base.is_empty()
         && base
             .chars()
@@ -206,7 +213,8 @@ mod tests {
         assert_eq!(p("BigInt"), p("bigint"));
     }
 
-    /// 大小寫不同的同一型別必須相等，否則 diff 會產生假的變更。
+    /// The same type in different cases must compare equal, or diff will invent
+    /// changes that are not there.
     #[test]
     fn case_differences_do_not_create_changes() {
         assert_eq!(p("NVARCHAR(255)"), p("nvarchar(255)"));
@@ -217,7 +225,7 @@ mod tests {
     fn max_is_its_own_variant() {
         let t = p("nvarchar(MAX)");
         assert!(t.is_max());
-        assert_eq!(t.first_int_arg(), None, "max 不是長度 0");
+        assert_eq!(t.first_int_arg(), None, "max is not a length of zero");
         assert_eq!(t.to_string(), "nvarchar(max)");
     }
 
@@ -233,7 +241,7 @@ mod tests {
     #[test]
     fn display_round_trips() {
         for s in ["bigint", "nvarchar(100)", "decimal(18, 2)", "nvarchar(max)"] {
-            assert_eq!(p(s).to_string(), s, "{s} 的往返不一致");
+            assert_eq!(p(s).to_string(), s, "{s} did not round-trip");
         }
     }
 
@@ -246,7 +254,8 @@ mod tests {
         assert!("nvarchar()".parse::<ColumnType>().is_err());
     }
 
-    /// 別名展開是方言的事，這一層不能自作主張。
+    /// Expanding aliases is the dialect's job; this layer must not decide on its
+    /// own.
     #[test]
     fn aliases_are_left_alone() {
         assert_ne!(p("integer"), p("int"));

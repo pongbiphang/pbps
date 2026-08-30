@@ -1,22 +1,26 @@
-//! `pbps` 的領域模型。
+//! The domain model of `pbps`.
 //!
-//! # 這一層的界線
+//! # The boundaries of this layer
 //!
-//! - **方言無關**。這裡沒有任何 T-SQL / PostgreSQL 的知識。型別字串只做
-//!   *語法* 解析（名稱 + 參數），「`nvarchar` 是不是有效型別」「`int → bigint`
-//!   算不算窄化」屬於 `pbps-dialect`。
-//! - **不帶 span**。載入期的位置資訊留在 `pbps-load`，不進模型。理由是
-//!   `Schema` 要能直接用 `==` 比較（diff 與 drift 檢查都靠它），
-//!   夾帶 span 會讓兩份語意相同的 schema 不相等。
-//! - **序列化目標是 JSON**（身份檔與 `__pbps_state` 快照），不是 YAML。
-//!   YAML 的形狀與模型不同（map key 即名稱、有預設值），
-//!   由 `pbps-load` 負責兩者之間的轉換。
+//! - **Dialect-agnostic**. There is no T-SQL or PostgreSQL knowledge here. Type
+//!   strings are parsed *syntactically* only (name + arguments); "is `nvarchar` a
+//!   valid type" and "does `int → bigint` count as narrowing" belong to
+//!   `pbps-dialect`.
+//! - **No spans**. Source locations from load time stay in `pbps-load` and never
+//!   enter the model. The reason is that `Schema` must be comparable with `==`
+//!   directly (both diff and drift detection rely on it), and carrying spans
+//!   would make two semantically identical schemas unequal.
+//! - **Serializes to JSON** (the identity file and the `__pbps_state` snapshot),
+//!   not YAML. The YAML shape differs from the model — map keys act as names,
+//!   fields have defaults — and `pbps-load` owns the conversion between them.
 //!
-//! # 決定性
+//! # Determinism
 //!
-//! 所有集合一律用 `BTreeMap` / `BTreeSet`，讓序列化輸出穩定 —— 身份檔要進
-//! git，順序跳動會製造假的 diff。唯一的例外是 `Table::columns` 用
-//! `IndexMap` 保留宣告順序，因為那會影響 `CREATE TABLE` 的欄位排列。
+//! Every collection is a `BTreeMap` / `BTreeSet` so that serialized output is
+//! stable: the identity file is committed to git, and shifting order would
+//! manufacture phantom diffs. The one exception is `Table::columns`, which uses
+//! `IndexMap` to preserve declaration order because that affects the column
+//! layout of `CREATE TABLE`.
 
 pub mod change;
 pub mod ids;

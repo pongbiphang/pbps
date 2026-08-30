@@ -1,15 +1,18 @@
-//! 變更集：diff 的產物，planner 的輸入。
+//! Change set: the output of diff, the input of the planner.
 //!
-//! # 為什麼是結構化資料而不是 SQL 字串
+//! # Why structured data instead of SQL strings
 //!
-//! 風險分類、閘門判斷、影響分析全部在這一層進行，SQL 只在方言的 emitter 中
-//! 出現一次（SPEC §11.1）。若 diff 直接吐字串，上述判斷就得靠 regex 去猜自己
-//! 剛剛寫了什麼 —— 那正是這個工具存在的理由的反面。
+//! Risk classification, gate decisions and impact analysis all happen at this
+//! layer; SQL appears exactly once, in the dialect emitter (SPEC §11.1). If diff
+//! emitted strings directly, every one of those decisions would have to guess —
+//! with regexes — what it had just written. That is the precise opposite of the
+//! reason this tool exists.
 //!
-//! # 風險為什麼是欄位而不是方法
+//! # Why risk is a field and not a method
 //!
-//! 「`int → bigint` 是放寬還是窄化」需要方言知識，模型層答不出來。因此風險由
-//! 帶著 `Dialect` 的 differ 算好，以資料的形式附在 [`PlannedChange`] 上。
+//! "Is `int → bigint` a widening or a narrowing?" needs dialect knowledge, which
+//! the model layer does not have. So risks are computed by the differ, which does
+//! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,29 +24,31 @@ use crate::schema::{
 use crate::types::ColumnType;
 use crate::uid::Uid;
 
-/// 需要在指令層顯性放行的風險類別（SPEC §7.2）。
+/// A risk class that must be explicitly allowed at the command level (SPEC §7.2).
 ///
-/// 判斷依據是**變更類別本身是否可能失敗**，不是「這次資料剛好安不安全」——
-/// 讀資料判斷屬於執行期，不在宣告層的職責內。
+/// The criterion is **whether this kind of change can fail at all**, not whether
+/// today's data happens to be safe — inspecting data is a runtime concern and has
+/// no place in the declarative layer.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
-    /// 改名。依賴此物件的 view / SP / 應用程式會失效。
+    /// Rename. Views, stored procedures and applications that depend on the
+    /// object will break.
     Rename,
-    /// 資料遺失：DROP COLUMN / TABLE / INDEX。
+    /// Data loss: DROP COLUMN / TABLE / INDEX.
     Destructive,
-    /// 型別窄化或不相容轉換：可能截斷或轉換失敗。
+    /// Type narrowing or an incompatible conversion: may truncate or fail.
     Narrowing,
-    /// nullable → NOT NULL 且無 DEFAULT：既有 NULL 會違反。
+    /// nullable → NOT NULL with no DEFAULT: existing NULLs will violate it.
     NotNull,
-    /// 新增 UNIQUE / FK / CHECK：既有資料可能不滿足。
+    /// Adding UNIQUE / FK / CHECK: existing rows may not satisfy it.
     Constraint,
 }
 
 impl RiskClass {
-    /// `--allow` 接受的名稱。
+    /// The name accepted by `--allow`.
     pub const fn as_str(self) -> &'static str {
         match self {
             RiskClass::Rename => "rename",
@@ -77,15 +82,15 @@ impl std::str::FromStr for RiskClass {
             .find(|r| r.as_str() == s)
             .ok_or_else(|| {
                 let all: Vec<_> = RiskClass::ALL.iter().map(|r| r.as_str()).collect();
-                format!("未知的風險類別 `{s}`，可用的有：{}", all.join(", "))
+                format!("unknown risk class `{s}`; available: {}", all.join(", "))
             })
     }
 }
 
-/// 一個原子變更。
+/// A single atomic change.
 ///
-/// 每個變體都帶著受影響物件的 UID，讓計畫在套用時不必再依賴名稱去對照 ——
-/// 名稱正是可能同時在改變的東西。
+/// Every variant carries the UID of the object it affects, so that applying a
+/// plan never has to match on names — names are exactly what may be changing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Change {
@@ -129,7 +134,7 @@ pub enum Change {
     AlterColumnNullability {
         uid: Uid,
         column: ColumnRef,
-        /// 變更後是否可為 NULL
+        /// Whether the column is nullable after the change.
         to_nullable: bool,
     },
     AlterColumnDefault {
@@ -138,15 +143,17 @@ pub enum Change {
         from: Option<String>,
         to: Option<String>,
     },
-    /// 棄用狀態改變。不產生結構變更，可選擇性寫入 extended property。
+    /// Deprecation flag changed. Produces no structural change; may optionally be
+    /// written to an extended property.
     SetColumnDeprecated {
         uid: Uid,
         column: ColumnRef,
         reason: Option<String>,
     },
 
-    // 約束與索引一律 drop + add，不做原地修改 —— 資料庫本身也是這樣實作的，
-    // 假裝可以原地改只會讓 emitter 多一條會出錯的路徑。
+    // Constraints and indexes are always drop + add, never modified in place —
+    // that is how the database itself implements it, and pretending otherwise
+    // would only give the emitter one more path that can fail.
     SetPrimaryKey {
         table: TableName,
         from: Option<PrimaryKey>,
@@ -191,7 +198,7 @@ pub enum Change {
 }
 
 impl Change {
-    /// 此變更作用的表。用於分組顯示與排序。
+    /// The table this change acts on. Used for grouping in output and for ordering.
     pub fn table(&self) -> &TableName {
         match self {
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
@@ -215,9 +222,10 @@ impl Change {
         }
     }
 
-    /// 與變更種類本身綁定、不需要方言知識就能斷定的風險。
+    /// Risks that follow from the kind of change alone, with no dialect knowledge.
     ///
-    /// 需要比較型別才能判定的（窄化）不在這裡，由 differ 補上。
+    /// Risks that require comparing types (narrowing) are not here; the differ
+    /// adds those.
     pub fn intrinsic_risks(&self) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
@@ -258,7 +266,7 @@ impl Change {
     }
 }
 
-/// 一個變更加上它已判定的風險。
+/// A change together with the risks that have been determined for it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     #[serde(flatten)]
@@ -269,7 +277,8 @@ pub struct PlannedChange {
 }
 
 impl PlannedChange {
-    /// 由變更本身可斷定的風險建立。需要方言判斷的風險由 differ 另外加入。
+    /// Builds from the risks the change itself implies. Risks that need dialect
+    /// knowledge are added separately by the differ.
     pub fn new(change: Change) -> Self {
         let risks = change.intrinsic_risks();
         Self { change, risks }
@@ -281,10 +290,11 @@ impl PlannedChange {
     }
 }
 
-/// 一次 diff 的完整結果。
+/// The complete result of one diff.
 ///
-/// `changes` 的順序即為套用順序。排序（先 drop index 再 drop column…）
-/// 是 planner 的職責，模型只保證順序被保留。
+/// The order of `changes` is the order of application. Producing that order
+/// (drop indexes before dropping columns, and so on) is the planner's job; the
+/// model only guarantees the order is preserved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangeSet {
     pub changes: Vec<PlannedChange>,
@@ -295,7 +305,7 @@ impl ChangeSet {
         self.changes.is_empty()
     }
 
-    /// 這份計畫涉及的所有風險類別 —— 即 `--allow` 必須涵蓋的集合。
+    /// Every risk class this plan involves — the set `--allow` must cover.
     pub fn risks(&self) -> BTreeSet<RiskClass> {
         self.changes
             .iter()
@@ -303,7 +313,7 @@ impl ChangeSet {
             .collect()
     }
 
-    /// 未被 `allowed` 涵蓋的風險。非空即代表 apply 應中止。
+    /// Risks not covered by `allowed`. Non-empty means apply must abort.
     pub fn unapproved_risks(&self, allowed: &BTreeSet<RiskClass>) -> BTreeSet<RiskClass> {
         self.risks().difference(allowed).copied().collect()
     }
@@ -354,7 +364,8 @@ mod tests {
         assert!(add_column().intrinsic_risks().is_empty());
     }
 
-    /// 加 NOT NULL 有風險，放寬成 nullable 沒有 —— 方向必須分得清楚。
+    /// Adding NOT NULL is risky, relaxing to nullable is not — the direction has
+    /// to be distinguished.
     #[test]
     fn nullability_risk_is_directional() {
         let tighten = Change::AlterColumnNullability {
@@ -371,7 +382,8 @@ mod tests {
         assert!(loosen.intrinsic_risks().is_empty());
     }
 
-    /// 型別窄化需要方言判斷，模型層不該自作主張。
+    /// Type narrowing needs a dialect to judge; the model layer must not decide
+    /// on its own.
     #[test]
     fn type_change_risk_is_left_to_the_dialect() {
         let c = Change::AlterColumnType {
@@ -380,7 +392,10 @@ mod tests {
             from: ty("bigint"),
             to: ty("int"),
         };
-        assert!(c.intrinsic_risks().is_empty(), "模型層不應猜測型別風險");
+        assert!(
+            c.intrinsic_risks().is_empty(),
+            "the model layer must not guess type risks"
+        );
 
         let planned = PlannedChange::new(c).with_risk(RiskClass::Narrowing);
         assert!(planned.risks.contains(&RiskClass::Narrowing));
@@ -406,7 +421,7 @@ mod tests {
         assert!(cs.unapproved_risks(&allowed).is_empty());
     }
 
-    /// 無風險的計畫不需要任何旗標。
+    /// A plan with no risks needs no flags at all.
     #[test]
     fn safe_plans_need_no_flags() {
         let cs = ChangeSet {

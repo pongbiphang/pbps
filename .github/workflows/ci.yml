@@ -10,8 +10,9 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # 本機開發在 Linux，Windows 的覆蓋完全靠這裡 —— 換行符、路徑分隔符、
-  # 終端機偵測這幾類平台差異只有在這個 matrix 裡才會現形。
+  # Development happens on Linux, so Windows coverage rests entirely on this
+  # matrix: line endings, path separators and terminal detection are the kinds of
+  # platform difference that only show up here.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -36,8 +37,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
 
-  # MSRV 由 serde-saphyr 決定（見 docs/ADR-0001）。獨立一個 job，
-  # 免得無意間用了新語法卻要到使用者端才發現。
+  # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
+  # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
     runs-on: ubuntu-latest
     steps:

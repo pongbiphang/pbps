@@ -9,16 +9,16 @@ members = [
     "crates/pbps-cli",
 ]
 
-# spike：Phase 0 的 YAML crate 選型驗證，定案後移除
+# spike: the Phase 0 YAML crate evaluation; removed once the choice is settled
 exclude = ["spikes/yaml-span"]
 
-# pbps-mssql / pbps-db 於 Phase 2 加入
-# pbps-pg 於 Phase 4 加入
+# pbps-mssql / pbps-db arrive in Phase 2
+# pbps-pg arrives in Phase 4
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.89"   # serde-saphyr 的要求，見 docs/ADR-0001
+rust-version = "1.89"   # required by serde-saphyr, see docs/ADR-0001
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pongbiphang/pbps"
 authors = ["PongBiphang"]
@@ -38,13 +38,15 @@ miette     = "7"
 clap       = { version = "4", features = ["derive"] }
 indexmap   = { version = "2", features = ["serde"] }
 
-# YAML：見 docs/ADR-0001-yaml-crate.md。僅 pbps-load 可直接依賴，
-# 其餘 crate 一律透過 pbps-load，讓日後替換是有界的工作。
+# YAML: see docs/ADR-0001-yaml-crate.md. Only pbps-load may depend on it
+# directly; every other crate goes through pbps-load, which keeps a future
+# replacement a bounded piece of work.
 serde-saphyr = "1.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-# diff / emit 的正確性依賴窮舉比對，不允許用 `_ =>` 草草帶過
+# The correctness of diff and emit depends on exhaustive matching; a catch-all
+# `_ =>` must not paper over a missing case.
 wildcard_enum_match_arm = "warn"

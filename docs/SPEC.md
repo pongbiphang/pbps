@@ -1,80 +1,111 @@
-# PongBiphang Schema (`pbps`) — 設計規格
+# PongBiphang Schema (`pbps`) — design specification
 
-> 狀態：Phase 0 定稿（可實作）
-> 語言：Rust
-> 定位：宣告式資料庫 schema 版控與部署工具
-> 首要方言：SQL Server；次要：PostgreSQL
+> Status: finalized and implementable; Phase 0 and Phase 1 are built
+> Language: Rust
+> Position: declarative database schema version control and deployment
+> Primary dialect: SQL Server; secondary: PostgreSQL
 
 ---
 
-## 1. 定位與範圍
+## 1. Position and scope
 
-### 1.1 這是什麼
+### 1.1 What this is
 
-一個**宣告式**的資料庫 schema 管理工具。使用者維護一份「我要的 schema 長什麼樣」的宣告檔，工具負責算出差異、產生變更腳本、在受控的閘門下套用到各環境，並記錄完整稽核軌跡。
+A **declarative** database schema management tool. Users maintain declarations of
+what they want the schema to look like, and the tool computes the difference,
+generates the change script, applies it to each environment behind a controlled
+gate, and records a complete audit trail.
 
-對照現有方案：
+Compared with what exists:
 
-| 工具 | 模式 | 缺口 |
+| Tool | Model | Gap |
 |---|---|---|
-| Flyway / Liquibase | 命令式 | 囉嗦；無法一眼看出 schema 現況；重構困難 |
-| Atlas | 宣告式 | rename 靠啟發式偵測，需人工改生成的 migration；HCL 學習曲線；OSS/Pro 功能切分 |
-| Skeema | 宣告式 | 僅 MySQL |
-| DACPAC | 宣告式 | 綁 SQL Server + Visual Studio 生態；rename 與誤刪風險 |
+| Flyway / Liquibase | Imperative | Verbose; the current schema is never visible at a glance; refactoring is hard |
+| Atlas | Declarative | Renames rest on heuristic detection and the generated migration needs hand-editing; HCL learning curve; OSS/Pro feature split |
+| Skeema | Declarative | MySQL only |
+| DACPAC | Declarative | Tied to the SQL Server + Visual Studio ecosystem; rename and accidental-drop risk |
 
-`pbps` 的差異化不在「宣告式」本身，而在四件事：
+`pbps` does not differentiate on "declarative" itself, but on four things:
 
-1. **rename / drop 的意圖由人明確給定**，記錄在版控中，不靠猜測
-2. **變更依風險分類**，危險操作需在指令層明確放行
-3. **saved plan + checksum**：review 過的計畫被釘死，apply 時不會多做也不會少做
-4. **狀態與稽核 ledger 存在資料庫自身**，天然支援多環境獨立演進
+1. **Rename and drop intent is stated explicitly by a human**, recorded in version
+   control, never guessed
+2. **Changes are classified by risk**, and dangerous operations must be allowed
+   explicitly at the command level
+3. **Saved plan plus checksum**: the reviewed plan is pinned, so apply does
+   neither more nor less
+4. **State and the audit ledger live in the database itself**, which supports
+   environments evolving independently as a matter of course
 
-### 1.2 v1 涵蓋範圍
+### 1.2 What v1 covers
 
-**納入**：table（create / drop / rename）、column、primary key、unique constraint、foreign key、check constraint、index
+**In**: tables (create / drop / rename), columns, primary keys, unique
+constraints, foreign keys, check constraints, indexes.
 
-**延後**：view、stored procedure、function、trigger、權限（GRANT）、資料轉換（backfill）
+**Deferred**: views, stored procedures, functions, triggers, permissions (GRANT),
+data transformation (backfill).
 
-view / SP 這類「定義即最新版」的物件性質接近 repeatable migration，模型不同，留待後續階段。
+Objects like views and stored procedures, where the definition simply *is* the
+latest version, behave much like repeatable migrations. That is a different model,
+left to a later phase.
 
-### 1.3 明確不做的事
+### 1.3 Explicit non-goals
 
-- **資料轉換（backfill）不自動化**。「資料要怎麼搬」是業務決策，無法從結構 diff 推導。需要時由人手動執行 SQL，再走 `pbps baseline` 重設基準。
-- **不做跨方言的抽象型別系統**。一份 schema 檔綁定一個方言。「支援多資料庫」指的是工具能操作 MSSQL 與 PostgreSQL，不是同一份檔案能部到兩者。
-- **不重播歷史**。宣告式工具沒有 migration history 可重跑；DR 與新環境重建走 `pbps bootstrap` 一次性生成完整 schema，比重播數百支腳本快且可靠。
+- **Data transformation (backfill) is not automated.** How data should be moved is
+  a business decision and cannot be derived from a structural diff. When it is
+  needed, a human runs the SQL and then re-baselines with `pbps baseline`.
+- **No cross-dialect abstract type system.** One schema is bound to one dialect.
+  "Supports multiple databases" means the tool can drive MSSQL and PostgreSQL, not
+  that one set of files deploys to both.
+- **History is not replayed.** A declarative tool has no migration history to
+  re-run; DR and new-environment rebuilds go through `pbps bootstrap`, which
+  generates the complete schema in one shot — faster and more reliable than
+  replaying hundreds of scripts.
 
 ---
 
-## 2. 核心設計原則
+## 2. Core design principles
 
-1. **宣告檔只包含期望狀態** —— 你要的欄位，就這些。不含 UID、不含 rename 註記、不含墓碑。
-2. **無法推導的資訊才需要人給** —— 只有 rename / drop 的意圖屬於此類，其餘一律自動判定。
-3. **意圖一次給定，永久記錄** —— 記在版控的身份檔中，與環境部署進度脫鉤。
-4. **人的判斷發生在作者端，不在部署端** —— 打 tag 部署時所有意圖已在 git 中，CI 全自動。
-5. **危險操作必須顯性放行** —— 但放行的粒度是「這份被 review 過的計畫」，不是「這個欄位」。
-6. **宣告狀態與已驗證狀態分離** —— apply 前必須確認資料庫真實狀態未偏離。
+1. **The declarations contain only the desired state** — the columns you want, and
+   that is all. No UIDs, no rename annotations, no tombstones.
+2. **Only what cannot be derived needs a human** — rename and drop intent is the
+   whole of that category; everything else is decided automatically.
+3. **Intent is stated once and recorded permanently** — in the identity file in
+   version control, decoupled from each environment's deployment progress.
+4. **Human judgement happens at authoring time, not deployment time** — by the
+   time a tag is deployed, every intent is already in git and CI is fully
+   automatic.
+5. **Dangerous operations must be allowed explicitly** — but the granularity of
+   the approval is "this reviewed plan", not "this column".
+6. **Declared state and verified state are kept apart** — before applying,
+   the database's real state must be confirmed not to have diverged.
 
 ---
 
-## 3. 概念模型
+## 3. Conceptual model
 
-三個持久化產物，職責嚴格分離：
+Three persistent artifacts with strictly separated responsibilities:
 
-| 產物 | 位置 | 內容 | 誰維護 |
+| Artifact | Location | Contents | Maintained by |
 |---|---|---|---|
-| `schema/*.yml` | git | 期望狀態：table / column / constraint / index | 人 |
-| `schema.ids.json` | git | 身份帳本：uid → 名稱、墓碑紀錄 | 工具 |
-| `__pbps_state` 表 | 各環境資料庫 | 該環境已驗證的真實狀態快照 + 稽核 ledger | 工具 |
+| `schema/*.yml` | git | Desired state: tables, columns, constraints, indexes | Humans |
+| `schema.ids.json` | git | Identity ledger: uid to name, plus tombstones | The tool |
+| `__pbps_state` table | Each environment's database | That environment's verified state snapshot plus the audit ledger | The tool |
 
-**為什麼身份檔要進 git**：rename 意圖必須存活到「所有環境都套用完畢」為止。dev 已套用、prod 落後五版是常態，若意圖只活到第一次 apply 就被消化，prod 部署時該資訊已不存在於任何地方。進 git 讓意圖與環境進度脫鉤。
+**Why the identity file goes into git**: rename intent has to survive until every
+environment has applied it. Dev applied and prod five versions behind is the norm,
+and if intent were consumed by the first apply, the information would no longer
+exist anywhere by the time prod deployed. Putting it in git decouples intent from
+each environment's progress.
 
-**為什麼狀態要存在資料庫裡**：每個環境的資料庫記得自己的狀態，dev / staging / prod 天然獨立，不需要任何 artifact 傳遞或環境對照策略。
+**Why state lives in the database**: each environment's database remembers its own
+state, so dev, staging and prod are independent by construction, with no artifact
+passing and no environment-mapping strategy.
 
 ---
 
-## 4. 宣告檔格式
+## 4. Declaration format
 
-### 4.1 專案設定
+### 4.1 Project configuration
 
 ```yaml
 # pbps.yml
@@ -83,14 +114,15 @@ schema_dir: schema/
 ids_file: schema.ids.json
 ```
 
-### 4.2 表定義
+### 4.2 Table definitions
 
-一張表一個檔案，檔名不具語意（表名由 `table:` 決定）。
+One table per file. File names carry no meaning; the table name comes from
+`table:`.
 
 ```yaml
 # schema/dbo.customer.yml
 table: dbo.customer
-description: 客戶主檔
+description: Customer master
 
 columns:
   customer_id:
@@ -101,7 +133,7 @@ columns:
   full_name:
     type: nvarchar(100)
     nullable: false
-    description: 客戶全名
+    description: The customer's full name
 
   email:
     type: nvarchar(255)
@@ -118,7 +150,7 @@ columns:
 
   legacy_code:
     type: varchar(20)
-    deprecated: 改用 email 識別
+    deprecated: superseded by email as the identifier
 
 primary_key: [customer_id]
 
@@ -141,37 +173,57 @@ indexes:
     where: legacy_code IS NULL
 ```
 
-### 4.3 格式規則
+### 4.3 Format rules
 
-- **columns 是 map 不是 list**，key 即欄位名。少一層巢狀，且天然禁止重複命名。
-- **`nullable` 預設 `true`**，只在需要時寫。欄位名不能用 `null` —— 那是 YAML 的空值字面量，見 [ADR-0001](ADR-0001-yaml-crate.md)。
-- **`type` 使用方言原生型別字串**，工具負責正規化（`INT` / `int` / `integer` 視為同一型別）。
-- **`deprecated` 只需一句原因**，日期由 git 提供，不用手寫。
-- **註解只能寫在 `description` 欄位**。工具擁有檔案格式，`pbps fmt` 會正規化重寫，一般 YAML 註解會遺失。`description` 同時作為資料目錄整合的來源。
-- **`pbps fmt` 輸出字串純量時必須加引號**，涵蓋布林類字面量（`true`/`false`/`yes`/`no`/`on`/`off`）、空值類（`null`/`~`）與數字狀字串。否則工具寫出的檔案下次讀取時會變成別的型別。
+- **`columns` is a map, not a list**, and the key is the column name. One less
+  level of nesting, and duplicate names become impossible to express.
+- **`nullable` defaults to `true`** and is written only when needed. The field
+  cannot be called `null` — that is YAML's null literal; see
+  [ADR-0001](ADR-0001-yaml-crate.md).
+- **`type` uses the dialect's native type string**, and the tool normalizes it
+  (`INT` / `int` / `integer` are one type).
+- **`deprecated` needs only a reason**; the date comes from git and is not written
+  by hand.
+- **Comments belong in `description` fields only.** The tool owns the file format
+  and `pbps fmt` rewrites files canonically, so ordinary YAML comments are lost.
+  `description` doubles as the source for data-catalogue integration.
+- **`pbps fmt` must quote string scalars on output**, covering boolean-ish
+  literals (`true`/`false`/`yes`/`no`/`on`/`off`), null-ish ones (`null`/`~`) and
+  number-shaped strings. Otherwise a file the tool writes would come back as a
+  different type on the next read.
 
-### 4.4 欄位生命週期
+### 4.4 Column lifecycle
 
 ```
-(不存在) ──新增──► [Active] ──加 deprecated──► [Deprecated]
-                      │                            │
-                      │ 從檔案移除                  │ 從檔案移除
-                      ▼                            ▼
-                   [Dropped] ◄──────────────────────┘
-                   （墓碑記在 ids 檔，不在 YAML 中）
+(absent) ──add──► [Active] ──add deprecated──► [Deprecated]
+                     │                              │
+                     │ removed from the file        │ removed from the file
+                     ▼                              ▼
+                  [Dropped] ◄──────────────────────-┘
+                  (the tombstone lives in the ids file, not the YAML)
 ```
 
-- **Active**：正常欄位
-- **Deprecated**：仍存在於資料庫、仍在 YAML 中（因為它確實是期望狀態的一部分），但不應再有其他屬性變更（見 L009）。可選擇性寫入 extended property 供資料目錄擷取。
-- **Dropped**：從 YAML 移除即代表要刪除。工具產生 `DROP COLUMN`，需 `--allow destructive`，並在 ids 檔留下墓碑、在 `__pbps_state` ledger 留下紀錄。
+- **Active**: an ordinary column.
+- **Deprecated**: still present in the database and still in the YAML, because it
+  genuinely is part of the desired state, but it should receive no further
+  attribute changes (see L009). It may optionally be written to an extended
+  property for a data catalogue to pick up.
+- **Dropped**: removing it from the YAML means deleting it. The tool emits `DROP
+  COLUMN`, requires `--allow destructive`, leaves a tombstone in the ids file and
+  a record in the `__pbps_state` ledger.
 
-`Deprecated` 不是終態。從 Active 直接 Drop 也允許，只是同樣受 destructive 閘門管制。此設計同時解決「法遵要求實際刪除 PII」與「宣告檔累積殭屍欄位」兩個問題：**檔案裡永遠沒有殭屍，稽核軌跡在 ids 檔與 DB ledger 裡，且可查詢**。
+`Deprecated` is not a terminal state, and going straight from Active to Dropped is
+allowed — it simply faces the same destructive gate. This design resolves two
+problems at once, "compliance requires PII to actually be deleted" and "the
+declarations accumulate zombie columns": **the files never hold zombies, and the
+audit trail lives in the ids file and the database ledger, where it is
+queryable**.
 
 ---
 
-## 5. 身份檔（`schema.ids.json`）
+## 5. The identity file (`schema.ids.json`)
 
-### 5.1 格式
+### 5.1 Format
 
 ```json
 {
@@ -188,150 +240,179 @@ indexes:
     "c_v2c9ql": {
       "was": "dbo.customer.national_id",
       "dropped_at": "2026-08-30",
-      "reason": "REG-2026-042 PII 刪除要求",
+      "reason": "REG-2026-042 PII erasure request",
       "operator": "leon"
     }
   }
 }
 ```
 
-只存**無法從 YAML 推導的資訊**：身份對照與墓碑。型別、nullable、index 定義一律不存 —— 那些 YAML 裡就有。
+It stores only **what cannot be derived from the YAML**: the identity mapping and
+the tombstones. Types, nullability and index definitions are never stored — the
+YAML already has them.
 
-一個 200 欄位的專案就是 200 行 `uid: 名稱`，rename 的 diff 是：
+A 200-column project is 200 lines of `uid: name`, and a rename's diff is:
 
 ```diff
 -    "c_p3n8vd": "dbo.customer.customer_name",
 +    "c_p3n8vd": "dbo.customer.full_name",
 ```
 
-同一個 uid 底下名稱改變 —— 在 MR review 中是無歧義的 rename 訊號。
+One name changing under one uid — an unambiguous rename signal in an MR review.
 
-### 5.2 UID 規則
+### 5.2 UID rules
 
-- 格式：`c_` / `t_` 前綴 + 6 碼 base32 隨機字元
-- 全域唯一（不限表內）
-- **使用者永不需要輸入或看見**，純為工具內部身份錨點
-- 隨機而非流水號：避免兩個分支各自配發相同序號
+- Format: a `c_` / `t_` prefix plus six random base32 characters
+- Globally unique, not merely unique within a table
+- **Users never have to type one or see one**; it is purely an internal identity
+  anchor
+- Random rather than sequential, so two branches cannot hand out the same number
 
-### 5.3 跨分支衝突
+Comparison uses the identity file from **each side** and matches by uid, rather
+than "name plus this revision's intent". The latter breaks on a jump-version
+deploy: when an environment is five versions behind, that rename intent left the
+working tree long ago. With an identity file on both sides the base's ids say
+`c_x → customer_name`, the declared ids say `c_x → full_name`, and one comparison
+gives the rename directly — in one step, with no need to walk the chain of names
+version by version. This is also why `StateSnapshot` carries `ids`.
 
-兩個分支各自對同一欄位做不同操作 → 兩邊都改到 ids 檔中同一個 uid 的那一行 → **git merge conflict**，直接擋下。不需要另外設計「標記間參照完整性」的檢查規則。
+### 5.3 Cross-branch conflicts
+
+Two branches doing different things to one column both edit the same uid's line in
+the ids file, which is a **git merge conflict** and stops right there. No separate
+"referential integrity between annotations" checking rules are needed.
 
 ---
 
-## 6. 意圖表達
+## 6. Expressing intent
 
-只有兩種變更需要人給意圖：**rename** 與 **drop**（當同一張表同時有欄位消失與欄位新增時，兩者無法自動區分）。
+Only two kinds of change need human intent: **rename** and **drop** (when one
+table both loses and gains a column, the two cannot be told apart automatically).
 
-三種等價的輸入方式，全部匯流到 ids 檔：
+There are three equivalent inputs, all of which converge on the ids file.
 
-### 6.1 CLI 指令（主要介面）
+### 6.1 CLI commands (the primary interface)
 
 ```bash
 pbps rename dbo.customer.customer_name full_name
 pbps rename-table dbo.customer dbo.client
-pbps drop dbo.customer.national_id --reason "REG-2026-042 PII 刪除要求"
+pbps drop dbo.customer.national_id --reason "REG-2026-042 PII erasure request"
 ```
 
-完全非互動、可腳本化、**不需要資料庫連線**。
+Fully non-interactive, scriptable, and **needs no database connection**.
 
-### 6.2 YAML 暫時性註記
+### 6.2 Transient YAML annotations
 
 ```yaml
 columns:
   full_name:
     type: nvarchar(100)
     nullable: false
-    renamed_from: customer_name    # 暫時性：被 pbps plan 吸收後自動移除
+    renamed_from: customer_name    # transient: removed once pbps plan absorbs it
 ```
 
-`pbps plan` 讀到後將事實寫入 ids 檔，並從 YAML 移除該行。這是**只有編輯器、沒有工具**時的逃生口，不會在檔案中累積。
+`pbps plan` reads it, writes the fact into the ids file and removes the line from
+the YAML. This is the escape hatch for **an editor and nothing else**, and it does
+not accumulate in the files.
 
-### 6.3 互動式 prompt
+### 6.3 Interactive prompt
 
-偵測到 TTY 時的便利包裝，實際執行的就是 6.1 的指令。
+A convenience wrapper for when a TTY is detected; what it actually runs is the
+commands from 6.1.
 
 ```
 $ pbps plan
 
   dbo.customer
-    ? customer_name 消失了，full_name 是新的
-      > 這是改名：customer_name → full_name
-        不是，刪除 customer_name 並新增 full_name
+    ? customer_name disappeared and full_name is new
+      > this is a rename: customer_name -> full_name
+        no, drop customer_name and add full_name
 ```
 
-### 6.4 非互動下的行為
+### 6.4 Behaviour without a TTY
 
-無 TTY 時**絕不 prompt**，直接失敗並給出可複製的指令：
+With no TTY it **never prompts**; it fails and prints a copy-pastable command:
 
 ```
 $ pbps plan
-error: 1 個變更無法自動判定
+error: 1 change could not be decided automatically
 
-  dbo.customer: customer_name 消失、full_name 是新的
+  dbo.customer: customer_name disappeared, full_name is new
 
-  若為改名：pbps rename dbo.customer.customer_name full_name
-  若為刪除：pbps drop dbo.customer.customer_name --reason "<原因>"
+  if renamed:  pbps rename dbo.customer.customer_name full_name
+  if dropped:  pbps drop dbo.customer.customer_name --reason "<why>"
 ```
 
 ---
 
-## 7. 變更分類與風險閘門
+## 7. Change classification and the risk gate
 
-### 7.1 自動判定 vs 需要意圖
+### 7.1 Decided automatically vs needing intent
 
-| 情境 | 需要人的意圖 | 說明 |
+| Situation | Needs human intent | Notes |
 |---|---|---|
-| 純新增欄位 / 表 / index | 否 | 無欄位消失，必定是 add |
-| 型別放寬（INT→BIGINT） | 否 | 安全變更 |
-| 型別窄化、加 NOT NULL、加 constraint | 否 | 意圖明確，但屬危險類別 |
-| 純刪除，同表無新增 | **是**（要理由） | 操作上無歧義，但墓碑要回答稽核的「為什麼」，那是演算法生不出來的 |
-| **同表同時有消失與新增** | **是** | rename 或 drop+add，無法區分 |
+| A pure addition of a column, table or index | No | Nothing disappeared, so it must be an add |
+| Type widening (INT→BIGINT) | No | A safe change |
+| Narrowing, adding NOT NULL, adding a constraint | No | The intent is clear, but the class is dangerous |
+| A pure deletion with no additions in the same table | **Yes** (a reason) | Unambiguous as an operation, but the tombstone has to answer an audit's "why", which no algorithm can produce |
+| **A disappearance and an addition in the same table** | **Yes** | Rename or drop+add; indistinguishable |
 
-### 7.2 風險類別
+### 7.2 Risk classes
 
-| 類別 | 觸發條件 | 風險 |
+| Class | Trigger | Risk |
 |---|---|---|
-| `rename` | 欄位或表改名 | 依賴物件失效（見 7.4） |
-| `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX | 資料遺失 |
-| `narrowing` | 型別窄化或不相容轉換 | 截斷、轉換失敗 |
-| `not-null` | nullable → NOT NULL 且無 DEFAULT | 既有 NULL 違反 |
-| `constraint` | 新增 UNIQUE / FK / CHECK | 既有資料可能不滿足 |
+| `rename` | A column or table is renamed | Dependent objects break (see 7.4) |
+| `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX | Data loss |
+| `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
+| `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
+| `constraint` | Adding UNIQUE / FK / CHECK | Existing rows may not satisfy it |
 
-判斷依據是**變更類別本身是否可能失敗**，不讀取資料判斷這次是否剛好安全。資料層面的驗證屬執行期，不在宣告層職責內。
+The criterion is **whether this kind of change can fail at all**; data is not read
+to decide whether this particular run happens to be safe. Data-level validation is
+a runtime concern and outside the declarative layer's responsibility.
 
-### 7.3 Saved plan + checksum
+### 7.3 Saved plan plus checksum
 
 ```
-pbps plan  → plan.json（變更清單 + 計算基準的狀態 checksum）
-             plan.sql （人類可讀，附在 MR 供 review）
+pbps plan  -> plan.json (the change list plus a checksum of the state it was
+                         computed against)
+              plan.sql  (human-readable, attached to the MR for review)
 
 pbps apply --plan plan.json --allow rename,destructive
 ```
 
-`apply` 先驗證資料庫現況的 checksum 仍等於 plan 計算時的基準，不符即中止（drift 檢查）。
+`apply` first verifies that the database's current checksum still equals the
+baseline the plan was computed against, and aborts otherwise — the drift check.
 
-因為變更集合被 checksum 釘死，`--allow` 這種粗粒度旗標是安全的：**放行的就是 MR 裡 review 過的那一份，不多不少**。旗標寫在 CI 設定檔中，是明文且可審查的。
+Because the change set is pinned by checksum, a coarse flag like `--allow` is
+safe: **what gets approved is exactly the plan reviewed in the MR, no more and no
+less**. The flag lives in the CI configuration, in plain sight and auditable.
 
-### 7.4 Rename 影響報告
+### 7.4 Rename impact report
 
-`plan` 偵測到 rename 時，若可連線則查詢依賴並輸出報告：
+When `plan` detects a rename and a connection is available, it queries
+dependencies and prints a report:
 
-| 來源（MSSQL） | 查法 | 後果 |
+| Source (MSSQL) | How | Consequence |
 |---|---|---|
-| view / SP / function / trigger | `sys.sql_expression_dependencies` | 列出所有參照者 |
-| SCHEMABINDING view | 同上 + `is_schema_bound` | **會直接擋住 rename**，須先 DROP |
-| 計算欄位 | `sys.computed_columns` | 定義失效 |
-| DEFAULT / CHECK 定義 | `sys.check_constraints` | 定義文字含舊名 |
-| index / constraint 名稱 | `sys.indexes` | 物件無恙，但名稱可能含舊欄位名（命名漂移） |
+| views / SPs / functions / triggers | `sys.sql_expression_dependencies` | Lists every referrer |
+| SCHEMABINDING views | As above plus `is_schema_bound` | **Blocks the rename outright**; must be dropped first |
+| Computed columns | `sys.computed_columns` | The definition breaks |
+| DEFAULT / CHECK definitions | `sys.check_constraints` | The definition text holds the old name |
+| Index / constraint names | `sys.indexes` | The objects are fine, but names may embed the old column name (naming drift) |
 
-方言差異必須被抽象容納：PostgreSQL 儲存解析後的依賴，`RENAME COLUMN` 會自動更新 view；SQL Server 儲存定義文字，`sp_rename` **不會**更新。這正是 `rename_impact` 屬於 `Dialect` trait 的原因。
+Dialect differences have to be absorbed by the abstraction: PostgreSQL stores
+resolved dependencies and `RENAME COLUMN` updates views automatically, whereas SQL
+Server stores definition text and `sp_rename` **does not**. That is exactly why
+`rename_impact` belongs on the `Dialect` trait.
 
-資料庫外的影響（應用程式、報表、下游 ELT）工具看不到，輸出 checklist 附於 MR 供人簽核。
+Impact outside the database — applications, reports, downstream ELT — is invisible
+to the tool; a checklist is printed and attached to the MR for a human to sign
+off.
 
 ---
 
-## 8. 環境狀態與 drift
+## 8. Environment state and drift
 
 ### 8.1 `__pbps_state`
 
@@ -342,7 +423,8 @@ CREATE TABLE dbo.__pbps_state (
     kind          VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap
     git_sha       VARCHAR(40)    NULL,
     plan_checksum CHAR(64)       NULL,
-    state_json    NVARCHAR(MAX)  NOT NULL,   -- 整份 schema 快照 + 當下的身份對照
+    state_json    NVARCHAR(MAX)  NOT NULL,   -- the whole schema snapshot plus the
+                                             -- identity mapping as of that moment
     operator      NVARCHAR(128)  NOT NULL,
     reason        NVARCHAR(1000) NULL
 );
@@ -354,79 +436,93 @@ CREATE TABLE dbo.__pbps_lock (
 );
 ```
 
-存**整份快照**而非增量或 checksum：drift 檢查可完整比對、可作為備援、可回答「三個月前這張表長什麼樣」。搭配 `pbps state prune --keep 50` 清理。
+The **whole snapshot** is stored rather than a delta or a checksum: drift
+detection can then compare in full, the snapshot doubles as a backup, and it can
+answer "what did this table look like three months ago?". `pbps state prune --keep
+50` handles cleanup.
 
-`__pbps_lock` 防止兩條 pipeline 同時 apply。
+`__pbps_lock` stops two pipelines applying at once.
 
-### 8.2 Drift 檢查
+### 8.2 The drift check
 
-`apply` 之前：實查 `sys.columns` / `INFORMATION_SCHEMA` → 與最新一列 `state_json` 比對 → 不符即中止，要求人工校準。
+Before `apply`: query `sys.columns` / `INFORMATION_SCHEMA`, compare against the
+newest `state_json` row, and abort on any mismatch, asking for manual
+reconciliation.
 
-這攔截的是「有人手動 SSH 上去改了 schema」的情形。
+What this catches is somebody having SSHed in and changed the schema by hand.
 
-### 8.3 Drift 之後的兩條路
+### 8.3 Two ways out of drift
 
-| 路徑 | 指令 | 適用 |
+| Path | Command | When |
 |---|---|---|
-| 接受現實：把手動變更回寫進宣告檔 | `pbps pull --table X` 後人工合併 | 手動變更是對的、應保留 |
-| 回復宣告：把資料庫改回宣告狀態 | 修正後正常 `plan` / `apply` | 手動變更是誤操作 |
-| 重設基準：不追究差異，以現況為新起點 | `pbps baseline --reason ... --operator ...` | DBA 已依特批手動處理完畢 |
+| Accept reality: fold the manual change back into the declarations | `pbps pull --table X`, then merge by hand | The manual change was right and should be kept |
+| Restore the declarations: change the database back | Fix, then run `plan` / `apply` normally | The manual change was a mistake |
+| Rebaseline: do not pursue the difference, take the current state as the new starting point | `pbps baseline --reason ... --operator ...` | A DBA has already dealt with it under a specific approval |
 
-`baseline` 會實查資料庫寫入新的 `state_json`，並在 ledger 記錄 reason / operator / 時間戳。
-
----
-
-## 9. CLI 指令集
-
-### 9.1 不需資料庫連線
-
-| 指令 | 用途 |
-|---|---|
-| `pbps plan` | 解析身份歧義、更新身份檔，並比對基準產出變更計畫 |
-| `pbps plan --base <檔案>` | 改用狀態快照檔當基準（沒有 git 的環境） |
-| `pbps fmt` / `fmt --check` | 正規化宣告檔格式 |
-| `pbps plan --check` | CI 模式：僅在「意圖缺失」時失敗，不 prompt |
-| `pbps fmt` | 正規化宣告檔格式 |
-| `pbps rename` / `rename-table` / `drop` | 記錄意圖到 ids 檔 |
-| `pbps validate` | 靜態檢查（型別合法性、FK 目標存在、命名規則） |
-
-`plan` 不需要資料庫，是刻意的設計：**正式環境不可直連時，開發者仍能在本地完整作業**。
-
-基準來源的優先序：
-
-1. `--base <檔案>`：明確指定的狀態快照。**不自動讀也不自動寫** —— 它是逃生口，
-   給沒有 git 的環境（export 式簽出、air-gapped 壓縮檔），不是第二套要維護的產物。
-2. git 的某一版（`--since`，預設 `HEAD`）。基準是什麼一目了然。
-3. 空基準，並大聲警告 —— 所有東西都會被列成新建，被誤當成真實計畫很危險。
-
-**離線算出的一律是預覽。** 真正要套用到某個環境的計畫，必須以該環境資料庫的實查
-狀態為基準（Phase 3）。身份檔只存 uid → 名稱，推導不出型別變更；屬性比對一定要有
-一個帶著完整狀態的基準。
-
-### 9.2 需要資料庫連線
-
-| 指令 | 用途 |
-|---|---|
-| `pbps pull` | 從現有資料庫反向生成 YAML 宣告檔（新使用者的第一步） |
-| `pbps verify` | drift 檢查：實查 vs `__pbps_state` |
-| `pbps apply --plan plan.json --allow ...` | 套用計畫 |
-| `pbps snapshot` | 實查資料庫寫入新的 `__pbps_state` |
-| `pbps baseline --reason --operator` | 重設狀態基準 |
-| `pbps bootstrap` | 從宣告檔生成完整 CREATE 腳本（DR / 新環境） |
-| `pbps state prune --keep N` | 清理歷史快照 |
-
-`pbps pull` 是採用門檻的關鍵：任何新使用者的第一步都是「我已經有一個資料庫了」。沒有這個指令，導入成本等同手抄兩百張表。
+`baseline` queries the database, writes a new `state_json`, and records the
+reason, operator and timestamp in the ledger.
 
 ---
 
-## 10. CI/CD 流程
+## 9. The command set
+
+### 9.1 No database connection required
+
+| Command | Purpose |
+|---|---|
+| `pbps plan` | Resolve identity ambiguities, update the identity file, and compare against a baseline to produce a change plan |
+| `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
+| `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
+| `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
+| `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
+| `pbps validate` | Static checks: type validity, FK targets exist, naming rules |
+
+That `plan` needs no database is deliberate: **when production cannot be reached
+directly, a developer can still do the whole job locally**.
+
+Baseline precedence:
+
+1. `--base <file>`: an explicitly named state snapshot. It is **never read or
+   written automatically** — an escape hatch for environments without git
+   (export-style checkouts, air-gapped archives), not a second artifact to
+   maintain.
+2. A revision in git (`--since`, default `HEAD`), where what the baseline is stays
+   obvious.
+3. An empty baseline, with a loud warning — everything is listed as newly created,
+   which is dangerous if mistaken for a real plan.
+
+**Anything computed offline is a preview.** A plan that is actually going to be
+applied to an environment must be based on that environment's database as queried
+(Phase 3). The identity file stores only uid to name, from which type changes
+cannot be derived; comparing attributes always needs a baseline that carries the
+full state.
+
+### 9.2 Database connection required
+
+| Command | Purpose |
+|---|---|
+| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
+| `pbps verify` | The drift check: the live database against `__pbps_state` |
+| `pbps apply --plan plan.json --allow ...` | Apply a plan |
+| `pbps snapshot` | Query the database and write a new `__pbps_state` |
+| `pbps baseline --reason --operator` | Reset the state baseline |
+| `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
+| `pbps state prune --keep N` | Clean up historical snapshots |
+
+`pbps pull` is the key to the adoption threshold: every new user's first step is
+"I already have a database". Without it, the cost of adoption is transcribing two
+hundred tables by hand.
+
+---
+
+## 10. The CI/CD flow
 
 ```yaml
 stages: [check, plan, verify, apply, record]
 
 check:
   script:
-    - pbps plan --check          # 意圖缺失才失敗，其餘全自動
+    - pbps plan --check          # fails only on missing intent; the rest is automatic
     - pbps validate
     - pbps fmt --check
 
@@ -434,7 +530,7 @@ plan:
   script:
     - pbps plan --out plan.json --sql plan.sql
   artifacts:
-    paths: [plan.json, plan.sql]   # plan.sql 附在 MR 供 review
+    paths: [plan.json, plan.sql]   # plan.sql is attached to the MR for review
 
 verify:
   script:
@@ -453,135 +549,176 @@ record:
   only: [/^prod-v.*$/]
 ```
 
-**部署階段完全不需要人的判斷。** rename / drop 的意圖在開發者寫 MR 時就已解決並進入 git，打 tag 時 CI 只是照著執行。`when: manual` 是核可閘門，不是決策點。
+**The deployment stage requires no human judgement at all.** Rename and drop
+intent was resolved and committed to git when the developer wrote the MR; at tag
+time CI merely follows instructions. `when: manual` is an approval gate, not a
+decision point.
 
 ---
 
-## 11. 架構
+## 11. Architecture
 
-### 11.1 Crate 切分
+### 11.1 Crate layout
 
 ```
 pbps/
   crates/
-    pbps-model/     領域模型：Schema, Table, Column, ColumnType, Uid,
-                    ChangeSet, RiskClass；ids 檔與 state 的序列化
-    pbps-config/    pbps.yml 專案設定
-    pbps-load/      YAML 載入 + span 錯誤診斷；fmt 正規化輸出
-    pbps-diff/      YAML ↔ ids 比對 → ChangeSet（純資料，不產生 SQL）
-    pbps-dialect/   Dialect trait 定義 + 共用工具
-    pbps-mssql/     MSSQL：型別正規化、SQL 生成、introspection、依賴查詢
-    pbps-pg/        PostgreSQL（Phase 4）
-    pbps-db/        連線抽象、__pbps_state 讀寫、lock
-    pbps-cli/       clap、互動 prompt、診斷輸出
+    pbps-model/     Domain model: Schema, Table, Column, ColumnType, Uid,
+                    ChangeSet, RiskClass; serialization of the ids file and state
+    pbps-config/    The pbps.yml project configuration
+    pbps-load/      YAML loading plus span-carrying diagnostics; fmt rendering
+    pbps-diff/      YAML <-> ids comparison -> ChangeSet (pure data, no SQL)
+    pbps-dialect/   The Dialect trait plus shared helpers
+    pbps-mssql/     MSSQL: type normalization, SQL generation, introspection,
+                    dependency queries
+    pbps-pg/        PostgreSQL (Phase 4)
+    pbps-db/        Connection abstraction, __pbps_state access, locking
+    pbps-cli/       clap, interactive prompts, diagnostic output
 ```
 
-**分層要點**：`diff` 產出的是型別化的 `ChangeSet`，不是 SQL 字串。風險分類、閘門判斷、影響分析全部在結構化資料上進行；SQL 只在 dialect crate 的 emitter 中出現一次。
+**The key to the layering**: what `diff` produces is a typed `ChangeSet`, not SQL
+strings. Risk classification, gate decisions and impact analysis all happen on
+structured data; SQL appears exactly once, in the dialect crate's emitter.
 
-### 11.2 `Dialect` trait
+### 11.2 The `Dialect` trait
 
 ```rust
 pub trait Dialect {
     fn name(&self) -> &'static str;
 
-    /// 型別字串正規化：INT / int / integer → 同一個 ColumnType
+    /// Type string normalization: INT / int / integer -> one ColumnType
     fn parse_type(&self, s: &str) -> Result<ColumnType>;
     fn render_type(&self, t: &ColumnType) -> String;
 
-    /// 型別變更的風險判定（放寬 / 窄化 / 不相容）
+    /// How safe a type change is (widening / narrowing / incompatible)
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> Risk;
 
     fn quote_ident(&self, s: &str) -> String;
 
-    /// ChangeSet → 可執行語句
+    /// ChangeSet -> executable statements
     fn emit(&self, change: &Change) -> Result<Vec<Statement>>;
 
     fn introspect(&self, conn: &mut Conn) -> Result<Schema>;
 
-    /// rename 的依賴影響（MSSQL 需要，PG 幾乎為空）
+    /// The dependency impact of a rename (needed for MSSQL, nearly empty for PG)
     fn rename_impact(&self, conn: &mut Conn, target: &RenameTarget)
         -> Result<ImpactReport>;
 }
 ```
 
-`pbps-model` / `pbps-diff` / `pbps-load` 完全方言無關。新增一個資料庫是有明確邊界的工作。
+`pbps-model`, `pbps-diff` and `pbps-load` are entirely dialect-agnostic. Adding a
+database is work with clearly drawn boundaries.
 
-### 11.3 主要依賴
+### 11.3 Principal dependencies
 
-| 用途 | crate | 備註 |
+| Purpose | Crate | Notes |
 |---|---|---|
-| SQL Server | `tiberius` | 純 Rust，**不需安裝 ODBC driver** —— 對 air-gapped 環境是決定性的 |
+| SQL Server | `tiberius` | Pure Rust; **no ODBC driver to install** — decisive for air-gapped environments |
 | PostgreSQL | `tokio-postgres` | Phase 4 |
-| 非同步 | `tokio` + `tokio-util`（tiberius compat） | |
-| CLI | `clap`（derive） | |
-| 診斷 | `miette` | 帶 source span 的錯誤訊息；Phase 1 的產品體驗核心 |
-| 錯誤 | `thiserror`（lib）/ `anyhow`（bin） | |
-| 序列化 | `serde` + `serde_json` | ids/state 需正規化輸出：`BTreeMap`、固定排序 |
-| YAML | `serde-saphyr` | 已定案，見 [ADR-0001](ADR-0001-yaml-crate.md)。錯誤帶 `offset + len` span、自帶原始碼片段、內建重複 key 偵測。MSRV 因此為 1.89 |
-| 互動 prompt | `dialoguer` 或 `inquire` | |
-| 測試 | `insta` | snapshot 測 AST、診斷輸出、生成的 SQL |
+| Async | `tokio` plus `tokio-util` (tiberius compat) | |
+| CLI | `clap` (derive) | |
+| Diagnostics | `miette` | Errors with source spans; the heart of the Phase 1 product experience |
+| Errors | `thiserror` (libraries) / `anyhow` (binaries) | |
+| Serialization | `serde` plus `serde_json` | ids and state need canonical output: `BTreeMap`, fixed ordering |
+| YAML | `serde-saphyr` | Settled; see [ADR-0001](ADR-0001-yaml-crate.md). Errors carry an `offset + len` span and a source excerpt, and duplicate-key detection is built in. This sets the MSRV at 1.89 |
+| Interactive prompt | `dialoguer` or `inquire` | |
+| Testing | `insta` | Snapshot tests for the AST, diagnostic output and generated SQL |
 
-**明確不用**：`sqlx`（compile-time 檢查對動態 DDL 無意義）、`diesel`、任何 SQL parser（改用 YAML 後不需要）。
+**Explicitly not used**: `sqlx` (compile-time checking is meaningless for dynamic
+DDL), `diesel`, and any SQL parser (unnecessary once the format is YAML).
 
-### 11.4 散布
+### 11.4 Distribution
 
-單一靜態執行檔。Windows runner 用 `x86_64-pc-windows-msvc`；Linux runner 用 `x86_64-unknown-linux-musl` 產出全靜態檔案。`tiberius` 為純 Rust 實作，兩者都能做到「複製一個檔案就能跑」，不需要在 air-gapped 主機上安裝任何執行環境。
+A single static binary. Windows runners use `x86_64-pc-windows-msvc`; Linux
+runners use `x86_64-unknown-linux-musl` for a fully static file. Since `tiberius`
+is pure Rust, both achieve "copy one file and run it", with no runtime to install
+on an air-gapped host.
 
-### 11.5 測試策略
+### 11.5 Testing strategy
 
-這類工具容易寫出「測試全過但會掉資料」，因此四層不變式必須被機器驗證：
+A tool like this can easily end up with all tests passing while it loses data, so
+four invariants must be machine-verified:
 
-1. **格式 round-trip**：`load(fmt(schema)) == schema`
-2. **Bootstrap 一致性**：宣告檔 → `bootstrap` 建到空庫 → `introspect` → 應等於宣告狀態。保證「宣告 ≡ 資料庫實況」
-3. **Migration convergence**：資料庫在狀態 A → 套用 `plan(A→B)` → `introspect` → 應等於狀態 B。**最重要的一條**，跑在 docker 的真實 SQL Server 上
-4. **診斷 snapshot**：所有錯誤訊息以 `insta` 固定
+1. **Format round-trip**: `load(fmt(schema)) == schema`
+2. **Bootstrap consistency**: declarations -> `bootstrap` into an empty database ->
+   `introspect` -> equals the declared state. This guarantees "the declarations are
+   the database".
+3. **Migration convergence**: a database in state A -> apply `plan(A→B)` ->
+   `introspect` -> equals state B. **The most important one**, run against a real
+   SQL Server in Docker.
+4. **Diagnostic snapshots**: every error message pinned with `insta`.
 
 ---
 
-## 12. 階段規劃
+## 12. Phases
 
-| 階段 | 內容 | 交付價值 |
+| Phase | Contents | Value delivered |
 |---|---|---|
-| **Phase 0** | workspace 骨架、`pbps-model` 資料模型、YAML/ids 格式定稿、`Dialect` trait 介面、YAML crate 的 span 能力驗證 | 所有東西的地基，改起來最貴 |
-| **Phase 1** | `load` / `fmt` / `diff` / ids 檔 / 意圖三管道 / `plan` / `plan --check` / `validate` | 純檔案層、零風險。已可產出 plan.sql 供人工執行 |
-| **Phase 2** | MSSQL emitter + introspection + **`pbps pull`** | 反向生成解決導入門檻，是採用的關鍵 |
-| **Phase 3** | `__pbps_state` / lock / `verify` / `apply` / `--allow` 閘門 / rename 影響報告 / `snapshot` / `baseline` / `bootstrap` | 完整產品 |
-| **Phase 4** | PostgreSQL 方言 | 抽象正確性的試金石。Phase 0 設計時即以 PG 為假想案例檢驗 |
-| **Phase 5** | view / SP 的 repeatable 模式、extended property 與資料目錄整合、更多方言 | |
+| **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
+| **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
+| **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`** | Reverse generation removes the adoption barrier, which is the key to being used at all |
+| **Phase 3** | `__pbps_state` / locking / `verify` / `apply` / the `--allow` gate / the rename impact report / `snapshot` / `baseline` / `bootstrap` | The complete product |
+| **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
+| **Phase 5** | The repeatable model for views and SPs, extended properties and data-catalogue integration, more dialects | |
 
-Phase 0 設計 `Dialect` trait 時**必須同時考慮 PostgreSQL**（即使不實作）。若 Phase 4 逼你大改 `pbps-model`，代表 Phase 0 的抽象抓錯了。
-
----
-
-## 13. 已知的未解問題
-
-1. **`serde-saphyr` 的供應鏈風險** —— 已選定（[ADR-0001](ADR-0001-yaml-crate.md)），但它是年輕的單一維護者 crate。緩解方式是架構上已有的隔離：只有 `pbps-load` 直接依賴它。需持續觀察維護狀況。
-
-2. **大表 ALTER 的執行策略** —— ONLINE 選項、分批、離峰排程屬執行期決策，diff 推不出來。可能方向：表層級的 `strategy:` 標注，或允許 plan.sql 在 MR 階段人工編修後再 apply。
-
-3. **應用程式與資料庫的部署時序協調** —— zero-downtime 常需 schema 變更與應用版本錯開。工具本身不管這個，但 `--allow` 與 saved plan 讓「何時套用哪個版本」可控。expand → 雙寫 → backfill → contract 這類多階段流程需跨多次部署，目前無工具支援。
-
-4. **`baseline` 的權限控管** —— 誰能執行、如何與 GitLab approval 串接，待設計。
-
-5. **資料轉換（backfill）** —— 目前明確不做（見 1.3）。若日後累積出重複 pattern，再以真實案例為規格設計 hook 機制。
-
-6. **view / SP 的處理模式** —— 這類物件「定義即最新版」，性質接近 repeatable migration，與欄位的身份追蹤模型不同，需要獨立設計。
-
-7. **權限（GRANT）是否納入** —— 宣告式權限管理有價值，但與 schema 變更的風險模型不同，且各方言差異大。
+When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
+at the same time**, even though it is not implemented. If Phase 4 forces a large
+change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
 
 ---
 
-## 附錄 A：命名查證
+## 13. Known open questions
 
-`pbps` 於 2026-08 查證結果：
+1. **The supply-chain risk of `serde-saphyr`** — chosen
+   ([ADR-0001](ADR-0001-yaml-crate.md)), but it is a young single-maintainer
+   crate. The mitigation is the isolation the architecture already has: only
+   `pbps-load` depends on it directly. Its maintenance needs watching.
 
-- crates.io：**無同名 crate**（`pbm` 亦無，但 `pbs` 已被 OpenPBS FFI 佔用）
-- 無任何同名 CLI 執行檔，無 PATH 衝突
-- 唯一同名為 PBPS（Performance Based Prevention System，美國藥物濫用防治通報系統），不同領域、非 CLI，不構成實務困擾
+2. **The execution strategy for ALTER on large tables** — ONLINE options,
+   batching and off-peak scheduling are runtime decisions that a diff cannot
+   derive. Possible directions: a table-level `strategy:` annotation, or allowing
+   plan.sql to be hand-edited during the MR before being applied.
 
-被排除的候選：
+3. **Coordinating application and database deployment timing** — zero-downtime
+   usually needs schema changes and application versions staggered. The tool does
+   not manage that, but `--allow` and the saved plan make "which version is applied
+   when" controllable. Multi-stage flows such as expand → dual-write → backfill →
+   contract span several deployments and are currently unsupported.
 
-- `pbm` —— 撞 Percona Backup for MongoDB（**同為資料庫工具，最嚴重**）、Netpbm 圖像格式、Petabridge.Cmd
-- `pbs` —— crates.io 已被佔用；撞 Portable Batch System（HPC 排程器）、PYBOSSA CLI
+4. **Access control for `baseline`** — who may run it, and how it hooks into
+   GitLab approvals, is still to be designed.
 
-**建議儘早於 crates.io 發佈 `0.0.0` 佔位版鎖定名稱。**
+5. **Data transformation (backfill)** — explicitly out of scope for now (see 1.3).
+   If a repeating pattern accumulates, a hook mechanism can be designed against
+   real cases.
+
+6. **How views and SPs should be handled** — for these objects the definition *is*
+   the latest version, which is closer to repeatable migration and different from
+   the identity-tracking model used for columns. It needs its own design.
+
+7. **Whether permissions (GRANT) belong here** — declarative permission management
+   has value, but its risk model differs from schema change and the dialects vary
+   widely.
+
+---
+
+## Appendix A: name research
+
+Findings for `pbps` as of 2026-08:
+
+- crates.io: **no crate of that name** (`pbm` is also free, but `pbs` is taken by
+  an OpenPBS FFI binding)
+- No CLI binary of that name anywhere, so no PATH conflict
+- The only namesake is PBPS (Performance Based Prevention System, a US substance
+  abuse prevention reporting system) — a different field, not a CLI, and no
+  practical problem
+
+Candidates that were ruled out:
+
+- `pbm` — collides with Percona Backup for MongoDB (**also a database tool, the
+  worst kind of collision**), the Netpbm image format, and Petabridge.Cmd
+- `pbs` — already taken on crates.io; collides with Portable Batch System (the HPC
+  scheduler) and the PYBOSSA CLI
+
+**Publishing a `0.0.0` placeholder on crates.io to reserve the name is worth doing
+soon.**

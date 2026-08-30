@@ -1,7 +1,8 @@
-//! DTO → 領域模型，並抽出一次性的意圖註記。
+//! DTO to domain model, extracting the one-shot intent annotations along the way.
 //!
-//! 錯誤一律**收集完再回傳**，不在第一個錯誤就中止 —— 使用者應該一次看完所有
-//! 要修的地方，而不是修一個跑一次。
+//! Errors are always **collected and returned together**, never aborted on the
+//! first one — the user should see everything that needs fixing in one pass
+//! instead of fixing one and running again.
 
 use serde_saphyr::Spanned;
 use std::str::FromStr;
@@ -14,7 +15,7 @@ use pbps_model::{
 use crate::dto::{PrimaryKeyDto, TableDto};
 use crate::error::{LoadError, SourceFile, to_span};
 
-/// 一份宣告檔的載入結果。
+/// The result of loading one declaration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedTable {
     pub name: TableName,
@@ -22,7 +23,7 @@ pub struct LoadedTable {
     pub intents: Vec<Intent>,
 }
 
-/// 解析一個 `Spanned` 字串，失敗時把錯誤標在該值上。
+/// Parses a `Spanned` string, labelling any failure on that value.
 fn parse_at<T>(src: &SourceFile, v: &Spanned<String>, what: &str) -> Result<T, LoadError>
 where
     T: FromStr,
@@ -32,7 +33,7 @@ where
         LoadError::semantic(
             src,
             to_span(&v.defined),
-            format!("{what}：{e}"),
+            format!("{what}: {e}"),
             e.to_string(),
         )
     })
@@ -42,16 +43,18 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
     let mut errs = Vec::new();
     let mut intents = Vec::new();
 
-    let name: Option<TableName> = match parse_at(src, &dto.table, "表名無效") {
+    let name: Option<TableName> = match parse_at(src, &dto.table, "invalid table name") {
         Ok(n) => Some(n),
         Err(e) => {
-            errs.push(e.with_help("表名必須是 `schema.table` 兩段式，例如 `dbo.customer`"));
+            errs.push(e.with_help(
+                "a table name must have the two parts `schema.table`, e.g. `dbo.customer`",
+            ));
             None
         }
     };
 
     if let (Some(name), Some(from)) = (&name, &dto.renamed_from) {
-        match parse_at::<TableName>(src, from, "renamed_from 的表名無效") {
+        match parse_at::<TableName>(src, from, "invalid table name in renamed_from") {
             Ok(from) => intents.push(Intent::RenameTable {
                 from,
                 to: name.clone(),
@@ -62,7 +65,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
 
     let mut columns = indexmap::IndexMap::with_capacity(dto.columns.len());
     for (col_name, c) in dto.columns {
-        let ty = match parse_at::<ColumnType>(src, &c.ty, "型別無效") {
+        let ty = match parse_at::<ColumnType>(src, &c.ty, "invalid type") {
             Ok(t) => t,
             Err(e) => {
                 errs.push(e);
@@ -179,7 +182,8 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
     }
 }
 
-/// `dbo.region(region_id)` / `dbo.region(a, b)` → 表名與欄位清單。
+/// `dbo.region(region_id)` / `dbo.region(a, b)` into a table name and a column
+/// list.
 fn parse_reference(
     src: &SourceFile,
     v: &Spanned<String>,
@@ -188,17 +192,17 @@ fn parse_reference(
         LoadError::semantic(
             src,
             to_span(&v.defined),
-            format!("外鍵目標無效：{msg}"),
+            format!("invalid foreign key target: {msg}"),
             msg,
         )
-        .with_help("格式為 `schema.table(column)`，多欄位用逗號分隔")
+        .with_help("the format is `schema.table(column)`; separate multiple columns with commas")
     };
 
     let s = v.value.trim();
-    let open = s.find('(').ok_or_else(|| bad("缺少 `(`"))?;
-    let close = s.rfind(')').ok_or_else(|| bad("缺少 `)`"))?;
+    let open = s.find('(').ok_or_else(|| bad("missing `(`"))?;
+    let close = s.rfind(')').ok_or_else(|| bad("missing `)`"))?;
     if close < open || !s[close + 1..].trim().is_empty() {
-        return Err(bad("括號位置不正確"));
+        return Err(bad("the parentheses are misplaced"));
     }
 
     let table = TableName::from_str(s[..open].trim()).map_err(|e| bad(&e.to_string()))?;
@@ -207,24 +211,24 @@ fn parse_reference(
     for raw in s[open + 1..close].split(',') {
         let c = raw.trim();
         if c.is_empty() {
-            return Err(bad("欄位清單中有空項目"));
+            return Err(bad("the column list has an empty entry"));
         }
         columns.push(c.to_owned());
     }
     Ok((table, columns))
 }
 
-/// `created_at` 或 `created_at desc`
+/// `created_at` or `created_at desc`.
 fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColumn, LoadError> {
     let parts: Vec<&str> = v.value.split_whitespace().collect();
     let bad = |msg: &str| {
         LoadError::semantic(
             src,
             to_span(&v.defined),
-            format!("索引欄位無效：{msg}"),
+            format!("invalid index column: {msg}"),
             msg,
         )
-        .with_help("格式為 `欄位名` 或 `欄位名 desc`")
+        .with_help("the format is `column` or `column desc`")
     };
 
     match parts.as_slice() {
@@ -238,7 +242,7 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
                 descending: dir.eq_ignore_ascii_case("desc"),
             })
         }
-        [_, dir] => Err(bad(&format!("`{dir}` 不是 asc 或 desc"))),
-        _ => Err(bad("項目數不正確")),
+        [_, dir] => Err(bad(&format!("`{dir}` is not asc or desc"))),
+        _ => Err(bad("wrong number of parts")),
     }
 }

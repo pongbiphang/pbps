@@ -1,6 +1,6 @@
 [package]
 name = "pbps-load"
-description = "PongBiphang Schema — YAML 載入、診斷與正規化輸出"
+description = "PongBiphang Schema - YAML loading, diagnostics and canonical rendering"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

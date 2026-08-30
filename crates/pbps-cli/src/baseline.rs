@@ -1,18 +1,23 @@
-//! 「目前狀態」從哪裡來。
+//! Where "the current state" comes from.
 //!
-//! 屬性變更（型別、nullable…）需要一個基準才算得出來，而身份檔刻意只存
-//! uid → 名稱，推導不出屬性。基準有三個來源，優先序如下：
+//! Attribute changes (type, nullability, …) can only be computed against a
+//! baseline, and the identity file deliberately stores only uid-to-name, from
+//! which attributes cannot be derived. There are three sources, in this order of
+//! precedence:
 //!
-//! 1. `--base <檔案>`：明確指定的狀態快照。**不自動讀也不自動寫** ——
-//!    它是逃生口，給沒有 git 的環境（export 式簽出、air-gapped 壓縮檔），
-//!    而不是第二套要維護的產物。
-//! 2. git 中的某一版（預設 `HEAD`）。基準是什麼一目了然，
-//!    `--since v1.2.0` 就是「從那個版本以來」。
-//! 3. 空基準。所有東西都會被列成新建 —— 這在第一次執行時是對的，
-//!    但被誤當成真實計畫會很危險，因此一定要大聲說出來。
+//! 1. `--base <file>`: an explicitly named state snapshot. It is **never read or
+//!    written automatically** — it is an escape hatch for environments without
+//!    git (export-style checkouts, air-gapped archives), not a second artifact to
+//!    maintain.
+//! 2. A revision in git (`HEAD` by default). What the baseline is stays obvious,
+//!    and `--since v1.2.0` reads as "since that release".
+//! 3. An empty baseline. Everything is listed as newly created, which is correct
+//!    on a first run but dangerous if mistaken for a real plan, so it is always
+//!    said out loud.
 //!
-//! 無論哪一種，離線算出的都是**預覽**。真正要套用到某個環境的計畫，必須以
-//! 該環境資料庫的實查狀態為基準（Phase 3）。
+//! Whichever it is, anything computed offline is a **preview**. A plan that is
+//! actually going to be applied to an environment must be based on that
+//! environment's database as queried (Phase 3).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,29 +32,33 @@ pub enum Source {
     Empty,
 }
 
-/// 基準狀態，連同一句給人看的來源說明。
+/// A baseline state, together with a human-readable note about where it came
+/// from.
 ///
-/// 身份對照與狀態必須成對 —— 少了 ids 就無法用 uid 配對，改名會退化成
-/// 刪除加新增。
+/// Identity and state have to travel together: without the ids, uid matching is
+/// impossible and a rename degrades into a drop plus an add.
 pub struct Baseline {
     pub schema: Schema,
     pub ids: IdsFile,
     pub description: String,
-    /// 空基準要提醒使用者，否則「全部都是新建」會被誤讀成真實計畫。
+    /// An empty baseline has to be flagged, or "everything is new" reads as a
+    /// real plan.
     pub is_empty_fallback: bool,
 }
 
 pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
     match source {
         Source::File(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("無法讀取基準檔 `{}`：{e}", path.display()))?;
-            let snap: StateSnapshot = serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("基準檔 `{}` 格式錯誤：{e}", path.display()))?;
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("cannot read baseline file `{}`: {e}", path.display())
+            })?;
+            let snap: StateSnapshot = serde_json::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("baseline file `{}` is malformed: {e}", path.display())
+            })?;
             Ok(Baseline {
                 schema: snap.schema,
                 ids: snap.ids,
-                description: format!("基準檔 {}", path.display()),
+                description: format!("baseline file {}", path.display()),
                 is_empty_fallback: false,
             })
         }
@@ -57,13 +66,14 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
-            description: "空基準".into(),
+            description: "empty baseline".into(),
             is_empty_fallback: true,
         }),
     }
 }
 
-/// 決定預設來源：在 git repo 內就用 `HEAD`，否則退回空基準。
+/// Picks the default source: `HEAD` inside a git repo, an empty baseline
+/// otherwise.
 pub fn default_source(project: &Project) -> Source {
     if in_git_repo(&project.root) {
         Source::Git {
@@ -80,12 +90,16 @@ fn in_git_repo(dir: &Path) -> bool {
 
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
-    let toplevel = git(root, &["rev-parse", "--show-toplevel"])
-        .map_err(|e| anyhow::anyhow!("這裡不是 git 工作區，請改用 --base 指定基準檔：{e}"))?;
+    let toplevel = git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+        anyhow::anyhow!(
+            "this is not a git working tree; name a baseline file with --base instead: {e}"
+        )
+    })?;
     let toplevel = PathBuf::from(toplevel.trim());
 
-    // 全新的 repo 還沒有任何 commit，HEAD 解析不了。這不是錯誤，
-    // 只是「還沒有前一版」—— 退回空基準並說清楚。
+    // A brand-new repo has no commits, so HEAD does not resolve. That is not an
+    // error, it just means there is no previous version yet: fall back to an empty
+    // baseline and say so.
     if git(
         root,
         &[
@@ -100,16 +114,19 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         return Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
-            description: format!("空基準（`{rev}` 尚不存在，這個 repo 還沒有 commit）"),
+            description: format!(
+                "empty baseline (`{rev}` does not exist yet; this repo has no commits)"
+            ),
             is_empty_fallback: true,
         });
     }
 
-    // git 的路徑以 repo 根目錄為基準，宣告檔目錄則相對於專案根目錄。
+    // git paths are relative to the repo root, whereas the declarations directory
+    // is relative to the project root.
     let rel = relative_to(&toplevel, &project.schema_dir());
 
     let listing = git(root, &["ls-tree", "-r", "--name-only", rev, "--", &rel])
-        .map_err(|e| anyhow::anyhow!("無法讀取 `{rev}` 的 `{rel}`：{e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
 
     let mut schema = Schema::default();
     let mut count = 0usize;
@@ -124,33 +141,36 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
                 count += 1;
             }
             Err(errs) => {
-                // 基準是歷史版本，它壞掉不該讓現在的工作停擺，但要說出來。
+                // The baseline is a historical version. Its being broken should not
+                // halt current work, but it does have to be reported.
                 anyhow::bail!(
-                    "`{rev}` 中的 `{path}` 無法解析（基準版本本身有問題）：{}",
+                    "`{path}` at `{rev}` does not parse (the baseline version itself is broken): {}",
                     errs.first().map(ToString::to_string).unwrap_or_default()
                 );
             }
         }
     }
 
-    // 身份檔要取同一版的 —— 用現行的身份檔當基準會讓改名看不出來。
+    // The identity file must come from the same revision: using the current one as
+    // the baseline would hide renames.
     let ids_rel = relative_to(&toplevel, &project.ids_file());
     let ids = match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("`{rev}` 中的身份檔格式錯誤：{e}"))?,
-        // 第一次執行時該版本還沒有身份檔，空的即可。
+            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}"))?,
+        // On a first run that revision has no identity file yet; empty is correct.
         Err(_) => IdsFile::default(),
     };
 
     Ok(Baseline {
         schema,
         ids,
-        description: format!("git {rev}（{count} 張表）"),
+        description: format!("git {rev} ({count} tables)"),
         is_empty_fallback: count == 0,
     })
 }
 
-/// 把路徑轉成相對於 repo 根目錄的形式 —— git 的路徑參數以根目錄為基準。
+/// Rewrites a path relative to the repo root, which is what git's path arguments
+/// are resolved against.
 fn relative_to(toplevel: &Path, path: &Path) -> String {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     abs.strip_prefix(toplevel)
@@ -165,7 +185,7 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .arg(dir)
         .args(args)
         .output()
-        .map_err(|e| anyhow::anyhow!("無法執行 git：{e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot run git: {e}"))?;
     if !out.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }

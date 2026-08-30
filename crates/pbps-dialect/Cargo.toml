@@ -1,6 +1,6 @@
 [package]
 name = "pbps-dialect"
-description = "PongBiphang Schema — 方言抽象"
+description = "PongBiphang Schema - dialect abstraction"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

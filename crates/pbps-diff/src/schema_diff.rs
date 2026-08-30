@@ -1,19 +1,25 @@
-//! 變更計畫：比對兩個「狀態 + 身份」組合，產出變更集。
+//! Change planning: comparing two "state + identity" pairs to produce a change
+//! set.
 //!
-//! # 為什麼兩邊都要帶身份檔
+//! # Why both sides carry an identity file
 //!
-//! 配對「哪個欄位是哪個欄位」不能靠名稱 —— 改名會讓名稱在兩邊對不上。也不能
-//! 靠本次的意圖註記，因為部署可能落後很多版：prod 停在 v1、宣告已經到 v5 時，
-//! 當初那則改名意圖早就不在工作區裡了。
+//! Matching up "which column is which" cannot rely on names — a rename makes the
+//! names disagree across the two sides. Nor can it rely on this revision's intent
+//! annotations, because a deployment may be many versions behind: when prod sits
+//! at v1 and the declarations have reached v5, that rename intent left the
+//! working tree long ago.
 //!
-//! 因此兩邊各自帶著自己的身份檔，用 **uid** 配對：基準的 ids 說
-//! `c_x → customer_name`、宣告的 ids 說 `c_x → full_name`，一比就是改名，
-//! 一步到位，不需要沿著名稱鏈逐版回推（SPEC §4.2 要解決的正是這件事）。
+//! So each side brings its own identity file and matching happens by **uid**: the
+//! base's ids say `c_x → customer_name`, the declared ids say `c_x → full_name`,
+//! and one comparison gives the rename directly, with no need to walk a chain of
+//! names version by version. (This is exactly the problem SPEC §4.2 sets out to
+//! solve.)
 //!
-//! # 基準是誰
+//! # Where the base comes from
 //!
-//! `base` 可能來自版控中的前一版（離線預覽），也可能來自資料庫實查
-//! （Phase 3 的權威計畫）。這一層不在意來源，只做純粹的比對。
+//! `base` may come from the previous version in source control (an offline
+//! preview) or from querying the database itself (Phase 3's authoritative plan).
+//! This layer does not care which; it does the comparison and nothing else.
 
 use std::collections::BTreeMap;
 
@@ -24,23 +30,26 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
-    /// IDENTITY 在多數資料庫中無法用 ALTER 修改，必須重建整張表。
-    /// 這超出宣告式自動化的範圍，得由人決定遷移策略。
-    #[error("{column} 的 IDENTITY 屬性改變了，但 IDENTITY 無法用 ALTER 修改")]
+    /// In most databases IDENTITY cannot be changed with ALTER; the whole table
+    /// has to be rebuilt. That is beyond what declarative automation should do on
+    /// its own — a human has to choose the migration strategy.
+    #[error(
+        "the IDENTITY property of {column} changed, but IDENTITY cannot be modified with ALTER"
+    )]
     IdentityChangeUnsupported { column: ColumnRef },
 }
 
-/// 一側的完整輸入：狀態加上它自己的身份對照。
+/// One side's complete input: a state plus its own identity mapping.
 #[derive(Debug, Clone, Copy)]
 pub struct Side<'a> {
     pub schema: &'a Schema,
     pub ids: &'a IdsFile,
 }
 
-/// 比對基準與宣告，產出變更集。
+/// Compares the base against the declarations and produces a change set.
 ///
-/// 目前**不比對 `description`**：它只影響資料目錄的說明文字，不影響結構，
-/// 寫入 extended property 屬於 Phase 5。
+/// `description` is **not compared** yet: it only affects data-catalogue prose,
+/// not structure, and writing it to an extended property belongs to Phase 5.
 pub fn diff(
     base: Side<'_>,
     declared: Side<'_>,
@@ -52,7 +61,7 @@ pub fn diff(
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
 
-    // 表只在基準 → 刪除
+    // Table present only in the base: dropped.
     for (uid, name) in base_tables {
         if !declared_tables.contains_key(uid) {
             changes.push(Change::DropTable {
@@ -62,7 +71,7 @@ pub fn diff(
         }
     }
 
-    // 表只在宣告 → 新建
+    // Table present only in the declarations: created.
     for (uid, name) in declared_tables {
         if !base_tables.contains_key(uid)
             && let Some(t) = declared.schema.tables.get(name)
@@ -75,7 +84,8 @@ pub fn diff(
         }
     }
 
-    // 表兩邊都在 → 可能改名，並且要比內容
+    // Table present on both sides: possibly renamed, and its contents must be
+    // compared.
     for (uid, declared_name) in declared_tables {
         let Some(base_name) = base_tables.get(uid) else {
             continue;
@@ -124,7 +134,7 @@ pub fn diff(
     Ok(ChangeSet { changes: planned })
 }
 
-/// 屬於某張仍存在的表、且兩邊都有的欄位：比屬性。
+/// Columns of a surviving table that exist on both sides: compare attributes.
 #[allow(clippy::too_many_arguments)]
 fn diff_columns(
     base: Side<'_>,
@@ -142,7 +152,7 @@ fn diff_columns(
 
     for (uid, declared_ref) in &declared_cols {
         let Some(base_ref) = base_cols.get(uid) else {
-            // 只在宣告側 → 新增欄位
+            // Present only on the declared side: a new column.
             if let Some(c) = declared_table.columns.get(&declared_ref.name) {
                 changes.push(Change::AddColumn {
                     uid: uid.clone(),
@@ -210,7 +220,7 @@ fn diff_columns(
         }
     }
 
-    // 只在基準側 → 刪除欄位
+    // Present only on the base side: a dropped column.
     for (uid, base_ref) in &base_cols {
         if !declared_cols.contains_key(uid) {
             changes.push(Change::DropColumn {
@@ -229,8 +239,9 @@ fn columns_of(ids: &IdsFile, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
         .collect()
 }
 
-/// 約束與索引一律以名稱比對，且不做原地修改 —— 資料庫本身也是 drop + add，
-/// 假裝可以原地改只會讓 emitter 多一條會出錯的路徑。
+/// Constraints and indexes are always matched by name and never modified in
+/// place — the database itself does drop + add, and pretending otherwise would
+/// only give the emitter one more path that can fail.
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
     if base.primary_key != declared.primary_key {
         changes.push(Change::SetPrimaryKey {
@@ -301,10 +312,11 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     }
 }
 
-/// 套用順序。
+/// The order of application.
 ///
-/// 改名排最前面，讓後續步驟都能用現行名稱；約束與索引的移除要早於欄位移除
-/// （它們可能參照到那些欄位），新增則要晚於欄位新增。
+/// Renames come first, so every later step can use current names. Dropping
+/// constraints and indexes must precede dropping columns, since they may
+/// reference those columns; adding them must follow adding columns.
 fn order_key(c: &Change) -> u8 {
     match c {
         Change::RenameTable { .. } | Change::RenameColumn { .. } => 0,
@@ -364,7 +376,8 @@ mod tests {
         s
     }
 
-    /// 重現真實流程：基準側的身份檔來自那一版，宣告側的身份檔是解析後的結果。
+    /// Reproduces the real flow: the base side's identity file is the one from
+    /// that version, and the declared side's is the resolved result.
     fn run(base: &Schema, declared: &Schema, intents: &[Intent]) -> ChangeSet {
         let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()
@@ -414,7 +427,7 @@ mod tests {
         let cs = run(&base, &want, &[]);
 
         assert_eq!(cs.changes.len(), 1);
-        assert!(cs.risks().is_empty(), "放寬長度不需要放行");
+        assert!(cs.risks().is_empty(), "widening a length needs no approval");
     }
 
     #[test]
@@ -430,7 +443,8 @@ mod tests {
         );
     }
 
-    /// 大小寫不同不是變更，否則每次重新輸入型別都會產生假的 diff。
+    /// A case difference is not a change, or retyping a type would produce a
+    /// phantom diff every time.
     #[test]
     fn type_case_difference_is_not_a_change() {
         let base = schema_of("dbo.t", table(&[("a", Column::new(ty("NVARCHAR(100)")))]));
@@ -463,7 +477,7 @@ mod tests {
         let want = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
         let intents = vec![Intent::DropColumn {
             column: "dbo.t.b".parse().unwrap(),
-            reason: "不再使用".into(),
+            reason: "no longer in use".into(),
         }];
         let cs = run(&base, &want, &intents);
 
@@ -471,7 +485,8 @@ mod tests {
         assert!(cs.risks().contains(&RiskClass::Destructive));
     }
 
-    /// 改名只能產生一個 RenameColumn，不能同時冒出新增與刪除。
+    /// A rename must produce exactly one RenameColumn, never an add and a drop
+    /// alongside it.
     #[test]
     fn renaming_produces_exactly_one_change() {
         let base = schema_of("dbo.t", table(&[("old", Column::new(ty("int")))]));
@@ -487,7 +502,8 @@ mod tests {
         assert!(cs.risks().contains(&RiskClass::Rename));
     }
 
-    /// 改名同時改型別：身份對應正確的話，型別比對要拿舊欄位來比。
+    /// A rename plus a type change: with identity mapped correctly, the type
+    /// comparison must be against the old column.
     #[test]
     fn rename_and_retype_are_both_detected() {
         let base = schema_of("dbo.t", table(&[("old", Column::new(ty("nvarchar(100)")))]));
@@ -503,7 +519,8 @@ mod tests {
         assert!(cs.risks().contains(&RiskClass::Narrowing));
     }
 
-    /// 新表的欄位由 CreateTable 帶著，不該再逐欄產生 AddColumn。
+    /// A new table's columns ride along in CreateTable; no per-column AddColumn
+    /// should be emitted as well.
     #[test]
     fn new_table_does_not_also_emit_add_column() {
         let base = Schema::default();
@@ -538,7 +555,8 @@ mod tests {
         assert_eq!(kinds(&cs), ["DropIndex", "AddIndex"]);
     }
 
-    /// 順序要能安全執行：改名最先，移除約束早於移除欄位，新增約束最後。
+    /// The order has to be safely executable: renames first, dropping constraints
+    /// before dropping columns, adding constraints last.
     #[test]
     fn changes_are_ordered_for_execution() {
         let mut base_t = table(&[
@@ -567,7 +585,7 @@ mod tests {
             },
             Intent::DropColumn {
                 column: "dbo.t.doomed".parse().unwrap(),
-                reason: "不再使用".into(),
+                reason: "no longer in use".into(),
             },
         ];
         let cs = run(
@@ -579,16 +597,17 @@ mod tests {
         assert_eq!(
             kinds(&cs),
             ["RenameColumn", "DropIndex", "DropColumn"],
-            "索引必須在它參照的欄位之前被移除"
+            "an index must be dropped before the column it references"
         );
     }
 
-    /// description 只影響文件，不影響結構，Phase 1 刻意不產生變更。
+    /// description affects documentation, not structure, so Phase 1 deliberately
+    /// produces no change for it.
     #[test]
     fn description_change_is_not_a_structural_change() {
         let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
         let mut c = Column::new(ty("int"));
-        c.description = Some("客戶編號".into());
+        c.description = Some("Customer identifier".into());
         let want = schema_of("dbo.t", table(&[("a", c)]));
         assert!(run(&base, &want, &[]).is_empty());
     }
@@ -597,7 +616,7 @@ mod tests {
     fn deprecating_a_column_is_a_change_but_not_a_risk() {
         let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
         let mut c = Column::new(ty("int"));
-        c.deprecated = Some("改用 email".into());
+        c.deprecated = Some("superseded by email".into());
         let want = schema_of("dbo.t", table(&[("a", c)]));
         let cs = run(&base, &want, &[]);
 
@@ -605,7 +624,8 @@ mod tests {
         assert!(cs.risks().is_empty());
     }
 
-    /// IDENTITY 無法用 ALTER 修改，必須明確擋下而不是產生無效的 SQL。
+    /// IDENTITY cannot be modified with ALTER, so it must be blocked explicitly
+    /// rather than emitting invalid SQL.
     #[test]
     fn identity_change_is_rejected() {
         let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
@@ -638,11 +658,12 @@ mod tests {
         ));
     }
 
-    /// 跳版部署：這是整個 uid 配對設計的理由。
+    /// A jump-version deploy: the entire reason uid matching exists.
     ///
-    /// prod 停在 v1，宣告已經演進到 v3，中間發生過改名。當初那則意圖早就不在
-    /// 工作區裡了 —— 但兩邊的身份檔都記著同一個 uid，所以改名依然判得出來，
-    /// 而且是一步到位，不需要沿著 v1→v2→v3 的名稱鏈回推。
+    /// Prod sits at v1 while the declarations have moved on to v3, with a rename
+    /// somewhere in between. That intent left the working tree long ago — but both
+    /// identity files still record the same uid, so the rename is still detected,
+    /// in one step, with no need to walk the v1→v2→v3 chain of names.
     #[test]
     fn a_rename_is_detected_across_many_versions() {
         let v1 = schema_of(
@@ -653,7 +674,7 @@ mod tests {
             .unwrap()
             .ids;
 
-        // v2：改名。意圖只在這一版存在。
+        // v2: the rename. The intent exists only in this version.
         let v2 = schema_of(
             "dbo.t",
             table(&[("full_name", Column::new(ty("nvarchar(50)")))]),
@@ -671,14 +692,14 @@ mod tests {
         .unwrap()
         .ids;
 
-        // v3：只是加長欄位。沒有任何意圖。
+        // v3: just a longer column. No intent at all.
         let v3 = schema_of(
             "dbo.t",
             table(&[("full_name", Column::new(ty("nvarchar(200)")))]),
         );
         let v3_ids = crate::resolve(&v3, &v2_ids, &[], &ctx()).unwrap().ids;
 
-        // 對停在 v1 的環境套用 v3：不提供任何意圖。
+        // Apply v3 to an environment stuck at v1, supplying no intent.
         let cs = diff(
             Side {
                 schema: &v1,
@@ -695,15 +716,16 @@ mod tests {
         assert_eq!(
             kinds(&cs),
             ["RenameColumn", "AlterColumnType"],
-            "跳版時改名仍須被判定為改名，而不是刪除加新增"
+            "across versions a rename must still read as a rename, not a drop plus an add"
         );
         assert!(
             !cs.risks().contains(&RiskClass::Destructive),
-            "絕不能變成掉資料的計畫"
+            "this must never turn into a data-losing plan"
         );
     }
 
-    /// 同樣的輸入必須產生同樣順序的計畫，否則 plan 的 checksum 會不穩定。
+    /// Identical input must produce a plan in the same order, or the plan's
+    /// checksum would be unstable.
     #[test]
     fn output_is_deterministic() {
         let base = schema_of(
@@ -721,7 +743,11 @@ mod tests {
         let first = run(&base, &want, &[]);
         for _ in 0..10 {
             let again = run(&base, &want, &[]);
-            assert_eq!(kinds(&first), kinds(&again), "同樣輸入應產生同樣順序的計畫");
+            assert_eq!(
+                kinds(&first),
+                kinds(&again),
+                "identical input should produce the plan in the same order"
+            );
         }
         let _ = Uid::generate(pbps_model::UidKind::Column);
     }

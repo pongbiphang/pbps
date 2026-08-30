@@ -1,8 +1,10 @@
-//! 宣告檔的載入、診斷與正規化輸出。
+//! Loading, diagnosing and canonically rendering the declaration files.
 //!
-//! 這是唯一直接依賴 YAML 函式庫的產品 crate（`pbps-config` 因為要讀 `pbps.yml`
-//! 也依賴它）。其餘 crate 一律透過這裡，讓日後替換 YAML 實作是有界的工作 ——
-//! 見 [`docs/ADR-0001`](../../../docs/ADR-0001-yaml-crate.md)。
+//! This is the only product crate that depends on a YAML library directly
+//! (`pbps-config` also does, because it has to read `pbps.yml`). Every other
+//! crate goes through here, which keeps replacing the YAML implementation a
+//! bounded piece of work — see
+//! [`docs/ADR-0001`](../../../docs/ADR-0001-yaml-crate.md).
 
 pub mod convert;
 pub mod dto;
@@ -18,14 +20,14 @@ pub use error::{LoadError, Semantic, SourceFile};
 pub use fmt::render;
 pub use pbps_model::Intent;
 
-/// 整個 `schema/` 目錄的載入結果。
+/// The result of loading an entire `schema/` directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loaded {
     pub schema: Schema,
     pub intents: Vec<Intent>,
 }
 
-/// 從字串載入一張表。`path` 只用於診斷訊息。
+/// Loads one table from a string. `path` is used only in diagnostics.
 pub fn load_table_str(path: &Path, text: &str) -> Result<LoadedTable, Vec<LoadError>> {
     let src = SourceFile::new(path, text);
     let dto: dto::TableDto = serde_saphyr::from_str(text).map_err(|e| {
@@ -47,10 +49,11 @@ pub fn load_table_file(path: &Path) -> Result<LoadedTable, Vec<LoadError>> {
     load_table_str(path, &text)
 }
 
-/// 載入整個目錄。
+/// Loads a whole directory.
 ///
-/// 檔名不具語意 —— 表名由檔案內的 `table:` 決定。這讓使用者可以自由地按主題
-/// 分子目錄，而不必讓檔名與表名綁死。
+/// File names carry no meaning — the table name comes from the `table:` key
+/// inside the file. That lets users split things into subdirectories by topic
+/// without tying file names to table names.
 pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files).map_err(|source| {
@@ -59,7 +62,8 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
             source,
         }]
     })?;
-    // 目錄列舉順序依平台而異，排序後才能得到穩定的診斷順序。
+    // Directory enumeration order is platform-dependent; sorting is what makes
+    // the order of diagnostics stable.
     files.sort();
 
     let mut loaded = Loaded::default();
@@ -73,7 +77,11 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                 if let Some(first) = seen.get(&t.name) {
                     errs.push(LoadError::Yaml {
                         path: path.clone(),
-                        message: format!("表 `{}` 已經在 `{}` 中宣告過了", t.name, first.display()),
+                        message: format!(
+                            "table `{}` was already declared in `{}`",
+                            t.name,
+                            first.display()
+                        ),
                     });
                     continue;
                 }
@@ -92,9 +100,10 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     }
 }
 
-/// 列出目錄下所有宣告檔，順序穩定。
+/// Lists every declaration file under a directory, in a stable order.
 ///
-/// `fmt` 需要逐檔處理，不能用 [`load_schema_dir`] 合併後的結果。
+/// `fmt` has to work file by file and cannot use [`load_schema_dir`]'s merged
+/// result.
 pub fn schema_files(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files)?;
@@ -129,12 +138,12 @@ mod tests {
     fn load(text: &str) -> LoadedTable {
         match load_table_str(p(), text) {
             Ok(t) => t,
-            Err(e) => panic!("預期載入成功，卻得到：{}", render(&e)),
+            Err(e) => panic!("expected the load to succeed, got: {}", render(&e)),
         }
     }
 
     fn errors(text: &str) -> Vec<LoadError> {
-        load_table_str(p(), text).expect_err("預期載入失敗")
+        load_table_str(p(), text).expect_err("expected the load to fail")
     }
 
     fn render(errs: &[LoadError]) -> String {
@@ -146,7 +155,7 @@ mod tests {
 
     const FULL: &str = r#"
 table: dbo.customer
-description: 客戶主檔
+description: Customer master
 columns:
   customer_id:
     type: bigint
@@ -155,7 +164,7 @@ columns:
   full_name:
     type: NVARCHAR(100)
     nullable: false
-    description: 客戶全名
+    description: The customer's full name
   email:
     type: nvarchar(255)
   region_id:
@@ -166,7 +175,7 @@ columns:
     default: "0"
   legacy_code:
     type: varchar(20)
-    deprecated: 改用 email 識別
+    deprecated: superseded by email as the identifier
 primary_key: [customer_id]
 unique:
   uq_customer_email: [email]
@@ -189,11 +198,12 @@ indexes:
     fn full_document_loads() {
         let t = load(FULL);
         assert_eq!(t.name.to_string(), "dbo.customer");
-        assert_eq!(t.table.description.as_deref(), Some("客戶主檔"));
+        assert_eq!(t.table.description.as_deref(), Some("Customer master"));
         assert_eq!(t.table.columns.len(), 6);
     }
 
-    /// 欄位順序決定 CREATE TABLE 的排列，必須照文件順序而非字典序。
+    /// Column order decides the CREATE TABLE layout, so it must follow the
+    /// document rather than alphabetical order.
     #[test]
     fn column_order_follows_the_document() {
         let t = load(FULL);
@@ -217,7 +227,8 @@ indexes:
         assert!(!t.table.columns["customer_id"].nullable);
     }
 
-    /// 型別在載入時就正規化大小寫，否則 diff 會產生假的變更。
+    /// Type case is normalized at load time, or diff would invent changes that
+    /// are not there.
     #[test]
     fn types_are_normalised_on_load() {
         let t = load(FULL);
@@ -234,7 +245,7 @@ indexes:
         assert_eq!((id.seed, id.increment), (1, 1));
         assert_eq!(
             t.table.columns["legacy_code"].deprecated.as_deref(),
-            Some("改用 email 識別")
+            Some("superseded by email as the identifier")
         );
     }
 
@@ -258,10 +269,14 @@ indexes:
         assert_eq!(ix.filter.as_deref(), Some("legacy_code IS NULL"));
         assert_eq!(ix.columns[0].name, "full_name");
         assert!(!ix.columns[0].descending);
-        assert!(ix.columns[1].descending, "`customer_id desc` 應為降冪");
+        assert!(
+            ix.columns[1].descending,
+            "`customer_id desc` should be descending"
+        );
     }
 
-    /// 具名主鍵要支援，否則 pull 反向生成時會丟失既有約束名。
+    /// Named primary keys have to be supported, or reverse generation via pull
+    /// would lose the existing constraint name.
     #[test]
     fn primary_key_accepts_both_shapes() {
         let unnamed = load("table: dbo.t\ncolumns:\n  a: {type: int}\nprimary_key: [a]\n");
@@ -276,9 +291,10 @@ indexes:
         );
     }
 
-    // ---- 意圖抽取 ----
+    // ---- intent extraction ----
 
-    /// renamed_from 是一次性註記，不能進模型 —— 否則同一個狀態會因註記有無而不相等。
+    /// renamed_from is a one-shot annotation and must not enter the model, or the
+    /// same state would compare unequal depending on whether it is present.
     #[test]
     fn rename_intent_is_extracted_not_stored() {
         let t = load(
@@ -293,7 +309,8 @@ indexes:
             }]
         );
 
-        // 同一份宣告，有無註記都必須產生相同的 Table
+        // The same declaration must produce the same Table with or without the
+        // annotation.
         let without =
             load("table: dbo.customer\ncolumns:\n  full_name:\n    type: nvarchar(100)\n");
         assert_eq!(t.table, without.table);
@@ -312,18 +329,18 @@ indexes:
         );
     }
 
-    // ---- 反向案例 ----
+    // ---- negative cases ----
 
     #[test]
     fn unqualified_table_name_is_rejected() {
         let e = errors("table: customer\ncolumns:\n  a: {type: int}\n");
-        assert!(render(&e).contains("表名無效"), "{}", render(&e));
+        assert!(render(&e).contains("invalid table name"), "{}", render(&e));
     }
 
     #[test]
     fn invalid_type_is_rejected() {
         let e = errors("table: dbo.t\ncolumns:\n  a:\n    type: \"nvarchar(100\"\n");
-        assert!(render(&e).contains("型別無效"), "{}", render(&e));
+        assert!(render(&e).contains("invalid type"), "{}", render(&e));
     }
 
     #[test]
@@ -332,7 +349,8 @@ indexes:
         assert!(render(&e).contains("nulable"), "{}", render(&e));
     }
 
-    /// 同名欄位被靜默吞掉會造成宣告與資料庫的無聲偏差（見 ADR-0001）。
+    /// Silently swallowing a duplicate column would let the declaration and the
+    /// database diverge without a sound (see ADR-0001).
     #[test]
     fn duplicate_column_is_rejected() {
         let e = errors("table: dbo.t\ncolumns:\n  a: {type: int}\n  a: {type: bigint}\n");
@@ -344,7 +362,11 @@ indexes:
         let e = errors(
             "table: dbo.t\ncolumns:\n  a: {type: int}\nforeign_keys:\n  fk:\n    columns: [a]\n    references: dbo.region\n",
         );
-        assert!(render(&e).contains("外鍵目標無效"), "{}", render(&e));
+        assert!(
+            render(&e).contains("invalid foreign key target"),
+            "{}",
+            render(&e)
+        );
     }
 
     #[test]
@@ -352,19 +374,28 @@ indexes:
         let e = errors(
             "table: dbo.t\ncolumns:\n  a: {type: int}\nindexes:\n  ix:\n    columns: [a sideways]\n",
         );
-        assert!(render(&e).contains("索引欄位無效"), "{}", render(&e));
+        assert!(
+            render(&e).contains("invalid index column"),
+            "{}",
+            render(&e)
+        );
     }
 
-    /// 一次回報所有問題，不要修一個跑一次。
+    /// Report every problem at once, rather than fix-one-run-again.
     #[test]
     fn multiple_errors_are_all_reported() {
         let e = errors(
             "table: dbo.t\ncolumns:\n  a:\n    type: \"int(\"\n  b:\n    type: \"varchar(\"\n",
         );
-        assert_eq!(e.len(), 2, "應同時回報兩個型別錯誤：{}", render(&e));
+        assert_eq!(
+            e.len(),
+            2,
+            "both type errors should be reported together: {}",
+            render(&e)
+        );
     }
 
-    // ---- 目錄載入 ----
+    // ---- directory loading ----
 
     #[test]
     fn directory_load_merges_tables_and_rejects_duplicates() {
@@ -383,16 +414,25 @@ indexes:
         .unwrap();
 
         let loaded = load_schema_dir(&dir).unwrap();
-        assert_eq!(loaded.schema.tables.len(), 2, "應遞迴掃描子目錄");
+        assert_eq!(
+            loaded.schema.tables.len(),
+            2,
+            "subdirectories should be scanned recursively"
+        );
 
-        // 檔名不具語意，兩個檔案宣告同一張表要擋下
+        // File names carry no meaning, so two files declaring one table must be
+        // rejected.
         std::fs::write(
             dir.join("c.yml"),
             "table: dbo.customer\ncolumns:\n  a: {type: int}\n",
         )
         .unwrap();
         let e = load_schema_dir(&dir).unwrap_err();
-        assert!(render(&e).contains("已經在"), "{}", render(&e));
+        assert!(
+            render(&e).contains("was already declared"),
+            "{}",
+            render(&e)
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

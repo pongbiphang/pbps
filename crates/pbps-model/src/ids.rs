@@ -1,31 +1,34 @@
-//! 身份檔（`schema.ids.json`）。
+//! The identity file (`schema.ids.json`).
 //!
-//! 這個檔案進 git，存的是**無法從宣告檔推導的資訊**：UID 與名稱的對照，
-//! 以及已刪除欄位的墓碑（SPEC §5）。型別、nullable、index 定義一律不存 ——
-//! 那些 YAML 裡就有，重複存放只會製造兩份會不一致的真相。
+//! This file is committed to git and holds exactly what **cannot be derived from
+//! the declaration files**: the mapping from UID to name, plus tombstones for
+//! deleted objects (SPEC §5). Types, nullability and index definitions are never
+//! stored here — the YAML already has them, and duplicating them would only
+//! create two sources of truth that can disagree.
 
 use std::collections::BTreeMap;
 
 use crate::name::{ColumnRef, TableName};
 use crate::uid::{Uid, UidKind};
 
-/// 目前的檔案格式版本。
+/// The current file-format version.
 ///
-/// 從第一版就存在，日後才有機會做相容性遷移；等到需要時才加就太遲了。
+/// It is present from version one so that a compatibility migration is possible
+/// later; adding it once it is needed is already too late.
 pub const CURRENT_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdsError {
-    #[error("身份檔版本為 {found}，本工具只支援 {supported}")]
+    #[error("the identity file is version {found}, but this tool only supports {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
 
-    #[error("UID {uid} 同時是活躍的與墓碑 —— 身份檔已損毀")]
+    #[error("UID {uid} is both live and tombstoned; the identity file is corrupt")]
     LiveAndTombstoned { uid: Uid },
 
-    #[error("{a} 與 {b} 都指向同一個名稱 `{name}`")]
+    #[error("{a} and {b} both point at the name `{name}`")]
     DuplicateName { a: Uid, b: Uid, name: String },
 
-    #[error("{uid} 的前綴與它所在的區塊不符")]
+    #[error("the prefix of {uid} does not match the section it appears in")]
     KindMismatch { uid: Uid },
 }
 
@@ -54,13 +57,15 @@ impl Default for IdsFile {
     }
 }
 
-/// 已物理刪除的物件留下的紀錄。
+/// The record left behind by an object that was physically deleted.
 ///
-/// 墓碑存在身份檔而不是宣告檔裡，宣告檔因此永遠只包含「你要的東西」，
-/// 不會隨年資累積殭屍欄位（SPEC §4.4）。
+/// Tombstones live in the identity file rather than in the declaration files, so
+/// the declarations only ever contain what you want and never accumulate zombie
+/// columns over the years (SPEC §4.4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tombstone {
-    /// 刪除當下的完整名稱。稽核要回答「這個欄位曾經叫什麼」。
+    /// The full name at the moment of deletion. An audit has to be able to answer
+    /// "what was this column called?".
     pub was: String,
     /// `YYYY-MM-DD`
     pub dropped_at: String,
@@ -69,7 +74,7 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
-    /// 以名稱反查 UID。差異比對每次都要做這件事。
+    /// Looks a UID up by name. Diffing does this constantly.
     pub fn table_uid(&self, name: &TableName) -> Option<&Uid> {
         self.tables.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
@@ -78,10 +83,12 @@ impl IdsFile {
         self.columns.iter().find(|(_, n)| *n == r).map(|(u, _)| u)
     }
 
-    /// 檢查內部一致性。
+    /// Checks internal consistency.
     ///
-    /// 身份檔是工具自己寫的，正常情況不會壞；但它進 git，就可能被手動編輯或
-    /// 被錯誤的 merge 解決搞亂。這裡的檢查是在 diff 拿它當真相之前的最後一道防線。
+    /// The tool writes this file itself, so under normal conditions it cannot
+    /// break. But it is committed to git, which means it can be hand-edited or
+    /// mangled by a bad merge resolution. These checks are the last line of
+    /// defence before diff treats it as truth.
     pub fn validate(&self) -> Result<(), IdsError> {
         if self.version != CURRENT_VERSION {
             return Err(IdsError::UnsupportedVersion {
@@ -113,7 +120,8 @@ impl IdsFile {
     }
 }
 
-/// 兩個 UID 指向同一個名稱，代表身份錯亂 —— 之後的 rename 判定會是錯的。
+/// Two UIDs pointing at one name means identity has been scrambled, and every
+/// later rename decision would be wrong.
 fn check_unique<'a>(it: impl Iterator<Item = (&'a Uid, String)>) -> Result<(), IdsError> {
     let mut seen: BTreeMap<String, &Uid> = BTreeMap::new();
     for (uid, name) in it {
@@ -165,7 +173,8 @@ mod tests {
         assert_eq!(f.column_uid(&col("dbo.customer.nope")), None);
     }
 
-    /// rename 的 diff 應該只有一行 —— 這是身份檔在 review 中可讀的關鍵。
+    /// A rename's diff should be a single line — that is what makes the identity
+    /// file reviewable.
     #[test]
     fn rename_changes_exactly_one_line() {
         let before = serde_json::to_string_pretty(&sample()).unwrap();
@@ -180,7 +189,7 @@ mod tests {
             .zip(after.lines())
             .filter(|(a, b)| a != b)
             .count();
-        assert_eq!(diff, 1, "rename 應只改動一行");
+        assert_eq!(diff, 1, "a rename should change exactly one line");
         assert_eq!(before.lines().count(), after.lines().count());
     }
 
@@ -200,7 +209,7 @@ mod tests {
         );
     }
 
-    /// 手動編輯或錯誤的 merge 可能造出兩個 UID 指向同一欄位。
+    /// A hand edit or a bad merge can produce two UIDs pointing at one column.
     #[test]
     fn duplicate_names_are_rejected() {
         let mut f = sample();
@@ -220,7 +229,7 @@ mod tests {
             Tombstone {
                 was: "dbo.customer.full_name".into(),
                 dropped_at: "2026-08-30".into(),
-                reason: "測試".into(),
+                reason: "test".into(),
                 operator: "leon".into(),
             },
         );

@@ -1,11 +1,13 @@
-//! 宣告檔的 YAML 形狀。
+//! The YAML shape of the declaration files.
 //!
-//! 這裡的結構刻意與 [`pbps_model`] 的領域模型**不同**：YAML 用 map key 表示
-//! 名稱、有預設值、還帶著 `renamed_from` 這類一次性的意圖註記。轉換由
-//! [`crate::convert`] 負責，模型因此得以保持乾淨（見 CLAUDE.md 約束 1、2）。
+//! These structures are deliberately **different** from [`pbps_model`]'s domain
+//! model: YAML uses map keys as names, has defaults, and carries one-shot intent
+//! annotations such as `renamed_from`. [`crate::convert`] owns the translation,
+//! which is what keeps the model clean (see constraints 1 and 2 in CLAUDE.md).
 //!
-//! 所有結構都加 `deny_unknown_fields`：拼錯欄位名是最常見的使用者錯誤，
-//! 默默套用預設值會讓宣告與實際產生無聲的偏差。
+//! Every structure sets `deny_unknown_fields`: a misspelled field name is the
+//! most common user error, and silently applying a default would let the
+//! declaration and reality diverge without a sound.
 
 use indexmap::IndexMap;
 use serde_saphyr::Spanned;
@@ -21,12 +23,13 @@ pub struct TableDto {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// 一次性意圖：這張表是從哪個名稱改過來的。
-    /// 被 `pbps plan` 吸收進身份檔後會從檔案中移除。
+    /// One-shot intent: the name this table was renamed from. Removed from the
+    /// file once `pbps plan` has absorbed it into the identity file.
     #[serde(default)]
     pub renamed_from: Option<Spanned<String>>,
 
-    /// `IndexMap` 保留文件中的宣告順序 —— 那會決定 `CREATE TABLE` 的欄位排列。
+    /// `IndexMap` preserves the declaration order in the document, which decides
+    /// the column layout of `CREATE TABLE`.
     pub columns: IndexMap<String, ColumnDto>,
 
     #[serde(default)]
@@ -38,7 +41,7 @@ pub struct TableDto {
     #[serde(default)]
     pub foreign_keys: BTreeMap<String, ForeignKeyDto>,
 
-    /// 約束名 → 檢查運算式
+    /// Constraint name to check expression.
     #[serde(default)]
     pub checks: BTreeMap<String, String>,
 
@@ -55,7 +58,7 @@ pub struct ColumnDto {
     #[serde(default = "yes")]
     pub nullable: bool,
 
-    /// 預設值運算式，原樣保留。
+    /// The default-value expression, kept verbatim.
     #[serde(default)]
     pub default: Option<String>,
 
@@ -66,11 +69,12 @@ pub struct ColumnDto {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// 有值即代表已棄用，內容是原因。日期由 git 提供，不在這裡寫。
+    /// Present means deprecated; the value is the reason. The date comes from
+    /// git and is not written here.
     #[serde(default)]
     pub deprecated: Option<String>,
 
-    /// 一次性意圖，同 [`TableDto::renamed_from`]。
+    /// One-shot intent, as for [`TableDto::renamed_from`].
     #[serde(default)]
     pub renamed_from: Option<Spanned<String>>,
 }
@@ -79,10 +83,12 @@ const fn yes() -> bool {
     true
 }
 
-/// 主鍵可以只寫欄位清單（名稱交給資料庫），也可以指定約束名。
+/// A primary key may be written as a bare column list, leaving the name to the
+/// database, or with an explicit constraint name.
 ///
-/// 支援具名形式不是為了好看：`pbps pull` 從既有資料庫反向生成時，若丟失原本的
-/// 約束名，下一次 diff 就會想把它改名。
+/// The named form is not there for looks: when `pbps pull` reverse-generates from
+/// an existing database, losing the original constraint name would make the next
+/// diff want to rename it.
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 pub enum PrimaryKeyDto {
@@ -95,7 +101,7 @@ pub enum PrimaryKeyDto {
 pub struct ForeignKeyDto {
     pub columns: Vec<String>,
 
-    /// `dbo.region(region_id)` 或 `dbo.region(a, b)`
+    /// `dbo.region(region_id)` or `dbo.region(a, b)`.
     pub references: Spanned<String>,
 
     #[serde(default)]
@@ -108,7 +114,7 @@ pub struct ForeignKeyDto {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDto {
-    /// 每項是 `欄位名` 或 `欄位名 desc`
+    /// Each entry is `column` or `column desc`.
     pub columns: Vec<Spanned<String>>,
 
     #[serde(default)]
@@ -117,7 +123,8 @@ pub struct IndexDto {
     #[serde(default)]
     pub unique: bool,
 
-    /// 篩選索引條件。YAML 用 `where`，那是 Rust 的關鍵字，故改名。
+    /// The filtered-index predicate. The YAML key is `where`, which is a Rust
+    /// keyword, hence the rename.
     #[serde(rename = "where", default)]
     pub filter: Option<String>,
 }

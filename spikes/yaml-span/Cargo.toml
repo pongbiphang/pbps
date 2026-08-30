@@ -4,8 +4,8 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Phase 0 spike：驗證候選 YAML crate 的 span / 診斷能力。
-# 定案後整個 spikes/yaml-span 目錄移除。
+# Phase 0 spike: evaluating the span and diagnostic capabilities of candidate
+# YAML crates. The whole spikes/yaml-span directory goes once the choice is made.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

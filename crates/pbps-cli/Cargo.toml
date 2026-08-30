@@ -1,6 +1,6 @@
 [package]
 name = "pbps-cli"
-description = "PongBiphang Schema — 宣告式資料庫 schema 版控工具"
+description = "PongBiphang Schema - declarative database schema version control"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

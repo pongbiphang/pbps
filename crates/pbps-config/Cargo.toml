@@ -1,6 +1,6 @@
 [package]
 name = "pbps-config"
-description = "PongBiphang Schema — 專案設定"
+description = "PongBiphang Schema - project configuration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

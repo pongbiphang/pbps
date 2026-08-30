@@ -1,35 +1,40 @@
-//! 身份錨點。
+//! Identity anchors.
 //!
-//! UID 是工具內部用來回答「這是不是同一個欄位」的唯一依據。**使用者永遠不會
-//! 輸入或看見它** —— 它只出現在身份檔與 `__pbps_state` 裡（見 SPEC §5.2）。
+//! A UID is the only thing the tool uses internally to answer "is this the same
+//! column?". **Users never type one and never see one** — it appears only in the
+//! identity file and in `__pbps_state` (see SPEC §5.2).
 //!
-//! 用隨機而非流水號，是為了讓兩個分支各自新增欄位時不會配到同一個號碼。
+//! They are random rather than sequential so that two branches adding a column
+//! each cannot be handed the same number.
 
 use std::fmt;
 use std::str::FromStr;
 
-/// 去掉容易誤讀的 `i` `l` `o` `u`，剩 32 個字元。
-/// 使用者不會手打 UID，但 UID 會出現在錯誤訊息與 git diff 裡，好讀仍有價值。
+/// The easily misread `i`, `l`, `o` and `u` are dropped, leaving 32 characters.
+/// Nobody types a UID by hand, but UIDs do show up in error messages and git
+/// diffs, so legibility is still worth something.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// 隨機段長度。32^6 ≈ 1.07e9；以單一專案的欄位數量級（10^3～10^4）而言，
-/// 依生日問題估算碰撞機率約在 10^-3 以下，且配發時會檢查既有 UID，
-/// 碰撞只會導致重抽，不會產生錯誤的身份。
+/// Length of the random part. 32^6 ≈ 1.07e9; for the number of columns in a
+/// single project (10^3 to 10^4) the birthday-problem estimate puts the
+/// collision probability below 10^-3, and allocation checks existing UIDs
+/// anyway, so a collision only causes a redraw, never a wrong identity.
 const LEN: usize = 6;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{0}` 缺少 `t_` 或 `c_` 前綴")]
+    #[error("UID `{0}` is missing the `t_` or `c_` prefix")]
     BadPrefix(String),
 
-    #[error("UID `{0}` 的長度應為 {LEN} 個字元（不含前綴）")]
+    #[error("UID `{0}` should be {LEN} characters long, excluding the prefix")]
     BadLength(String),
 
-    #[error("UID `{0}` 含有字母表以外的字元")]
+    #[error("UID `{0}` contains a character outside the alphabet")]
     BadChar(String),
 }
 
-/// UID 指向的物件種類。前綴讓身份檔一眼看得出這一列在講表還是欄位。
+/// The kind of object a UID points at. The prefix makes it obvious at a glance
+/// whether a line in the identity file is about a table or a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UidKind {
     Table,
@@ -45,9 +50,10 @@ impl UidKind {
     }
 }
 
-/// 形如 `c_k7x2mq` / `t_a9k2mq`。
+/// Of the form `c_k7x2mq` / `t_a9k2mq`.
 ///
-/// `Ord` 直接取字串序，因此同類的 UID 會排在一起，身份檔的 diff 比較好讀。
+/// `Ord` is plain string order, so UIDs of the same kind sort together and the
+/// identity file's diff reads better.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -55,10 +61,11 @@ impl UidKind {
 pub struct Uid(String);
 
 impl Uid {
-    /// 配發一個新的 UID。
+    /// Allocates a new UID.
     ///
-    /// 呼叫端有責任確認結果不與既有 UID 重複；碰撞極罕見但並非不可能，
-    /// 而「靜默重用同一個身份」會直接造成錯誤的 rename 判定。
+    /// The caller is responsible for checking the result against existing UIDs.
+    /// A collision is very rare but not impossible, and silently reusing an
+    /// identity would directly produce a wrong rename decision.
     pub fn generate(kind: UidKind) -> Self {
         let mut s = String::with_capacity(2 + LEN);
         s.push_str(kind.prefix());
@@ -120,15 +127,17 @@ impl From<Uid> for String {
     }
 }
 
-/// UID 的隨機來源。
+/// The source of randomness for UIDs.
 ///
-/// **刻意不使用 `rand`。** UID 是身份標記而非秘密 —— 猜到別人的 UID 沒有任何
-/// 好處，因此不需要密碼學品質的隨機性，只需要「兩個分支不會配到同一個號碼」。
-/// 為此拉進一個依賴（以及它底下的 `getrandom` 與平台 FFI）不划算：這個工具
-/// 會在受管制的環境裡被稽核，依賴樹愈短愈好。
+/// **`rand` is deliberately not used.** A UID is an identity marker, not a
+/// secret — guessing someone else's UID buys nothing — so cryptographic quality
+/// is not required, only that two branches never draw the same number. Pulling
+/// in a dependency for that (along with `getrandom` beneath it and its platform
+/// FFI) is a bad trade: this tool gets audited in regulated environments, and a
+/// shorter dependency tree is worth more.
 ///
-/// 種子取自 `RandomState`（作業系統提供、每個 process 不同）與單調時間，
-/// 之後以 SplitMix64 推進。
+/// The seed comes from `RandomState` (OS-provided, different per process) and
+/// the wall clock, then advances with SplitMix64.
 fn next_random() -> u64 {
     use std::cell::Cell;
     use std::collections::hash_map::RandomState;
@@ -149,7 +158,8 @@ fn next_random() -> u64 {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0),
             );
-            // RandomState 每個實例的 key 不同，雜湊結果因此帶有 OS 熵。
+            // Each RandomState instance has a different key, so the hash
+            // carries OS entropy.
             x = h.finish() | 1;
         }
         // SplitMix64
@@ -183,28 +193,35 @@ mod tests {
             let body = &u.as_str()[2..];
             assert!(
                 !body.contains(['i', 'l', 'o', 'u']),
-                "字母表不該產出易誤讀字元: {u}"
+                "the alphabet must not emit easily misread characters: {u}"
             );
         }
     }
 
-    /// 不是密碼學品質的要求，只是確認沒有寫成常數。
+    /// Not a demand for cryptographic quality, just a check that this was not
+    /// written as a constant.
     #[test]
     fn generation_is_not_constant() {
         let set: BTreeSet<_> = (0..200).map(|_| Uid::generate(UidKind::Column)).collect();
         assert!(
             set.len() > 190,
-            "隨機性明顯不足：200 次只產生 {} 個相異值",
+            "randomness is clearly inadequate: 200 draws produced only {} distinct values",
             set.len()
         );
     }
 
     #[test]
     fn malformed_uids_are_rejected() {
-        assert!("k7x2mq".parse::<Uid>().is_err(), "缺前綴");
-        assert!("c_k7x2m".parse::<Uid>().is_err(), "太短");
-        assert!("c_k7x2mqq".parse::<Uid>().is_err(), "太長");
-        assert!("c_k7x2mi".parse::<Uid>().is_err(), "含字母表外的 i");
-        assert!("c_K7X2MQ".parse::<Uid>().is_err(), "大寫不在字母表內");
+        assert!("k7x2mq".parse::<Uid>().is_err(), "missing prefix");
+        assert!("c_k7x2m".parse::<Uid>().is_err(), "too short");
+        assert!("c_k7x2mqq".parse::<Uid>().is_err(), "too long");
+        assert!(
+            "c_k7x2mi".parse::<Uid>().is_err(),
+            "contains i, outside the alphabet"
+        );
+        assert!(
+            "c_K7X2MQ".parse::<Uid>().is_err(),
+            "uppercase is not in the alphabet"
+        );
     }
 }

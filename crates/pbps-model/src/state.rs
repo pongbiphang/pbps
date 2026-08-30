@@ -1,55 +1,64 @@
-//! 環境狀態快照 —— 寫入各環境資料庫的 `__pbps_state`（SPEC §8）。
+//! Environment state snapshots — written to each environment's `__pbps_state`
+//! (SPEC §8).
 //!
-//! 狀態存在資料庫自己身上，而不是 CI artifact，是這個工具能天然支援多環境的
-//! 原因：dev / staging / prod 各自記得自己的狀態，落後幾版都不需要任何
-//! artifact 傳遞或環境對照策略。
+//! Keeping state in the database itself rather than in a CI artifact is what
+//! makes multi-environment support fall out naturally: dev, staging and prod each
+//! remember their own state, and an environment several versions behind needs no
+//! artifact passing and no environment-mapping strategy at all.
 
 use crate::ids::IdsFile;
 use crate::schema::Schema;
 
 pub const CURRENT_VERSION: u32 = 1;
 
-/// 這筆狀態是怎麼來的。
+/// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateKind {
-    /// 正常套用一份計畫
+    /// A plan was applied normally.
     Apply,
-    /// 重設基準：不追究差異，以資料庫現況為新起點
+    /// Rebaseline: differences are not pursued; the database as it stands
+    /// becomes the new starting point.
     Baseline,
-    /// 從宣告檔一次性建出完整 schema（DR / 新環境）
+    /// The whole schema was built from the declarations in one shot (DR, or a
+    /// new environment).
     Bootstrap,
 }
 
-/// 某一時刻某個環境的完整已驗證狀態。
+/// One environment's complete, verified state at a point in time.
 ///
-/// 存整份 schema 而不是增量或 checksum：drift 檢查才能完整比對、可作為備援、
-/// 也才能回答「三個月前這張表長什麼樣」。
+/// The whole schema is stored, not a delta or a checksum: that is what lets
+/// drift detection compare in full, what makes the snapshot usable as a backup,
+/// and what lets it answer "what did this table look like three months ago?".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StateSnapshot {
     pub version: u32,
     pub kind: StateKind,
 
-    /// 該環境實際的 schema
+    /// The schema that environment actually has.
     pub schema: Schema,
 
-    /// 這份狀態當下的身份對照。
+    /// The identity mapping as of this state.
     ///
-    /// 少了它，落後好幾版的環境就無法用 uid 與現行宣告配對，改名會退化成
-    /// 「刪除加新增」—— 也就是掉資料。狀態與身份必須一起存。
+    /// Without it, an environment several versions behind cannot match the
+    /// current declarations by uid, and a rename degrades into "drop plus add" —
+    /// which is data loss. State and identity have to be stored together.
     pub ids: IdsFile,
 
-    /// 產生此狀態的 commit。`None` 用於在版控之外執行的 baseline。
+    /// The commit that produced this state. `None` for a baseline taken outside
+    /// version control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,
 
-    /// 套用的計畫的 checksum，對應 saved plan 的釘死機制（SPEC §7.3）。
+    /// Checksum of the plan that was applied, matching the saved-plan pinning
+    /// mechanism (SPEC §7.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_checksum: Option<String>,
 
     pub operator: String,
 
-    /// baseline 必填 —— 「為什麼要跳過差異」正是稽核要問的問題。
+    /// Required for a baseline: "why were the differences skipped?" is precisely
+    /// what an audit asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -68,7 +77,7 @@ impl StateSnapshot {
         }
     }
 
-    /// 資料庫現況是否仍等於這份快照。不等於即為 drift。
+    /// Whether the database still equals this snapshot. Anything else is drift.
     pub fn matches(&self, actual: &Schema) -> bool {
         &self.schema == actual
     }
@@ -121,12 +130,16 @@ mod tests {
         );
         assert!(
             !snap.matches(&schema_with("nvarchar(100)")),
-            "型別改變應為 drift"
+            "a type change is drift"
         );
-        assert!(!snap.matches(&Schema::default()), "表消失應為 drift");
+        assert!(
+            !snap.matches(&Schema::default()),
+            "a vanished table is drift"
+        );
     }
 
-    /// 大小寫差異不該被當成 drift，否則每次 introspect 都可能誤報。
+    /// Case differences must not count as drift, or every introspection could
+    /// raise a false alarm.
     #[test]
     fn type_case_is_not_drift() {
         let snap = StateSnapshot::new(

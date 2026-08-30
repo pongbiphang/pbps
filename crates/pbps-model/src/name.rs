@@ -1,26 +1,29 @@
-//! 限定名稱：`dbo.customer` 與 `dbo.customer.email`。
+//! Qualified names: `dbo.customer` and `dbo.customer.email`.
 //!
-//! 名稱一律要求完整限定。不接受省略 schema 的寫法 —— 「預設 schema」是連線
-//! 層的概念，讓它滲進宣告檔會使同一份檔案在不同連線下指到不同的表。
+//! Names must always be fully qualified. Omitting the schema is not accepted —
+//! a "default schema" is a connection-level concept, and letting it leak into
+//! declaration files would make one file point at different tables depending on
+//! the connection.
 
 use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NameError {
-    #[error("表名必須是 `schema.table` 兩段式，收到 `{0}`")]
+    #[error("a table name must have the two parts `schema.table`, got `{0}`")]
     TableShape(String),
 
-    #[error("欄位參照必須是 `schema.table.column` 三段式，收到 `{0}`")]
+    #[error("a column reference must have the three parts `schema.table.column`, got `{0}`")]
     ColumnShape(String),
 
-    #[error("`{0}` 之中有空的識別名")]
+    #[error("`{0}` contains an empty identifier")]
     EmptySegment(String),
 }
 
-/// 完整限定的表名，如 `dbo.customer`。
+/// A fully qualified table name, such as `dbo.customer`.
 ///
-/// `Ord` 由 `(schema, name)` 決定，序列化順序因此是穩定的。
+/// `Ord` is decided by `(schema, name)`, which is what makes serialization order
+/// stable.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -38,7 +41,7 @@ impl TableName {
         }
     }
 
-    /// 取得此表中某欄位的參照。
+    /// A reference to one column of this table.
     pub fn column(&self, column: impl Into<String>) -> ColumnRef {
         ColumnRef {
             table: self.clone(),
@@ -68,7 +71,7 @@ impl FromStr for TableName {
     }
 }
 
-/// 完整限定的欄位參照，如 `dbo.customer.email`。
+/// A fully qualified column reference, such as `dbo.customer.email`.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -108,7 +111,7 @@ impl FromStr for ColumnRef {
     }
 }
 
-// ---- serde 橋接：兩者都以字串形式進出 JSON ----
+// ---- serde bridge: both cross the JSON boundary as strings ----
 
 macro_rules! string_serde {
     ($t:ty) => {
@@ -169,7 +172,7 @@ mod tests {
         );
     }
 
-    /// 過多的段數要被擋下，不能默默取前幾段。
+    /// Too many segments must be rejected, never silently truncated.
     #[test]
     fn over_qualified_names_are_rejected() {
         assert!("db.dbo.customer".parse::<TableName>().is_err());

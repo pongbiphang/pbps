@@ -1,15 +1,18 @@
-//! 期望狀態的結構。
+//! The structure of the desired state.
 //!
-//! # 兩條刻意的設計約束
+//! # Two deliberate design constraints
 //!
-//! **容器持有名稱，元素不持有。** `Table` 沒有 `name` 欄位、`Column` 沒有
-//! `name` 欄位 —— 名稱是父層 map 的 key。這消滅了「map key 與內部 name 不一致」
-//! 這一整類不可能自我察覺的 bug。
+//! **Containers hold names; elements do not.** `Table` has no `name` field and
+//! `Column` has no `name` field — the name is the key in the parent map. This
+//! eliminates an entire class of bugs that cannot detect themselves: a map key
+//! disagreeing with the name stored inside.
 //!
-//! **模型只表達狀態，不表達意圖。** `renamed_from` 這種暫時性註記不在這裡，
-//! 由 `pbps-load` 另外回傳。理由是 `Schema` 必須滿足「兩份語意相同的 schema
-//! 一定相等」，diff 與 drift 檢查都建立在這個前提上；把一次性的意圖混進來，
-//! 同一個狀態就會因為註記有無而不相等。
+//! **The model expresses state, never intent.** Transient annotations such as
+//! `renamed_from` do not live here; `pbps-load` returns them separately. The
+//! reason is that `Schema` must satisfy "two semantically identical schemas are
+//! equal", which both diff and drift detection are built on. Mixing in one-shot
+//! intent would make the same state compare unequal depending on whether an
+//! annotation happened to be present.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +21,7 @@ use indexmap::IndexMap;
 use crate::name::TableName;
 use crate::types::ColumnType;
 
-/// 一個專案的完整期望狀態。
+/// The complete desired state of a project.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
@@ -35,8 +38,9 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// 用 `IndexMap` 保留宣告順序 —— 那會決定 `CREATE TABLE` 的欄位排列。
-    /// 相等性比較與順序無關，所以順序變動不會被誤判為 schema 變更。
+    /// An `IndexMap` preserves declaration order, which decides the column
+    /// layout of `CREATE TABLE`. Equality ignores order, so reordering is never
+    /// mistaken for a schema change.
     pub columns: IndexMap<String, Column>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,13 +64,14 @@ pub struct Column {
     #[serde(rename = "type")]
     pub ty: ColumnType,
 
-    /// 預設 `true`，與 SQL 的預設一致。
+    /// Defaults to `true`, matching SQL's own default.
     pub nullable: bool,
 
-    /// 預設值運算式，原樣保留（如 `0`、`SYSUTCDATETIME()`）。
+    /// The default-value expression, kept verbatim (`0`, `SYSUTCDATETIME()`).
     ///
-    /// 不解析成結構 —— 運算式的語法是方言知識，而我們對它唯一的需求是
-    /// 「原封不動送給資料庫」與「比較是否改變」。
+    /// It is not parsed into a structure: expression syntax is dialect knowledge,
+    /// and all we ever need from it is to hand it to the database untouched and
+    /// to compare whether it changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
 
@@ -76,16 +81,17 @@ pub struct Column {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// 有值即代表已棄用，內容是棄用原因。
+    /// Present means deprecated; the value is the reason.
     ///
-    /// 日期不存 —— git 已經記錄了它，要使用者手寫一次是多餘的
-    /// 且必然會與真實時間不符（SPEC §4.2）。
+    /// No date is stored — git already records it, so asking the user to write
+    /// one by hand is redundant and guaranteed to drift from the real time
+    /// (SPEC §4.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
 }
 
 impl Column {
-    /// 最常見的形狀：可為 NULL、無預設值。
+    /// The most common shape: nullable, no default.
     pub fn new(ty: ColumnType) -> Self {
         Self {
             ty,
@@ -115,7 +121,7 @@ pub struct Identity {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrimaryKey {
-    /// 約束名。`None` 表示交由資料庫自動命名。
+    /// The constraint name. `None` leaves the database to name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub columns: Vec<String>,
@@ -150,7 +156,7 @@ pub enum ReferentialAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckConstraint {
-    /// 檢查運算式，原樣保留。
+    /// The check expression, kept verbatim.
     pub expression: String,
 }
 
@@ -158,14 +164,14 @@ pub struct CheckConstraint {
 pub struct Index {
     pub columns: Vec<IndexColumn>,
 
-    /// 只讀不入 key 的附加欄位（SQL Server 的 INCLUDE）。
+    /// Payload columns that are not part of the key (SQL Server's INCLUDE).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 
     #[serde(default)]
     pub unique: bool,
 
-    /// 篩選索引的條件，原樣保留。
+    /// The filtered-index predicate, kept verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 }
@@ -205,7 +211,7 @@ mod tests {
         assert!(!Column::new(ty("int")).not_null().nullable);
     }
 
-    /// 欄位順序影響 CREATE TABLE 的輸出，所以必須保留。
+    /// Column order affects CREATE TABLE output, so it has to be preserved.
     #[test]
     fn column_order_is_preserved() {
         let t = sample();
@@ -215,7 +221,8 @@ mod tests {
         );
     }
 
-    /// ...但順序不同不該被判定為 schema 變更，否則每次重排都會產生假的 diff。
+    /// ...but a different order must not count as a schema change, or every
+    /// reshuffle would produce a phantom diff.
     #[test]
     fn column_order_does_not_affect_equality() {
         let a = sample();
@@ -229,7 +236,8 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// 序列化必須是決定性的 —— 狀態快照要進 git 與 DB，順序跳動會製造假 diff。
+    /// Serialization must be deterministic: state snapshots go into git and into
+    /// the database, and shifting order would manufacture phantom diffs.
     #[test]
     fn serialisation_is_deterministic() {
         let mut schema = Schema::default();
@@ -244,7 +252,7 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(serde_json::to_string(&schema).unwrap(), first);
         }
-        // BTreeMap 排序：app.region 在 dbo.customer 之前
+        // BTreeMap ordering: app.region comes before dbo.customer
         assert!(first.find("app.region").unwrap() < first.find("dbo.customer").unwrap());
     }
 
@@ -259,7 +267,8 @@ mod tests {
         assert_eq!(schema, back);
     }
 
-    /// 空集合不應污染輸出，否則身份檔與快照會充滿 `{}`。
+    /// Empty collections must not pollute the output, or identity files and
+    /// snapshots would fill up with `{}`.
     #[test]
     fn empty_collections_are_omitted() {
         let json = serde_json::to_string(&Table::default()).unwrap();

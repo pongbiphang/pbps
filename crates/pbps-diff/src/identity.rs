@@ -1,65 +1,75 @@
-//! 身份解析：把宣告檔的名稱對應回 UID，並找出哪些變化需要人來裁決。
+//! Identity resolution: mapping the names in the declarations back to UIDs and
+//! finding the changes a human has to adjudicate.
 //!
-//! # 核心問題
+//! # The core problem
 //!
-//! 身份檔記的是「上次已知的 uid → 名稱」。宣告檔記的是「現在要什麼」。兩邊
-//! 一比就會出現三種情形：名稱兩邊都在（同一個東西）、只在宣告檔（新的）、
-//! 只在身份檔（消失了）。
+//! The identity file records the last known uid-to-name mapping. The declarations
+//! record what is wanted now. Comparing the two produces three cases: a name is
+//! on both sides (the same thing), only in the declarations (new), or only in the
+//! identity file (it disappeared).
 //!
-//! 麻煩的是最後兩種**同時**發生：一張表裡既有欄位消失、又有欄位出現時，
-//! 結構上無法區分那是改名還是刪除加新增。這個資訊只存在於當事人腦中，
-//! 因此必須由人給（[`Intent`]），演算法不准猜 —— 猜錯的代價是掉資料。
+//! The trouble is the last two happening **at the same time**: when one table
+//! loses a column and gains another, there is no structural way to tell a rename
+//! from a drop plus an add. That information exists only in the author's head, so
+//! it has to be supplied ([`Intent`]) and the algorithm is not allowed to guess —
+//! the price of guessing wrong is lost data.
 //!
-//! # 為什麼刪除也要理由
+//! # Why a drop needs a reason too
 //!
-//! 「純刪除、同表無新增」在操作上確實沒有歧義。但墓碑要回答稽核的
-//! 「誰、何時、為什麼刪的」，而理由沒有任何演算法生得出來。因此刪除同樣
-//! 需要一則意圖 —— 差別在於它要的不是「是不是改名」，而是「為什麼」。
+//! A pure deletion with no additions in the same table really is unambiguous as
+//! an operation. But the tombstone has to answer an audit's "who dropped this,
+//! when, and why", and no algorithm can produce the why. So a drop needs an
+//! intent as well — the difference being that what it asks for is not "was this a
+//! rename" but "why".
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{ColumnRef, IdsFile, Intent, Schema, TableName, Tombstone, Uid, UidKind};
 
-/// 無法自動判定、必須由人處理的情況。
+/// A situation that cannot be decided automatically and needs a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
-    /// 同一張表同時有欄位消失與新增。
+    /// One table both lost and gained columns.
     AmbiguousColumns {
         table: TableName,
         disappeared: Vec<String>,
         appeared: Vec<String>,
     },
-    /// 同時有表消失與新增。
+    /// Tables both disappeared and appeared.
     AmbiguousTables {
         disappeared: Vec<TableName>,
         appeared: Vec<TableName>,
     },
-    /// 欄位從宣告檔消失，但沒有提供刪除理由。
+    /// A column vanished from the declarations with no reason for dropping it.
     DropColumnNeedsReason { column: ColumnRef },
-    /// 表從宣告檔消失，但沒有提供刪除理由。
+    /// A table vanished from the declarations with no reason for dropping it.
     DropTableNeedsReason { table: TableName },
-    /// 給了意圖，但宣告檔與身份檔裡都對不上 —— 幾乎一定是打錯字。
+    /// An intent was given that matches nothing in either the declarations or the
+    /// identity file — almost always a typo.
     ///
-    /// 靜默忽略會讓使用者接著看到一個他不理解的歧義錯誤。
+    /// Ignoring it silently would leave the user facing an ambiguity error they
+    /// cannot explain.
     UnusedIntent { intent: Intent },
 }
 
-/// 產生墓碑所需、但無法從檔案推導的資訊。
+/// Information a tombstone needs that cannot be derived from the files.
 #[derive(Debug, Clone)]
 pub struct Context {
     pub operator: String,
-    /// `YYYY-MM-DD`。由呼叫端提供，讓這一層維持純函式、可測試。
+    /// `YYYY-MM-DD`. Supplied by the caller so that this layer stays pure and
+    /// testable.
     pub today: String,
 }
 
-/// 身份解析的結果 —— 只有身份層級的事實，不含屬性變更。
+/// The result of identity resolution: identity-level facts only, no attribute
+/// changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resolution {
-    /// 套用本次變化後的身份檔。
+    /// The identity file with this round's changes applied.
     pub ids: IdsFile,
     pub created_tables: Vec<(Uid, TableName)>,
     pub dropped_tables: Vec<(Uid, TableName)>,
-    /// `(uid, 舊名, 新名)`
+    /// `(uid, old name, new name)`
     pub renamed_tables: Vec<(Uid, TableName, TableName)>,
     pub added_columns: Vec<(Uid, ColumnRef)>,
     pub dropped_columns: Vec<(Uid, ColumnRef)>,
@@ -98,14 +108,16 @@ pub fn resolve(
     }
 }
 
-/// 這則意圖是不是「已經生效了」。
+/// Whether this intent has already taken effect.
 ///
-/// 意圖必須是冪等的。宣告檔中的 `renamed_from` 註記在身份檔更新後仍會留在
-/// 檔案裡（要等 `pbps fmt` 才清掉），若把它當成對不上的意圖報錯，使用者會在
-/// 一次成功的改名之後看到一個莫名其妙的失敗。
+/// Intents have to be idempotent. A `renamed_from` annotation stays in the
+/// declaration file after the identity file has been updated (only `pbps fmt`
+/// clears it), and reporting it as an unmatched intent would hand the user a
+/// baffling failure right after a successful rename.
 ///
-/// 判斷方式是看世界是否已經處於這則意圖想要的樣子：改名的目標名稱已存在且
-/// 來源名稱已不存在、或刪除的對象已經不在身份檔中。
+/// The test is whether the world is already in the shape the intent asks for: for
+/// a rename, the target name exists and the source name does not; for a drop, the
+/// object is already gone from the identity file.
 fn already_satisfied(intent: &Intent, ids: &IdsFile) -> bool {
     let has_column = |c: &ColumnRef| ids.columns.values().any(|v| v == c);
     let has_table = |t: &TableName| ids.tables.values().any(|v| v == t);
@@ -129,7 +141,7 @@ fn resolve_tables(
     used: &mut BTreeSet<usize>,
 ) {
     let declared_names: BTreeSet<&TableName> = declared.tables.keys().collect();
-    // 取得擁有權的副本：底下要邊查邊改 `r.ids`。
+    // An owned copy: the loop below reads while mutating `r.ids`.
     let known: BTreeMap<TableName, Uid> = r
         .ids
         .tables
@@ -148,7 +160,8 @@ fn resolve_tables(
         .cloned()
         .collect();
 
-    // 改名優先於刪除：同一張表若兩種意圖都給了，改名的語意更具體。
+    // Rename wins over drop: if both intents are given for one table, rename is
+    // the more specific statement.
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameTable { from, to } = intent
             && disappeared.remove(from)
@@ -199,8 +212,9 @@ fn resolve_columns(
     blockers: &mut Vec<Blocker>,
     used: &mut BTreeSet<usize>,
 ) {
-    // 只處理宣告檔中仍存在的表。新建表的欄位一律是新增；已刪除的表，
-    // 其欄位的墓碑在 drop_table_in_ids 中一併處理。
+    // Only tables still present in the declarations are handled here. Columns of
+    // a newly created table are all additions, and for a dropped table the
+    // tombstones for its columns are handled in drop_table_in_ids.
     for (table_name, table) in &declared.tables {
         let declared_cols: BTreeSet<&String> = table.columns.keys().collect();
         let known: BTreeMap<String, Uid> = r
@@ -282,8 +296,10 @@ fn resolve_columns(
     }
 }
 
-/// 表改名時，它底下所有欄位的參照也要一起改 —— 欄位的身份沒變，但它們的
-/// 限定名稱包含表名。漏掉這一步，下一次 diff 會把整張表的欄位看成全新的。
+/// When a table is renamed, every column reference beneath it has to move too:
+/// the columns' identities have not changed, but their qualified names contain
+/// the table name. Skip this and the next diff sees every column in the table as
+/// brand new.
 fn rename_table_in_ids(ids: &mut IdsFile, uid: &Uid, from: &TableName, to: &TableName) {
     ids.tables.insert(uid.clone(), to.clone());
     let moved: Vec<(Uid, ColumnRef)> = ids
@@ -320,10 +336,10 @@ fn drop_table_in_ids(ids: &mut IdsFile, uid: &Uid, table: &TableName, reason: &s
     }
 }
 
-/// 配一個不與現有身份衝突的 UID。
+/// Allocates a UID that does not collide with an existing identity.
 ///
-/// 碰撞極罕見，但「靜默重用同一個身份」會直接造成錯誤的改名判定，
-/// 所以寧可多檢查一次。
+/// Collisions are very rare, but silently reusing an identity would directly
+/// produce a wrong rename decision, so one extra check is worth it.
 fn fresh_uid(ids: &IdsFile, kind: UidKind) -> Uid {
     loop {
         let u = Uid::generate(kind);
@@ -336,7 +352,8 @@ fn fresh_uid(ids: &IdsFile, kind: UidKind) -> Uid {
     }
 }
 
-/// 輸出順序必須穩定，否則同樣的輸入會產生不同的計畫與診斷順序。
+/// Output order must be stable, or identical input would produce plans and
+/// diagnostics in differing orders.
 fn sort_resolution(r: &mut Resolution) {
     r.created_tables.sort();
     r.dropped_tables.sort();

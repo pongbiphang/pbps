@@ -1,6 +1,6 @@
 [package]
 name = "pbps-model"
-description = "PongBiphang Schema — 領域模型與狀態序列化"
+description = "PongBiphang Schema - domain model and state serialization"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
