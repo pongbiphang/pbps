@@ -20,7 +20,8 @@ Guidance for Claude working in this repo.
 - Do not attempt `x86_64-pc-windows-gnu`: rustup's mingw lacks a GNU assembler,
   so `windows-sys` (pulled by `clap` and `miette`) fails; `gnullvm` needs an
   external llvm-mingw. Details in README.
-- All three must pass before committing:
+- All three must pass before committing (a change touching only Markdown files
+  is exempt):
 
 ```bash
 cargo test --workspace

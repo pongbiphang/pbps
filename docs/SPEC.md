@@ -21,20 +21,25 @@ Compared with what exists:
 | Tool | Model | Gap |
 |---|---|---|
 | Flyway / Liquibase | Imperative | Verbose; the current schema is never visible at a glance; refactoring is hard |
-| Atlas | Declarative | Renames rest on heuristic detection and the generated migration needs hand-editing; HCL learning curve; OSS/Pro feature split |
+| Atlas | Declarative | Rename intent exists (`renamed_from`, v0.22+) but matches by name with no identity anchor, so two branches' renames can merge silently; HCL learning curve; SQL Server, saved-plan approval and drift detection sit behind the Pro plan and its cloud registry |
 | Skeema | Declarative | MySQL only |
 | DACPAC | Declarative | Tied to the SQL Server + Visual Studio ecosystem; rename and accidental-drop risk |
 
 `pbps` does not differentiate on "declarative" itself, but on four things:
 
-1. **Rename and drop intent is stated explicitly by a human**, recorded in version
-   control, never guessed
+1. **Rename and drop intent is stated once by a human and anchored to identity**:
+   the ids file records it against a uid, not a name, so conflicting intents on
+   two branches surface as git merge conflicts (see 5.3) instead of merging
+   silently — protection that name-matched annotations (Atlas's `renamed_from`)
+   cannot give
 2. **Changes are classified by risk**, and dangerous operations must be allowed
    explicitly at the command level
 3. **Saved plan plus checksum**: the reviewed plan is pinned, so apply does
-   neither more nor less
+   neither more nor less — as a free, file-based mechanism, with no cloud
+   registry in the loop
 4. **State and the audit ledger live in the database itself**, which supports
-   environments evolving independently as a matter of course
+   environments evolving independently as a matter of course — and keeps the
+   whole product usable air-gapped
 
 ### 1.2 What v1 covers
 
