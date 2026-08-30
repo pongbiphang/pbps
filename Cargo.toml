@@ -36,7 +36,6 @@ thiserror  = "2"
 anyhow     = "1"
 miette     = "7"
 clap       = { version = "4", features = ["derive"] }
-rand       = "0.9"
 indexmap   = { version = "2", features = ["serde"] }
 
 # YAML：見 docs/ADR-0001-yaml-crate.md。僅 pbps-load 可直接依賴，
