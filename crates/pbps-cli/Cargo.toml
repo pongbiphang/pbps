@@ -1,0 +1,25 @@
+[package]
+name = "pbps-cli"
+description = "PongBiphang Schema — 宣告式資料庫 schema 版控工具"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pbps"
+path = "src/main.rs"
+
+[dependencies]
+pbps-model.workspace = true
+pbps-config.workspace = true
+pbps-load.workspace = true
+pbps-diff.workspace = true
+pbps-dialect.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+miette = { workspace = true, features = ["fancy"] }
+
+[lints]
+workspace = true

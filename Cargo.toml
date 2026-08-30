@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pbps-model",
+    "crates/pbps-config",
+    "crates/pbps-load",
+    "crates/pbps-diff",
+    "crates/pbps-dialect",
+    "crates/pbps-cli",
+]
+
+# pbps-mssql / pbps-db 於 Phase 2 加入
+# pbps-pg 於 Phase 4 加入
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pongbiphang/pbps"
+authors = ["PongBiphang"]
+
+[workspace.dependencies]
+pbps-model   = { path = "crates/pbps-model" }
+pbps-config  = { path = "crates/pbps-config" }
+pbps-load    = { path = "crates/pbps-load" }
+pbps-diff    = { path = "crates/pbps-diff" }
+pbps-dialect = { path = "crates/pbps-dialect" }
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror  = "2"
+anyhow     = "1"
+miette     = "7"
+clap       = { version = "4", features = ["derive"] }
+rand       = "0.9"
+indexmap   = { version = "2", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# diff / emit 的正確性依賴窮舉比對，不允許用 `_ =>` 草草帶過
+wildcard_enum_match_arm = "warn"

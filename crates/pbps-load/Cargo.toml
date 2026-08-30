@@ -1,0 +1,17 @@
+[package]
+name = "pbps-load"
+description = "PongBiphang Schema — YAML 載入、診斷與正規化輸出"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+serde.workspace = true
+miette.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

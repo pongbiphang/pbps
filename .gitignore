@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# 本地連線設定，絕不進版控
+.env
+*.local.toml
+
+# 工具產物
+/plan.json
+/plan.sql

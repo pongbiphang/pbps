@@ -1,0 +1,15 @@
+[package]
+name = "pbps-dialect"
+description = "PongBiphang Schema — 方言抽象"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

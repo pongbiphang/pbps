@@ -1,0 +1,16 @@
+[package]
+name = "pbps-diff"
+description = "PongBiphang Schema — 宣告狀態比對與變更集"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+pbps-dialect.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
