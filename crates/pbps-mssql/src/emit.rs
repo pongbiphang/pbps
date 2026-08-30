@@ -421,7 +421,7 @@ fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, Dia
     Ok(match &pk.name {
         Some(n) => Statement::new(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n)?)),
         None => Statement::new(format!(
-            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL EXEC(N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@pk));",
+            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@pk);\n    EXEC(@sql);\nEND",
             literal(&q)
         ))
         .own_batch(),
@@ -437,7 +437,7 @@ fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, Dia
 fn drop_default_block(table: &TableName, column: &str) -> Result<String, DialectError> {
     let q = qualified(table)?;
     Ok(format!(
-        "DECLARE @df sysname = (\n    SELECT dc.name FROM sys.default_constraints dc\n      JOIN sys.columns c ON c.object_id = dc.parent_object_id\n                        AND c.column_id = dc.parent_column_id\n     WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {});\nIF @df IS NOT NULL EXEC(N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@df));",
+        "DECLARE @df sysname = (\n    SELECT dc.name FROM sys.default_constraints dc\n      JOIN sys.columns c ON c.object_id = dc.parent_object_id\n                        AND c.column_id = dc.parent_column_id\n     WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {});\nIF @df IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@df);\n    EXEC(@sql);\nEND",
         literal(&q),
         literal(column)
     ))

@@ -150,11 +150,14 @@ Phase 2 additions worth knowing before touching them:
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.
 
-**Phase 2 caveat**: introspection and the emitter have never run against a real
-SQL Server — the SPEC §11.5 Docker-based convergence tests (bootstrap ==
-introspect, apply(plan(A→B)) converges on B) are still owed. The catalog
-queries in `pbps-mssql/src/catalog.rs` are the untested surface; `assemble` and
-everything below it is covered.
+**Live tests**: the SPEC §11.5 invariants (bootstrap == introspect,
+apply(plan(A→B)) converges on B, pull warns rather than losing) run against a
+real SQL Server in Docker: `scripts/live-tests.sh`, or set `PBPS_TEST_DB` and
+`cargo test -p pbps-mssql --test live -- --ignored`. They are `#[ignore]`d so
+the ordinary suite stays offline; CI has a dedicated job. When touching the
+emitter or the catalog queries, run them — they caught two bugs the unit suite
+could not (FK ordering between two new tables; `EXEC()` rejecting function
+calls in its argument).
 
 **Phase 3 (next)**: `pbps-db` grows `__pbps_state` / locking; `apply`,
 `verify`, `snapshot`, the `--allow` gate, `plan --db`, rename impact

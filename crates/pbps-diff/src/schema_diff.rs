@@ -61,9 +61,19 @@ pub fn diff(
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
 
-    // Table present only in the base: dropped.
+    // Table present only in the base: dropped. Its foreign keys are dropped
+    // first as separate changes — two dropped tables that reference each other
+    // would otherwise fail or succeed depending on which DROP TABLE runs first.
     for (uid, name) in base_tables {
         if !declared_tables.contains_key(uid) {
+            if let Some(t) = base.schema.tables.get(name) {
+                for fk_name in t.foreign_keys.keys() {
+                    changes.push(Change::DropForeignKey {
+                        table: name.clone(),
+                        name: fk_name.clone(),
+                    });
+                }
+            }
             changes.push(Change::DropTable {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -71,15 +81,26 @@ pub fn diff(
         }
     }
 
-    // Table present only in the declarations: created.
+    // Table present only in the declarations: created. Foreign keys are split
+    // out of the CREATE into their own changes, because they sort after every
+    // CreateTable — a new table's FK may reference another new table, and
+    // within one ordering class the order of creation is not meaningful.
     for (uid, name) in declared_tables {
         if !base_tables.contains_key(uid)
             && let Some(t) = declared.schema.tables.get(name)
         {
+            let mut table = t.clone();
+            for (fk_name, fk) in std::mem::take(&mut table.foreign_keys) {
+                changes.push(Change::AddForeignKey {
+                    table: name.clone(),
+                    name: fk_name,
+                    constraint: Box::new(fk),
+                });
+            }
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
-                table: Box::new(t.clone()),
+                table: Box::new(table),
             });
         }
     }
@@ -130,7 +151,17 @@ pub fn diff(
             p.risks.insert(r);
         }
     }
-    planned.sort_by_key(|p| (order_key(&p.change), format!("{:?}", p.change)));
+    // The tiebreaker within an ordering class is the table name, then the
+    // change's rendering. Debug output alone would sort by uid, which is random
+    // at mint time — the plan would be correct but differently ordered per
+    // project, and a reviewer diffing two plan.sql files would see noise.
+    planned.sort_by_key(|p| {
+        (
+            order_key(&p.change),
+            p.change.table().to_string(),
+            format!("{:?}", p.change),
+        )
+    });
     Ok(ChangeSet { changes: planned })
 }
 
@@ -417,6 +448,90 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Found by the live convergence test: a new table's FK referenced another
+    /// new table, and whether the referenced CREATE ran first depended on the
+    /// random uid order. The FK must always come out as its own change, after
+    /// every CreateTable — from either direction of the reference.
+    #[test]
+    fn a_foreign_key_between_two_new_tables_sorts_after_both_creates() {
+        // Run it both ways round: customer -> region and region2 -> aaa. With
+        // the bug, one of the two directions fails depending on name order.
+        for (referencing, referenced) in [("dbo.customer", "dbo.region"), ("dbo.aaa", "dbo.zzz")] {
+            let mut fk_table = table(&[("other_id", Column::new(ty("int")))]);
+            fk_table.foreign_keys.insert(
+                "fk_link".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["other_id".into()],
+                    references_table: referenced.parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            let mut declared = schema_of(referencing, fk_table);
+            declared.tables.insert(
+                referenced.parse().unwrap(),
+                table(&[("id", Column::new(ty("int")).not_null())]),
+            );
+
+            let cs = run(&Schema::default(), &declared, &[]);
+            let ks = kinds(&cs);
+            assert_eq!(
+                ks,
+                ["CreateTable", "CreateTable", "AddForeignKey"],
+                "{referencing} -> {referenced}: {ks:?}"
+            );
+            // And the CreateTable no longer smuggles the FK along.
+            assert!(
+                cs.changes.iter().all(|p| match &p.change {
+                    Change::CreateTable { table, .. } => table.foreign_keys.is_empty(),
+                    _ => true,
+                }),
+                "the FK must not also ride inside the CREATE"
+            );
+        }
+    }
+
+    /// The mirror image: dropping two tables that reference each other must
+    /// shed the foreign keys before either DROP TABLE runs.
+    #[test]
+    fn foreign_keys_of_dropped_tables_are_dropped_before_the_tables() {
+        let mut fk_table = table(&[("other_id", Column::new(ty("int")))]);
+        fk_table.foreign_keys.insert(
+            "fk_link".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["other_id".into()],
+                references_table: "dbo.zzz".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let mut base = schema_of("dbo.aaa", fk_table);
+        base.tables.insert(
+            "dbo.zzz".parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+
+        let intents = [
+            Intent::DropTable {
+                table: "dbo.aaa".parse().unwrap(),
+                reason: "test".into(),
+            },
+            Intent::DropTable {
+                table: "dbo.zzz".parse().unwrap(),
+                reason: "test".into(),
+            },
+        ];
+        let cs = run(&base, &Schema::default(), &intents);
+        assert_eq!(
+            kinds(&cs),
+            ["DropForeignKey", "DropTable", "DropTable"],
+            "{:?}",
+            kinds(&cs)
+        );
     }
 
     #[test]

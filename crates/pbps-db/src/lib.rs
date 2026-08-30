@@ -69,4 +69,14 @@ impl Conn {
         let stream = self.client.simple_query(sql).await?;
         Ok(stream.into_first_result().await?)
     }
+
+    /// Runs one batch of statements and discards any results.
+    ///
+    /// This is `simple_query`, not `execute`: DDL is sent as a batch exactly the
+    /// way the emitter framed it, with no parameter machinery in the way.
+    pub async fn execute(&mut self, sql: &str) -> Result<(), DbError> {
+        let stream = self.client.simple_query(sql).await?;
+        stream.into_results().await?;
+        Ok(())
+    }
 }

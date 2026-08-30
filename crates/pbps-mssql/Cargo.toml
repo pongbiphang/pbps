@@ -13,5 +13,9 @@ pbps-dialect.workspace = true
 pbps-db.workspace = true
 tiberius.workspace = true
 
+[dev-dependencies]
+pbps-diff.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true
