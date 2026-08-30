@@ -10,7 +10,7 @@
 pub mod identity;
 pub mod schema_diff;
 
-pub use identity::{Blocker, Context, Resolution, resolve};
+pub use identity::{Blocker, Context, Resolution, intent_is_absorbed, resolve};
 pub use schema_diff::{DiffError, Side, diff};
 
 #[cfg(test)]
@@ -343,6 +343,31 @@ mod tests {
         assert!(
             again.renamed_columns.is_empty(),
             "the rename must not be applied twice"
+        );
+    }
+
+    /// `pbps fmt` keeps or strips a `renamed_from` annotation on exactly this
+    /// predicate, so its two answers are pinned: pending stays, absorbed goes.
+    #[test]
+    fn an_intent_counts_as_absorbed_only_after_it_took_effect() {
+        let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
+        let intent = Intent::RenameColumn {
+            table: t("dbo.customer"),
+            from: "customer_name".into(),
+            to: "full_name".into(),
+        };
+        assert!(
+            !intent_is_absorbed(&intent, &ids),
+            "a pending rename must not count as absorbed, or fmt would strip it early"
+        );
+
+        let s = schema(&[("dbo.customer", &["id", "full_name"])]);
+        let after = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx())
+            .unwrap()
+            .ids;
+        assert!(
+            intent_is_absorbed(&intent, &after),
+            "once the ids file has the fact, the annotation is redundant"
         );
     }
 

@@ -386,6 +386,80 @@ fn fmt_normalises_and_check_mode_never_writes() {
     );
 }
 
+/// The split of side effects in SPEC §6.2: plan absorbs the annotation into the
+/// ids file but never touches the YAML; stripping the now-redundant line is
+/// fmt's job, and fmt must not strip one whose fact is not absorbed yet.
+#[test]
+fn fmt_strips_a_renamed_from_only_after_plan_absorbs_it() {
+    let d = Demo::new("strip");
+    d.table("table: dbo.t\ncolumns:\n  old_name: {type: nvarchar(50)}\n");
+    d.run(&["plan"]);
+    d.commit();
+
+    let annotated = "table: dbo.t\n\ncolumns:\n  new_name:\n    type: nvarchar(50)\n    renamed_from: old_name\n";
+    d.table(annotated);
+
+    // The intent is still pending: fmt must keep the annotation, or the rename
+    // would silently degrade into an ambiguity at the next plan.
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let kept = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(
+        kept.contains("renamed_from: old_name"),
+        "a pending annotation must survive fmt: {kept}"
+    );
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        std::fs::read_to_string(d.dir.join("schema/dbo.t.yml"))
+            .unwrap()
+            .contains("renamed_from"),
+        "plan must never rewrite the user's YAML"
+    );
+
+    // Absorbed now: fmt reports the file as non-canonical, then strips it.
+    assert_eq!(code(&d.run(&["fmt", "--check"])), 1);
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let stripped = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(
+        !stripped.contains("renamed_from"),
+        "an absorbed annotation is redundant and must be stripped: {stripped}"
+    );
+    assert!(stripped.contains("new_name"), "{stripped}");
+
+    // The stripped file still plans cleanly — the fact lives in the ids file.
+    assert_eq!(code(&d.run(&["plan", "--check"])), 0);
+}
+
+/// SPEC §5.3: two branches each add a same-named column, each hands out its own
+/// uid, and git auto-merges the two lines cleanly. validate is the only thing
+/// that can catch the result.
+#[test]
+fn validate_rejects_one_name_mapped_to_two_uids() {
+    let d = Demo::new("dupuid");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    assert_eq!(code(&d.run(&["validate"])), 0);
+
+    // Simulate the auto-merge: a second uid pointing at the same column name.
+    let mut ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    ids["columns"]["c_zzzzzz"] = serde_json::json!("dbo.t.id");
+    std::fs::write(d.ids_path(), ids.to_string()).unwrap();
+
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 1, "a scrambled identity file must fail validate");
+    let msg = stderr(&o);
+    assert!(
+        msg.contains("both point at"),
+        "the duplicate must be named: {msg}"
+    );
+    assert!(
+        msg.contains("decide which uid survives"),
+        "the user must be told the remedy, since no algorithm can pick: {msg}"
+    );
+}
+
 /// A file the tool writes must read back: a bare `no` is a boolean to YAML.
 #[test]
 fn fmt_quotes_scalars_that_yaml_would_misread() {

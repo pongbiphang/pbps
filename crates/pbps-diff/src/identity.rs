@@ -93,7 +93,7 @@ pub fn resolve(
     resolve_columns(declared, intents, ctx, &mut r, &mut blockers, &mut used);
 
     for (i, intent) in intents.iter().enumerate() {
-        if !used.contains(&i) && !already_satisfied(intent, &r.ids) {
+        if !used.contains(&i) && !intent_is_absorbed(intent, &r.ids) {
             blockers.push(Blocker::UnusedIntent {
                 intent: intent.clone(),
             });
@@ -108,7 +108,7 @@ pub fn resolve(
     }
 }
 
-/// Whether this intent has already taken effect.
+/// Whether this intent has already taken effect — its fact is in the ids file.
 ///
 /// Intents have to be idempotent. A `renamed_from` annotation stays in the
 /// declaration file after the identity file has been updated (only `pbps fmt`
@@ -118,7 +118,11 @@ pub fn resolve(
 /// The test is whether the world is already in the shape the intent asks for: for
 /// a rename, the target name exists and the source name does not; for a drop, the
 /// object is already gone from the identity file.
-fn already_satisfied(intent: &Intent, ids: &IdsFile) -> bool {
+///
+/// Public because `pbps fmt` shares this exact judgement: an annotation whose
+/// intent is absorbed is redundant and gets stripped, while a pending one must
+/// survive the rewrite (SPEC §6.2). Two definitions of "absorbed" would drift.
+pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile) -> bool {
     let has_column = |c: &ColumnRef| ids.columns.values().any(|v| v == c);
     let has_table = |t: &TableName| ids.tables.values().any(|v| v == t);
 

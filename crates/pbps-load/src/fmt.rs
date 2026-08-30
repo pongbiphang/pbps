@@ -20,7 +20,10 @@ use pbps_model::{Intent, PrimaryKey, Table, TableName};
 ///
 /// Renames in `intents` that concern this table are written back out as
 /// `renamed_from` annotations: they are one-shot input and do not live in the
-/// model, but rewriting the file must not lose them.
+/// model, but rewriting the file must not lose them. The caller decides which
+/// intents still belong in the file — `pbps fmt` passes only the ones not yet
+/// absorbed into the ids file, which is how a redundant annotation gets
+/// stripped (SPEC §6.2).
 pub fn render(name: &TableName, table: &Table, intents: &[Intent]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.to_string()));

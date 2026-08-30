@@ -25,7 +25,12 @@ pub enum IdsError {
     #[error("UID {uid} is both live and tombstoned; the identity file is corrupt")]
     LiveAndTombstoned { uid: Uid },
 
-    #[error("{a} and {b} both point at the name `{name}`")]
+    // The remedy is spelled out here because no algorithm can pick the survivor:
+    // this state usually comes from two branches adding a same-named object and
+    // git auto-merging the two lines cleanly (SPEC §5.3).
+    #[error(
+        "{a} and {b} both point at the name `{name}`; decide which uid survives and delete the other entry from the identity file"
+    )]
     DuplicateName { a: Uid, b: Uid, name: String },
 
     #[error("the prefix of {uid} does not match the section it appears in")]

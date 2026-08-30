@@ -91,7 +91,8 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phase 0 and Phase 1 complete.** 135 tests, zero clippy warnings.
+**Phase 0 and Phase 1 complete.** The test and clippy bar is in "Development
+environment" above; counts change too often to record here.
 
 Commands: `plan` (`--check` / `--since` / `--base` / `--out`), `validate`,
 `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`.

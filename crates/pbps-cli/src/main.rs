@@ -203,6 +203,10 @@ fn context() -> Context {
 
 fn cmd_validate(project: &Project) -> anyhow::Result<()> {
     let loaded = load(project)?;
+    // Identity consistency is validate's job too (SPEC §5.3): two branches each
+    // adding a same-named column merge cleanly at the line level — two uids, two
+    // lines — so no git conflict flags it, and only a check can.
+    let ids = read_ids(project)?;
     println!(
         "Declarations are valid: {} table(s), {} column(s).",
         loaded.schema.tables.len(),
@@ -213,6 +217,14 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
             .map(|t| t.columns.len())
             .sum::<usize>()
     );
+    if project.ids_file().exists() {
+        println!(
+            "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
+            ids.tables.len(),
+            ids.columns.len(),
+            ids.tombstones.len()
+        );
+    }
     Ok(())
 }
 
@@ -226,6 +238,12 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     let files = pbps_load::schema_files(&dir)
         .with_context(|| format!("cannot list `{}`", dir.display()))?;
 
+    // Stripping a redundant `renamed_from` is fmt's job, not plan's: plan writes
+    // only the ids file and never the user's YAML (SPEC §6.2). Redundancy is
+    // judged against the ids file, so it is read here — an annotation whose fact
+    // is not absorbed yet must survive the rewrite.
+    let ids = read_ids(project)?;
+
     let mut changed = Vec::new();
     for path in &files {
         let original = std::fs::read_to_string(path)
@@ -237,7 +255,13 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
 
-        let rendered = pbps_load::render(&loaded.name, &loaded.table, &loaded.intents);
+        let pending: Vec<_> = loaded
+            .intents
+            .iter()
+            .filter(|i| !pbps_diff::intent_is_absorbed(i, &ids))
+            .cloned()
+            .collect();
+        let rendered = pbps_load::render(&loaded.name, &loaded.table, &pending);
         if rendered == original {
             continue;
         }
