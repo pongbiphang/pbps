@@ -285,7 +285,7 @@ error: 1 個變更無法自動判定
 | 純新增欄位 / 表 / index | 否 | 無欄位消失，必定是 add |
 | 型別放寬（INT→BIGINT） | 否 | 安全變更 |
 | 型別窄化、加 NOT NULL、加 constraint | 否 | 意圖明確，但屬危險類別 |
-| 純刪除，同表無新增 | 否 | 必定是 drop，但屬破壞性類別 |
+| 純刪除，同表無新增 | **是**（要理由） | 操作上無歧義，但墓碑要回答稽核的「為什麼」，那是演算法生不出來的 |
 | **同表同時有消失與新增** | **是** | rename 或 drop+add，無法區分 |
 
 ### 7.2 風險類別
@@ -342,7 +342,7 @@ CREATE TABLE dbo.__pbps_state (
     kind          VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap
     git_sha       VARCHAR(40)    NULL,
     plan_checksum CHAR(64)       NULL,
-    state_json    NVARCHAR(MAX)  NOT NULL,   -- 整份 schema 快照
+    state_json    NVARCHAR(MAX)  NOT NULL,   -- 整份 schema 快照 + 當下的身份對照
     operator      NVARCHAR(128)  NOT NULL,
     reason        NVARCHAR(1000) NULL
 );
@@ -382,13 +382,26 @@ CREATE TABLE dbo.__pbps_lock (
 
 | 指令 | 用途 |
 |---|---|
-| `pbps plan` | 比對 YAML ↔ ids 檔，產出 plan.json / plan.sql，解決意圖歧義 |
+| `pbps plan` | 解析身份歧義、更新身份檔，並比對基準產出變更計畫 |
+| `pbps plan --base <檔案>` | 改用狀態快照檔當基準（沒有 git 的環境） |
+| `pbps fmt` / `fmt --check` | 正規化宣告檔格式 |
 | `pbps plan --check` | CI 模式：僅在「意圖缺失」時失敗，不 prompt |
 | `pbps fmt` | 正規化宣告檔格式 |
 | `pbps rename` / `rename-table` / `drop` | 記錄意圖到 ids 檔 |
 | `pbps validate` | 靜態檢查（型別合法性、FK 目標存在、命名規則） |
 
 `plan` 不需要資料庫，是刻意的設計：**正式環境不可直連時，開發者仍能在本地完整作業**。
+
+基準來源的優先序：
+
+1. `--base <檔案>`：明確指定的狀態快照。**不自動讀也不自動寫** —— 它是逃生口，
+   給沒有 git 的環境（export 式簽出、air-gapped 壓縮檔），不是第二套要維護的產物。
+2. git 的某一版（`--since`，預設 `HEAD`）。基準是什麼一目了然。
+3. 空基準，並大聲警告 —— 所有東西都會被列成新建，被誤當成真實計畫很危險。
+
+**離線算出的一律是預覽。** 真正要套用到某個環境的計畫，必須以該環境資料庫的實查
+狀態為基準（Phase 3）。身份檔只存 uid → 名稱，推導不出型別變更；屬性比對一定要有
+一個帶著完整狀態的基準。
 
 ### 9.2 需要資料庫連線
 

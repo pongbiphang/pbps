@@ -96,18 +96,25 @@ rename 是 rename）。型別窄化需要比較型別，由帶著 `Dialect` 的 
 
 ## 目前進度
 
-**Phase 0 完成**：workspace、`pbps-model`（7 模組 46 測試）、`Dialect` trait、
-YAML crate 定案、CI matrix。
+**Phase 0、Phase 1 完成。** 135 個測試、clippy 零警告。
 
-**Phase 1（下一步）**：純檔案層，不碰資料庫。
-- `pbps-load`：YAML → model，錯誤要帶 miette span（`serde-saphyr` 的
-  `Spanned<T>` 給 `offset + len`，可直接建 `SourceSpan`）
-- `pbps-load`：`fmt` 正規化輸出，含上面說的引號規則
-- `pbps-diff`：ids 檔讀寫、以 UID 為準的比對、歧義偵測
-- 意圖三管道：CLI 指令 / YAML 暫時性註記 / 互動 prompt
-- `pbps plan`、`plan --check`、`validate`
+可用的指令：`plan`（含 `--check` / `--since` / `--base` / `--out`）、`validate`、
+`fmt`（含 `--check`）、`rename`、`rename-table`、`drop`、`drop-table`。
 
-Phase 1 結束就能產出 `plan.sql` 給人工執行 —— 第一個真正可用的形態。
+Phase 1 實作時改掉的原規格決定（SPEC 已同步）：
 
-後續：Phase 2 MSSQL emitter + `pbps pull`；Phase 3 apply/state/ledger；
-Phase 4 PostgreSQL。
+1. **比對用兩側身份檔以 uid 配對**，不用「名稱 + 本次意圖」。後者在跳版部署下
+   會壞：環境落後五版時，當初那則意圖早就不在工作區了。
+2. **刪除也要求理由**。原規格說純刪除無歧義、不需意圖，但墓碑要回答稽核的
+   「為什麼」，演算法生不出來。
+3. **意圖必須冪等**。宣告檔裡的 `renamed_from` 在身份檔更新後仍會留著，
+   若判成「對不上的意圖」，使用者會在一次成功的改名後看到莫名的失敗。
+4. **`StateSnapshot` 含 `ids`**。狀態與身份必須成對，理由同 1。
+5. **IDENTITY 變更明確擋下**，它無法用 ALTER 修改。
+
+**Phase 1 尚未做的**：互動式 prompt（TTY 時的第三個意圖管道）。CLI 指令與
+YAML 註記兩條路都能用，非互動是必須支援的路徑，所以這一項不阻塞任何事。
+
+**Phase 2（下一步）**：`pbps-mssql` 的型別正規化、風險判定、SQL emitter、
+introspection，以及 `pbps pull`（從既有資料庫反向生成宣告檔 —— 這是採用門檻的
+關鍵）。`pbps-dialect::MinimalDialect` 是測試用的替身，Phase 2 要換成真的。
