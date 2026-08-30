@@ -1,0 +1,10 @@
+C:\Users\lll86_rwunuof\python\test\pbps\spikes\yaml-span\target\debug\deps\marked_yaml-12e6c626af85abcf.d: C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\lib.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\loader.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\types.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\spanned_serde.rs
+
+C:\Users\lll86_rwunuof\python\test\pbps\spikes\yaml-span\target\debug\deps\libmarked_yaml-12e6c626af85abcf.rlib: C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\lib.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\loader.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\types.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\spanned_serde.rs
+
+C:\Users\lll86_rwunuof\python\test\pbps\spikes\yaml-span\target\debug\deps\libmarked_yaml-12e6c626af85abcf.rmeta: C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\lib.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\loader.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\types.rs C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\spanned_serde.rs
+
+C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\lib.rs:
+C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\loader.rs:
+C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\types.rs:
+C:\Users\lll86_rwunuof\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\marked-yaml-0.8.0\src\spanned_serde.rs:

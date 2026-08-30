@@ -95,12 +95,12 @@ description: 客戶主檔
 columns:
   customer_id:
     type: bigint
-    null: false
+    nullable: false
     identity: [1, 1]
 
   full_name:
     type: nvarchar(100)
-    null: false
+    nullable: false
     description: 客戶全名
 
   email:
@@ -108,12 +108,12 @@ columns:
 
   balance:
     type: bigint
-    null: false
+    nullable: false
     default: 0
 
   created_at:
     type: datetime2(3)
-    null: false
+    nullable: false
     default: SYSUTCDATETIME()
 
   legacy_code:
@@ -144,10 +144,11 @@ indexes:
 ### 4.3 格式規則
 
 - **columns 是 map 不是 list**，key 即欄位名。少一層巢狀，且天然禁止重複命名。
-- **`null` 預設 `true`**，只在需要時寫。
+- **`nullable` 預設 `true`**，只在需要時寫。欄位名不能用 `null` —— 那是 YAML 的空值字面量，見 [ADR-0001](ADR-0001-yaml-crate.md)。
 - **`type` 使用方言原生型別字串**，工具負責正規化（`INT` / `int` / `integer` 視為同一型別）。
 - **`deprecated` 只需一句原因**，日期由 git 提供，不用手寫。
 - **註解只能寫在 `description` 欄位**。工具擁有檔案格式，`pbps fmt` 會正規化重寫，一般 YAML 註解會遺失。`description` 同時作為資料目錄整合的來源。
+- **`pbps fmt` 輸出字串純量時必須加引號**，涵蓋布林類字面量（`true`/`false`/`yes`/`no`/`on`/`off`）、空值類（`null`/`~`）與數字狀字串。否則工具寫出的檔案下次讀取時會變成別的型別。
 
 ### 4.4 欄位生命週期
 
@@ -240,7 +241,7 @@ pbps drop dbo.customer.national_id --reason "REG-2026-042 PII 刪除要求"
 columns:
   full_name:
     type: nvarchar(100)
-    null: false
+    nullable: false
     renamed_from: customer_name    # 暫時性：被 pbps plan 吸收後自動移除
 ```
 
@@ -503,7 +504,7 @@ pub trait Dialect {
 | 診斷 | `miette` | 帶 source span 的錯誤訊息；Phase 1 的產品體驗核心 |
 | 錯誤 | `thiserror`（lib）/ `anyhow`（bin） | |
 | 序列化 | `serde` + `serde_json` | ids/state 需正規化輸出：`BTreeMap`、固定排序 |
-| YAML | **待定** | `serde_yaml` 已停止維護；候選 `serde_yaml_ng` / `saphyr` 系列。**選擇標準：錯誤必須帶行號 span** |
+| YAML | `serde-saphyr` | 已定案，見 [ADR-0001](ADR-0001-yaml-crate.md)。錯誤帶 `offset + len` span、自帶原始碼片段、內建重複 key 偵測。MSRV 因此為 1.89 |
 | 互動 prompt | `dialoguer` 或 `inquire` | |
 | 測試 | `insta` | snapshot 測 AST、診斷輸出、生成的 SQL |
 
@@ -541,7 +542,7 @@ Phase 0 設計 `Dialect` trait 時**必須同時考慮 PostgreSQL**（即使不�
 
 ## 13. 已知的未解問題
 
-1. **YAML crate 選型未定** —— `serde_yaml` 已停止維護。替代品的錯誤訊息是否帶行號 span 直接決定 Phase 1 的使用體驗，需在 Phase 0 實測後定案。
+1. **`serde-saphyr` 的供應鏈風險** —— 已選定（[ADR-0001](ADR-0001-yaml-crate.md)），但它是年輕的單一維護者 crate。緩解方式是架構上已有的隔離：只有 `pbps-load` 直接依賴它。需持續觀察維護狀況。
 
 2. **大表 ALTER 的執行策略** —— ONLINE 選項、分批、離峰排程屬執行期決策，diff 推不出來。可能方向：表層級的 `strategy:` 標注，或允許 plan.sql 在 MR 階段人工編修後再 apply。
 

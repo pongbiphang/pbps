@@ -9,13 +9,16 @@ members = [
     "crates/pbps-cli",
 ]
 
+# spike：Phase 0 的 YAML crate 選型驗證，定案後移除
+exclude = ["spikes/yaml-span"]
+
 # pbps-mssql / pbps-db 於 Phase 2 加入
 # pbps-pg 於 Phase 4 加入
 
 [workspace.package]
 version = "0.0.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.89"   # serde-saphyr 的要求，見 docs/ADR-0001
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pongbiphang/pbps"
 authors = ["PongBiphang"]
@@ -35,6 +38,10 @@ miette     = "7"
 clap       = { version = "4", features = ["derive"] }
 rand       = "0.9"
 indexmap   = { version = "2", features = ["serde"] }
+
+# YAML：見 docs/ADR-0001-yaml-crate.md。僅 pbps-load 可直接依賴，
+# 其餘 crate 一律透過 pbps-load，讓日後替換是有界的工作。
+serde-saphyr = "1.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 pbps-model.workspace = true
 serde.workspace = true
+serde-saphyr.workspace = true
 miette.workspace = true
 thiserror.workspace = true
 

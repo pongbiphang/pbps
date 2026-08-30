@@ -1,0 +1,13 @@
+[package]
+name = "yaml-span-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Phase 0 spike：驗證候選 YAML crate 的 span / 診斷能力。
+# 定案後整個 spikes/yaml-span 目錄移除。
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "1.2"
+marked-yaml = { version = "0.8", features = ["serde"] }
