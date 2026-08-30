@@ -282,6 +282,13 @@ Two branches doing different things to one column both edit the same uid's line 
 the ids file, which is a **git merge conflict** and stops right there. No separate
 "referential integrity between annotations" checking rules are needed.
 
+There is one hole a line-level conflict does not catch: two branches **each add a
+column with the same name**. Each hands out a different random uid, the two land
+on different lines of the ids file, and git will likely auto-merge them cleanly —
+leaving two uids pointing at one name, a silently corrupted identity mapping.
+`validate` therefore must include the rule: **one name may not map to more than
+one uid**. On violation it fails and asks a human to decide which uid survives.
+
 ---
 
 ## 6. Expressing intent
@@ -308,12 +315,21 @@ columns:
   full_name:
     type: nvarchar(100)
     nullable: false
-    renamed_from: customer_name    # transient: removed once pbps plan absorbs it
+    renamed_from: customer_name    # transient: pbps plan absorbs it into the ids
+                                   # file; pbps fmt strips it once redundant
 ```
 
-`pbps plan` reads it, writes the fact into the ids file and removes the line from
-the YAML. This is the escape hatch for **an editor and nothing else**, and it does
-not accumulate in the files.
+`pbps plan` reads it and writes the fact into the ids file. This is the escape
+hatch for **an editor and nothing else**.
+
+The side effects are deliberately split: **`plan` writes only the ids file** (a
+tool-owned artifact) and **never rewrites the user's YAML**. Removing the
+annotation line is `pbps fmt`'s job — a `renamed_from` whose fact is already in
+the ids file is redundant, and canonicalization strips it. An annotation left in
+place is harmless: one that agrees with the ids file is a no-op, not an error
+(intent is idempotent). `plan --check` in CI is strictly read-only; when an
+annotation exists whose fact is not yet in the ids file, it fails with a
+copy-pastable instruction (run `pbps plan` locally, commit the ids file).
 
 ### 6.3 Interactive prompt
 
@@ -371,22 +387,44 @@ The criterion is **whether this kind of change can fail at all**; data is not re
 to decide whether this particular run happens to be safe. Data-level validation is
 a runtime concern and outside the declarative layer's responsibility.
 
-### 7.3 Saved plan plus checksum
+### 7.3 Saved plan plus checksum: two layers of review
+
+Review happens twice, and the two layers answer different questions:
+
+| Layer | What is reviewed | What it answers |
+|---|---|---|
+| MR | The YAML diff, the ids diff (intent), and an offline plan.sql **preview** | Do we want this change at all? |
+| Deployment | plan.json + plan.sql computed against the target environment as queried | On that environment's current state, what exactly will run? |
 
 ```
-pbps plan  -> plan.json (the change list plus a checksum of the state it was
-                         computed against)
-              plan.sql  (human-readable, attached to the MR for review)
+pbps plan --db $ENV -> plan.json (the change list plus a checksum of the state it
+                                  was computed against)
+                       plan.sql  (human-readable, for the deployment gate's approver)
 
-pbps apply --plan plan.json --allow rename,destructive
+pbps apply --db $ENV --plan plan.json --allow rename,destructive
 ```
 
 `apply` first verifies that the database's current checksum still equals the
 baseline the plan was computed against, and aborts otherwise — the drift check.
 
+**The checksum pins "the plan approved at the deployment gate" to "what actually
+runs" — not the MR to the apply.** Jump-version deploys (prod five versions
+behind) are the norm; the plan computed at deployment time naturally covers the
+merged diff of every skipped version, and intent surviving in the ids file is
+precisely what makes that possible. A plan computed offline (without `--db`) is
+always a preview and is never accepted by `apply`.
+
 Because the change set is pinned by checksum, a coarse flag like `--allow` is
-safe: **what gets approved is exactly the plan reviewed in the MR, no more and no
-less**. The flag lives in the CI configuration, in plain sight and auditable.
+safe: **what gets approved is exactly the plan approved at the deployment gate,
+no more and no less**. The flag lives in the CI configuration, in plain sight and
+auditable.
+
+plan.sql is the emitter's output and **is never hand-edited** — that would
+destroy both the checksum guarantee and "SQL appears exactly once, in the
+emitter". Customizing execution goes through the declaration layer's `strategy:`
+annotation (see open question 2); anything that genuinely needs manual handling
+uses the escape hatch that already exists: a DBA runs the SQL, then
+`pbps baseline`.
 
 ### 7.4 Rename impact report
 
@@ -409,6 +447,23 @@ Server stores definition text and `sp_rename` **does not**. That is exactly why
 Impact outside the database — applications, reports, downstream ELT — is invisible
 to the tool; a checklist is printed and attached to the MR for a human to sign
 off.
+
+### 7.5 The execution model of `apply`
+
+**One plan, one transaction, all or nothing.** Almost all MSSQL DDL can run
+inside a transaction; on failure everything rolls back, the environment is
+unchanged, the ledger records the failed attempt, and the drift check stays
+clean. Two supporting rules:
+
+- The emitter marks every `Statement` as transactional or not. A plan containing
+  a statement that cannot run inside a transaction (certain ONLINE operations,
+  full-text, ...) **fails at plan time**, asking for it to be split into its own
+  deployment — rather than being discovered halfway through an apply.
+- Before executing the first statement, `apply` runs pre-flight checks (a
+  connection is guaranteed at this point): the rename impact queries and the
+  SCHEMABINDING check happen here. Whatever is going to blow up should blow up
+  **before** anything has run, filling in the information an offline plan cannot
+  see.
 
 ---
 
@@ -443,6 +498,18 @@ answer "what did this table look like three months ago?". `pbps state prune --ke
 
 `__pbps_lock` stops two pipelines applying at once.
 
+**Trust model**: `__pbps_state` protects against mistakes and process disorder,
+**not** against deliberate tampering by someone with DDL rights — whoever can
+change the schema by hand can change this table too. The real audit baseline is
+git (intent, plans, MR approvals) plus the CI logs; the in-database ledger is
+that environment's operational record. Permissions should reflect this: **only
+the dedicated deployment account may write `__pbps_state` / `__pbps_lock`**, and
+human accounts get read-only — which also answers the access-control question
+for `baseline`: it must run under the pipeline identity. If tamper-evidence is
+ever needed, apply / baseline can additionally emit each ledger entry to an
+append-only destination outside the database (a CI artifact, a webhook), and the
+two records must agree.
+
 ### 8.2 The drift check
 
 Before `apply`: query `sys.columns` / `INFORMATION_SCHEMA`, compare against the
@@ -450,6 +517,26 @@ newest `state_json` row, and abort on any mismatch, asking for manual
 reconciliation.
 
 What this catches is somebody having SSHed in and changed the schema by hand.
+
+**The scope of the comparison is the managed set**: the tables that appear in the
+declarations (with their columns, constraints and indexes) plus `__pbps_state`
+itself. Other objects in the same database are ignored by default — which is what
+lets pbps coexist with existing tooling in one database, the precondition for
+gradual adoption. Teams that want whole-database control tune it with
+`unmanaged: ignore | warn | error` in `pbps.yml`, and scope can also be drawn at
+the schema level (manage `dbo` only).
+
+**Expressions (check / default / index WHERE) are never parsed; the database
+itself is the normalizer.** Immediately after a successful apply, the tool reads
+the definition back and stores the dialect's stored form (MSSQL's
+`([balance]>=(0))`) in `state_json`. Both sides of the drift check — the live
+query and `state_json` — are then in the database's normalized space, and `==`
+holds directly. That is the hottest path and the one that must not produce false
+positives. The declaration-versus-baseline comparison (the differ's side) uses a
+lightweight best-effort normalization supplied by the `Dialect` (whitespace,
+redundant parentheses, `[]`, case); anything still different after normalization
+is treated as a constraint change and emitted as drop+add — the cost of a false
+positive is rebuilding one constraint, which is cheap and idempotent.
 
 ### 8.3 Two ways out of drift
 
@@ -475,7 +562,7 @@ reason, operator and timestamp in the ledger.
 | `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
-| `pbps validate` | Static checks: type validity, FK targets exist, naming rules |
+| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still do the whole job locally**.
@@ -502,6 +589,7 @@ full state.
 | Command | Purpose |
 |---|---|
 | `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
+| `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3) |
 | `pbps verify` | The drift check: the live database against `__pbps_state` |
 | `pbps apply --plan plan.json --allow ...` | Apply a plan |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
@@ -513,12 +601,20 @@ full state.
 "I already have a database". Without it, the cost of adoption is transcribing two
 hundred tables by hand.
 
+**The onboarding workflow**: `pull` designates one **source-of-truth environment**
+(usually prod — the one piece of reality that must not be broken) and generates
+the declarations and the ids file from it. Then diff against every other
+environment to lay the divergences out, deciding per environment whether to
+"plan / apply it into agreement with the declarations" or "this environment's
+difference is right, fold it back into the declarations". Onboarding is done when
+every environment has been `snapshot`ted and drifts by nothing.
+
 ---
 
 ## 10. The CI/CD flow
 
 ```yaml
-stages: [check, plan, verify, apply, record]
+stages: [check, preview, verify, plan, apply, record]
 
 check:
   script:
@@ -526,15 +622,22 @@ check:
     - pbps validate
     - pbps fmt --check
 
-plan:
+preview:                         # the MR layer: offline, for review only
   script:
-    - pbps plan --out plan.json --sql plan.sql
+    - pbps plan --out preview.json --sql preview.sql
   artifacts:
-    paths: [plan.json, plan.sql]   # plan.sql is attached to the MR for review
+    paths: [preview.sql]         # attached to the MR: "do we want this change?"
 
 verify:
   script:
     - pbps verify --db "$PROD_CONN"
+  only: [/^prod-v.*$/]
+
+plan:                            # the deployment layer: baselined on the target
+  script:                        # environment as queried
+    - pbps plan --db "$PROD_CONN" --out plan.json --sql plan.sql
+  artifacts:
+    paths: [plan.json, plan.sql] # what the gate's approver actually reads
   only: [/^prod-v.*$/]
 
 apply:
@@ -552,7 +655,8 @@ record:
 **The deployment stage requires no human judgement at all.** Rename and drop
 intent was resolved and committed to git when the developer wrote the MR; at tag
 time CI merely follows instructions. `when: manual` is an approval gate, not a
-decision point.
+decision point — what the approver confirms is the deployment-layer plan.sql,
+the concrete plan for that specific environment (the two layers of 7.3).
 
 ---
 
@@ -676,8 +780,11 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
 
 2. **The execution strategy for ALTER on large tables** — ONLINE options,
    batching and off-peak scheduling are runtime decisions that a diff cannot
-   derive. Possible directions: a table-level `strategy:` annotation, or allowing
-   plan.sql to be hand-edited during the MR before being applied.
+   derive. The direction is a table-level `strategy:` annotation: the declaration
+   layer gives the hint, and SQL is still generated only in the emitter.
+   Hand-editing plan.sql has been **ruled out** — it destroys both the checksum
+   guarantee and "SQL appears exactly once" (see 7.3); genuinely manual cases go
+   through a DBA running the SQL plus `pbps baseline`.
 
 3. **Coordinating application and database deployment timing** — zero-downtime
    usually needs schema changes and application versions staggered. The tool does
@@ -685,8 +792,10 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    when" controllable. Multi-stage flows such as expand → dual-write → backfill →
    contract span several deployments and are currently unsupported.
 
-4. **Access control for `baseline`** — who may run it, and how it hooks into
-   GitLab approvals, is still to be designed.
+4. **Access control for `baseline`** — the direction is settled: only the
+   dedicated deployment account may write `__pbps_state` / `__pbps_lock` (see the
+   trust model in 8.1), so `baseline` must run under the pipeline identity. The
+   concrete hookup to GitLab approvals is Phase 3 design work.
 
 5. **Data transformation (backfill)** — explicitly out of scope for now (see 1.3).
    If a repeating pattern accumulates, a hook mechanism can be designed against
