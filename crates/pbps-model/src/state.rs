@@ -4,6 +4,7 @@
 //! 原因：dev / staging / prod 各自記得自己的狀態，落後幾版都不需要任何
 //! artifact 傳遞或環境對照策略。
 
+use crate::ids::IdsFile;
 use crate::schema::Schema;
 
 pub const CURRENT_VERSION: u32 = 1;
@@ -29,8 +30,14 @@ pub struct StateSnapshot {
     pub version: u32,
     pub kind: StateKind,
 
-    /// 實查資料庫得到的 schema
+    /// 該環境實際的 schema
     pub schema: Schema,
+
+    /// 這份狀態當下的身份對照。
+    ///
+    /// 少了它，落後好幾版的環境就無法用 uid 與現行宣告配對，改名會退化成
+    /// 「刪除加新增」—— 也就是掉資料。狀態與身份必須一起存。
+    pub ids: IdsFile,
 
     /// 產生此狀態的 commit。`None` 用於在版控之外執行的 baseline。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,11 +55,12 @@ pub struct StateSnapshot {
 }
 
 impl StateSnapshot {
-    pub fn new(kind: StateKind, schema: Schema, operator: impl Into<String>) -> Self {
+    pub fn new(kind: StateKind, schema: Schema, ids: IdsFile, operator: impl Into<String>) -> Self {
         Self {
             version: CURRENT_VERSION,
             kind,
             schema,
+            ids,
             git_sha: None,
             plan_checksum: None,
             operator: operator.into(),
@@ -69,6 +77,7 @@ impl StateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::IdsFile;
     use crate::name::TableName;
     use crate::schema::{Column, Table};
     use crate::types::ColumnType;
@@ -93,13 +102,23 @@ mod tests {
 
     #[test]
     fn identical_schema_is_not_drift() {
-        let snap = StateSnapshot::new(StateKind::Apply, schema_with("nvarchar(255)"), "leon");
+        let snap = StateSnapshot::new(
+            StateKind::Apply,
+            schema_with("nvarchar(255)"),
+            IdsFile::default(),
+            "leon",
+        );
         assert!(snap.matches(&schema_with("nvarchar(255)")));
     }
 
     #[test]
     fn any_difference_is_drift() {
-        let snap = StateSnapshot::new(StateKind::Apply, schema_with("nvarchar(255)"), "leon");
+        let snap = StateSnapshot::new(
+            StateKind::Apply,
+            schema_with("nvarchar(255)"),
+            IdsFile::default(),
+            "leon",
+        );
         assert!(
             !snap.matches(&schema_with("nvarchar(100)")),
             "型別改變應為 drift"
@@ -110,13 +129,23 @@ mod tests {
     /// 大小寫差異不該被當成 drift，否則每次 introspect 都可能誤報。
     #[test]
     fn type_case_is_not_drift() {
-        let snap = StateSnapshot::new(StateKind::Apply, schema_with("NVARCHAR(255)"), "leon");
+        let snap = StateSnapshot::new(
+            StateKind::Apply,
+            schema_with("NVARCHAR(255)"),
+            IdsFile::default(),
+            "leon",
+        );
         assert!(snap.matches(&schema_with("nvarchar(255)")));
     }
 
     #[test]
     fn version_is_recorded() {
-        let snap = StateSnapshot::new(StateKind::Baseline, Schema::default(), "leon");
+        let snap = StateSnapshot::new(
+            StateKind::Baseline,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains(r#""version":1"#));
         assert!(json.contains(r#""kind":"baseline""#));
@@ -124,7 +153,12 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let mut snap = StateSnapshot::new(StateKind::Apply, schema_with("bigint"), "leon");
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            schema_with("bigint"),
+            IdsFile::default(),
+            "leon",
+        );
         snap.git_sha = Some("bd4be74".into());
         snap.plan_checksum = Some("abc123".into());
         let back: StateSnapshot =

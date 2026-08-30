@@ -83,7 +83,7 @@ pub fn resolve(
     resolve_columns(declared, intents, ctx, &mut r, &mut blockers, &mut used);
 
     for (i, intent) in intents.iter().enumerate() {
-        if !used.contains(&i) {
+        if !used.contains(&i) && !already_satisfied(intent, &r.ids) {
             blockers.push(Blocker::UnusedIntent {
                 intent: intent.clone(),
             });
@@ -95,6 +95,28 @@ pub fn resolve(
         Ok(r)
     } else {
         Err(blockers)
+    }
+}
+
+/// 這則意圖是不是「已經生效了」。
+///
+/// 意圖必須是冪等的。宣告檔中的 `renamed_from` 註記在身份檔更新後仍會留在
+/// 檔案裡（要等 `pbps fmt` 才清掉），若把它當成對不上的意圖報錯，使用者會在
+/// 一次成功的改名之後看到一個莫名其妙的失敗。
+///
+/// 判斷方式是看世界是否已經處於這則意圖想要的樣子：改名的目標名稱已存在且
+/// 來源名稱已不存在、或刪除的對象已經不在身份檔中。
+fn already_satisfied(intent: &Intent, ids: &IdsFile) -> bool {
+    let has_column = |c: &ColumnRef| ids.columns.values().any(|v| v == c);
+    let has_table = |t: &TableName| ids.tables.values().any(|v| v == t);
+
+    match intent {
+        Intent::RenameTable { from, to } => has_table(to) && !has_table(from),
+        Intent::RenameColumn { table, from, to } => {
+            has_column(&table.column(to)) && !has_column(&table.column(from))
+        }
+        Intent::DropTable { table, .. } => !has_table(table),
+        Intent::DropColumn { column, .. } => !has_column(column),
     }
 }
 

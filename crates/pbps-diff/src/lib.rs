@@ -296,6 +296,41 @@ mod tests {
         );
     }
 
+    /// 意圖必須冪等：改名成功之後，宣告檔裡還留著的 renamed_from 註記
+    /// 不該讓下一次執行失敗。
+    #[test]
+    fn an_already_applied_intent_is_not_an_error() {
+        let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
+        let s = schema(&[("dbo.customer", &["id", "full_name"])]);
+        let intent = Intent::RenameColumn {
+            table: t("dbo.customer"),
+            from: "customer_name".into(),
+            to: "full_name".into(),
+        };
+        let after = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx())
+            .unwrap()
+            .ids;
+
+        // 註記還留在檔案裡，再跑一次
+        let again = resolve(&s, &after, std::slice::from_ref(&intent), &ctx()).unwrap();
+        assert!(again.renamed_columns.is_empty(), "不該重複改名");
+    }
+
+    #[test]
+    fn an_already_applied_drop_is_not_an_error() {
+        let (_, ids) = baseline(&[("dbo.customer", &["id", "gone"])]);
+        let s = schema(&[("dbo.customer", &["id"])]);
+        let intent = Intent::DropColumn {
+            column: "dbo.customer.gone".parse().unwrap(),
+            reason: "REG-1".into(),
+        };
+        let after = resolve(&s, &ids, std::slice::from_ref(&intent), &ctx())
+            .unwrap()
+            .ids;
+        resolve(&s, &after, std::slice::from_ref(&intent), &ctx())
+            .expect("已生效的刪除意圖不該報錯");
+    }
+
     // ---- 不變式 ----
 
     /// 解析後的身份檔必須自洽，否則下一次比對會建立在壞掉的基準上。

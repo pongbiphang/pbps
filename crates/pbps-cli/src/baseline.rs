@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pbps_config::Project;
-use pbps_model::Schema;
+use pbps_model::{IdsFile, Schema, StateSnapshot};
 
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -28,8 +28,12 @@ pub enum Source {
 }
 
 /// 基準狀態，連同一句給人看的來源說明。
+///
+/// 身份對照與狀態必須成對 —— 少了 ids 就無法用 uid 配對，改名會退化成
+/// 刪除加新增。
 pub struct Baseline {
     pub schema: Schema,
+    pub ids: IdsFile,
     pub description: String,
     /// 空基準要提醒使用者，否則「全部都是新建」會被誤讀成真實計畫。
     pub is_empty_fallback: bool,
@@ -40,10 +44,11 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
         Source::File(path) => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("無法讀取基準檔 `{}`：{e}", path.display()))?;
-            let schema: Schema = serde_json::from_str(&text)
+            let snap: StateSnapshot = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("基準檔 `{}` 格式錯誤：{e}", path.display()))?;
             Ok(Baseline {
-                schema,
+                schema: snap.schema,
+                ids: snap.ids,
                 description: format!("基準檔 {}", path.display()),
                 is_empty_fallback: false,
             })
@@ -51,6 +56,7 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
         Source::Git { rev } => load_from_git(project, rev),
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
+            ids: IdsFile::default(),
             description: "空基準".into(),
             is_empty_fallback: true,
         }),
@@ -78,15 +84,32 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         .map_err(|e| anyhow::anyhow!("這裡不是 git 工作區，請改用 --base 指定基準檔：{e}"))?;
     let toplevel = PathBuf::from(toplevel.trim());
 
-    // git 的路徑以 repo 根目錄為基準，宣告檔目錄則相對於專案根目錄。
-    let schema_dir = project.schema_dir();
-    let abs = std::fs::canonicalize(&schema_dir).unwrap_or(schema_dir.clone());
-    let rel = abs.strip_prefix(&toplevel).unwrap_or(&abs);
-    let rel = rel.to_string_lossy().replace('\\', "/");
+    // 全新的 repo 還沒有任何 commit，HEAD 解析不了。這不是錯誤，
+    // 只是「還沒有前一版」—— 退回空基準並說清楚。
+    if git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_err()
+    {
+        return Ok(Baseline {
+            schema: Schema::default(),
+            ids: IdsFile::default(),
+            description: format!("空基準（`{rev}` 尚不存在，這個 repo 還沒有 commit）"),
+            is_empty_fallback: true,
+        });
+    }
 
-    let listing = git(root, &["ls-tree", "-r", "--name-only", rev, "--", &rel]).map_err(|e| {
-        anyhow::anyhow!("無法讀取 `{rev}` 的 `{rel}`：{e}")
-    })?;
+    // git 的路徑以 repo 根目錄為基準，宣告檔目錄則相對於專案根目錄。
+    let rel = relative_to(&toplevel, &project.schema_dir());
+
+    let listing = git(root, &["ls-tree", "-r", "--name-only", rev, "--", &rel])
+        .map_err(|e| anyhow::anyhow!("無法讀取 `{rev}` 的 `{rel}`：{e}"))?;
 
     let mut schema = Schema::default();
     let mut count = 0usize;
@@ -110,11 +133,30 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         }
     }
 
+    // 身份檔要取同一版的 —— 用現行的身份檔當基準會讓改名看不出來。
+    let ids_rel = relative_to(&toplevel, &project.ids_file());
+    let ids = match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("`{rev}` 中的身份檔格式錯誤：{e}"))?,
+        // 第一次執行時該版本還沒有身份檔，空的即可。
+        Err(_) => IdsFile::default(),
+    };
+
     Ok(Baseline {
         schema,
+        ids,
         description: format!("git {rev}（{count} 張表）"),
         is_empty_fallback: count == 0,
     })
+}
+
+/// 把路徑轉成相對於 repo 根目錄的形式 —— git 的路徑參數以根目錄為基準。
+fn relative_to(toplevel: &Path, path: &Path) -> String {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    abs.strip_prefix(toplevel)
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
