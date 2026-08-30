@@ -1,146 +1,111 @@
-//! 屬性比對：在身份已經對應好之後，找出同一個東西的哪些屬性變了。
+//! 變更計畫：比對兩個「狀態 + 身份」組合，產出變更集。
+//!
+//! # 為什麼兩邊都要帶身份檔
+//!
+//! 配對「哪個欄位是哪個欄位」不能靠名稱 —— 改名會讓名稱在兩邊對不上。也不能
+//! 靠本次的意圖註記，因為部署可能落後很多版：prod 停在 v1、宣告已經到 v5 時，
+//! 當初那則改名意圖早就不在工作區裡了。
+//!
+//! 因此兩邊各自帶著自己的身份檔，用 **uid** 配對：基準的 ids 說
+//! `c_x → customer_name`、宣告的 ids 說 `c_x → full_name`，一比就是改名，
+//! 一步到位，不需要沿著名稱鏈逐版回推（SPEC §4.2 要解決的正是這件事）。
 //!
 //! # 基準是誰
 //!
-//! `base` 是「目前實際上長什麼樣」。它可能來自資料庫實查（Phase 3），也可能
-//! 來自版控中的前一版宣告（離線預覽）。這一層不在意來源，只做純粹的比對 ——
-//! 這正是它能同時服務兩種情境的原因。
-//!
-//! # 為什麼身份要先解析好
-//!
-//! 「同一個東西」不能靠名稱判斷，改名會讓名稱在兩邊對不上。因此本函式吃的是
-//! [`Resolution`]，由它提供 uid 層級的對應，這裡只負責比屬性。
+//! `base` 可能來自版控中的前一版（離線預覽），也可能來自資料庫實查
+//! （Phase 3 的權威計畫）。這一層不在意來源，只做純粹的比對。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use pbps_dialect::Dialect;
-use pbps_model::{Change, ChangeSet, ColumnRef, PlannedChange, Schema, Table, TableName};
-
-use crate::identity::Resolution;
+use pbps_model::{
+    Change, ChangeSet, ColumnRef, ColumnType, IdsFile, PlannedChange, Schema, Table, TableName, Uid,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
-    /// IDENTITY 屬性在多數資料庫中無法用 ALTER 修改，必須重建整張表。
+    /// IDENTITY 在多數資料庫中無法用 ALTER 修改，必須重建整張表。
     /// 這超出宣告式自動化的範圍，得由人決定遷移策略。
     #[error("{column} 的 IDENTITY 屬性改變了，但 IDENTITY 無法用 ALTER 修改")]
     IdentityChangeUnsupported { column: ColumnRef },
 }
 
-/// 比對兩份 schema，產出變更集。
+/// 一側的完整輸入：狀態加上它自己的身份對照。
+#[derive(Debug, Clone, Copy)]
+pub struct Side<'a> {
+    pub schema: &'a Schema,
+    pub ids: &'a IdsFile,
+}
+
+/// 比對基準與宣告，產出變更集。
 ///
 /// 目前**不比對 `description`**：它只影響資料目錄的說明文字，不影響結構，
-/// 而寫入 extended property 是 Phase 5 的範圍。
+/// 寫入 extended property 屬於 Phase 5。
 pub fn diff(
-    base: &Schema,
-    declared: &Schema,
-    res: &Resolution,
+    base: Side<'_>,
+    declared: Side<'_>,
     dialect: &dyn Dialect,
 ) -> Result<ChangeSet, Vec<DiffError>> {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
 
-    let created: BTreeSet<&TableName> = res.created_tables.iter().map(|(_, n)| n).collect();
-    let dropped: BTreeSet<&TableName> = res.dropped_tables.iter().map(|(_, n)| n).collect();
+    let base_tables = &base.ids.tables;
+    let declared_tables = &declared.ids.tables;
 
-    for (uid, from, to) in &res.renamed_tables {
-        changes.push(Change::RenameTable {
-            uid: uid.clone(),
-            from: from.clone(),
-            to: to.clone(),
-        });
+    // 表只在基準 → 刪除
+    for (uid, name) in base_tables {
+        if !declared_tables.contains_key(uid) {
+            changes.push(Change::DropTable {
+                uid: uid.clone(),
+                name: name.clone(),
+            });
+        }
     }
 
-    for (uid, name) in &res.created_tables {
-        if let Some(table) = declared.tables.get(name) {
+    // 表只在宣告 → 新建
+    for (uid, name) in declared_tables {
+        if !base_tables.contains_key(uid)
+            && let Some(t) = declared.schema.tables.get(name)
+        {
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
-                table: Box::new(table.clone()),
+                table: Box::new(t.clone()),
             });
         }
     }
 
-    for (uid, name) in &res.dropped_tables {
-        changes.push(Change::DropTable {
-            uid: uid.clone(),
-            name: name.clone(),
-        });
-    }
-
-    for (uid, from, to) in &res.renamed_columns {
-        changes.push(Change::RenameColumn {
-            uid: uid.clone(),
-            table: to.table.clone(),
-            from: from.name.clone(),
-            to: to.name.clone(),
-        });
-    }
-
-    // 新建表的欄位已包含在 CreateTable 裡，不再重複；
-    // 已刪除表的欄位同理由 DropTable 帶走。
-    for (uid, col) in &res.added_columns {
-        if created.contains(&col.table) {
+    // 表兩邊都在 → 可能改名，並且要比內容
+    for (uid, declared_name) in declared_tables {
+        let Some(base_name) = base_tables.get(uid) else {
             continue;
-        }
-        if let Some(c) = declared
-            .tables
-            .get(&col.table)
-            .and_then(|t| t.columns.get(&col.name))
-        {
-            changes.push(Change::AddColumn {
+        };
+        if base_name != declared_name {
+            changes.push(Change::RenameTable {
                 uid: uid.clone(),
-                table: col.table.clone(),
-                name: col.name.clone(),
-                column: Box::new(c.clone()),
+                from: base_name.clone(),
+                to: declared_name.clone(),
             });
         }
-    }
-
-    for (uid, col) in &res.dropped_columns {
-        if dropped.contains(&col.table) {
-            continue;
-        }
-        changes.push(Change::DropColumn {
-            uid: uid.clone(),
-            column: col.clone(),
-        });
-    }
-
-    // 改名對照：宣告檔中的欄位 → 它在基準中的名稱
-    let renamed_back: BTreeMap<&ColumnRef, &ColumnRef> = res
-        .renamed_columns
-        .iter()
-        .map(|(_, from, to)| (to, from))
-        .collect();
-    let table_renamed_back: BTreeMap<&TableName, &TableName> = res
-        .renamed_tables
-        .iter()
-        .map(|(_, from, to)| (to, from))
-        .collect();
-    let added: BTreeSet<&ColumnRef> = res.added_columns.iter().map(|(_, c)| c).collect();
-
-    for (name, table) in &declared.tables {
-        if created.contains(name) {
-            continue;
-        }
-        let base_name = table_renamed_back.get(name).copied().unwrap_or(name);
-        let Some(base_table) = base.tables.get(base_name) else {
+        let (Some(base_table), Some(declared_table)) = (
+            base.schema.tables.get(base_name),
+            declared.schema.tables.get(declared_name),
+        ) else {
             continue;
         };
 
         diff_columns(
-            name,
+            base,
+            declared,
             base_name,
+            declared_name,
             base_table,
-            table,
-            &renamed_back,
-            &added,
-            res,
+            declared_table,
             dialect,
             &mut changes,
             &mut errs,
         );
-        diff_constraints(name, base_table, table, &mut changes);
+        diff_constraints(declared_name, base_table, declared_table, &mut changes);
     }
 
     if !errs.is_empty() {
@@ -148,7 +113,6 @@ pub fn diff(
     }
 
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
-    // 加上需要方言知識才能判定的風險
     for p in &mut planned {
         if let Change::AlterColumnType { from, to, .. } = &p.change
             && let Some(r) = dialect.type_change_risk(from, to).risk_class()
@@ -160,81 +124,109 @@ pub fn diff(
     Ok(ChangeSet { changes: planned })
 }
 
+/// 屬於某張仍存在的表、且兩邊都有的欄位：比屬性。
 #[allow(clippy::too_many_arguments)]
 fn diff_columns(
-    name: &TableName,
-    base_name: &TableName,
+    base: Side<'_>,
+    declared: Side<'_>,
+    base_table_name: &TableName,
+    declared_table_name: &TableName,
     base_table: &Table,
-    table: &Table,
-    renamed_back: &BTreeMap<&ColumnRef, &ColumnRef>,
-    added: &BTreeSet<&ColumnRef>,
-    res: &Resolution,
+    declared_table: &Table,
     dialect: &dyn Dialect,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
-    for (col_name, col) in &table.columns {
-        let ref_new = name.column(col_name);
-        if added.contains(&ref_new) {
-            continue;
-        }
-        let base_col_name = renamed_back
-            .get(&ref_new)
-            .map(|r| r.name.clone())
-            .unwrap_or_else(|| col_name.clone());
-        let Some(base_col) = base_table.columns.get(&base_col_name) else {
+    let base_cols = columns_of(base.ids, base_table_name);
+    let declared_cols = columns_of(declared.ids, declared_table_name);
+
+    for (uid, declared_ref) in &declared_cols {
+        let Some(base_ref) = base_cols.get(uid) else {
+            // 只在宣告側 → 新增欄位
+            if let Some(c) = declared_table.columns.get(&declared_ref.name) {
+                changes.push(Change::AddColumn {
+                    uid: uid.clone(),
+                    table: declared_table_name.clone(),
+                    name: declared_ref.name.clone(),
+                    column: Box::new(c.clone()),
+                });
+            }
             continue;
         };
 
-        let uid = match res.ids.column_uid(&ref_new) {
-            Some(u) => u.clone(),
-            None => continue,
+        if base_ref.name != declared_ref.name {
+            changes.push(Change::RenameColumn {
+                uid: uid.clone(),
+                table: declared_table_name.clone(),
+                from: base_ref.name.clone(),
+                to: declared_ref.name.clone(),
+            });
+        }
+
+        let (Some(base_col), Some(col)) = (
+            base_table.columns.get(&base_ref.name),
+            declared_table.columns.get(&declared_ref.name),
+        ) else {
+            continue;
         };
 
         if base_col.identity != col.identity {
             errs.push(DiffError::IdentityChangeUnsupported {
-                column: ref_new.clone(),
+                column: declared_ref.clone(),
             });
         }
 
-        let normalised =
-            |t: &pbps_model::ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
-        let (from_ty, to_ty) = (normalised(&base_col.ty), normalised(&col.ty));
+        let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
+        let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
         if from_ty != to_ty {
             changes.push(Change::AlterColumnType {
                 uid: uid.clone(),
-                column: ref_new.clone(),
+                column: declared_ref.clone(),
                 from: from_ty,
                 to: to_ty,
             });
         }
-
         if base_col.nullable != col.nullable {
             changes.push(Change::AlterColumnNullability {
                 uid: uid.clone(),
-                column: ref_new.clone(),
+                column: declared_ref.clone(),
                 to_nullable: col.nullable,
             });
         }
-
         if base_col.default != col.default {
             changes.push(Change::AlterColumnDefault {
                 uid: uid.clone(),
-                column: ref_new.clone(),
+                column: declared_ref.clone(),
                 from: base_col.default.clone(),
                 to: col.default.clone(),
             });
         }
-
         if base_col.deprecated != col.deprecated {
             changes.push(Change::SetColumnDeprecated {
-                uid,
-                column: ref_new.clone(),
+                uid: uid.clone(),
+                column: declared_ref.clone(),
                 reason: col.deprecated.clone(),
             });
         }
     }
-    let _ = base_name;
+
+    // 只在基準側 → 刪除欄位
+    for (uid, base_ref) in &base_cols {
+        if !declared_cols.contains_key(uid) {
+            changes.push(Change::DropColumn {
+                uid: uid.clone(),
+                column: base_ref.clone(),
+            });
+        }
+    }
+}
+
+fn columns_of(ids: &IdsFile, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
+    ids.columns
+        .iter()
+        .filter(|(_, c)| &c.table == table)
+        .map(|(u, c)| (u.clone(), c.clone()))
+        .collect()
 }
 
 /// 約束與索引一律以名稱比對，且不做原地修改 —— 資料庫本身也是 drop + add，
@@ -248,83 +240,39 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         });
     }
 
-    for (n, c) in &declared.unique {
-        if base.unique.get(n) != Some(c) {
-            if base.unique.contains_key(n) {
-                changes.push(Change::DropUnique {
+    macro_rules! by_name {
+        ($field:ident, $add:ident, $drop:ident, $wrap:expr) => {
+            for (n, c) in &declared.$field {
+                if base.$field.get(n) != Some(c) {
+                    if base.$field.contains_key(n) {
+                        changes.push(Change::$drop {
+                            table: name.clone(),
+                            name: n.clone(),
+                        });
+                    }
+                    changes.push(Change::$add {
+                        table: name.clone(),
+                        name: n.clone(),
+                        constraint: $wrap(c.clone()),
+                    });
+                }
+            }
+            for n in base
+                .$field
+                .keys()
+                .filter(|n| !declared.$field.contains_key(*n))
+            {
+                changes.push(Change::$drop {
                     table: name.clone(),
                     name: n.clone(),
                 });
             }
-            changes.push(Change::AddUnique {
-                table: name.clone(),
-                name: n.clone(),
-                constraint: c.clone(),
-            });
-        }
-    }
-    for n in base
-        .unique
-        .keys()
-        .filter(|n| !declared.unique.contains_key(*n))
-    {
-        changes.push(Change::DropUnique {
-            table: name.clone(),
-            name: n.clone(),
-        });
+        };
     }
 
-    for (n, c) in &declared.foreign_keys {
-        if base.foreign_keys.get(n) != Some(c) {
-            if base.foreign_keys.contains_key(n) {
-                changes.push(Change::DropForeignKey {
-                    table: name.clone(),
-                    name: n.clone(),
-                });
-            }
-            changes.push(Change::AddForeignKey {
-                table: name.clone(),
-                name: n.clone(),
-                constraint: Box::new(c.clone()),
-            });
-        }
-    }
-    for n in base
-        .foreign_keys
-        .keys()
-        .filter(|n| !declared.foreign_keys.contains_key(*n))
-    {
-        changes.push(Change::DropForeignKey {
-            table: name.clone(),
-            name: n.clone(),
-        });
-    }
-
-    for (n, c) in &declared.checks {
-        if base.checks.get(n) != Some(c) {
-            if base.checks.contains_key(n) {
-                changes.push(Change::DropCheck {
-                    table: name.clone(),
-                    name: n.clone(),
-                });
-            }
-            changes.push(Change::AddCheck {
-                table: name.clone(),
-                name: n.clone(),
-                constraint: c.clone(),
-            });
-        }
-    }
-    for n in base
-        .checks
-        .keys()
-        .filter(|n| !declared.checks.contains_key(*n))
-    {
-        changes.push(Change::DropCheck {
-            table: name.clone(),
-            name: n.clone(),
-        });
-    }
+    by_name!(unique, AddUnique, DropUnique, std::convert::identity);
+    by_name!(foreign_keys, AddForeignKey, DropForeignKey, Box::new);
+    by_name!(checks, AddCheck, DropCheck, std::convert::identity);
 
     for (n, ix) in &declared.indexes {
         if base.indexes.get(n) != Some(ix) {
@@ -355,8 +303,8 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
 
 /// 套用順序。
 ///
-/// 改名排最前面，讓後續所有步驟都能用現行名稱；約束與索引的移除要早於欄位
-/// 移除（它們可能參照到那些欄位），而新增則要晚於欄位新增。
+/// 改名排最前面，讓後續步驟都能用現行名稱；約束與索引的移除要早於欄位移除
+/// （它們可能參照到那些欄位），新增則要晚於欄位新增。
 fn order_key(c: &Change) -> u8 {
     match c {
         Change::RenameTable { .. } | Change::RenameColumn { .. } => 0,
@@ -379,7 +327,6 @@ fn order_key(c: &Change) -> u8 {
         | Change::AddIndex { .. } => 8,
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
@@ -417,13 +364,26 @@ mod tests {
         s
     }
 
-    /// 建立基準：先讓身份檔認識 `base`，再對 `declared` 解析身份、比對屬性。
+    /// 重現真實流程：基準側的身份檔來自那一版，宣告側的身份檔是解析後的結果。
     fn run(base: &Schema, declared: &Schema, intents: &[Intent]) -> ChangeSet {
-        let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
-        let res = crate::resolve(declared, &ids, intents, &ctx()).unwrap();
-        diff(base, declared, &res, &MinimalDialect).unwrap()
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+        )
+        .unwrap()
     }
 
     fn kinds(cs: &ChangeSet) -> Vec<String> {
@@ -656,15 +616,91 @@ mod tests {
         });
         let want = schema_of("dbo.t", table(&[("a", c)]));
 
-        let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
-        let res = crate::resolve(&want, &ids, &[], &ctx()).unwrap();
-        let err = diff(&base, &want, &res, &MinimalDialect).unwrap_err();
+        let declared_ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+        let err = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &want,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+        )
+        .unwrap_err();
         assert!(matches!(
             err[0],
             DiffError::IdentityChangeUnsupported { .. }
         ));
+    }
+
+    /// 跳版部署：這是整個 uid 配對設計的理由。
+    ///
+    /// prod 停在 v1，宣告已經演進到 v3，中間發生過改名。當初那則意圖早就不在
+    /// 工作區裡了 —— 但兩邊的身份檔都記著同一個 uid，所以改名依然判得出來，
+    /// 而且是一步到位，不需要沿著 v1→v2→v3 的名稱鏈回推。
+    #[test]
+    fn a_rename_is_detected_across_many_versions() {
+        let v1 = schema_of(
+            "dbo.t",
+            table(&[("customer_name", Column::new(ty("nvarchar(50)")))]),
+        );
+        let v1_ids = crate::resolve(&v1, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+
+        // v2：改名。意圖只在這一版存在。
+        let v2 = schema_of(
+            "dbo.t",
+            table(&[("full_name", Column::new(ty("nvarchar(50)")))]),
+        );
+        let v2_ids = crate::resolve(
+            &v2,
+            &v1_ids,
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "customer_name".into(),
+                to: "full_name".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+
+        // v3：只是加長欄位。沒有任何意圖。
+        let v3 = schema_of(
+            "dbo.t",
+            table(&[("full_name", Column::new(ty("nvarchar(200)")))]),
+        );
+        let v3_ids = crate::resolve(&v3, &v2_ids, &[], &ctx()).unwrap().ids;
+
+        // 對停在 v1 的環境套用 v3：不提供任何意圖。
+        let cs = diff(
+            Side {
+                schema: &v1,
+                ids: &v1_ids,
+            },
+            Side {
+                schema: &v3,
+                ids: &v3_ids,
+            },
+            &MinimalDialect,
+        )
+        .unwrap();
+
+        assert_eq!(
+            kinds(&cs),
+            ["RenameColumn", "AlterColumnType"],
+            "跳版時改名仍須被判定為改名，而不是刪除加新增"
+        );
+        assert!(
+            !cs.risks().contains(&RiskClass::Destructive),
+            "絕不能變成掉資料的計畫"
+        );
     }
 
     /// 同樣的輸入必須產生同樣順序的計畫，否則 plan 的 checksum 會不穩定。

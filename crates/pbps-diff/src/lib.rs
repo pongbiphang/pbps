@@ -9,7 +9,7 @@ pub mod identity;
 pub mod schema_diff;
 
 pub use identity::{Blocker, Context, Resolution, resolve};
-pub use schema_diff::{DiffError, diff};
+pub use schema_diff::{DiffError, Side, diff};
 
 #[cfg(test)]
 // 測試中用 catch-all 搭配 panic 來表達「不該走到這裡」是恰當的；

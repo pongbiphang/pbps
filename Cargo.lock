@@ -381,6 +381,7 @@ dependencies = [
  "pbps-diff",
  "pbps-load",
  "pbps-model",
+ "serde_json",
 ]
 
 [[package]]
