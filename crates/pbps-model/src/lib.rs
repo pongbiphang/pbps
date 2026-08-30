@@ -20,6 +20,7 @@
 
 pub mod change;
 pub mod ids;
+pub mod intent;
 pub mod name;
 pub mod schema;
 pub mod state;
@@ -28,6 +29,7 @@ pub mod uid;
 
 pub use change::{Change, ChangeSet, PlannedChange, RiskClass};
 pub use ids::{IdsFile, Tombstone};
+pub use intent::Intent;
 pub use name::{ColumnRef, NameError, TableName};
 pub use schema::{
     CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,

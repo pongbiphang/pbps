@@ -7,29 +7,12 @@ use serde_saphyr::Spanned;
 use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
-    Table, TableName, UniqueConstraint,
+    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Intent,
+    PrimaryKey, Table, TableName, UniqueConstraint,
 };
 
 use crate::dto::{PrimaryKeyDto, TableDto};
 use crate::error::{LoadError, SourceFile, to_span};
-
-/// 需要人給定、且只在本次變更中有效的意圖（SPEC §6）。
-///
-/// 這些不進領域模型：`Schema` 必須滿足「兩份語意相同的 schema 一定相等」，
-/// 混入一次性註記會讓同一個狀態因為註記有無而不相等。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Intent {
-    RenameTable {
-        from: TableName,
-        to: TableName,
-    },
-    RenameColumn {
-        table: TableName,
-        from: String,
-        to: String,
-    },
-}
 
 /// 一份宣告檔的載入結果。
 #[derive(Debug, Clone, PartialEq, Eq)]

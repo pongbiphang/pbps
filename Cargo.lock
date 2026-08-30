@@ -404,6 +404,7 @@ dependencies = [
 name = "pbps-diff"
 version = "0.0.0"
 dependencies = [
+ "indexmap",
  "pbps-dialect",
  "pbps-model",
  "thiserror",

@@ -12,8 +12,9 @@ use std::path::Path;
 
 use pbps_model::{Schema, TableName};
 
-pub use convert::{Intent, LoadedTable};
+pub use convert::LoadedTable;
 pub use error::{LoadError, Semantic, SourceFile};
+pub use pbps_model::Intent;
 
 /// 整個 `schema/` 目錄的載入結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

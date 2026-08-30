@@ -12,5 +12,8 @@ pbps-model.workspace = true
 pbps-dialect.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+indexmap.workspace = true
+
 [lints]
 workspace = true
