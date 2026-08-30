@@ -7,6 +7,7 @@
 pub mod convert;
 pub mod dto;
 pub mod error;
+pub mod fmt;
 
 use std::path::Path;
 
@@ -14,6 +15,7 @@ use pbps_model::{Schema, TableName};
 
 pub use convert::LoadedTable;
 pub use error::{LoadError, Semantic, SourceFile};
+pub use fmt::render;
 pub use pbps_model::Intent;
 
 /// 整個 `schema/` 目錄的載入結果。
@@ -88,6 +90,16 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     } else {
         Err(errs)
     }
+}
+
+/// 列出目錄下所有宣告檔，順序穩定。
+///
+/// `fmt` 需要逐檔處理，不能用 [`load_schema_dir`] 合併後的結果。
+pub fn schema_files(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    collect_yaml_files(dir, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 
 fn collect_yaml_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {

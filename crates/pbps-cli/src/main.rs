@@ -48,6 +48,13 @@ enum Command {
     /// 只檢查宣告檔是否合法，不比對基準
     Validate,
 
+    /// 把宣告檔重寫成正規化格式
+    Fmt {
+        /// 只檢查，有檔案需要重寫就以非零退出（不修改任何檔案）
+        #[arg(long)]
+        check: bool,
+    },
+
     /// 記錄一次欄位改名
     Rename {
         /// 舊的完整欄位名，如 dbo.customer.customer_name
@@ -106,6 +113,7 @@ fn run() -> anyhow::Result<()> {
             cmd_plan(&project, &source, check, out.as_deref())
         }
         Command::Validate => cmd_validate(&project),
+        Command::Fmt { check } => cmd_fmt(&project, check),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
             cmd_intent(
@@ -198,6 +206,54 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
             .map(|t| t.columns.len())
             .sum::<usize>()
     );
+    Ok(())
+}
+
+/// 正規化所有宣告檔。
+///
+/// 這會重寫整份檔案，一般 YAML 註解因此會遺失 —— 說明文字要寫在
+/// `description` 欄位裡（SPEC §4.2「工具擁有檔案格式」）。
+fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
+    let dir = project.schema_dir();
+    let files =
+        pbps_load::schema_files(&dir).with_context(|| format!("無法列出 `{}`", dir.display()))?;
+
+    let mut changed = Vec::new();
+    for path in &files {
+        let original = std::fs::read_to_string(path)
+            .with_context(|| format!("無法讀取 `{}`", path.display()))?;
+        let loaded = pbps_load::load_table_str(path, &original).map_err(|errs| {
+            for e in &errs {
+                eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+            }
+            anyhow::anyhow!("`{}` 無法解析", path.display())
+        })?;
+
+        let rendered = pbps_load::render(&loaded.name, &loaded.table, &loaded.intents);
+        if rendered == original {
+            continue;
+        }
+        changed.push(path.clone());
+        if !check {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("無法寫入 `{}`", path.display()))?;
+        }
+    }
+
+    if changed.is_empty() {
+        println!("{} 個檔案都已是正規格式。", files.len());
+        return Ok(());
+    }
+
+    if check {
+        for p in &changed {
+            eprintln!("  需要重寫：{}", p.display());
+        }
+        bail!("有 {} 個檔案不是正規格式，請執行 `pbps fmt`", changed.len());
+    }
+    for p in &changed {
+        println!("已重寫 {}", p.display());
+    }
     Ok(())
 }
 

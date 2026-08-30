@@ -327,3 +327,39 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("新增欄位 extra"), "{}", stdout(&o));
 }
+
+#[test]
+fn fmt_normalises_and_check_mode_never_writes() {
+    let d = Demo::new("fmt");
+    let messy = "table:    dbo.t\ncolumns:\n  id: {type: BIGINT, nullable: false}\n";
+    d.table(messy);
+
+    let o = d.run(&["fmt", "--check"]);
+    assert_eq!(code(&o), 1, "未正規化的檔案應以非零退出");
+    assert_eq!(
+        std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
+        messy,
+        "--check 絕不可寫檔"
+    );
+
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let after = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(after.contains("type: bigint"), "型別應正規化：{after}");
+    assert_eq!(code(&d.run(&["fmt", "--check"])), 0, "重寫後應通過");
+}
+
+/// 工具寫出來的檔案必須讀得回來 —— 裸的 `no` 會被 YAML 讀成布林。
+#[test]
+fn fmt_quotes_scalars_that_yaml_would_misread() {
+    let d = Demo::new("quote");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, default: no, description: 0123}\n");
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+
+    let after = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(after.contains(r#"default: "no""#), "{after}");
+    assert!(after.contains(r#"description: "0123""#), "{after}");
+
+    // 讀得回來，而且值沒有變
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
