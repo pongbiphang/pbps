@@ -54,6 +54,17 @@ pub enum DialectError {
 
     #[error("the identifier `{0}` cannot be written into SQL safely")]
     UnquotableIdent(String),
+
+    /// A declaration that parses but that this dialect will not accept — a
+    /// primary key over a column that does not exist, an IDENTITY on a type that
+    /// cannot carry one. Distinct from [`DialectError::Unsupported`], which says
+    /// "this database has no such feature"; this one says "this database has the
+    /// feature, and you used it wrongly".
+    #[error("{dialect}: {message}")]
+    Invalid {
+        dialect: &'static str,
+        message: String,
+    },
 }
 
 /// How safe a type change is.
@@ -147,6 +158,41 @@ pub trait Dialect {
     /// a nullability change into two `ALTER COLUMN` statements, whereas SQL Server
     /// can merge them into one.
     fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError>;
+
+    /// The line that separates batches in a script for this dialect, if the
+    /// dialect has batches at all.
+    ///
+    /// `GO` for SQL Server; `None` for PostgreSQL, where a script is just a
+    /// sequence of statements. Used when rendering a plan into a script a human
+    /// can read or paste into their own tooling.
+    fn batch_separator(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Renders emitted statements as one script, honouring [`Statement::own_batch`].
+///
+/// This lives here rather than in the CLI because "what a runnable script looks
+/// like" is dialect knowledge — but only the separator differs per dialect, so
+/// the walk itself is shared.
+pub fn render_script(statements: &[Statement], separator: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut previous_own_batch = false;
+    for (i, s) in statements.iter().enumerate() {
+        if i > 0 {
+            if let Some(sep) = separator
+                && (s.own_batch || previous_own_batch)
+            {
+                out.push_str(sep);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(&s.sql);
+        out.push('\n');
+        previous_own_batch = s.own_batch;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -208,6 +254,24 @@ mod tests {
             d.type_change_risk(&ty("nvarchar(100)"), &ty("nvarchar(max)")),
             TypeChangeRisk::Safe
         );
+    }
+
+    /// An own-batch statement must be separated on both sides, and a dialect
+    /// with no separator must render plain statements.
+    #[test]
+    fn scripts_put_separators_around_own_batch_statements() {
+        let stmts = vec![
+            Statement::new("A;"),
+            Statement::new("B;").own_batch(),
+            Statement::new("C;"),
+            Statement::new("D;"),
+        ];
+        assert_eq!(
+            render_script(&stmts, Some("GO")),
+            "A;\nGO\n\nB;\nGO\n\nC;\n\nD;\n"
+        );
+        assert_eq!(render_script(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
+        assert_eq!(render_script(&[], Some("GO")), "");
     }
 
     #[test]

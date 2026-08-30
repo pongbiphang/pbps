@@ -17,6 +17,7 @@ pbps-config.workspace = true
 pbps-load.workspace = true
 pbps-diff.workspace = true
 pbps-dialect.workspace = true
+pbps-mssql.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 miette = { workspace = true, features = ["fancy"] }

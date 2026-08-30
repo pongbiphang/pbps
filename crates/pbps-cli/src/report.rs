@@ -7,7 +7,21 @@
 //! no idea what to type.
 
 use pbps_diff::Blocker;
-use pbps_model::{Change, ChangeSet, RiskClass};
+use pbps_model::{Change, ChangeSet, Intent, RiskClass};
+
+/// One intent in the user's own vocabulary.
+///
+/// `Debug` would do at a pinch, but this string is shown to someone who has never
+/// seen the `Intent` type — they wrote `renamed_from:` in a YAML file, or typed a
+/// `pbps rename`, and that is what they should be shown.
+pub fn intent(i: &Intent) -> String {
+    match i {
+        Intent::RenameTable { from, to } => format!("{to} renamed_from {from}"),
+        Intent::RenameColumn { table, from, to } => format!("{table}.{to} renamed_from {from}"),
+        Intent::DropTable { table, reason } => format!("drop table {table} (reason: {reason})"),
+        Intent::DropColumn { column, reason } => format!("drop column {column} (reason: {reason})"),
+    }
+}
 
 pub fn blockers(list: &[Blocker]) -> String {
     let mut out = String::new();
@@ -73,9 +87,10 @@ fn one_blocker(b: &Blocker) -> String {
         Blocker::DropTableNeedsReason { table } => format!(
             "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason \"<why>\"\n"
         ),
-        Blocker::UnusedIntent { intent } => {
+        Blocker::UnusedIntent { intent: i } => {
             format!(
-                "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {intent:?}\n"
+                "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n",
+                intent(i)
             )
         }
     }

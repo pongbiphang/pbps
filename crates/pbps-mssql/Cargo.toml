@@ -1,0 +1,15 @@
+[package]
+name = "pbps-mssql"
+description = "PongBiphang Schema - the Microsoft SQL Server dialect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+pbps-dialect.workspace = true
+
+[lints]
+workspace = true

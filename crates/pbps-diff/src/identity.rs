@@ -123,8 +123,8 @@ pub fn resolve(
 /// intent is absorbed is redundant and gets stripped, while a pending one must
 /// survive the rewrite (SPEC §6.2). Two definitions of "absorbed" would drift.
 pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile) -> bool {
-    let has_column = |c: &ColumnRef| ids.columns.values().any(|v| v == c);
-    let has_table = |t: &TableName| ids.tables.values().any(|v| v == t);
+    let has_column = |c: &ColumnRef| ids.column_uid(c).is_some();
+    let has_table = |t: &TableName| ids.table_uid(t).is_some();
 
     match intent {
         Intent::RenameTable { from, to } => has_table(to) && !has_table(from),

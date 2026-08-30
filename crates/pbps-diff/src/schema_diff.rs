@@ -188,18 +188,23 @@ fn diff_columns(
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        // A type change subsumes a nullability change rather than sitting beside
+        // one: `ALTER COLUMN` restates the whole definition, so two changes would
+        // mean two statements where the second undoes half of the first.
         if from_ty != to_ty {
             changes.push(Change::AlterColumnType {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 from: from_ty,
                 to: to_ty,
+                from_nullable: base_col.nullable,
+                to_nullable: col.nullable,
             });
-        }
-        if base_col.nullable != col.nullable {
+        } else if base_col.nullable != col.nullable {
             changes.push(Change::AlterColumnNullability {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
+                ty: to_ty,
                 to_nullable: col.nullable,
             });
         }

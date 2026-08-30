@@ -381,6 +381,7 @@ dependencies = [
  "pbps-diff",
  "pbps-load",
  "pbps-model",
+ "pbps-mssql",
  "serde_json",
 ]
 
@@ -431,6 +432,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "pbps-mssql"
+version = "0.0.0"
+dependencies = [
+ "pbps-dialect",
+ "pbps-model",
 ]
 
 [[package]]

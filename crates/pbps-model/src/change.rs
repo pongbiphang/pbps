@@ -130,10 +130,27 @@ pub enum Change {
         column: ColumnRef,
         from: ColumnType,
         to: ColumnType,
+        /// Nullability before and after, carried even when it is not what
+        /// changed.
+        ///
+        /// `ALTER COLUMN` restates the entire column definition, and SQL Server
+        /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
+        /// emitted without the nullability silently drops a `NOT NULL`. The
+        /// differ therefore never emits a separate
+        /// [`Change::AlterColumnNullability`] beside a type change on the same
+        /// column, and carrying both ends keeps the `not-null` risk derivable
+        /// from the change alone.
+        from_nullable: bool,
+        to_nullable: bool,
     },
     AlterColumnNullability {
         uid: Uid,
         column: ColumnRef,
+        /// The column's type, unchanged, restated for the same reason
+        /// [`Change::AlterColumnType`] carries the nullability: `ALTER COLUMN`
+        /// takes a whole column definition, and there is no way to say "keep the
+        /// type, change only this".
+        ty: ColumnType,
         /// Whether the column is nullable after the change.
         to_nullable: bool,
     },
@@ -237,6 +254,11 @@ impl Change {
             }
             Change::AlterColumnNullability {
                 to_nullable: false, ..
+            }
+            | Change::AlterColumnType {
+                from_nullable: true,
+                to_nullable: false,
+                ..
             } => {
                 r.insert(RiskClass::NotNull);
             }
@@ -368,16 +390,13 @@ mod tests {
     /// to be distinguished.
     #[test]
     fn nullability_risk_is_directional() {
-        let tighten = Change::AlterColumnNullability {
+        let make = |to_nullable| Change::AlterColumnNullability {
             uid: uid("c_k7x2mq"),
             column: col("dbo.customer.email"),
-            to_nullable: false,
+            ty: ty("nvarchar(255)"),
+            to_nullable,
         };
-        let loosen = Change::AlterColumnNullability {
-            uid: uid("c_k7x2mq"),
-            column: col("dbo.customer.email"),
-            to_nullable: true,
-        };
+        let (tighten, loosen) = (make(false), make(true));
         assert!(tighten.intrinsic_risks().contains(&RiskClass::NotNull));
         assert!(loosen.intrinsic_risks().is_empty());
     }
@@ -391,6 +410,8 @@ mod tests {
             column: col("dbo.customer.balance"),
             from: ty("bigint"),
             to: ty("int"),
+            from_nullable: true,
+            to_nullable: true,
         };
         assert!(
             c.intrinsic_risks().is_empty(),
@@ -399,6 +420,30 @@ mod tests {
 
         let planned = PlannedChange::new(c).with_risk(RiskClass::Narrowing);
         assert!(planned.risks.contains(&RiskClass::Narrowing));
+    }
+
+    /// A type change that also tightens nullability carries the not-null risk:
+    /// the differ folds the two into one change, and folding must not lose the
+    /// risk that the separate change would have carried.
+    #[test]
+    fn a_type_change_that_tightens_nullability_is_a_not_null_risk() {
+        let make = |from_nullable, to_nullable| Change::AlterColumnType {
+            uid: uid("c_k7x2mq"),
+            column: col("dbo.customer.email"),
+            from: ty("nvarchar(50)"),
+            to: ty("nvarchar(100)"),
+            from_nullable,
+            to_nullable,
+        };
+        assert!(
+            make(true, false)
+                .intrinsic_risks()
+                .contains(&RiskClass::NotNull)
+        );
+        // Already NOT NULL, and staying that way: restating it risks nothing.
+        assert!(make(false, false).intrinsic_risks().is_empty());
+        assert!(make(true, true).intrinsic_risks().is_empty());
+        assert!(make(false, true).intrinsic_risks().is_empty());
     }
 
     #[test]

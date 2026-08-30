@@ -475,3 +475,97 @@ fn fmt_quotes_scalars_that_yaml_would_misread() {
     let o = d.run(&["validate"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
+
+// ---- Phase 2: the mssql dialect wired into plan and validate ----
+
+/// `plan --sql` writes a runnable T-SQL preview, with the warning header.
+#[test]
+fn plan_sql_writes_a_tsql_preview() {
+    let d = Demo::new("plan-sql");
+    d.table(ONE_COLUMN);
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        script.contains("-- A preview, not an applyable plan"),
+        "{script}"
+    );
+    assert!(
+        script.contains("CREATE TABLE [dbo].[t] (\n    [id] bigint NOT NULL\n);"),
+        "{script}"
+    );
+}
+
+/// A rename plans as sp_rename — proof the dialect, not a drop+add, is in charge.
+#[test]
+fn a_planned_rename_emits_sp_rename() {
+    let d = Demo::new("plan-sql-rename");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+
+    d.table("table: dbo.t\ncolumns:\n  ident: {type: bigint, nullable: false, renamed_from: id}\n");
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        script.contains("EXEC sp_rename N'[dbo].[t].[id]', N'ident', 'COLUMN';"),
+        "{script}"
+    );
+    assert!(
+        !script.contains("DROP"),
+        "a rename must not plan as drop+add: {script}"
+    );
+}
+
+/// The dialect's type knowledge reaches diff: two spellings of one type are not
+/// a change, and validate rejects a type the engine does not have.
+#[test]
+fn respelling_a_type_produces_no_plan() {
+    let d = Demo::new("plan-respell");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+
+    d.table("table: dbo.t\ncolumns:\n  id: {type: BIGINT, nullable: false}\n");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+}
+
+#[test]
+fn validate_rejects_what_the_engine_would_refuse() {
+    let d = Demo::new("validate-dialect");
+    // A postgres type, and a primary key over a nullable column.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: jsonb}\n  code: {type: int}\nprimary_key: [code]\n",
+    );
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(err.contains("has no type `jsonb`"), "{err}");
+    assert!(err.contains("must be NOT NULL"), "{err}");
+}
+
+/// A narrowing type change carries the narrowing risk into the printed plan.
+#[test]
+fn a_narrowing_change_is_flagged_in_the_plan() {
+    let d = Demo::new("plan-narrowing");
+    d.table("table: dbo.t\ncolumns:\n  name: {type: 'nvarchar(100)'}\n");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+
+    d.table("table: dbo.t\ncolumns:\n  name: {type: 'nvarchar(50)'}\n");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("[narrowing]"), "{out}");
+    assert!(out.contains("--allow narrowing"), "{out}");
+}

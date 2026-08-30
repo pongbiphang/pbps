@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 
-use pbps_config::Project;
-use pbps_dialect::MinimalDialect;
+use pbps_config::{DialectName, Project};
+use pbps_dialect::Dialect;
 use pbps_diff::{Context, Side};
 use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
 
@@ -48,6 +48,10 @@ enum Command {
         /// Write the change set out as JSON
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Write the plan as a SQL script (a preview; never hand-edited)
+        #[arg(long)]
+        sql: Option<PathBuf>,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
@@ -109,13 +113,14 @@ fn run() -> anyhow::Result<()> {
             base,
             check,
             out,
+            sql,
         } => {
             let source = match base {
                 Some(p) => baseline::Source::File(p),
                 None if since == "HEAD" => baseline::default_source(&project),
                 None => baseline::Source::Git { rev: since },
             };
-            cmd_plan(&project, &source, check, out.as_deref())
+            cmd_plan(&project, &source, check, out.as_deref(), sql.as_deref())
         }
         Command::Validate => cmd_validate(&project),
         Command::Fmt { check } => cmd_fmt(&project, check),
@@ -154,6 +159,16 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
+/// The dialect implementation this project is configured for.
+fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
+    match project.config.dialect {
+        DialectName::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
+        DialectName::Postgres => bail!(
+            "the postgres dialect is not implemented yet (it arrives in Phase 4); this project's pbps.yml selects it"
+        ),
+    }
+}
+
 /// Loads the declarations, printing every error in one pass.
 fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
     let dir = project.schema_dir();
@@ -168,17 +183,29 @@ fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
     })
 }
 
-fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
+/// Reads the identity file, or `None` when the project has none yet.
+///
+/// The distinction matters to `validate`, which must not claim to have checked a
+/// file that is not there. Everything else wants [`read_ids`], for which "absent"
+/// and "empty" are the same thing.
+fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     let path = project.ids_file();
     if !path.exists() {
-        return Ok(IdsFile::default());
+        return Ok(None);
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read identity file `{}`", path.display()))?;
     let ids: IdsFile = serde_json::from_str(&text)
         .with_context(|| format!("identity file `{}` is malformed", path.display()))?;
-    ids.validate()?;
-    Ok(ids)
+    // The path belongs on this one too: with a custom `ids_file` in pbps.yml, an
+    // error naming only two uids leaves the user hunting for the file.
+    ids.validate()
+        .with_context(|| format!("identity file `{}` is inconsistent", path.display()))?;
+    Ok(Some(ids))
+}
+
+fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
+    Ok(read_ids_opt(project)?.unwrap_or_default())
 }
 
 fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
@@ -202,30 +229,62 @@ fn context() -> Context {
 }
 
 fn cmd_validate(project: &Project) -> anyhow::Result<()> {
-    let loaded = load(project)?;
     // Identity consistency is validate's job too (SPEC §5.3): two branches each
     // adding a same-named column merge cleanly at the line level — two uids, two
     // lines — so no git conflict flags it, and only a check can.
-    let ids = read_ids(project)?;
-    println!(
-        "Declarations are valid: {} table(s), {} column(s).",
-        loaded.schema.tables.len(),
-        loaded
-            .schema
-            .tables
-            .values()
-            .map(|t| t.columns.len())
-            .sum::<usize>()
-    );
-    if project.ids_file().exists() {
-        println!(
-            "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
-            ids.tables.len(),
-            ids.columns.len(),
-            ids.tombstones.len()
-        );
+    //
+    // Both halves run before either is allowed to fail. A bad merge produces a
+    // broken declaration *and* a scrambled identity file together, and the rule
+    // everywhere else in this tool is to report every problem in one pass rather
+    // than fix-one-run-again.
+    let loaded = load(project);
+    let ids = read_ids_opt(project);
+    let dialect = dialect(project)?;
+
+    // Three layers, all reported in the same pass: the loader checks shape, the
+    // dialect checks what the engine will refuse (a nullable PK column, an
+    // IDENTITY on nvarchar), and the identity file checks below stand alone.
+    let mut dialect_problems = 0usize;
+    if let Ok(l) = &loaded {
+        for (name, table) in &l.schema.tables {
+            for e in dialect.validate_table(name, table) {
+                eprintln!("  {name}: {e}");
+                dialect_problems += 1;
+            }
+        }
+        if dialect_problems == 0 {
+            println!(
+                "Declarations are valid for {}: {} table(s), {} column(s).",
+                dialect.name(),
+                l.schema.tables.len(),
+                l.schema
+                    .tables
+                    .values()
+                    .map(|t| t.columns.len())
+                    .sum::<usize>()
+            );
+        }
     }
-    Ok(())
+    match &ids {
+        Ok(Some(i)) => println!(
+            "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
+            i.tables.len(),
+            i.columns.len(),
+            i.tombstones.len()
+        ),
+        Ok(None) => println!(
+            "No identity file yet at `{}`; run `pbps plan` to create it.",
+            project.ids_file().display()
+        ),
+        Err(e) => eprintln!("  {e:#}"),
+    }
+
+    match (loaded.is_err() || dialect_problems > 0, ids.is_err()) {
+        (false, false) => Ok(()),
+        (true, false) => bail!("the declarations did not validate"),
+        (false, true) => bail!("the identity file did not validate"),
+        (true, true) => bail!("neither the declarations nor the identity file validated"),
+    }
 }
 
 /// Canonicalizes every declaration file.
@@ -242,9 +301,22 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     // only the ids file and never the user's YAML (SPEC §6.2). Redundancy is
     // judged against the ids file, so it is read here — an annotation whose fact
     // is not absorbed yet must survive the rewrite.
-    let ids = read_ids(project)?;
+    //
+    // A broken identity file must not stop fmt, though. Canonicalizing YAML does
+    // not depend on identity, and a conflicted ids file is precisely the moment a
+    // user reaches for fmt; treating it as "nothing absorbed" keeps every
+    // annotation, which is the safe direction. `validate` and `plan` still refuse
+    // to run on it, so the corruption is not swallowed.
+    let ids = match read_ids(project) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            eprintln!("warning: every `renamed_from` will be kept; run `pbps validate` to fix it");
+            IdsFile::default()
+        }
+    };
 
-    let mut changed = Vec::new();
+    let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for path in &files {
         let original = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read `{}`", path.display()))?;
@@ -255,17 +327,16 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
 
-        let pending: Vec<_> = loaded
+        let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = loaded
             .intents
             .iter()
-            .filter(|i| !pbps_diff::intent_is_absorbed(i, &ids))
             .cloned()
-            .collect();
+            .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
         let rendered = pbps_load::render(&loaded.name, &loaded.table, &pending);
         if rendered == original {
             continue;
         }
-        changed.push(path.clone());
+        changed.push((path.clone(), absorbed));
         if !check {
             std::fs::write(path, &rendered)
                 .with_context(|| format!("cannot write `{}`", path.display()))?;
@@ -278,7 +349,7 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     }
 
     if check {
-        for p in &changed {
+        for (p, _) in &changed {
             eprintln!("  needs rewriting: {}", p.display());
         }
         bail!(
@@ -286,8 +357,16 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
             changed.len()
         );
     }
-    for p in &changed {
+    for (p, absorbed) in &changed {
         println!("rewrote {}", p.display());
+        // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
+        // cannot tell "this rename happened" from "this rename never applied": a
+        // `renamed_from` naming a column that never existed also looks absorbed,
+        // because the ids file records no history to distinguish them. Naming what
+        // went is the only thing that lets the user catch the typo.
+        for i in absorbed {
+            println!("  dropped a redundant annotation: {}", report::intent(i));
+        }
     }
     Ok(())
 }
@@ -324,9 +403,11 @@ fn cmd_plan(
     source: &baseline::Source,
     check: bool,
     out: Option<&std::path::Path>,
+    sql: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let loaded = load(project)?;
     let ids = read_ids(project)?;
+    let dialect = dialect(project)?;
 
     let res = match pbps_diff::resolve(&loaded.schema, &ids, &loaded.intents, &context()) {
         Ok(r) => r,
@@ -349,6 +430,18 @@ fn cmd_plan(
         println!("updated {}", project.ids_file().display());
     }
 
+    // plan never rewrites the user's YAML (SPEC §6.2), so without this line
+    // nothing tells the author that the annotations they just had absorbed are now
+    // redundant — and CI's `pbps fmt --check` fails on exactly that, with no local
+    // signal that anything was left undone.
+    if loaded
+        .intents
+        .iter()
+        .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids))
+    {
+        println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+    }
+
     let base = baseline::load(project, source)?;
     if base.is_empty_fallback {
         eprintln!(
@@ -366,7 +459,7 @@ fn cmd_plan(
             schema: &loaded.schema,
             ids: &res.ids,
         },
-        &MinimalDialect,
+        dialect.as_ref(),
     )
     .map_err(|errs| {
         for e in &errs {
@@ -383,7 +476,37 @@ fn cmd_plan(
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         println!("\nwrote {}", path.display());
     }
+
+    if let Some(path) = sql {
+        let script = render_sql(&cs, dialect.as_ref(), &base.description)?;
+        std::fs::write(path, script)
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        println!("wrote {}", path.display());
+    }
     Ok(())
+}
+
+/// Renders the change set as one SQL script.
+///
+/// An offline plan is a preview (SPEC §7.3): the header says so, so a script
+/// that escapes into a chat or a ticket still carries its own warning label.
+fn render_sql(
+    cs: &pbps_model::ChangeSet,
+    dialect: &dyn Dialect,
+    baseline: &str,
+) -> anyhow::Result<String> {
+    let mut statements = Vec::new();
+    for p in &cs.changes {
+        statements.extend(
+            dialect
+                .emit(&p.change)
+                .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?,
+        );
+    }
+    Ok(format!(
+        "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
+        pbps_dialect::render_script(&statements, dialect.batch_separator())
+    ))
 }
 
 /// The operator. An audit asks "who did this", and git's configuration is the

@@ -6,13 +6,14 @@ members = [
     "crates/pbps-load",
     "crates/pbps-diff",
     "crates/pbps-dialect",
+    "crates/pbps-mssql",
     "crates/pbps-cli",
 ]
 
 # spike: the Phase 0 YAML crate evaluation; removed once the choice is settled
 exclude = ["spikes/yaml-span"]
 
-# pbps-mssql / pbps-db arrive in Phase 2
+# pbps-db arrives in Phase 2 (the connection layer)
 # pbps-pg arrives in Phase 4
 
 [workspace.package]
@@ -29,6 +30,7 @@ pbps-config  = { path = "crates/pbps-config" }
 pbps-load    = { path = "crates/pbps-load" }
 pbps-diff    = { path = "crates/pbps-diff" }
 pbps-dialect = { path = "crates/pbps-dialect" }
+pbps-mssql   = { path = "crates/pbps-mssql" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

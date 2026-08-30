@@ -6,7 +6,7 @@
 //! stored here — the YAML already has them, and duplicating them would only
 //! create two sources of truth that can disagree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::name::{ColumnRef, TableName};
 use crate::uid::{Uid, UidKind};
@@ -35,6 +35,9 @@ pub enum IdsError {
 
     #[error("the prefix of {uid} does not match the section it appears in")]
     KindMismatch { uid: Uid },
+
+    #[error("{uid} points at `{column}`, but no live table entry owns it")]
+    OrphanColumn { uid: Uid, column: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,6 +124,22 @@ impl IdsFile {
 
         check_unique(self.tables.iter().map(|(u, n)| (u, n.to_string())))?;
         check_unique(self.columns.iter().map(|(u, n)| (u, n.to_string())))?;
+
+        // A live column whose table has no entry cannot be produced by the tool:
+        // a table rename moves its columns and a table drop tombstones them. So it
+        // means the file was hand-edited or badly merged — and a comparison would
+        // then be matching a column that belongs to nothing. Without this, the
+        // "identity file is consistent" that `validate` prints claims more than it
+        // has checked.
+        let live: BTreeSet<&TableName> = self.tables.values().collect();
+        for (uid, c) in &self.columns {
+            if !live.contains(&c.table) {
+                return Err(IdsError::OrphanColumn {
+                    uid: uid.clone(),
+                    column: c.to_string(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -241,6 +260,19 @@ mod tests {
         assert!(matches!(
             f.validate().unwrap_err(),
             IdsError::LiveAndTombstoned { .. }
+        ));
+    }
+
+    /// A merge that keeps one branch's deletion of a table line and the other's
+    /// edit to a column line leaves the column pointing at nothing. Diff would
+    /// then compare a column that belongs to no table.
+    #[test]
+    fn a_column_whose_table_has_no_entry_is_rejected() {
+        let mut f = sample();
+        f.columns.insert(uid("c_qqqqqq"), col("dbo.ghost.x"));
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::OrphanColumn { .. }
         ));
     }
 

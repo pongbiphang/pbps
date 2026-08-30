@@ -1,0 +1,385 @@
+//! What SQL Server will refuse, checked before anything is generated.
+//!
+//! These are the errors worth catching in `pbps validate`, where the user sees
+//! the file and the line, rather than at apply time as a message from the server
+//! about a table it half-created. Every check here is a rule of the engine, not a
+//! matter of taste — style opinions belong in `fmt`, not in an error.
+
+use pbps_dialect::DialectError;
+use pbps_model::{Table, TableName};
+
+use crate::ident;
+use crate::types::{self, DIALECT};
+
+/// SQL Server's limit on the number of key columns in one index.
+const MAX_INDEX_KEY_COLUMNS: usize = 32;
+
+fn invalid(message: impl Into<String>) -> DialectError {
+    DialectError::Invalid {
+        dialect: DIALECT,
+        message: message.into(),
+    }
+}
+
+/// Every problem with the table, not just the first.
+///
+/// Stopping at the first would turn fixing a table into as many round trips as
+/// it has mistakes.
+pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+
+    for part in [&name.schema, &name.name] {
+        if let Err(e) = ident::quote(part) {
+            errs.push(e);
+        }
+    }
+
+    let mut identity_columns = Vec::new();
+    for (col_name, col) in &table.columns {
+        if let Err(e) = ident::quote(col_name) {
+            errs.push(e);
+        }
+        match types::normalize(&col.ty) {
+            Ok(_) => {}
+            Err(e) => {
+                errs.push(e);
+                // Everything below asks questions about the type, and asking
+                // them of a type that does not exist only produces noise on top
+                // of the real error.
+                continue;
+            }
+        }
+        if let Some(identity) = col.identity {
+            identity_columns.push(col_name.clone());
+            if !types::can_be_identity(&col.ty) {
+                errs.push(invalid(format!(
+                    "column `{col_name}` is IDENTITY, which needs an integer type or a decimal with scale 0, not `{}`",
+                    col.ty
+                )));
+            }
+            if col.nullable {
+                errs.push(invalid(format!(
+                    "column `{col_name}` is IDENTITY, so it cannot be nullable"
+                )));
+            }
+            if identity.increment == 0 {
+                errs.push(invalid(format!(
+                    "column `{col_name}` has an IDENTITY increment of 0, which never advances"
+                )));
+            }
+            if col.default.is_some() {
+                errs.push(invalid(format!(
+                    "column `{col_name}` is IDENTITY, so it cannot also have a default"
+                )));
+            }
+        }
+    }
+    if identity_columns.len() > 1 {
+        errs.push(invalid(format!(
+            "a table may have only one IDENTITY column, but `{}` are all marked",
+            identity_columns.join("`, `")
+        )));
+    }
+
+    if let Some(pk) = &table.primary_key {
+        if let Some(n) = &pk.name
+            && let Err(e) = ident::quote(n)
+        {
+            errs.push(e);
+        }
+        errs.extend(key_columns("primary key", &pk.columns, table));
+        for c in &pk.columns {
+            if table.columns.get(c).is_some_and(|c| c.nullable) {
+                errs.push(invalid(format!(
+                    "primary key column `{c}` is nullable; a primary key column must be NOT NULL"
+                )));
+            }
+        }
+    }
+
+    for (n, u) in &table.unique {
+        if let Err(e) = ident::quote(n) {
+            errs.push(e);
+        }
+        errs.extend(key_columns(
+            &format!("unique constraint `{n}`"),
+            &u.columns,
+            table,
+        ));
+    }
+
+    for (n, fk) in &table.foreign_keys {
+        if let Err(e) = ident::quote(n) {
+            errs.push(e);
+        }
+        errs.extend(key_columns(
+            &format!("foreign key `{n}`"),
+            &fk.columns,
+            table,
+        ));
+        if fk.columns.len() != fk.references_columns.len() {
+            errs.push(invalid(format!(
+                "foreign key `{n}` has {} column(s) but references {}; the two sides must line up",
+                fk.columns.len(),
+                fk.references_columns.len()
+            )));
+        }
+        if fk.references_columns.is_empty() {
+            errs.push(invalid(format!(
+                "foreign key `{n}` names no columns on the referenced table"
+            )));
+        }
+    }
+
+    for (n, c) in &table.checks {
+        if let Err(e) = ident::quote(n) {
+            errs.push(e);
+        }
+        if c.expression.trim().is_empty() {
+            errs.push(invalid(format!(
+                "check constraint `{n}` has an empty expression"
+            )));
+        }
+    }
+
+    for (n, idx) in &table.indexes {
+        if let Err(e) = ident::quote(n) {
+            errs.push(e);
+        }
+        let keys: Vec<String> = idx.columns.iter().map(|c| c.name.clone()).collect();
+        errs.extend(key_columns(&format!("index `{n}`"), &keys, table));
+        if keys.len() > MAX_INDEX_KEY_COLUMNS {
+            errs.push(invalid(format!(
+                "index `{n}` has {} key columns; SQL Server allows at most {MAX_INDEX_KEY_COLUMNS}",
+                keys.len()
+            )));
+        }
+        for inc in &idx.include {
+            if !table.columns.contains_key(inc) {
+                errs.push(invalid(format!(
+                    "index `{n}` includes `{inc}`, which is not a column of this table"
+                )));
+            }
+            if keys.contains(inc) {
+                errs.push(invalid(format!(
+                    "index `{n}` has `{inc}` both as a key column and as an included column"
+                )));
+            }
+        }
+        if idx.filter.as_ref().is_some_and(|f| f.trim().is_empty()) {
+            errs.push(invalid(format!(
+                "index `{n}` has an empty filter expression"
+            )));
+        }
+    }
+
+    errs
+}
+
+/// The checks shared by every construct that builds a key out of columns.
+fn key_columns(what: &str, columns: &[String], table: &Table) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if columns.is_empty() {
+        errs.push(invalid(format!("{what} names no columns")));
+    }
+    let mut seen = Vec::new();
+    for c in columns {
+        match table.columns.get(c) {
+            None => errs.push(invalid(format!(
+                "{what} references `{c}`, which is not a column of this table"
+            ))),
+            Some(col) if !types::is_indexable(&col.ty) => errs.push(invalid(format!(
+                "{what} uses `{c}`, whose type `{}` cannot be part of a key",
+                col.ty
+            ))),
+            Some(_) => {}
+        }
+        if seen.contains(&c) {
+            errs.push(invalid(format!("{what} names `{c}` twice")));
+        }
+        seen.push(c);
+    }
+    errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{
+        CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
+        UniqueConstraint,
+    };
+
+    fn ty(s: &str) -> ColumnType {
+        s.parse().unwrap()
+    }
+
+    fn base_table() -> (TableName, Table) {
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("bigint")).not_null());
+        t.columns
+            .insert("email".into(), Column::new(ty("nvarchar(255)")));
+        t.columns
+            .insert("body".into(), Column::new(ty("nvarchar(max)")));
+        (TableName::new("dbo", "customer"), t)
+    }
+
+    fn messages(errs: &[DialectError]) -> String {
+        errs.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_well_formed_table_produces_no_errors() {
+        let (name, mut t) = base_table();
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_customer".into()),
+            columns: vec!["id".into()],
+        });
+        t.unique.insert(
+            "uq_email".into(),
+            UniqueConstraint {
+                columns: vec!["email".into()],
+            },
+        );
+        assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    #[test]
+    fn a_key_over_a_missing_column_is_reported() {
+        let (name, mut t) = base_table();
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["nope".into()],
+        });
+        let errs = table(&name, &t);
+        assert!(
+            messages(&errs).contains("not a column of this table"),
+            "{}",
+            messages(&errs)
+        );
+    }
+
+    /// The engine refuses a nullable PK column at CREATE time; catching it at
+    /// validate time points at the file instead of at a failed apply.
+    #[test]
+    fn a_nullable_primary_key_column_is_reported() {
+        let (name, mut t) = base_table();
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["email".into()],
+        });
+        assert!(messages(&table(&name, &t)).contains("must be NOT NULL"));
+    }
+
+    #[test]
+    fn a_key_over_an_unindexable_type_is_reported() {
+        let (name, mut t) = base_table();
+        t.unique.insert(
+            "uq_body".into(),
+            UniqueConstraint {
+                columns: vec!["body".into()],
+            },
+        );
+        assert!(messages(&table(&name, &t)).contains("cannot be part of a key"));
+    }
+
+    #[test]
+    fn identity_rules_are_enforced() {
+        let (name, mut t) = base_table();
+        let mut c = Column::new(ty("nvarchar(10)"));
+        c.identity = Some(Identity {
+            seed: 1,
+            increment: 0,
+        });
+        t.columns.insert("seq".into(), c);
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("needs an integer type"), "{msg}");
+        assert!(msg.contains("cannot be nullable"), "{msg}");
+        assert!(msg.contains("never advances"), "{msg}");
+    }
+
+    #[test]
+    fn two_identity_columns_are_reported() {
+        let (name, mut t) = base_table();
+        for col in ["a", "b"] {
+            let mut c = Column::new(ty("int")).not_null();
+            c.identity = Some(Identity {
+                seed: 1,
+                increment: 1,
+            });
+            t.columns.insert(col.into(), c);
+        }
+        assert!(messages(&table(&name, &t)).contains("only one IDENTITY column"));
+    }
+
+    #[test]
+    fn a_foreign_key_with_mismatched_sides_is_reported() {
+        let (name, mut t) = base_table();
+        t.foreign_keys.insert(
+            "fk_x".into(),
+            ForeignKey {
+                columns: vec!["id".into(), "email".into()],
+                references_table: TableName::new("dbo", "other"),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        assert!(messages(&table(&name, &t)).contains("must line up"));
+    }
+
+    #[test]
+    fn an_index_including_one_of_its_own_keys_is_reported() {
+        let (name, mut t) = base_table();
+        t.indexes.insert(
+            "ix_email".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "email".into(),
+                    descending: false,
+                }],
+                include: vec!["email".into()],
+                unique: false,
+                filter: None,
+            },
+        );
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("both as a key column and as an included column"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn empty_expressions_are_reported() {
+        let (name, mut t) = base_table();
+        t.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: "  ".into(),
+            },
+        );
+        assert!(messages(&table(&name, &t)).contains("empty expression"));
+    }
+
+    /// One pass must surface every problem: the loop must not stop at the first.
+    #[test]
+    fn all_problems_are_reported_in_one_pass() {
+        let (name, mut t) = base_table();
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["nope".into()],
+        });
+        t.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: "".into(),
+            },
+        );
+        assert!(table(&name, &t).len() >= 2);
+    }
+}
