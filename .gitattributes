@@ -1,0 +1,4 @@
+# 這個工具會自己寫檔案（pbps fmt），版控內一律 LF，避免平台差異
+# 讓「工具擁有檔案格式」這個保證在 Windows 上破功。
+* text=auto eol=lf
+*.png binary

@@ -9,8 +9,7 @@ use crate::schema::Schema;
 pub const CURRENT_VERSION: u32 = 1;
 
 /// 這筆狀態是怎麼來的。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateKind {
     /// 正常套用一份計畫
@@ -25,8 +24,7 @@ pub enum StateKind {
 ///
 /// 存整份 schema 而不是增量或 checksum：drift 檢查才能完整比對、可作為備援、
 /// 也才能回答「三個月前這張表長什麼樣」。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StateSnapshot {
     pub version: u32,
     pub kind: StateKind,
@@ -85,7 +83,10 @@ mod tests {
         let mut s = Schema::default();
         s.tables.insert(
             TableName::new("dbo", "customer"),
-            Table { columns, ..Default::default() },
+            Table {
+                columns,
+                ..Default::default()
+            },
         );
         s
     }
@@ -99,7 +100,10 @@ mod tests {
     #[test]
     fn any_difference_is_drift() {
         let snap = StateSnapshot::new(StateKind::Apply, schema_with("nvarchar(255)"), "leon");
-        assert!(!snap.matches(&schema_with("nvarchar(100)")), "型別改變應為 drift");
+        assert!(
+            !snap.matches(&schema_with("nvarchar(100)")),
+            "型別改變應為 drift"
+        );
         assert!(!snap.matches(&Schema::default()), "表消失應為 drift");
     }
 

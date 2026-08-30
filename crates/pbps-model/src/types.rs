@@ -28,8 +28,9 @@ pub enum TypeParseError {
 }
 
 /// 型別參數。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeArg {
     /// `nvarchar(100)` 的 100、`decimal(18, 2)` 的 18 與 2
@@ -55,8 +56,9 @@ impl fmt::Display for TypeArg {
 ///
 /// 正規化只做兩件事：大小寫統一為小寫、去除空白。**別名不在此展開**
 /// （`integer` 不會變成 `int`），因為哪些名字互為別名是方言知識。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct ColumnType {
     pub base: String,
@@ -65,7 +67,10 @@ pub struct ColumnType {
 
 impl ColumnType {
     pub fn new(base: impl Into<String>, args: Vec<TypeArg>) -> Self {
-        Self { base: base.into().to_ascii_lowercase(), args }
+        Self {
+            base: base.into().to_ascii_lowercase(),
+            args,
+        }
     }
 
     /// 無參數型別，如 `bigint`。
@@ -219,7 +224,10 @@ mod tests {
     #[test]
     fn multi_word_base_names_are_allowed() {
         assert_eq!(p("double precision").base, "double precision");
-        assert_eq!(p("timestamp with time zone").base, "timestamp with time zone");
+        assert_eq!(
+            p("timestamp with time zone").base,
+            "timestamp with time zone"
+        );
     }
 
     #[test]

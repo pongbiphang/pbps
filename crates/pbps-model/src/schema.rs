@@ -19,8 +19,7 @@ use crate::name::TableName;
 use crate::types::ColumnType;
 
 /// 一個專案的完整期望狀態。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
 }
@@ -31,8 +30,7 @@ impl Schema {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -57,8 +55,7 @@ pub struct Table {
     pub indexes: BTreeMap<String, Index>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Column {
     #[serde(rename = "type")]
     pub ty: ColumnType,
@@ -110,15 +107,13 @@ impl Column {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub seed: i64,
     pub increment: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrimaryKey {
     /// 約束名。`None` 表示交由資料庫自動命名。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,14 +121,12 @@ pub struct PrimaryKey {
     pub columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UniqueConstraint {
     pub columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub references_table: TableName,
@@ -145,8 +138,7 @@ pub struct ForeignKey {
     pub on_update: ReferentialAction,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferentialAction {
     #[default]
@@ -156,15 +148,13 @@ pub enum ReferentialAction {
     SetDefault,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckConstraint {
     /// 檢查運算式，原樣保留。
     pub expression: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Index {
     pub columns: Vec<IndexColumn>,
 
@@ -180,8 +170,7 @@ pub struct Index {
     pub filter: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndexColumn {
     pub name: String,
     #[serde(default)]
@@ -233,7 +222,10 @@ mod tests {
         let mut columns = IndexMap::new();
         columns.insert("email".into(), Column::new(ty("nvarchar(255)")));
         columns.insert("customer_id".into(), Column::new(ty("bigint")).not_null());
-        let b = Table { columns, ..a.clone() };
+        let b = Table {
+            columns,
+            ..a.clone()
+        };
         assert_eq!(a, b);
     }
 
@@ -241,8 +233,12 @@ mod tests {
     #[test]
     fn serialisation_is_deterministic() {
         let mut schema = Schema::default();
-        schema.tables.insert(TableName::new("dbo", "customer"), sample());
-        schema.tables.insert(TableName::new("app", "region"), Table::default());
+        schema
+            .tables
+            .insert(TableName::new("dbo", "customer"), sample());
+        schema
+            .tables
+            .insert(TableName::new("app", "region"), Table::default());
 
         let first = serde_json::to_string(&schema).unwrap();
         for _ in 0..20 {
@@ -255,7 +251,9 @@ mod tests {
     #[test]
     fn schema_round_trips_through_json() {
         let mut schema = Schema::default();
-        schema.tables.insert(TableName::new("dbo", "customer"), sample());
+        schema
+            .tables
+            .insert(TableName::new("dbo", "customer"), sample());
         let json = serde_json::to_string(&schema).unwrap();
         let back: Schema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, back);

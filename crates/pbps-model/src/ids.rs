@@ -29,8 +29,7 @@ pub enum IdsError {
     KindMismatch { uid: Uid },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdsFile {
     pub version: u32,
 
@@ -59,8 +58,7 @@ impl Default for IdsFile {
 ///
 /// 墓碑存在身份檔而不是宣告檔裡，宣告檔因此永遠只包含「你要的東西」，
 /// 不會隨年資累積殭屍欄位（SPEC §4.4）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tombstone {
     /// 刪除當下的完整名稱。稽核要回答「這個欄位曾經叫什麼」。
     pub was: String,
@@ -143,9 +141,12 @@ mod tests {
 
     fn sample() -> IdsFile {
         let mut f = IdsFile::default();
-        f.tables.insert(uid("t_a9k2mq"), "dbo.customer".parse().unwrap());
-        f.columns.insert(uid("c_k7x2mq"), col("dbo.customer.customer_id"));
-        f.columns.insert(uid("c_p3n8vd"), col("dbo.customer.full_name"));
+        f.tables
+            .insert(uid("t_a9k2mq"), "dbo.customer".parse().unwrap());
+        f.columns
+            .insert(uid("c_k7x2mq"), col("dbo.customer.customer_id"));
+        f.columns
+            .insert(uid("c_p3n8vd"), col("dbo.customer.full_name"));
         f
     }
 
@@ -192,7 +193,10 @@ mod tests {
         f.version = 99;
         assert_eq!(
             f.validate().unwrap_err(),
-            IdsError::UnsupportedVersion { found: 99, supported: 1 }
+            IdsError::UnsupportedVersion {
+                found: 99,
+                supported: 1
+            }
         );
     }
 
@@ -200,7 +204,8 @@ mod tests {
     #[test]
     fn duplicate_names_are_rejected() {
         let mut f = sample();
-        f.columns.insert(uid("c_zzzzzz"), col("dbo.customer.full_name"));
+        f.columns
+            .insert(uid("c_zzzzzz"), col("dbo.customer.full_name"));
         assert!(matches!(
             f.validate().unwrap_err(),
             IdsError::DuplicateName { .. }

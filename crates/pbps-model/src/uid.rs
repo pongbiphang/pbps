@@ -48,8 +48,9 @@ impl UidKind {
 /// 形如 `c_k7x2mq` / `t_a9k2mq`。
 ///
 /// `Ord` 直接取字串序，因此同類的 UID 會排在一起，身份檔的 diff 比較好讀。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct Uid(String);
 
@@ -69,7 +70,11 @@ impl Uid {
     }
 
     pub fn kind(&self) -> UidKind {
-        if self.0.starts_with("t_") { UidKind::Table } else { UidKind::Column }
+        if self.0.starts_with("t_") {
+            UidKind::Table
+        } else {
+            UidKind::Column
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -131,7 +136,7 @@ fn next_random() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     thread_local! {
-        static STATE: Cell<u64> = Cell::new(0);
+        static STATE: Cell<u64> = const { Cell::new(0) };
     }
 
     STATE.with(|st| {
@@ -187,7 +192,11 @@ mod tests {
     #[test]
     fn generation_is_not_constant() {
         let set: BTreeSet<_> = (0..200).map(|_| Uid::generate(UidKind::Column)).collect();
-        assert!(set.len() > 190, "隨機性明顯不足：200 次只產生 {} 個相異值", set.len());
+        assert!(
+            set.len() > 190,
+            "隨機性明顯不足：200 次只產生 {} 個相異值",
+            set.len()
+        );
     }
 
     #[test]

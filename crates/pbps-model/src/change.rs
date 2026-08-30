@@ -25,8 +25,9 @@ use crate::uid::Uid;
 ///
 /// 判斷依據是**變更類別本身是否可能失敗**，不是「這次資料剛好安不安全」——
 /// 讀資料判斷屬於執行期，不在宣告層的職責內。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
     /// 改名。依賴此物件的 view / SP / 應用程式會失效。
@@ -85,8 +86,7 @@ impl std::str::FromStr for RiskClass {
 ///
 /// 每個變體都帶著受影響物件的 UID，讓計畫在套用時不必再依賴名稱去對照 ——
 /// 名稱正是可能同時在改變的東西。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Change {
     CreateTable {
@@ -227,12 +227,12 @@ impl Change {
             Change::RenameTable { .. } | Change::RenameColumn { .. } => {
                 r.insert(RiskClass::Rename);
             }
-            Change::AlterColumnNullability { to_nullable: false, .. } => {
+            Change::AlterColumnNullability {
+                to_nullable: false, ..
+            } => {
                 r.insert(RiskClass::NotNull);
             }
-            Change::AddUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::AddCheck { .. } => {
+            Change::AddUnique { .. } | Change::AddForeignKey { .. } | Change::AddCheck { .. } => {
                 r.insert(RiskClass::Constraint);
             }
             Change::SetPrimaryKey { to: Some(_), .. } => {
@@ -244,7 +244,9 @@ impl Change {
             Change::CreateTable { .. }
             | Change::AddColumn { .. }
             | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { to_nullable: true, .. }
+            | Change::AlterColumnNullability {
+                to_nullable: true, ..
+            }
             | Change::AlterColumnDefault { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::DropUnique { .. }
@@ -257,8 +259,7 @@ impl Change {
 }
 
 /// 一個變更加上它已判定的風險。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     #[serde(flatten)]
     pub change: Change,
@@ -284,8 +285,7 @@ impl PlannedChange {
 ///
 /// `changes` 的順序即為套用順序。排序（先 drop index 再 drop column…）
 /// 是 planner 的職責，模型只保證順序被保留。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangeSet {
     pub changes: Vec<PlannedChange>,
 }
@@ -297,7 +297,10 @@ impl ChangeSet {
 
     /// 這份計畫涉及的所有風險類別 —— 即 `--allow` 必須涵蓋的集合。
     pub fn risks(&self) -> BTreeSet<RiskClass> {
-        self.changes.iter().flat_map(|c| c.risks.iter().copied()).collect()
+        self.changes
+            .iter()
+            .flat_map(|c| c.risks.iter().copied())
+            .collect()
     }
 
     /// 未被 `allowed` 涵蓋的風險。非空即代表 apply 應中止。
@@ -339,7 +342,11 @@ mod tests {
 
     #[test]
     fn destructive_changes_are_flagged() {
-        assert!(drop_column().intrinsic_risks().contains(&RiskClass::Destructive));
+        assert!(
+            drop_column()
+                .intrinsic_risks()
+                .contains(&RiskClass::Destructive)
+        );
     }
 
     #[test]
@@ -382,7 +389,10 @@ mod tests {
     #[test]
     fn unapproved_risks_are_reported() {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(drop_column()), PlannedChange::new(add_column())],
+            changes: vec![
+                PlannedChange::new(drop_column()),
+                PlannedChange::new(add_column()),
+            ],
         };
         assert_eq!(cs.risks(), BTreeSet::from([RiskClass::Destructive]));
 
@@ -416,7 +426,10 @@ mod tests {
     #[test]
     fn changes_round_trip_through_json() {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(drop_column()), PlannedChange::new(add_column())],
+            changes: vec![
+                PlannedChange::new(drop_column()),
+                PlannedChange::new(add_column()),
+            ],
         };
         let back: ChangeSet = serde_json::from_str(&serde_json::to_string(&cs).unwrap()).unwrap();
         assert_eq!(cs, back);

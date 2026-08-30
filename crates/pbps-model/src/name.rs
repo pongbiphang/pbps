@@ -21,8 +21,9 @@ pub enum NameError {
 /// 完整限定的表名，如 `dbo.customer`。
 ///
 /// `Ord` 由 `(schema, name)` 決定，序列化順序因此是穩定的。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct TableName {
     pub schema: String,
@@ -31,12 +32,18 @@ pub struct TableName {
 
 impl TableName {
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { schema: schema.into(), name: name.into() }
+        Self {
+            schema: schema.into(),
+            name: name.into(),
+        }
     }
 
     /// 取得此表中某欄位的參照。
     pub fn column(&self, column: impl Into<String>) -> ColumnRef {
-        ColumnRef { table: self.clone(), name: column.into() }
+        ColumnRef {
+            table: self.clone(),
+            name: column.into(),
+        }
     }
 }
 
@@ -62,8 +69,9 @@ impl FromStr for TableName {
 }
 
 /// 完整限定的欄位參照，如 `dbo.customer.email`。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct ColumnRef {
     pub table: TableName,
@@ -72,7 +80,10 @@ pub struct ColumnRef {
 
 impl ColumnRef {
     pub fn new(table: TableName, name: impl Into<String>) -> Self {
-        Self { table, name: name.into() }
+        Self {
+            table,
+            name: name.into(),
+        }
     }
 }
 
@@ -167,7 +178,7 @@ mod tests {
 
     #[test]
     fn ordering_is_schema_then_name() {
-        let mut v = vec![
+        let mut v = [
             TableName::new("dbo", "z"),
             TableName::new("app", "a"),
             TableName::new("dbo", "a"),
