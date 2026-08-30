@@ -45,8 +45,9 @@ constraints, foreign keys, check constraints, indexes.
 data transformation (backfill).
 
 Objects like views and stored procedures, where the definition simply *is* the
-latest version, behave much like repeatable migrations. That is a different model,
-left to a later phase.
+latest version, behave much like repeatable migrations. That is a different
+model — the module model, designed in [ADR-0002](ADR-0002-module-model.md) and
+targeted at Phase 3.5.
 
 ### 1.3 Explicit non-goals
 
@@ -465,6 +466,25 @@ clean. Two supporting rules:
   **before** anything has run, filling in the information an offline plan cannot
   see.
 
+Pre-flight also runs **probes derived automatically from the plan itself**.
+The differ's output is a typed `ChangeSet`, so the tool already knows how each
+change can fail, and `Dialect::preflight(change)` turns that knowledge into
+queries — no user-authored assertions needed (compare Atlas, whose
+pre-migration checks are hand-written SQL):
+
+| Risk class | Probe |
+|---|---|
+| `not-null` | Count the existing NULLs in the column |
+| `constraint` | Count the rows that violate the new UNIQUE / FK / CHECK |
+| `narrowing` | Count the values that fail or truncate under conversion |
+| `rename` | The impact queries of 7.4 |
+
+On a non-zero count, `apply` aborts before the first statement, reporting the
+real number ("4,213 rows violate ck_customer_balance"). This does not
+contradict 7.2's "data is not read to decide the class": classification stays
+static; the probes are the last line of defence at apply time, where a
+connection is guaranteed and reading data is exactly the job.
+
 ---
 
 ## 8. Environment state and drift
@@ -536,7 +556,9 @@ positives. The declaration-versus-baseline comparison (the differ's side) uses a
 lightweight best-effort normalization supplied by the `Dialect` (whitespace,
 redundant parentheses, `[]`, case); anything still different after normalization
 is treated as a constraint change and emitted as drop+add — the cost of a false
-positive is rebuilding one constraint, which is cheap and idempotent.
+positive is rebuilding one constraint, which is cheap and idempotent. When a
+dev database is configured (see 9.3), the offline preview upgrades this
+best-effort normalization to a real-engine round-trip.
 
 ### 8.3 Two ways out of drift
 
@@ -562,7 +584,7 @@ reason, operator and timestamp in the ledger.
 | `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
-| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3) |
+| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still do the whole job locally**.
@@ -608,6 +630,38 @@ environment to lay the divergences out, deciding per environment whether to
 "plan / apply it into agreement with the declarations" or "this environment's
 difference is right, fold it back into the declarations". Onboarding is done when
 every environment has been `snapshot`ted and drifts by nothing.
+
+### 9.3 The dev database (optional)
+
+`plan` accepts an optional throwaway engine for higher-fidelity previews:
+
+```bash
+pbps plan --dev docker://mssql/2022     # or `dev:` in pbps.yml
+```
+
+The container is used three ways, all on the preview side:
+
+1. **Normalization round-trip** — types and expressions are created in the
+   real engine and read back, replacing 8.2's best-effort normalization for
+   the preview.
+2. **Bootstrap validation** — the declarations must actually compile.
+3. **Convergence rehearsal** — bootstrap the baseline state, apply the plan,
+   introspect, and compare against the desired state. This is invariant 3 of
+   11.5 (migration convergence) surfaced as a user-facing pre-check.
+
+Three stances, all deliberate and all different from Atlas (whose dev database
+is required for many operations):
+
+- **Always optional.** The air-gap promise of 9.1 stands: with no Docker the
+  preview degrades to lightweight normalization and says so.
+- **A dev-database-verified plan is still a preview.** Applyable plans come
+  only from `plan --db` against the target (7.3); the two-layer review model
+  does not move.
+- **Edition honesty.** The container runs Developer edition (the Enterprise
+  feature set) while production may be Standard, so the dev database validates
+  syntax and convergence, not edition capabilities — and the tool says so
+  rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
+  on edition-dependent risk).
 
 ---
 
@@ -760,10 +814,11 @@ four invariants must be machine-verified:
 |---|---|---|
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
-| **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`** | Reverse generation removes the adoption barrier, which is the key to being used at all |
-| **Phase 3** | `__pbps_state` / locking / `verify` / `apply` / the `--allow` gate / the rename impact report / `snapshot` / `baseline` / `bootstrap` | The complete product |
+| **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier, which is the key to being used at all |
+| **Phase 3** | `__pbps_state` / locking / `verify` / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` hook / the optional dev database (9.3) | The complete product |
+| **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
-| **Phase 5** | The repeatable model for views and SPs, extended properties and data-catalogue integration, more dialects | |
+| **Phase 5** | Extended properties and data-catalogue integration, more dialects | |
 
 When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
 at the same time**, even though it is not implemented. If Phase 4 forces a large
@@ -778,32 +833,48 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    crate. The mitigation is the isolation the architecture already has: only
    `pbps-load` depends on it directly. Its maintenance needs watching.
 
-2. **The execution strategy for ALTER on large tables** — ONLINE options,
-   batching and off-peak scheduling are runtime decisions that a diff cannot
-   derive. The direction is a table-level `strategy:` annotation: the declaration
-   layer gives the hint, and SQL is still generated only in the emitter.
-   Hand-editing plan.sql has been **ruled out** — it destroys both the checksum
-   guarantee and "SQL appears exactly once" (see 7.3); genuinely manual cases go
-   through a DBA running the SQL plus `pbps baseline`.
+2. **The execution strategy for ALTER on large tables** — settled; see
+   [ADR-0003](ADR-0003-execution-strategy.md). A persistent table-level
+   `strategy:` annotation lives beside the model (never in it, so Schema
+   equality is untouched), the emitter consumes it, and non-transactional
+   operations get a dedicated staged apply rather than a weakening of "one
+   plan, one transaction". External OSC wrappers (Skeema's `alter-wrapper`
+   path) and hand-editing plan.sql stay ruled out — both destroy the checksum
+   guarantee and "SQL appears exactly once" (see 7.3); genuinely manual cases
+   go through a DBA running the SQL plus `pbps baseline`.
 
 3. **Coordinating application and database deployment timing** — zero-downtime
    usually needs schema changes and application versions staggered. The tool does
    not manage that, but `--allow` and the saved plan make "which version is applied
-   when" controllable. Multi-stage flows such as expand → dual-write → backfill →
-   contract span several deployments and are currently unsupported.
+   when" controllable. Multi-stage flows (expand → dual-write → backfill →
+   contract) get **no engine, by decision**: in a declarative model each stage
+   is simply a commit, and every stage is already individually supported —
+   add: automatic; backfill: the DBA + `baseline` escape hatch; NOT NULL:
+   automatic, caught by the preflight probes of 7.5; drop: intent plus a
+   reason. What ships instead is a documented staging guide plus an advisory
+   lint: `validate` warns when one revision both adds and drops or narrows in
+   the same table, which usually wants splitting.
 
 4. **Access control for `baseline`** — the direction is settled: only the
    dedicated deployment account may write `__pbps_state` / `__pbps_lock` (see the
    trust model in 8.1), so `baseline` must run under the pipeline identity. The
    concrete hookup to GitLab approvals is Phase 3 design work.
 
-5. **Data transformation (backfill)** — explicitly out of scope for now (see 1.3).
-   If a repeating pattern accumulates, a hook mechanism can be designed against
-   real cases.
+5. **Data transformation (backfill) and hooks** — backfill stays out of scope
+   (see 1.3). The two adjacent needs are settled separately. Pre-apply
+   assertions are **derived automatically** from the typed ChangeSet — the
+   preflight probes of 7.5 — rather than hand-written by users. User hooks
+   stay deliberately minimal: a single `on_apply` entry in `pbps.yml`
+   receiving the plan path, checksum and outcome, which also implements 8.1's
+   append-only ledger fan-out for tamper-evidence. The CI pipeline remains the
+   real hook system (see 10).
 
-6. **How views and SPs should be handled** — for these objects the definition *is*
-   the latest version, which is closer to repeatable migration and different from
-   the identity-tracking model used for columns. It needs its own design.
+6. **How views and SPs should be handled** — settled; see
+   [ADR-0002](ADR-0002-module-model.md). Modules (views, procedures,
+   functions, triggers) carry no data, so they get a second, identity-free
+   model: the declared definition is the desired state, renames are lossless
+   drop+add, and git history is the audit trail. Targeted at Phase 3.5;
+   `pull`'s inventory of unmanaged modules lands with Phase 2.
 
 7. **Whether permissions (GRANT) belong here** — declarative permission management
    has value, but its risk model differs from schema change and the dialects vary
