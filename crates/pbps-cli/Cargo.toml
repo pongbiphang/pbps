@@ -18,6 +18,8 @@ pbps-load.workspace = true
 pbps-diff.workspace = true
 pbps-dialect.workspace = true
 pbps-mssql.workspace = true
+pbps-db.workspace = true
+tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 miette = { workspace = true, features = ["fancy"] }
@@ -28,3 +30,4 @@ workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+pbps-load.workspace = true

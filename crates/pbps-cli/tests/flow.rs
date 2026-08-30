@@ -569,3 +569,37 @@ fn a_narrowing_change_is_flagged_in_the_plan() {
     assert!(out.contains("[narrowing]"), "{out}");
     assert!(out.contains("--allow narrowing"), "{out}");
 }
+
+// ---- pull (the paths that need no database) ----
+
+/// pull must never clobber an existing project by accident: the connection is
+/// not even attempted when declarations are already there.
+#[test]
+fn pull_refuses_to_overwrite_existing_declarations() {
+    let d = Demo::new("pull-refuse");
+    d.table(ONE_COLUMN);
+    let o = d.run(&[
+        "pull",
+        "--db",
+        "Server=nowhere.invalid,1433;Database=x;User Id=u;Password=p",
+    ]);
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(err.contains("already has declarations"), "{err}");
+    assert!(err.contains("--force"), "{err}");
+    // Refusal happened before any connection attempt.
+    assert!(!err.contains("nowhere.invalid"), "{err}");
+}
+
+#[test]
+fn pull_names_the_dialect_it_needs() {
+    let d = Demo::new("pull-dialect");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let o = d.run(&["pull", "--db", "Server=x;Database=y"]);
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("only implemented for mssql"),
+        "{}",
+        stderr(&o)
+    );
+}

@@ -1,6 +1,6 @@
 [package]
-name = "pbps-mssql"
-description = "PongBiphang Schema - the Microsoft SQL Server dialect"
+name = "pbps-db"
+description = "PongBiphang Schema - database connections"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pbps-model.workspace = true
-pbps-dialect.workspace = true
-pbps-db.workspace = true
+thiserror.workspace = true
 tiberius.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true

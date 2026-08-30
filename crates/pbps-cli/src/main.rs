@@ -90,6 +90,18 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
+
+    /// Reverse-generate declarations from an existing database
+    Pull {
+        /// ADO.NET-style connection string, e.g.
+        /// "Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true"
+        #[arg(long)]
+        db: String,
+
+        /// Overwrite existing declarations and identity file
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -156,7 +168,80 @@ fn run() -> anyhow::Result<()> {
                 reason,
             },
         ),
+        Command::Pull { db, force } => cmd_pull(&project, &db, force),
     }
+}
+
+/// Reverse-generates declarations from a live database — the adoption path.
+///
+/// `pull` designates one source-of-truth environment (SPEC §9.2): everything the
+/// database has and the model can express becomes YAML, everything it cannot
+/// express is printed as a warning, and a fresh identity file is minted so the
+/// next `plan` starts from "no changes".
+fn cmd_pull(project: &Project, db: &str, force: bool) -> anyhow::Result<()> {
+    if project.config.dialect != DialectName::Mssql {
+        bail!(
+            "pull is only implemented for mssql (this project's pbps.yml selects `{}`)",
+            project.config.dialect
+        );
+    }
+
+    let dir = project.schema_dir();
+    if !force {
+        let existing = if dir.is_dir() {
+            pbps_load::schema_files(&dir).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !existing.is_empty() || project.ids_file().exists() {
+            bail!(
+                "this project already has declarations; pull would overwrite them.\n                 Re-run with --force if that is what you want, or pull into a fresh project and merge."
+            );
+        }
+    }
+
+    // The runtime lives for exactly this one command: the tool is a CLI, not a
+    // server, and only the driver needs async at all.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let pulled = rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(db).await?;
+        pbps_mssql::catalog::introspect(&mut conn).await
+    })?;
+
+    for w in &pulled.warnings {
+        eprintln!("warning: {w}");
+    }
+
+    // Mint fresh identity for everything pulled. resolve with an empty baseline
+    // can produce no blockers (nothing disappears from empty), so a failure here
+    // is a bug, not a user problem.
+    let res = pbps_diff::resolve(&pulled.schema, &IdsFile::default(), &[], &context())
+        .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
+
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    for (name, table) in &pulled.schema.tables {
+        let path = dir.join(format!("{}.{}.yml", name.schema, name.name));
+        std::fs::write(&path, pbps_load::render(name, table, &[]))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+    }
+    write_ids(project, &res.ids)?;
+
+    println!(
+        "Pulled {} table(s) into `{}` and minted `{}`.",
+        pulled.schema.tables.len(),
+        dir.display(),
+        project.ids_file().display()
+    );
+    if !pulled.warnings.is_empty() {
+        println!(
+            "{} thing(s) could not be expressed and were left out; see the warnings above.",
+            pulled.warnings.len()
+        );
+    }
+    println!("Next: commit these files, then `pbps plan` should report no changes.");
+    Ok(())
 }
 
 /// The dialect implementation this project is configured for.

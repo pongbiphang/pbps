@@ -7,13 +7,13 @@ members = [
     "crates/pbps-diff",
     "crates/pbps-dialect",
     "crates/pbps-mssql",
+    "crates/pbps-db",
     "crates/pbps-cli",
 ]
 
 # spike: the Phase 0 YAML crate evaluation; removed once the choice is settled
 exclude = ["spikes/yaml-span"]
 
-# pbps-db arrives in Phase 2 (the connection layer)
 # pbps-pg arrives in Phase 4
 
 [workspace.package]
@@ -31,8 +31,17 @@ pbps-load    = { path = "crates/pbps-load" }
 pbps-diff    = { path = "crates/pbps-diff" }
 pbps-dialect = { path = "crates/pbps-dialect" }
 pbps-mssql   = { path = "crates/pbps-mssql" }
+pbps-db      = { path = "crates/pbps-db" }
 
 serde      = { version = "1", features = ["derive"] }
+
+# The driver is pure Rust: no ODBC to install, which matters on air-gapped
+# hosts (SPEC §11.3). tokio is pulled for the driver, not embraced: only
+# pbps-db and the mssql introspection are async, and the CLI block_on's them.
+tiberius   = { version = "0.12", default-features = false, features = ["rustls", "tds73"] }
+tokio      = { version = "1", features = ["net", "rt"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror  = "2"
 anyhow     = "1"

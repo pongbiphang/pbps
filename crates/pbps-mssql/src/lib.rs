@@ -22,8 +22,10 @@ use std::borrow::Cow;
 use pbps_dialect::{Dialect, DialectError, Statement, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Table, TableName};
 
+pub mod catalog;
 pub mod emit;
 pub mod ident;
+pub mod introspect;
 pub mod types;
 pub mod validate;
 

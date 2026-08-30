@@ -38,10 +38,15 @@ pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
 pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL
 pbps-dialect   Dialect abstraction. Pure functions; DB-bound work waits for
                Phase 3's DialectDb
+pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
+               only place SQL is written), catalog introspection
+pbps-db        Connections (tiberius). Owns "there is a network" and nothing
+               else; __pbps_state access and locking arrive in Phase 3
 pbps-cli       clap, interactive prompts, diagnostic output
 ```
 
-- Phase 2 adds `pbps-mssql` / `pbps-db`; Phase 4 adds `pbps-pg`.
+- Only `pbps-db` and `pbps-mssql::catalog` are async; the CLI `block_on`s
+  them per command. Phase 4 adds `pbps-pg`.
 - `spikes/` is workspace-`exclude`d: standalone evaluation crates, not product
   code.
 
@@ -92,11 +97,13 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phase 0 and Phase 1 complete.** The test and clippy bar is in "Development
-environment" above; counts change too often to record here.
+**Phases 0-2 complete** (Phase 2 with one caveat below). The test and clippy
+bar is in "Development environment" above; counts change too often to record
+here.
 
-Commands: `plan` (`--check` / `--since` / `--base` / `--out`), `validate`,
-`fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`.
+Commands: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
+`validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
+`pull` (`--db` / `--force`).
 
 Decisions that changed from the original spec (SPEC is in sync):
 
@@ -124,9 +131,32 @@ Decisions that changed from the original spec (SPEC is in sync):
     deployment account writes `__pbps_state` / `__pbps_lock`; the audit
     baseline is git + CI logs.
 
+Phase 2 additions worth knowing before touching them:
+
+12. **`ALTER COLUMN` restates the whole definition**, and an omitted
+    `NULL`/`NOT NULL` means `NULL` — so `AlterColumnType` carries nullability,
+    `AlterColumnNullability` carries the type, and the differ folds a
+    type+nullability change into one `AlterColumnType`.
+13. **Normalization targets what the catalog stores**, not what the user wrote
+    (`numeric`→`decimal`, `float(24)`→`real`, `varchar`→`varchar(1)`);
+    introspection reads the stored form back, and any gap is a phantom diff.
+14. **`pull` never drops what it cannot express** (computed columns, UDTs,
+    clustered indexes): each becomes a warning, and a table with no expressible
+    columns is left out whole. The round-trip `load(render(pulled)) == pulled`
+    is pinned by `pbps-cli/tests/pull_roundtrip.rs`.
+15. **Default/check expressions are compared after peeling the engine's stored
+    parentheses** (`((0))` → `0`), only when they wrap the whole string.
+
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.
 
-**Phase 2 (next)**: `pbps-mssql` type normalization, risk judgement, SQL
-emitter, introspection, and `pbps pull` (reverse-generation — the adoption
-key). `pbps-dialect::MinimalDialect` is a test stand-in to be replaced.
+**Phase 2 caveat**: introspection and the emitter have never run against a real
+SQL Server — the SPEC §11.5 Docker-based convergence tests (bootstrap ==
+introspect, apply(plan(A→B)) converges on B) are still owed. The catalog
+queries in `pbps-mssql/src/catalog.rs` are the untested surface; `assemble` and
+everything below it is covered.
+
+**Phase 3 (next)**: `pbps-db` grows `__pbps_state` / locking; `apply`,
+`verify`, `snapshot`, the `--allow` gate, `plan --db`, rename impact
+pre-flight. `pbps-dialect::MinimalDialect` remains only as pbps-diff's test
+stand-in.
