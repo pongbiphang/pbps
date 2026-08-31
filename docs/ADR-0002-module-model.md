@@ -34,6 +34,10 @@ measure, but as a principled line:
 
 Modules never appear in `schema.ids.json`.
 
+([ADR-0005](ADR-0005-roles-and-grants.md) later sharpened this criterion to
+"does drop + add destroy state that lives only in the environment?" — the
+answer for modules is unchanged.)
+
 ## Declaration format
 
 One module per file; as with tables, the file name carries no meaning and the

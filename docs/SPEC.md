@@ -59,6 +59,10 @@ targeted at Phase 3.5.
 - **Data transformation (backfill) is not automated.** How data should be moved is
   a business decision and cannot be derived from a structural diff. When it is
   needed, a human runs the SQL and then re-baselines with `pbps baseline`.
+  The boundary runs between business data (history — never touched) and
+  reference data (code — rows the application logic depends on): the latter
+  is declarable through an explicit `data:` block, designed in
+  [ADR-0004](ADR-0004-reference-data.md) and targeted at Phase 5.
 - **No cross-dialect abstract type system.** One schema is bound to one dialect.
   "Supports multiple databases" means the tool can drive MSSQL and PostgreSQL, not
   that one set of files deploys to both.
@@ -823,7 +827,7 @@ four invariants must be machine-verified:
 | **Phase 3** | `__pbps_state` / locking / `verify` / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` hook / the optional dev database (9.3) | The complete product |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
-| **Phase 5** | Extended properties and data-catalogue integration, more dialects | |
+| **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |
 
 When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
 at the same time**, even though it is not implemented. If Phase 4 forces a large
@@ -881,9 +885,14 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    drop+add, and git history is the audit trail. Targeted at Phase 3.5;
    `pull`'s inventory of unmanaged modules lands with Phase 2.
 
-7. **Whether permissions (GRANT) belong here** — declarative permission management
-   has value, but its risk model differs from schema change and the dialects vary
-   widely.
+7. **Whether permissions (GRANT) belong here** — settled; see
+   [ADR-0005](ADR-0005-roles-and-grants.md). The portable unit is the database
+   role: grants to roles are declarable, while logins, users and role
+   membership stay environment-local. The differing risk model becomes two new
+   classes (`grant-widen`, `revoke`), and roles join the ids file because
+   dropping one destroys per-environment membership — the generalized identity
+   criterion. Implementation targets Phase 5; the ids-file format extension is
+   pinned now.
 
 ---
 
