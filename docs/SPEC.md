@@ -1,6 +1,6 @@
 # PongBiphang Schema (`pbps`) — design specification
 
-> Status: finalized and implementable; Phases 0-3.5 are built for SQL Server
+> Status: living specification; Phases 0-3.5 are built for SQL Server
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Primary dialect: SQL Server; secondary: PostgreSQL
@@ -47,7 +47,8 @@ platform (cloud registry, dashboards, agents), pbps ships composable
 primitives — files, exit codes, JSON output, exec hooks — that plug into the
 infrastructure a team already runs: git, CI, schedulers, webhooks. For the
 regulated environments this tool targets, that is not a cheaper substitute; it
-is the requirement.
+is the requirement. The boundaries that thread draws — and the shortcuts it
+rules out even when they would be convenient — are listed in 14.3.
 
 ### 1.2 What v1 covers
 
@@ -426,6 +427,14 @@ error: 1 change could not be decided automatically
   if dropped:  pbps drop dbo.customer.customer_name --reason "<why>"
 ```
 
+**No flag may stand in for that answer.** Similarity is allowed to order the
+candidates in 6.3's prompt, one pair at a time, but an `--assume-renames` would
+be written once into a CI file or a shell alias and then never looked at again —
+and a confirmation that can become a line of configuration has stopped being a
+confirmation (14.3). Whichever channel supplies it, the artifact is the same: one
+entry in the ids file, in git, reviewed in the merge request. That is what still
+exists when prod deploys the rename five versions later.
+
 ---
 
 ## 7. Change classification and the risk gate
@@ -551,6 +560,13 @@ contradict 7.2's "data is not read to decide the class": classification stays
 static; the probes are the last line of defence at apply time, where a
 connection is guaranteed and reading data is exactly the job.
 
+**Nothing user-supplied runs between the approval and the statements.** The
+pre-flight is derived from the plan; the exec hooks of 13.5 run after an apply
+has finished. That gap is closed deliberately: anything executing inside it
+would make the checksum describe something other than what ran, and anything it
+changed in the database outside the declarations would become permanent drift
+that the next plan tries to remove (14.3).
+
 ---
 
 ## 8. Environment state and drift
@@ -626,7 +642,7 @@ positive is rebuilding one constraint, which is cheap and idempotent. When a
 dev database is configured (see 9.3), the offline preview upgrades this
 best-effort normalization to a real-engine round-trip.
 
-### 8.3 Two ways out of drift
+### 8.3 Three ways out of drift
 
 | Path | Command | When |
 |---|---|---|
@@ -636,6 +652,14 @@ best-effort normalization to a real-engine round-trip.
 
 `baseline` queries the database, writes a new `state_json`, and records the
 reason, operator and timestamp in the ledger.
+
+A fourth situation looks similar and is not drift at all: **the change applied
+exactly as planned, and the change itself was wrong.** The database matches its
+declarations, so nothing here fires. The answer is to take a past state out of
+the ledger and go forward into it — `state export` then the ordinary
+`plan --db` / `apply` (14.1) — because what changes is the declarations, so git
+and the database go back together. There is no one-step rollback, and what comes
+back is structure: a column that was dropped returns empty (14.3).
 
 ---
 
@@ -979,6 +1003,7 @@ Phase 3.5 adds one more, for the same reason:
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
 | **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
+| **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |
@@ -1048,6 +1073,127 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    dropping one destroys per-environment membership — the generalized identity
    criterion. Implementation targets Phase 5; the ids-file format extension is
    pinned now.
+
+---
+
+## 14. Usability gap review
+
+This review compares the **workflow**, not merely the object checklist. Atlas has
+a strong lint / policy / CI story and a guided migration workflow; Skeema makes
+the common inspect-and-push loop deliberately small and supplies practical lints
+and workspace validation. pbps is already stronger where its product thesis is
+strongest — explicit identity, reviewable saved plans, per-environment state and
+air-gapped operation — but several ordinary tasks still require the user to
+understand the architecture before they can succeed at all.
+
+Competitor capabilities change, so this is a **point-in-time product review, not
+a compatibility contract**. A capability belongs here only when it makes pbps
+easier to adopt or safer to operate *without* introducing a hosted control
+plane, making a database mandatory for offline work, or creating a second path
+around the typed plan and its checksum.
+
+### 14.1 The gaps
+
+| User job | Current friction | Proposed capability | Priority |
+|---|---|---|---|
+| Start a project from an existing database | The user must create `pbps.yml`, choose paths, discover the `pull` workflow and work out when to snapshot | `pbps init` detects an empty or new project, asks at most for dialect and environment, previews every file, then writes config + declarations + ids atomically; `--from <env>` chains `pull` and prints the exact next commands | **P0** |
+| Find out why setup fails | Connection, engine version, permissions, paths and ledger readiness each fail later, at a different command | `pbps doctor [--env <name>]` checks what only a connection can answer: reachability, dialect and edition, the minimum permissions, ledger and lock access, whether the environment is mid-deployment, and optionally Docker for 9.3. It runs `validate` rather than reimplementing it. Every failure carries a copy-pastable remedy and connection strings stay redacted | **P0** |
+| Understand a plan without reading SQL | The typed plan exists, but the first human-facing artifact is effectively plan.sql | Every `plan` prints a stable summary grouped by table and risk; `pbps explain --plan plan.json` answers **what**, **why**, the risk classes, the probes that will run, the execution mode (transactional or staged, see ADR-0003) and whether the target is mid-deployment — all without a connection, because the reviewer at the deployment gate may not have one | **P0** |
+| Diagnose CI in the code-review UI | Span diagnostics are good locally, while CI users must open raw logs; and only `verify` currently separates a finding (exit 2) from a tool failure (exit 1), so `plan --check`, `fmt --check` and `validate` report both the same way | Every read-only command supports the same `--format human\|json` and emits the *same typed findings*, with file and line spans. Exit codes are standardized as success / finding / tool failure. **Vendor-native annotations are produced by a converter in `scripts/`, never by the binary** — see 14.3 | **P0** |
+| Discover the declaration format while typing | Users move between YAML and this document, and a misspelled key is found only by running `validate` | Ship versioned JSON Schemas for `pbps.yml` and the declarations, **generated from the loader's own types** so the two cannot drift, plus a `pbps schema` exporter for air-gapped editors, shell completions and generated man pages | **P0** |
+| Apply organization-specific safety rules | Built-in validation cannot express local naming, size or change-window rules | A declarative `policies:` block selects built-in rules and severities. Suppression requires a rule id, a reason and an optional expiry; no embedded code in v1 (14.3). `validate --since` evaluates only changed objects, so a large estate can adopt it gradually. The block is a new format surface and gets an ADR before it is built, as reference data and roles did | **P1** |
+| Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
+| Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
+| Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed. A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
+| Assert domain invariants beyond structural convergence | The derived probes cover the hazards a change implies; teams also have rules no diff can imply ("every order has a customer") | A later `tests:` format runs read-only SQL assertions in the optional dev database and at target pre-flight. It is **deliberately separate from the probes of 7.5**, which are derived from the typed ChangeSet and are never replaced by hand-written ones — a probe nobody remembered to write is a probe that does not exist. `tests:` covers what no diff can imply, cannot mutate data, and gets an ADR before it is built | **P2** |
+
+### 14.2 The recommended first slice
+
+Phase 3.1 should be delivered as one end-to-end journey rather than ten isolated
+flags:
+
+```text
+pbps init --from prod
+  -> declarations + ids + config (atomically)
+  -> "run pbps doctor --env prod"
+
+pbps doctor --env prod
+  -> readiness report
+  -> "run pbps plan --db ..."
+
+pbps plan --db ... --out plan.json --sql plan.sql
+  -> a five-line summary and the exact approval command
+
+pbps explain --plan plan.json
+  -> the reviewer's explanation, no credentials required
+```
+
+Acceptance criteria for that slice:
+
+1. A user with a supported existing database can reach a reviewable plan without
+   opening this specification.
+2. No successful onboarding command partially rewrites the working tree: output
+   is staged, validated, then renamed into place atomically.
+3. Every diagnostic names the failing environment or file, says what to do next,
+   and redacts connection strings.
+4. The human, JSON and CI-annotation views describe the same typed findings; a
+   frontend never reimplements validation logic.
+5. Interactive convenience is optional. Every prompt has a flag, no flag ever
+   supplies rename or drop intent (14.3), and a run with no TTY stays
+   deterministic.
+6. Generated artifacts carry the pbps version and the schema version, so editor
+   assistance and templates cannot silently drift from the installed binary.
+
+### 14.3 Product guardrails
+
+The easiest product is not the one with the fewest confirmations; it is the one
+whose safe path explains itself. Each boundary below refuses a path that would
+be **shorter but would bypass the typed plan, the checksum, a human's recorded
+intent, or the git audit trail**. They are recorded here because a refusal is
+harder to reconstruct later than a feature: without them, every one of these
+arrives again as a reasonable-sounding request.
+
+- **No `push` shortcut.** `plan` then `apply --plan` stays visible. Collapsing
+  the two would leave nothing for a human to have read, which is the whole
+  difference between this and a schema-sync tool — and if a shorter path
+  existed, it would become the path everyone actually uses, and the reviewed one
+  would quietly die.
+- **Rename suggestions, never rename decisions.** Similarity may *order the
+  candidates* in the interactive prompt of 6.3, one pair at a time. Identity
+  intent is recorded only by a human, and **no non-interactive flag may supply
+  it**: a confirmation that can be written once into a CI file or a shell alias
+  has stopped being a confirmation. Whichever way it is given, the artifact is
+  the same — one entry in the ids file, in git, reviewed in the merge request,
+  which is what still exists when prod deploys that rename five versions later.
+- **`revert`, not rollback.** The ledger holds every past state, so a historical
+  state can be exported and applied — as a **new forward plan** through the
+  ordinary gate, the way `git revert` writes a new commit rather than rewriting
+  history. It restores *structure*: a column that was dropped comes back empty,
+  and the tool says so at the point of use rather than in a footnote nobody
+  reads at three in the morning. It is never one step, because the plan run in a
+  panic must not be the least reviewed one.
+- **No policy SaaS dependency.** Policies, suppressions, schemas, annotations and
+  reports are files or stdout, and they work air-gapped. Beyond the adoption
+  argument of 1.1 there is a structural one: the gate's granularity is *this
+  reviewed plan*, and a policy living outside git would be a second gate that
+  nobody reviewed and that can change an outcome without anyone noticing.
+- **No second plugin execution engine.** Organization-specific orchestration
+  stays in CI and in the exec hooks; built-in policy stays declarative and
+  bounded. The test is one question: **does the extension need to run between
+  "this plan was approved" and "these statements executed"?** If it does, it is
+  refused — it makes the checksum describe something other than what runs (this
+  is why ADR-0003 rules out Skeema's `alter-wrapper` path), and anything it
+  changes in the database outside the declarations becomes permanent drift that
+  the next plan will try to remove. Everything before a plan or after an apply
+  is already supported.
+- **Progressive disclosure.** The default output is a short result plus the next
+  command; `--verbose`, JSON and `explain` reveal the identities, probes,
+  normalization and checksums underneath when they are wanted.
+
+This ordering is deliberate. Broadening the object model improves coverage, and
+Phase 3.5 did exactly that — but `init` / `doctor` / `explain` improve the first
+hour and every failure after it. The same argument now places Phase 3.1 ahead of
+Phase 4, unless a specific user is blocked on PostgreSQL.
 
 ---
 

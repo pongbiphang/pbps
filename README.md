@@ -29,7 +29,8 @@ groups of commands:
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |
 
-PostgreSQL is Phase 4.
+Next is Phase 3.1 — `init`, `doctor` and `explain`, so that the safe path is
+also the shortest one (see [SPEC §14](docs/SPEC.md)). PostgreSQL is Phase 4.
 
 ### Declaring a view
 

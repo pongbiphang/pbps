@@ -89,6 +89,30 @@ Each of these was paid for — stop and think before breaking one.
    in the database, so either one inside `Schema` breaks constraint 1. They come
    back from `pbps-load` as `Loaded.hints` and reach the differ as `Hints`.
 
+## Product guardrails (SPEC 14.3)
+
+Each of these refuses a path that is **shorter but bypasses the typed plan, the
+checksum, a human's recorded intent, or the git audit trail**. They arrive as
+reasonable-sounding requests; the reason they were refused is the part that is
+expensive to reconstruct.
+
+- **No `push`.** `plan` then `apply --plan` stays two steps. A shorter path would
+  become the path everyone uses, and the reviewed one would die.
+- **Rename suggestions, never rename decisions.** Similarity may order the
+  candidates in the TTY prompt (SPEC 6.3, still unbuilt), one pair at a time.
+  **No non-interactive flag may supply identity intent** — a confirmation that
+  can be written once into a CI file has stopped being a confirmation.
+- **`revert`, not rollback.** A historical state is exported and applied as a new
+  forward plan through the ordinary gate. It restores structure, not data, and
+  says so at the point of use. Never one step.
+- **No policy SaaS.** Policies and reports are files or stdout, air-gapped. A
+  policy outside git is a second gate nobody reviewed.
+- **No plugin execution engine.** The test: does it need to run *between* "plan
+  approved" and "statements executed"? Then no — it makes the checksum describe
+  something other than what runs, and anything it changes outside the
+  declarations becomes permanent drift. Before a plan or after an apply is
+  already served by the exec hooks and CI.
+
 ## Format traps (all found the hard way)
 
 - **`null` cannot be a YAML key** (it is the null literal); the field is
@@ -271,7 +295,13 @@ argument; `sql_expression_dependencies` returning one row per referenced
 The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
 
-**Next**: Phase 4, the PostgreSQL dialect — the touchstone for the `Dialect`
+**Next**: Phase 3.1, the usability foundation of SPEC 14 — `init`, `doctor`,
+plan summaries and `explain`, one typed JSON output across the read-only
+commands, editor schemas and completions. It is placed ahead of the next dialect
+deliberately: broadening the object model improves coverage, but these improve
+the first hour and every failure after it.
+
+Then Phase 4, the PostgreSQL dialect — the touchstone for the `Dialect`
 abstraction. One module-model question is already known to be waiting there:
 PostgreSQL identifies a function by name **plus argument types**, so "the name
 is the identity" needs revisiting (ADR-0002). Phase 5 holds declarative
