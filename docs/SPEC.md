@@ -1,6 +1,6 @@
 # PongBiphang Schema (`pbps`) — design specification
 
-> Status: finalized and implementable; Phase 0 and Phase 1 are built
+> Status: finalized and implementable; Phases 0-3.5 are built for SQL Server
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Primary dialect: SQL Server; secondary: PostgreSQL
@@ -52,15 +52,16 @@ is the requirement.
 ### 1.2 What v1 covers
 
 **In**: tables (create / drop / rename), columns, primary keys, unique
-constraints, foreign keys, check constraints, indexes.
+constraints, foreign keys, check constraints, indexes — and, since Phase 3.5,
+**modules**: views, stored procedures, functions and triggers.
 
-**Deferred**: views, stored procedures, functions, triggers, permissions (GRANT),
-data transformation (backfill).
+**Deferred**: permissions (GRANT), data transformation (backfill).
 
 Objects like views and stored procedures, where the definition simply *is* the
 latest version, behave much like repeatable migrations. That is a different
 model — the module model, designed in [ADR-0002](ADR-0002-module-model.md) and
-targeted at Phase 3.5.
+built in Phase 3.5: they carry no data, so they get none of the identity
+machinery and never appear in the ids file (see 4.5).
 
 ### 1.3 Explicit non-goals
 
@@ -236,6 +237,54 @@ problems at once, "compliance requires PII to actually be deleted" and "the
 declarations accumulate zombie columns": **the files never hold zombies, and the
 audit trail lives in the ids file and the database ledger, where it is
 queryable**.
+
+---
+
+### 4.5 Module definitions
+
+One module per file, as for tables; the leading key is both the kind and the
+name (`view:` / `procedure:` / `function:` / `trigger:`), and triggers name
+their table with `on:`.
+
+```yaml
+# schema/dbo.active_customer.view.yml
+view: dbo.active_customer
+description: Customers that are not legacy records
+definition: |-
+  SELECT customer_id, full_name
+  FROM dbo.customer
+  WHERE legacy_code IS NULL
+```
+
+The emitter composes the whole `CREATE OR ALTER` statement, so SQL still appears
+exactly once. `definition:` holds everything after the part the emitter can
+derive:
+
+| Kind | Emitted prefix | `definition:` starts at |
+|---|---|---|
+| view | `CREATE OR ALTER VIEW <name> AS` | the `SELECT` |
+| trigger | `CREATE OR ALTER TRIGGER <name> ON <on>` | `AFTER INSERT ...` |
+| procedure | `CREATE OR ALTER PROCEDURE <name>` | the parameter list, then `AS` |
+| function | `CREATE OR ALTER FUNCTION <name>` | the parameter list, then `RETURNS` |
+
+A parameter list stays inside `definition` because it is part of the object's
+contract, and modelling T-SQL parameter syntax would mean parsing SQL — which
+this tool does not do (8.2).
+
+Two more rules, both consequences of the model rather than choices:
+
+- **`depends_on:` is an annotation, not state.** Creation order is invisible in
+  the database, so it lives beside the model exactly as `strategy:` does. It is
+  needed only where the identifier scan of ADR-0002 cannot see a dependency.
+- **A module name may not collide with a table or another module.** SQL Server
+  keeps them in one `sys.objects` namespace per schema, so `pbps validate`
+  answers this before the engine does — at apply time the answer arrives on a
+  database that is already half-changed.
+
+A module created `WITH ENCRYPTION`, a CLR object, and a view carrying options
+the model cannot hold (`WITH SCHEMABINDING`) have no manageable form. `pull`
+inventories them with the reason and leaves them alone; it never recreates one
+without the option nobody noticed it had.
 
 ---
 
@@ -601,7 +650,7 @@ reason, operator and timestamp in the ledger.
 | `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
-| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
+| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
@@ -629,9 +678,9 @@ full state.
 | Command | Purpose |
 |---|---|
 | `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
-| `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3) |
+| `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
-| `pbps apply --plan plan.json --allow ...` | Apply a plan |
+| `pbps apply --plan plan.json --allow ...` | Apply a plan. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason --operator` | Reset the state baseline |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
@@ -655,8 +704,16 @@ every environment has been `snapshot`ted and drifts by nothing.
 `plan` accepts an optional throwaway engine for higher-fidelity previews:
 
 ```bash
-pbps plan --dev docker://mssql/2022     # or `dev:` in pbps.yml
+pbps plan --dev docker://mcr.microsoft.com/mssql/server:2022-latest
+pbps plan --dev "Server=...;User Id=...;Password=..."   # a server already running
+# or `dev: { docker: ... }` / `dev: { url_env: ... }` in pbps.yml
 ```
+
+A container is started with a per-run password on a host-chosen port and removed
+on every path out; against a server that is already running, pbps creates one
+scratch database and drops it. `--dev` and `--db` are refused together: a
+rehearsal answers a preview's question, and combining the two would invite a
+dev-verified plan to be read as a target-verified one.
 
 The container is used three ways, all on the preview side:
 
@@ -667,6 +724,14 @@ The container is used three ways, all on the preview side:
 3. **Convergence rehearsal** — bootstrap the baseline state, apply the plan,
    introspect, and compare against the desired state. This is invariant 3 of
    11.5 (migration convergence) surfaced as a user-facing pre-check.
+
+What is left over after the rehearsal is reported in two groups, because they
+mean different things. A **structural** difference is a plan that does not
+converge, and it fails the command. A **spelling** difference is the engine's
+normalization showing through — the declaration says `amount > 0` and the
+catalog stores `([amount]>(0))` — and it is reported *with the stored form*,
+which is the one thing no offline normalization can produce and exactly what is
+needed to silence it.
 
 Three stances, all deliberate and all different from Atlas (whose dev database
 is required for many operations):
@@ -898,6 +963,12 @@ promise about the engine's behaviour rather than about the tool's own logic:
 8. **Probe accuracy**: the counts a probe reports are the rows the engine would
    actually refuse. The whole value of a probe is its number.
 
+Phase 3.5 adds one more, for the same reason:
+
+9. **Module round-trip**: a module emitted, executed, and read back out of
+   `sys.sql_modules` equals the declaration that produced it. If it did not,
+   every apply would be followed by a drift report that never goes quiet.
+
 ---
 
 ## 12. Phases
@@ -907,7 +978,7 @@ promise about the engine's behaviour rather than about the tool's own logic:
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
-| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4) | The complete product. The optional dev database (9.3) and edition-aware `strategy: online` are deferred: both sharpen a preview rather than gating a deployment |
+| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |
@@ -966,8 +1037,8 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    [ADR-0002](ADR-0002-module-model.md). Modules (views, procedures,
    functions, triggers) carry no data, so they get a second, identity-free
    model: the declared definition is the desired state, renames are lossless
-   drop+add, and git history is the audit trail. Targeted at Phase 3.5;
-   `pull`'s inventory of unmanaged modules lands with Phase 2.
+   drop+add, and git history is the audit trail. Built in Phase 3.5;
+   `pull`'s inventory of what it cannot manage landed with Phase 2.
 
 7. **Whether permissions (GRANT) belong here** — settled; see
    [ADR-0005](ADR-0005-roles-and-grants.md). The portable unit is the database

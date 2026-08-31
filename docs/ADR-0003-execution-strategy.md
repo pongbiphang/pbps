@@ -1,6 +1,6 @@
 # ADR-0003: Execution strategy and the staged apply
 
-- Status: decided (design; format in Phase 2, staged apply in Phase 3.5)
+- Status: accepted; format in Phase 2, emitter and edition-awareness in Phase 3, staged apply in Phase 3.5
 - Date: 2026-08-30
 - Related: docs/SPEC.md §7.3, §7.5, §12, §13.2
 
@@ -92,6 +92,24 @@ where both meet.
 | Phase 2 | The `strategy:` block enters the YAML format and `pbps-load`'s return type — the cheapest moment, before the signature has many callers. `fmt` preserves it; `validate` rejects unknown keys |
 | Phase 3 | The emitter honours `online: true` where the statement stays transactional; edition-aware classification at `plan --db` |
 | Phase 3.5 | Staged apply (`--staged` / `--resume`, per-statement ledger records) |
+
+## What was learned building it
+
+- **The hint travels on the change, not beside the plan.** The plan file is
+  what the deployment gate approves, so an approver has to be able to see that
+  this index will be rebuilt online. A strategy resolved at emit time against a
+  YAML file the deployment host may not even have is a hint nobody reviewed.
+- **`WITH (ONLINE = ON)` is not accepted everywhere the intuition says.** A
+  UNIQUE constraint is backed by an index and takes it; a foreign key and a
+  check are metadata only, where the clause is a syntax error rather than a
+  no-op. The emitter's three-way `DROP CONSTRAINT` arm had to be split.
+- **A staged plan's mode belongs in the file, and the flag has to agree with
+  it.** Running whichever the operator typed would be the tool choosing the
+  loser of a disagreement about what was approved.
+- **An unfinished staged apply makes the environment mid-deployment.** The
+  recorded baseline is then a checkpoint, not a state anybody signed off, so
+  `plan --db` and a fresh `apply` both refuse until it is finished or
+  baselined, and `status` reports it as its own state rather than as `ok`.
 
 ## Ruled out
 

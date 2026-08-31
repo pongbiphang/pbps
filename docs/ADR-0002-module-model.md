@@ -1,6 +1,6 @@
 # ADR-0002: The module model — views, procedures, functions, triggers
 
-- Status: decided (design; implementation targeted at Phase 3.5)
+- Status: accepted; built in Phase 3.5 for SQL Server
 - Date: 2026-08-30
 - Related: docs/SPEC.md §1.2, §7.4, §8.2, §12, §13.6
 
