@@ -7,8 +7,8 @@
 use pbps_db::{Conn, DbError, Row};
 
 use crate::introspect::{
-    Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
-    RawTable, assemble,
+    ModuleKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
+    RawKeyColumn, RawModule, RawTable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the `__pbps_` filter drops this
@@ -86,6 +86,18 @@ SELECT i.object_id, i.name, i.is_unique,
  WHERE i.type > 0 AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
    AND i.is_hypothetical = 0
  ORDER BY i.object_id, i.name, ic.is_included_column, ic.key_ordinal;";
+
+/// Views, procedures, functions and triggers. They are not managed
+/// (ADR-0002 targets Phase 3.5), but `pull` has to report them: a pull that
+/// silently ignores half the database breaks the adoption story that justifies
+/// it. `is_ms_shipped = 0` drops the system objects.
+const MODULES: &str = "\
+SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code
+  FROM sys.objects o
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+ WHERE o.is_ms_shipped = 0
+   AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
+ ORDER BY s.name, o.name;";
 
 /// A required value that came back NULL means the query and the struct have
 /// drifted apart; that is a bug here, not bad data, and it must be named.
@@ -168,6 +180,20 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             column: get::<&str>(&row, "column_name")?.to_owned(),
             is_included: get(&row, "is_included_column")?,
             is_descending: get(&row, "is_descending_key")?,
+        });
+    }
+
+    for row in conn.query(MODULES).await? {
+        let code = get::<&str>(&row, "type_code")?;
+        // An unrecognised code means the query and the mapping have drifted;
+        // skipping is right (it is not a module) but silence is not.
+        let Some(kind) = ModuleKind::from_type_code(code) else {
+            continue;
+        };
+        raw.modules.push(RawModule {
+            schema: get::<&str>(&row, "schema_name")?.to_owned(),
+            name: get::<&str>(&row, "object_name")?.to_owned(),
+            kind,
         });
     }
 

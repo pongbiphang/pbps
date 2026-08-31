@@ -811,6 +811,7 @@ pbps/
                     dependency queries
     pbps-pg/        PostgreSQL (Phase 4)
     pbps-db/        Connection abstraction, __pbps_state access, locking
+    pbps-docs/      Documentation and ERD rendering (9.4); pure, no dialect
     pbps-cli/       clap, interactive prompts, diagnostic output
 ```
 

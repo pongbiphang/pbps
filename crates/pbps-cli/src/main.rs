@@ -91,6 +91,21 @@ enum Command {
         reason: String,
     },
 
+    /// Render documentation and an ERD from the declarations
+    Docs {
+        /// markdown, html or erd
+        #[arg(long, default_value = "markdown")]
+        format: pbps_docs::Format,
+
+        /// Where to write. Defaults to standard output
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+
+        /// Heading for the document
+        #[arg(long, default_value = "Database schema")]
+        title: String,
+    },
+
     /// Reverse-generate declarations from an existing database
     Pull {
         /// ADO.NET-style connection string, e.g.
@@ -169,7 +184,36 @@ fn run() -> anyhow::Result<()> {
             },
         ),
         Command::Pull { db, force } => cmd_pull(&project, &db, force),
+        Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
     }
+}
+
+/// Renders documentation from the declarations, offline (SPEC §9.4).
+///
+/// The ids file is read but not required: without it there is simply no
+/// graveyard section. Documentation must not become the one command that fails
+/// on a project that has never run `plan`.
+fn cmd_docs(
+    project: &Project,
+    format: pbps_docs::Format,
+    out: Option<&std::path::Path>,
+    title: &str,
+) -> anyhow::Result<()> {
+    let loaded = load(project)?;
+    let ids = read_ids_opt(project)?.unwrap_or_default();
+    let rendered = pbps_docs::render(&loaded.schema, &ids, format, title);
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            // To stderr: stdout may be the document itself when --out is absent,
+            // and a progress line in a piped file would corrupt it.
+            eprintln!("wrote {} ({})", path.display(), format.as_str());
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(())
 }
 
 /// Reverse-generates declarations from a live database — the adoption path.
@@ -214,6 +258,21 @@ fn cmd_pull(project: &Project, db: &str, force: bool) -> anyhow::Result<()> {
         eprintln!("warning: {w}");
     }
 
+    // Modules are not managed yet (ADR-0002), but staying quiet about them
+    // would tell the user the database is fully covered when it is not.
+    if !pulled.unmanaged_modules.is_empty() {
+        eprintln!(
+            "note: {} object(s) exist in the database that pbps does not manage yet:",
+            pulled.unmanaged_modules.len()
+        );
+        for m in &pulled.unmanaged_modules {
+            eprintln!("  {} {}", m.kind, m.name);
+        }
+        eprintln!(
+            "  They are left untouched: pbps will neither change nor drop them, and they do not appear in any plan."
+        );
+    }
+
     // Mint fresh identity for everything pulled. resolve with an empty baseline
     // can produce no blockers (nothing disappears from empty), so a failure here
     // is a bug, not a user problem.
@@ -223,7 +282,7 @@ fn cmd_pull(project: &Project, db: &str, force: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     for (name, table) in &pulled.schema.tables {
         let path = dir.join(format!("{}.{}.yml", name.schema, name.name));
-        std::fs::write(&path, pbps_load::render(name, table, &[]))
+        std::fs::write(&path, pbps_load::render(name, table, &[], None))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
     }
     write_ids(project, &res.ids)?;
@@ -417,7 +476,12 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
             .iter()
             .cloned()
             .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
-        let rendered = pbps_load::render(&loaded.name, &loaded.table, &pending);
+        let rendered = pbps_load::render(
+            &loaded.name,
+            &loaded.table,
+            &pending,
+            loaded.strategy.as_ref(),
+        );
         if rendered == original {
             continue;
         }

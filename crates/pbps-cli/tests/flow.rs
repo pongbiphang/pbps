@@ -603,3 +603,111 @@ fn pull_names_the_dialect_it_needs() {
         stderr(&o)
     );
 }
+
+// ---- docs (SPEC 9.4) and the strategy block (ADR-0003) ----
+
+/// Written with explicit `\n` rather than a `\`-continued literal: Rust strips
+/// the leading whitespace of a continued line, which silently unindents YAML.
+const DOCUMENTED: &str = concat!(
+    "table: dbo.t\n",
+    "description: A documented table.\n",
+    "strategy:\n",
+    "  online: true\n",
+    "columns:\n",
+    "  id: {type: bigint, nullable: false, description: Surrogate key.}\n",
+    "  old: {type: int, deprecated: use id instead}\n",
+    "primary_key: [id]\n",
+);
+
+#[test]
+fn docs_renders_markdown_to_stdout_by_default() {
+    let d = Demo::new("docs-md");
+    d.table(DOCUMENTED);
+    let o = d.run(&["docs"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("A documented table."), "{out}");
+    assert!(out.contains("Surrogate key."), "{out}");
+    assert!(out.contains("## Do not use"), "{out}");
+    assert!(out.contains("use id instead"), "{out}");
+    assert!(out.contains("```mermaid"), "{out}");
+}
+
+/// The air-gap rule applies to artifacts too: a page that needs the network to
+/// look right is not self-contained.
+#[test]
+fn docs_html_is_one_self_contained_file() {
+    let d = Demo::new("docs-html");
+    d.table(DOCUMENTED);
+    let path = d.dir.join("schema.html");
+    let o = d.run(&["docs", "--format", "html", "--out", path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let html = std::fs::read_to_string(&path).unwrap();
+    assert!(html.starts_with("<!doctype html>"), "{html}");
+    for forbidden in ["http://", "https://", "<script", "<link", "src="] {
+        assert!(!html.contains(forbidden), "found `{forbidden}` in the page");
+    }
+    // Progress goes to stderr so a piped document is never corrupted.
+    assert!(stdout(&o).is_empty(), "stdout: {}", stdout(&o));
+}
+
+/// Identical declarations must produce byte-identical files, or every docs run
+/// would show up as a diff.
+#[test]
+fn docs_output_is_deterministic() {
+    let d = Demo::new("docs-determinism");
+    d.table(DOCUMENTED);
+    let first = stdout(&d.run(&["docs"]));
+    for _ in 0..3 {
+        assert_eq!(stdout(&d.run(&["docs"])), first);
+    }
+    assert!(!first.is_empty());
+}
+
+#[test]
+fn docs_names_the_formats_it_has() {
+    let d = Demo::new("docs-bad-format");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["docs", "--format", "pdf"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("markdown"), "{}", stderr(&o));
+}
+
+/// A project that has never run `plan` has no ids file; documentation must not
+/// be the one command that fails on it.
+#[test]
+fn docs_works_before_the_ids_file_exists() {
+    let d = Demo::new("docs-no-ids");
+    d.table(ONE_COLUMN);
+    assert!(!d.ids_path().exists());
+    let o = d.run(&["docs", "--format", "erd"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).starts_with("erDiagram"), "{}", stdout(&o));
+}
+
+/// Unlike `renamed_from`, a strategy is persistent: fmt must not quietly turn an
+/// online alter into a blocking one.
+#[test]
+fn fmt_preserves_the_strategy_block() {
+    let d = Demo::new("fmt-strategy");
+    d.table(DOCUMENTED);
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(text.contains("strategy:\n  online: true"), "{text}");
+
+    // And it is a fixpoint: a second fmt changes nothing.
+    let o = d.run(&["fmt", "--check"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// ADR-0003: a typo must not silently become a no-op.
+#[test]
+fn an_unknown_strategy_key_is_rejected() {
+    let d = Demo::new("strategy-typo");
+    d.table("table: dbo.t\nstrategy:\n  onlnie: true\ncolumns:\n  id: {type: int}\n");
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("onlnie"), "{}", stderr(&o));
+}

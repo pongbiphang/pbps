@@ -588,6 +588,7 @@ dependencies = [
  "pbps-db",
  "pbps-dialect",
  "pbps-diff",
+ "pbps-docs",
  "pbps-load",
  "pbps-model",
  "pbps-mssql",
@@ -630,6 +631,13 @@ dependencies = [
  "pbps-dialect",
  "pbps-model",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pbps-docs"
+version = "0.0.0"
+dependencies = [
+ "pbps-model",
 ]
 
 [[package]]

@@ -399,3 +399,56 @@ async fn pull_warns_about_what_it_cannot_express() {
         pulled.warnings
     );
 }
+
+/// ADR-0002: modules are not managed, but a pull that does not even see them
+/// tells the user the database is covered when half of it is not.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn pull_inventories_the_modules_it_does_not_manage() {
+    let mut db = TestDb::create("modules").await;
+    db.conn
+        .execute("CREATE TABLE dbo.t (id int NOT NULL, flag bit NULL);")
+        .await
+        .expect("create table");
+    // Each in its own batch: CREATE VIEW and CREATE PROCEDURE must each begin
+    // their own.
+    for sql in [
+        "CREATE VIEW dbo.v_active AS SELECT id FROM dbo.t WHERE flag = 1;",
+        "CREATE PROCEDURE dbo.sp_touch AS SELECT 1;",
+        "CREATE FUNCTION dbo.fn_double(@n int) RETURNS int AS BEGIN RETURN @n * 2 END;",
+        "CREATE TRIGGER dbo.tr_t ON dbo.t AFTER INSERT AS SELECT 1;",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let found: Vec<(&str, &str)> = pulled
+        .unmanaged_modules
+        .iter()
+        .map(|m| (m.kind, m.name.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("function", "dbo.fn_double"),
+            ("procedure", "dbo.sp_touch"),
+            ("trigger", "dbo.tr_t"),
+            ("view", "dbo.v_active"),
+        ],
+        "every module kind must be seen, sorted"
+    );
+    // The table itself still came through untouched.
+    assert!(
+        pulled
+            .schema
+            .tables
+            .contains_key(&TableName::new("dbo", "t"))
+    );
+}

@@ -13,7 +13,7 @@ pub mod fmt;
 
 use std::path::Path;
 
-use pbps_model::{Schema, TableName};
+use pbps_model::{Schema, Strategies, TableName};
 
 pub use convert::LoadedTable;
 pub use error::{LoadError, Semantic, SourceFile};
@@ -25,6 +25,8 @@ pub use pbps_model::Intent;
 pub struct Loaded {
     pub schema: Schema,
     pub intents: Vec<Intent>,
+    /// Only the tables that declared one; absence means the default.
+    pub strategies: Strategies,
 }
 
 /// Loads one table from a string. `path` is used only in diagnostics.
@@ -87,6 +89,9 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                 }
                 seen.insert(t.name.clone(), path);
                 loaded.intents.append(&mut t.intents);
+                if let Some(s) = t.strategy {
+                    loaded.strategies.insert(t.name.clone(), s);
+                }
                 loaded.schema.tables.insert(t.name, t.table);
             }
             Err(mut e) => errs.append(&mut e),

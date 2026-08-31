@@ -28,6 +28,11 @@ pub struct TableDto {
     #[serde(default)]
     pub renamed_from: Option<Spanned<String>>,
 
+    /// Execution hints (ADR-0003). Persistent, unlike `renamed_from`: `fmt`
+    /// keeps it.
+    #[serde(default)]
+    pub strategy: Option<StrategyDto>,
+
     /// `IndexMap` preserves the declaration order in the document, which decides
     /// the column layout of `CREATE TABLE`.
     pub columns: IndexMap<String, ColumnDto>,
@@ -47,6 +52,15 @@ pub struct TableDto {
 
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexDto>,
+}
+
+/// `deny_unknown_fields` is what turns a typo into an error instead of a
+/// silent no-op — the whole point of ADR-0003's "validate rejects unknown keys".
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategyDto {
+    #[serde(default)]
+    pub online: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]

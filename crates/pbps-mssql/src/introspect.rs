@@ -100,6 +100,51 @@ pub struct RawIndexColumn {
     pub is_descending: bool,
 }
 
+/// One view, procedure, function or trigger.
+///
+/// Modules are not managed yet ([ADR-0002](../../../docs/ADR-0002-module-model.md)
+/// targets Phase 3.5), but they must be *seen*: a pull that silently ignores
+/// half the database breaks the adoption story that justifies pull at all. So
+/// they are counted and reported, never converted.
+#[derive(Debug, Clone)]
+pub struct RawModule {
+    pub schema: String,
+    pub name: String,
+    /// `sys.objects.type_desc`, mapped to a word a user recognises.
+    pub kind: ModuleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModuleKind {
+    View,
+    Procedure,
+    Function,
+    Trigger,
+}
+
+impl ModuleKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ModuleKind::View => "view",
+            ModuleKind::Procedure => "procedure",
+            ModuleKind::Function => "function",
+            ModuleKind::Trigger => "trigger",
+        }
+    }
+
+    /// Maps `sys.objects.type` codes. Returns `None` for anything that is not a
+    /// module, so an unknown code is skipped rather than mislabelled.
+    pub fn from_type_code(code: &str) -> Option<Self> {
+        match code.trim() {
+            "V" => Some(ModuleKind::View),
+            "P" | "PC" => Some(ModuleKind::Procedure),
+            "FN" | "IF" | "TF" | "FS" | "FT" => Some(ModuleKind::Function),
+            "TR" => Some(ModuleKind::Trigger),
+            _ => None,
+        }
+    }
+}
+
 /// Everything read from one database.
 #[derive(Debug, Clone, Default)]
 pub struct RawCatalog {
@@ -109,6 +154,7 @@ pub struct RawCatalog {
     pub foreign_key_columns: Vec<RawForeignKeyColumn>,
     pub checks: Vec<RawCheck>,
     pub index_columns: Vec<RawIndexColumn>,
+    pub modules: Vec<RawModule>,
 }
 
 /// The result of a pull: the schema, plus everything that could not be said.
@@ -119,6 +165,18 @@ pub struct Pulled {
     /// the caller must show these, because each one is a difference that would
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
+    /// Views, procedures, functions and triggers found but not managed
+    /// (ADR-0002). Separate from `warnings` because these are not defects in
+    /// the pull — they are an inventory of what the tool does not cover yet,
+    /// and the user needs the count and the names, not one line each.
+    pub unmanaged_modules: Vec<UnmanagedModule>,
+}
+
+/// One module the database has and `pbps` does not manage.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnmanagedModule {
+    pub kind: &'static str,
+    pub name: String,
 }
 
 /// Rebuilds the declared type from what the catalog stores.
@@ -371,7 +429,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         schema.tables.insert(names.remove(&id).unwrap(), table);
     }
 
-    Pulled { schema, warnings }
+    // Sorted so that two pulls of the same database report the same order —
+    // the inventory ends up in a commit message or a ticket often enough that
+    // shifting order would be noise.
+    let mut unmanaged_modules: Vec<UnmanagedModule> = raw
+        .modules
+        .iter()
+        .map(|m| UnmanagedModule {
+            kind: m.kind.as_str(),
+            name: format!("{}.{}", m.schema, m.name),
+        })
+        .collect();
+    unmanaged_modules.sort();
+    unmanaged_modules.dedup();
+
+    Pulled {
+        schema,
+        warnings,
+        unmanaged_modules,
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +707,121 @@ mod tests {
         });
         let p = assemble(&raw);
         assert_eq!(p.schema.tables.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    fn catalog_with(modules: Vec<RawModule>) -> RawCatalog {
+        let mut c = raw_one_table();
+        c.modules = modules;
+        c
+    }
+
+    fn raw_one_table() -> RawCatalog {
+        RawCatalog {
+            tables: vec![RawTable {
+                object_id: 1,
+                schema: "dbo".into(),
+                name: "t".into(),
+            }],
+            columns: vec![RawColumn {
+                object_id: 1,
+                name: "id".into(),
+                type_name: "int".into(),
+                max_length: 4,
+                precision: 10,
+                scale: 0,
+                is_nullable: false,
+                is_computed: false,
+                is_user_defined_type: false,
+                identity: None,
+                default: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn module(schema: &str, name: &str, kind: ModuleKind) -> RawModule {
+        RawModule {
+            schema: schema.into(),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    /// ADR-0002: modules are not managed, but a pull that does not even mention
+    /// them tells the user the database is fully covered when half of it is not.
+    #[test]
+    fn modules_are_inventoried_rather_than_ignored() {
+        let p = assemble(&catalog_with(vec![
+            module("dbo", "v_active", ModuleKind::View),
+            module("dbo", "sp_reprice", ModuleKind::Procedure),
+        ]));
+        assert_eq!(
+            p.unmanaged_modules,
+            vec![
+                UnmanagedModule {
+                    kind: "procedure",
+                    name: "dbo.sp_reprice".into()
+                },
+                UnmanagedModule {
+                    kind: "view",
+                    name: "dbo.v_active".into()
+                },
+            ]
+        );
+        // They are an inventory, not defects: the tables still came through and
+        // nothing was added to `warnings`.
+        assert_eq!(p.warnings, Vec::<String>::new());
+        assert_eq!(p.schema.tables.len(), 1);
+    }
+
+    #[test]
+    fn a_database_with_no_modules_reports_an_empty_inventory() {
+        assert!(assemble(&raw_one_table()).unmanaged_modules.is_empty());
+    }
+
+    /// The order must not depend on what the server happened to return.
+    #[test]
+    fn the_inventory_is_sorted_and_deduplicated() {
+        let p = assemble(&catalog_with(vec![
+            module("dbo", "zzz", ModuleKind::View),
+            module("app", "aaa", ModuleKind::Trigger),
+            module("dbo", "zzz", ModuleKind::View),
+        ]));
+        assert_eq!(
+            p.unmanaged_modules
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["app.aaa", "dbo.zzz"]
+        );
+    }
+
+    #[test]
+    fn every_module_type_code_maps_to_the_right_word() {
+        for (code, want) in [
+            ("V", Some("view")),
+            ("P", Some("procedure")),
+            ("PC", Some("procedure")),
+            ("FN", Some("function")),
+            ("IF", Some("function")),
+            ("TF", Some("function")),
+            ("TR", Some("trigger")),
+        ] {
+            assert_eq!(
+                ModuleKind::from_type_code(code).map(ModuleKind::as_str),
+                want,
+                "type code {code}"
+            );
+        }
+        // A table is not a module, and neither is a constraint; mislabelling one
+        // would put it in the inventory as something the user must act on.
+        assert_eq!(ModuleKind::from_type_code("U"), None);
+        assert_eq!(ModuleKind::from_type_code("PK"), None);
+        assert_eq!(ModuleKind::from_type_code("D"), None);
     }
 }

@@ -42,6 +42,8 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place SQL is written), catalog introspection
 pbps-db        Connections (tiberius). Owns "there is a network" and nothing
                else; __pbps_state access and locking arrive in Phase 3
+pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
+               Pure: no dialect, no connection, no configuration
 pbps-cli       clap, interactive prompts, diagnostic output
 ```
 
@@ -97,29 +99,13 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phases 0-1 complete; Phase 2 partially.** The test and clippy bar is in
-"Development environment" above; counts change too often to record here.
-
-Phase 2's scope grew after the competitive review (SPEC §12). Built: the MSSQL
-emitter, introspection and `pull`. Still owed:
-
-- **`pbps docs`** (SPEC §9.4) — Markdown / single-file HTML / Mermaid ERD from
-  the declarations. This is what makes §4.3's "comments live in `description`
-  only" pay off, and with `pull` it is the first-contact story.
-- **The `strategy:` block** ([ADR-0003](docs/ADR-0003-execution-strategy.md)) —
-  it enters the YAML format and `pbps-load`'s return type now, while that
-  signature has few callers; `fmt` preserves it, `validate` rejects unknown
-  keys. The emitter honours it in Phase 3.
-- **`pull` inventorying unmanaged modules**
-  ([ADR-0002](docs/ADR-0002-module-model.md)) — introspection currently reads
-  `sys.tables` only, so views, procedures, functions and triggers are invisible.
-  Managing them is Phase 3.5, but reporting them is Phase 2: a pull that
-  silently ignores half the database breaks the adoption story that justifies
-  pull at all.
+**Phases 0-2 complete**, including the three items the competitive review
+added to Phase 2 (SPEC §12). The test and clippy bar is in "Development
+environment" above; counts change too often to record here.
 
 Commands: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
-`pull` (`--db` / `--force`).
+`pull` (`--db` / `--force`), `docs` (`--format` / `--out` / `--title`).
 
 Decisions that changed from the original spec (SPEC is in sync):
 
@@ -162,6 +148,18 @@ Phase 2 additions worth knowing before touching them:
     is pinned by `pbps-cli/tests/pull_roundtrip.rs`.
 15. **Default/check expressions are compared after peeling the engine's stored
     parentheses** (`((0))` → `0`), only when they wrap the whole string.
+16. **`strategy:` is persistent, unlike `renamed_from`** — it lives beside the
+    model (`Loaded.strategies`, never in `Schema`, or constraint 1 breaks) and
+    `fmt` preserves it. Unknown keys are rejected: a typo that became a no-op
+    would leave the user believing a large table is altered online when it is
+    not (ADR-0003). The emitter honours `online` in Phase 3.
+17. **`pull` inventories what it cannot manage.** Views, procedures, functions
+    and triggers are listed as unmanaged rather than ignored (ADR-0002); they
+    are separate from `warnings`, which are defects in the pull itself.
+18. **`docs` output must stay deterministic and self-contained** — identical
+    declarations produce byte-identical files, and the HTML references nothing
+    external (the air-gap rule applies to artifacts). That is why the ERD
+    travels as Mermaid source rather than a script-rendered diagram.
 
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.

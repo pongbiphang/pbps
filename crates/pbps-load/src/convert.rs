@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Intent,
-    PrimaryKey, Table, TableName, UniqueConstraint,
+    PrimaryKey, Strategy, Table, TableName, UniqueConstraint,
 };
 
 use crate::dto::{PrimaryKeyDto, TableDto};
@@ -21,6 +21,9 @@ pub struct LoadedTable {
     pub name: TableName,
     pub table: Table,
     pub intents: Vec<Intent>,
+    /// `None` when the file declares no `strategy:` block. Kept out of `table`
+    /// so that `Schema` equality stays a question about the database alone.
+    pub strategy: Option<Strategy>,
 }
 
 /// Parses a `Spanned` string, labelling any failure on that value.
@@ -177,6 +180,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 indexes,
             },
             intents,
+            strategy: dto.strategy.map(|s| Strategy { online: s.online }),
         }),
         _ => Err(errs),
     }

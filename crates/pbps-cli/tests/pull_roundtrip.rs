@@ -104,6 +104,7 @@ fn full_catalog() -> RawCatalog {
                 is_descending: false,
             },
         ],
+        modules: Vec::new(),
     }
 }
 
@@ -122,7 +123,7 @@ fn what_pull_writes_reads_back_as_the_same_schema() {
     assert_eq!(pulled.schema.tables.len(), 2);
 
     for (name, table) in &pulled.schema.tables {
-        let yaml = pbps_load::render(name, table, &[]);
+        let yaml = pbps_load::render(name, table, &[], None);
         let loaded = pbps_load::load_table_str(Path::new("pulled.yml"), &yaml)
             .unwrap_or_else(|e| panic!("{name}: pulled YAML does not parse: {e:?}"));
         assert_eq!(&loaded.name, name);

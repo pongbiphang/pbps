@@ -7,6 +7,7 @@ members = [
     "crates/pbps-diff",
     "crates/pbps-dialect",
     "crates/pbps-mssql",
+    "crates/pbps-docs",
     "crates/pbps-db",
     "crates/pbps-cli",
 ]
@@ -31,6 +32,7 @@ pbps-load    = { path = "crates/pbps-load" }
 pbps-diff    = { path = "crates/pbps-diff" }
 pbps-dialect = { path = "crates/pbps-dialect" }
 pbps-mssql   = { path = "crates/pbps-mssql" }
+pbps-docs    = { path = "crates/pbps-docs" }
 pbps-db      = { path = "crates/pbps-db" }
 
 serde      = { version = "1", features = ["derive"] }

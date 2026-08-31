@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::{Intent, PrimaryKey, Table, TableName};
+use pbps_model::{Intent, PrimaryKey, Strategy, Table, TableName};
 
 /// Renders one table as canonical YAML.
 ///
@@ -24,7 +24,12 @@ use pbps_model::{Intent, PrimaryKey, Table, TableName};
 /// intents still belong in the file — `pbps fmt` passes only the ones not yet
 /// absorbed into the ids file, which is how a redundant annotation gets
 /// stripped (SPEC §6.2).
-pub fn render(name: &TableName, table: &Table, intents: &[Intent]) -> String {
+pub fn render(
+    name: &TableName,
+    table: &Table,
+    intents: &[Intent],
+    strategy: Option<&Strategy>,
+) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.to_string()));
 
@@ -37,6 +42,16 @@ pub fn render(name: &TableName, table: &Table, intents: &[Intent]) -> String {
         .find(|i| matches!(i, Intent::RenameTable { to, .. } if to == name))
     {
         let _ = writeln!(s, "renamed_from: {}", scalar(&from.to_string()));
+    }
+
+    // Persistent, unlike `renamed_from`: rewriting the file must preserve it
+    // (ADR-0003). The default renders as nothing, so a table that never asked
+    // for a strategy keeps a file with no block.
+    if let Some(st) = strategy.filter(|s| !s.is_default()) {
+        s.push_str("\nstrategy:\n");
+        if st.online {
+            s.push_str("  online: true\n");
+        }
     }
 
     s.push_str("\ncolumns:\n");
@@ -222,7 +237,7 @@ mod tests {
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render(&a.name, &a.table, &a.intents);
+        let out = render(&a.name, &a.table, &a.intents, a.strategy.as_ref());
         let b = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
@@ -231,7 +246,7 @@ mod tests {
         assert_eq!(a.intents, b.intents, "output:\n{out}");
 
         // Idempotence: formatting an already-formatted file must change nothing.
-        let out2 = render(&b.name, &b.table, &b.intents);
+        let out2 = render(&b.name, &b.table, &b.intents, b.strategy.as_ref());
         assert_eq!(out, out2, "fmt is not idempotent");
     }
 
@@ -339,11 +354,89 @@ indexes:
     fn output_is_stable() {
         let yaml = "table: dbo.t\ncolumns:\n  b: {type: int}\n  a: {type: int}\n";
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
-        let first = render(&t.name, &t.table, &t.intents);
+        let first = render(&t.name, &t.table, &t.intents, None);
         for _ in 0..10 {
-            assert_eq!(render(&t.name, &t.table, &t.intents), first);
+            assert_eq!(render(&t.name, &t.table, &t.intents, None), first);
         }
         // Column order follows the declaration; nothing is reordered.
         assert!(first.find("  b:").unwrap() < first.find("  a:").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod strategy_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn load(text: &str) -> crate::LoadedTable {
+        crate::load_table_str(Path::new("t.yml"), text).expect("should load")
+    }
+
+    const WITH_STRATEGY: &str =
+        "table: dbo.order_line\nstrategy:\n  online: true\ncolumns:\n  id: {type: bigint}\n";
+
+    #[test]
+    fn a_strategy_block_is_read_and_kept_out_of_the_model() {
+        let t = load(WITH_STRATEGY);
+        assert_eq!(t.strategy, Some(Strategy { online: true }));
+        // The whole point: the table itself is indistinguishable from one
+        // declared without a strategy, so Schema equality is unaffected.
+        let plain = load("table: dbo.order_line\ncolumns:\n  id: {type: bigint}\n");
+        assert_eq!(t.table, plain.table);
+        assert_eq!(plain.strategy, None);
+    }
+
+    /// Unlike `renamed_from`, a strategy is persistent: rewriting the file must
+    /// not silently turn an online alter into a blocking one.
+    #[test]
+    fn fmt_preserves_a_strategy() {
+        let t = load(WITH_STRATEGY);
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(out.contains("strategy:\n  online: true\n"), "{out}");
+
+        let again = load(&out);
+        assert_eq!(again.strategy, t.strategy);
+        assert_eq!(
+            render(
+                &again.name,
+                &again.table,
+                &again.intents,
+                again.strategy.as_ref()
+            ),
+            out,
+            "rendering must be a fixpoint"
+        );
+    }
+
+    /// The default renders as nothing, or every pulled file would grow a block
+    /// saying "do the ordinary thing".
+    #[test]
+    fn a_default_strategy_renders_no_block() {
+        let t = load("table: dbo.t\nstrategy:\n  online: false\ncolumns:\n  id: {type: int}\n");
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(!out.contains("strategy"), "{out}");
+    }
+
+    /// ADR-0003: a typo must not silently become a no-op, leaving the user
+    /// believing a large table is being altered online when it is not.
+    #[test]
+    fn an_unknown_strategy_key_is_rejected() {
+        let e = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: dbo.t\nstrategy:\n  onlnie: true\ncolumns:\n  id: {type: int}\n",
+        )
+        .expect_err("a misspelled key must not be accepted");
+        assert!(
+            render_errors(&e).contains("onlnie"),
+            "the error must name the offending key: {}",
+            render_errors(&e)
+        );
+    }
+
+    fn render_errors(errs: &[crate::LoadError]) -> String {
+        errs.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

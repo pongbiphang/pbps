@@ -28,6 +28,7 @@ pub mod intent;
 pub mod name;
 pub mod schema;
 pub mod state;
+pub mod strategy;
 pub mod types;
 pub mod uid;
 
@@ -40,5 +41,6 @@ pub use schema::{
     ReferentialAction, Schema, Table, UniqueConstraint,
 };
 pub use state::{StateKind, StateSnapshot};
+pub use strategy::{Strategies, Strategy};
 pub use types::{ColumnType, TypeArg, TypeParseError};
 pub use uid::{Uid, UidError, UidKind};
