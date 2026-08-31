@@ -23,6 +23,7 @@
 //! layout of `CREATE TABLE`.
 
 pub mod change;
+pub mod drift;
 pub mod ids;
 pub mod intent;
 pub mod name;
@@ -34,6 +35,7 @@ pub mod types;
 pub mod uid;
 
 pub use change::{Change, ChangeSet, PlannedChange, RiskClass};
+pub use drift::{DriftBaseline, DriftReport};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use name::{ColumnRef, NameError, TableName};

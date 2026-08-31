@@ -3,7 +3,21 @@
 mod baseline;
 mod db;
 mod deploy;
+mod hooks;
 mod report;
+
+/// Drift was found. Not a failure of the tool, so it must not look like one.
+///
+/// A scheduled drift-watch pipeline (SPEC §10) needs to tell "the database
+/// moved" from "the tool could not reach it": the first pages the schema owner,
+/// the second pages whoever runs CI. One exit code for both would send every
+/// alert to the wrong person half the time.
+#[derive(Debug, thiserror::Error)]
+#[error("drift found")]
+pub struct DriftFound;
+
+/// The exit code for [`DriftFound`].
+const EXIT_DRIFT: i32 = 2;
 
 use std::path::PathBuf;
 
@@ -118,6 +132,16 @@ enum Command {
         force: bool,
     },
 
+    /// Check the live database against its recorded state
+    Verify {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// text (default) or json
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+
     /// Record the database's current state in its ledger
     Snapshot {
         #[command(flatten)]
@@ -174,6 +198,13 @@ enum StateCommand {
     },
 }
 
+/// How a machine-readable command should speak.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 /// Which database to act on.
 ///
 /// Two ways in, and they are not interchangeable in practice: `--db` is what CI
@@ -199,6 +230,11 @@ impl TargetArgs {
 
 fn main() {
     if let Err(e) = run() {
+        // Drift has already printed its own report; repeating "error: drift
+        // found" underneath it would add nothing but noise.
+        if e.downcast_ref::<DriftFound>().is_some() {
+            std::process::exit(EXIT_DRIFT);
+        }
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -266,6 +302,10 @@ fn run() -> anyhow::Result<()> {
             cmd_pull(&project, &target, force)
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
+        Command::Verify { target, format } => {
+            let target = target.resolve(&project)?;
+            deploy::cmd_verify(&project, &target, format == OutputFormat::Json)
+        }
         Command::Snapshot { target, force } => {
             let target = target.resolve(&project)?;
             deploy::cmd_snapshot(&project, &target, force)
@@ -790,12 +830,33 @@ fn operator() -> String {
 /// tool gets audited, where a shorter dependency tree is worth more. The
 /// algorithm is Howard Hinnant's civil_from_days.
 fn today() -> String {
-    let secs = std::time::SystemTime::now()
+    let (y, m, d) = civil_from_days(unix_seconds().div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Now in UTC, as `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// Used to stamp plans and drift reports — always by the *client's* clock,
+/// which is why the ledger's `applied_at` is set by the server instead: two CI
+/// runners disagreeing about the time would make an environment's history
+/// unorderable, and only the server has one clock for everyone.
+fn now() -> String {
+    let secs = unix_seconds();
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    format!("{y:04}-{m:02}-{d:02}")
+        .unwrap_or(0)
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -829,5 +890,22 @@ mod tests {
         let t = today();
         assert_eq!(t.len(), 10, "{t}");
         assert!(t.starts_with("20"), "{t}");
+    }
+
+    /// The timestamp goes into plan files and drift reports that other tools
+    /// parse, so the shape is part of the contract.
+    #[test]
+    fn now_is_an_iso_instant_in_utc() {
+        let n = now();
+        assert_eq!(n.len(), 20, "{n}");
+        assert!(n.ends_with('Z'), "{n}");
+        assert_eq!(&n[..10], today(), "{n}");
+        assert_eq!(&n[10..11], "T", "{n}");
+        // Every field in range; a naive modulo elsewhere would show up as an
+        // hour of 24 exactly once a day.
+        let (h, m, s) = (&n[11..13], &n[14..16], &n[17..19]);
+        assert!(h.parse::<u32>().unwrap() < 24, "{n}");
+        assert!(m.parse::<u32>().unwrap() < 60, "{n}");
+        assert!(s.parse::<u32>().unwrap() < 60, "{n}");
     }
 }

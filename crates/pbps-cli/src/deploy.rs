@@ -88,6 +88,101 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
     );
 }
 
+/// `pbps verify` — the drift check (SPEC §8.2).
+///
+/// The comparison is scoped and identified by the **recorded** state's identity
+/// file, not the working tree's. The question this command answers is "has this
+/// environment moved since pbps last recorded it", and answering it with a
+/// mapping the environment has never seen would report every uncommitted local
+/// rename as drift in production.
+pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Result<()> {
+    db::require_mssql(project, "verify")?;
+    let dialect = crate::dialect(project)?;
+    let checked_at = crate::now();
+
+    let report = db::runtime()?.block_on(async {
+        let mut conn = Conn::connect(target.connection())
+            .await
+            .context("cannot connect to the database")?;
+
+        let Some(baseline) = pbps_mssql::state::latest(&mut conn).await? else {
+            bail!(
+                "`{}` has a ledger but no entries; there is nothing to compare against.\n\
+                 Record one with `pbps snapshot` or `pbps baseline --reason ...`.",
+                target.label
+            );
+        };
+
+        let recorded_ids = baseline.snapshot.ids.clone();
+        let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
+
+        // The live side is identified by what is actually there, not by the
+        // recorded mapping. Comparing two sides that share one identity file
+        // can only surface attribute changes on objects present in both — so a
+        // hand-added or hand-dropped column, the two things a drift check most
+        // needs to catch, would be exactly what it missed.
+        let observed = pbps_diff::observed_ids(&scoped.schema, &recorded_ids);
+
+        let changes = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &baseline.snapshot.schema,
+                ids: &recorded_ids,
+            },
+            pbps_diff::Side {
+                schema: &scoped.schema,
+                ids: &observed,
+            },
+            dialect.as_ref(),
+        )
+        .map_err(|errs| {
+            for e in &errs {
+                eprintln!("  {e}");
+            }
+            anyhow::anyhow!(
+                "the live database differs in {} way(s) that cannot even be expressed as changes",
+                errs.len()
+            )
+        })?;
+
+        Ok(pbps_model::DriftReport {
+            version: pbps_model::drift::CURRENT_VERSION,
+            environment: target.label.clone(),
+            checked_at,
+            baseline: pbps_model::DriftBaseline {
+                entry_id: baseline.id,
+                applied_at: baseline.applied_at.clone(),
+                checksum: pbps_model::state_checksum(&baseline.snapshot.schema, &recorded_ids),
+            },
+            // The checksum compares like with like: both sides fingerprinted
+            // with the recorded mapping, so a derived identity for a hand-added
+            // column cannot by itself make the two differ.
+            live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
+            changes,
+            unmanaged: scoped.unmanaged,
+        })
+    })?;
+
+    // The hook always receives JSON, whatever the human asked for on stdout:
+    // a script's payload should not change shape because someone added a flag
+    // for their own eyes.
+    let payload = format!("{}\n", serde_json::to_string_pretty(&report)?);
+    if json {
+        print!("{payload}");
+    } else {
+        print!("{}", crate::report::drift(&report));
+    }
+
+    if !report.has_drift() {
+        return Ok(());
+    }
+    if let Some(hook) = &project.config.hooks.on_drift {
+        crate::hooks::run(hook, &payload, "on_drift");
+    }
+    // A distinct exit code so a scheduled pipeline can tell "the database moved"
+    // from "the tool could not run" — the two need different people woken up.
+    Err(crate::DriftFound.into())
+}
+
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;

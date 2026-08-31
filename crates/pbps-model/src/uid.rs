@@ -76,6 +76,37 @@ impl Uid {
         Self(s)
     }
 
+    /// A UID derived from a name rather than drawn at random.
+    ///
+    /// **This is not for minting identities.** Real UIDs must be random, or two
+    /// branches adding a same-named column would be handed the same one and a
+    /// merge would silently fuse two different columns into one.
+    ///
+    /// It exists for objects that are *observed* rather than declared: a column
+    /// somebody added to a database by hand has no recorded identity, and the
+    /// drift comparison still has to be able to talk about it. Deriving it from
+    /// the name keeps a drift report byte-identical across runs, which a random
+    /// UID would not — and a report whose payload changes every time cannot be
+    /// deduplicated by whatever the `on_drift` hook feeds.
+    ///
+    /// `salt` lets a caller step past a collision with an identity that already
+    /// exists; see `pbps_diff::observed_ids`.
+    pub fn derived(kind: UidKind, seed: &str, salt: u32) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(kind.prefix().as_bytes());
+        hasher.update(seed.as_bytes());
+        hasher.update(salt.to_be_bytes());
+        let digest = hasher.finalize();
+
+        let mut s = String::with_capacity(2 + LEN);
+        s.push_str(kind.prefix());
+        for byte in digest.iter().take(LEN) {
+            s.push(ALPHABET[(*byte as usize) % ALPHABET.len()] as char);
+        }
+        Self(s)
+    }
+
     pub fn kind(&self) -> UidKind {
         if self.0.starts_with("t_") {
             UidKind::Table
@@ -176,6 +207,45 @@ fn next_random() -> u64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// A drift report is fed to a hook; a payload that changes on every run
+    /// cannot be deduplicated by whatever the hook talks to.
+    #[test]
+    fn derived_uids_are_stable_and_well_formed() {
+        let a = Uid::derived(UidKind::Column, "dbo.customer.nickname", 0);
+        let b = Uid::derived(UidKind::Column, "dbo.customer.nickname", 0);
+        assert_eq!(a, b);
+        assert_eq!(a.kind(), UidKind::Column);
+        assert_eq!(a.as_str().parse::<Uid>().unwrap(), a);
+    }
+
+    #[test]
+    fn derived_uids_separate_names_kinds_and_salts() {
+        let base = Uid::derived(UidKind::Column, "dbo.customer.nickname", 0);
+        assert_ne!(base, Uid::derived(UidKind::Column, "dbo.customer.note", 0));
+        assert_ne!(
+            base,
+            Uid::derived(UidKind::Column, "dbo.customer.nickname", 1)
+        );
+        assert_ne!(
+            Uid::derived(UidKind::Table, "dbo.customer", 0).to_string(),
+            Uid::derived(UidKind::Column, "dbo.customer", 0).to_string()
+        );
+    }
+
+    /// Derivation must never be mistaken for allocation: two branches adding a
+    /// same-named column would otherwise be handed one identity and a clean
+    /// merge would fuse two different columns.
+    #[test]
+    fn generation_is_not_derivation() {
+        let derived = Uid::derived(UidKind::Column, "dbo.customer.email", 0);
+        let mut drawn = BTreeSet::new();
+        for _ in 0..50 {
+            drawn.insert(Uid::generate(UidKind::Column));
+        }
+        assert!(drawn.len() > 40, "generation must not be deterministic");
+        assert!(!drawn.contains(&derived));
+    }
 
     #[test]
     fn generated_uids_round_trip() {

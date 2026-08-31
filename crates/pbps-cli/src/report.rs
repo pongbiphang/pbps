@@ -7,7 +7,7 @@
 //! no idea what to type.
 
 use pbps_diff::Blocker;
-use pbps_model::{Change, ChangeSet, Intent, RiskClass};
+use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
 
 /// One intent in the user's own vocabulary.
 ///
@@ -108,6 +108,31 @@ pub fn plan(cs: &ChangeSet) -> String {
         return "No changes.\n".to_owned();
     }
 
+    let mut out = changes(cs);
+    let risks = cs.risks();
+    if !risks.is_empty() {
+        out.push_str(&format!(
+            "\n  This plan contains risky changes and needs approval to apply: --allow {}\n",
+            risks
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        if risks.contains(&RiskClass::Destructive) {
+            out.push_str("  Some of them are destructive and will lose data.\n");
+        }
+    }
+    out
+}
+
+/// The change list alone, grouped by table.
+///
+/// Separate from [`plan`] because the `--allow` advice below it belongs to a
+/// plan and to nothing else: a drift report describes what already happened, and
+/// telling the reader which flag would approve it invites them to approve their
+/// way past a schema someone changed by hand.
+pub fn changes(cs: &ChangeSet) -> String {
     let mut out = String::new();
     let mut current = None;
     for p in &cs.changes {
@@ -130,21 +155,61 @@ pub fn plan(cs: &ChangeSet) -> String {
         };
         out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
     }
+    out
+}
 
-    let risks = cs.risks();
-    if !risks.is_empty() {
+/// A drift report as prose.
+///
+/// The changes are phrased as "what the database has grown", because that is
+/// what happened. Turning them round into "the plan would drop it" would smuggle
+/// a remedy into a report whose job is to describe — and the remedy is a
+/// judgement call with three legitimate answers (SPEC §8.3).
+pub fn drift(r: &DriftReport) -> String {
+    let mut out = format!(
+        "Environment: {}\nBaseline:    entry #{} recorded {}\n",
+        r.environment, r.baseline.entry_id, r.baseline.applied_at
+    );
+
+    if !r.unmanaged.is_empty() {
         out.push_str(&format!(
-            "\n  This plan contains risky changes and needs approval to apply: --allow {}\n",
-            risks
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
+            "Unmanaged:   {} table(s) left alone: {}\n",
+            r.unmanaged.len(),
+            join(&r.unmanaged)
         ));
-        if risks.contains(&RiskClass::Destructive) {
-            out.push_str("  Some of them are destructive and will lose data.\n");
-        }
     }
+
+    if !r.has_drift() {
+        out.push_str("\nNo drift: the database matches its recorded state.\n");
+        return out;
+    }
+
+    out.push_str("\nDRIFT: the database no longer matches its recorded state.\n");
+    if !r.changes.is_empty() {
+        out.push_str("\n  Differences found (recorded state -> database as it is now):\n");
+        // The plan's own vocabulary, indented, minus its `--allow` advice: a
+        // reader who has read one plan can read this without learning a second
+        // vocabulary, but nothing here is waiting to be approved.
+        for line in changes(&r.changes).lines() {
+            if line.trim().is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    } else {
+        // The checksums differ but the differ produced nothing: something the
+        // model does not carry has changed. Saying so is far better than an
+        // empty list that reads like "nothing, really".
+        out.push_str(
+            "\n  The state fingerprints differ, but no difference could be expressed as a\n  \
+             change. Something outside what pbps models has moved; compare the recorded\n  \
+             state_json by hand.\n",
+        );
+    }
+    out.push_str(
+        "\n  Three ways out (SPEC 8.3): fold it into the declarations (`pbps pull`), put the\n  \
+         database back (`pbps plan --db` then `apply`), or accept it (`pbps baseline --reason`).\n",
+    );
     out
 }
 

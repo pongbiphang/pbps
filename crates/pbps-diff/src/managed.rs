@@ -17,9 +17,9 @@
 //! disagree, and the difference would show up as a plan that creates a table
 //! that already exists.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{IdsFile, Schema, TableName};
+use pbps_model::{ColumnRef, IdsFile, Schema, TableName, Uid, UidKind};
 
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,11 +67,86 @@ pub fn scope(schema: &Schema, ids: &IdsFile) -> Scoped {
     }
 }
 
+/// The identity of a database **as observed**, for comparing a live schema
+/// against a recorded one.
+///
+/// # The problem this solves
+///
+/// [`crate::diff`] matches by uid, so a comparison where both sides carry the
+/// same identity file can only ever see attribute changes on objects that exist
+/// on both sides. A column somebody added by hand has no uid, and one they
+/// dropped still has its old one — so the two changes a drift check most needs
+/// to report are exactly the two it would miss.
+///
+/// So the live side gets an identity file built from what is actually there:
+/// objects that match a recorded name keep their recorded uid, objects that do
+/// not get a derived one, and recorded objects with nothing to match simply do
+/// not appear. The differ then sees additions and removals the way it sees them
+/// in a plan.
+///
+/// # Matching by name, and what that costs
+///
+/// A hand-rename comes out as a drop plus an add. That is not a shortcoming to
+/// be apologized for: nothing in the database records that the two were the same
+/// column, and a tool that guessed would eventually guess wrong about a
+/// column holding real data. Rename intent is human input everywhere else in
+/// pbps (constraint 6), and drift is no exception.
+pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
+    let tables_by_name: BTreeMap<&TableName, &Uid> =
+        recorded.tables.iter().map(|(u, n)| (n, u)).collect();
+    let columns_by_ref: BTreeMap<&ColumnRef, &Uid> =
+        recorded.columns.iter().map(|(u, c)| (c, u)).collect();
+
+    // Every recorded uid is off-limits for derivation: reusing one would make
+    // the differ match a brand-new column to an unrelated recorded one and
+    // report a rename that never happened.
+    let mut taken: BTreeSet<Uid> = recorded
+        .tables
+        .keys()
+        .chain(recorded.columns.keys())
+        .chain(recorded.tombstones.keys())
+        .cloned()
+        .collect();
+
+    let mut observed = IdsFile::default();
+    for (name, table) in &live.tables {
+        let uid = match tables_by_name.get(name) {
+            Some(u) => (*u).clone(),
+            None => free_uid(UidKind::Table, &name.to_string(), &mut taken),
+        };
+        observed.tables.insert(uid, name.clone());
+
+        for column in table.columns.keys() {
+            let cref = name.column(column);
+            let uid = match columns_by_ref.get(&cref) {
+                Some(u) => (*u).clone(),
+                None => free_uid(UidKind::Column, &cref.to_string(), &mut taken),
+            };
+            observed.columns.insert(uid, cref);
+        }
+    }
+    observed
+}
+
+/// Derives a uid from a name, stepping past anything already claimed.
+///
+/// The salt makes the walk deterministic, so the same database observed twice
+/// produces the same identity file and therefore a byte-identical drift report.
+fn free_uid(kind: UidKind, seed: &str, taken: &mut BTreeSet<Uid>) -> Uid {
+    for salt in 0.. {
+        let uid = Uid::derived(kind, seed, salt);
+        if taken.insert(uid.clone()) {
+            return uid;
+        }
+    }
+    unreachable!("u32 salts exhausted against a 32^6 space")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use pbps_model::{Column, ColumnType, Table, Uid};
+    use pbps_model::{Column, ColumnType, Table};
 
     fn t(s: &str) -> TableName {
         s.parse().unwrap()
@@ -147,5 +222,126 @@ mod tests {
         let scoped = scope(&schema(&["dbo.customer"]), &IdsFile::default());
         assert!(scoped.schema.tables.is_empty());
         assert_eq!(scoped.unmanaged, vec![t("dbo.customer")]);
+    }
+
+    /// Columns need their own fixture here: `observed_ids` is entirely about
+    /// which columns exist, which the table-level helper above ignores.
+    fn schema_with(spec: &[(&str, &[&str])]) -> Schema {
+        let mut s = Schema::default();
+        for (name, cols) in spec {
+            let mut columns = IndexMap::new();
+            for c in *cols {
+                columns.insert(
+                    (*c).to_string(),
+                    Column::new("int".parse::<ColumnType>().unwrap()),
+                );
+            }
+            s.tables.insert(
+                t(name),
+                Table {
+                    columns,
+                    ..Default::default()
+                },
+            );
+        }
+        s
+    }
+
+    fn recorded(tables: &[(&str, &str)], columns: &[(&str, &str)]) -> IdsFile {
+        let mut ids = IdsFile::default();
+        for (uid, name) in tables {
+            ids.tables.insert(uid.parse::<Uid>().unwrap(), t(name));
+        }
+        for (uid, cref) in columns {
+            ids.columns
+                .insert(uid.parse::<Uid>().unwrap(), cref.parse().unwrap());
+        }
+        ids
+    }
+
+    #[test]
+    fn an_object_that_still_exists_keeps_its_recorded_identity() {
+        let ids = recorded(
+            &[("t_aaaaaa", "dbo.customer")],
+            &[("c_bbbbbb", "dbo.customer.email")],
+        );
+        let observed = observed_ids(&schema_with(&[("dbo.customer", &["email"])]), &ids);
+        assert_eq!(observed.tables, ids.tables);
+        assert_eq!(observed.columns, ids.columns);
+    }
+
+    /// The two cases a shared identity file makes invisible, and the whole
+    /// reason this function exists.
+    #[test]
+    fn a_hand_added_column_gets_an_identity_and_a_dropped_one_loses_its_place() {
+        let ids = recorded(
+            &[("t_aaaaaa", "dbo.customer")],
+            &[
+                ("c_bbbbbb", "dbo.customer.email"),
+                ("c_cccccc", "dbo.customer.gone"),
+            ],
+        );
+        let observed = observed_ids(
+            &schema_with(&[("dbo.customer", &["email", "nickname"])]),
+            &ids,
+        );
+
+        // Sorted by name, because the map is keyed by uid and uid order is not
+        // name order.
+        let mut names: Vec<String> = observed.columns.values().map(ToString::to_string).collect();
+        names.sort();
+        assert_eq!(names, ["dbo.customer.email", "dbo.customer.nickname"]);
+        assert!(
+            !observed.columns.values().any(|c| c.name == "gone"),
+            "a dropped column must not appear, or the differ cannot see the drop"
+        );
+        assert!(
+            observed.columns.keys().all(|u| u.as_str() != "c_cccccc"),
+            "the dropped column's uid must not be handed to another column"
+        );
+    }
+
+    /// The report is fed to a hook. A payload that differs between two runs
+    /// over an unchanged database cannot be deduplicated by whatever receives
+    /// it.
+    #[test]
+    fn observing_the_same_database_twice_gives_the_same_identities() {
+        let live = schema_with(&[("dbo.customer", &["email", "nickname"])]);
+        let ids = recorded(&[("t_aaaaaa", "dbo.customer")], &[]);
+        assert_eq!(observed_ids(&live, &ids), observed_ids(&live, &ids));
+    }
+
+    /// A derived uid colliding with a recorded one would make the differ match
+    /// a new column to an unrelated old one and report a rename that never
+    /// happened.
+    #[test]
+    fn a_derived_identity_never_collides_with_a_recorded_one() {
+        let live = schema_with(&[("dbo.customer", &["nickname"])]);
+        // Claim the uid derivation would otherwise hand out.
+        let clash = Uid::derived(UidKind::Column, "dbo.customer.nickname", 0);
+        let mut ids = recorded(&[("t_aaaaaa", "dbo.customer")], &[]);
+        ids.columns
+            .insert(clash.clone(), "dbo.other.x".parse().unwrap());
+
+        let observed = observed_ids(&live, &ids);
+        let assigned = observed.columns.keys().next().unwrap();
+        assert_ne!(assigned, &clash);
+        assert_eq!(
+            assigned,
+            &Uid::derived(UidKind::Column, "dbo.customer.nickname", 1),
+            "the walk past a collision must be deterministic too"
+        );
+    }
+
+    /// A table nobody recorded is still observable — that is how a hand-created
+    /// table inside the managed set becomes visible at all.
+    #[test]
+    fn an_unrecorded_table_is_given_an_identity() {
+        let observed = observed_ids(
+            &schema_with(&[("dbo.brand_new", &["id"])]),
+            &IdsFile::default(),
+        );
+        assert_eq!(observed.tables.len(), 1);
+        assert_eq!(observed.columns.len(), 1);
     }
 }
