@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pbps-model.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tiberius.workspace = true
 tokio.workspace = true

@@ -1,9 +1,15 @@
 //! Database connections.
 //!
-//! This crate owns "there is a network" and nothing else: opening a connection
-//! from a connection string and running queries over it. What to ask the
-//! database and what the answers mean is dialect knowledge and stays in
-//! `pbps-mssql`; `__pbps_state` access and locking arrive here in Phase 3.
+//! This crate owns "there is a network": opening a connection from a connection
+//! string, running statements over it, and framing a transaction. What to ask
+//! the database and what the answers mean is dialect knowledge and stays in
+//! `pbps-mssql`.
+//!
+//! [`ledger`] holds the shapes of the `__pbps_state` ledger and the
+//! `__pbps_lock` lock (SPEC §8.1). Only the shapes: the SQL that reads and
+//! writes them is T-SQL, so it lives in `pbps_mssql::state` beside the catalog
+//! queries, and Phase 4's `pbps-pg` will write its own. Keeping the types here
+//! is what stops the ledger's meaning from being defined twice.
 //!
 //! The driver is `tiberius` — pure Rust, so a single static binary needs no
 //! ODBC driver installed on the host (SPEC §11.3).
@@ -12,7 +18,10 @@ use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-pub use tiberius::Row;
+pub mod ledger;
+
+pub use ledger::{LedgerEntry, LedgerError, LockInfo};
+pub use tiberius::{Row, ToSql};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -62,9 +71,11 @@ impl Conn {
     /// Runs one query with no parameters and returns every row.
     ///
     /// Introspection queries are static SQL against the catalog views; nothing
-    /// user-controlled is interpolated into them, which is why this deliberately
-    /// takes no parameters — a parameter here would mean someone is building SQL
-    /// where they should not be.
+    /// user-controlled is interpolated into them, which is why this takes no
+    /// parameters — a parameter here would mean someone is building SQL where
+    /// they should not be. Where a *value* genuinely has to reach the server —
+    /// a state snapshot, an operator's name — that is [`Conn::query_with`] and
+    /// [`Conn::execute_with`], which bind it rather than paste it.
     pub async fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
         let stream = self.client.simple_query(sql).await?;
         Ok(stream.into_first_result().await?)
@@ -78,5 +89,53 @@ impl Conn {
         let stream = self.client.simple_query(sql).await?;
         stream.into_results().await?;
         Ok(())
+    }
+
+    /// Runs one parameterized query (`@P1`, `@P2`, ...) and returns every row.
+    pub async fn query_with(
+        &mut self,
+        sql: &str,
+        params: &[&dyn ToSql],
+    ) -> Result<Vec<Row>, DbError> {
+        let stream = self.client.query(sql, params).await?;
+        Ok(stream.into_first_result().await?)
+    }
+
+    /// Runs one parameterized statement and returns the number of rows affected.
+    ///
+    /// The ledger is the only thing that writes *data*, and everything it writes
+    /// is user-supplied: a reason, an operator's name, a whole JSON snapshot.
+    /// Binding is not politeness here — a `'` in an operator's name would end
+    /// the statement.
+    pub async fn execute_with(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, DbError> {
+        let result = self.client.execute(sql, params).await?;
+        Ok(result.rows_affected().iter().sum())
+    }
+
+    /// Opens a transaction for "one plan, one transaction, all or nothing"
+    /// (SPEC §7.5).
+    ///
+    /// `XACT_ABORT ON` is what makes that promise true rather than merely
+    /// intended: without it, SQL Server keeps a transaction running after many
+    /// statement-level errors, so a failed statement halfway through a plan
+    /// would leave the earlier ones committable. With it, any such error dooms
+    /// the transaction and the rollback is total.
+    pub async fn begin(&mut self) -> Result<(), DbError> {
+        self.execute("SET XACT_ABORT ON; BEGIN TRANSACTION;").await
+    }
+
+    pub async fn commit(&mut self) -> Result<(), DbError> {
+        self.execute("COMMIT TRANSACTION;").await
+    }
+
+    /// Rolls back, tolerating a transaction the server has already killed.
+    ///
+    /// After `XACT_ABORT` doomed the transaction, `ROLLBACK` may find nothing to
+    /// roll back and error with "no corresponding BEGIN TRANSACTION". Reporting
+    /// that error would replace the real failure — the statement that broke —
+    /// with a confusing second one, so the guard checks `@@TRANCOUNT` instead.
+    pub async fn rollback(&mut self) -> Result<(), DbError> {
+        self.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;")
+            .await
     }
 }

@@ -26,6 +26,7 @@ pub mod change;
 pub mod ids;
 pub mod intent;
 pub mod name;
+pub mod plan;
 pub mod schema;
 pub mod state;
 pub mod strategy;
@@ -36,6 +37,7 @@ pub use change::{Change, ChangeSet, PlannedChange, RiskClass};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use name::{ColumnRef, NameError, TableName};
+pub use plan::{PlanBaseline, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use schema::{
     CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
     ReferentialAction, Schema, Table, UniqueConstraint,

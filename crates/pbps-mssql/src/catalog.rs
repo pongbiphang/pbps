@@ -101,12 +101,15 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code
 
 /// A required value that came back NULL means the query and the struct have
 /// drifted apart; that is a bug here, not bad data, and it must be named.
-fn get<'a, T: tiberius::FromSql<'a>>(row: &'a Row, col: &str) -> Result<T, DbError> {
+pub(crate) fn get<'a, T: tiberius::FromSql<'a>>(row: &'a Row, col: &str) -> Result<T, DbError> {
     row.try_get::<T, _>(col)?
         .ok_or_else(|| DbError::BadRow(format!("column `{col}` is unexpectedly NULL")))
 }
 
-fn opt<'a, T: tiberius::FromSql<'a>>(row: &'a Row, col: &str) -> Result<Option<T>, DbError> {
+pub(crate) fn opt<'a, T: tiberius::FromSql<'a>>(
+    row: &'a Row,
+    col: &str,
+) -> Result<Option<T>, DbError> {
     Ok(row.try_get::<T, _>(col)?)
 }
 

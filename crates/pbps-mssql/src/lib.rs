@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod emit;
 pub mod ident;
 pub mod introspect;
+pub mod state;
 pub mod types;
 pub mod validate;
 

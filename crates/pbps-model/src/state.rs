@@ -25,6 +25,24 @@ pub enum StateKind {
     Bootstrap,
 }
 
+impl StateKind {
+    /// The value stored in the ledger's `kind` column, matching the serde
+    /// representation so the column and `state_json` cannot disagree.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StateKind::Apply => "apply",
+            StateKind::Baseline => "baseline",
+            StateKind::Bootstrap => "bootstrap",
+        }
+    }
+}
+
+impl std::fmt::Display for StateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One environment's complete, verified state at a point in time.
 ///
 /// The whole schema is stored, not a delta or a checksum: that is what lets
@@ -162,6 +180,16 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains(r#""version":1"#));
         assert!(json.contains(r#""kind":"baseline""#));
+    }
+
+    /// The ledger writes `kind` into a column of its own so `status` can filter
+    /// without parsing JSON; the two spellings must be the same one.
+    #[test]
+    fn the_kind_column_matches_the_json_spelling() {
+        for kind in [StateKind::Apply, StateKind::Baseline, StateKind::Bootstrap] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+        }
     }
 
     #[test]

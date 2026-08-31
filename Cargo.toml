@@ -45,6 +45,11 @@ tokio      = { version = "1", features = ["net", "rt"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 serde_json = { version = "1", features = ["preserve_order"] }
+
+# Plan pinning (SPEC §7.3) needs a checksum an auditor recognizes. Pure Rust,
+# no C dependency, so the single static binary of §11.4 stays single.
+sha2       = "0.10"
+
 thiserror  = "2"
 anyhow     = "1"
 miette     = "7"
