@@ -97,9 +97,25 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phases 0-2 complete** (Phase 2 with one caveat below). The test and clippy
-bar is in "Development environment" above; counts change too often to record
-here.
+**Phases 0-1 complete; Phase 2 partially.** The test and clippy bar is in
+"Development environment" above; counts change too often to record here.
+
+Phase 2's scope grew after the competitive review (SPEC §12). Built: the MSSQL
+emitter, introspection and `pull`. Still owed:
+
+- **`pbps docs`** (SPEC §9.4) — Markdown / single-file HTML / Mermaid ERD from
+  the declarations. This is what makes §4.3's "comments live in `description`
+  only" pay off, and with `pull` it is the first-contact story.
+- **The `strategy:` block** ([ADR-0003](docs/ADR-0003-execution-strategy.md)) —
+  it enters the YAML format and `pbps-load`'s return type now, while that
+  signature has few callers; `fmt` preserves it, `validate` rejects unknown
+  keys. The emitter honours it in Phase 3.
+- **`pull` inventorying unmanaged modules**
+  ([ADR-0002](docs/ADR-0002-module-model.md)) — introspection currently reads
+  `sys.tables` only, so views, procedures, functions and triggers are invisible.
+  Managing them is Phase 3.5, but reporting them is Phase 2: a pull that
+  silently ignores half the database breaks the adoption story that justifies
+  pull at all.
 
 Commands: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
@@ -159,7 +175,9 @@ emitter or the catalog queries, run them — they caught two bugs the unit suite
 could not (FK ordering between two new tables; `EXEC()` rejecting function
 calls in its argument).
 
-**Phase 3 (next)**: `pbps-db` grows `__pbps_state` / locking; `apply`,
-`verify`, `snapshot`, the `--allow` gate, `plan --db`, rename impact
-pre-flight. `pbps-dialect::MinimalDialect` remains only as pbps-diff's test
-stand-in.
+**Phase 3 (after Phase 2 closes)**: `pbps-db` grows `__pbps_state` / locking;
+`apply`, `verify` (`--format json`), `snapshot`, `baseline`, `bootstrap`, the
+`--allow` gate, `plan --db`, the rename impact report and the automatic
+preflight probes of §7.5, the `on_apply` / `on_drift` hooks, `status`, and the
+optional dev database of §9.3. `pbps-dialect::MinimalDialect` remains only as
+pbps-diff's test stand-in.
