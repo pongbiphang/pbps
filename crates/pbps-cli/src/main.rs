@@ -49,6 +49,10 @@ struct Cli {
 enum Command {
     /// Compare the declarations against a baseline and produce a change plan
     Plan {
+        /// Compute an applyable plan against this environment as queried
+        #[command(flatten)]
+        target: TargetArgs,
+
         /// Which git revision to use as the baseline
         #[arg(long, default_value = "HEAD")]
         since: String,
@@ -130,6 +134,20 @@ enum Command {
         /// Overwrite existing declarations and identity file
         #[arg(long)]
         force: bool,
+    },
+
+    /// Run a saved plan against the environment it was computed for
+    Apply {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// The plan.json written by `pbps plan --db --out`
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Risk classes this deployment is approved for, comma-separated
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<pbps_model::RiskClass>,
     },
 
     /// Check the live database against its recorded state
@@ -250,18 +268,42 @@ fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Plan {
+            target,
             since,
             base,
             check,
             out,
             sql,
         } => {
+            // Two commands under one name, because to a user they are one
+            // question asked in two places (SPEC §7.3): the MR wants a preview,
+            // the deployment wants the plan for that environment.
+            if target.db.is_some() || target.env.is_some() {
+                if check {
+                    bail!(
+                        "--check is the CI file check; it never connects, so it cannot take --db"
+                    );
+                }
+                if base.is_some() {
+                    bail!("--base and --db name two different baselines; pass one of them");
+                }
+                let target = target.resolve(&project)?;
+                return deploy::cmd_plan_db(&project, &target, out.as_deref(), sql.as_deref());
+            }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
                 None if since == "HEAD" => baseline::default_source(&project),
                 None => baseline::Source::Git { rev: since },
             };
             cmd_plan(&project, &source, check, out.as_deref(), sql.as_deref())
+        }
+        Command::Apply {
+            target,
+            plan,
+            allow,
+        } => {
+            let target = target.resolve(&project)?;
+            deploy::cmd_apply(&project, &target, &plan, &allow.into_iter().collect())
         }
         Command::Validate => cmd_validate(&project),
         Command::Fmt { check } => cmd_fmt(&project, check),
@@ -759,9 +801,27 @@ fn cmd_plan(
     print!("{}", report::plan(&cs));
 
     if let Some(path) = out {
-        std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&cs)?))
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("\nwrote {}", path.display());
+        // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
+        // §7.3's "a plan computed offline is never accepted by apply" has to be
+        // a property of the artifact. A file that merely lacked a checksum
+        // would invite someone to add one.
+        let mut plan = pbps_model::SavedPlan::new(
+            pbps_model::PlanOrigin::Preview,
+            dialect.name(),
+            now(),
+            pbps_model::PlanBaseline {
+                description: base.description.clone(),
+                checksum: pbps_model::state_checksum(&base.schema, &base.ids),
+            },
+            cs.clone(),
+            res.ids.clone(),
+        );
+        plan.git_sha = db::git_sha();
+        write_plan(path, &plan)?;
+        println!(
+            "\nwrote {} (a preview; `apply` will refuse it)",
+            path.display()
+        );
     }
 
     if let Some(path) = sql {
@@ -771,6 +831,13 @@ fn cmd_plan(
         println!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// Writes a plan file. A trailing newline, so it never shows
+/// "\ No newline at end of file" when a reviewer diffs two of them.
+fn write_plan(path: &std::path::Path, plan: &pbps_model::SavedPlan) -> anyhow::Result<()> {
+    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(plan)?))
+        .with_context(|| format!("cannot write `{}`", path.display()))
 }
 
 /// Renders the change set as one SQL script.

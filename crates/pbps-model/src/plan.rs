@@ -86,6 +86,17 @@ pub struct SavedPlan {
     pub baseline: PlanBaseline,
 
     pub changes: ChangeSet,
+
+    /// The identity mapping the environment has **after** this plan.
+    ///
+    /// Carried so that `apply` needs nothing but the plan file: the state it
+    /// records afterwards has to pair the new schema with the new mapping, and
+    /// reusing the baseline's mapping would record a rename as never having
+    /// happened. State and identity travel together everywhere else in this
+    /// tool (see [`crate::StateSnapshot`]), and an applyable artifact that left
+    /// half of it behind would be an artifact that has to be applied from a
+    /// checkout — which is exactly what an air-gapped host does not have.
+    pub ids: IdsFile,
 }
 
 impl SavedPlan {
@@ -95,6 +106,7 @@ impl SavedPlan {
         created_at: impl Into<String>,
         baseline: PlanBaseline,
         changes: ChangeSet,
+        ids: IdsFile,
     ) -> Self {
         Self {
             version: CURRENT_VERSION,
@@ -104,6 +116,7 @@ impl SavedPlan {
             git_sha: None,
             baseline,
             changes,
+            ids,
         }
     }
 
@@ -208,6 +221,7 @@ mod tests {
                 checksum: state_checksum(&schema_with("nvarchar(255)"), &IdsFile::default()),
             },
             cs,
+            ids_with("t_a1b2c3"),
         )
     }
 
@@ -257,6 +271,17 @@ mod tests {
         });
         assert_ne!(empty.checksum(), one.checksum());
         assert_eq!(empty.checksum(), plan_over(ChangeSet::default()).checksum());
+    }
+
+    /// The recorded state after an apply pairs the new schema with the new
+    /// mapping. A plan that carried only the baseline's would record a rename
+    /// as never having happened.
+    #[test]
+    fn the_plan_carries_the_identity_it_leaves_behind() {
+        let plan = plan_over(ChangeSet::default());
+        assert_eq!(plan.ids, ids_with("t_a1b2c3"));
+        let back: SavedPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.ids, plan.ids);
     }
 
     /// Only `plan --db` produces something applyable (SPEC §7.3); a preview must

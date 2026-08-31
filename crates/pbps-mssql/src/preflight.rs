@@ -25,28 +25,123 @@
 //! - **Reducing a `decimal`'s scale** rounds rather than failing, so no count
 //!   exists to take. The `narrowing` class still flags it for approval.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use pbps_dialect::{DialectError, Probe};
-use pbps_model::{Change, ColumnRef, ColumnType, TableName, TypeArg};
+use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, TableName, TypeArg};
 
 use crate::emit::qualified;
 use crate::ident::quote;
 use crate::types;
 
-/// Every probe this change implies. Errors in quoting are swallowed here on
-/// purpose: an identifier this dialect cannot write has already stopped the
-/// plan in [`crate::emit`], and a probe list is not the place to report it a
-/// second time.
-pub fn probes(change: &Change) -> Vec<Probe> {
-    build(change).unwrap_or_default()
+/// Every probe a plan implies.
+///
+/// Errors in quoting are swallowed on purpose: an identifier this dialect
+/// cannot write has already stopped the plan in [`crate::emit`], and a probe
+/// list is not the place to report it a second time.
+pub fn probes(changes: &ChangeSet) -> Vec<Probe> {
+    let names = AsStored::of(changes);
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| build(&p.change, &names).ok())
+        .flatten()
+        .collect()
 }
 
-fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
+/// Translates the names a plan uses into the names the database still has.
+///
+/// Probes run before the first statement, so every object they mention has to
+/// be named as the catalog knows it *now*. A plan that renames `email` to
+/// `contact_email` and then tightens it to NOT NULL describes that column by
+/// its new name, and a probe built from the change alone would ask about a
+/// column that does not exist yet — silently skipping the very check that
+/// mattered.
+#[derive(Debug, Default)]
+struct AsStored {
+    /// New table name → the name it currently has.
+    tables: BTreeMap<TableName, TableName>,
+    /// New column ref → the column name it currently has.
+    columns: BTreeMap<ColumnRef, String>,
+    /// Tables this plan creates. They are empty, so nothing in them can violate
+    /// anything, and probing them would only produce "invalid object name".
+    created: BTreeSet<TableName>,
+}
+
+impl AsStored {
+    fn of(changes: &ChangeSet) -> Self {
+        let mut this = Self::default();
+        for p in &changes.changes {
+            match &p.change {
+                Change::RenameTable { from, to, .. } => {
+                    this.tables.insert(to.clone(), from.clone());
+                }
+                Change::RenameColumn {
+                    table, from, to, ..
+                } => {
+                    this.columns.insert(table.column(to), from.clone());
+                }
+                Change::CreateTable { name, .. } => {
+                    this.created.insert(name.clone());
+                }
+                // Exhaustive rather than `_`: a change added later that moves a
+                // name has to be reflected here, or every probe downstream of
+                // it would quietly query the wrong object.
+                Change::DropTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. } => {}
+            }
+        }
+        this
+    }
+
+    /// `None` when the object does not exist yet, and so cannot be probed.
+    fn table(&self, name: &TableName) -> Option<TableName> {
+        if self.created.contains(name) {
+            return None;
+        }
+        Some(
+            self.tables
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone()),
+        )
+    }
+
+    fn column(&self, column: &ColumnRef) -> Option<ColumnRef> {
+        let table = self.table(&column.table)?;
+        let name = self
+            .columns
+            .get(column)
+            .cloned()
+            .unwrap_or_else(|| column.name.clone());
+        Some(table.column(&name))
+    }
+}
+
+fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
     match change {
         Change::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } => Ok(vec![null_probe(column)?]),
+        } => match names.column(column) {
+            Some(stored) => Ok(vec![null_probe(column, &stored)?]),
+            None => Ok(Vec::new()),
+        },
 
         Change::AlterColumnType {
             column,
@@ -56,14 +151,17 @@ fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
             to_nullable,
             ..
         } => {
+            let Some(stored) = names.column(column) else {
+                return Ok(Vec::new());
+            };
             let mut out = Vec::new();
             // A type change folds a nullability change into itself (§12), so it
             // has to carry that change's probe too.
             if *from_nullable && !*to_nullable {
-                out.push(null_probe(column)?);
+                out.push(null_probe(column, &stored)?);
             }
             if types::change_risk(from, to).risk_class().is_some() {
-                out.extend(conversion_probe(column, to)?);
+                out.extend(conversion_probe(column, &stored, to)?);
             }
             Ok(out)
         }
@@ -72,40 +170,59 @@ fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
             table,
             name,
             constraint,
-        } => Ok(vec![Probe::new(
-            format!("rows that violate the new check {name}"),
-            // A CHECK rejects a row only when its predicate is FALSE; UNKNOWN
-            // passes. `WHERE NOT (expr)` has exactly that behaviour, so the
-            // count matches what the engine will refuse.
-            format!(
-                "SELECT COUNT(*) AS n FROM {} WHERE NOT ({});",
-                qualified(table)?,
-                constraint.expression
-            ),
-        )]),
+        } => {
+            let Some(stored) = names.table(table) else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![Probe::new(
+                format!("rows that violate the new check {name}"),
+                // A CHECK rejects a row only when its predicate is FALSE;
+                // UNKNOWN passes. `WHERE NOT (expr)` has exactly that
+                // behaviour, so the count matches what the engine will refuse.
+                //
+                // The expression is not rewritten for renames: rewriting SQL
+                // text by substitution is how a tool that promised never to
+                // parse SQL starts parsing it badly. Such a probe fails to run
+                // and is reported as unchecked, which is honest.
+                format!(
+                    "SELECT COUNT(*) AS n FROM {} WHERE NOT ({});",
+                    qualified(&stored)?,
+                    constraint.expression
+                ),
+            )])
+        }
 
         Change::AddUnique {
             table,
             name,
             constraint,
-        } => Ok(vec![duplicate_probe(
-            table,
-            &constraint.columns,
-            &format!("rows that would collide under the new unique constraint {name}"),
-        )?]),
+        } => match stored_columns(names, table, &constraint.columns) {
+            Some((stored, columns)) => Ok(vec![duplicate_probe(
+                &stored,
+                &columns,
+                &format!("rows that would collide under the new unique constraint {name}"),
+            )?]),
+            None => Ok(Vec::new()),
+        },
 
         Change::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
         } => {
+            let Some((stored, columns)) = stored_columns(names, table, &pk.columns) else {
+                return Ok(Vec::new());
+            };
             let mut out = Vec::new();
-            for column in &pk.columns {
-                out.push(null_probe(&table.column(column))?);
+            for (declared, current) in pk.columns.iter().zip(&columns) {
+                out.push(null_probe(
+                    &table.column(declared),
+                    &stored.column(current),
+                )?);
             }
             out.push(duplicate_probe(
-                table,
-                &pk.columns,
+                &stored,
+                &columns,
                 "rows that would collide under the new primary key",
             )?);
             Ok(out)
@@ -116,18 +233,29 @@ fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
             name,
             constraint,
         } => {
+            let Some((child_table, child_columns)) =
+                stored_columns(names, table, &constraint.columns)
+            else {
+                return Ok(Vec::new());
+            };
+            let Some((parent_table, parent_columns)) = stored_columns(
+                names,
+                &constraint.references_table,
+                &constraint.references_columns,
+            ) else {
+                return Ok(Vec::new());
+            };
+
             // A row with any NULL in the key is exempt from the constraint
             // (MATCH SIMPLE, which is what SQL Server implements), so excluding
             // them is not leniency — it is the rule.
-            let not_null: Vec<String> = constraint
-                .columns
+            let not_null: Vec<String> = child_columns
                 .iter()
                 .map(|c| Ok(format!("c.{} IS NOT NULL", quote(c)?)))
                 .collect::<Result<_, DialectError>>()?;
-            let join: Vec<String> = constraint
-                .columns
+            let join: Vec<String> = child_columns
                 .iter()
-                .zip(&constraint.references_columns)
+                .zip(&parent_columns)
                 .map(|(child, parent)| Ok(format!("p.{} = c.{}", quote(parent)?, quote(child)?)))
                 .collect::<Result<_, DialectError>>()?;
 
@@ -135,9 +263,9 @@ fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
                 format!("rows with no matching parent for the new foreign key {name}"),
                 format!(
                     "SELECT COUNT(*) AS n FROM {} AS c\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM {} AS p WHERE {});",
-                    qualified(table)?,
+                    qualified(&child_table)?,
                     not_null.join("\n   AND "),
-                    qualified(&constraint.references_table)?,
+                    qualified(&parent_table)?,
                     join.join(" AND ")
                 ),
             )])
@@ -165,13 +293,30 @@ fn build(change: &Change) -> Result<Vec<Probe>, DialectError> {
     }
 }
 
-fn null_probe(column: &ColumnRef) -> Result<Probe, DialectError> {
+/// The table and columns as the database currently names them, or `None` when
+/// the table does not exist yet.
+fn stored_columns(
+    names: &AsStored,
+    table: &TableName,
+    columns: &[String],
+) -> Option<(TableName, Vec<String>)> {
+    let stored = names.table(table)?;
+    let columns = columns
+        .iter()
+        .map(|c| names.column(&table.column(c)).map(|r| r.name))
+        .collect::<Option<Vec<_>>>()?;
+    Some((stored, columns))
+}
+
+/// `column` names it as the plan does — for the message a human reads — and
+/// `stored` as the database does, for the query.
+fn null_probe(column: &ColumnRef, stored: &ColumnRef) -> Result<Probe, DialectError> {
     Ok(Probe::new(
         format!("existing NULLs in {column}, which NOT NULL would reject"),
         format!(
             "SELECT COUNT(*) AS n FROM {} WHERE {} IS NULL;",
-            qualified(&column.table)?,
-            quote(&column.name)?
+            qualified(&stored.table)?,
+            quote(&stored.name)?
         ),
     ))
 }
@@ -201,9 +346,13 @@ fn duplicate_probe(
 }
 
 /// The probe for narrowing a column's type, or `None` when no count exists.
-fn conversion_probe(column: &ColumnRef, to: &ColumnType) -> Result<Vec<Probe>, DialectError> {
-    let table = qualified(&column.table)?;
-    let col = quote(&column.name)?;
+fn conversion_probe(
+    column: &ColumnRef,
+    stored: &ColumnRef,
+    to: &ColumnType,
+) -> Result<Vec<Probe>, DialectError> {
+    let table = qualified(&stored.table)?;
+    let col = quote(&stored.name)?;
 
     // A bounded string or binary target truncates silently under CONVERT, so
     // `TRY_CONVERT` would return a value and report nothing. Length is the only
@@ -260,7 +409,7 @@ fn conversion_probe(column: &ColumnRef, to: &ColumnType) -> Result<Vec<Probe>, D
 mod tests {
     use super::*;
     use pbps_model::{
-        CheckConstraint, ForeignKey, PrimaryKey, ReferentialAction, UniqueConstraint,
+        CheckConstraint, ForeignKey, PlannedChange, PrimaryKey, ReferentialAction, UniqueConstraint,
     };
 
     fn cref(s: &str) -> ColumnRef {
@@ -275,8 +424,16 @@ mod tests {
     fn uid(s: &str) -> pbps_model::Uid {
         s.parse().unwrap()
     }
+    fn plan(changes: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        }
+    }
     fn sql_of(change: &Change) -> Vec<String> {
-        probes(change).into_iter().map(|p| p.sql).collect()
+        probes(&plan(vec![change.clone()]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect()
     }
 
     #[test]
@@ -481,7 +638,7 @@ mod tests {
     /// instead of a count would be read as garbage.
     #[test]
     fn every_probe_counts() {
-        let changes = [
+        let changes = plan(vec![
             Change::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.email"),
@@ -502,13 +659,89 @@ mod tests {
                     columns: vec!["email".into()],
                 },
             },
-        ];
-        for change in &changes {
-            for probe in probes(change) {
-                assert!(probe.sql.contains(" AS n"), "{probe:?}");
-                assert!(probe.sql.trim_end().ends_with(';'), "{probe:?}");
-                assert!(!probe.description.is_empty(), "{probe:?}");
-            }
+        ]);
+        let all = probes(&changes);
+        assert!(!all.is_empty());
+        for probe in all {
+            assert!(probe.sql.contains(" AS n"), "{probe:?}");
+            assert!(probe.sql.trim_end().ends_with(';'), "{probe:?}");
+            assert!(!probe.description.is_empty(), "{probe:?}");
         }
+    }
+
+    /// The bug this whole `AsStored` layer exists for: a plan that renames a
+    /// column and then tightens it must probe the name the database still has.
+    /// Built change-by-change, the probe asked about a column that did not
+    /// exist yet, and the one check that mattered was silently skipped.
+    #[test]
+    fn a_probe_uses_the_name_the_database_still_has() {
+        let cs = plan(vec![
+            Change::RenameColumn {
+                uid: uid("c_aaaaaa"),
+                table: tname("dbo.customer"),
+                from: "email".into(),
+                to: "contact_email".into(),
+            },
+            Change::AlterColumnNullability {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.contact_email"),
+                ty: ty("nvarchar(255)"),
+                to_nullable: false,
+            },
+        ]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].sql.contains("[email] IS NULL"), "{:?}", p[0]);
+        assert!(!p[0].sql.contains("contact_email"), "{:?}", p[0]);
+        // The message names it as the plan does; the reader is looking at the
+        // plan, not at the catalog.
+        assert!(p[0].description.contains("contact_email"), "{:?}", p[0]);
+    }
+
+    #[test]
+    fn a_renamed_table_is_probed_under_its_old_name() {
+        let cs = plan(vec![
+            Change::RenameTable {
+                uid: uid("t_aaaaaa"),
+                from: tname("dbo.client"),
+                to: tname("dbo.customer"),
+            },
+            Change::AddCheck {
+                table: tname("dbo.customer"),
+                name: "ck".into(),
+                constraint: CheckConstraint {
+                    expression: "[amount] >= 0".into(),
+                },
+            },
+        ]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].sql.contains("[dbo].[client]"), "{:?}", p[0]);
+    }
+
+    /// A table this plan creates is empty, so nothing in it can violate
+    /// anything — and probing it would only produce "invalid object name",
+    /// which reads like a failure rather than the non-question it is.
+    #[test]
+    fn a_table_created_by_this_plan_is_not_probed() {
+        let mut table = pbps_model::Table::default();
+        table
+            .columns
+            .insert("id".into(), pbps_model::Column::new(ty("int")));
+        let cs = plan(vec![
+            Change::CreateTable {
+                uid: uid("t_aaaaaa"),
+                name: tname("dbo.brand_new"),
+                table: Box::new(table),
+            },
+            Change::AddUnique {
+                table: tname("dbo.brand_new"),
+                name: "uq".into(),
+                constraint: UniqueConstraint {
+                    columns: vec!["id".into()],
+                },
+            },
+        ]);
+        assert!(probes(&cs).is_empty());
     }
 }

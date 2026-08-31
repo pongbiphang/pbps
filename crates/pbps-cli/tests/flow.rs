@@ -247,8 +247,11 @@ fn an_invalid_declaration_is_rejected() {
     assert_eq!(code(&o), 1);
 }
 
+/// An offline plan is a preview and the file has to say so in its own terms
+/// (SPEC §7.3): `apply` decides by reading `origin`, not by noticing that
+/// something is missing.
 #[test]
-fn plan_writes_the_change_set_as_json() {
+fn plan_writes_a_preview_plan_as_json() {
     let d = Demo::new("out");
     d.table(ONE_COLUMN);
     d.run(&["plan"]);
@@ -261,7 +264,17 @@ fn plan_writes_the_change_set_as_json() {
 
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(json["changes"][0]["op"], "add_column");
+    assert_eq!(json["changes"]["changes"][0]["op"], "add_column");
+    assert_eq!(json["origin"], "preview");
+    assert_eq!(json["dialect"], "mssql");
+    // The identity mapping travels with the plan, so an apply needs nothing
+    // else; and the baseline carries the fingerprint apply compares against.
+    assert!(json["ids"]["tables"].is_object(), "{json}");
+    assert_eq!(
+        json["baseline"]["checksum"].as_str().unwrap().len(),
+        64,
+        "{json}"
+    );
 }
 
 #[test]

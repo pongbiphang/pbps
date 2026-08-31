@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Probe, Statement, TypeChangeRisk};
-use pbps_model::{Change, ColumnType, Table, TableName};
+use pbps_model::{Change, ChangeSet, ColumnType, Table, TableName};
 
 pub mod catalog;
 pub mod emit;
@@ -81,8 +81,8 @@ impl Dialect for Mssql {
         emit::emit(change)
     }
 
-    fn preflight(&self, change: &Change) -> Vec<Probe> {
-        preflight::probes(change)
+    fn preflight(&self, changes: &ChangeSet) -> Vec<Probe> {
+        preflight::probes(changes)
     }
 
     fn batch_separator(&self) -> Option<&'static str> {

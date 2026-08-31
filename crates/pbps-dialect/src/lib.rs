@@ -32,7 +32,7 @@
 
 use std::borrow::Cow;
 
-use pbps_model::{Change, ColumnType, RiskClass, Table, TableName};
+use pbps_model::{Change, ChangeSet, ColumnType, RiskClass, Table, TableName};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
@@ -212,16 +212,21 @@ pub trait Dialect {
     /// can merge them into one.
     fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError>;
 
-    /// Questions to ask the data before this change runs (SPEC §7.5).
+    /// Questions to ask the data before this **plan** runs (SPEC §7.5).
+    ///
+    /// The unit is the plan and not one change, and that is not a convenience.
+    /// Probes run before the first statement, so every name in them must be the
+    /// name the database still has — and a plan that renames a column and then
+    /// tightens it to NOT NULL describes that column by its *new* name.
+    /// Building each probe in isolation would query a column that does not
+    /// exist yet, and the check the pre-flight most needed to make is the one
+    /// it would skip. For the same reason a table this plan creates is not
+    /// probed at all: it is empty, and nothing in it can violate anything.
     ///
     /// The default is "none", which is the honest answer for a dialect that has
     /// not implemented them: an empty list means "nothing was checked", and the
     /// caller reports it that way rather than as "nothing is wrong".
-    ///
-    /// A change whose risk class cannot be probed usefully — a rename, whose
-    /// impact is a dependency question rather than a data one — belongs
-    /// elsewhere, not in a probe that always returns zero.
-    fn preflight(&self, _change: &Change) -> Vec<Probe> {
+    fn preflight(&self, _changes: &ChangeSet) -> Vec<Probe> {
         Vec::new()
     }
 
@@ -356,11 +361,13 @@ mod tests {
     /// never "nothing is wrong".
     #[test]
     fn a_dialect_without_probes_returns_none() {
-        let change = Change::DropTable {
-            uid: "t_a1b2c3".parse().unwrap(),
-            name: "dbo.customer".parse().unwrap(),
+        let changes = ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::DropTable {
+                uid: "t_a1b2c3".parse().unwrap(),
+                name: "dbo.customer".parse().unwrap(),
+            })],
         };
-        assert!(MinimalDialect.preflight(&change).is_empty());
+        assert!(MinimalDialect.preflight(&changes).is_empty());
     }
 }
 
