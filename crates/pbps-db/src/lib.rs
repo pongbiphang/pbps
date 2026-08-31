@@ -35,6 +35,13 @@ pub enum DbError {
         source: std::io::Error,
     },
 
+    #[error(
+        "`{addr}` did not answer within {}s.\n\
+         The host is unreachable or a firewall is dropping the connection rather than refusing it.",
+        CONNECT_TIMEOUT.as_secs()
+    )]
+    ConnectTimeout { addr: String },
+
     #[error("{0}")]
     Driver(#[from] tiberius::error::Error),
 
@@ -43,6 +50,15 @@ pub enum DbError {
     #[error("unexpected row shape: {0}")]
     BadRow(String),
 }
+
+/// How long to wait for the TCP connection before giving up.
+///
+/// Long enough for a slow VPN or a container still starting, short enough that
+/// a pipeline blocked by a firewall reports it while someone is still watching.
+/// It bounds only the connect; a query against a reachable server is not
+/// hurried, because a long-running ALTER is exactly what this tool exists to
+/// run.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// An open SQL Server connection.
 pub struct Conn {
@@ -57,9 +73,15 @@ impl Conn {
         let config = Config::from_ado_string(connection_string)
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
         let addr = config.get_addr().to_owned();
-        let tcp = TcpStream::connect(&addr)
-            .await
-            .map_err(|source| DbError::Connect { addr, source })?;
+        // A firewall that drops rather than refuses leaves the OS retrying for
+        // over two minutes. Waiting that long for a pipeline to say "I could
+        // not reach prod" is a bad way to learn it, so the wait is bounded and
+        // the message says which of the two happened.
+        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(source)) => return Err(DbError::Connect { addr, source }),
+            Err(_elapsed) => return Err(DbError::ConnectTimeout { addr }),
+        };
         tcp.set_nodelay(true).map_err(|source| DbError::Connect {
             addr: config.get_addr().to_owned(),
             source,

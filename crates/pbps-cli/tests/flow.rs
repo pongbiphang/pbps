@@ -724,3 +724,77 @@ fn an_unknown_strategy_key_is_rejected() {
     assert_ne!(code(&o), 0);
     assert!(stderr(&o).contains("onlnie"), "{}", stderr(&o));
 }
+
+/// SPEC §7.3: "a plan computed offline is always a preview and is never
+/// accepted by `apply`". The refusal happens before anything connects, which is
+/// what makes it testable here — and what makes it a property of the artifact
+/// rather than of the deployment.
+#[test]
+fn apply_refuses_an_offline_preview_without_ever_connecting() {
+    let d = Demo::new("preview");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  b: {type: int}\n");
+    let plan = d.dir.join("preview.json");
+    d.run(&["plan", "--out", plan.to_str().unwrap()]);
+
+    let o = d.run(&[
+        "apply",
+        // A port nothing listens on, so a connection that should never be
+        // attempted is refused instantly rather than waiting out a timeout.
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "destructive",
+    ]);
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(err.contains("preview"), "{err}");
+    assert!(err.contains("plan --db"), "the remedy must be named: {err}");
+    assert!(!err.contains("connect"), "it must not have tried: {err}");
+}
+
+/// A password must not reach a log even when the command fails, and the failure
+/// message is the easiest place to leak one.
+#[test]
+fn a_connection_string_never_appears_in_output() {
+    let d = Demo::new("secret");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+
+    let o = d.run(&[
+        "verify",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=hunter2",
+    ]);
+    assert_eq!(code(&o), 1);
+    let all = format!("{}{}", stderr(&o), String::from_utf8_lossy(&o.stdout));
+    assert!(!all.contains("hunter2"), "{all}");
+}
+
+/// A project with no environments must explain how to add one rather than
+/// print an empty table.
+#[test]
+fn status_without_environments_says_how_to_configure_them() {
+    let d = Demo::new("noenv");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["status"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("url_env"), "{out}");
+}
+
+/// `--check` never connects, so pairing it with a target is a mistake worth
+/// naming rather than quietly resolving one way or the other.
+#[test]
+fn plan_check_and_db_are_refused_together() {
+    let d = Demo::new("checkdb");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--check", "--db", "Server=x;Database=y"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("--check"), "{}", stderr(&o));
+}

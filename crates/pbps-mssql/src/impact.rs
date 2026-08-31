@@ -120,14 +120,43 @@ impl ImpactReport {
     }
 }
 
-const DEPENDENCIES: &str = "\
-SELECT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
+/// `DISTINCT` is not tidiness: the catalog holds one row per referenced
+/// *column*, so a view naming three columns of the table appears three times,
+/// and a report that listed it three times would read like three problems.
+///
+/// The type filter keeps constraints out. A check constraint genuinely depends
+/// on its table, so it turns up here — but whether it is affected depends on
+/// which column its text names, which is what [`EXPRESSIONS`] decides. Letting
+/// both report it would flag every constraint on the table for every rename.
+const DEPENDENCIES_TABLE: &str = "\
+SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
        CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
   FROM sys.sql_expression_dependencies d
   JOIN sys.objects o ON o.object_id = d.referencing_id
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
  WHERE d.referenced_id = OBJECT_ID(@P1)
+   AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
+ ORDER BY s.name, o.name;";
+
+/// The same, narrowed to modules that name *this column*.
+///
+/// `referenced_minor_id = 0` is a reference to the object as a whole (`SELECT
+/// *`), which a column rename does affect. Anything else is a specific column,
+/// and a module naming a different one keeps working — reporting it would flag
+/// a rename as risky when it is not, and a report that blocks valid deploys is
+/// one people learn to override.
+const DEPENDENCIES_COLUMN: &str = "\
+SELECT DISTINCT o.type AS type_code, s.name AS schema_name, o.name AS object_name,
+       CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS schema_bound
+  FROM sys.sql_expression_dependencies d
+  JOIN sys.objects o ON o.object_id = d.referencing_id
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
+ WHERE d.referenced_id = OBJECT_ID(@P1)
+   AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
+   AND (d.referenced_minor_id = 0
+        OR d.referenced_minor_id = COLUMNPROPERTY(OBJECT_ID(@P1), @P2, 'ColumnId'))
  ORDER BY s.name, o.name;";
 
 const COMPUTED_COLUMNS: &str = "\
@@ -170,7 +199,17 @@ pub async fn rename_impact(
         ..Default::default()
     };
 
-    for row in conn.query_with(DEPENDENCIES, &[&table.as_str()]).await? {
+    let dependencies = match target {
+        RenameTarget::Table(_) => {
+            conn.query_with(DEPENDENCIES_TABLE, &[&table.as_str()])
+                .await?
+        }
+        RenameTarget::Column(c) => {
+            conn.query_with(DEPENDENCIES_COLUMN, &[&table.as_str(), &c.name.as_str()])
+                .await?
+        }
+    };
+    for row in dependencies {
         let kind = module_kind(get::<&str>(&row, "type_code")?);
         let name = format!(
             "{}.{}",
@@ -342,6 +381,26 @@ mod tests {
         assert!(!mentions("amount_paid >= 0", "amount"));
         assert!(!mentions("net_amount >= 0", "amount"));
         assert!(!mentions("@amount >= 0", "amount"));
+    }
+
+    /// The two traps a live run found: one row per referenced column made a
+    /// single view look like three problems, and check constraints arrived as
+    /// dependencies of their own table, flagging every one of them for every
+    /// rename.
+    #[test]
+    fn the_dependency_queries_deduplicate_and_exclude_constraints() {
+        for sql in [DEPENDENCIES_TABLE, DEPENDENCIES_COLUMN] {
+            assert!(sql.contains("SELECT DISTINCT"), "{sql}");
+            assert!(sql.contains("o.type IN ("), "{sql}");
+            assert!(
+                !sql.contains("'C'"),
+                "constraints are EXPRESSIONS' job: {sql}"
+            );
+        }
+        // Only the column query narrows to a column; a table rename affects
+        // every referrer.
+        assert!(DEPENDENCIES_COLUMN.contains("referenced_minor_id"));
+        assert!(!DEPENDENCIES_TABLE.contains("referenced_minor_id"));
     }
 
     #[test]

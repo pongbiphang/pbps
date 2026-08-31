@@ -28,7 +28,7 @@ use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
     Column, ColumnType, ForeignKey, Identity, IdsFile, Index, IndexColumn, Intent, PrimaryKey,
-    ReferentialAction, Schema, Table, TableName, UniqueConstraint,
+    ReferentialAction, Schema, StateSnapshot, Table, TableName, UniqueConstraint,
 };
 use pbps_mssql::Mssql;
 
@@ -451,4 +451,316 @@ async fn pull_inventories_the_modules_it_does_not_manage() {
             .tables
             .contains_key(&TableName::new("dbo", "t"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: the ledger, the lock, the transaction promise, and the queries that
+// only a real catalog can answer.
+// ---------------------------------------------------------------------------
+
+fn snapshot(kind: pbps_model::StateKind, schema: &Schema, ids: &IdsFile) -> StateSnapshot {
+    StateSnapshot::new(kind, schema.clone(), ids.clone(), "live-test")
+}
+
+/// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
+/// downstream — drift, the plan checksum, `status` — reads this row, so a
+/// serialization that lost a field would make every one of them quietly wrong.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_ledger_returns_exactly_what_was_recorded() {
+    let mut db = TestDb::create("ledger").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+
+    // A database with no ledger must say so, not fail with "invalid object
+    // name": the remedy is `baseline`, and only this distinction can print it.
+    assert!(matches!(
+        pbps_mssql::state::latest(&mut db.conn).await,
+        Err(pbps_db::LedgerError::NotInitialized)
+    ));
+
+    let mut first = snapshot(pbps_model::StateKind::Baseline, &schema, &ids);
+    first.reason = Some("adopting the database as it stands".into());
+    first.git_sha = Some("bd4be74".into());
+    let id = pbps_mssql::state::record(&mut db.conn, &first)
+        .await
+        .expect("record");
+
+    let back = pbps_mssql::state::latest(&mut db.conn)
+        .await
+        .expect("latest")
+        .expect("an entry");
+    assert_eq!(back.id, id);
+    assert_eq!(
+        back.snapshot, first,
+        "the snapshot must survive the round trip"
+    );
+    // The server's clock, formatted as ISO 8601 by the query.
+    assert_eq!(back.applied_at.len(), 23, "{}", back.applied_at);
+    assert!(back.applied_at.contains('T'), "{}", back.applied_at);
+
+    // Recording again must append, never overwrite: the ledger is a history.
+    let second = snapshot(pbps_model::StateKind::Apply, &Schema::default(), &ids);
+    let second_id = pbps_mssql::state::record(&mut db.conn, &second)
+        .await
+        .expect("record again");
+    assert!(second_id > id);
+    assert_eq!(
+        pbps_mssql::state::latest(&mut db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .kind,
+        pbps_model::StateKind::Apply
+    );
+
+    let kept = pbps_mssql::state::prune(&mut db.conn, 1)
+        .await
+        .expect("prune");
+    assert_eq!(kept, 1, "one old entry removed");
+    let history = pbps_mssql::state::history(&mut db.conn, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].id, second_id,
+        "the newest is the one that survives"
+    );
+
+    db.drop().await;
+}
+
+/// SPEC §8.1: `__pbps_lock` stops two pipelines applying at once. The gate is
+/// the insert itself, not a preceding read — a check-then-insert would let two
+/// runners through the check together.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_lock_admits_one_holder_at_a_time() {
+    let mut db = TestDb::create("lock").await;
+
+    pbps_mssql::state::lock(&mut db.conn, "runner-a")
+        .await
+        .expect("first lock");
+
+    match pbps_mssql::state::lock(&mut db.conn, "runner-b").await {
+        Err(pbps_db::LedgerError::Locked(info)) => {
+            assert_eq!(info.locked_by, "runner-a", "the holder must be named");
+            assert!(!info.locked_at.is_empty());
+        }
+        other => panic!("the second holder must be refused, got {other:?}"),
+    }
+
+    assert!(pbps_mssql::state::unlock(&mut db.conn).await.unwrap());
+    assert!(
+        !pbps_mssql::state::unlock(&mut db.conn).await.unwrap(),
+        "releasing a lock nobody holds is not an error, but it is not a release either"
+    );
+    pbps_mssql::state::lock(&mut db.conn, "runner-b")
+        .await
+        .expect("the lock is free again");
+
+    db.drop().await;
+}
+
+/// SPEC §7.5, the promise the whole apply model rests on: one plan, one
+/// transaction, all or nothing. Only a real engine can show that a statement
+/// failing halfway leaves nothing behind — and only with XACT_ABORT ON, without
+/// which SQL Server would keep the transaction alive and let the earlier
+/// statements commit.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_failed_statement_rolls_the_whole_plan_back() {
+    let mut db = TestDb::create("rollback").await;
+    db.conn
+        .execute("CREATE TABLE dbo.t (id int NOT NULL);")
+        .await
+        .expect("create");
+
+    db.conn.begin().await.expect("begin");
+    db.conn
+        .execute("ALTER TABLE dbo.t ADD good nvarchar(10) NULL;")
+        .await
+        .expect("the first statement succeeds");
+    assert!(
+        db.conn
+            .execute("ALTER TABLE dbo.t ADD bad nosuchtype;")
+            .await
+            .is_err(),
+        "the second statement must fail"
+    );
+    db.conn.rollback().await.expect("rollback");
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let t = &pulled.schema.tables[&TableName::new("dbo", "t")];
+    assert!(
+        !t.columns.contains_key("good"),
+        "the successful statement must have gone too: {:?}",
+        t.columns.keys().collect::<Vec<_>>()
+    );
+
+    db.drop().await;
+}
+
+/// SPEC §7.4: a SCHEMABINDING view blocks a rename outright, and the report has
+/// to say so before anything runs rather than letting the engine refuse
+/// mid-apply. The dependency queries are the half no unit test can cover.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn rename_impact_finds_the_dependencies_that_block() {
+    use pbps_mssql::impact::{RenameTarget, rename_impact};
+
+    let mut db = TestDb::create("impact").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.customer (
+                 id int NOT NULL CONSTRAINT pk_customer PRIMARY KEY,
+                 email nvarchar(255) NULL,
+                 amount decimal(18,2) NOT NULL
+                     CONSTRAINT ck_customer_amount CHECK (amount >= 0)
+             );",
+        )
+        .await
+        .expect("create table");
+    for sql in [
+        "CREATE VIEW dbo.v_plain AS SELECT id, email FROM dbo.customer;",
+        "CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id, email FROM dbo.customer;",
+        "CREATE INDEX ix_customer_email ON dbo.customer (email);",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let target = RenameTarget::Column("dbo.customer.email".parse().unwrap());
+    let report = rename_impact(&mut db.conn, &target).await.expect("impact");
+
+    assert_eq!(
+        report
+            .blocking
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["dbo.v_bound"],
+        "only the schema-bound view blocks: {report:?}"
+    );
+    assert!(
+        report.advisory.iter().any(|r| r.name == "dbo.v_plain"),
+        "the ordinary view still breaks and must be listed: {report:?}"
+    );
+    assert!(
+        report
+            .advisory
+            .iter()
+            .any(|r| r.name == "ix_customer_email"),
+        "an index whose name embeds the column is naming drift: {report:?}"
+    );
+    // The check names `amount`, not `email`; a report that flagged it would be
+    // a report nobody reads.
+    assert!(
+        !report
+            .advisory
+            .iter()
+            .any(|r| r.name == "ck_customer_amount"),
+        "unrelated constraints must not be reported: {report:?}"
+    );
+
+    db.drop().await;
+}
+
+/// SPEC §7.5: the probes have to count what the engine would actually refuse.
+/// Their whole value is the number they report, and only real rows can show
+/// that the number is right.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn preflight_probes_count_what_the_engine_would_refuse() {
+    use pbps_dialect::Dialect;
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("probes").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.region (region_id int NOT NULL CONSTRAINT pk_region PRIMARY KEY);
+             CREATE TABLE dbo.customer (
+                 id int NOT NULL,
+                 email nvarchar(255) NULL,
+                 region_id int NULL,
+                 amount decimal(18,2) NOT NULL
+             );",
+        )
+        .await
+        .expect("create");
+    db.conn
+        .execute(
+            "INSERT INTO dbo.region VALUES (1);
+             INSERT INTO dbo.customer VALUES
+                 (1, 'a@example.com', 1, 10.00),
+                 (2, NULL,            1, -5.00),
+                 (3, NULL,            99, 20.00),
+                 (1, 'a@example.com', 1, 30.00);",
+        )
+        .await
+        .expect("insert");
+
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.customer.email".parse().unwrap(),
+                ty: ty("nvarchar(255)"),
+                to_nullable: false,
+            }),
+            PlannedChange::new(Change::AddCheck {
+                table: TableName::new("dbo", "customer"),
+                name: "ck_customer_amount".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "[amount] >= 0".into(),
+                },
+            }),
+            PlannedChange::new(Change::AddForeignKey {
+                table: TableName::new("dbo", "customer"),
+                name: "fk_customer_region".into(),
+                constraint: Box::new(ForeignKey {
+                    columns: vec!["region_id".into()],
+                    references_table: TableName::new("dbo", "region"),
+                    references_columns: vec!["region_id".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                }),
+            }),
+            PlannedChange::new(Change::AddUnique {
+                table: TableName::new("dbo", "customer"),
+                name: "uq_customer_id".into(),
+                constraint: UniqueConstraint {
+                    columns: vec!["id".into()],
+                },
+            }),
+        ],
+    };
+
+    let mut counts = Vec::new();
+    for probe in Mssql.preflight(&cs) {
+        let rows = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
+        let n: i32 = rows[0].try_get(0).unwrap().unwrap();
+        counts.push((probe.description, n));
+    }
+    db.drop().await;
+
+    let by = |needle: &str| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains(needle))
+            .unwrap_or_else(|| panic!("no probe mentioning `{needle}` in {counts:?}"))
+            .1
+    };
+    assert_eq!(by("NULLs"), 2, "two rows have a NULL email: {counts:?}");
+    assert_eq!(by("check"), 1, "one row has a negative amount: {counts:?}");
+    assert_eq!(by("parent"), 1, "one row points at region 99: {counts:?}");
+    // Rows, not groups: two rows share id 1.
+    assert_eq!(by("collide"), 2, "{counts:?}");
 }

@@ -887,6 +887,17 @@ four invariants must be machine-verified:
    SQL Server in Docker.
 4. **Diagnostic snapshots**: every error message pinned with `insta`.
 
+Phase 3 adds four more that only a live engine can settle, since each is a
+promise about the engine's behaviour rather than about the tool's own logic:
+
+5. **Ledger round-trip**: a recorded `StateSnapshot` comes back identical.
+   Drift, the plan checksum and `status` all read that row.
+6. **Lock exclusivity**: the second holder is refused and told who holds it.
+7. **All or nothing**: a plan whose second statement fails leaves the first
+   one's effect behind nowhere. Without `XACT_ABORT ON` it would.
+8. **Probe accuracy**: the counts a probe reports are the rows the engine would
+   actually refuse. The whole value of a probe is its number.
+
 ---
 
 ## 12. Phases
@@ -896,7 +907,7 @@ four invariants must be machine-verified:
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
-| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4) / the optional dev database (9.3) | The complete product |
+| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4) | The complete product. The optional dev database (9.3) and edition-aware `strategy: online` are deferred: both sharpen a preview rather than gating a deployment |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |

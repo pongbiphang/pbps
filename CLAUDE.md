@@ -32,23 +32,28 @@ cargo fmt --all
 ## Architectural boundaries
 
 ```
-pbps-model     Domain model. Dialect-agnostic, span-free, serializes to JSON
-pbps-config    Project configuration (pbps.yml)
+pbps-model     Domain model. Dialect-agnostic, span-free, serializes to JSON:
+               the ids file, the state snapshot, the saved plan, the drift report
+pbps-config    Project configuration (pbps.yml): paths, environments, hooks
 pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
-pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL
-pbps-dialect   Dialect abstraction. Pure functions; DB-bound work waits for
-               Phase 3's DialectDb
+pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL. Also owns
+               the managed-set scope and observed identity
+pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
+               probes. Connection-bound work is free async fns in the dialect
+               crate, not trait methods
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
-               only place SQL is written), catalog introspection
-pbps-db        Connections (tiberius). Owns "there is a network" and nothing
-               else; __pbps_state access and locking arrive in Phase 3
+               only place a *change* becomes SQL), catalog introspection,
+               the ledger/lock statements, rename impact
+pbps-db        Connections (tiberius) plus transaction framing. Owns "there is
+               a network"; ledger types and prune policy, no T-SQL
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
-pbps-cli       clap, interactive prompts, diagnostic output
+pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
 ```
 
-- Only `pbps-db` and `pbps-mssql::catalog` are async; the CLI `block_on`s
-  them per command. Phase 4 adds `pbps-pg`.
+- Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
+  `state`, `impact`) are async; the CLI `block_on`s them per command. Phase 4
+  adds `pbps-pg`.
 - `spikes/` is workspace-`exclude`d: standalone evaluation crates, not product
   code.
 
@@ -99,13 +104,17 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phases 0-2 complete**, including the three items the competitive review
-added to Phase 2 (SPEC §12). The test and clippy bar is in "Development
-environment" above; counts change too often to record here.
+**Phases 0-3 complete** for SQL Server. The test and clippy bar is in
+"Development environment" above; counts change too often to record here.
 
-Commands: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
+Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
-`pull` (`--db` / `--force`), `docs` (`--format` / `--out` / `--title`).
+`docs` (`--format` / `--out` / `--title`).
+
+Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
+`plan --db`, `apply` (`--plan` / `--allow`), `verify` (`--format json`),
+`snapshot` (`--force`), `baseline` (`--reason`), `bootstrap` (`--sql`),
+`state prune` (`--keep`), `unlock`, `status` (`--format json`).
 
 Decisions that changed from the original spec (SPEC is in sync):
 
@@ -161,21 +170,65 @@ Phase 2 additions worth knowing before touching them:
     external (the air-gap rule applies to artifacts). That is why the ERD
     travels as Mermaid source rather than a script-rendered diagram.
 
+Phase 3 additions worth knowing before touching them:
+
+19. **The ledger's T-SQL lives in `pbps-mssql::state`**, its types and prune
+    policy in `pbps-db::ledger`. The columns beside `state_json` are projected
+    from the snapshot at record time, never passed separately, so they cannot
+    come to disagree with it. `applied_at` is the *server's* clock, formatted
+    as ISO 8601 text by the query — tiberius is built without `chrono`.
+20. **Drift needs `observed_ids`, not the recorded mapping on both sides.**
+    `diff` matches by uid, so two sides sharing one ids file see only attribute
+    changes; a hand-added or hand-dropped column would be invisible. The live
+    side is identified by what is there, with `Uid::derived` (deterministic, so
+    a hook payload is stable) for objects that have none. Never use `derived`
+    to mint a real identity — two branches would collide.
+21. **`pbps.yml` names the env var, never the connection string** (`url_env:`),
+    and nothing prints one: `db::redact` reduces it to server/database and
+    degrades to a placeholder rather than echoing what it could not parse.
+22. **Probes are built per plan, not per change.** They run before the first
+    statement, so every name in them must be the one the catalog still has —
+    `preflight::AsStored` translates through the plan's renames, and tables the
+    plan creates are skipped. Check expressions are deliberately *not*
+    rewritten; that probe fails to run and is reported as unchecked.
+23. **A saved plan carries `origin` and the post-plan `ids`.** `Preview` is a
+    value in the file, so `apply` refuses it structurally; the ids make apply
+    self-contained on a host with no checkout, and recording the baseline's
+    mapping instead would say a rename never happened.
+24. **`apply` takes the lock before the pre-flight, and releases it on every
+    path.** A check that passed while another pipeline was mid-apply was
+    answered about a moving database; a lock left behind blocks the pipeline
+    that would fix it.
+25. **`verify` exits 2 on drift**, distinct from 1 for a tool failure: a
+    scheduled drift-watch wakes different people for each. `status` always
+    exits 0 — it is a report, and one unreachable environment must not cost
+    the operator the other five lines.
+
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.
 
-**Live tests**: the SPEC §11.5 invariants (bootstrap == introspect,
-apply(plan(A→B)) converges on B, pull warns rather than losing) run against a
-real SQL Server in Docker: `scripts/live-tests.sh`, or set `PBPS_TEST_DB` and
-`cargo test -p pbps-mssql --test live -- --ignored`. They are `#[ignore]`d so
-the ordinary suite stays offline; CI has a dedicated job. When touching the
-emitter or the catalog queries, run them — they caught two bugs the unit suite
-could not (FK ordering between two new tables; `EXEC()` rejecting function
-calls in its argument).
+**Live tests**: the SPEC §11.5 invariants plus the Phase 3 ones (the ledger
+round-trip, the lock admitting one holder, a failed statement rolling the whole
+plan back, the rename-impact queries, the probes counting real rows) run
+against a real SQL Server in Docker: `scripts/live-tests.sh` (set
+`PBPS_TEST_PORT` if 14330 is taken), or set `PBPS_TEST_DB` and `cargo test -p
+pbps-mssql --test live -- --ignored`. They are `#[ignore]`d so the ordinary
+suite stays offline; CI has a dedicated job. When touching the emitter, the
+catalog queries or the ledger, run them — they have caught four bugs the unit
+suite structurally could not: FK ordering between two new tables; `EXEC()`
+rejecting function calls in its argument; `sql_expression_dependencies`
+returning one row per referenced *column*; and check constraints arriving as
+dependencies of their own table.
 
-**Phase 3 (after Phase 2 closes)**: `pbps-db` grows `__pbps_state` / locking;
-`apply`, `verify` (`--format json`), `snapshot`, `baseline`, `bootstrap`, the
-`--allow` gate, `plan --db`, the rename impact report and the automatic
-preflight probes of §7.5, the `on_apply` / `on_drift` hooks, `status`, and the
-optional dev database of §9.3. `pbps-dialect::MinimalDialect` remains only as
-pbps-diff's test stand-in.
+**Not done in Phase 3**: the optional dev database of §9.3 (a throwaway engine
+for higher-fidelity previews — always optional, and a dev-verified plan is
+still a preview), and the emitter honouring `strategy: online` with
+edition-aware classification at `plan --db` (ADR-0003). Neither blocks
+anything: the first only sharpens a preview, and `strategy:` is parsed,
+preserved and validated already.
+
+**Phase 3.5 next**: the module model for views / SPs / functions / triggers
+(ADR-0002), and staged apply for non-transactional operations (ADR-0003).
+`Statement::transactional` and `--staged`'s refusal path already exist; what
+is missing is the per-statement ledger record and `--resume`.
+`pbps-dialect::MinimalDialect` remains only as pbps-diff's test stand-in.
