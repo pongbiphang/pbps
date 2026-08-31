@@ -46,7 +46,10 @@ async fn managed_state(
     // inside the managed set by name and outside it in fact, so the next plan
     // would propose creating one that is already there.
     for m in &pulled.unmanaged_modules {
-        if modules.contains(&m.name.parse().unwrap_or_else(|_| unreachable_name())) {
+        if m.name
+            .parse::<pbps_model::ObjectName>()
+            .is_ok_and(|n| modules.contains(&n))
+        {
             eprintln!(
                 "warning: {} {} is declared, but {}; it is left alone",
                 m.kind, m.name, m.why
@@ -57,12 +60,6 @@ async fn managed_state(
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     report_unmanaged(&scoped, unmanaged)?;
     Ok(scoped)
-}
-
-/// A name the catalog produced cannot fail to parse; this exists only so the
-/// comparison above needs no `unwrap` that could one day fire.
-fn unreachable_name() -> pbps_model::ObjectName {
-    pbps_model::ObjectName::new("\u{0}", "\u{0}")
 }
 
 /// The modules the declarations name, for the commands that record a state.

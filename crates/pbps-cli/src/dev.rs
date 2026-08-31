@@ -165,7 +165,6 @@ pub fn rehearse(
         declared_ids,
         dialect,
         hints,
-        project.config.unmanaged,
     ));
     // The container goes whatever happened; leaving one behind on a failure is
     // how a developer's machine fills up with servers they did not know about.
@@ -182,9 +181,7 @@ async fn run(
     declared_ids: &IdsFile,
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
-    unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<Rehearsal> {
-    let _ = unmanaged;
     let mut conn = Conn::connect(connection)
         .await
         .context("cannot reach the dev database")?;
