@@ -126,6 +126,33 @@ pub struct Hooks {
     pub on_drift: Option<String>,
 }
 
+/// The optional throwaway engine of SPEC §9.3.
+///
+/// # Why it is always optional
+///
+/// The air-gap promise stands: with no dev database the preview degrades to
+/// lightweight normalization and says so. This differs from Atlas, where a dev
+/// database is required for many operations — and the difference is deliberate,
+/// because a tool that cannot answer without Docker cannot be used where this
+/// one has to be.
+///
+/// A dev-verified plan is still a **preview**. Applyable plans come only from
+/// `plan --db` against the target, and this does not move that line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dev {
+    /// The name of an environment variable holding a connection string to a
+    /// throwaway server — never the string itself, for the reason
+    /// [`Environment`] gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_env: Option<String>,
+
+    /// A container image to start and throw away, e.g.
+    /// `mcr.microsoft.com/mssql/server:2022-latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -147,6 +174,11 @@ pub struct Config {
 
     #[serde(default)]
     pub unmanaged: Unmanaged,
+
+    /// The optional dev database (SPEC §9.3). Absent means previews stay
+    /// offline, which is the default and a supported way to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<Dev>,
 }
 
 fn default_schema_dir() -> PathBuf {
@@ -385,5 +417,36 @@ mod tests {
         let err = Project::discover(&tmp).unwrap_err();
         assert!(matches!(err, ConfigError::NotFound { .. }));
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The dev database is optional, and a project that never mentions one has
+    /// to keep working exactly as before — the air-gap promise of §9.1.
+    #[test]
+    fn the_dev_database_is_absent_unless_declared() {
+        let c = Config::parse("dialect: mssql\n", Path::new("pbps.yml")).unwrap();
+        assert!(c.dev.is_none());
+
+        let c = Config::parse(
+            "dialect: mssql\ndev:\n  docker: mcr.microsoft.com/mssql/server:2022-latest\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.dev.unwrap().docker.as_deref(),
+            Some("mcr.microsoft.com/mssql/server:2022-latest")
+        );
+    }
+
+    /// A connection string in the file would be a credential in version
+    /// control; the dev block names the variable, like every other target.
+    #[test]
+    fn the_dev_block_rejects_an_inline_url() {
+        assert!(
+            Config::parse(
+                "dialect: mssql\ndev:\n  url: Server=localhost\n",
+                Path::new("pbps.yml")
+            )
+            .is_err()
+        );
     }
 }

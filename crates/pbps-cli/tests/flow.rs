@@ -1017,6 +1017,83 @@ fn resume_without_staged_is_refused() {
     assert_ne!(code(&o), 0);
 }
 
+// ---- the optional dev database (SPEC §9.3) ----
+
+/// A rehearsal answers a preview's question; `plan --db` produces the artifact
+/// the deployment gate approves. Combining them would invite a dev-verified
+/// plan to be read as a target-verified one.
+#[test]
+fn dev_and_db_are_refused_together() {
+    let d = Demo::new("dev-and-db");
+    d.table(ONE_COLUMN);
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--dev",
+        "docker://mcr.microsoft.com/mssql/server:2022-latest",
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("separately"), "{}", stderr(&o));
+}
+
+/// The air-gap promise of §9.1: with no dev database configured, `plan` does
+/// exactly what it always did and says nothing about one.
+#[test]
+fn a_plan_without_a_dev_database_never_mentions_one() {
+    let d = Demo::new("dev-absent");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("rehearsal"), "{}", stdout(&o));
+}
+
+/// `dev.url_env` names the variable, never the string. An unset one has to say
+/// which variable and offer the flag, or a developer is left guessing.
+#[test]
+fn an_unset_dev_variable_names_itself() {
+    let d = Demo::new("dev-env");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\ndev:\n  url_env: PBPS_DEV_CONN_ABSENT\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("PBPS_DEV_CONN_ABSENT"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// The rehearsal itself, against a real engine: the declarations have to
+/// compile and the plan has to converge on them (SPEC §9.3, §11.5 invariant 3).
+///
+/// `#[ignore]`d like the other live tests — run it with
+/// `PBPS_TEST_DB=... cargo test -p pbps-cli --test flow -- --ignored`, or
+/// through `scripts/live-tests.sh`, which sets the variable.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_rehearsal_against_a_real_engine_reports_convergence() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("dev-live");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+
+    let o = d.run(&["plan", "--dev", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("Dev rehearsal:"), "{out}");
+    assert!(out.contains("converges"), "{out}");
+    // Edition honesty: a green rehearsal must not read as a promise about the
+    // target, and the scratch database must be gone either way.
+    assert!(out.contains("still a preview"), "{out}");
+}
+
 /// A password must not reach a log even when the command fails, and the failure
 /// message is the easiest place to leak one.
 #[test]

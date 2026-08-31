@@ -3,6 +3,7 @@
 mod baseline;
 mod db;
 mod deploy;
+mod dev;
 mod hooks;
 mod report;
 mod status;
@@ -78,6 +79,11 @@ enum Command {
         /// one statement at a time, with a checkpoint in the ledger. Needs --db/--env
         #[arg(long)]
         staged: bool,
+
+        /// Rehearse the plan against a throwaway engine: "docker://<image>", or a
+        /// connection string to a server pbps may create a scratch database on
+        #[arg(long)]
+        dev: Option<String>,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
@@ -296,6 +302,7 @@ fn run() -> anyhow::Result<()> {
             out,
             sql,
             staged,
+            dev,
         } => {
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
@@ -308,6 +315,17 @@ fn run() -> anyhow::Result<()> {
                 }
                 if base.is_some() {
                     bail!("--base and --db name two different baselines; pass one of them");
+                }
+                if dev.is_some() {
+                    // A rehearsal answers "would this compile and converge",
+                    // which is a preview's question. `plan --db` produces the
+                    // artifact the deployment gate approves, and mixing the two
+                    // would invite a dev-verified plan to be read as a
+                    // target-verified one (SPEC §9.3).
+                    bail!(
+                        "--dev rehearses a preview and --db computes the plan for a real \
+                         environment; run them separately"
+                    );
                 }
                 let target = target.resolve(&project)?;
                 return deploy::cmd_plan_db(
@@ -330,7 +348,14 @@ fn run() -> anyhow::Result<()> {
                 None if since == "HEAD" => baseline::default_source(&project),
                 None => baseline::Source::Git { rev: since },
             };
-            cmd_plan(&project, &source, check, out.as_deref(), sql.as_deref())
+            cmd_plan(
+                &project,
+                &source,
+                check,
+                out.as_deref(),
+                sql.as_deref(),
+                dev.as_deref(),
+            )
         }
         Command::Apply {
             target,
@@ -820,6 +845,7 @@ fn cmd_plan(
     check: bool,
     out: Option<&std::path::Path>,
     sql: Option<&std::path::Path>,
+    dev: Option<&str>,
 ) -> anyhow::Result<()> {
     let loaded = load(project)?;
     let ids = read_ids(project)?;
@@ -928,6 +954,33 @@ fn cmd_plan(
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         println!("wrote {}", path.display());
+    }
+
+    // The dev database is optional and is asked last: everything above is what
+    // a plan produces with no engine in the room, and it must be identical
+    // whether or not one is available (SPEC §9.3).
+    if check && dev.is_some() {
+        bail!("--check is the CI file check; it changes nothing and connects to nothing");
+    }
+    if let Some(spec) = dev::spec(project, dev)? {
+        let rehearsal = dev::rehearse(
+            project,
+            &spec,
+            &base.schema,
+            &base.ids,
+            &loaded.schema,
+            &res.ids,
+            &statements(&cs, dialect.as_ref())?,
+            dialect.as_ref(),
+            &loaded.hints,
+        )?;
+        print!("{}", report::rehearsal(&rehearsal));
+        if !rehearsal.converged() {
+            bail!(
+                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n\
+                 differences above are what would be left behind"
+            );
+        }
     }
     Ok(())
 }

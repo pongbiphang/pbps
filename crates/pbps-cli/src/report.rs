@@ -213,7 +213,44 @@ pub fn drift(r: &DriftReport) -> String {
     out
 }
 
-fn describe(c: &Change) -> String {
+/// What a dev-database rehearsal found (SPEC §9.3).
+pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
+    let mut out = format!(
+        "\nDev rehearsal: built the baseline in {} statement(s), applied {} more.\n",
+        r.built, r.applied
+    );
+    if !r.structural.is_empty() {
+        out.push_str(
+            "\n  The plan does NOT converge: after applying it, the database still differs\n               from the declarations.\n",
+        );
+        for d in &r.structural {
+            out.push_str(&format!("    {d}\n"));
+        }
+    }
+    if !r.spelling.is_empty() {
+        // The one thing no offline normalization can produce: what the engine
+        // actually stored. Rewriting the declaration in that form is what makes
+        // the difference stop being reported after every apply.
+        out.push_str(
+            "\n  These differ only in how the engine spells them. Each costs one rebuilt\n               constraint per apply until the declaration is written in the stored form:\n",
+        );
+        for d in &r.spelling {
+            out.push_str(&format!("    {d}\n"));
+        }
+    }
+    if r.structural.is_empty() && r.spelling.is_empty() {
+        out.push_str("  The declarations compile and the plan converges on them.\n");
+    }
+    // A container runs Developer edition — the Enterprise feature set — while
+    // production may be Standard. Saying so keeps a green rehearsal from
+    // reading as a promise it cannot make (ADR-0003 decision 3).
+    out.push_str(
+        "  This is still a preview: it proves syntax and convergence, not edition\n           capabilities, and only `pbps plan --db` produces an applyable plan.\n",
+    );
+    out
+}
+
+pub fn describe(c: &Change) -> String {
     match c {
         Change::CreateTable { name, table, .. } => {
             format!("+ create table {name} ({} columns)", table.columns.len())
