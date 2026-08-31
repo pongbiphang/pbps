@@ -105,6 +105,20 @@ pub struct Statement {
     /// the field has to exist in the interface, or the executor has no way to know
     /// whether to split.
     pub own_batch: bool,
+
+    /// Whether this statement can run inside a transaction.
+    ///
+    /// "One plan, one transaction, all or nothing" (SPEC §7.5) is only a
+    /// promise the executor can keep if it knows in advance which statements
+    /// would break it. A plan containing one of these **fails at plan time**,
+    /// asking to be split into its own deployment — rather than being
+    /// discovered halfway through an apply, with half the plan committed and no
+    /// way back.
+    ///
+    /// Almost all DDL is transactional on SQL Server; the exceptions are
+    /// specific (certain ONLINE index operations, full-text). Defaulting to
+    /// `true` is therefore right, and the emitter marks the exceptions.
+    pub transactional: bool,
 }
 
 impl Statement {
@@ -112,12 +126,51 @@ impl Statement {
         Self {
             sql: sql.into(),
             own_batch: false,
+            transactional: true,
         }
     }
 
     pub fn own_batch(mut self) -> Self {
         self.own_batch = true;
         self
+    }
+
+    pub fn non_transactional(mut self) -> Self {
+        self.transactional = false;
+        self
+    }
+}
+
+/// A question asked of the data before a plan runs (SPEC §7.5).
+///
+/// # Why these are derived rather than written
+///
+/// The differ's output is a typed `ChangeSet`, so the tool already knows how
+/// each change can fail. Atlas asks users to hand-write pre-migration checks;
+/// here the change *is* the specification of its own failure mode, and a probe
+/// nobody remembered to write is a probe that does not exist.
+///
+/// This does not contradict "data is not read to decide the risk class"
+/// (§7.2). Classification stays static and happens offline; probes are the last
+/// line of defence at apply time, where a connection is guaranteed and reading
+/// the data is precisely the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// What is being checked, in the operator's words. It becomes the error
+    /// message when the count is non-zero, so it has to name the object.
+    pub description: String,
+
+    /// Returns exactly one row with one integer column: how many rows would
+    /// break. Zero means the change is safe to run on today's data.
+    pub sql: String,
+}
+
+impl Probe {
+    pub fn new(description: impl Into<String>, sql: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            sql: sql.into(),
+        }
     }
 }
 
@@ -158,6 +211,19 @@ pub trait Dialect {
     /// a nullability change into two `ALTER COLUMN` statements, whereas SQL Server
     /// can merge them into one.
     fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError>;
+
+    /// Questions to ask the data before this change runs (SPEC §7.5).
+    ///
+    /// The default is "none", which is the honest answer for a dialect that has
+    /// not implemented them: an empty list means "nothing was checked", and the
+    /// caller reports it that way rather than as "nothing is wrong".
+    ///
+    /// A change whose risk class cannot be probed usefully — a rename, whose
+    /// impact is a dependency question rather than a data one — belongs
+    /// elsewhere, not in a probe that always returns zero.
+    fn preflight(&self, _change: &Change) -> Vec<Probe> {
+        Vec::new()
+    }
 
     /// The line that separates batches in a script for this dialect, if the
     /// dialect has batches at all.
@@ -274,11 +340,27 @@ mod tests {
         assert_eq!(render_script(&[], Some("GO")), "");
     }
 
+    /// Almost all DDL is transactional, and the default has to reflect that —
+    /// but the exceptions must be sayable, or §7.5's "fails at plan time"
+    /// cannot be enforced.
     #[test]
-    fn statements_default_to_shared_batch() {
+    fn statements_default_to_shared_batch_and_to_transactional() {
         let s = Statement::new("ALTER TABLE t ADD c INT");
         assert!(!s.own_batch);
-        assert!(s.own_batch().own_batch);
+        assert!(s.transactional);
+        assert!(s.clone().own_batch().own_batch);
+        assert!(!s.non_transactional().transactional);
+    }
+
+    /// A dialect that has not implemented probes must say "I checked nothing",
+    /// never "nothing is wrong".
+    #[test]
+    fn a_dialect_without_probes_returns_none() {
+        let change = Change::DropTable {
+            uid: "t_a1b2c3".parse().unwrap(),
+            name: "dbo.customer".parse().unwrap(),
+        };
+        assert!(MinimalDialect.preflight(&change).is_empty());
     }
 }
 

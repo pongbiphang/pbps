@@ -11,21 +11,27 @@
 //!   one *costs* ([`Dialect::type_change_risk`]).
 //! - [`validate`] — what the engine will refuse ([`Dialect::validate_table`]).
 //! - [`emit`] — the SQL ([`Dialect::emit`]). The only place in the codebase that
-//!   writes SQL.
+//!   writes the SQL of a *change*.
+//! - [`preflight`] — the questions a change implies about the data
+//!   ([`Dialect::preflight`]), asked before the first statement runs.
 //!
-//! Nothing here opens a connection. Introspection and rename impact need one and
-//! belong to `DialectDb`, so that this crate stays testable without a server and
-//! without an async runtime.
+//! [`Dialect`] itself opens no connection; everything above is pure and
+//! testable without a server. The two capabilities that genuinely need one —
+//! [`catalog`] introspection and [`impact`] dependency analysis — are free
+//! async functions taking a `pbps_db::Conn`, so the trait stays synchronous and
+//! nothing that only compares schemas has to drag a runtime along.
 
 use std::borrow::Cow;
 
-use pbps_dialect::{Dialect, DialectError, Statement, TypeChangeRisk};
+use pbps_dialect::{Dialect, DialectError, Probe, Statement, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Table, TableName};
 
 pub mod catalog;
 pub mod emit;
 pub mod ident;
+pub mod impact;
 pub mod introspect;
+pub mod preflight;
 pub mod state;
 pub mod types;
 pub mod validate;
@@ -73,6 +79,10 @@ impl Dialect for Mssql {
 
     fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError> {
         emit::emit(change)
+    }
+
+    fn preflight(&self, change: &Change) -> Vec<Probe> {
+        preflight::probes(change)
     }
 
     fn batch_separator(&self) -> Option<&'static str> {

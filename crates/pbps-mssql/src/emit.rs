@@ -28,7 +28,7 @@ use crate::types::{self, DIALECT};
 type Sql = Result<Vec<Statement>, DialectError>;
 
 /// `[schema].[table]`.
-fn qualified(t: &TableName) -> Result<String, DialectError> {
+pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
     Ok(format!("{}.{}", quote(&t.schema)?, quote(&t.name)?))
 }
 
