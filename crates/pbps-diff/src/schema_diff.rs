@@ -571,6 +571,61 @@ mod tests {
         .unwrap()
     }
 
+    /// Why a comparison against a live database has to identify the live side
+    /// by what is there (`crate::observed_ids`), not by the mapping the
+    /// declarations carry.
+    ///
+    /// Matching is by uid. Handing both sides the same identity file makes
+    /// every uid present on both, so a table one side does not hold is not an
+    /// addition — it is a pair whose model lookup fails, and the loop skips it.
+    /// The two findings that matter most (something the plan failed to create,
+    /// something a hand added) are exactly the two that vanish. `plan --dev`
+    /// and the drift check both depend on this.
+    #[test]
+    fn a_shared_identity_file_hides_what_one_side_is_missing() {
+        let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        // The engine built nothing at all.
+        let engine = Schema::default();
+
+        let shared = diff(
+            Side {
+                schema: &engine,
+                ids: &ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(
+            shared.changes.is_empty(),
+            "the trap this test exists for has moved: {:?}",
+            kinds(&shared)
+        );
+
+        let observed = crate::observed_ids(&engine, &ids);
+        let honest = diff(
+            Side {
+                schema: &engine,
+                ids: &observed,
+            },
+            Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert_eq!(kinds(&honest), vec!["CreateTable"]);
+    }
+
     fn kinds(cs: &ChangeSet) -> Vec<String> {
         cs.changes
             .iter()

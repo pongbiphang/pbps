@@ -57,6 +57,25 @@ fn online(strategy: Strategy) -> &'static str {
     }
 }
 
+/// Whether this change's statements would actually carry `WITH (ONLINE = ON)`.
+///
+/// # Why this is asked of the emitter rather than listed
+///
+/// Only some statements take the clause: a UNIQUE constraint is index-backed
+/// and does, a foreign key and a check are metadata only and it is a syntax
+/// error there. A second list of change kinds saying so would be a copy of
+/// knowledge that lives above, and the two would drift — with the cost falling
+/// on [`crate::edition::online_not_supported`], which would refuse a plan the
+/// server would have run happily. Emitting is pure and cheap, so it answers for
+/// itself.
+///
+/// A change the emitter cannot express is not online: it will fail the plan for
+/// its own reasons, with its own error.
+pub fn takes_online(change: &Change) -> bool {
+    emit(change, Strategy { online: true })
+        .is_ok_and(|stmts| stmts.iter().any(|s| s.sql.contains("ONLINE = ON")))
+}
+
 pub fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
         Change::CreateTable { name, table, .. } => create_table(name, table),

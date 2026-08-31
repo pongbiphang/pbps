@@ -91,6 +91,17 @@ pub async fn edition(conn: &mut Conn) -> Result<Edition, DbError> {
 /// Standard fails at the statement, halfway through an apply. Failing at plan
 /// time, with the edition named, is the same information at the only moment it
 /// is still cheap.
+///
+/// # Why the declared strategy is not enough on its own
+///
+/// `strategy:` is persistent (ADR-0003): it sits on the table and applies to
+/// every change to it, including the many for which the emitter deliberately
+/// writes no ONLINE clause — adding a column, adding a foreign key or a check,
+/// creating the table in the first place. Refusing on the annotation alone
+/// would mean that a Standard-edition environment could not plan an ordinary
+/// metadata change against any table somebody had annotated, which is a
+/// refusal with nothing behind it. Only a change whose statements really carry
+/// the clause is one this edition would reject.
 pub fn online_not_supported(changes: &ChangeSet, edition: &Edition) -> Vec<String> {
     if edition.supports_online() {
         return Vec::new();
@@ -98,7 +109,7 @@ pub fn online_not_supported(changes: &ChangeSet, edition: &Edition) -> Vec<Strin
     changes
         .changes
         .iter()
-        .filter(|p| p.strategy.online)
+        .filter(|p| p.strategy.online && crate::emit::takes_online(&p.change))
         .map(|p| p.change.table().to_string())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -184,11 +195,27 @@ mod tests {
         })
     }
 
+    /// `ALTER COLUMN` is one of the statements the emitter really writes
+    /// `WITH (ONLINE = ON)` on.
+    fn alter_nullability() -> pbps_model::PlannedChange {
+        pbps_model::PlannedChange::new(Change::AlterColumnNullability {
+            uid: "c_a1b2c3".parse().unwrap(),
+            column: "dbo.customer.score".parse().unwrap(),
+            ty: "int".parse().unwrap(),
+            to_nullable: true,
+        })
+    }
+
+    fn online(c: pbps_model::PlannedChange) -> pbps_model::PlannedChange {
+        c.with_strategy(pbps_model::Strategy { online: true })
+    }
+
     #[test]
     fn a_full_edition_blocks_nothing_and_warns_about_nothing() {
         let cs = ChangeSet {
             changes: vec![
-                add_column(false, Some("0")).with_strategy(pbps_model::Strategy { online: true }),
+                online(alter_nullability()),
+                online(add_column(false, Some("0"))),
             ],
         };
         let e = Edition::classify("Developer Edition (64-bit)");
@@ -200,12 +227,41 @@ mod tests {
     fn a_limited_edition_refuses_online_and_warns_about_a_rewrite() {
         let cs = ChangeSet {
             changes: vec![
-                add_column(false, Some("0")).with_strategy(pbps_model::Strategy { online: true }),
+                online(alter_nullability()),
+                online(add_column(false, Some("0"))),
             ],
         };
         let e = Edition::classify("Standard Edition (64-bit)");
         assert_eq!(online_not_supported(&cs, &e), vec!["dbo.customer"]);
         assert_eq!(size_of_data_warnings(&cs, &e).len(), 1);
+    }
+
+    /// `strategy:` sits on the table and so travels with every change to it,
+    /// including the many the emitter writes no ONLINE clause for. Refusing on
+    /// the annotation alone would leave a Standard-edition environment unable
+    /// to plan an ordinary column addition against an annotated table.
+    #[test]
+    fn a_change_that_emits_no_online_clause_is_not_refused() {
+        let e = Edition::classify("Standard Edition (64-bit)");
+        for c in [
+            add_column(true, None),
+            pbps_model::PlannedChange::new(Change::AddCheck {
+                table: "dbo.customer".parse().unwrap(),
+                name: "ck_score".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "score > 0".into(),
+                },
+            }),
+        ] {
+            let cs = ChangeSet {
+                changes: vec![online(c)],
+            };
+            assert!(
+                online_not_supported(&cs, &e).is_empty(),
+                "{:?}",
+                cs.changes[0].change
+            );
+        }
     }
 
     /// A nullable column, or one with no default, is added as metadata on every

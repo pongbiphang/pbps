@@ -10,17 +10,32 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 struct Demo {
+    /// The project directory: where `pbps.yml` is.
     dir: PathBuf,
+    /// The git working tree, which is the project directory unless the demo was
+    /// built nested. Removed on drop, so it has to be tracked separately.
+    root: PathBuf,
 }
 
 impl Demo {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("pbps-flow-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        Self::nested(name, "")
+    }
+
+    /// A project `sub` levels below the repo root. `sub` empty puts them at the
+    /// same place, which is the ordinary case.
+    fn nested(name: &str, sub: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("pbps-flow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = if sub.is_empty() {
+            root.clone()
+        } else {
+            root.join(sub)
+        };
         std::fs::create_dir_all(dir.join("schema")).unwrap();
         std::fs::write(dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
 
-        let d = Self { dir };
+        let d = Self { dir, root };
         d.git(&["init", "-q"]);
         d.git(&["config", "user.email", "d@e.f"]);
         d.git(&["config", "user.name", "demo"]);
@@ -30,7 +45,7 @@ impl Demo {
     fn git(&self, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
-            .arg(&self.dir)
+            .arg(&self.root)
             .args(args)
             .output()
             .unwrap();
@@ -62,7 +77,7 @@ impl Demo {
 
 impl Drop for Demo {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -1133,4 +1148,37 @@ fn plan_check_and_db_are_refused_together() {
     let o = d.run(&["plan", "--check", "--db", "Server=x;Database=y"]);
     assert_eq!(code(&o), 1);
     assert!(stderr(&o).contains("--check"), "{}", stderr(&o));
+}
+
+/// The project does not have to be the repo root, and the baseline's git paths
+/// have to be right when it is not.
+///
+/// The regression this pins is platform-shaped: computing the path by
+/// canonicalizing and stripping the toplevel prefix works on Linux and fails on
+/// Windows, where `canonicalize` returns a `\\?\` verbatim path and the temp
+/// directory arrives in 8.3 short form. What reached `git show` was then an
+/// absolute path, which resolves to the root tree — and a tree listing parsed
+/// as JSON reports "the identity file is malformed", naming nothing that would
+/// lead anyone to the path. A nested project exercises the same conversion on
+/// every platform.
+#[test]
+fn a_project_below_the_repo_root_reads_its_own_baseline() {
+    let d = Demo::nested("nested", "db/app");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The second plan is the one that has to read the first one's ids file back
+    // out of git: an empty baseline would report the table as newly created.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("extra"), "{s}");
+    assert!(
+        !s.to_lowercase().contains("create table"),
+        "the baseline was not found; the plan re-creates the table:\n{s}"
+    );
 }

@@ -90,12 +90,11 @@ fn in_git_repo(dir: &Path) -> bool {
 
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
-    let toplevel = git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+    git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
         anyhow::anyhow!(
             "this is not a git working tree; name a baseline file with --base instead: {e}"
         )
     })?;
-    let toplevel = PathBuf::from(toplevel.trim());
 
     // A brand-new repo has no commits, so HEAD does not resolve. That is not an
     // error, it just means there is no previous version yet: fall back to an empty
@@ -123,10 +122,26 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
     // git paths are relative to the repo root, whereas the declarations directory
     // is relative to the project root.
-    let rel = relative_to(&toplevel, &project.schema_dir());
+    let rel = relative_to(&project.schema_dir())?;
 
-    let listing = git(root, &["ls-tree", "-r", "--name-only", rev, "--", &rel])
-        .map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
+    // `--full-tree` because git resolves an `ls-tree` pathspec against the
+    // current directory, while `<rev>:<path>` below resolves against the repo
+    // root. Without it a project in a subdirectory lists nothing, and — since
+    // the identity file is still found — the plan comes back as "no changes"
+    // against a baseline that holds no tables at all.
+    let listing = git(
+        root,
+        &[
+            "ls-tree",
+            "-r",
+            "--full-tree",
+            "--name-only",
+            rev,
+            "--",
+            &rel,
+        ],
+    )
+    .map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
 
     let mut schema = Schema::default();
     let mut count = 0usize;
@@ -159,7 +174,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
     // The identity file must come from the same revision: using the current one as
     // the baseline would hide renames.
-    let ids_rel = relative_to(&toplevel, &project.ids_file());
+    let ids_rel = relative_to(&project.ids_file())?;
     let ids = match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}"))?,
@@ -177,12 +192,35 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
 /// Rewrites a path relative to the repo root, which is what git's path arguments
 /// are resolved against.
-fn relative_to(toplevel: &Path, path: &Path) -> String {
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    abs.strip_prefix(toplevel)
-        .unwrap_or(&abs)
-        .to_string_lossy()
-        .replace('\\', "/")
+///
+/// # Why git is asked instead of the path being computed
+///
+/// The obvious version canonicalizes the path and strips the toplevel prefix.
+/// That works on Linux and silently produces nonsense on Windows: `canonicalize`
+/// returns a `\\?\` verbatim path while `rev-parse --show-toplevel` returns a
+/// plain one, and a temp directory arrives in 8.3 short form (`RUNNER~1`) on one
+/// side and long form on the other. The prefix then never matches, an absolute
+/// path reaches `git show`, and what comes back is the root tree rather than the
+/// blob — which parses as neither YAML nor JSON, so the failure surfaces as
+/// "the identity file is malformed" a long way from its cause.
+///
+/// `rev-parse --show-prefix` asks git for the same answer in git's own terms, so
+/// only git's notion of the path has to be right.
+fn relative_to(path: &Path) -> anyhow::Result<String> {
+    // The path itself may not exist yet — a first run has no identity file — but
+    // its parent directory does, and that is what git needs to resolve.
+    let Some(name) = path.file_name() else {
+        anyhow::bail!("`{}` names no file", path.display());
+    };
+    // A project discovered as a bare `pbps.yml` has an empty root, so the parent
+    // comes out empty rather than absent: that is the current directory.
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let prefix = git(dir, &["rev-parse", "--show-prefix"])?;
+    // `--show-prefix` is empty at the repo root and otherwise ends in a slash.
+    Ok(format!("{}{}", prefix.trim(), name.to_string_lossy()))
 }
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {

@@ -1100,11 +1100,23 @@ async fn apply_staged_under_lock(
             ));
         }
 
+        // The unmanaged policy is deliberately not enforced between two
+        // committed statements. A staged plan is executed one statement at a
+        // time, and a table can sit at a name neither the baseline nor the plan
+        // records while it is halfway through: a rename that moves both the
+        // schema and the object name transfers first and renames second. Under
+        // `unmanaged: error` that would abort *after* the DDL committed and
+        // leave no checkpoint to resume from — the policy is a hygiene gate for
+        // the start of a command, and it was already applied there.
+        //
+        // The table is then briefly outside this checkpoint's scope, which is
+        // safe because `--resume` scopes the live side by `plan.ids` too: both
+        // sides of that comparison leave out the same object.
         let after = managed_state(
             conn,
             &plan.ids,
             &modules_after(&entry.snapshot, &plan.changes),
-            project.config.unmanaged,
+            pbps_config::Unmanaged::Ignore,
         )
         .await?;
         let mut checkpoint = pbps_model::StateSnapshot::new(

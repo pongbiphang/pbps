@@ -257,13 +257,22 @@ async fn rehearse_in(
     let modules: std::collections::BTreeSet<_> = declared.modules.keys().cloned().collect();
     let scoped = pbps_diff::scope(&built.schema, declared_ids, &modules);
 
+    // The engine side is identified by what the engine actually holds, not by
+    // the identity file the declarations carry. Handing both sides the same
+    // mapping would make the differ match every uid on both sides and then skip
+    // any object the engine is missing — so a plan that failed to create a
+    // declared table or column, which is the defect this rehearsal exists to
+    // catch, would come back as convergence (the same reason drift needs
+    // observed identity, SPEC 8.2).
+    let observed = pbps_diff::observed_ids(&scoped.schema, declared_ids);
+
     // What is left after applying the plan is what has not converged. The
     // comparison is the ordinary one, so the rehearsal cannot disagree with the
     // differ about what a difference is.
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &scoped.schema,
-            ids: declared_ids,
+            ids: &observed,
         },
         pbps_diff::Side {
             schema: declared,
@@ -324,9 +333,30 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     .and_then(|c| c.default.as_deref())
                     .unwrap_or("(none)")
             )),
-            // The other half of a check's drop+add pair, and a module the engine
-            // stored with different layout: neither is a second finding.
-            Change::DropCheck { .. } | Change::AlterModule { .. } => {}
+            // A module whose stored body still differs is not layout: the
+            // difference already survived `Dialect::normalize_definition`, and
+            // the engine stores a module's text verbatim rather than rewriting
+            // it the way it rewrites an expression. So it is the emitter or the
+            // introspection that is wrong, and swallowing it here would let a
+            // view with the wrong body pass as converged.
+            Change::AlterModule { name, module, .. } => structural.push(format!(
+                "{} {name}: declared `{}`, the engine stores `{}`",
+                module.kind,
+                module.definition.trim(),
+                engine
+                    .modules
+                    .get(name)
+                    .map(|m| m.definition.trim())
+                    .unwrap_or("(absent)")
+            )),
+            // The other half of a check's drop+add pair: not a second finding.
+            Change::DropCheck { .. } => {}
+            // Deprecation is a fact about the declarations, and the emitter
+            // writes nothing for it on purpose. The engine has nowhere to keep
+            // it, so it comes back on every rehearsal of every declaration that
+            // uses it — as non-convergence it would mean `plan --dev` could
+            // never pass on a schema that documents a deprecated column.
+            Change::SetColumnDeprecated { .. } => {}
             other => structural.push(crate::report::describe(other)),
         }
     }
@@ -444,6 +474,77 @@ impl Drop for Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planned(c: Change) -> pbps_model::PlannedChange {
+        pbps_model::PlannedChange::new(c)
+    }
+
+    fn view(definition: &str) -> pbps_model::Module {
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            on: None,
+            definition: definition.into(),
+        }
+    }
+
+    /// A body that still differs after the plan has run is the emitter or the
+    /// introspection being wrong, not the engine spelling things its own way:
+    /// unlike an expression, a module's text is stored verbatim. Swallowing it
+    /// would let a view with the wrong body rehearse as converged.
+    #[test]
+    fn a_module_the_engine_stored_differently_fails_the_rehearsal() {
+        let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
+        let mut engine = Schema::default();
+        engine.modules.insert(name.clone(), view("SELECT 1 AS one"));
+
+        let remaining = ChangeSet {
+            changes: vec![planned(Change::AlterModule {
+                name: name.clone(),
+                module: Box::new(view("SELECT 2 AS two")),
+            })],
+        };
+        let (structural, spelling) = classify(&remaining, &engine);
+        assert!(spelling.is_empty(), "{spelling:?}");
+        assert_eq!(structural.len(), 1, "{structural:?}");
+        // Both sides have to be in the message, or the reader cannot tell which
+        // half is wrong.
+        assert!(structural[0].contains("SELECT 2 AS two"), "{structural:?}");
+        assert!(structural[0].contains("SELECT 1 AS one"), "{structural:?}");
+    }
+
+    /// Deprecation is a fact about the declarations; the emitter writes nothing
+    /// for it on purpose and the engine has nowhere to keep it. Counting it as
+    /// non-convergence would mean `plan --dev` could never pass on a schema
+    /// that documents a deprecated column.
+    #[test]
+    fn a_deprecation_never_fails_the_rehearsal() {
+        let remaining = ChangeSet {
+            changes: vec![planned(Change::SetColumnDeprecated {
+                uid: "c_a1b2c3".parse().unwrap(),
+                column: "dbo.t.old".parse().unwrap(),
+                reason: Some("superseded by email".into()),
+            })],
+        };
+        let (structural, spelling) = classify(&remaining, &Schema::default());
+        assert!(structural.is_empty(), "{structural:?}");
+        assert!(spelling.is_empty(), "{spelling:?}");
+    }
+
+    /// The safe default is the loud one: a change kind nobody has classified
+    /// must fail the rehearsal rather than pass quietly.
+    #[test]
+    fn an_unclassified_change_is_structural() {
+        let remaining = ChangeSet {
+            changes: vec![planned(Change::DropColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                column: "dbo.t.gone".parse().unwrap(),
+            })],
+        };
+        let (structural, spelling) = classify(&remaining, &Schema::default());
+        assert_eq!(structural.len(), 1, "{structural:?}");
+        assert!(spelling.is_empty(), "{spelling:?}");
+    }
 
     /// The scheme is what tells a container apart from a server that is already
     /// running; a connection string must never be mistaken for an image name.
