@@ -25,7 +25,8 @@ use std::collections::BTreeMap;
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, ColumnType, IdsFile, PlannedChange, Schema, Table, TableName, Uid,
+    Change, ChangeSet, ColumnRef, ColumnType, IdsFile, PlannedChange, Schema, Strategies, Table,
+    TableName, Uid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,10 +51,15 @@ pub struct Side<'a> {
 ///
 /// `description` is **not compared** yet: it only affects data-catalogue prose,
 /// not structure, and writing it to an extended property belongs to Phase 5.
+///
+/// The strategies are the **declared** side's: a hint describes how to operate
+/// on the table as it will be, and a table that no longer exists has nothing
+/// left to operate on (ADR-0003).
 pub fn diff(
     base: Side<'_>,
     declared: Side<'_>,
     dialect: &dyn Dialect,
+    strategies: &Strategies,
 ) -> Result<ChangeSet, Vec<DiffError>> {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -149,6 +155,13 @@ pub fn diff(
             && let Some(r) = dialect.type_change_risk(from, to).risk_class()
         {
             p.risks.insert(r);
+        }
+        // Attached here, not looked up at emit time: the plan file is the
+        // artifact the deployment gate reviews, and a hint resolved later
+        // against a YAML file the deployment host may not have is a hint
+        // nobody read (ADR-0003).
+        if let Some(strategy) = strategies.get(p.change.table()) {
+            p.strategy = *strategy;
         }
     }
     // The tiebreaker within an ordering class is the table name, then the
@@ -431,6 +444,7 @@ mod tests {
                 ids: &declared_ids,
             },
             &MinimalDialect,
+            &Strategies::default(),
         )
         .unwrap()
     }
@@ -770,6 +784,7 @@ mod tests {
                 ids: &declared_ids,
             },
             &MinimalDialect,
+            &Strategies::default(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -830,6 +845,7 @@ mod tests {
                 ids: &v3_ids,
             },
             &MinimalDialect,
+            &Strategies::default(),
         )
         .unwrap();
 

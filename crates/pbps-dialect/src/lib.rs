@@ -32,7 +32,7 @@
 
 use std::borrow::Cow;
 
-use pbps_model::{Change, ChangeSet, ColumnType, RiskClass, Table, TableName};
+use pbps_model::{Change, ChangeSet, ColumnType, RiskClass, Strategy, Table, TableName};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
@@ -210,7 +210,12 @@ pub trait Dialect {
     /// Returning a `Vec` is necessary: PostgreSQL has to split a type change and
     /// a nullability change into two `ALTER COLUMN` statements, whereas SQL Server
     /// can merge them into one.
-    fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError>;
+    ///
+    /// `strategy` says *how* to get there (ADR-0003) and never *where* to go: a
+    /// dialect that cannot honour a hint on this statement emits the statement
+    /// without it rather than failing, because the desired state is the same
+    /// either way and refusing would turn a performance hint into an outage.
+    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError>;
 
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///
@@ -430,7 +435,7 @@ impl Dialect for MinimalDialect {
         Vec::new()
     }
 
-    fn emit(&self, _change: &Change) -> Result<Vec<Statement>, DialectError> {
+    fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         Err(DialectError::Unsupported {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),

@@ -511,6 +511,30 @@ fn plan_sql_writes_a_tsql_preview() {
     );
 }
 
+/// `strategy: online` has to survive the whole path — load, ids, diff, plan
+/// file, emitter — or a user who declared it would get an exclusive-lock
+/// rebuild on the large table they annotated to avoid exactly that (ADR-0003).
+#[test]
+fn an_online_strategy_reaches_the_emitted_sql_and_says_it_is_unverified() {
+    let d = Demo::new("plan-sql-online");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\nstrategy:\n  online: true\ncolumns:\n  id: {type: bigint, nullable: false}\nindexes:\n  ix_t_id:\n    columns: [id]\n",
+    );
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(script.contains("WITH (ONLINE = ON);"), "{script}");
+    // An offline plan cannot read the target's edition, and a preview that
+    // reads as verified is the one thing worse than no preview.
+    assert!(stdout(&o).contains("unverified"), "{}", stdout(&o));
+}
+
 /// A rename plans as sp_rename — proof the dialect, not a drop+add, is in charge.
 #[test]
 fn a_planned_rename_emits_sp_rename() {

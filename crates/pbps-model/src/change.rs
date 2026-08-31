@@ -21,6 +21,7 @@ use crate::name::{ColumnRef, TableName};
 use crate::schema::{
     CheckConstraint, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
 };
+use crate::strategy::Strategy;
 use crate::types::ColumnType;
 use crate::uid::Uid;
 
@@ -288,7 +289,8 @@ impl Change {
     }
 }
 
-/// A change together with the risks that have been determined for it.
+/// A change together with the risks that have been determined for it, and the
+/// execution strategy it is to be carried out with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     #[serde(flatten)]
@@ -296,6 +298,16 @@ pub struct PlannedChange {
 
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub risks: BTreeSet<RiskClass>,
+
+    /// How to get there, never where to go (ADR-0003).
+    ///
+    /// It travels *with the change* rather than being looked up at emit time
+    /// because the plan file is the reviewed artifact: an approver reading
+    /// plan.json has to be able to see that this index will be rebuilt online,
+    /// and a hint resolved later against a YAML file the deployment host may
+    /// not even have is a hint nobody reviewed.
+    #[serde(default, skip_serializing_if = "Strategy::is_default")]
+    pub strategy: Strategy,
 }
 
 impl PlannedChange {
@@ -303,11 +315,20 @@ impl PlannedChange {
     /// knowledge are added separately by the differ.
     pub fn new(change: Change) -> Self {
         let risks = change.intrinsic_risks();
-        Self { change, risks }
+        Self {
+            change,
+            risks,
+            strategy: Strategy::default(),
+        }
     }
 
     pub fn with_risk(mut self, r: RiskClass) -> Self {
         self.risks.insert(r);
+        self
+    }
+
+    pub fn with_strategy(mut self, s: Strategy) -> Self {
+        self.strategy = s;
         self
     }
 }

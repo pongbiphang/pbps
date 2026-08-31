@@ -133,6 +133,10 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 ids: &observed,
             },
             dialect.as_ref(),
+            // Drift emits no SQL, so there is no execution to give a hint
+            // about; passing the declarations' strategies here would put a
+            // hint nobody can act on into a report about what already happened.
+            &pbps_model::Strategies::default(),
         )
         .map_err(|errs| {
             for e in &errs {
@@ -305,6 +309,9 @@ pub fn cmd_bootstrap(
             ids: &ids,
         },
         dialect.as_ref(),
+        // Bootstrap builds into an empty database: every table is created from
+        // nothing, and there are no rows for an online operation to spare.
+        &pbps_model::Strategies::default(),
     )
     .map_err(|errs| {
         for e in &errs {
@@ -503,6 +510,7 @@ pub fn cmd_plan_db(
                 ids: &resolved.ids,
             },
             dialect.as_ref(),
+            &loaded.strategies,
         )
         .map_err(|errs| {
             for e in &errs {
@@ -510,6 +518,28 @@ pub fn cmd_plan_db(
             }
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
+
+        // The edition is a connection-time fact, and it is the only place the
+        // two edition-dependent questions of ADR-0003 can be answered
+        // honestly: whether ONLINE will be accepted at all, and whether an
+        // addition that is metadata-only on Enterprise rewrites every row
+        // here. An offline plan has to assume the conservative answer.
+        let edition = pbps_mssql::edition::edition(&mut conn).await?;
+        let refused = pbps_mssql::edition::online_not_supported(&cs, &edition);
+        if !refused.is_empty() {
+            bail!(
+                "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
+                 index operations.\n\
+                 The statement would fail partway through the apply. Remove the hint, or deploy \
+                 this change to an edition that supports it.",
+                refused.join(", "),
+                target.label,
+                edition.name()
+            );
+        }
+        for w in pbps_mssql::edition::size_of_data_warnings(&cs, &edition) {
+            eprintln!("warning: {w}");
+        }
 
         Ok((
             cs,

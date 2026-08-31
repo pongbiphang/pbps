@@ -72,7 +72,7 @@ impl TestDb {
 /// Emits and executes every change of a plan, in plan order.
 async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
     for p in &cs.changes {
-        for stmt in Mssql.emit(&p.change).expect("emit") {
+        for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -125,6 +125,7 @@ fn plan(
             ids: declared_ids,
         },
         &Mssql,
+        &pbps_model::Strategies::default(),
     )
     .expect("diff")
 }
