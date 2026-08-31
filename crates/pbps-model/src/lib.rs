@@ -39,12 +39,12 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use name::{ColumnRef, NameError, TableName};
-pub use plan::{PlanBaseline, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
+pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use schema::{
     CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
     ReferentialAction, Schema, Table, UniqueConstraint,
 };
-pub use state::{StateKind, StateSnapshot};
+pub use state::{StagedProgress, StateKind, StateSnapshot};
 pub use strategy::{Strategies, Strategy};
 pub use types::{ColumnType, TypeArg, TypeParseError};
 pub use uid::{Uid, UidError, UidKind};

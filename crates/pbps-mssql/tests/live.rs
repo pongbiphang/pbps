@@ -530,6 +530,55 @@ async fn the_ledger_returns_exactly_what_was_recorded() {
     db.drop().await;
 }
 
+/// ADR-0003: a staged apply's checkpoint is what makes a mid-way failure
+/// visible rather than mysterious, and what `--resume` starts from. It only
+/// does that if the marker survives `state_json` — the `kind` column and the
+/// progress have to come back exactly as they went in.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_staged_checkpoint_survives_the_ledger() {
+    let mut db = TestDb::create("staged").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+
+    let mut checkpoint = snapshot(pbps_model::StateKind::Staged, &schema, &ids);
+    checkpoint.plan_checksum = Some("a".repeat(64));
+    checkpoint.staged = Some(pbps_model::StagedProgress {
+        completed: 1,
+        total: 2,
+        last_statement: "CREATE INDEX [ix_live] ON [dbo].[customer] ([email] ASC);".into(),
+    });
+    pbps_mssql::state::record(&mut db.conn, &checkpoint)
+        .await
+        .expect("record the checkpoint");
+
+    let back = pbps_mssql::state::latest(&mut db.conn)
+        .await
+        .expect("latest")
+        .expect("an entry");
+    assert_eq!(back.snapshot, checkpoint);
+    let progress = back.snapshot.staged.expect("the progress marker");
+    assert!(!progress.is_finished());
+
+    // The closing entry carries no marker, and its absence is what tells every
+    // later command the environment is no longer mid-deployment.
+    let done = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record(&mut db.conn, &done)
+        .await
+        .expect("record the finish");
+    assert!(
+        pbps_mssql::state::latest(&mut db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .staged
+            .is_none()
+    );
+
+    db.drop().await;
+}
+
 /// SPEC §8.1: `__pbps_lock` stops two pipelines applying at once. The gate is
 /// the insert itself, not a preceding read — a check-then-insert would let two
 /// runners through the check together.

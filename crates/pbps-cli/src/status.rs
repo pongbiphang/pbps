@@ -31,7 +31,7 @@ pub struct EnvStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// `ok`, `drift`, `uninitialized`, `unreachable` or `unconfigured`.
+    /// `ok`, `staged`, `drift`, `uninitialized`, `unreachable` or `unconfigured`.
     pub state: &'static str,
 
     /// What went wrong, when something did. Never a connection string.
@@ -165,6 +165,19 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         locked_by,
         checked_at: checked_at.to_owned(),
     };
+
+    // An environment sitting on a staged checkpoint is mid-deployment, and that
+    // is the first thing an operator needs to know about it: `plan --db` and
+    // `apply` both refuse until it is finished, so a screen that read "ok"
+    // would leave them puzzled at the refusal.
+    if let Some(progress) = &entry.snapshot.staged {
+        row.state = "staged";
+        row.detail = Some(format!(
+            "a staged apply stopped after {} of {} statement(s); continue it with \
+             `pbps apply --staged --resume --env {name} --plan ...`",
+            progress.completed, progress.total
+        ));
+    }
 
     // The drift verdict is the checksum, computed exactly as `verify` computes
     // it. Two commands that disagreed about whether an environment has drifted

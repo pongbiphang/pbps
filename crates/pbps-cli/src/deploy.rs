@@ -445,6 +445,7 @@ pub fn cmd_plan_db(
     target: &Target,
     out: Option<&std::path::Path>,
     sql_out: Option<&std::path::Path>,
+    staged: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "plan --db")?;
     let loaded = crate::load(project)?;
@@ -480,6 +481,7 @@ pub fn cmd_plan_db(
                 target.label
             );
         };
+        refuse_mid_deployment(&entry, &target.label)?;
         let recorded_ids = entry.snapshot.ids.clone();
         let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
 
@@ -548,10 +550,29 @@ pub fn cmd_plan_db(
         ))
     })?;
 
-    // §7.5: a statement that cannot run inside a transaction fails **here**,
-    // not halfway through an apply with no way back.
     let statements = crate::statements(&cs, dialect.as_ref())?;
-    reject_non_transactional(&statements)?;
+    if staged {
+        // A staged plan is one logical change isolated in a deployment of its
+        // own (ADR-0003). The limit is the whole point: what cannot be rolled
+        // back must not be able to take four unrelated changes down with it,
+        // and a resume that had to reason about which of five changes were
+        // half-done would be guessing.
+        if cs.changes.len() > 1 {
+            bail!(
+                "--staged applies one logical change, and this plan has {}.\n\
+                 Stage the change that needs it in a revision of its own; the rest can go \
+                 through an ordinary transactional apply.",
+                cs.changes.len()
+            );
+        }
+        if cs.is_empty() {
+            bail!("there is nothing to stage: this plan is empty");
+        }
+    } else {
+        // §7.5: a statement that cannot run inside a transaction fails **here**,
+        // not halfway through an apply with no way back.
+        reject_non_transactional(&statements)?;
+    }
 
     println!("Baseline: {baseline_description}");
     print!("{}", crate::report::plan(&cs));
@@ -568,6 +589,15 @@ pub fn cmd_plan_db(
         resolved.ids,
     );
     plan.git_sha = db::git_sha();
+    if staged {
+        plan = plan.staged();
+        println!(
+            "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
+             recorded in the ledger as it completes. Apply it with `pbps apply --staged`, and \n\
+             continue an interrupted run with `--staged --resume`.",
+            statements.len()
+        );
+    }
 
     if let Some(path) = out {
         crate::write_plan(path, &plan)?;
@@ -597,6 +627,8 @@ pub fn cmd_apply(
     target: &Target,
     plan_path: &std::path::Path,
     allow: &std::collections::BTreeSet<pbps_model::RiskClass>,
+    staged: bool,
+    resume: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "apply")?;
     let dialect = crate::dialect(project)?;
@@ -634,6 +666,23 @@ pub fn cmd_apply(
             plan.dialect,
             dialect.name()
         );
+    }
+    // The mode lives in the file because that is what the gate approved; the
+    // flag exists so that the CI configuration says out loud which kind of
+    // deployment this is. A disagreement between them is somebody's mistake,
+    // and running whichever was typed would be the tool choosing the loser.
+    if plan.mode.is_staged() != staged {
+        bail!(
+            "`{}` is a {} plan and `--staged` was {}.\n\
+             A staged plan runs outside a transaction and is applied with `--staged`; a \
+             transactional one is not.",
+            plan_path.display(),
+            plan.mode,
+            if staged { "given" } else { "not given" }
+        );
+    }
+    if resume && !staged {
+        bail!("--resume continues a staged apply; pass --staged as well");
     }
 
     if plan.changes.is_empty() {
@@ -674,18 +723,34 @@ pub fn cmd_apply(
         // pre-flight that passed while another pipeline was mid-apply would
         // have been answered about a database that is already moving.
         pbps_mssql::state::lock(&mut conn, &operator).await?;
-        let result = apply_under_lock(
-            &mut conn,
-            project,
-            target,
-            &plan,
-            &plan_checksum,
-            &statements,
-            &targets,
-            dialect.as_ref(),
-            &operator,
-        )
-        .await;
+        let result = if staged {
+            apply_staged_under_lock(
+                &mut conn,
+                project,
+                target,
+                &plan,
+                &plan_checksum,
+                &statements,
+                &targets,
+                dialect.as_ref(),
+                &operator,
+                resume,
+            )
+            .await
+        } else {
+            apply_under_lock(
+                &mut conn,
+                project,
+                target,
+                &plan,
+                &plan_checksum,
+                &statements,
+                &targets,
+                dialect.as_ref(),
+                &operator,
+            )
+            .await
+        };
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
         let released = pbps_mssql::state::unlock(&mut conn).await;
@@ -695,9 +760,10 @@ pub fn cmd_apply(
     })?;
 
     println!(
-        "Applied {} change(s) to `{}`; recorded as entry #{recorded}.",
+        "Applied {} change(s) to `{}`{}; recorded as entry #{recorded}.",
         plan.changes.changes.len(),
-        target.label
+        target.label,
+        if staged { " (staged)" } else { "" }
     );
     if let Some(hook) = &project.config.hooks.on_apply {
         crate::hooks::run(hook, &raw, "on_apply");
@@ -724,6 +790,7 @@ async fn apply_under_lock(
             target.label
         );
     };
+    refuse_mid_deployment(&entry, &target.label)?;
     let recorded_ids = entry.snapshot.ids.clone();
     let scoped = managed_state(conn, &recorded_ids, project.config.unmanaged).await?;
 
@@ -764,6 +831,199 @@ async fn apply_under_lock(
     snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+}
+
+/// A staged apply: one logical change, run statement by statement outside a
+/// transaction, with each completion recorded (ADR-0003 decision 2).
+///
+/// # Why the ledger is written between statements
+///
+/// Nothing here rolls back — that is the whole reason the plan is staged. So
+/// the only thing that can make a mid-way failure visible rather than
+/// mysterious is a record written as each statement completes; and once that
+/// record exists, `--resume` has somewhere honest to start from.
+///
+/// # Why resume re-checks the database
+///
+/// A checkpoint says what the database looked like when the run stopped. Half a
+/// deployment sitting in an environment is exactly when somebody reaches in by
+/// hand, so the drift discipline applies to a half-finished plan as much as to
+/// a finished one: the live state has to still equal the checkpoint, or the
+/// remaining statements are being run against something nobody planned for.
+#[allow(clippy::too_many_arguments)]
+async fn apply_staged_under_lock(
+    conn: &mut Conn,
+    project: &Project,
+    target: &Target,
+    plan: &pbps_model::SavedPlan,
+    plan_checksum: &str,
+    statements: &[pbps_dialect::Statement],
+    rename_targets: &[pbps_mssql::impact::RenameTarget],
+    dialect: &dyn pbps_dialect::Dialect,
+    operator: &str,
+    resume: bool,
+) -> anyhow::Result<i64> {
+    let Some(entry) = pbps_mssql::state::latest(conn).await? else {
+        bail!(
+            "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
+            target.label
+        );
+    };
+
+    let start = if resume {
+        let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
+            (Some(p), StateKind::Staged) => p.clone(),
+            _ => bail!(
+                "`{}` has no staged apply in progress: its newest entry (#{}) is an ordinary \
+                 {} state.\n\
+                 Run `pbps apply --staged` without `--resume` to start this plan.",
+                target.label,
+                entry.id,
+                entry.snapshot.kind
+            ),
+        };
+        if entry.snapshot.plan_checksum.as_deref() != Some(plan_checksum) {
+            bail!(
+                "entry #{} is a checkpoint of a different plan (checksum {}).\n\
+                 Resume the plan that was interrupted, not this one.",
+                entry.id,
+                entry.snapshot.plan_checksum.as_deref().unwrap_or("none")
+            );
+        }
+        // The drift check, applied to a half-finished plan. The mapping used is
+        // the plan's on both sides, so the comparison is like with like
+        // whichever statement the run stopped after.
+        let scoped = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+        let live = pbps_model::state_checksum(&scoped.schema, &plan.ids);
+        let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, &plan.ids);
+        if live != checkpoint {
+            bail!(
+                "`{}` has moved since the checkpoint at entry #{}.\n\
+                 checkpoint: {checkpoint}\n\
+                 database:   {live}\n\
+                 Something changed while this deployment was half-finished. `pbps verify` shows \
+                 what; the remaining statements must not run against a database nobody planned \
+                 for.",
+                target.label,
+                entry.id
+            );
+        }
+        println!(
+            "Resuming at statement {} of {} (checkpoint entry #{}).",
+            progress.completed + 1,
+            statements.len(),
+            entry.id
+        );
+        if progress.total != statements.len() {
+            bail!(
+                "the checkpoint recorded {} statement(s) and this plan emits {}; they are not the \
+                 same run.",
+                progress.total,
+                statements.len()
+            );
+        }
+        progress.completed
+    } else {
+        if entry.snapshot.staged.is_some() {
+            bail!(
+                "`{}` is mid-deployment: entry #{} is a staged checkpoint ({} of {} statements).\n\
+                 Finish it with `pbps apply --staged --resume --plan ...`, or take the database \
+                 as it stands with `pbps baseline --reason ...`.",
+                target.label,
+                entry.id,
+                entry.snapshot.staged.as_ref().map_or(0, |p| p.completed),
+                entry.snapshot.staged.as_ref().map_or(0, |p| p.total)
+            );
+        }
+        let recorded_ids = entry.snapshot.ids.clone();
+        let scoped = managed_state(conn, &recorded_ids, project.config.unmanaged).await?;
+        let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+        if live != plan.baseline.checksum {
+            bail!(
+                "`{}` is no longer the database this plan was computed against.\n\
+                 plan baseline: {}\n\
+                 database now:  {live}\n\
+                 Something changed since the plan was approved. `pbps verify` shows what; \
+                 then recompute the plan with `pbps plan --db --staged`.",
+                target.label,
+                plan.baseline.checksum
+            );
+        }
+        // Only on a fresh start. The probes name objects as the catalog had
+        // them before the first statement, and after a partial run some of
+        // those names have already moved — a probe answered about the wrong
+        // object is worse than one that was not asked.
+        preflight(conn, dialect, plan, rename_targets).await?;
+        0
+    };
+
+    let total = statements.len();
+    println!(
+        "Applying {} statement(s) without a transaction...",
+        total - start
+    );
+    for (i, stmt) in statements.iter().enumerate().skip(start) {
+        if let Err(e) = conn.execute(&stmt.sql).await {
+            return Err(anyhow::anyhow!(
+                "the database rejected statement {} of {total}, and nothing was rolled back \
+                 (a staged apply runs outside a transaction):\n{}\n\n{e}\n\n\
+                 The ledger records everything that did complete. Fix the cause, then continue \
+                 with `pbps apply --staged --resume`.",
+                i + 1,
+                stmt.sql
+            ));
+        }
+
+        let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+        let mut checkpoint = pbps_model::StateSnapshot::new(
+            StateKind::Staged,
+            after.schema,
+            plan.ids.clone(),
+            operator,
+        );
+        checkpoint.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+        checkpoint.plan_checksum = Some(plan_checksum.to_owned());
+        checkpoint.staged = Some(pbps_model::StagedProgress {
+            completed: i + 1,
+            total,
+            last_statement: stmt.sql.clone(),
+        });
+        let id = pbps_mssql::state::record(conn, &checkpoint).await?;
+        println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
+    }
+
+    // The closing entry is an ordinary apply with no staged marker: its absence
+    // is what tells every later command this environment is no longer
+    // mid-deployment.
+    let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+    let mut snapshot = pbps_model::StateSnapshot::new(
+        pbps_model::StateKind::Apply,
+        after.schema,
+        plan.ids.clone(),
+        operator,
+    );
+    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.plan_checksum = Some(plan_checksum.to_owned());
+    Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+}
+
+/// Refuses to act on an environment that is half-way through a staged apply.
+///
+/// Planning or applying anything else on top of an unfinished staged plan
+/// builds on a state nobody approved: the recorded baseline is a checkpoint,
+/// not a deployment anybody signed off.
+fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::Result<()> {
+    let Some(progress) = &entry.snapshot.staged else {
+        return Ok(());
+    };
+    bail!(
+        "`{label}` is mid-deployment: entry #{} is a staged checkpoint ({} of {} statements).\n\
+         Finish it with `pbps apply --staged --resume --plan ...`, or take the database as it \
+         stands with `pbps baseline --reason ...`.",
+        entry.id,
+        progress.completed,
+        progress.total
+    )
 }
 
 /// The pre-flight of §7.5: dependency impact, then probes against the data.
@@ -887,7 +1147,9 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
     }
     bail!(
         "{} statement(s) in this plan cannot run inside a transaction, and \"one plan, one \
-         transaction\" is not negotiable:\n  {}\nSplit them into a deployment of their own.",
+         transaction\" is not negotiable:\n  {}\n\
+         Isolate the change in a revision of its own and plan it with `pbps plan --db --staged`, \n\
+         which runs it statement by statement with a checkpoint in the ledger (ADR-0003).",
         offenders.len(),
         offenders.join("\n  ")
     )

@@ -782,6 +782,103 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
     assert!(!err.contains("connect"), "it must not have tried: {err}");
 }
 
+// ---- Phase 3.5: staged apply (ADR-0003 decision 2) ----
+
+/// Staged execution is a property of a plan that is going to be applied, and an
+/// offline plan never is. Accepting the flag there would write "staged" into a
+/// preview nobody can apply.
+#[test]
+fn staged_needs_a_target() {
+    let d = Demo::new("staged-offline");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--staged"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("--db or --env"), "{}", stderr(&o));
+}
+
+/// Writes a plan file by hand: the mode check is a property of the artifact,
+/// and it is made before the plan's contents matter at all — so an empty change
+/// list is enough, and nothing here has to connect.
+fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
+    let path = d.dir.join(name);
+    let plan = format!(
+        r#"{{
+  "version": 1,
+  "origin": "database",
+  "mode": "{mode}",
+  "dialect": "mssql",
+  "created_at": "2026-08-31T09:00:00Z",
+  "baseline": {{ "description": "prod as queried (entry #1)", "checksum": "deadbeef" }},
+  "changes": {{ "changes": [] }},
+  "ids": {{ "version": 1, "tables": {{}}, "columns": {{}} }}
+}}
+"#
+    );
+    std::fs::write(&path, plan).unwrap();
+    path
+}
+
+/// The mode lives in the file because that is what the deployment gate
+/// approved; running whichever the operator typed would be the tool choosing
+/// the loser of a disagreement.
+#[test]
+fn apply_refuses_a_mode_the_plan_does_not_declare() {
+    let d = Demo::new("staged-mode");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+
+    let unreachable = "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p";
+
+    // A transactional plan applied with --staged.
+    let plain = write_plan(&d, "plain.json", "transactional");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        unreachable,
+        "--plan",
+        plain.to_str().unwrap(),
+        "--staged",
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("transactional plan"), "{}", stderr(&o));
+
+    // ...and a staged plan applied without it.
+    let staged = write_plan(&d, "staged.json", "staged");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        unreachable,
+        "--plan",
+        staged.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("staged plan"), "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("connect"),
+        "the refusal must happen before connecting: {}",
+        stderr(&o)
+    );
+}
+
+/// `--resume` continues a staged apply, so asking for it on a transactional one
+/// is a mistake worth naming rather than quietly ignoring.
+#[test]
+fn resume_without_staged_is_refused() {
+    let d = Demo::new("staged-resume");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    let plain = write_plan(&d, "plain.json", "transactional");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plain.to_str().unwrap(),
+        "--resume",
+    ]);
+    assert_ne!(code(&o), 0);
+}
+
 /// A password must not reach a log even when the command fails, and the failure
 /// message is the easiest place to leak one.
 #[test]

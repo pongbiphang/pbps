@@ -73,6 +73,11 @@ enum Command {
         /// Write the plan as a SQL script (a preview; never hand-edited)
         #[arg(long)]
         sql: Option<PathBuf>,
+
+        /// Plan one logical change for a staged apply: run outside a transaction,
+        /// one statement at a time, with a checkpoint in the ledger. Needs --db/--env
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
@@ -149,6 +154,14 @@ enum Command {
         /// Risk classes this deployment is approved for, comma-separated
         #[arg(long, value_delimiter = ',')]
         allow: Vec<pbps_model::RiskClass>,
+
+        /// Apply a staged plan: outside a transaction, one statement at a time
+        #[arg(long)]
+        staged: bool,
+
+        /// Continue a staged apply that stopped part-way through
+        #[arg(long, requires = "staged")]
+        resume: bool,
     },
 
     /// Check the live database against its recorded state
@@ -282,6 +295,7 @@ fn run() -> anyhow::Result<()> {
             check,
             out,
             sql,
+            staged,
         } => {
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
@@ -296,7 +310,20 @@ fn run() -> anyhow::Result<()> {
                     bail!("--base and --db name two different baselines; pass one of them");
                 }
                 let target = target.resolve(&project)?;
-                return deploy::cmd_plan_db(&project, &target, out.as_deref(), sql.as_deref());
+                return deploy::cmd_plan_db(
+                    &project,
+                    &target,
+                    out.as_deref(),
+                    sql.as_deref(),
+                    staged,
+                );
+            }
+            if staged {
+                // Staged execution is a property of a plan that is going to be
+                // applied, and an offline plan never is (SPEC §7.3).
+                bail!(
+                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env"
+                );
             }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
@@ -309,9 +336,18 @@ fn run() -> anyhow::Result<()> {
             target,
             plan,
             allow,
+            staged,
+            resume,
         } => {
             let target = target.resolve(&project)?;
-            deploy::cmd_apply(&project, &target, &plan, &allow.into_iter().collect())
+            deploy::cmd_apply(
+                &project,
+                &target,
+                &plan,
+                &allow.into_iter().collect(),
+                staged,
+                resume,
+            )
         }
         Command::Validate => cmd_validate(&project),
         Command::Fmt { check } => cmd_fmt(&project, check),

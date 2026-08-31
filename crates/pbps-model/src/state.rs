@@ -23,6 +23,14 @@ pub enum StateKind {
     /// The whole schema was built from the declarations in one shot (DR, or a
     /// new environment).
     Bootstrap,
+    /// A checkpoint inside a staged apply: one statement of a staged plan
+    /// completed, and the rest have not run yet (ADR-0003 decision 2).
+    ///
+    /// It is a state like any other — the schema recorded is the database as it
+    /// stands — but it is deliberately a *different* kind, because an
+    /// environment sitting on one is mid-deployment: planning or applying
+    /// anything else against it would build on a half-finished change.
+    Staged,
 }
 
 impl StateKind {
@@ -33,6 +41,7 @@ impl StateKind {
             StateKind::Apply => "apply",
             StateKind::Baseline => "baseline",
             StateKind::Bootstrap => "bootstrap",
+            StateKind::Staged => "staged",
         }
     }
 }
@@ -79,6 +88,43 @@ pub struct StateSnapshot {
     /// what an audit asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+
+    /// Present only on a [`StateKind::Staged`] checkpoint: how far through the
+    /// staged plan this environment is.
+    ///
+    /// Its absence is what "this environment is not mid-deployment" means, so
+    /// it is never written on any other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<StagedProgress>,
+}
+
+/// How far a staged apply has got (ADR-0003 decision 2).
+///
+/// A staged plan runs outside a transaction, because the whole reason it is
+/// staged is that it contains something a transaction cannot hold. Nothing
+/// rolls back, so the only honest way to make a mid-way failure visible rather
+/// than mysterious is to record each completed statement as it completes —
+/// which is also what lets `--resume` know where to start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StagedProgress {
+    /// How many of the plan's statements have run. The resume point.
+    pub completed: usize,
+
+    /// How many there are in total, so a reader of the ledger can see "3 of 5"
+    /// without holding the plan file.
+    pub total: usize,
+
+    /// The statement that has just completed, verbatim.
+    ///
+    /// Stored because the operator meeting a failed staged apply needs to know
+    /// what did run, and the plan file may be on a machine they do not have.
+    pub last_statement: String,
+}
+
+impl StagedProgress {
+    pub fn is_finished(&self) -> bool {
+        self.completed >= self.total
+    }
 }
 
 impl StateSnapshot {
@@ -92,6 +138,7 @@ impl StateSnapshot {
             plan_checksum: None,
             operator: operator.into(),
             reason: None,
+            staged: None,
         }
     }
 
@@ -186,7 +233,12 @@ mod tests {
     /// without parsing JSON; the two spellings must be the same one.
     #[test]
     fn the_kind_column_matches_the_json_spelling() {
-        for kind in [StateKind::Apply, StateKind::Baseline, StateKind::Bootstrap] {
+        for kind in [
+            StateKind::Apply,
+            StateKind::Baseline,
+            StateKind::Bootstrap,
+            StateKind::Staged,
+        ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
         }
@@ -205,5 +257,43 @@ mod tests {
         let back: StateSnapshot =
             serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
         assert_eq!(snap, back);
+    }
+
+    /// A staged checkpoint is what tells every other command that this
+    /// environment is mid-deployment, so the marker has to survive the round
+    /// trip through `state_json` intact.
+    #[test]
+    fn a_staged_checkpoint_carries_its_progress_through_json() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Staged,
+            schema_with("bigint"),
+            IdsFile::default(),
+            "leon",
+        );
+        snap.plan_checksum = Some("abc123".into());
+        snap.staged = Some(StagedProgress {
+            completed: 1,
+            total: 3,
+            last_statement: "CREATE INDEX [ix] ON [dbo].[t] ([a] ASC);".into(),
+        });
+        let back: StateSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(back, snap);
+        assert!(!back.staged.unwrap().is_finished());
+    }
+
+    /// Every other kind must serialize without the marker: its presence is the
+    /// signal, and an empty one written on an ordinary apply would leave every
+    /// later command believing a deployment is still in flight.
+    #[test]
+    fn an_ordinary_state_carries_no_staged_marker() {
+        let snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("staged"), "{json}");
     }
 }
