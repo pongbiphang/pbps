@@ -483,15 +483,17 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         eprintln!("warning: {w}");
     }
 
-    // Modules are not managed yet (ADR-0002), but staying quiet about them
-    // would tell the user the database is fully covered when it is not.
+    // What pbps cannot manage it still names (ADR-0002): an encrypted module or
+    // one whose shape the emitter cannot reproduce is left alone, and a pull
+    // that stayed quiet about it would tell the user the database is fully
+    // covered when it is not.
     if !pulled.unmanaged_modules.is_empty() {
         eprintln!(
-            "note: {} object(s) exist in the database that pbps does not manage yet:",
+            "note: {} object(s) in this database cannot be managed:",
             pulled.unmanaged_modules.len()
         );
         for m in &pulled.unmanaged_modules {
-            eprintln!("  {} {}", m.kind, m.name);
+            eprintln!("  {} {} — {}", m.kind, m.name, m.why);
         }
         eprintln!(
             "  They are left untouched: pbps will neither change nor drop them, and they do not appear in any plan."
@@ -510,11 +512,28 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         std::fs::write(&path, pbps_load::render(name, table, &[], None))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
     }
+    // Modules go into files of their own, named for the kind as well as the
+    // object: a view and a table cannot collide in the database, so they must
+    // not collide on disk either (ADR-0002).
+    for (name, module) in &pulled.schema.modules {
+        let path = dir.join(format!(
+            "{}.{}.{}.yml",
+            name.schema,
+            name.name,
+            module.kind.as_str()
+        ));
+        std::fs::write(
+            &path,
+            pbps_load::render_module(name, module, &Default::default()),
+        )
+        .with_context(|| format!("cannot write `{}`", path.display()))?;
+    }
     write_ids(project, &res.ids)?;
 
     println!(
-        "Pulled {} table(s) into `{}` and minted `{}`.",
+        "Pulled {} table(s) and {} module(s) into `{}` and minted `{}`.",
         pulled.schema.tables.len(),
+        pulled.schema.modules.len(),
         dir.display(),
         project.ids_file().display()
     );
@@ -621,16 +640,31 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
                 dialect_problems += 1;
             }
         }
+        for (name, module) in &l.schema.modules {
+            for e in dialect.validate_module(name, module) {
+                eprintln!("  {name}: {e}");
+                dialect_problems += 1;
+            }
+        }
+        // Two problems only the whole schema can see: a module named after a
+        // table, and a trigger on a table nobody declares. Both would otherwise
+        // surface as an engine error at apply time, on a database that is
+        // already half-changed.
+        for problem in pbps_model::module::check_names(&l.schema) {
+            eprintln!("  {problem}");
+            dialect_problems += 1;
+        }
         if dialect_problems == 0 {
             println!(
-                "Declarations are valid for {}: {} table(s), {} column(s).",
+                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
                 dialect.name(),
                 l.schema.tables.len(),
                 l.schema
                     .tables
                     .values()
                     .map(|t| t.columns.len())
-                    .sum::<usize>()
+                    .sum::<usize>(),
+                l.schema.modules.len()
             );
         }
     }
@@ -689,24 +723,32 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     for path in &files {
         let original = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read `{}`", path.display()))?;
-        let loaded = pbps_load::load_table_str(path, &original).map_err(|errs| {
+        let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
             for e in &errs {
                 eprintln!("{:?}", miette::Report::msg(format!("{e}")));
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
 
-        let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = loaded
-            .intents
-            .iter()
-            .cloned()
-            .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
-        let rendered = pbps_load::render(
-            &loaded.name,
-            &loaded.table,
-            &pending,
-            loaded.strategy.as_ref(),
-        );
+        let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
+            pbps_load::LoadedFile::Module(m) => (
+                // A module has no one-shot annotations to absorb: it carries no
+                // identity, so there is no rename intent to record (ADR-0002).
+                pbps_load::render_module(&m.name, &m.module, &m.depends_on),
+                Vec::new(),
+            ),
+            pbps_load::LoadedFile::Table(t) => {
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = t
+                    .intents
+                    .iter()
+                    .cloned()
+                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                (
+                    pbps_load::render(&t.name, &t.table, &pending, t.strategy.as_ref()),
+                    absorbed,
+                )
+            }
+        };
         if rendered == original {
             continue;
         }
@@ -834,7 +876,7 @@ fn cmd_plan(
             ids: &res.ids,
         },
         dialect.as_ref(),
-        &loaded.strategies,
+        &loaded.hints,
     )
     .map_err(|errs| {
         for e in &errs {

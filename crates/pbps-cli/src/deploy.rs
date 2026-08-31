@@ -33,6 +33,7 @@ use crate::db::{self, Target};
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
+    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let pulled = pbps_mssql::catalog::introspect(conn)
@@ -41,10 +42,84 @@ async fn managed_state(
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
     }
+    // A module pbps cannot read is not a module it can leave to chance: it is
+    // inside the managed set by name and outside it in fact, so the next plan
+    // would propose creating one that is already there.
+    for m in &pulled.unmanaged_modules {
+        if modules.contains(&m.name.parse().unwrap_or_else(|_| unreachable_name())) {
+            eprintln!(
+                "warning: {} {} is declared, but {}; it is left alone",
+                m.kind, m.name, m.why
+            );
+        }
+    }
 
-    let scoped = pbps_diff::scope(&pulled.schema, ids);
+    let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     report_unmanaged(&scoped, unmanaged)?;
     Ok(scoped)
+}
+
+/// A name the catalog produced cannot fail to parse; this exists only so the
+/// comparison above needs no `unwrap` that could one day fire.
+fn unreachable_name() -> pbps_model::ObjectName {
+    pbps_model::ObjectName::new("\u{0}", "\u{0}")
+}
+
+/// The modules the declarations name, for the commands that record a state.
+///
+/// `snapshot` and `baseline` write down what the environment is; a module the
+/// declarations manage has to be in that record, or the next `verify` would not
+/// be watching it. The ids file is already required by both, so requiring the
+/// declarations to parse as well changes nothing about when they can run.
+fn declared_modules(
+    project: &Project,
+) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ObjectName>> {
+    Ok(managed_modules(None, Some(&crate::load(project)?.schema)))
+}
+
+/// The modules a plan leaves the environment holding.
+///
+/// Built from the recorded state plus the plan's own changes rather than from
+/// the declarations, so that `apply` still needs nothing but the plan file — the
+/// same reason the plan carries its ids (SPEC §7.3, and constraint 23).
+fn modules_after(
+    recorded: &pbps_model::StateSnapshot,
+    changes: &pbps_model::ChangeSet,
+) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+    let mut set: std::collections::BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
+    for p in &changes.changes {
+        // Every module change names its module and nothing else does, so the
+        // accessor is the whole classification; only the direction is left.
+        let Some(name) = p.change.module_name() else {
+            continue;
+        };
+        if matches!(p.change, pbps_model::Change::DropModule { .. }) {
+            set.remove(name);
+        } else {
+            set.insert(name.clone());
+        }
+    }
+    set
+}
+
+/// The modules a command is answerable for.
+///
+/// Two callers, two questions (see [`pbps_diff::scope`]): `verify` asks whether
+/// this environment has moved since it was recorded, so the recorded state's
+/// modules are the set; everything that plans or records asks what the state
+/// should be, so the declarations count too.
+fn managed_modules(
+    recorded: Option<&pbps_model::StateSnapshot>,
+    declared: Option<&pbps_model::Schema>,
+) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Some(s) = recorded {
+        set.extend(s.schema.modules.keys().cloned());
+    }
+    if let Some(s) = declared {
+        set.extend(s.modules.keys().cloned());
+    }
+    set
 }
 
 /// Applies the `unmanaged:` policy of SPEC §8.2 to what fell outside the scope.
@@ -52,19 +127,24 @@ fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    if scoped.unmanaged.is_empty() {
+    if scoped.unmanaged.is_empty() && scoped.unmanaged_modules.is_empty() {
         return Ok(());
     }
-    let names: Vec<String> = scoped.unmanaged.iter().map(ToString::to_string).collect();
+    let names: Vec<String> = scoped
+        .unmanaged
+        .iter()
+        .chain(&scoped.unmanaged_modules)
+        .map(ToString::to_string)
+        .collect();
     match policy {
         pbps_config::Unmanaged::Ignore => {}
         pbps_config::Unmanaged::Warn => eprintln!(
-            "warning: {} table(s) in this database are not declared and are left alone: {}",
+            "warning: {} object(s) in this database are not declared and are left alone: {}",
             names.len(),
             names.join(", ")
         ),
         pbps_config::Unmanaged::Error => bail!(
-            "`unmanaged: error` in pbps.yml, and {} table(s) here are not declared: {}.\n\
+            "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
              Declare them (`pbps pull` reverse-generates them) or relax the setting.",
             names.len(),
             names.join(", ")
@@ -114,7 +194,14 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         };
 
         let recorded_ids = baseline.snapshot.ids.clone();
-        let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
+        let recorded_modules = managed_modules(Some(&baseline.snapshot), None);
+        let scoped = managed_state(
+            &mut conn,
+            &recorded_ids,
+            &recorded_modules,
+            project.config.unmanaged,
+        )
+        .await?;
 
         // The live side is identified by what is actually there, not by the
         // recorded mapping. Comparing two sides that share one identity file
@@ -136,7 +223,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // Drift emits no SQL, so there is no execution to give a hint
             // about; passing the declarations' strategies here would put a
             // hint nobody can act on into a report about what already happened.
-            &pbps_model::Strategies::default(),
+            &pbps_model::Hints::default(),
         )
         .map_err(|errs| {
             for e in &errs {
@@ -191,13 +278,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
+    let declared_modules = declared_modules(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let scoped =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
         // Comparing against the recorded state is the whole guard. A snapshot
@@ -248,13 +337,15 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
+    let declared_modules = declared_modules(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let scoped =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
         let mut snapshot = with_provenance(StateSnapshot::new(
@@ -290,6 +381,7 @@ pub fn cmd_bootstrap(
     let loaded = crate::load(project)?;
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     if ids.tables.is_empty() && !loaded.schema.tables.is_empty() {
         bail!(
@@ -311,7 +403,7 @@ pub fn cmd_bootstrap(
         dialect.as_ref(),
         // Bootstrap builds into an empty database: every table is created from
         // nothing, and there are no rows for an online operation to spare.
-        &pbps_model::Strategies::default(),
+        &pbps_model::Hints::default(),
     )
     .map_err(|errs| {
         for e in &errs {
@@ -347,7 +439,8 @@ pub fn cmd_bootstrap(
         // managed set would fail halfway through on the first CREATE of a table
         // that is already there, leaving a partly built schema and a ledger that
         // never mentioned it.
-        let existing = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let existing =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         if !existing.schema.tables.is_empty() {
             bail!(
                 "`{}` already has {} of the declared table(s); bootstrap builds into an empty \
@@ -366,7 +459,8 @@ pub fn cmd_bootstrap(
         // The state recorded is what the engine actually built, read back — not
         // what was declared. Expressions come back in the engine's stored form,
         // and only that form compares equal on the next drift check (SPEC §8.2).
-        let built = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let built =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         let snapshot = with_provenance(StateSnapshot::new(
             StateKind::Bootstrap,
             built.schema,
@@ -483,7 +577,20 @@ pub fn cmd_plan_db(
         };
         refuse_mid_deployment(&entry, &target.label)?;
         let recorded_ids = entry.snapshot.ids.clone();
-        let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
+        // The baseline's module scope is the **recorded** state's, never the
+        // declarations': `apply` has only the plan file and the ledger, so a
+        // scope that needed a checkout would make the two checksums disagree on
+        // a host with none. A declared module that exists but was never
+        // recorded is simply created again, which `CREATE OR ALTER` makes
+        // harmless.
+        let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+        let scoped = managed_state(
+            &mut conn,
+            &recorded_ids,
+            &recorded_modules,
+            project.config.unmanaged,
+        )
+        .await?;
 
         // The plan is computed against the environment *as queried*, so the
         // queried state had better be the recorded one. When it is not, the
@@ -512,7 +619,7 @@ pub fn cmd_plan_db(
                 ids: &resolved.ids,
             },
             dialect.as_ref(),
-            &loaded.strategies,
+            &loaded.hints,
         )
         .map_err(|errs| {
             for e in &errs {
@@ -792,7 +899,14 @@ async fn apply_under_lock(
     };
     refuse_mid_deployment(&entry, &target.label)?;
     let recorded_ids = entry.snapshot.ids.clone();
-    let scoped = managed_state(conn, &recorded_ids, project.config.unmanaged).await?;
+    let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+    let scoped = managed_state(
+        conn,
+        &recorded_ids,
+        &recorded_modules,
+        project.config.unmanaged,
+    )
+    .await?;
 
     // The drift check, and the whole reason a coarse `--allow` is safe: this
     // plan is only valid against the environment it was computed against, down
@@ -818,7 +932,13 @@ async fn apply_under_lock(
     // What gets recorded is the database read back, not the plan applied to the
     // old state. Expressions come back in the engine's stored form, and only
     // that form compares equal on the next drift check (SPEC §8.2).
-    let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+    let after = managed_state(
+        conn,
+        &plan.ids,
+        &modules_after(&entry.snapshot, &plan.changes),
+        project.config.unmanaged,
+    )
+    .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -893,7 +1013,9 @@ async fn apply_staged_under_lock(
         // The drift check, applied to a half-finished plan. The mapping used is
         // the plan's on both sides, so the comparison is like with like
         // whichever statement the run stopped after.
-        let scoped = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+        let after_modules = modules_after(&entry.snapshot, &plan.changes);
+        let scoped =
+            managed_state(conn, &plan.ids, &after_modules, project.config.unmanaged).await?;
         let live = pbps_model::state_checksum(&scoped.schema, &plan.ids);
         let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, &plan.ids);
         if live != checkpoint {
@@ -936,7 +1058,14 @@ async fn apply_staged_under_lock(
             );
         }
         let recorded_ids = entry.snapshot.ids.clone();
-        let scoped = managed_state(conn, &recorded_ids, project.config.unmanaged).await?;
+        let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+        let scoped = managed_state(
+            conn,
+            &recorded_ids,
+            &recorded_modules,
+            project.config.unmanaged,
+        )
+        .await?;
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
         if live != plan.baseline.checksum {
             bail!(
@@ -974,7 +1103,13 @@ async fn apply_staged_under_lock(
             ));
         }
 
-        let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+        let after = managed_state(
+            conn,
+            &plan.ids,
+            &modules_after(&entry.snapshot, &plan.changes),
+            project.config.unmanaged,
+        )
+        .await?;
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
             after.schema,
@@ -995,7 +1130,13 @@ async fn apply_staged_under_lock(
     // The closing entry is an ordinary apply with no staged marker: its absence
     // is what tells every later command this environment is no longer
     // mid-deployment.
-    let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+    let after = managed_state(
+        conn,
+        &plan.ids,
+        &modules_after(&entry.snapshot, &plan.changes),
+        project.config.unmanaged,
+    )
+    .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,

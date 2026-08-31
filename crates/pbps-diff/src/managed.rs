@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{ColumnRef, IdsFile, Schema, TableName, Uid, UidKind};
+use pbps_model::{ColumnRef, IdsFile, ObjectName, Schema, TableName, Uid, UidKind};
 
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +38,24 @@ pub struct Scoped {
     /// fresh baseline it means the ids file and this environment describe
     /// different databases.
     pub missing: Vec<TableName>,
+
+    /// Modules the database has that nobody manages. Left alone, exactly like
+    /// an unmanaged table.
+    pub unmanaged_modules: Vec<ObjectName>,
 }
 
-/// Cuts a live schema down to the tables the identity file names.
-pub fn scope(schema: &Schema, ids: &IdsFile) -> Scoped {
+/// Cuts a live schema down to the managed set.
+///
+/// # Why modules are scoped by a set instead of by the ids file
+///
+/// Modules carry no identity — they carry no data, so they never enter the ids
+/// file (ADR-0002). The set of managed modules is therefore supplied by the
+/// caller, and what each caller passes says what question it is asking: `verify`
+/// passes the modules of the **recorded** state ("has this environment moved
+/// since pbps last recorded it"), while `plan --db` passes those plus the
+/// declared ones ("what would it take to get there"). A module in neither is
+/// somebody else's, and pbps neither changes nor drops it.
+pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectName>) -> Scoped {
     let managed: BTreeSet<&TableName> = ids.tables.values().collect();
 
     let mut scoped = Schema::default();
@@ -60,10 +74,20 @@ pub fn scope(schema: &Schema, ids: &IdsFile) -> Scoped {
         .cloned()
         .collect();
 
+    let mut unmanaged_modules = Vec::new();
+    for (name, module) in &schema.modules {
+        if managed_modules.contains(name) {
+            scoped.modules.insert(name.clone(), module.clone());
+        } else {
+            unmanaged_modules.push(name.clone());
+        }
+    }
+
     Scoped {
         schema: scoped,
         unmanaged,
         missing,
+        unmanaged_modules,
     }
 }
 
@@ -184,6 +208,7 @@ mod tests {
         let scoped = scope(
             &schema(&["dbo.customer", "dbo.order", "dbo.legacy_audit"]),
             &ids(&[("t_aaaaaa", "dbo.customer"), ("t_bbbbbb", "dbo.order")]),
+            &BTreeSet::new(),
         );
         assert_eq!(
             scoped.schema.tables.keys().collect::<Vec<_>>(),
@@ -199,8 +224,13 @@ mod tests {
     fn an_unmanaged_table_does_not_change_the_managed_state() {
         let ids = ids(&[("t_aaaaaa", "dbo.customer")]);
         assert_eq!(
-            scope(&schema(&["dbo.customer"]), &ids).schema,
-            scope(&schema(&["dbo.customer", "dbo.other_tool"]), &ids).schema,
+            scope(&schema(&["dbo.customer"]), &ids, &BTreeSet::new()).schema,
+            scope(
+                &schema(&["dbo.customer", "dbo.other_tool"]),
+                &ids,
+                &BTreeSet::new()
+            )
+            .schema,
         );
     }
 
@@ -212,6 +242,7 @@ mod tests {
         let scoped = scope(
             &schema(&["dbo.customer"]),
             &ids(&[("t_aaaaaa", "dbo.customer"), ("t_bbbbbb", "dbo.order")]),
+            &BTreeSet::new(),
         );
         assert_eq!(scoped.missing, vec![t("dbo.order")]);
         assert!(scoped.unmanaged.is_empty());
@@ -219,7 +250,11 @@ mod tests {
 
     #[test]
     fn an_empty_identity_file_manages_nothing() {
-        let scoped = scope(&schema(&["dbo.customer"]), &IdsFile::default());
+        let scoped = scope(
+            &schema(&["dbo.customer"]),
+            &IdsFile::default(),
+            &BTreeSet::new(),
+        );
         assert!(scoped.schema.tables.is_empty());
         assert_eq!(scoped.unmanaged, vec![t("dbo.customer")]);
     }
@@ -343,5 +378,45 @@ mod tests {
         );
         assert_eq!(observed.tables.len(), 1);
         assert_eq!(observed.columns.len(), 1);
+    }
+
+    // ---- modules (ADR-0002) ----
+
+    fn with_module(mut schema: Schema, name: &str) -> Schema {
+        schema.modules.insert(
+            name.parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                on: None,
+                definition: "SELECT 1".into(),
+            },
+        );
+        schema
+    }
+
+    /// A module nobody manages is somebody else's object, exactly like an
+    /// undeclared table: pbps neither changes nor drops it, and drift must not
+    /// fire on it.
+    #[test]
+    fn only_the_named_modules_are_in_scope() {
+        let live = with_module(
+            with_module(schema(&["dbo.customer"]), "dbo.v_mine"),
+            "dbo.v_theirs",
+        );
+        let managed = BTreeSet::from(["dbo.v_mine".parse::<TableName>().unwrap()]);
+        let scoped = scope(&live, &ids(&[("t_aaaaaa", "dbo.customer")]), &managed);
+
+        assert_eq!(scoped.schema.modules.len(), 1);
+        assert!(
+            scoped
+                .schema
+                .modules
+                .contains_key(&"dbo.v_mine".parse().unwrap())
+        );
+        assert_eq!(
+            scoped.unmanaged_modules,
+            vec!["dbo.v_theirs".parse::<TableName>().unwrap()]
+        );
     }
 }

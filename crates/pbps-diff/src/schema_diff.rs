@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, ColumnType, IdsFile, PlannedChange, Schema, Strategies, Table,
-    TableName, Uid,
+    Change, ChangeSet, ColumnRef, ColumnType, Hints, IdsFile, ObjectName, PlannedChange, Schema,
+    Table, TableName, Uid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -52,14 +52,14 @@ pub struct Side<'a> {
 /// `description` is **not compared** yet: it only affects data-catalogue prose,
 /// not structure, and writing it to an extended property belongs to Phase 5.
 ///
-/// The strategies are the **declared** side's: a hint describes how to operate
-/// on the table as it will be, and a table that no longer exists has nothing
-/// left to operate on (ADR-0003).
+/// The hints are the **declared** side's: a strategy describes how to operate on
+/// the table as it will be, and a table that no longer exists has nothing left
+/// to operate on (ADR-0003).
 pub fn diff(
     base: Side<'_>,
     declared: Side<'_>,
     dialect: &dyn Dialect,
-    strategies: &Strategies,
+    hints: &Hints,
 ) -> Result<ChangeSet, Vec<DiffError>> {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -145,6 +145,8 @@ pub fn diff(
         diff_constraints(declared_name, base_table, declared_table, &mut changes);
     }
 
+    diff_modules(base.schema, declared.schema, dialect, &mut changes);
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -160,10 +162,21 @@ pub fn diff(
         // artifact the deployment gate reviews, and a hint resolved later
         // against a YAML file the deployment host may not have is a hint
         // nobody read (ADR-0003).
-        if let Some(strategy) = strategies.get(p.change.table()) {
+        if let Some(strategy) = hints.strategies.get(p.change.table()) {
             p.strategy = *strategy;
         }
     }
+
+    // Modules are ordered among themselves by dependency: a view over a view
+    // has to be created second, and dropped first (ADR-0002).
+    let create_rank = rank_of(&pbps_model::module::creation_order(
+        &declared.schema.modules,
+        &hints.module_deps,
+    ));
+    let drop_rank = rank_of(&pbps_model::module::creation_order(
+        &base.schema.modules,
+        &hints.module_deps,
+    ));
     // The tiebreaker within an ordering class is the table name, then the
     // change's rendering. Debug output alone would sort by uid, which is random
     // at mint time — the plan would be correct but differently ordered per
@@ -171,6 +184,7 @@ pub fn diff(
     planned.sort_by_key(|p| {
         (
             order_key(&p.change),
+            module_rank(&p.change, &create_rank, &drop_rank),
             p.change.table().to_string(),
             format!("{:?}", p.change),
         )
@@ -361,6 +375,108 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     }
 }
 
+/// Position in the dependency order, by name.
+fn rank_of(order: &[ObjectName]) -> BTreeMap<ObjectName, usize> {
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect()
+}
+
+/// Where a change sorts *within* its ordering class.
+///
+/// Only module changes have anything to say here; everything else is zero and
+/// keeps the tiebreakers that were already there. Drops run in reverse creation
+/// order, so a dependent goes before the thing it depends on.
+fn module_rank(
+    change: &Change,
+    create_rank: &BTreeMap<ObjectName, usize>,
+    drop_rank: &BTreeMap<ObjectName, usize>,
+) -> isize {
+    match change {
+        Change::CreateModule { name, .. } | Change::AlterModule { name, .. } => {
+            create_rank.get(name).map_or(0, |r| *r as isize)
+        }
+        Change::DropModule { name, .. } => -(drop_rank.get(name).map_or(0, |r| *r as isize)),
+        Change::CreateTable { .. }
+        | Change::DropTable { .. }
+        | Change::RenameTable { .. }
+        | Change::AddColumn { .. }
+        | Change::DropColumn { .. }
+        | Change::RenameColumn { .. }
+        | Change::AlterColumnType { .. }
+        | Change::AlterColumnNullability { .. }
+        | Change::AlterColumnDefault { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { .. }
+        | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
+        | Change::AddForeignKey { .. }
+        | Change::DropForeignKey { .. }
+        | Change::AddCheck { .. }
+        | Change::DropCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. } => 0,
+    }
+}
+
+/// Modules are matched by **name**, never by uid: they carry no data, so they
+/// carry no identity (ADR-0002).
+///
+/// Two of the three comparisons are ordinary. The third is the interesting one:
+/// a module whose *kind* or trigger table changed is not an alteration at all —
+/// `CREATE OR ALTER` cannot turn a view into a procedure, or move a trigger to
+/// another table — so it is emitted as a drop followed by a create.
+fn diff_modules(
+    base: &Schema,
+    declared: &Schema,
+    dialect: &dyn Dialect,
+    changes: &mut Vec<Change>,
+) {
+    for (name, module) in &declared.modules {
+        match base.modules.get(name) {
+            None => changes.push(Change::CreateModule {
+                name: name.clone(),
+                module: Box::new(module.clone()),
+            }),
+            Some(before) if before.kind != module.kind || before.on != module.on => {
+                changes.push(Change::DropModule {
+                    name: name.clone(),
+                    kind: before.kind,
+                });
+                changes.push(Change::CreateModule {
+                    name: name.clone(),
+                    module: Box::new(module.clone()),
+                });
+            }
+            Some(before) => {
+                // The definition is compared after the dialect's lightweight
+                // normalization, never by understanding it (SPEC §8.2). What
+                // survives that is re-stated in full, which is idempotent and
+                // keeps the permissions granted on the object.
+                if dialect.normalize_definition(&before.definition)
+                    != dialect.normalize_definition(&module.definition)
+                {
+                    changes.push(Change::AlterModule {
+                        name: name.clone(),
+                        module: Box::new(module.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    for (name, module) in &base.modules {
+        if !declared.modules.contains_key(name) {
+            changes.push(Change::DropModule {
+                name: name.clone(),
+                kind: module.kind,
+            });
+        }
+    }
+}
+
 /// The order of application.
 ///
 /// Renames come first, so every later step can use current names. Dropping
@@ -368,24 +484,30 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
 /// reference those columns; adding them must follow adding columns.
 fn order_key(c: &Change) -> u8 {
     match c {
-        Change::RenameTable { .. } | Change::RenameColumn { .. } => 0,
+        // Modules go first and last, and both ends are load-bearing. A
+        // SCHEMABINDING view blocks a rename of the column it binds, so every
+        // module that is going has to go before the table changes; and a view
+        // can only be created once the columns it selects exist.
+        Change::DropModule { .. } => 0,
+        Change::RenameTable { .. } | Change::RenameColumn { .. } => 1,
         Change::DropIndex { .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. } => 1,
-        Change::DropColumn { .. } => 2,
-        Change::DropTable { .. } => 3,
-        Change::CreateTable { .. } => 4,
-        Change::AddColumn { .. } => 5,
+        | Change::DropCheck { .. } => 2,
+        Change::DropColumn { .. } => 3,
+        Change::DropTable { .. } => 4,
+        Change::CreateTable { .. } => 5,
+        Change::AddColumn { .. } => 6,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 6,
-        Change::SetColumnDeprecated { .. } => 7,
+        | Change::AlterColumnDefault { .. } => 7,
+        Change::SetColumnDeprecated { .. } => 8,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
-        | Change::AddIndex { .. } => 8,
+        | Change::AddIndex { .. } => 9,
+        Change::CreateModule { .. } | Change::AlterModule { .. } => 10,
     }
 }
 #[cfg(test)]
@@ -444,7 +566,7 @@ mod tests {
                 ids: &declared_ids,
             },
             &MinimalDialect,
-            &Strategies::default(),
+            &Hints::default(),
         )
         .unwrap()
     }
@@ -784,7 +906,7 @@ mod tests {
                 ids: &declared_ids,
             },
             &MinimalDialect,
-            &Strategies::default(),
+            &Hints::default(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -845,7 +967,7 @@ mod tests {
                 ids: &v3_ids,
             },
             &MinimalDialect,
-            &Strategies::default(),
+            &Hints::default(),
         )
         .unwrap();
 
@@ -886,5 +1008,169 @@ mod tests {
             );
         }
         let _ = Uid::generate(pbps_model::UidKind::Column);
+    }
+
+    // ---- modules (ADR-0002) ----
+
+    fn a_module(kind: pbps_model::ModuleKind, definition: &str) -> pbps_model::Module {
+        pbps_model::Module {
+            kind,
+            description: None,
+            on: None,
+            definition: definition.to_owned(),
+        }
+    }
+
+    fn with_modules(mut schema: Schema, specs: &[(&str, &str)]) -> Schema {
+        for (name, definition) in specs {
+            schema.modules.insert(
+                name.parse().unwrap(),
+                a_module(pbps_model::ModuleKind::View, definition),
+            );
+        }
+        schema
+    }
+
+    /// Modules are matched by name and carry no identity, so `run`'s uid
+    /// machinery is bypassed: this calls the differ directly with the same ids
+    /// on both sides.
+    fn module_diff(base: &Schema, declared: &Schema) -> ChangeSet {
+        let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &ids,
+            },
+            Side {
+                schema: declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_module_is_created_and_a_removed_one_dropped() {
+        let base = Schema::default();
+        let declared = with_modules(Schema::default(), &[("dbo.v", "SELECT 1")]);
+        assert_eq!(kinds(&module_diff(&base, &declared)), ["CreateModule"]);
+
+        let dropped = module_diff(&declared, &base);
+        assert_eq!(kinds(&dropped), ["DropModule"]);
+        // What a dropped module destroys is the validity of its dependents, so
+        // it faces the gate — with no tombstone and no reason, because git
+        // holds the definition it had.
+        assert!(dropped.risks().contains(&RiskClass::Destructive));
+    }
+
+    /// Layout is not a change. Re-stating every view on every deploy would
+    /// train reviewers to skim the plan, which is the one thing a plan must not
+    /// invite.
+    #[test]
+    fn a_reindented_definition_is_not_a_change() {
+        let base = with_modules(Schema::default(), &[("dbo.v", "SELECT a, b FROM t")]);
+        let declared = with_modules(
+            Schema::default(),
+            &[("dbo.v", "SELECT a,\n       b\nFROM t")],
+        );
+        assert!(module_diff(&base, &declared).is_empty());
+    }
+
+    #[test]
+    fn a_changed_definition_is_restated_in_full() {
+        let base = with_modules(Schema::default(), &[("dbo.v", "SELECT a FROM t")]);
+        let declared = with_modules(Schema::default(), &[("dbo.v", "SELECT a, b FROM t")]);
+        let cs = module_diff(&base, &declared);
+        assert_eq!(kinds(&cs), ["AlterModule"]);
+        // CREATE OR ALTER preserves the permissions granted on the object, so
+        // an alteration must never be planned as drop + create.
+        assert!(cs.risks().is_empty());
+    }
+
+    /// `CREATE OR ALTER` cannot turn a view into a procedure, nor move a
+    /// trigger to another table. Planning either as an alteration would fail at
+    /// the statement, halfway through an apply.
+    #[test]
+    fn a_changed_kind_or_table_becomes_drop_plus_create() {
+        let base = with_modules(Schema::default(), &[("dbo.thing", "SELECT 1")]);
+        let mut declared = Schema::default();
+        declared.modules.insert(
+            "dbo.thing".parse().unwrap(),
+            a_module(pbps_model::ModuleKind::Procedure, "AS SELECT 1"),
+        );
+        assert_eq!(
+            kinds(&module_diff(&base, &declared)),
+            ["DropModule", "CreateModule"]
+        );
+    }
+
+    /// A view over a view has to be created second and dropped first, or the
+    /// statement fails. The scan of the definition text is what produces the
+    /// order; §8.2's "never parse" is about comparison, not about this.
+    #[test]
+    fn modules_are_ordered_by_what_they_reference() {
+        let declared = with_modules(
+            Schema::default(),
+            &[
+                ("dbo.top", "SELECT * FROM dbo.middle"),
+                ("dbo.middle", "SELECT * FROM dbo.base"),
+                ("dbo.base", "SELECT 1"),
+            ],
+        );
+        let created: Vec<String> = module_diff(&Schema::default(), &declared)
+            .changes
+            .iter()
+            .map(|p| p.change.table().to_string())
+            .collect();
+        assert_eq!(created, ["dbo.base", "dbo.middle", "dbo.top"]);
+
+        let dropped: Vec<String> = module_diff(&declared, &Schema::default())
+            .changes
+            .iter()
+            .map(|p| p.change.table().to_string())
+            .collect();
+        assert_eq!(dropped, ["dbo.top", "dbo.middle", "dbo.base"]);
+    }
+
+    /// A module that is going must go before the table changes: a SCHEMABINDING
+    /// view blocks a rename of the column it binds. And one that is arriving
+    /// must come after them, or it selects a column that does not exist yet.
+    #[test]
+    fn modules_bracket_the_table_changes() {
+        let base = with_modules(
+            schema_of("dbo.t", table(&[("a", Column::new(ty("int")))])),
+            &[("dbo.going", "SELECT a FROM dbo.t")],
+        );
+        let declared = with_modules(
+            schema_of(
+                "dbo.t",
+                table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+            ),
+            &[("dbo.arriving", "SELECT a, b FROM dbo.t")],
+        );
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert_eq!(kinds(&cs), ["DropModule", "AddColumn", "CreateModule"]);
     }
 }

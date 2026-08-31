@@ -102,7 +102,12 @@ impl AsStored {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::DropIndex { .. } => {}
+                | Change::DropIndex { .. }
+                // A module carries no data and no identity, so nothing here
+                // applies to one.
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. } => {}
             }
         }
         this
@@ -283,6 +288,11 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
+        // A module holds no rows. A definition the engine will not compile
+        // fails inside the plan's transaction, where the rollback is total.
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::DropModule { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }

@@ -135,9 +135,15 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
             continue;
         }
         let text = git(root, &["show", &format!("{rev}:{path}")])?;
-        match pbps_load::load_table_str(Path::new(path), &text) {
-            Ok(t) => {
+        match pbps_load::load_file_str(Path::new(path), &text) {
+            Ok(pbps_load::LoadedFile::Table(t)) => {
                 schema.tables.insert(t.name, t.table);
+                count += 1;
+            }
+            // A module has no identity to reconstruct, so the baseline needs
+            // nothing from it but the state itself (ADR-0002).
+            Ok(pbps_load::LoadedFile::Module(m)) => {
+                schema.modules.insert(m.name, m.module);
                 count += 1;
             }
             Err(errs) => {
@@ -164,7 +170,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     Ok(Baseline {
         schema,
         ids,
-        description: format!("git {rev} ({count} tables)"),
+        description: format!("git {rev} ({count} objects)"),
         is_empty_fallback: count == 0,
     })
 }

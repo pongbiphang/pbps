@@ -32,7 +32,9 @@
 
 use std::borrow::Cow;
 
-use pbps_model::{Change, ChangeSet, ColumnType, RiskClass, Strategy, Table, TableName};
+use pbps_model::{
+    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Strategy, Table, TableName,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
@@ -199,6 +201,49 @@ pub trait Dialect {
     /// Quotes an identifier for embedding in SQL.
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError>;
 
+    /// The comparison form of a module definition (ADR-0002).
+    ///
+    /// # Why this is normalization and not parsing
+    ///
+    /// SPEC §8.2's rule stands: the database is the normalizer, and after an
+    /// apply the stored text is read back so that both sides of the drift check
+    /// live in the engine's own space. This is the *other* comparison — the
+    /// declaration against the baseline — where the two texts were written by
+    /// different hands and only whitespace and line endings may separate them.
+    /// Anything still different after this is re-emitted as `CREATE OR ALTER`,
+    /// which is idempotent and lossless: the cost of a false positive is
+    /// restating one definition.
+    ///
+    /// Case is deliberately **kept**. Two definitions differing only in the case
+    /// of a keyword are still two different texts to the engine's stored form,
+    /// and folding case here would also fold it inside string literals, where
+    /// it means something.
+    fn normalize_definition(&self, definition: &str) -> String {
+        let mut out = String::with_capacity(definition.len());
+        let mut in_space = false;
+        for ch in definition.trim().chars() {
+            if ch.is_whitespace() {
+                in_space = true;
+                continue;
+            }
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(ch);
+        }
+        out
+    }
+
+    /// Checks whether this dialect supports the features the module uses.
+    ///
+    /// The default is "no objection", which is the honest answer from a dialect
+    /// that does not implement modules: `validate` says what it checked, and
+    /// this one checked nothing.
+    fn validate_module(&self, _name: &ObjectName, _module: &Module) -> Vec<DialectError> {
+        Vec::new()
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see
@@ -360,6 +405,23 @@ mod tests {
         assert!(s.transactional);
         assert!(s.clone().own_batch().own_batch);
         assert!(!s.non_transactional().transactional);
+    }
+
+    /// Line endings and indentation are what separate a definition someone
+    /// pasted from the same definition someone reindented. Neither is a change
+    /// worth re-stating a view for.
+    #[test]
+    fn definition_comparison_ignores_layout_but_not_case() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.normalize_definition("  SELECT a,\r\n       b\n  FROM t\n"),
+            d.normalize_definition("SELECT a, b FROM t")
+        );
+        assert_ne!(
+            d.normalize_definition("select a from t"),
+            d.normalize_definition("SELECT a FROM t"),
+            "case is meaningful inside string literals, so it is kept"
+        );
     }
 
     /// A dialect that has not implemented probes must say "I checked nothing",

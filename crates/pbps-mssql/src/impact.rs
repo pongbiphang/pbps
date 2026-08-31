@@ -77,7 +77,12 @@ impl RenameTarget {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::DropIndex { .. } => None,
+                | Change::DropIndex { .. }
+                // A module is dropped and recreated rather than renamed, so it
+                // never moves a name the catalog has to be asked about.
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. } => None,
             })
             .collect()
     }

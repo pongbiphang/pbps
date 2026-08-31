@@ -26,6 +26,7 @@ pub mod change;
 pub mod drift;
 pub mod ids;
 pub mod intent;
+pub mod module;
 pub mod name;
 pub mod plan;
 pub mod schema;
@@ -38,6 +39,7 @@ pub use change::{Change, ChangeSet, PlannedChange, RiskClass};
 pub use drift::{DriftBaseline, DriftReport};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
+pub use module::{Hints, Module, ModuleDeps, ModuleKind, ObjectName};
 pub use name::{ColumnRef, NameError, TableName};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use schema::{

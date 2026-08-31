@@ -125,7 +125,7 @@ fn plan(
             ids: declared_ids,
         },
         &Mssql,
-        &pbps_model::Strategies::default(),
+        &pbps_model::Hints::default(),
     )
     .expect("diff")
 }
@@ -405,7 +405,7 @@ async fn pull_warns_about_what_it_cannot_express() {
 /// tells the user the database is covered when half of it is not.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
-async fn pull_inventories_the_modules_it_does_not_manage() {
+async fn pull_reads_every_kind_of_module_back() {
     let mut db = TestDb::create("modules").await;
     db.conn
         .execute("CREATE TABLE dbo.t (id int NOT NULL, flag bit NULL);")
@@ -418,6 +418,11 @@ async fn pull_inventories_the_modules_it_does_not_manage() {
         "CREATE PROCEDURE dbo.sp_touch AS SELECT 1;",
         "CREATE FUNCTION dbo.fn_double(@n int) RETURNS int AS BEGIN RETURN @n * 2 END;",
         "CREATE TRIGGER dbo.tr_t ON dbo.t AFTER INSERT AS SELECT 1;",
+        // Two that cannot be managed, and must be reported rather than lost:
+        // SCHEMABINDING has nowhere to live in the model, and an encrypted
+        // module has no readable definition at all.
+        "CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id FROM dbo.t;",
+        "CREATE PROCEDURE dbo.sp_secret WITH ENCRYPTION AS SELECT 1;",
     ] {
         db.conn
             .execute(sql)
@@ -430,27 +435,125 @@ async fn pull_inventories_the_modules_it_does_not_manage() {
         .expect("introspect");
     db.drop().await;
 
-    let found: Vec<(&str, &str)> = pulled
+    let mut managed: Vec<String> = pulled
+        .schema
+        .modules
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    managed.sort();
+    assert_eq!(
+        managed,
+        ["dbo.fn_double", "dbo.sp_touch", "dbo.tr_t", "dbo.v_active"],
+        "every readable module kind must come back managed"
+    );
+
+    // The body, not the whole CREATE: the prefix is the emitter's, and keeping
+    // it would make every declaration compare unequal to the database it came
+    // from.
+    let view = &pulled.schema.modules[&TableName::new("dbo", "v_active")];
+    assert_eq!(view.definition, "SELECT id FROM dbo.t WHERE flag = 1;");
+    let trigger = &pulled.schema.modules[&TableName::new("dbo", "tr_t")];
+    assert_eq!(trigger.on, Some(TableName::new("dbo", "t")));
+
+    let unmanaged: Vec<&str> = pulled
         .unmanaged_modules
         .iter()
-        .map(|m| (m.kind, m.name.as_str()))
+        .map(|m| m.name.as_str())
         .collect();
-    assert_eq!(
-        found,
-        [
-            ("function", "dbo.fn_double"),
-            ("procedure", "dbo.sp_touch"),
-            ("trigger", "dbo.tr_t"),
-            ("view", "dbo.v_active"),
-        ],
-        "every module kind must be seen, sorted"
-    );
+    assert_eq!(unmanaged, ["dbo.sp_secret", "dbo.v_bound"]);
+
     // The table itself still came through untouched.
     assert!(
         pulled
             .schema
             .tables
             .contains_key(&TableName::new("dbo", "t"))
+    );
+}
+
+/// The round trip modules stand on (ADR-0002): what the emitter sends, the
+/// engine stores, and introspection reads back must be the definition that was
+/// declared — or every apply would be followed by drift, for ever.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_module_applied_then_read_back_equals_what_was_declared() {
+    let mut db = TestDb::create("module_roundtrip").await;
+    db.conn
+        .execute("CREATE TABLE dbo.customer (id int NOT NULL, legacy_code varchar(10) NULL);")
+        .await
+        .expect("create table");
+
+    let mut declared = Schema::default();
+    declared.tables.insert(
+        TableName::new("dbo", "customer"),
+        pbps_model::Table::default(),
+    );
+    let modules = [
+        (
+            "dbo.active_customer",
+            pbps_model::ModuleKind::View,
+            None,
+            "SELECT id\nFROM dbo.customer\nWHERE legacy_code IS NULL",
+        ),
+        (
+            "dbo.sp_touch_customer",
+            pbps_model::ModuleKind::Procedure,
+            None,
+            "@id int\nAS\nUPDATE dbo.customer SET legacy_code = NULL WHERE id = @id;",
+        ),
+        (
+            "dbo.fn_customer_count",
+            pbps_model::ModuleKind::Function,
+            None,
+            "()\nRETURNS int\nAS\nBEGIN RETURN (SELECT COUNT(*) FROM dbo.customer); END",
+        ),
+        (
+            "dbo.tr_customer_audit",
+            pbps_model::ModuleKind::Trigger,
+            Some("dbo.customer"),
+            "AFTER INSERT\nAS SELECT 1;",
+        ),
+    ];
+    for (name, kind, on, definition) in modules {
+        declared.modules.insert(
+            name.parse().unwrap(),
+            pbps_model::Module {
+                kind,
+                description: None,
+                on: on.map(|t| t.parse().unwrap()),
+                definition: definition.to_owned(),
+            },
+        );
+    }
+
+    // Apply exactly what the emitter produces, statement by statement.
+    for (name, module) in &declared.modules {
+        let sql = pbps_mssql::emit::module_definition(name, module).expect("emit");
+        db.conn
+            .execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{sql}\n{e}"));
+    }
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    assert_eq!(
+        pulled.schema.modules, declared.modules,
+        "the stored definition must read back as the declaration that produced it"
+    );
+
+    // And therefore the differ sees nothing: a module that came back different
+    // would be re-stated on every plan, which is drift that never goes quiet.
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&pulled.schema, &ids, &declared, &ids);
+    assert!(
+        cs.changes.iter().all(|c| c.change.module_name().is_none()),
+        "no module change should be planned: {:?}",
+        cs.changes
     );
 }
 

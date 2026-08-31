@@ -7,8 +7,8 @@
 use pbps_db::{Conn, DbError, Row};
 
 use crate::introspect::{
-    ModuleKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawTable, assemble,
+    Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
+    RawModule, RawTable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the `__pbps_` filter drops this
@@ -87,14 +87,27 @@ SELECT i.object_id, i.name, i.is_unique,
    AND i.is_hypothetical = 0
  ORDER BY i.object_id, i.name, ic.is_included_column, ic.key_ordinal;";
 
-/// Views, procedures, functions and triggers. They are not managed
-/// (ADR-0002 targets Phase 3.5), but `pull` has to report them: a pull that
-/// silently ignores half the database breaks the adoption story that justifies
-/// it. `is_ms_shipped = 0` drops the system objects.
+/// Views, procedures, functions and triggers (ADR-0002).
+///
+/// `sys.sql_modules` stores the definition **verbatim** — SQL Server does not
+/// rewrite it the way it rewrites a check constraint's expression — which is
+/// what makes the round trip near-exact and the drift false-positive risk lower
+/// here than for constraints. The join is a LEFT one because two kinds of
+/// module have no readable definition: a CLR object, and one created WITH
+/// ENCRYPTION. Both come back NULL and are reported as unmanageable rather than
+/// silently skipped.
+///
+/// `parent_object_id` gives a trigger its table. `is_ms_shipped = 0` drops the
+/// system objects.
 const MODULES: &str = "\
-SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code
+SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
+       m.definition AS definition,
+       ps.name AS parent_schema, pt.name AS parent_table
   FROM sys.objects o
   JOIN sys.schemas s ON s.schema_id = o.schema_id
+  LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
+  LEFT JOIN sys.tables pt ON pt.object_id = o.parent_object_id
+  LEFT JOIN sys.schemas ps ON ps.schema_id = pt.schema_id
  WHERE o.is_ms_shipped = 0
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
@@ -190,13 +203,18 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         let code = get::<&str>(&row, "type_code")?;
         // An unrecognised code means the query and the mapping have drifted;
         // skipping is right (it is not a module) but silence is not.
-        let Some(kind) = ModuleKind::from_type_code(code) else {
+        let Some(kind) = crate::introspect::kind_from_type_code(code) else {
             continue;
         };
+        let parent = opt::<&str>(&row, "parent_schema")?
+            .zip(opt::<&str>(&row, "parent_table")?)
+            .map(|(s, t)| (s.to_owned(), t.to_owned()));
         raw.modules.push(RawModule {
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "object_name")?.to_owned(),
             kind,
+            definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
+            parent,
         });
     }
 

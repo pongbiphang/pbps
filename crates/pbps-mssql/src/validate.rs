@@ -6,7 +6,7 @@
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
 use pbps_dialect::DialectError;
-use pbps_model::{Table, TableName};
+use pbps_model::{Module, ModuleKind, ObjectName, Table, TableName};
 
 use crate::ident;
 use crate::types::{self, DIALECT};
@@ -19,6 +19,73 @@ fn invalid(message: impl Into<String>) -> DialectError {
         dialect: DIALECT,
         message: message.into(),
     }
+}
+
+/// Every problem with a module, not just the first (ADR-0002).
+///
+/// The checks are few on purpose. Whether the body compiles is the engine's
+/// question, and asking it here would mean parsing T-SQL — which this tool does
+/// not do. What is checked is what the *emitter* needs to be true in order to
+/// produce a statement at all, plus the two shapes that would otherwise become
+/// a puzzling engine error on a database that is already half-changed.
+pub fn module(name: &ObjectName, module: &Module) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+
+    for part in [&name.schema, &name.name] {
+        if let Err(e) = ident::quote(part) {
+            errs.push(e);
+        }
+    }
+
+    let body = module.definition.trim();
+    if body.is_empty() {
+        errs.push(invalid(format!(
+            "{} `{name}` has an empty definition",
+            module.kind
+        )));
+    }
+
+    // A `GO` is not T-SQL: it is a batch separator the client interprets. One
+    // inside a definition would be sent to the server verbatim and rejected —
+    // and a user who wrote it meant to split the object into pieces that
+    // `CREATE OR ALTER` cannot express.
+    if body.lines().any(|l| l.trim().eq_ignore_ascii_case("go")) {
+        errs.push(invalid(format!(
+            "{} `{name}` contains a `GO` batch separator; a module is one batch, and `GO` is a \
+             client instruction rather than something the server understands",
+            module.kind
+        )));
+    }
+
+    // An encrypted module has no readable definition, so pbps could never
+    // compare it and would re-state it on every plan. Saying so at validate
+    // time is better than a drift report that never goes quiet.
+    if body.to_ascii_uppercase().contains("WITH ENCRYPTION") {
+        errs.push(invalid(format!(
+            "{} `{name}` is declared WITH ENCRYPTION, whose definition cannot be read back; \
+             pbps cannot manage it (ADR-0002)",
+            module.kind
+        )));
+    }
+
+    match (module.kind, &module.on) {
+        (ModuleKind::Trigger, None) => errs.push(invalid(format!(
+            "trigger `{name}` does not say which table it is on (`on:`)"
+        ))),
+        (ModuleKind::Trigger, Some(table)) => {
+            for part in [&table.schema, &table.name] {
+                if let Err(e) = ident::quote(part) {
+                    errs.push(e);
+                }
+            }
+        }
+        (kind, Some(table)) => errs.push(invalid(format!(
+            "`{name}` is a {kind} and cannot be `on: {table}`; only a trigger names a table"
+        ))),
+        (_, None) => {}
+    }
+
+    errs
 }
 
 /// Every problem with the table, not just the first.
@@ -381,5 +448,78 @@ mod tests {
             },
         );
         assert!(table(&name, &t).len() >= 2);
+    }
+
+    // ---- modules ----
+
+    fn a_module(kind: ModuleKind, definition: &str) -> Module {
+        Module {
+            kind,
+            description: None,
+            on: None,
+            definition: definition.to_owned(),
+        }
+    }
+
+    fn module_errors(name: &str, m: &Module) -> String {
+        module(&name.parse().unwrap(), m)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_well_formed_view_produces_no_errors() {
+        assert!(
+            module(
+                &"dbo.active_customer".parse().unwrap(),
+                &a_module(ModuleKind::View, "SELECT customer_id FROM dbo.customer")
+            )
+            .is_empty()
+        );
+    }
+
+    /// `GO` is a client instruction, not T-SQL. Sent to the server it is a
+    /// syntax error, and the user who wrote it meant something the emitter
+    /// cannot express as one CREATE OR ALTER.
+    #[test]
+    fn a_batch_separator_inside_a_definition_is_refused() {
+        let e = module_errors(
+            "dbo.v",
+            &a_module(ModuleKind::View, "SELECT 1\nGO\nSELECT 2"),
+        );
+        assert!(e.contains("GO"), "{e}");
+    }
+
+    /// An encrypted module cannot be read back, so every plan would re-state
+    /// it and every drift check would fire.
+    #[test]
+    fn an_encrypted_module_is_refused() {
+        let e = module_errors(
+            "dbo.v",
+            &a_module(ModuleKind::View, "WITH ENCRYPTION AS SELECT 1"),
+        );
+        assert!(e.contains("cannot be read back"), "{e}");
+    }
+
+    #[test]
+    fn a_trigger_needs_a_table_and_nothing_else_may_have_one() {
+        let e = module_errors(
+            "dbo.trg",
+            &a_module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
+        );
+        assert!(e.contains("which table"), "{e}");
+
+        let mut view = a_module(ModuleKind::View, "SELECT 1");
+        view.on = Some("dbo.customer".parse().unwrap());
+        let e = module_errors("dbo.v", &view);
+        assert!(e.contains("only a trigger"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_definition_is_refused() {
+        let e = module_errors("dbo.v", &a_module(ModuleKind::View, "  \n "));
+        assert!(e.contains("empty definition"), "{e}");
     }
 }

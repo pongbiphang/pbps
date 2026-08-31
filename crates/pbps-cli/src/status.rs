@@ -190,7 +190,12 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
             return row;
         }
     };
-    let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids);
+    // Scoped by what was recorded, exactly as `verify` scopes it: two commands
+    // that disagreed about which objects are managed would disagree about
+    // whether an environment has drifted.
+    let recorded_modules: std::collections::BTreeSet<_> =
+        entry.snapshot.schema.modules.keys().cloned().collect();
+    let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
     let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {

@@ -95,4 +95,36 @@ mod tests {
             assert!(!out.is_empty(), "{f:?} produced nothing");
         }
     }
+
+    /// A module's definition *is* the object (ADR-0002), so documentation that
+    /// left it out would document the name and nothing else.
+    #[test]
+    fn a_modules_definition_is_documented_in_every_prose_format() {
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            "dbo.active_customer".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: Some("Customers that are not legacy records".into()),
+                on: None,
+                definition: "SELECT customer_id FROM dbo.customer".into(),
+            },
+        );
+
+        for f in [Format::Markdown, Format::Html] {
+            let out = render(&schema, &IdsFile::default(), f, "Schema");
+            assert!(out.contains("dbo.active_customer"), "{f:?}: {out}");
+            assert!(
+                out.contains("SELECT customer_id FROM dbo.customer"),
+                "{f:?}"
+            );
+            assert!(
+                out.contains("Customers that are not legacy records"),
+                "{f:?}"
+            );
+            // Determinism is the promise of this command: the same declarations
+            // produce byte-identical files.
+            assert_eq!(out, render(&schema, &IdsFile::default(), f, "Schema"));
+        }
+    }
 }

@@ -259,5 +259,10 @@ fn describe(c: &Change) -> String {
         Change::DropCheck { name, .. } => format!("- check constraint {name}"),
         Change::AddIndex { name, .. } => format!("+ index {name}"),
         Change::DropIndex { name, .. } => format!("- index {name}"),
+        Change::CreateModule { module, .. } => format!("+ create {}", module.kind),
+        // "restate", not "alter": the whole definition is sent, which is what
+        // `CREATE OR ALTER` does and what the reviewer is approving.
+        Change::AlterModule { module, .. } => format!("~ restate {}", module.kind),
+        Change::DropModule { kind, .. } => format!("- drop {kind}"),
     }
 }

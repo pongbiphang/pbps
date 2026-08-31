@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use pbps_mssql::introspect::{
-    RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawTable,
-    assemble,
+    ModuleKind, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
+    RawModule, RawTable, assemble,
 };
 
 /// A catalog exercising every construct the model can express.
@@ -104,7 +104,28 @@ fn full_catalog() -> RawCatalog {
                 is_descending: false,
             },
         ],
-        modules: Vec::new(),
+        modules: vec![
+            RawModule {
+                schema: "dbo".into(),
+                name: "v_active".into(),
+                kind: ModuleKind::View,
+                definition: Some(
+                    "CREATE OR ALTER VIEW [dbo].[v_active]\nAS\nSELECT id\nFROM dbo.customer\nWHERE status = 0"
+                        .into(),
+                ),
+                parent: None,
+            },
+            RawModule {
+                schema: "dbo".into(),
+                name: "tr_customer".into(),
+                kind: ModuleKind::Trigger,
+                definition: Some(
+                    "CREATE TRIGGER dbo.tr_customer ON dbo.customer AFTER INSERT AS SELECT 1;"
+                        .into(),
+                ),
+                parent: Some(("dbo".into(), "customer".into())),
+            },
+        ],
     }
 }
 
@@ -132,5 +153,30 @@ fn what_pull_writes_reads_back_as_the_same_schema() {
             "{name}: the pulled declaration is lossy\n---\n{yaml}"
         );
         assert!(loaded.intents.is_empty());
+    }
+}
+
+/// The same property for modules: what `pull` writes has to read back as the
+/// module it saw, definition and all. If it did not, the first plan after a
+/// pull would propose re-stating every view in the database.
+#[test]
+fn what_pull_writes_for_a_module_reads_back_as_the_same_module() {
+    let pulled = assemble(&full_catalog());
+    assert!(
+        pulled.unmanaged_modules.is_empty(),
+        "{:?}",
+        pulled.unmanaged_modules
+    );
+    assert_eq!(pulled.schema.modules.len(), 2);
+
+    for (name, module) in &pulled.schema.modules {
+        let yaml = pbps_load::render_module(name, module, &Default::default());
+        let loaded = pbps_load::load_module_str(Path::new("pulled.yml"), &yaml)
+            .unwrap_or_else(|e| panic!("{name}: pulled YAML does not parse: {e:?}"));
+        assert_eq!(&loaded.name, name);
+        assert_eq!(
+            &loaded.module, module,
+            "{name}: the pulled declaration is lossy\n---\n{yaml}"
+        );
     }
 }

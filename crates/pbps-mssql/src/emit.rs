@@ -18,8 +18,8 @@
 
 use pbps_dialect::{DialectError, Statement};
 use pbps_model::{
-    Change, Column, ForeignKey, Index, PrimaryKey, ReferentialAction, Strategy, Table, TableName,
-    UniqueConstraint,
+    Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
+    ReferentialAction, Strategy, Table, TableName, UniqueConstraint,
 };
 
 use crate::ident::{literal, quote};
@@ -244,7 +244,70 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             qualified(table)?,
             online(strategy)
         )),
+
+        // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
+        // because it is idempotent: it **preserves the permissions** granted on
+        // the object, which drop + create silently destroys (ADR-0002).
+        Change::CreateModule { name, module } | Change::AlterModule { name, module } => Ok(vec![
+            Statement::new(module_definition(name, module)?).own_batch(),
+        ]),
+
+        Change::DropModule { name, kind } => {
+            one(format!("DROP {} {};", keyword(*kind), qualified(name)?))
+        }
     }
+}
+
+/// The T-SQL keyword for a module kind.
+const fn keyword(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::View => "VIEW",
+        ModuleKind::Procedure => "PROCEDURE",
+        ModuleKind::Function => "FUNCTION",
+        ModuleKind::Trigger => "TRIGGER",
+    }
+}
+
+/// The whole `CREATE OR ALTER` statement for a module.
+///
+/// The emitter composes the prefix and the declaration holds the body, so SQL
+/// still appears exactly once here — and the text this produces is the text the
+/// engine stores verbatim in `sys.sql_modules`, which is what makes the
+/// round trip of [`crate::introspect::split_module`] exact for anything pbps
+/// wrote (ADR-0002).
+///
+/// It is [`Statement::own_batch`] because T-SQL requires it: `CREATE VIEW`,
+/// `CREATE PROCEDURE`, `CREATE FUNCTION` and `CREATE TRIGGER` must each be the
+/// only statement in their batch.
+pub fn module_definition(name: &ObjectName, module: &Module) -> Result<String, DialectError> {
+    let body = module.definition.trim();
+    if body.is_empty() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!("module `{name}` has an empty definition"),
+        });
+    }
+    let head = format!(
+        "CREATE OR ALTER {} {}",
+        keyword(module.kind),
+        qualified(name)?
+    );
+    Ok(match module.kind {
+        // The `AS` is the emitter's, so a view's definition is just its query —
+        // which is what a reader of the declarations wants to see.
+        ModuleKind::View => format!("{head}\nAS\n{body}"),
+        ModuleKind::Trigger => {
+            let on = module.on.as_ref().ok_or_else(|| DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!("trigger `{name}` does not say which table it is on"),
+            })?;
+            format!("{head}\nON {}\n{body}", qualified(on)?)
+        }
+        // A parameter list is part of the object's contract, and modelling
+        // T-SQL parameter syntax would mean parsing SQL. So everything after
+        // the name is the user's.
+        ModuleKind::Procedure | ModuleKind::Function => format!("{head}\n{body}"),
+    })
 }
 
 fn one(sql: String) -> Sql {

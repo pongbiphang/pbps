@@ -782,6 +782,144 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
     assert!(!err.contains("connect"), "it must not have tried: {err}");
 }
 
+// ---- Phase 3.5: the module model (ADR-0002) ----
+
+impl Demo {
+    fn module(&self, file: &str, body: &str) {
+        std::fs::write(self.dir.join("schema").join(file), body).unwrap();
+    }
+}
+
+const A_VIEW: &str = "view: dbo.active_t\ndefinition: |-\n  SELECT id FROM dbo.t WHERE id > 0\n";
+
+/// A module is part of the desired state, so it must reach the plan and the
+/// SQL — and it must do so as `CREATE OR ALTER`, which preserves the
+/// permissions granted on the object (ADR-0002).
+#[test]
+fn a_view_plans_as_create_or_alter() {
+    let d = Demo::new("module-plan");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("+ create view"), "{}", stdout(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        // No terminator is added: the stored text is what pbps sent, and a
+        // semicolon the declaration did not have would come back as part of the
+        // body and read as a change on every plan thereafter.
+        script.contains(
+            "CREATE OR ALTER VIEW [dbo].[active_t]\nAS\nSELECT id FROM dbo.t WHERE id > 0"
+        ),
+        "{script}"
+    );
+    // The view selects a column, so the table has to exist first.
+    assert!(
+        script.find("CREATE TABLE").unwrap() < script.find("CREATE OR ALTER").unwrap(),
+        "{script}"
+    );
+}
+
+/// Modules carry no data, so they carry no identity: a removed one is a drop
+/// that needs no tombstone and no reason — but it still faces the gate, because
+/// what it destroys is the validity of whatever depends on it.
+#[test]
+fn a_removed_module_drops_without_intent_but_needs_approval() {
+    let d = Demo::new("module-drop");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    std::fs::remove_file(d.dir.join("schema/v.yml")).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a module drop must not need intent recorded first: {}",
+        stderr(&o)
+    );
+    assert!(stdout(&o).contains("- drop view"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("--allow destructive"), "{}", stdout(&o));
+    assert!(
+        !std::fs::read_to_string(d.ids_path())
+            .unwrap()
+            .contains("active_t"),
+        "a module must never enter the identity file"
+    );
+}
+
+/// Reindenting a definition is not a change. A tool that re-stated every view
+/// on every deploy would teach reviewers to skim the plan.
+#[test]
+fn reformatting_a_definition_is_not_a_change() {
+    let d = Demo::new("module-noop");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.module(
+        "v.yml",
+        "view: dbo.active_t\ndefinition: |-\n  SELECT id\n  FROM dbo.t\n  WHERE id > 0\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+}
+
+/// SQL Server keeps tables and modules in one namespace per schema, so a view
+/// named after a table is a collision the engine would only report at apply
+/// time — on a database that is already half-changed.
+#[test]
+fn a_module_named_after_a_table_is_refused() {
+    let d = Demo::new("module-clash");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", "view: dbo.t\ndefinition: SELECT 1\n");
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("already declared"), "{}", stderr(&o));
+}
+
+/// A trigger has to name a table that is actually managed here, or pbps would
+/// be maintaining a trigger on an object it knows nothing about.
+#[test]
+fn a_trigger_on_an_undeclared_table_is_refused() {
+    let d = Demo::new("module-trigger");
+    d.table(ONE_COLUMN);
+    d.module(
+        "trg.yml",
+        "trigger: dbo.trg_audit\non: dbo.absent\ndefinition: |-\n  AFTER INSERT AS SELECT 1;\n",
+    );
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("not declared here"), "{}", stderr(&o));
+}
+
+/// `fmt` owns the file format for modules too, and a definition is exactly the
+/// kind of text YAML quoting mangles.
+#[test]
+fn fmt_canonicalises_a_module_file() {
+    let d = Demo::new("module-fmt");
+    d.table(ONE_COLUMN);
+    d.module(
+        "v.yml",
+        "view: dbo.active_t\ndefinition: \"SELECT id FROM dbo.t\"\n",
+    );
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let written = std::fs::read_to_string(d.dir.join("schema/v.yml")).unwrap();
+    assert!(written.contains("definition: |-"), "{written}");
+    assert_eq!(
+        code(&d.run(&["fmt", "--check"])),
+        0,
+        "fmt is not idempotent"
+    );
+}
+
 // ---- Phase 3.5: staged apply (ADR-0003 decision 2) ----
 
 /// Staged execution is a property of a plan that is going to be applied, and an

@@ -64,13 +64,14 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     );
     let _ = writeln!(
         s,
-        "<p class=\"muted\">{} table(s), {} column(s).</p>",
+        "<p class=\"muted\">{} table(s), {} column(s), {} module(s).</p>",
         schema.tables.len(),
         schema
             .tables
             .values()
             .map(|t| t.columns.len())
-            .sum::<usize>()
+            .sum::<usize>(),
+        schema.modules.len()
     );
 
     s.push_str("<h2>Diagram</h2>\n<p class=\"muted\">Mermaid source — paste it into a Markdown view that renders Mermaid (GitLab, GitHub). This file carries no scripts, so it renders identically offline.</p>\n<pre>");
@@ -82,11 +83,38 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    modules_section(&mut s, schema);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
 
     s.push_str("</body>\n</html>\n");
     s
+}
+
+/// Views, procedures, functions and triggers, with their definitions — which
+/// for this family of objects *is* the object (ADR-0002).
+fn modules_section(s: &mut String, schema: &Schema) {
+    if schema.modules.is_empty() {
+        return;
+    }
+    s.push_str("<h2>Views, procedures, functions and triggers</h2>\n");
+    for (name, m) in &schema.modules {
+        let _ = writeln!(
+            s,
+            "<h3 id=\"{}\">{}</h3>",
+            esc(&name.to_string()),
+            esc(&name.to_string())
+        );
+        let on =
+            m.on.as_ref()
+                .map(|t| format!(" on {}", esc(&t.to_string())))
+                .unwrap_or_default();
+        let _ = writeln!(s, "<p class=\"muted\">{}{on}</p>", m.kind);
+        if let Some(d) = &m.description {
+            let _ = writeln!(s, "<p>{}</p>", esc(d));
+        }
+        let _ = writeln!(s, "<pre>{}</pre>", esc(m.definition.trim_end()));
+    }
 }
 
 fn one_table(s: &mut String, name: &TableName, table: &Table) {
