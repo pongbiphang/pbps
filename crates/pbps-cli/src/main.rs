@@ -5,6 +5,7 @@ mod db;
 mod deploy;
 mod hooks;
 mod report;
+mod status;
 
 /// Drift was found. Not a failure of the tool, so it must not look like one.
 ///
@@ -196,6 +197,13 @@ enum Command {
         command: StateCommand,
     },
 
+    /// One screen across every configured environment
+    Status {
+        /// text (default) or json
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+
     /// Release a lock left behind by a process that died mid-apply
     Unlock {
         #[command(flatten)]
@@ -371,6 +379,7 @@ fn run() -> anyhow::Result<()> {
                 deploy::cmd_prune(&project, &target, keep)
             }
         },
+        Command::Status { format } => status::cmd_status(&project, format == OutputFormat::Json),
         Command::Unlock { target } => {
             let target = target.resolve(&project)?;
             deploy::cmd_unlock(&project, &target)

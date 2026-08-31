@@ -25,6 +25,7 @@ clap.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 miette = { workspace = true, features = ["fancy"] }
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

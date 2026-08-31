@@ -1,0 +1,305 @@
+//! `pbps status` — one screen across every environment (SPEC §9.4).
+//!
+//! # Why there is nothing to host
+//!
+//! Every environment already self-reports: its ledger is in its own database
+//! (§8.1). So the dashboard is a query, not a service — no agent, no cloud, no
+//! state leaving the team's estate. Atlas answers this need with an agent
+//! reporting to its own cloud; here the same answer costs one command.
+//!
+//! # Why it always exits zero
+//!
+//! `status` is a report, not a gate. An environment that has drifted is
+//! information here and a failure in `pbps verify`, which is the command CI
+//! runs and the one with an exit code that means something (see
+//! [`crate::DriftFound`]). Two commands failing on the same condition would
+//! make the pipeline's intent ambiguous — and a `status` that failed because
+//! one of six environments was unreachable would be useless for exactly the
+//! situation it is best at.
+
+use pbps_config::Project;
+use pbps_db::Conn;
+
+use crate::db;
+
+/// One environment's line. Serialized as-is for `--format json`, so anyone who
+/// wants their own web view has a stable shape to render.
+#[derive(Debug, serde::Serialize)]
+pub struct EnvStatus {
+    pub environment: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// `ok`, `drift`, `uninitialized`, `unreachable` or `unconfigured`.
+    pub state: &'static str,
+
+    /// What went wrong, when something did. Never a connection string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_entry: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+
+    /// Set when an apply is in progress, or when one died without releasing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
+
+    /// When this line was produced, by the reporting machine's clock.
+    pub checked_at: String,
+}
+
+impl EnvStatus {
+    fn failed(environment: &str, state: &'static str, detail: String, checked_at: &str) -> Self {
+        Self {
+            environment: environment.to_owned(),
+            description: None,
+            state,
+            detail: Some(detail),
+            last_entry: None,
+            last_kind: None,
+            applied_at: None,
+            git_sha: None,
+            operator: None,
+            locked_by: None,
+            checked_at: checked_at.to_owned(),
+        }
+    }
+}
+
+pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
+    if project.config.environments.is_empty() {
+        println!(
+            "No environments are configured. Add them to pbps.yml:\n\n\
+             environments:\n  prod:\n    url_env: PROD_CONN\n\n\
+             The variable name goes in the file, never the connection string."
+        );
+        return Ok(());
+    }
+    db::require_mssql(project, "status")?;
+    let checked_at = crate::now();
+
+    let rt = db::runtime()?;
+    let mut rows = Vec::new();
+    for (name, environment) in &project.config.environments {
+        // Each environment is reported independently. One unreachable database
+        // must not cost the operator the other five lines — being able to see
+        // the whole estate at once is the entire point of the command.
+        let connection = match environment.connection_string(name) {
+            Ok(c) => c,
+            Err(e) => {
+                rows.push(EnvStatus::failed(
+                    name,
+                    "unconfigured",
+                    e.to_string(),
+                    &checked_at,
+                ));
+                continue;
+            }
+        };
+        let mut row = rt.block_on(one(&connection, name, &checked_at));
+        row.description = environment.description.clone();
+        rows.push(row);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", render(&rows));
+    }
+    Ok(())
+}
+
+async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
+    let mut conn = match Conn::connect(connection).await {
+        Ok(c) => c,
+        Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
+    };
+
+    let entry = match pbps_mssql::state::latest(&mut conn).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return EnvStatus::failed(
+                name,
+                "uninitialized",
+                "the ledger exists but has no entries".to_owned(),
+                checked_at,
+            );
+        }
+        Err(pbps_db::LedgerError::NotInitialized) => {
+            return EnvStatus::failed(
+                name,
+                "uninitialized",
+                "pbps has never recorded a state here".to_owned(),
+                checked_at,
+            );
+        }
+        Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
+    };
+
+    let locked_by = pbps_mssql::state::lock_holder(&mut conn)
+        .await
+        .ok()
+        .flatten()
+        .map(|l| format!("{} since {}", l.locked_by, l.locked_at));
+
+    let recorded_ids = entry.snapshot.ids.clone();
+    let mut row = EnvStatus {
+        environment: name.to_owned(),
+        description: None,
+        state: "ok",
+        detail: None,
+        last_entry: Some(entry.id),
+        last_kind: Some(entry.snapshot.kind.to_string()),
+        applied_at: Some(entry.applied_at.clone()),
+        git_sha: entry.snapshot.git_sha.clone(),
+        operator: Some(entry.snapshot.operator.clone()),
+        locked_by,
+        checked_at: checked_at.to_owned(),
+    };
+
+    // The drift verdict is the checksum, computed exactly as `verify` computes
+    // it. Two commands that disagreed about whether an environment has drifted
+    // would be worse than one of them not existing.
+    let pulled = match pbps_mssql::catalog::introspect(&mut conn).await {
+        Ok(p) => p,
+        Err(e) => {
+            row.state = "unreachable";
+            row.detail = Some(e.to_string());
+            return row;
+        }
+    };
+    let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids);
+    let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+    let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
+    if live != recorded {
+        row.state = "drift";
+        row.detail = Some(format!(
+            "the database no longer matches entry #{}; run `pbps verify --env {name}`",
+            entry.id
+        ));
+    }
+    row
+}
+
+/// One line per environment, aligned so a wide estate stays scannable.
+fn render(rows: &[EnvStatus]) -> String {
+    let width = |f: fn(&EnvStatus) -> String| {
+        rows.iter()
+            .map(|r| f(r).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1)
+    };
+    let env_w = width(|r| r.environment.clone()).max("ENVIRONMENT".len());
+    let state_w = width(|r| r.state.to_owned()).max("STATE".len());
+    let when_w = width(|r| r.applied_at.clone().unwrap_or_default()).max("LAST RECORDED".len());
+
+    let mut out = format!(
+        "{:env_w$}  {:state_w$}  {:when_w$}  {:9}  {}\n",
+        "ENVIRONMENT", "STATE", "LAST RECORDED", "GIT", "BY"
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "{:env_w$}  {:state_w$}  {:when_w$}  {:9}  {}\n",
+            r.environment,
+            r.state,
+            r.applied_at.as_deref().unwrap_or("-"),
+            // Eight characters is what a person recognizes a commit by.
+            r.git_sha
+                .as_deref()
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("-"),
+            r.operator.as_deref().unwrap_or("-"),
+        ));
+    }
+    for r in rows {
+        if let Some(detail) = &r.detail {
+            out.push_str(&format!("\n  {}: {detail}\n", r.environment));
+        }
+        if let Some(lock) = &r.locked_by {
+            // A lock is either an apply in flight or one that died. Both are
+            // things an operator wants to know before they start typing.
+            out.push_str(&format!("\n  {}: locked by {lock}\n", r.environment));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(environment: &str, state: &'static str) -> EnvStatus {
+        EnvStatus {
+            environment: environment.into(),
+            description: None,
+            state,
+            detail: None,
+            last_entry: Some(7),
+            last_kind: Some("apply".into()),
+            applied_at: Some("2026-08-31T09:14:22.517".into()),
+            git_sha: Some("bd4be7412ab9c0".into()),
+            operator: Some("ci-deploy".into()),
+            locked_by: None,
+            checked_at: "2026-08-31T09:20:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn the_table_lines_up_and_shortens_the_sha() {
+        let out = render(&[row("prod", "ok"), row("staging-eu", "drift")]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("ENVIRONMENT"), "{out}");
+        assert_eq!(lines[1].len(), lines[2].len(), "columns must align:\n{out}");
+        assert!(out.contains("bd4be741"), "{out}");
+        assert!(!out.contains("bd4be7412ab9c0"), "{out}");
+    }
+
+    /// A short sha must not panic the slice that shortens a long one.
+    #[test]
+    fn a_short_sha_survives() {
+        let mut r = row("prod", "ok");
+        r.git_sha = Some("abc".into());
+        assert!(render(&[r]).contains("abc"));
+    }
+
+    #[test]
+    fn a_missing_value_shows_a_dash_not_a_blank() {
+        let mut r = row("prod", "unreachable");
+        r.applied_at = None;
+        r.git_sha = None;
+        r.operator = None;
+        let out = render(&[r]);
+        assert!(out.contains(" -  "), "{out}");
+    }
+
+    /// A lock is either an apply in flight or one that died; either way it is
+    /// the first thing an operator needs before they start typing.
+    #[test]
+    fn a_lock_is_called_out_under_the_table() {
+        let mut r = row("prod", "ok");
+        r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
+        let out = render(&[r]);
+        assert!(out.contains("locked by ci-deploy"), "{out}");
+    }
+
+    /// The JSON shape is what anyone rendering their own view depends on.
+    #[test]
+    fn json_omits_absent_fields_rather_than_nulling_them() {
+        let mut r = row("prod", "ok");
+        r.git_sha = None;
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("git_sha"), "{json}");
+        assert!(json.contains(r#""state":"ok""#), "{json}");
+        assert!(json.contains(r#""environment":"prod""#), "{json}");
+    }
+}
