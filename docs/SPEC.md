@@ -41,6 +41,14 @@ Compared with what exists:
    environments evolving independently as a matter of course — and keeps the
    whole product usable air-gapped
 
+A fifth thread runs through all four, and through the ADRs: **primitives over
+platform**. Where Atlas answers docs, monitoring and approval with a hosted
+platform (cloud registry, dashboards, agents), pbps ships composable
+primitives — files, exit codes, JSON output, exec hooks — that plug into the
+infrastructure a team already runs: git, CI, schedulers, webhooks. For the
+regulated environments this tool targets, that is not a cheaper substitute; it
+is the requirement.
+
 ### 1.2 What v1 covers
 
 **In**: tables (create / drop / rename), columns, primary keys, unique
@@ -594,6 +602,7 @@ reason, operator and timestamp in the ledger.
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
+| `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still do the whole job locally**.
@@ -621,12 +630,13 @@ full state.
 |---|---|
 | `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3) |
-| `pbps verify` | The drift check: the live database against `__pbps_state` |
+| `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
 | `pbps apply --plan plan.json --allow ...` | Apply a plan |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason --operator` | Reset the state baseline |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state prune --keep N` | Clean up historical snapshots |
+| `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
 
 `pbps pull` is the key to the adoption threshold: every new user's first step is
 "I already have a database". Without it, the cost of adoption is transcribing two
@@ -671,6 +681,51 @@ is required for many operations):
   syntax and convergence, not edition capabilities — and the tool says so
   rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
   on edition-dependent risk).
+
+### 9.4 Docs, status, and drift alerting
+
+Three commands, one stance — **primitives over platform** (see 1.1): pbps
+provides deterministic outputs and exec points; scheduling and delivery belong
+to the infrastructure the team already runs.
+
+**`pbps docs`** renders documentation from the declarations, offline. The
+declarations are already documentation-grade source, holding four things a
+live-database introspection can never produce:
+
+| Source | Becomes |
+|---|---|
+| `description` fields (4.3) | Table and column documentation |
+| `deprecated` + reason | A "do not use" section |
+| The ids file's tombstones | A graveyard: who dropped what, when, and why |
+| FK declarations | The edges of the ERD |
+
+Output targets: Markdown, a single self-contained HTML file (no CDN
+dependencies — the air-gap rule applies to artifacts too), and a Mermaid
+`erDiagram`, which GitLab and GitHub render natively. Output is
+deterministic: the same declarations produce byte-identical files.
+
+This command is also what makes 4.3's "comments live in `description` only"
+trade-off pay off — the discipline is rewarded, not merely demanded. Together
+with `pull` it forms the first-contact story: point pbps at an existing
+database and get browsable documentation and an ERD in one step. A later
+extension: the preview stage (10) can attach a change-coloured ERD to the MR,
+since the typed ChangeSet already knows which tables changed.
+
+**`pbps verify --format json`** emits the drift diff in typed form, and found
+drift invokes the `on_drift` hook (13.5) with that JSON on stdin. pbps never
+speaks Slack or Teams: it execs a command and the command does the talking —
+no credentials to hold, no chat APIs to chase.
+
+**`pbps status`** reads each configured environment's `__pbps_state` and
+prints one screen: environment, last apply, git sha, drift state, last
+verified. The dashboard's database already exists — every environment
+self-reports (8.1) — so there is nothing to host; `--format json` serves
+anyone who wants to render their own web view.
+
+Deliberately not built: a hosted service (it would contradict the product's
+premise), a resident daemon (pbps is a CLI; a daemon changes the security and
+operations profile entirely), and built-in chat integrations (an exec hook
+outlives any API).
 
 ---
 
@@ -720,6 +775,22 @@ intent was resolved and committed to git when the developer wrote the MR; at tag
 time CI merely follows instructions. `when: manual` is an approval gate, not a
 decision point — what the approver confirms is the deployment-layer plan.sql,
 the concrete plan for that specific environment (the two layers of 7.3).
+
+**Monitoring is a scheduled pipeline, not a service.** The same primitives
+compose into drift alerting with nothing hosted:
+
+```yaml
+# a scheduled pipeline, one per environment
+drift-watch:
+  script:
+    - pbps verify --db "$PROD_CONN" --format json
+  # on drift: verify exits non-zero, and the on_drift hook (13.5) has already
+  # delivered — a webhook, a chat message, a ticket; its command decides
+```
+
+Atlas answers this need with an agent reporting to its cloud; here the
+scheduler is the team's CI, the delivery is the team's webhook, and the state
+never leaves the team's database.
 
 ---
 
@@ -823,8 +894,8 @@ four invariants must be machine-verified:
 |---|---|---|
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
-| **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier, which is the key to being used at all |
-| **Phase 3** | `__pbps_state` / locking / `verify` / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` hook / the optional dev database (9.3) | The complete product |
+| **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
+| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4) / the optional dev database (9.3) | The complete product |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |
@@ -873,10 +944,11 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    (see 1.3). The two adjacent needs are settled separately. Pre-apply
    assertions are **derived automatically** from the typed ChangeSet — the
    preflight probes of 7.5 — rather than hand-written by users. User hooks
-   stay deliberately minimal: a single `on_apply` entry in `pbps.yml`
-   receiving the plan path, checksum and outcome, which also implements 8.1's
-   append-only ledger fan-out for tamper-evidence. The CI pipeline remains the
-   real hook system (see 10).
+   stay deliberately minimal: an exec-only family in `pbps.yml` — `on_apply`
+   (receiving the plan path, checksum and outcome; also implements 8.1's
+   append-only ledger fan-out for tamper-evidence) and `on_drift` (receiving
+   `verify`'s typed drift JSON, see 9.4). The CI pipeline remains the real
+   hook system (see 10).
 
 6. **How views and SPs should be handled** — settled; see
    [ADR-0002](ADR-0002-module-model.md). Modules (views, procedures,
