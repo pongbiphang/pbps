@@ -5,6 +5,7 @@
 //! subdirectory — the same behaviour as `git` and `cargo`, so users never have to
 //! remember which level they are standing on.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "pbps.yml";
@@ -23,6 +24,15 @@ pub enum ConfigError {
 
     #[error("`{path}` is malformed: {message}")]
     Parse { path: PathBuf, message: String },
+
+    #[error("no environment named `{name}` in {CONFIG_FILE}; it declares: {available}")]
+    UnknownEnvironment { name: String, available: String },
+
+    #[error(
+        "environment `{name}` reads its connection string from ${var}, which is not set.\n\
+         Export it, or pass the connection string directly with --db."
+    )]
+    MissingConnection { name: String, var: String },
 }
 
 /// The target database dialect.
@@ -52,6 +62,70 @@ impl std::fmt::Display for DialectName {
     }
 }
 
+/// How to treat objects in the database that the declarations do not mention
+/// (SPEC §8.2).
+///
+/// `Ignore` is the default because it is the precondition for gradual adoption:
+/// pbps has to be able to share a database with tooling that was there first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Unmanaged {
+    #[default]
+    Ignore,
+    Warn,
+    Error,
+}
+
+/// One deployment target.
+///
+/// # Why there is no `url:` field
+///
+/// A connection string carries a password, and `pbps.yml` is committed to git.
+/// The config therefore names the **environment variable** that holds the
+/// string, never the string. This is not an inconvenience to be worked around
+/// with a second, undocumented field: an inline `url:` would be a credential in
+/// version control, and the one thing worse than not having the feature is
+/// having it and being surprised by it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    /// The name of the environment variable holding the ADO.NET connection
+    /// string, e.g. `PROD_CONN`.
+    pub url_env: String,
+
+    /// Shown by `pbps status`, for humans reading a list of environments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl Environment {
+    /// Reads the connection string from the environment.
+    pub fn connection_string(&self, name: &str) -> Result<String, ConfigError> {
+        std::env::var(&self.url_env).map_err(|_| ConfigError::MissingConnection {
+            name: name.to_owned(),
+            var: self.url_env.clone(),
+        })
+    }
+}
+
+/// Exec points (SPEC §9.4): pbps runs a command, and the command does the
+/// talking.
+///
+/// There are no Slack or Teams integrations here on purpose. An exec hook
+/// outlives any chat API, holds no credentials of its own, and lets a team
+/// deliver drift alerts through whatever they already run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    /// Run after a successful `apply`, with the plan JSON on stdin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_apply: Option<String>,
+
+    /// Run when `verify` finds drift, with the drift report JSON on stdin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_drift: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -62,6 +136,17 @@ pub struct Config {
 
     #[serde(default = "default_ids_file")]
     pub ids_file: PathBuf,
+
+    /// Deployment targets, by name. Optional: a project that only ever passes
+    /// `--db` explicitly needs none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, Environment>,
+
+    #[serde(default)]
+    pub hooks: Hooks,
+
+    #[serde(default)]
+    pub unmanaged: Unmanaged,
 }
 
 fn default_schema_dir() -> PathBuf {
@@ -126,6 +211,34 @@ impl Project {
     pub fn ids_file(&self) -> PathBuf {
         self.root.join(&self.config.ids_file)
     }
+
+    /// Looks up a named environment, listing what does exist when it does not.
+    ///
+    /// A typo in an environment name would otherwise deploy nothing and say
+    /// only "not found" — while the user is watching a release window.
+    pub fn environment(&self, name: &str) -> Result<&Environment, ConfigError> {
+        self.config.environments.get(name).ok_or_else(|| {
+            let names: Vec<&str> = self
+                .config
+                .environments
+                .keys()
+                .map(String::as_str)
+                .collect();
+            ConfigError::UnknownEnvironment {
+                name: name.to_owned(),
+                available: if names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    names.join(", ")
+                },
+            }
+        })
+    }
+
+    /// Resolves a named environment to a connection string.
+    pub fn connection_string(&self, name: &str) -> Result<String, ConfigError> {
+        self.environment(name)?.connection_string(name)
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +300,81 @@ mod tests {
         assert_eq!(p.ids_file(), tmp.join("schema.ids.json"));
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn environments_and_hooks_are_optional() {
+        let c = Config::parse("dialect: mssql\n", Path::new("pbps.yml")).unwrap();
+        assert!(c.environments.is_empty());
+        assert_eq!(c.hooks, Hooks::default());
+        assert_eq!(c.unmanaged, Unmanaged::Ignore);
+    }
+
+    #[test]
+    fn environments_and_hooks_parse() {
+        let c = Config::parse(
+            concat!(
+                "dialect: mssql\n",
+                "unmanaged: warn\n",
+                "environments:\n",
+                "  prod:\n",
+                "    url_env: PROD_CONN\n",
+                "    description: the one that must not break\n",
+                "  staging:\n",
+                "    url_env: STAGING_CONN\n",
+                "hooks:\n",
+                "  on_drift: ./scripts/alert.sh\n",
+            ),
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        assert_eq!(c.unmanaged, Unmanaged::Warn);
+        assert_eq!(c.environments["prod"].url_env, "PROD_CONN");
+        assert_eq!(c.environments["staging"].description, None);
+        assert_eq!(c.hooks.on_drift.as_deref(), Some("./scripts/alert.sh"));
+        assert_eq!(c.hooks.on_apply, None);
+    }
+
+    /// A connection string in `pbps.yml` would be a password in git. The field
+    /// does not exist, and a user reaching for it must be told so rather than
+    /// have it silently ignored.
+    #[test]
+    fn an_inline_connection_string_is_rejected() {
+        let err = Config::parse(
+            "dialect: mssql\nenvironments:\n  prod:\n    url: Server=x;Password=hunter2\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("url"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_environment_lists_the_ones_that_exist() {
+        let project = Project {
+            root: PathBuf::from("."),
+            config: Config::parse(
+                "dialect: mssql\nenvironments:\n  prod:\n    url_env: PROD_CONN\n",
+                Path::new("pbps.yml"),
+            )
+            .unwrap(),
+        };
+        let err = project.environment("prd").unwrap_err();
+        assert!(err.to_string().contains("prod"), "{err}");
+    }
+
+    /// The remedy has to name the variable: "not set" alone leaves the user
+    /// guessing which of several it was.
+    #[test]
+    fn a_missing_connection_variable_names_itself() {
+        let env = Environment {
+            url_env: "PBPS_DEFINITELY_UNSET_9137".into(),
+            description: None,
+        };
+        let err = env.connection_string("prod").unwrap_err();
+        assert!(
+            err.to_string().contains("PBPS_DEFINITELY_UNSET_9137"),
+            "{err}"
+        );
     }
 
     #[test]

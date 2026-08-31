@@ -1,12 +1,14 @@
 //! `pbps` — declarative database schema version control.
 
 mod baseline;
+mod db;
+mod deploy;
 mod report;
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use pbps_config::{DialectName, Project};
 use pbps_dialect::Dialect;
@@ -108,15 +110,91 @@ enum Command {
 
     /// Reverse-generate declarations from an existing database
     Pull {
-        /// ADO.NET-style connection string, e.g.
-        /// "Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true"
-        #[arg(long)]
-        db: String,
+        #[command(flatten)]
+        target: TargetArgs,
 
         /// Overwrite existing declarations and identity file
         #[arg(long)]
         force: bool,
     },
+
+    /// Record the database's current state in its ledger
+    Snapshot {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// Record even when the database differs from the last recorded state
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Take the database as it stands as the new starting point
+    Baseline {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// Why the difference is not being pursued; required for audit
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Build the whole schema from the declarations, into an empty database
+    Bootstrap {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// Write the CREATE script here (useful with no database at all)
+        #[arg(long)]
+        sql: Option<PathBuf>,
+    },
+
+    /// Maintenance of the in-database state ledger
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+
+    /// Release a lock left behind by a process that died mid-apply
+    Unlock {
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Delete all but the newest snapshots
+    Prune {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// How many to keep
+        #[arg(long, default_value_t = pbps_db::ledger::DEFAULT_KEEP)]
+        keep: u32,
+    },
+}
+
+/// Which database to act on.
+///
+/// Two ways in, and they are not interchangeable in practice: `--db` is what CI
+/// passes from a secret, and `--env` is what a human types. Neither is a default
+/// for the other — see [`db::target`].
+#[derive(Args)]
+struct TargetArgs {
+    /// ADO.NET-style connection string, e.g.
+    /// "Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true"
+    #[arg(long)]
+    db: Option<String>,
+
+    /// Name of an environment declared in pbps.yml
+    #[arg(long)]
+    env: Option<String>,
+}
+
+impl TargetArgs {
+    fn resolve(&self, project: &Project) -> anyhow::Result<db::Target> {
+        db::target(project, self.db.as_deref(), self.env.as_deref())
+    }
 }
 
 fn main() {
@@ -183,8 +261,38 @@ fn run() -> anyhow::Result<()> {
                 reason,
             },
         ),
-        Command::Pull { db, force } => cmd_pull(&project, &db, force),
+        Command::Pull { target, force } => {
+            let target = target.resolve(&project)?;
+            cmd_pull(&project, &target, force)
+        }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
+        Command::Snapshot { target, force } => {
+            let target = target.resolve(&project)?;
+            deploy::cmd_snapshot(&project, &target, force)
+        }
+        Command::Baseline { target, reason } => {
+            let target = target.resolve(&project)?;
+            deploy::cmd_baseline(&project, &target, &reason)
+        }
+        Command::Bootstrap { target, sql } => {
+            // The only command with an optional target: writing the script needs
+            // no database, and on an air-gapped host there is not one to give.
+            let target = match (&target.db, &target.env) {
+                (None, None) => None,
+                _ => Some(target.resolve(&project)?),
+            };
+            deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
+        }
+        Command::State { command } => match command {
+            StateCommand::Prune { target, keep } => {
+                let target = target.resolve(&project)?;
+                deploy::cmd_prune(&project, &target, keep)
+            }
+        },
+        Command::Unlock { target } => {
+            let target = target.resolve(&project)?;
+            deploy::cmd_unlock(&project, &target)
+        }
     }
 }
 
@@ -222,13 +330,8 @@ fn cmd_docs(
 /// database has and the model can express becomes YAML, everything it cannot
 /// express is printed as a warning, and a fresh identity file is minted so the
 /// next `plan` starts from "no changes".
-fn cmd_pull(project: &Project, db: &str, force: bool) -> anyhow::Result<()> {
-    if project.config.dialect != DialectName::Mssql {
-        bail!(
-            "pull is only implemented for mssql (this project's pbps.yml selects `{}`)",
-            project.config.dialect
-        );
-    }
+fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Result<()> {
+    db::require_mssql(project, "pull")?;
 
     let dir = project.schema_dir();
     if !force {
@@ -244,13 +347,8 @@ fn cmd_pull(project: &Project, db: &str, force: bool) -> anyhow::Result<()> {
         }
     }
 
-    // The runtime lives for exactly this one command: the tool is a CLI, not a
-    // server, and only the driver needs async at all.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let pulled = rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(db).await?;
+    let pulled = db::runtime()?.block_on(async {
+        let mut conn = pbps_db::Conn::connect(target.connection()).await?;
         pbps_mssql::catalog::introspect(&mut conn).await
     })?;
 
@@ -644,6 +742,23 @@ fn render_sql(
     dialect: &dyn Dialect,
     baseline: &str,
 ) -> anyhow::Result<String> {
+    let statements = statements(cs, dialect)?;
+    Ok(format!(
+        "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
+        pbps_dialect::render_script(&statements, dialect.batch_separator())
+    ))
+}
+
+/// Emits every change of a plan, in plan order.
+///
+/// The whole plan is emitted before anything runs. A change the dialect cannot
+/// express must stop the apply at statement zero, not halfway through — which is
+/// the same reason `plan` renders the SQL rather than the executor doing it one
+/// change at a time.
+fn statements(
+    cs: &pbps_model::ChangeSet,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
     let mut statements = Vec::new();
     for p in &cs.changes {
         statements.extend(
@@ -652,10 +767,7 @@ fn render_sql(
                 .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?,
         );
     }
-    Ok(format!(
-        "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
-        pbps_dialect::render_script(&statements, dialect.batch_separator())
-    ))
+    Ok(statements)
 }
 
 /// The operator. An audit asks "who did this", and git's configuration is the

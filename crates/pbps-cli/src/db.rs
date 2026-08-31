@@ -1,0 +1,140 @@
+//! Getting to a database: resolving which one, connecting, and reading its
+//! current state.
+//!
+//! Every connected command shares three problems — which environment, one
+//! runtime per command, and "what does this database look like right now" — so
+//! they are solved once here rather than five times in five command bodies.
+
+use anyhow::bail;
+
+use pbps_config::{DialectName, Project};
+
+/// A resolved deployment target.
+pub struct Target {
+    /// What to print. **Never** the connection string: see [`redact`].
+    pub label: String,
+    connection: String,
+}
+
+impl Target {
+    pub fn connection(&self) -> &str {
+        &self.connection
+    }
+}
+
+/// Resolves `--db` / `--env` into one target.
+///
+/// Exactly one is required. Defaulting to a single configured environment was
+/// considered and rejected: "it picked the only one there was" is a rule that
+/// stops being safe the day someone adds a second environment, and the day it
+/// stops being safe is a deployment.
+pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow::Result<Target> {
+    match (db, env) {
+        (Some(_), Some(_)) => bail!("--db and --env name the same thing; pass one of them"),
+        (Some(conn), None) => Ok(Target {
+            label: redact(conn),
+            connection: conn.to_owned(),
+        }),
+        (None, Some(name)) => Ok(Target {
+            label: name.to_owned(),
+            connection: project.connection_string(name)?,
+        }),
+        (None, None) => bail!(
+            "this command needs a database: pass --db <connection string> or --env <name from pbps.yml>"
+        ),
+    }
+}
+
+/// The parts of a connection string that are safe to print.
+///
+/// Command output lands in CI logs, in tickets and in chat. A connection string
+/// carries a password, so what identifies the target — server and database — is
+/// extracted and everything else is dropped. Anything unrecognizable degrades to
+/// a placeholder rather than being echoed on the chance it was harmless.
+pub fn redact(connection: &str) -> String {
+    let mut server = None;
+    let mut database = None;
+    for part in connection.split(';') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "server" | "data source" | "addr" | "address" => server = Some(value),
+            "database" | "initial catalog" => database = Some(value),
+            _ => {}
+        }
+    }
+    match (server, database) {
+        (Some(s), Some(d)) => format!("{s}/{d}"),
+        (Some(s), None) => s.to_owned(),
+        _ => "the database given on the command line".to_owned(),
+    }
+}
+
+/// One runtime per command. The tool is a CLI, not a server; only the driver
+/// needs async at all.
+pub fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}
+
+/// Refuses politely on a dialect whose connected half does not exist yet.
+pub fn require_mssql(project: &Project, command: &str) -> anyhow::Result<()> {
+    if project.config.dialect != DialectName::Mssql {
+        bail!(
+            "`pbps {command}` is only implemented for mssql (this project's pbps.yml selects `{}`)",
+            project.config.dialect
+        );
+    }
+    Ok(())
+}
+
+/// The commit the declarations were read from, when there is one.
+///
+/// Absent outside a checkout, which is legitimate: an air-gapped host applying
+/// an exported plan has no git. The ledger records `None` rather than a lie.
+pub fn git_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!sha.is_empty()).then_some(sha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one thing this function exists to prevent: a password reaching a log.
+    #[test]
+    fn redaction_never_leaks_the_password() {
+        let s = "Server=db.internal,1433;Database=app;User Id=deploy;Password=hunter2;TrustServerCertificate=true";
+        let label = redact(s);
+        assert_eq!(label, "db.internal,1433/app");
+        assert!(!label.contains("hunter2"));
+        assert!(!label.contains("deploy"));
+    }
+
+    #[test]
+    fn redaction_accepts_the_other_spellings() {
+        assert_eq!(
+            redact("Data Source=srv;Initial Catalog=db;Password=x"),
+            "srv/db"
+        );
+        assert_eq!(redact("SERVER=srv;PASSWORD=x"), "srv");
+    }
+
+    /// An unparseable string must degrade to a placeholder, never be echoed:
+    /// "I did not recognize it" is not a reason to assume it is harmless.
+    #[test]
+    fn an_unrecognized_string_is_not_echoed() {
+        let label = redact("this-is-not-a-connection-string-Password=hunter2");
+        assert!(!label.contains("hunter2"), "{label}");
+    }
+}

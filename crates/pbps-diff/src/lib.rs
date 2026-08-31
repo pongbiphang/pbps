@@ -8,9 +8,11 @@
 //! CLAUDE.md).
 
 pub mod identity;
+pub mod managed;
 pub mod schema_diff;
 
 pub use identity::{Blocker, Context, Resolution, intent_is_absorbed, resolve};
+pub use managed::{Scoped, scope};
 pub use schema_diff::{DiffError, Side, diff};
 
 #[cfg(test)]

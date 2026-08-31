@@ -6,7 +6,10 @@
 set -euo pipefail
 
 NAME=pbps-test-mssql
-PORT=14330
+# Overridable: a developer machine often already has a SQL Server container
+# holding the default port, and "the tests will not start" is a bad way to find
+# that out.
+PORT=${PBPS_TEST_PORT:-14330}
 PASSWORD='Pbps!Test12345'
 IMAGE=mcr.microsoft.com/mssql/server:2025-latest
 
