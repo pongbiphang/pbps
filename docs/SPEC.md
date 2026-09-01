@@ -831,7 +831,39 @@ premise), a resident daemon (pbps is a CLI; a daemon changes the security and
 operations profile entirely), and built-in chat integrations (an exec hook
 outlives any API).
 
-### 9.5 Explaining a plan
+### 9.5 Readiness (`doctor`)
+
+**`pbps doctor [--env <name>]`** answers "can I deploy from here", in one run.
+Before it existed, connection, engine edition, permissions, paths and ledger
+readiness each failed later, at a different command — a user adopting their first
+database learned about them in the order the commands happened to need them,
+often across five runs and two days.
+
+It checks the project (which `pbps.yml` is in force, where the declarations and
+the identity file are, whether this is a git checkout and whether it has any
+commits) and then each environment: reachability, server version, edition and
+therefore whether `strategy: online` can be honoured here, the database-scoped
+permissions the account is missing *and what each is for*, and whether the
+environment is uninitialized, locked or mid-deployment on a staged checkpoint.
+
+Two rules hold it in place:
+
+- **It reimplements nothing.** The declaration checks are `validate`'s own, run
+  through the same function. A readiness command that disagreed with `validate`
+  about whether the declarations are valid would be worse than one that never
+  looked.
+- **It writes nothing.** This is the command someone runs when they are not yet
+  sure what they are pointed at, which is quite possibly production — so the
+  permissions are *asked for* (`sys.fn_my_permissions`) rather than tried, and
+  the ledger is read rather than created. It cannot leave a project or a database
+  changed.
+
+Permissions are named individually rather than as "make it `db_owner`". An
+organization that grants the deployment account exactly what it needs should be
+able to see the list; "make it an owner" is the advice that makes that
+organization say no to the tool.
+
+### 9.6 Explaining a plan
 
 **`pbps explain --plan plan.json`** is the deployment gate's own view of a saved
 plan, and it is not for the author of the change — the author has the
@@ -867,7 +899,7 @@ Every `plan` also opens with the same summary — how many changes across how ma
 tables, then each risk class with its explanation — so the first screenful says
 what shape the plan is rather than what its first line happens to be.
 
-### 9.6 Machine-readable output and exit codes
+### 9.7 Machine-readable output and exit codes
 
 Every read-only command takes `--format human|json` and, in JSON, emits one
 envelope:
@@ -1375,21 +1407,21 @@ pbps init --from prod
   -> "run pbps doctor --env prod"
 
 pbps doctor --env prod
-  -> readiness report
+  -> readiness report (9.5)
   -> "run pbps plan --db ..."
 
 pbps plan --db ... --out plan.json --sql plan.sql
   -> a five-line summary and the exact approval command
 
 pbps explain --plan plan.json
-  -> the reviewer's explanation, no credentials required (9.5)
+  -> the reviewer's explanation, no credentials required (9.6)
 ```
 
 Implementation status: the `init` link of this journey is built, including
 `--from`, staged round-trip validation, an every-file preview and installing
-`pbps.yml` last. The typed findings envelope and the three exit codes of 9.6 are
+`pbps.yml` last. The typed findings envelope and the three exit codes of 9.7 are
 built and cover `validate`, `fmt`, `plan`, `verify`, `status` and `explain`. The
-plan summary and `explain` (9.5) are built. The remaining Phase 3.1 links are in
+plan summary and `explain` (9.6) are built, and `doctor` (9.5) with them. The remaining Phase 3.1 links are in
 progress.
 
 Acceptance criteria for that slice:

@@ -1829,3 +1829,152 @@ fn explain_never_fails_on_a_risky_plan() {
     ]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
 }
+
+// ---- Phase 3.1: `doctor` ----
+
+/// The point of the command: everything wrong with the project in one run,
+/// rather than one thing per command over two days.
+#[test]
+fn doctor_reports_the_project_and_never_writes() {
+    let d = Demo::new("doctor");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let o = d.run(&["doctor"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("pbps.yml"), "{out}");
+    assert!(out.contains("1 table(s)"), "{out}");
+    assert!(
+        out.contains("no environments are configured"),
+        "an unconfigured estate must be said out loud: {out}"
+    );
+    // Nothing this command does may create the identity file: it is the command
+    // someone runs when they are not yet sure what they are pointed at.
+    assert!(!d.ids_path().exists(), "doctor must not write");
+}
+
+/// `doctor` runs `validate` rather than a second copy of it, so a broken
+/// declaration has to reach the report with the same id `validate` gives it.
+#[test]
+fn doctor_reports_the_same_finding_validate_would() {
+    let d = Demo::new("doctorvalidate");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+
+    let doctored: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    let validated: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["validate", "--format", "json"]))).unwrap();
+
+    assert_eq!(doctored["findings"][0]["id"], "dialect.rejected");
+    assert_eq!(
+        doctored["findings"][0]["message"], validated["findings"][0]["message"],
+        "the two must not be able to disagree"
+    );
+    assert_eq!(code(&d.run(&["doctor"])), FINDING);
+}
+
+/// An environment naming a variable nobody exported is the single most common
+/// first-run failure, and it must not take the rest of the report down with it.
+#[test]
+fn doctor_names_an_unset_connection_variable_without_echoing_anything() {
+    let d = Demo::new("doctorenv");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["doctor"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("PBPS_DOCTOR_UNSET"), "{out}");
+    assert!(out.contains("unconfigured"), "{out}");
+    // The project half of the report still ran.
+    assert!(out.contains("1 table(s)"), "{out}");
+}
+
+/// The negative case for the split: a checkout with no commits and no checkout
+/// at all have different remedies, and one message for both sends the user to
+/// the wrong one.
+#[test]
+fn doctor_tells_an_empty_checkout_from_no_checkout() {
+    let d = Demo::new("doctorgit");
+    d.table(ONE_COLUMN);
+
+    let out = stdout(&d.run(&["doctor"]));
+    assert!(out.contains("no commits yet"), "{out}");
+    assert!(out.contains("git add -A && git commit"), "{out}");
+    assert!(!out.contains("not inside a git checkout"), "{out}");
+
+    d.commit();
+    let out = stdout(&d.run(&["doctor"]));
+    assert!(!out.contains("no commits yet"), "{out}");
+}
+
+/// `doctor`'s permissions query has never met a real `sys.fn_my_permissions`
+/// until this runs, and a catalog query that is wrong offline is wrong
+/// silently: it returns an empty set, which `missing` reads as "this account
+/// holds nothing" and reports as five errors. Only a live server can tell the
+/// two apart.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctor-live");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_DOCTOR_LIVE_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+
+    assert_eq!(env["environment"], "test", "{v}");
+    assert!(
+        env["server_version"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{v}"
+    );
+    assert!(
+        env["edition"].as_str().is_some_and(|s| !s.is_empty()),
+        "{v}"
+    );
+    // The container runs Developer edition, which does support ONLINE. The
+    // assertion is on the field being answered at all: `None` would mean the
+    // SERVERPROPERTY read failed and the report silently said nothing.
+    assert!(env["supports_online"].is_boolean(), "{v}");
+    // The account the test container gives us is `sa`, which holds CONTROL.
+    // Anything in this list means the permissions query came back empty or the
+    // names it returns are not the ones `REQUIRED` spells.
+    assert_eq!(
+        env["missing_permissions"].as_array().unwrap().len(),
+        0,
+        "the deployment account should hold everything: {v}"
+    );
+    // A database with a ledger is ready; one without has never been touched.
+    // Both are legitimate here, and neither is unreachable.
+    assert!(
+        matches!(env["state"].as_str(), Some("ready" | "uninitialized")),
+        "{v}"
+    );
+    assert!(
+        !stdout(&o).contains("Password"),
+        "no part of a connection string may reach the report"
+    );
+}

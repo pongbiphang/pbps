@@ -380,12 +380,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             Err(e) => return Err(e.into()),
         }
 
-        let snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Apply,
-            scoped.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Apply, scoped.schema, ids.clone(), &operator),
+        );
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
@@ -411,12 +409,10 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
-        let mut snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Baseline,
-            scoped.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let mut snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Baseline, scoped.schema, ids.clone(), &operator),
+        );
         snapshot.reason = Some(reason.to_owned());
 
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
@@ -568,12 +564,10 @@ pub fn cmd_bootstrap(
         // and only that form compares equal on the next drift check (SPEC §8.2).
         let built =
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        let snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Bootstrap,
-            built.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
+        );
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
@@ -836,7 +830,7 @@ pub fn cmd_plan_db(
         cs,
         resolved.ids,
     );
-    plan.git_sha = db::git_sha();
+    plan.git_sha = db::git_sha(project.root());
     if staged {
         plan = plan.staged();
         println!(
@@ -1099,7 +1093,7 @@ async fn apply_under_lock(
         plan.ids.clone(),
         operator,
     );
-    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
@@ -1301,7 +1295,7 @@ async fn apply_staged_under_lock(
             live_ids.clone(),
             operator,
         );
-        checkpoint.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+        checkpoint.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         checkpoint.plan_checksum = Some(plan_checksum.to_owned());
         checkpoint.staged = Some(pbps_model::StagedProgress {
             completed: i + 1,
@@ -1328,7 +1322,7 @@ async fn apply_staged_under_lock(
         plan.ids.clone(),
         operator,
     );
-    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
@@ -1543,7 +1537,7 @@ pub async fn run_in_transaction(
 }
 
 /// Stamps a snapshot with where it came from.
-fn with_provenance(mut snapshot: StateSnapshot) -> StateSnapshot {
-    snapshot.git_sha = db::git_sha();
+fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> StateSnapshot {
+    snapshot.git_sha = db::git_sha(root);
     snapshot
 }

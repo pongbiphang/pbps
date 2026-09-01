@@ -5,6 +5,7 @@ mod db;
 mod declaration_file;
 mod deploy;
 mod dev;
+mod doctor;
 mod explain;
 mod hooks;
 mod init;
@@ -112,6 +113,17 @@ enum Command {
         /// connection string to a server pbps may create a scratch database on
         #[arg(long)]
         dev: Option<String>,
+    },
+
+    /// Check whether this project and its environments are ready
+    Doctor {
+        /// Check only this environment. Without it, every configured one
+        #[arg(long)]
+        env: Option<String>,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Explain a saved plan to whoever has to approve it
@@ -462,6 +474,9 @@ fn run() -> anyhow::Result<()> {
                 format == OutputFormat::Json,
             )
         }
+        Command::Doctor { env, format } => {
+            doctor::cmd_doctor(&project, env.as_deref(), format == OutputFormat::Json)
+        }
         Command::Validate { format } => cmd_validate(&project, format),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
         Command::Rename { from, to } => {
@@ -791,18 +806,25 @@ fn context() -> Context {
     }
 }
 
-fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
-    // Identity consistency is validate's job too (SPEC §5.3): two branches each
-    // adding a same-named column merge cleanly at the line level — two uids, two
-    // lines — so no git conflict flags it, and only a check can.
-    //
+/// Everything `validate` checks, as findings.
+///
+/// Extracted so `doctor` can run the same checks rather than a second, drifting
+/// copy of them (SPEC §14.1). A readiness command that disagreed with `validate`
+/// about whether the declarations are valid would be worse than one that never
+/// looked.
+pub fn validate_findings(
+    project: &Project,
+    dialect: &dyn Dialect,
+) -> (Vec<output::Finding>, ValidateData) {
     // Both halves run before either is allowed to fail. A bad merge produces a
     // broken declaration *and* a scrambled identity file together, and the rule
     // everywhere else in this tool is to report every problem in one pass rather
     // than fix-one-run-again.
     let loaded = load_quiet(project);
+    // Identity consistency is validate's job too (SPEC §5.3): two branches each
+    // adding a same-named column merge cleanly at the line level — two uids, two
+    // lines — so no git conflict flags it, and only a check can.
     let ids = read_ids_opt(project);
-    let dialect = dialect(project)?;
 
     let mut findings = Vec::new();
     if let Err(errs) = &loaded {
@@ -866,6 +888,12 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
             _ => None,
         },
     };
+    (findings, data)
+}
+
+fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
+    let dialect = dialect(project)?;
+    let (findings, data) = validate_findings(project, dialect.as_ref());
     let report = output::Report::new("validate", findings, Some(data));
 
     if format == OutputFormat::Json {
@@ -875,46 +903,53 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
     // The human view keeps the loader's own diagnostics, which quote the source
     // and point a caret at the value. Reducing them to the finding's one-line
     // message here would throw away the part that makes them worth having.
-    if let Err(errs) = &loaded {
-        for e in errs {
-            print_load_error(e);
+    let load_errors: Vec<&output::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("load."))
+        .collect();
+    if !load_errors.is_empty() {
+        // Re-loading to render is cheap and keeps one collection point for the
+        // checks; the alternative is `validate_findings` returning the raw
+        // errors as well and every other caller ignoring them.
+        if let Err(errs) = load_quiet(project) {
+            for e in &errs {
+                print_load_error(e);
+            }
         }
     }
     let unlocated: Vec<output::Finding> = report
         .findings
         .iter()
-        .filter(|f| f.id != "load.io" && f.id != "load.yaml" && f.id != "load.semantic")
+        .filter(|f| !f.id.starts_with("load."))
         .cloned()
         .collect();
     eprint!("{}", output::human(&unlocated));
 
-    if let Ok(l) = &loaded
-        && unlocated.is_empty()
-    {
-        println!(
-            "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
-            dialect.name(),
-            l.schema.tables.len(),
-            l.schema
-                .tables
-                .values()
-                .map(|t| t.columns.len())
-                .sum::<usize>(),
-            l.schema.modules.len()
-        );
-    }
-    match &ids {
-        Ok(Some(i)) => println!(
-            "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
-            i.tables.len(),
-            i.columns.len(),
-            i.tombstones.len()
-        ),
-        Ok(None) => println!(
-            "No identity file yet at `{}`; run `pbps plan` to create it.",
-            project.ids_file().display()
-        ),
-        Err(_) => {}
+    if let Some(d) = &report.data {
+        if load_errors.is_empty() && unlocated.is_empty() {
+            println!(
+                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
+                d.dialect, d.tables, d.columns, d.modules
+            );
+        }
+        match &d.identity {
+            Some(i) => println!(
+                "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
+                i.tables, i.columns, i.tombstones
+            ),
+            None if !report
+                .findings
+                .iter()
+                .any(|f| f.id == "identity.inconsistent") =>
+            {
+                println!(
+                    "No identity file yet at `{}`; run `pbps plan` to create it.",
+                    project.ids_file().display()
+                )
+            }
+            None => {}
+        }
     }
 
     report.outcome()
@@ -926,20 +961,20 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
 /// broken" needs the 40, and a payload that vanished on failure would make the
 /// only interesting case the one with no context.
 #[derive(serde::Serialize)]
-struct ValidateData {
-    dialect: &'static str,
-    tables: usize,
-    columns: usize,
-    modules: usize,
+pub struct ValidateData {
+    pub dialect: &'static str,
+    pub tables: usize,
+    pub columns: usize,
+    pub modules: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    identity: Option<IdentityCounts>,
+    pub identity: Option<IdentityCounts>,
 }
 
 #[derive(serde::Serialize)]
-struct IdentityCounts {
-    tables: usize,
-    columns: usize,
-    tombstones: usize,
+pub struct IdentityCounts {
+    pub tables: usize,
+    pub columns: usize,
+    pub tombstones: usize,
 }
 
 /// Canonicalizes every declaration file.
@@ -1249,7 +1284,7 @@ fn cmd_plan(
             cs.clone(),
             res.ids.clone(),
         );
-        plan.git_sha = db::git_sha();
+        plan.git_sha = db::git_sha(project.root());
         write_plan(path, &plan)?;
         println!(
             "\nwrote {} (a preview; `apply` will refuse it)",

@@ -91,12 +91,32 @@ pub fn require_mssql(project: &Project, command: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `dir` is inside a git checkout at all.
+///
+/// Distinct from [`git_sha`] returning `None`, which a checkout with no commits
+/// yet also does. The two have different remedies — install git and clone, or
+/// make the first commit — and `doctor` has to give the right one.
+pub fn in_checkout(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// The commit the declarations were read from, when there is one.
 ///
 /// Absent outside a checkout, which is legitimate: an air-gapped host applying
 /// an exported plan has no git. The ledger records `None` rather than a lie.
-pub fn git_sha() -> Option<String> {
+///
+/// Asked about the *project* directory, not the process's. `--project` points
+/// somewhere else, and a sha read from the shell's location would stamp a plan
+/// with a commit that has nothing to do with the declarations in it.
+pub fn git_sha(dir: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()?;

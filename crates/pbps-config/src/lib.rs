@@ -244,6 +244,21 @@ impl Project {
         self.root.join(&self.config.ids_file)
     }
 
+    /// The directory holding `pbps.yml`. Every path in the config is relative
+    /// to it, and so is anything asked of git about this project.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Path to this project's `pbps.yml`.
+    ///
+    /// Discovery searches upwards, so a user two directories down cannot
+    /// otherwise tell which file the command is obeying — which is exactly the
+    /// question `pbps doctor` exists to answer.
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join(CONFIG_FILE)
+    }
+
     /// Looks up a named environment, listing what does exist when it does not.
     ///
     /// A typo in an environment name would otherwise deploy nothing and say
