@@ -1141,6 +1141,10 @@ pbps explain --plan plan.json
   -> the reviewer's explanation, no credentials required
 ```
 
+Implementation status: the `init` link of this journey is built, including
+`--from`, staged round-trip validation, an every-file preview and installing
+`pbps.yml` last. The remaining Phase 3.1 links are in progress.
+
 Acceptance criteria for that slice:
 
 1. A user with a supported existing database can reach a reviewable plan without

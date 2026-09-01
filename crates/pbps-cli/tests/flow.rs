@@ -307,6 +307,259 @@ fn a_directory_without_a_project_file_is_reported_clearly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---- init (SPEC 14.2) ----
+
+#[test]
+fn init_creates_a_complete_valid_project_without_an_existing_config() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--env", "qa-east"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(dir.join("pbps.yml").is_file());
+    assert!(dir.join("schema").is_dir());
+    assert!(dir.join("schema.ids.json").is_file());
+    let config = std::fs::read_to_string(dir.join("pbps.yml")).unwrap();
+    assert!(config.contains("QA_EAST_CONN"), "{config}");
+    assert!(config.contains("config schema 1"), "{config}");
+
+    let validate = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+    assert!(stdout(&o).contains("Next: `pbps validate`"));
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pbps-init-")),
+        "the staging directory must not survive a successful init"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// git tracks files, not directories. A project initialized with no
+/// declarations used to lose `schema/` on the first clone, and every command
+/// then failed on a directory the user had never deleted.
+#[test]
+fn an_initialized_project_survives_a_clone() {
+    let root = std::env::temp_dir().join(format!("pbps-init-clone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let origin = root.join("origin");
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&origin)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(origin.join("schema/.gitkeep").is_file());
+    // The listing must name every file init creates, or the preview is not one.
+    assert!(stdout(&o).contains(".gitkeep"), "{}", stdout(&o));
+
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+    };
+    git(&["init", "-q"], &origin);
+    git(&["config", "user.email", "d@e.f"], &origin);
+    git(&["config", "user.name", "demo"], &origin);
+    git(&["add", "-A"], &origin);
+    git(&["commit", "-qm", "init"], &origin);
+
+    let clone = root.join("clone");
+    git(
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+        &root,
+    );
+    assert!(
+        clone.join("schema").is_dir(),
+        "the declaration directory did not survive the clone"
+    );
+
+    for command in ["validate", "plan"] {
+        let o = Command::new(BIN)
+            .arg("--project")
+            .arg(&clone)
+            .arg(command)
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "{command}: {}", stderr(&o));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The file init writes itself cannot be the thing that blocks init.
+#[test]
+fn init_accepts_a_declaration_directory_holding_only_an_empty_gitkeep() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("schema")).unwrap();
+    std::fs::write(dir.join("schema/.gitkeep"), "").unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(dir.join("pbps.yml").is_file());
+    assert!(dir.join("schema/.gitkeep").is_file());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pbps-init-")),
+        "the staging directory must not survive a successful init"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Project::discover` walks the target's ancestors, so a lexical `..` used to
+/// put the project being escaped from on that walk and refuse a sibling.
+#[test]
+fn init_into_a_sibling_directory_is_not_refused_by_the_project_it_escapes() {
+    let root = std::env::temp_dir().join(format!("pbps-init-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let inside = root.join("a/b");
+    std::fs::create_dir_all(&inside).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&inside)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = Command::new(BIN)
+        .args(["--project", "../newproj", "init", "--env", "dev"])
+        .current_dir(&inside)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(root.join("a/newproj/pbps.yml").is_file());
+
+    // The guard itself still holds: a directory genuinely under the project is
+    // refused.
+    let o = Command::new(BIN)
+        .args(["--project", "nested", "init", "--env", "dev"])
+        .current_dir(&inside)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(stderr(&o).contains("already inside"), "{}", stderr(&o));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn init_refuses_existing_files_without_changing_them() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-existing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("schema")).unwrap();
+    // Non-YAML files matter too. A common `.gitkeep` used to pass the initial
+    // check, then make the commit fail after staging and leave the staging tree
+    // behind.
+    let declaration = dir.join("schema/.gitkeep");
+    std::fs::write(&declaration, "do not touch me\n").unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("will not overwrite"), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read_to_string(&declaration).unwrap(),
+        "do not touch me\n"
+    );
+    assert!(!dir.join("pbps.yml").exists());
+    assert!(!dir.join("schema.ids.json").exists());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pbps-init-")),
+        "a refusal must not leave a staging directory"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_from_a_missing_connection_variable_leaves_no_project() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-no-conn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let var = format!("PBPS_INIT_MISSING_{}", std::process::id());
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--from", "prod", "--url-env", &var])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1);
+    let err = stderr(&o);
+    assert!(err.contains(&var), "{err}");
+    assert!(err.contains("Export it"), "{err}");
+    assert!(!dir.join("pbps.yml").exists());
+    assert!(!dir.join("schema.ids.json").exists());
+    assert!(!dir.join("schema").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pull_accepts_the_pristine_identity_file_created_by_init() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-pull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let init = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--env", "source"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&init), 0, "{}", stderr(&init));
+
+    let pull = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args([
+            "pull",
+            "--db",
+            "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&pull), 1);
+    let err = stderr(&pull);
+    assert!(!err.contains("already has declarations"), "{err}");
+    assert!(err.contains("cannot reach"), "pull should connect: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A jump-version deploy: with an environment several versions behind, a rename
 /// must still read as a rename. This is the property the uid matching design
 /// exists to protect, checked once more against real files.
@@ -1107,6 +1360,50 @@ fn a_rehearsal_against_a_real_engine_reports_convergence() {
     // Edition honesty: a green rehearsal must not read as a promise about the
     // target, and the scratch database must be gone either way.
     assert!(out.contains("still a preview"), "{out}");
+}
+
+/// The first command in the Phase 3.1 journey has to work against a real
+/// catalog, not merely construct an empty project offline. The configured test
+/// database may contain any supported objects; init must render all of them and
+/// leave a project that the ordinary loader accepts.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn init_from_a_real_database_produces_a_valid_project() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let dir = std::env::temp_dir().join(format!("pbps-init-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let var = format!("PBPS_INIT_LIVE_{}", std::process::id());
+
+    let o = Command::new(BIN)
+        .env(&var, &connection)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--from", "source", "--url-env", &var])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("pbps baseline --env source --reason initial-adoption"),
+        "{}",
+        stdout(&o)
+    );
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !all.contains(&connection),
+        "connection string leaked: {all}"
+    );
+
+    let validate = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+    assert!(dir.join("schema.ids.json").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A password must not reach a log even when the command fails, and the failure
