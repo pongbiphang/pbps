@@ -91,6 +91,28 @@ impl IdsFile {
         self.columns.iter().find(|(_, n)| *n == r).map(|(u, _)| u)
     }
 
+    /// Moves a table, and the columns under it, to a new name.
+    ///
+    /// The uids do not change — that is the point of an identity file, and it is
+    /// what makes this the right operation to record "the object is now called
+    /// something else" without deciding anything about identity.
+    ///
+    /// A no-op when nothing is called `from`, so replaying a sequence of renames
+    /// over a mapping that has already absorbed some of them is safe.
+    pub fn rename_table(&mut self, from: &TableName, to: &TableName) {
+        let Some(uid) = self.table_uid(from).cloned() else {
+            return;
+        };
+        self.tables.insert(uid, to.clone());
+        // The columns travel with it, or the mapping would name them under a
+        // table that no longer exists.
+        for r in self.columns.values_mut() {
+            if &r.table == from {
+                r.table = to.clone();
+            }
+        }
+    }
+
     /// Checks internal consistency.
     ///
     /// The tool writes this file itself, so under normal conditions it cannot
@@ -185,6 +207,45 @@ mod tests {
     #[test]
     fn sample_is_valid() {
         sample().validate().unwrap();
+    }
+
+    /// A staged apply replays the renames the emitter declared, one statement
+    /// at a time, so a table halfway through a cross-schema move can still be
+    /// found. The uids must not move: this records where an object *is*, not a
+    /// decision about what it is.
+    #[test]
+    fn renaming_a_table_moves_its_columns_and_keeps_every_uid() {
+        let mut f = sample();
+        // The two halves of `dbo.customer` -> `sales.client`, in order.
+        f.rename_table(
+            &"dbo.customer".parse().unwrap(),
+            &"sales.customer".parse().unwrap(),
+        );
+        assert_eq!(
+            f.tables[&uid("t_a9k2mq")],
+            "sales.customer".parse().unwrap()
+        );
+        assert_eq!(
+            f.columns[&uid("c_k7x2mq")],
+            col("sales.customer.customer_id")
+        );
+
+        f.rename_table(
+            &"sales.customer".parse().unwrap(),
+            &"sales.client".parse().unwrap(),
+        );
+        assert_eq!(f.tables[&uid("t_a9k2mq")], "sales.client".parse().unwrap());
+        assert_eq!(f.columns[&uid("c_p3n8vd")], col("sales.client.full_name"));
+        f.validate().unwrap();
+
+        // Replaying a rename the mapping has already absorbed changes nothing,
+        // which is what makes a resume safe to start from a checkpoint.
+        let before = f.clone();
+        f.rename_table(
+            &"dbo.customer".parse().unwrap(),
+            &"sales.customer".parse().unwrap(),
+        );
+        assert_eq!(f, before);
     }
 
     #[test]

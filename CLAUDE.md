@@ -267,13 +267,25 @@ Phase 3.5 additions worth knowing before touching them:
 31. **Module changes bracket the table changes.** Drops sort first (a
     SCHEMABINDING view blocks a rename), creates last (they select columns that
     must exist), and within each group the order comes from an identifier scan
-    over the definition text, with `depends_on:` as the escape hatch.
+    over the definition text — of the **code only**, so a name in a comment or
+    a literal invents no edge — with `depends_on:` as the escape hatch.
+    *Known limitation*: an alter that **releases** a schema-bound dependency
+    would have to run first, and one rank cannot serve both directions. Left
+    unfixed on purpose; the reasoning and the trade are in ADR-0002 under
+    "Known limitation".
 32. **A staged plan is one logical change, and its mode lives in the file.**
     `apply --staged` runs it outside a transaction with a `staged` ledger entry
     per completed statement; `--resume` re-checks the live state against the
     checkpoint before continuing. An unfinished checkpoint makes the
     environment mid-deployment: `plan --db` and a fresh `apply` refuse, and
     `status` reports `staged`.
+33. **A checkpoint's `ids` are the names at that checkpoint**, not the plan's.
+    One `RenameTable` can take two statements, and between them the table is at
+    `[new schema].[old name]` — a name in neither the baseline nor the plan.
+    Each `Statement` therefore declares its own renames, the staged loop
+    replays them, and the checkpoint records what the catalog actually has.
+    Deriving that name anywhere else would be a second copy of the emitter's
+    statement order.
 
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.
@@ -281,7 +293,8 @@ only). CLI commands and YAML annotations both work; nothing is blocked.
 **Live tests**: the SPEC §11.5 invariants plus the Phase 3 and 3.5 ones (the
 ledger round-trip, the lock admitting one holder, a failed statement rolling the
 whole plan back, the rename-impact queries, the probes counting real rows, a
-staged checkpoint surviving `state_json`, and the module round-trip through
+staged checkpoint surviving `state_json`, a cross-schema rename stopping at the
+name its statement declared, and the module round-trip through
 `sys.sql_modules`) run against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The

@@ -531,17 +531,22 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
     // `sp_rename` cannot move a table between schemas, and `ALTER SCHEMA
     // TRANSFER` cannot rename it. A rename that does both therefore needs both,
     // in this order: transfer first, then rename inside the new schema.
+    // Each statement declares what it does to the name (`Statement::renaming`).
+    // Between the two the table is at `[new schema].[old name]`, which is in
+    // neither the baseline nor the plan — and a staged apply checkpoints there.
     let mut current = from.clone();
     if from.schema != to.schema {
+        let moved = TableName::new(to.schema.clone(), current.name.clone());
         out.push(
             Statement::new(format!(
                 "ALTER SCHEMA {} TRANSFER {};",
                 quote(&to.schema)?,
                 qualified(&current)?
             ))
-            .own_batch(),
+            .own_batch()
+            .renaming(current.clone(), moved.clone()),
         );
-        current = TableName::new(to.schema.clone(), current.name.clone());
+        current = moved;
     }
     if current.name != to.name {
         out.push(
@@ -552,7 +557,8 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
                 literal(&qualified(&current)?),
                 literal(&to.name)
             ))
-            .own_batch(),
+            .own_batch()
+            .renaming(current.clone(), to.clone()),
         );
     }
     Ok(out)
@@ -779,6 +785,54 @@ mod tests {
                 "ALTER SCHEMA [app] TRANSFER [dbo].[old_name];",
                 "EXEC sp_rename N'[app].[old_name]', N'new_name', 'OBJECT';"
             ]
+        );
+    }
+
+    /// Each statement declares what it does to the name, so nothing downstream
+    /// has to re-derive the emitter's statement order. A staged apply
+    /// checkpoints between these two, and `[app].[old_name]` is the only name
+    /// under which the table can be found at that moment.
+    #[test]
+    fn a_cross_schema_rename_declares_both_halves_of_the_move() {
+        let stmts = emit(
+            &Change::RenameTable {
+                uid: uid("t_k7x2mq"),
+                from: tname("dbo.old_name"),
+                to: tname("app.new_name"),
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+        assert_eq!(
+            stmts[0].renames,
+            [(tname("dbo.old_name"), tname("app.old_name"))]
+        );
+        assert_eq!(
+            stmts[1].renames,
+            [(tname("app.old_name"), tname("app.new_name"))]
+        );
+
+        // A rename within one schema is one statement and has no intermediate.
+        let stmts = emit(
+            &Change::RenameTable {
+                uid: uid("t_k7x2mq"),
+                from: tname("dbo.old_name"),
+                to: tname("dbo.new_name"),
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0].renames,
+            [(tname("dbo.old_name"), tname("dbo.new_name"))]
+        );
+
+        // And a statement that renames nothing says nothing.
+        assert!(
+            emit(&an_index(), Strategy::default()).expect("emit")[0]
+                .renames
+                .is_empty()
         );
     }
 

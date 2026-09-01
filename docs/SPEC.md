@@ -282,10 +282,23 @@ Two more rules, both consequences of the model rather than choices:
   answers this before the engine does — at apply time the answer arrives on a
   database that is already half-changed.
 
-A module created `WITH ENCRYPTION`, a CLR object, and a view carrying options
-the model cannot hold (`WITH SCHEMABINDING`) have no manageable form. `pull`
-inventories them with the reason and leaves them alone; it never recreates one
-without the option nobody noticed it had.
+A module created `WITH ENCRYPTION`, a CLR object, one created with
+`QUOTED_IDENTIFIER` or `ANSI_NULLS` OFF (the engine persists those with the
+module and re-applies them on every execution, so the same text recreated under
+the deployment connection's settings would not mean the same thing), and a view
+carrying options the model cannot hold (`WITH SCHEMABINDING`) have no
+manageable form. `pull` inventories them with the reason and leaves them alone;
+it never recreates one without the option nobody noticed it had.
+
+**One ordering case is knowingly unserved.** Module drops sort before the table
+changes and creates and alters after them, which is right for an alter that
+begins using a column the same plan adds, and wrong for an alter that *releases*
+a schema-bound dependency the same plan then drops. The second needs to run
+first, one rank cannot be both, and telling them apart needs facts the model
+does not carry. The plan fails at apply, loudly and with nothing changed; the
+alternative — drop and recreate the module around the table changes — succeeds
+while destroying its GRANTs, which pbps cannot see, restore, or warn about
+until ADR-0005. ADR-0002 records the trade in full.
 
 ---
 

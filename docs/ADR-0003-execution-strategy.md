@@ -99,10 +99,17 @@ where both meet.
   what the deployment gate approves, so an approver has to be able to see that
   this index will be rebuilt online. A strategy resolved at emit time against a
   YAML file the deployment host may not even have is a hint nobody reviewed.
-- **`WITH (ONLINE = ON)` is not accepted everywhere the intuition says.** A
-  UNIQUE constraint is backed by an index and takes it; a foreign key and a
-  check are metadata only, where the clause is a syntax error rather than a
-  no-op. The emitter's three-way `DROP CONSTRAINT` arm had to be split.
+- **`WITH (ONLINE = ON)` is not accepted everywhere the intuition says.**
+  Building a unique constraint online works, because it is index-backed. Every
+  *drop* refuses it unless the index behind it is clustered — and this emitter
+  writes no `CLUSTERED`, so `DROP INDEX`, `DROP CONSTRAINT` for a unique key,
+  and a primary-key drop all take no clause at all. A foreign key and a check
+  are metadata only, where it is a syntax error rather than a no-op.
+- **Whether a statement carries the clause is asked of the emitter, and by
+  comparing two emissions rather than searching the text.** A second list of
+  change kinds would drift from the emitter; searching the SQL would read the
+  user's own expressions, and a column default of `'ONLINE = ON'` would have
+  refused a valid plan on Standard edition.
 - **A staged plan's mode belongs in the file, and the flag has to agree with
   it.** Running whichever the operator typed would be the tool choosing the
   loser of a disagreement about what was approved.
@@ -110,6 +117,28 @@ where both meet.
   recorded baseline is then a checkpoint, not a state anybody signed off, so
   `plan --db` and a fresh `apply` both refuse until it is finished or
   baselined, and `status` reports it as its own state rather than as `ok`.
+  Drift does not displace that: an environment that is both staged and moved
+  stays `staged`, because the way out is `--resume` or a new baseline and the
+  drift workflow cannot finish a half-applied plan.
+- **A checkpoint's identity file is the mapping at that checkpoint.** One
+  `RenameTable` can need two statements — `sp_rename` cannot move a table
+  between schemas and `ALTER SCHEMA TRANSFER` cannot rename it — and between
+  them the table sits at `[new schema].[old name]`, which appears in neither
+  the baseline nor the plan. Scoping the checkpoint by the plan's mapping left
+  the table out of the record entirely, so a change made to it while the
+  deployment was paused was invisible to `--resume` and was carried into the
+  closing entry as the applied state.
+
+  The name cannot be derived downstream without keeping a second copy of the
+  emitter's statement order, so each `Statement` declares the renames it
+  performs and the staged loop replays them. That the declaration matches what
+  the engine does is a live test: a unit test would be comparing the emitter
+  with itself.
+
+  What this does **not** close is the window itself. `__pbps_lock` protects
+  against mistakes, not tampering, so a second connection can change a table
+  mid-apply whatever the checkpoint records. It closes the part that was
+  pbps's own: the change is now seen and refused instead of blessed.
 
 ## Ruled out
 

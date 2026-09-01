@@ -682,6 +682,73 @@ async fn a_staged_checkpoint_survives_the_ledger() {
     db.drop().await;
 }
 
+/// A cross-schema rename is two statements, and a staged apply checkpoints
+/// between them. The name the table carries in that gap is what the checkpoint
+/// has to record, and the emitter is the only thing that can say what it is
+/// (`Statement::renames`) — so what it says had better be what the engine did.
+///
+/// Only a real server can answer that: a unit test would be comparing the
+/// emitter against itself.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_cross_schema_rename_stops_where_the_emitter_says_it_does() {
+    let mut db = TestDb::create("rename_gap").await;
+    db.conn
+        .execute("CREATE SCHEMA [sales];")
+        .await
+        .expect("create the target schema");
+    db.conn
+        .execute("CREATE TABLE [dbo].[customer] ([id] int NOT NULL);")
+        .await
+        .expect("create the table");
+
+    let statements = Mssql
+        .emit(
+            &pbps_model::Change::RenameTable {
+                uid: "t_a9k2mq".parse().unwrap(),
+                from: "dbo.customer".parse().unwrap(),
+                to: "sales.client".parse().unwrap(),
+            },
+            pbps_model::Strategy::default(),
+        )
+        .expect("emit");
+    assert_eq!(statements.len(), 2, "a cross-schema rename takes both");
+
+    // Run only the first, exactly as a staged apply that stopped there would
+    // have, and ask the catalog what the table is called now.
+    db.conn
+        .execute(&statements[0].sql)
+        .await
+        .expect("transfer the table");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let names: Vec<TableName> = pulled.schema.tables.keys().cloned().collect();
+
+    let (from, to) = &statements[0].renames[0];
+    assert_eq!(from, &"dbo.customer".parse::<TableName>().unwrap());
+    assert_eq!(
+        names,
+        vec![to.clone()],
+        "the emitter said the table would be at `{to}`; the catalog says `{names:?}`"
+    );
+
+    // And the second statement finishes the move it declared.
+    db.conn
+        .execute(&statements[1].sql)
+        .await
+        .expect("rename the table");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert_eq!(
+        pulled.schema.tables.keys().cloned().collect::<Vec<_>>(),
+        vec![statements[1].renames[0].1.clone()]
+    );
+
+    db.drop().await;
+}
+
 /// SPEC §8.1: `__pbps_lock` stops two pipelines applying at once. The gate is
 /// the insert itself, not a preceding read — a check-then-insert would let two
 /// runners through the check together.

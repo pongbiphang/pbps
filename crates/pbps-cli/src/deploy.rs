@@ -1128,14 +1128,23 @@ async fn apply_staged_under_lock(
                 entry.snapshot.plan_checksum.as_deref().unwrap_or("none")
             );
         }
-        // The drift check, applied to a half-finished plan. The mapping used is
-        // the plan's on both sides, so the comparison is like with like
-        // whichever statement the run stopped after.
+        // The drift check, applied to a half-finished plan. The mapping is the
+        // checkpoint's own — which names every managed table as the catalog had
+        // it at that moment, intermediate rename names included. Using the
+        // plan's here instead would leave a table that is mid-rename out of both
+        // sides, and a change someone made to it while the deployment was
+        // paused would pass unseen into the closing entry.
         let after_modules = modules_after(&entry.snapshot, &plan.changes);
-        let scoped =
-            managed_state(conn, &plan.ids, &after_modules, project.config.unmanaged).await?;
-        let live = pbps_model::state_checksum(&scoped.schema, &plan.ids);
-        let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, &plan.ids);
+        let at_checkpoint = &entry.snapshot.ids;
+        let scoped = managed_state(
+            conn,
+            at_checkpoint,
+            &after_modules,
+            project.config.unmanaged,
+        )
+        .await?;
+        let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
+        let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, at_checkpoint);
         if live != checkpoint {
             bail!(
                 "`{}` has moved since the checkpoint at entry #{}.\n\
@@ -1209,6 +1218,11 @@ async fn apply_staged_under_lock(
     };
 
     let total = statements.len();
+    // The names the catalog has right now. It starts at whatever the newest
+    // entry recorded — the last ordinary state on a fresh run, the checkpoint
+    // on a resume — and each statement moves it, using what the emitter said
+    // that statement does (`Statement::renames`).
+    let mut live_ids = entry.snapshot.ids.clone();
     println!(
         "Applying {} statement(s) without a transaction...",
         total - start
@@ -1225,29 +1239,33 @@ async fn apply_staged_under_lock(
             ));
         }
 
+        // Applied before the checkpoint is taken: this statement has committed,
+        // so the names it moved are the names the catalog has now.
+        for (from, to) in &stmt.renames {
+            live_ids.rename_table(from, to);
+        }
+
         // The unmanaged policy is deliberately not enforced between two
-        // committed statements. A staged plan is executed one statement at a
-        // time, and a table can sit at a name neither the baseline nor the plan
-        // records while it is halfway through: a rename that moves both the
-        // schema and the object name transfers first and renames second. Under
-        // `unmanaged: error` that would abort *after* the DDL committed and
-        // leave no checkpoint to resume from — the policy is a hygiene gate for
-        // the start of a command, and it was already applied there.
-        //
-        // The table is then briefly outside this checkpoint's scope, which is
-        // safe because `--resume` scopes the live side by `plan.ids` too: both
-        // sides of that comparison leave out the same object.
+        // committed statements. It is a hygiene gate for the start of a
+        // command, where it already ran, and failing it here would abort
+        // *after* the DDL committed and leave no checkpoint to resume from.
         let after = managed_state(
             conn,
-            &plan.ids,
+            &live_ids,
             &modules_after(&entry.snapshot, &plan.changes),
             pbps_config::Unmanaged::Ignore,
         )
         .await?;
+        // Scoped and identified by `live_ids`, not by the plan's mapping: a
+        // checkpoint records the database as it stands, and halfway through a
+        // rename that moves both the schema and the name, the table stands at
+        // neither end. `--resume` reads this mapping back and compares against
+        // it, so a hand-made change to that table while the deployment is
+        // paused is seen rather than carried silently into the closing entry.
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
             after.schema,
-            plan.ids.clone(),
+            live_ids.clone(),
             operator,
         );
         checkpoint.git_sha = plan.git_sha.clone().or_else(db::git_sha);

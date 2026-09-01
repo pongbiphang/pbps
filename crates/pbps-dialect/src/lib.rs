@@ -121,6 +121,27 @@ pub struct Statement {
     /// specific (certain ONLINE index operations, full-text). Defaulting to
     /// `true` is therefore right, and the emitter marks the exceptions.
     pub transactional: bool,
+
+    /// The object renames this statement performs, `(from, to)`, in order.
+    ///
+    /// # Why the emitter has to say this
+    ///
+    /// One [`pbps_model::Change::RenameTable`] can need two statements — SQL
+    /// Server's `sp_rename` cannot move a table between schemas and `ALTER
+    /// SCHEMA TRANSFER` cannot rename it — and between them the table carries a
+    /// name that appears in neither the baseline nor the plan. A staged apply
+    /// checkpoints after every statement, so that intermediate name is the only
+    /// one under which the table can be found, and a checkpoint that cannot
+    /// find it records the environment without it.
+    ///
+    /// Working the name out anywhere else would mean a second copy of the
+    /// emitter's statement order, and the two would drift. The emitter knows
+    /// what its own SQL does to a name, so it says so — the same reason SQL
+    /// itself is written in exactly one place.
+    ///
+    /// Empty for every statement that renames nothing, which is nearly all of
+    /// them.
+    pub renames: Vec<(TableName, TableName)>,
 }
 
 impl Statement {
@@ -129,7 +150,14 @@ impl Statement {
             sql: sql.into(),
             own_batch: false,
             transactional: true,
+            renames: Vec::new(),
         }
+    }
+
+    /// Records that this statement moves `from` to `to`.
+    pub fn renaming(mut self, from: TableName, to: TableName) -> Self {
+        self.renames.push((from, to));
+        self
     }
 
     pub fn own_batch(mut self) -> Self {

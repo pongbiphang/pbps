@@ -11,12 +11,20 @@ use crate::schema::Schema;
 
 /// The current state-snapshot format version.
 ///
-/// Bumped to 2 when `Schema` grew `modules`. What a state records is what a
+/// Bumped to 2 when `Schema` grew `modules`: what a state records is what a
 /// drift check compares, so an older client would deserialize a new snapshot,
 /// silently ignore the modules in it, introspect only tables, and report a
 /// clean verification for an environment whose managed procedure has drifted.
-/// Readers refuse a version they do not understand instead.
-pub const CURRENT_VERSION: u32 = 2;
+///
+/// Bumped to 3 when a staged checkpoint's `ids` became the mapping *at that
+/// checkpoint* rather than the plan's. An older client resuming a version 3
+/// checkpoint would scope the live side by the plan's names and the recorded
+/// side by the checkpoint's — two different sets of objects — and refuse the
+/// resume with a checksum mismatch it cannot explain.
+///
+/// Readers refuse a version they do not understand rather than reading it
+/// partially.
+pub const CURRENT_VERSION: u32 = 3;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
