@@ -219,37 +219,94 @@ pub trait Dialect {
     /// and folding case here would also fold it inside string literals, where
     /// it means something.
     fn normalize_definition(&self, definition: &str) -> String {
+        // What the scanner is in the middle of. Layout is only layout in
+        // `Code`: inside a literal or a quoted identifier the spacing is data,
+        // and after `--` the *line ending* is what stops the comment, so
+        // collapsing it would splice the next line into the comment and make
+        // two bodies that run differently compare equal.
+        enum At {
+            Code,
+            Quoted(char),
+            Line,
+            /// Carrying how many non-space characters have been consumed, so
+            /// that the `*` of the opener cannot also close it (`/*/`).
+            Block(usize),
+        }
+
         let mut out = String::with_capacity(definition.len());
         let mut in_space = false;
-        // The quote character currently open, if any. Whitespace inside a string
-        // literal or a quoted identifier is data, not layout: collapsing
-        // `SELECT 'a  b'` to `SELECT 'a b'` would make two module bodies that
-        // return different rows compare equal, and `diff_modules` would never
-        // emit the `AlterModule` that fixes it.
-        let mut quote: Option<char> = None;
-        for ch in definition.trim().chars() {
-            if let Some(q) = quote {
-                // A doubled `''` needs no special case: the first closes the
-                // literal and the second opens it again, and everything between
-                // them is copied either way.
-                if if q == '[' { ch == ']' } else { ch == q } {
-                    quote = None;
+        let mut at = At::Code;
+        let text = definition.trim();
+        let bytes = text.as_bytes();
+
+        for (i, ch) in text.char_indices() {
+            match at {
+                At::Quoted(q) => {
+                    // A doubled `''` needs no special case: the first closes the
+                    // literal and the second opens it again, and everything
+                    // between them is copied either way.
+                    if if q == '[' { ch == ']' } else { ch == q } {
+                        at = At::Code;
+                    }
+                    out.push(ch);
                 }
-                out.push(ch);
-                continue;
+                At::Line => {
+                    if ch == '\n' {
+                        // The newline is the comment's terminator, so it is
+                        // structure. Its own trailing spaces are not.
+                        while out.ends_with(' ') {
+                            out.pop();
+                        }
+                        out.push('\n');
+                        at = At::Code;
+                        in_space = false;
+                    } else if ch.is_whitespace() {
+                        in_space = true;
+                    } else {
+                        if in_space {
+                            out.push(' ');
+                        }
+                        in_space = false;
+                        out.push(ch);
+                    }
+                }
+                At::Block(seen) => {
+                    // A block comment ends at `*/` wherever it falls, so nothing
+                    // inside it is structure and its layout collapses like code.
+                    if ch.is_whitespace() {
+                        in_space = true;
+                    } else {
+                        if in_space {
+                            out.push(' ');
+                        }
+                        in_space = false;
+                        out.push(ch);
+                        at = if ch == '/' && seen >= 2 && out.ends_with("*/") {
+                            At::Code
+                        } else {
+                            At::Block(seen + 1)
+                        };
+                    }
+                }
+                At::Code => {
+                    if ch.is_whitespace() {
+                        in_space = true;
+                        continue;
+                    }
+                    if in_space && !out.is_empty() && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    in_space = false;
+                    let next = bytes.get(i + ch.len_utf8()).copied();
+                    at = match (ch, next) {
+                        ('-', Some(b'-')) => At::Line,
+                        ('/', Some(b'*')) => At::Block(0),
+                        ('\'' | '"' | '[', _) => At::Quoted(ch),
+                        _ => At::Code,
+                    };
+                    out.push(ch);
+                }
             }
-            if ch.is_whitespace() {
-                in_space = true;
-                continue;
-            }
-            if in_space && !out.is_empty() {
-                out.push(' ');
-            }
-            in_space = false;
-            if matches!(ch, '\'' | '"' | '[') {
-                quote = Some(ch);
-            }
-            out.push(ch);
         }
         out
     }
@@ -468,6 +525,42 @@ mod tests {
         assert_ne!(
             d.normalize_definition("SELECT 'it''s  here'"),
             d.normalize_definition("SELECT 'it''s here'")
+        );
+    }
+
+    /// A `--` comment runs to the end of its line, so that line ending is
+    /// structure, not layout. Collapsing it splices the next statement into the
+    /// comment — and two bodies that execute differently would compare equal,
+    /// which means the change is never planned.
+    #[test]
+    fn a_line_comment_keeps_the_newline_that_ends_it() {
+        let d = MinimalDialect;
+        assert_ne!(
+            d.normalize_definition("SELECT 1 -- note\nUNION ALL SELECT 2"),
+            d.normalize_definition("SELECT 1 -- note UNION ALL SELECT 2")
+        );
+        // Indentation around the comment is still only indentation.
+        assert_eq!(
+            d.normalize_definition("SELECT 1   --  note\n   UNION ALL SELECT 2"),
+            d.normalize_definition("SELECT 1 -- note\nUNION ALL SELECT 2")
+        );
+    }
+
+    /// A block comment ends at `*/` wherever that falls, so nothing inside it
+    /// is structure — but a quote inside one must not be read as opening a
+    /// literal, and `/*/` must not close what it opened.
+    #[test]
+    fn a_block_comment_collapses_but_does_not_confuse_the_scanner() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.normalize_definition("SELECT /* it's\n   fine */ 1"),
+            d.normalize_definition("SELECT /* it's fine */ 1")
+        );
+        // If the opener's own `*` closed the comment, the `'` would be read as
+        // starting a literal and everything after it would keep its spacing.
+        assert_eq!(
+            d.normalize_definition("SELECT /*/ ' */ a  b"),
+            "SELECT /*/ ' */ a b"
         );
     }
 

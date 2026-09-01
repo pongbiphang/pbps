@@ -317,6 +317,31 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
     problems
 }
 
+/// Every `depends_on:` target has to be a declared module.
+///
+/// [`creation_order`] considers dependencies only between modules it is
+/// iterating, so an unknown name is silently a no-op. The declaration then
+/// passes every check while the ordering edge its author asked for does not
+/// exist — and the failure surfaces much later, as an apply that emits the
+/// dependent module first (the same argument as ADR-0003's rejection of unknown
+/// `strategy:` keys).
+pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, on) in deps {
+        for target in on {
+            if target == name {
+                problems.push(format!("`{name}` lists itself in `depends_on`"));
+            } else if !schema.modules.contains_key(target) {
+                problems.push(format!(
+                    "`{name}` depends on `{target}`, which is not a declared module; the ordering \
+                     it asks for would silently not happen"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +521,30 @@ mod tests {
             "{:?}",
             check_names(&schema)
         );
+    }
+
+    /// An ordering edge that silently does not exist is the failure this check
+    /// is for: the declaration looks right and the apply emits in the wrong
+    /// order much later.
+    #[test]
+    fn a_depends_on_target_that_is_not_declared_is_refused() {
+        let mut schema = Schema::default();
+        schema.modules.insert(n("dbo.a"), view("SELECT 1"));
+        schema.modules.insert(n("dbo.b"), view("SELECT 2"));
+
+        let mut deps = ModuleDeps::default();
+        deps.insert(n("dbo.b"), [n("dbo.a")].into_iter().collect());
+        assert!(check_dependencies(&schema, &deps).is_empty());
+
+        deps.insert(n("dbo.b"), [n("dbo.typo")].into_iter().collect());
+        assert!(
+            check_dependencies(&schema, &deps)[0].contains("not a declared module"),
+            "{:?}",
+            check_dependencies(&schema, &deps)
+        );
+
+        deps.insert(n("dbo.b"), [n("dbo.b")].into_iter().collect());
+        assert!(check_dependencies(&schema, &deps)[0].contains("lists itself"));
     }
 
     /// `on:` on a view would read as if it did something; it does not, and a

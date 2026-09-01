@@ -40,6 +40,13 @@ pub enum Source {
 pub struct Baseline {
     pub schema: Schema,
     pub ids: IdsFile,
+    /// The annotations that travelled beside that revision's declarations.
+    ///
+    /// Only `depends_on:` survives usefully — it is an ordering edge the
+    /// identifier scan cannot find, so rebuilding the baseline without it can
+    /// fail on declarations that were always valid. A baseline read from a state
+    /// file has none: a snapshot records the database, and hints are not in it.
+    pub hints: pbps_model::Hints,
     pub description: String,
     /// An empty baseline has to be flagged, or "everything is new" reads as a
     /// real plan.
@@ -58,6 +65,7 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
             Ok(Baseline {
                 schema: snap.schema,
                 ids: snap.ids,
+                hints: pbps_model::Hints::default(),
                 description: format!("baseline file {}", path.display()),
                 is_empty_fallback: false,
             })
@@ -66,6 +74,7 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
+            hints: pbps_model::Hints::default(),
             description: "empty baseline".into(),
             is_empty_fallback: true,
         }),
@@ -113,6 +122,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         return Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
+            hints: pbps_model::Hints::default(),
             description: format!(
                 "empty baseline (`{rev}` does not exist yet; this repo has no commits)"
             ),
@@ -145,6 +155,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     })?;
 
     let mut schema = Schema::default();
+    let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
     for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
@@ -159,6 +170,9 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
             // A module has no identity to reconstruct, so the baseline needs
             // nothing from it but the state itself (ADR-0002).
             Ok(pbps_load::LoadedFile::Module(m)) => {
+                if !m.depends_on.is_empty() {
+                    hints.module_deps.insert(m.name.clone(), m.depends_on);
+                }
                 schema.modules.insert(m.name, m.module);
                 count += 1;
             }
@@ -186,6 +200,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     Ok(Baseline {
         schema,
         ids,
+        hints,
         description: format!("git {rev} ({count} objects)"),
         is_empty_fallback: count == 0,
     })

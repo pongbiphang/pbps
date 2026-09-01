@@ -189,7 +189,16 @@ pub struct UnmanagedModule {
 /// silently would have the next apply recreate the view *without*
 /// SCHEMABINDING — a change nobody asked for, in the one direction that
 /// removes a guarantee.
-pub fn split_module(kind: ModuleKind, stored: &str) -> Option<(Option<TableName>, String)> {
+/// `has_parent` says whether the catalog can supply the trigger's target. When
+/// it can, an unqualified `ON customer` is no obstacle: the schema the text
+/// omits is exactly what `sys.objects` records, and `assemble` substitutes it.
+/// Refusing there would inventory as unmanageable the commonest spelling of a
+/// perfectly reproducible trigger.
+pub fn split_module(
+    kind: ModuleKind,
+    stored: &str,
+    has_parent: bool,
+) -> Option<(Option<TableName>, String)> {
     let s = stored;
     let mut i = keyword(s, 0, "create")?;
     // `OR ALTER` is optional: pbps emits it, a hand-written module has not.
@@ -220,12 +229,14 @@ pub fn split_module(kind: ModuleKind, stored: &str) -> Option<(Option<TableName>
             i = keyword(s, i, "on")?;
             let (table, after) = qualified_name(s, skip_ws(s, i))?;
             let on = match table.as_slice() {
-                [schema, name] => TableName::new(schema.clone(), name.clone()),
+                [schema, name] => Some(TableName::new(schema.clone(), name.clone())),
                 // An unqualified table means the default schema of whoever
-                // created it, which the catalog text does not record.
+                // created it, which the definition text does not record — so it
+                // is readable only when the catalog can answer instead.
+                [_] if has_parent => None,
                 _ => return None,
             };
-            Some((Some(on), s[after..].trim().to_owned()))
+            Some((on, s[after..].trim().to_owned()))
         }
         ModuleKind::Procedure | ModuleKind::Function => {
             Some((None, s[after_name..].trim().to_owned()))
@@ -607,7 +618,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
             continue;
         };
-        let Some((on, definition)) = split_module(m.kind, stored) else {
+        let Some((on, definition)) = split_module(m.kind, stored, m.parent.is_some()) else {
             unmanageable(
                 "its definition is not of a shape pbps can reproduce (a view with options such \
                  as SCHEMABINDING, or a trigger on an unqualified table)",
@@ -1114,8 +1125,8 @@ mod module_tests {
                 definition: body.to_owned(),
             };
             let stored = crate::emit::module_definition(&name, &module).expect("emit");
-            let (back_on, back_body) =
-                split_module(kind, &stored).unwrap_or_else(|| panic!("could not split:\n{stored}"));
+            let (back_on, back_body) = split_module(kind, &stored, false)
+                .unwrap_or_else(|| panic!("could not split:\n{stored}"));
             assert_eq!(back_body, body, "{kind}");
             assert_eq!(back_on, module.on, "{kind}");
         }
@@ -1131,7 +1142,7 @@ mod module_tests {
             "-- who and why\nCREATE VIEW dbo.v\nAS select 1",
             "/* header */ CREATE OR ALTER VIEW dbo.v AS select 1",
         ] {
-            let split = split_module(ModuleKind::View, stored);
+            let split = split_module(ModuleKind::View, stored, false);
             assert!(split.is_some(), "{stored}");
             assert!(
                 split.unwrap().1.to_lowercase().contains("select 1"),
@@ -1140,7 +1151,24 @@ mod module_tests {
         }
         // `PROC` is a legal abbreviation, and a definition using it is not a
         // module pbps should refuse to manage.
-        assert!(split_module(ModuleKind::Procedure, "CREATE PROC dbo.p AS SELECT 1").is_some());
+        assert!(
+            split_module(
+                ModuleKind::Procedure,
+                "CREATE PROC dbo.p AS SELECT 1",
+                false
+            )
+            .is_some()
+        );
+
+        // An unqualified trigger target is the commonest spelling of all, and
+        // the catalog knows the schema even though the text does not. The split
+        // leaves `on` empty for `assemble` to fill from `sys.objects`.
+        let split = split_module(
+            ModuleKind::Trigger,
+            "CREATE TRIGGER dbo.trg ON customer AFTER INSERT AS SELECT 1",
+            true,
+        );
+        assert_eq!(split, Some((None, "AFTER INSERT AS SELECT 1".to_owned())));
     }
 
     /// When the scan meets something it cannot account for it must return
@@ -1150,6 +1178,8 @@ mod module_tests {
     fn an_unaccountable_definition_does_not_split() {
         for stored in [
             "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT 1",
+            // Unqualified, and this time the catalog has no parent to fall back
+            // on: guessing a schema would attach the trigger to the wrong table.
             "CREATE TRIGGER trg ON customer AFTER INSERT AS SELECT 1",
             "ALTER VIEW dbo.v AS SELECT 1",
             "",
@@ -1159,7 +1189,7 @@ mod module_tests {
             } else {
                 ModuleKind::View
             };
-            assert!(split_module(kind, stored).is_none(), "{stored}");
+            assert!(split_module(kind, stored, false).is_none(), "{stored}");
         }
     }
 }

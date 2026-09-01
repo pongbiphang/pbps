@@ -60,7 +60,15 @@ pub fn module(name: &ObjectName, module: &Module) -> Vec<DialectError> {
     // An encrypted module has no readable definition, so pbps could never
     // compare it and would re-state it on every plan. Saying so at validate
     // time is better than a drift report that never goes quiet.
-    if body.to_ascii_uppercase().contains("WITH ENCRYPTION") {
+    // Matched on the collapsed text, not the literal string: `WITH\nENCRYPTION`
+    // and `WITH  ENCRYPTION` are the same option, and a declaration that slipped
+    // past this check would be applied and then come back with a NULL
+    // definition — the module would drop out of every snapshot and every later
+    // plan would try to create it again.
+    if pbps_dialect::Dialect::normalize_definition(&crate::Mssql, body)
+        .to_ascii_uppercase()
+        .contains("WITH ENCRYPTION")
+    {
         errs.push(invalid(format!(
             "{} `{name}` is declared WITH ENCRYPTION, whose definition cannot be read back; \
              pbps cannot manage it (ADR-0002)",
@@ -501,6 +509,27 @@ mod tests {
             &a_module(ModuleKind::View, "WITH ENCRYPTION AS SELECT 1"),
         );
         assert!(e.contains("cannot be read back"), "{e}");
+    }
+
+    /// The option is tokens, not one exact string. A spelling that slipped
+    /// through would be applied and then read back as NULL, so the module would
+    /// drop out of every snapshot and every later plan would create it again.
+    #[test]
+    fn encryption_is_recognised_however_it_is_spaced() {
+        for body in [
+            "WITH  ENCRYPTION AS SELECT 1",
+            "WITH\nENCRYPTION AS SELECT 1",
+            "WITH\t ENCRYPTION\n AS SELECT 1",
+        ] {
+            let e = module_errors("dbo.v", &a_module(ModuleKind::View, body));
+            assert!(e.contains("cannot be read back"), "{body}: {e}");
+        }
+        // And a body that merely mentions the words apart is not the option.
+        let e = module_errors(
+            "dbo.v",
+            &a_module(ModuleKind::View, "AS SELECT 'encryption' AS with_note"),
+        );
+        assert!(!e.contains("cannot be read back"), "{e}");
     }
 
     #[test]

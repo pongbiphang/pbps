@@ -31,7 +31,13 @@ use crate::ids::IdsFile;
 use crate::schema::Schema;
 
 /// The current plan-file format version.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// Bumped to 2 when `mode` and `strategy` arrived. Both change what *executing*
+/// the plan does, and serde would let an older `apply` read the file, ignore the
+/// unknown fields, and run a staged plan inside a transaction with the reviewed
+/// online strategy silently dropped. `apply` compares this exactly, so an older
+/// deployment host refuses the artifact instead.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -113,8 +119,9 @@ pub struct SavedPlan {
     /// runs. `apply` refuses a mismatch between the file and the flag rather
     /// than silently doing whichever the operator typed.
     ///
-    /// Defaulted on read, so every plan written before staged apply existed
-    /// still parses as what it was: a transactional one.
+    /// Defaulted on read so that the field can be omitted from a transactional
+    /// plan; a file old enough to predate it is refused by the version check
+    /// instead, since an old *reader* is the dangerous direction.
     #[serde(default)]
     pub mode: PlanMode,
 
@@ -360,7 +367,7 @@ mod tests {
     #[test]
     fn the_format_version_is_written() {
         let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":1"#), "{json}");
+        assert!(json.contains(r#""version":2"#), "{json}");
         assert!(json.contains(r#""origin":"database""#), "{json}");
     }
 

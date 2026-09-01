@@ -679,6 +679,12 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
             eprintln!("  {problem}");
             dialect_problems += 1;
         }
+        // And a third: a `depends_on:` naming a module nobody declared. It is
+        // silently a no-op in the ordering, so nothing else would ever say so.
+        for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
+            eprintln!("  {problem}");
+            dialect_problems += 1;
+        }
         if dialect_problems == 0 {
             println!(
                 "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
@@ -977,6 +983,7 @@ fn cmd_plan(
             &spec,
             &base.schema,
             &base.ids,
+            &base.hints,
             &loaded.schema,
             &res.ids,
             &statements(&cs, dialect.as_ref())?,

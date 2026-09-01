@@ -956,7 +956,7 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
     let plan = format!(
         r#"{{
-  "version": 1,
+  "version": 2,
   "origin": "database",
   "mode": "{mode}",
   "dialect": "mssql",

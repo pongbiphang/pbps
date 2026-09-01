@@ -114,6 +114,7 @@ pub fn rehearse(
     spec: &Spec,
     baseline: &Schema,
     baseline_ids: &IdsFile,
+    baseline_hints: &pbps_model::Hints,
     declared: &Schema,
     declared_ids: &IdsFile,
     plan: &[Statement],
@@ -135,7 +136,12 @@ pub fn rehearse(
             ids: baseline_ids,
         },
         dialect,
-        &pbps_model::Hints::default(),
+        // The baseline's own hints, from the revision it came from. The
+        // strategies in them are irrelevant here (nothing has rows yet), but
+        // `depends_on:` is the edge the identifier scan could not find — drop it
+        // and the rehearsal fails while compiling a baseline that was always
+        // valid, before it has said anything about the plan.
+        baseline_hints,
     )
     .map_err(|errs| {
         anyhow::anyhow!(
@@ -188,11 +194,19 @@ async fn run(
 
     // A database of its own, so a dev server shared by several developers (or
     // by two runs at once) cannot have one rehearsal walk into another's.
-    let name = format!(
-        "pbps_dev_{}_{}",
-        std::process::id(),
-        crate::unix_seconds().rem_euclid(100_000)
-    );
+    //
+    // The suffix is random rather than derived from the process id and the
+    // clock: two CI containers on one host routinely get the same pid within
+    // the same second, and the collision shows up as one run failing to create
+    // a database the other is using. `RandomState` is seeded per process by the
+    // OS, which is exactly the property wanted here.
+    let salt = {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    };
+    let name = format!("pbps_dev_{}_{salt:016x}", std::process::id());
     conn.execute(&format!("CREATE DATABASE [{name}];"))
         .await
         .with_context(|| format!("cannot create the scratch database `{name}`"))?;

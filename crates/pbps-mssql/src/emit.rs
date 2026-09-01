@@ -238,18 +238,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             constraint.expression
         )),
 
-        // A UNIQUE constraint is backed by an index, so dropping it is an index
-        // operation and takes the ONLINE hint. A foreign key and a check are
-        // metadata only: the same statement, but `WITH (ONLINE = ON)` on them
-        // is a syntax error, not a no-op.
-        Change::DropUnique { table, name } => one(format!(
-            "ALTER TABLE {} DROP CONSTRAINT {}{};",
-            qualified(table)?,
-            quote(name)?,
-            online(strategy)
-        )),
-
-        Change::DropForeignKey { table, name } | Change::DropCheck { table, name } => one(format!(
+        // No ONLINE clause on any of the three, for two different reasons. A
+        // foreign key and a check are metadata only, where the clause is a
+        // syntax error rather than a no-op. A UNIQUE constraint *is* backed by
+        // an index, but dropping one takes the option only when that index is
+        // clustered — and this emitter writes no CLUSTERED, so every constraint
+        // it creates is nonclustered and the statement would be rejected even on
+        // Enterprise. Building one online is a different matter: see AddUnique.
+        Change::DropUnique { table, name }
+        | Change::DropForeignKey { table, name }
+        | Change::DropCheck { table, name } => one(format!(
             "ALTER TABLE {} DROP CONSTRAINT {};",
             qualified(table)?,
             quote(name)?
@@ -987,9 +985,13 @@ mod tests {
     #[test]
     fn online_is_left_off_the_statements_that_cannot_take_it() {
         for change in [
-            // A nonclustered index drop belongs here too: the option exists on
-            // DROP INDEX only for a clustered index, and the emitter creates no
+            // The two nonclustered drops belong here too: the option exists on
+            // a drop only for a clustered index, and the emitter creates no
             // clustered ones.
+            Change::DropUnique {
+                table: tname("dbo.order_line"),
+                name: "uq_line".into(),
+            },
             Change::DropIndex {
                 table: tname("dbo.order_line"),
                 name: "ix_old".into(),

@@ -30,12 +30,37 @@ use crate::db::{self, Target};
 /// returned because ignoring them is never right: a drift check that silently
 /// skipped a computed column would report "no drift" about a database it only
 /// half read.
+/// A scoped live state, plus the declared modules the read could not express.
+///
+/// The second list cannot live in [`pbps_diff::Scoped`] — "pbps cannot read
+/// this back" is a dialect fact, and the differ knows no dialect — but a caller
+/// that has to decide whether an object is *there* needs both: a module the
+/// catalog holds and introspection cannot reproduce is inside the managed set
+/// by name and outside the scoped schema in fact.
+pub struct Managed {
+    pub scoped: pbps_diff::Scoped,
+    /// Declared modules that exist but cannot be read back, already described.
+    pub unreadable: Vec<String>,
+}
+
+/// The scoped state alone, which is all any caller but `bootstrap` needs.
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
+    Ok(managed_state_full(conn, ids, modules, unmanaged)
+        .await?
+        .scoped)
+}
+
+async fn managed_state_full(
+    conn: &mut Conn,
+    ids: &IdsFile,
+    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    unmanaged: pbps_config::Unmanaged,
+) -> anyhow::Result<Managed> {
     let pulled = pbps_mssql::catalog::introspect(conn)
         .await
         .context("cannot read the database catalog")?;
@@ -45,6 +70,7 @@ async fn managed_state(
     // A module pbps cannot read is not a module it can leave to chance: it is
     // inside the managed set by name and outside it in fact, so the next plan
     // would propose creating one that is already there.
+    let mut unreadable = Vec::new();
     for m in &pulled.unmanaged_modules {
         if m.name
             .parse::<pbps_model::ObjectName>()
@@ -54,12 +80,13 @@ async fn managed_state(
                 "warning: {} {} is declared, but {}; it is left alone",
                 m.kind, m.name, m.why
             );
+            unreadable.push(format!("{} {} ({})", m.kind, m.name, m.why));
         }
     }
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     report_unmanaged(&scoped, unmanaged)?;
-    Ok(scoped)
+    Ok(Managed { scoped, unreadable })
 }
 
 /// The modules the declarations name, for the commands that record a state.
@@ -444,18 +471,36 @@ pub fn cmd_bootstrap(
         // that is already there, leaving a partly built schema and a ledger that
         // never mentioned it.
         let existing =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+            managed_state_full(&mut conn, &ids, &declared_modules, project.config.unmanaged)
+                .await?;
         // Modules count as much as tables here. `CREATE OR ALTER` would not fail
         // on a view that is already there — it would quietly replace it, with no
         // plan, no risk classification and no approval, which is the opposite of
         // what "builds into an empty database" promises.
-        if !existing.schema.tables.is_empty() || !existing.schema.modules.is_empty() {
+        // The unreadable ones count too. A declared view that is already there
+        // with SCHEMABINDING, or a procedure created WITH ENCRYPTION, never
+        // reaches the scoped schema — introspection cannot express it — so
+        // without this the target reads as empty and `CREATE OR ALTER` replaces
+        // the object that is standing there.
+        if !existing.scoped.schema.tables.is_empty()
+            || !existing.scoped.schema.modules.is_empty()
+            || !existing.unreadable.is_empty()
+        {
             let names: Vec<String> = existing
+                .scoped
                 .schema
                 .tables
                 .keys()
                 .map(ToString::to_string)
-                .chain(existing.schema.modules.keys().map(ToString::to_string))
+                .chain(
+                    existing
+                        .scoped
+                        .schema
+                        .modules
+                        .keys()
+                        .map(ToString::to_string),
+                )
+                .chain(existing.unreadable.iter().cloned())
                 .collect();
             bail!(
                 "`{}` already has {} of the declared object(s): {}.\n\
@@ -1242,7 +1287,7 @@ async fn preflight(
         if report.is_empty() {
             continue;
         }
-        println!("\nRenaming {} affects:", report.target);
+        println!("\n{} {} affects:", target.verb(), report.target);
         for r in &report.advisory {
             let detail = r
                 .detail
