@@ -1023,6 +1023,11 @@ at the driver and its direct TLS dependencies and never thought to look at
 `rustls-webpki`, where all three vulnerabilities actually were. That is the
 argument for the job in one sentence: a person checks the crates they think of.
 
+The live suite carries the other half of that division of labour. `cargo-deny`
+can say a dependency is unsafe; only a real engine can say a *replacement* is
+safe, which is why the driver question in open question 10 is settled here and
+not by a version number.
+
 ---
 
 ## 12. Phases
@@ -1182,34 +1187,46 @@ engine already supported.
     all four findings (`rustls 0.23`, `rustls-webpki 0.103`) and passed the
     whole offline suite.
 
-    What is *not* yet established is the part that matters most: the trial was
-    never run against a real engine. **The live suite of 11.5 is the acceptance
-    test for this change** — a driver is exactly the layer whose defects a
-    unit test cannot see — so the move lands with that job green, not before.
-    Until it does, `deny.toml` carries the four findings as documented
-    exceptions with this entry as their reason, which is a statement about
-    where the fix lives, not about how much they matter.
+**The live suite of 11.5 is the acceptance test for this change** — a driver is
+    exactly the layer whose defects a unit test cannot see — and on 2026-09-01
+    it was run: against SQL Server 2025 in Docker, the continuation passed all
+    fourteen live tests, the same set and the same result as the driver in use.
+    The convergence, ledger, lock, all-or-nothing, probe-accuracy and module
+    round-trip invariants therefore hold on it, not merely the offline suite.
 
-11. **Whether a universal connection layer belongs here** — answered in part;
-    see [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive
-    sounding like an answer to question 10 and to dialect breadth at once, and
-    they are only an answer to the first. A connection layer replaces
-    `pbps-db` — about 300 lines — and none of the type catalogue, emitter,
-    introspection, validation or probes that make up the real per-engine cost;
-    three engines answer "what objects exist" from three different catalogs,
-    and no connectivity standard makes those one query. So a universal layer is
-    never adopted to reduce dialect work. It may one day be adopted for driver
-    maintenance, which is a different and much narrower claim, and it would be
-    paid for with the property 11.3 bought: one binary, nothing to install.
+    So what is left is a decision, not an unknown. Until it is taken,
+    `deny.toml` carries the four findings as documented exceptions with this
+    entry as their reason, which is a statement about where the fix lives, not
+    about how much they matter.
 
-    ADBC is left open rather than refused, because its SQL Server driver wraps
-    Microsoft's own `go-mssqldb` and is therefore better maintained than what
-    question 10 is about. What it must first be shown to do is honour §7.5 —
-    one plan, one transaction, all or nothing — since ADBC is built for
-    analytic reads. That is a spike, not a documentation question. Dialect
-    plugins are declined separately and for unrelated reasons (no stable Rust
-    ABI, and a plugin API would freeze `ChangeSet` while the model is still
-    moving).
+11. **Whether a universal connection layer belongs here** — settled; see
+    [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive sounding
+    like an answer to question 10 and to dialect breadth at once, and they are
+    only ever an answer to the first. A connection layer replaces `pbps-db` —
+    about 300 lines — and none of the type catalogue, emitter, introspection,
+    validation or probes that make up the real per-engine cost; three engines
+    answer "what objects exist" from three different catalogs, and no
+    connectivity standard makes those one query. So a universal layer is never
+    adopted to reduce dialect work.
+
+    That left driver maintenance as the one motivation worth testing, and a
+    spike on 2026-09-01 settled it against ADBC for this engine. The SQL Server
+    ADBC driver's **source is not published**: the repository carries only a
+    README and a licence, and that licence is the Permissive Binary License —
+    binary redistribution from a single vendor's CDN, with reverse engineering
+    forbidden. A tool whose claim is that the reviewed plan is exactly what runs
+    (7.3) cannot have an unauditable binary execute the statements, and the
+    vendor CDN is the "cloud registry in the loop" that 1.1 and 14.3 refuse.
+    The maintenance argument also inverts: a stale open-source crate can be
+    forked, which is what the escape hatch in question 10 is, while a
+    proprietary binary cannot. The behavioural question — whether ADBC honours
+    7.5 — was never reached and no claim is made about it.
+
+    The Foundry's MySQL and PostgreSQL drivers *are* Apache-2.0, so this is a
+    finding about one driver rather than about ADBC; but for those engines the
+    healthy pure-Rust drivers remove the motivation. Dialect plugins are
+    declined separately and for unrelated reasons (no stable Rust ABI, and a
+    plugin API would freeze `ChangeSet` while the model is still moving).
 
 ---
 

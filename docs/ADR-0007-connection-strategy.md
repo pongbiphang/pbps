@@ -1,8 +1,7 @@
 # ADR-0007: The connection layer — what a universal driver can and cannot carry
 
-- Status: decided in part. Dialect plugins are declined; a universal connection
-  layer is not adopted now, and the ADBC evaluation stays open behind a named
-  test
+- Status: decided. Dialect plugins are declined; a universal connection layer is
+  not adopted; ADBC for SQL Server is refused on the spike's result below
 - Date: 2026-09-01
 - Related: docs/SPEC.md §11.2, §11.3, §11.5, §12, §13.10, §14.3;
   [ADR-0002](ADR-0002-module-model.md);
@@ -49,35 +48,73 @@ driver — and that is a different decision with a different price.
 **Correction, recorded because ADRs are read later and a wrong reason is worse
 than none.** This evaluation first claimed ADBC had no SQL Server driver. That
 was wrong: it looked only at the driver list in the Apache `arrow-adbc`
-repository. The SQL Server driver is published by the **ADBC Driver Foundry**
-(adbc-drivers.org), Apache-licensed, each driver in its own repository, and it
-**wraps `go-mssqldb`, which Microsoft maintains officially.**
+repository. A SQL Server driver exists, published by the **ADBC Driver
+Foundry** (adbc-drivers.org). The follow-up description was wrong too, in the
+opposite direction — it called that driver Apache-licensed and open source,
+which the spike below disproves.
 
-That fact matters more than any argument here, because it speaks directly to
-motivation 2: it is a better maintenance lineage than the one open question 10
-is about. Microsoft's own migration of Power BI and Fabric from ODBC to ADBC
-makes the direction credible rather than speculative.
+Microsoft's own migration of Power BI and Fabric from ODBC to ADBC makes the
+standard's direction credible rather than speculative, and that is not in
+dispute. What was in dispute was whether this project can use it.
 
-The costs are real and unchanged by the correction:
+### The spike, 2026-09-01
 
-- **Distribution.** ADBC drivers are shared libraries, installed with a
-  package manager (`dbc`). SPEC §11.3 bought the opposite property — one static
-  binary, nothing to install — and it is what separates this tool from
-  Liquibase's JVM for the on-prem estates it currently targets. That price was
-  set for a world of copying a binary onto a locked-down host; for a
-  container-first deployment it is a line in a Dockerfile, and pretending
-  otherwise would be dishonest.
-- **Trust surface.** Adopting it means a young Rust FFI layer
-  (`adbc_core`'s driver manager) plus a Go shared library, in place of one pure
-  Rust crate. Each piece is better maintained; there are more pieces.
+The question this ADR set was whether the driver's transaction control and
+arbitrary-DDL execution could honour §7.5. **That question was never reached.**
+The driver fails an earlier gate, and the gate is not a matter of taste.
 
-**The open question, and the test that settles it:** ADBC's centre of gravity is
-Arrow-columnar transport for analytics. This tool's central promise is *one
-plan, one transaction, all or nothing* (SPEC §7.5), with a staged mode for the
-statements that cannot honour it (ADR-0003). Whether the SQL Server driver's
-transaction control and arbitrary-DDL execution are faithful enough for that is
-not answerable from documentation. **A spike answers it; nothing else does.**
-Until then ADBC is neither adopted nor refused.
+Fetched through the Go module proxy, `github.com/adbc-drivers/mssql` contains
+three files — `README.md`, `LICENSE.txt`, `NOTICE.txt` — and no source. The
+README states it plainly:
+
+> This repository is only for issue tracking and community feedback. […] The
+> source code for this project is private and is not included in this
+> repository.
+
+`LICENSE.txt` is not Apache-2.0. It is the **Permissive Binary License 1.0**,
+copyright Columnar Technologies Inc.: binary redistribution only, and
+explicitly *"no reverse engineering, decompilation, or disassembly of this
+software is permitted."* The driver is obtained as a pre-built binary from one
+vendor's CDN via `dbc`. The module has no tagged release — the newest version
+the proxy knows is a pseudo-version dated 2025-11-09.
+
+This is specific to SQL Server, and worth stating precisely rather than
+condemning ADBC as a whole. Checked the same way: `github.com/adbc-drivers/mysql`
+is Apache-2.0, tagged v0.1.0, with source present; `github.com/adbc-drivers/postgresql`
+is Apache-2.0. **The one engine this project most needs is the proprietary
+one.**
+
+### Why that settles it, on grounds stronger than the original question
+
+- **Auditability.** This tool's entire claim is that the reviewed plan is
+  exactly what runs (§7.3). Having an unauditable binary execute the statements
+  contradicts it at the root, and the licence forbids even looking.
+- **The cloud-registry refusal.** §1.1's third differentiator is a saved plan
+  pinned "as a free, file-based mechanism, with no cloud registry in the loop",
+  and §14.3 refuses a vendor holding a piece of the pipeline. `dbc install
+  mssql` against one company's CDN is that vendor, one layer down.
+- **Licence policy.** `deny.toml` allows a permissive open-source set. The PBL
+  is not in it, and adding a binary-only, no-reverse-engineering licence is a
+  real decision, not a list edit.
+- **The motivation inverts.** ADBC was worth considering *because* a stale crate
+  is a maintenance risk. But a stale open-source crate can be forked — that is
+  exactly what `tiberius-ng` is. A proprietary binary from a single vendor
+  cannot. If Columnar stops, the recourse is strictly less than today's.
+- **Air-gap, demonstrated rather than argued.** The spike could not obtain the
+  binary at all: the vendor CDN is unreachable from a restricted-egress
+  environment. That is the scenario §11.3 was written for, arriving on the
+  first attempt.
+
+**So ADBC is refused for SQL Server.** For PostgreSQL and MySQL its drivers are
+open source, but there the healthy pure-Rust drivers remove the motivation
+entirely — adopting a shared-library stack to reach engines that already have
+one would be paying the distribution cost for nothing.
+
+**What remains untested, stated plainly:** transaction and DDL fidelity. The
+binary could not be obtained, so no behavioural claim is made here in either
+direction. If the licensing ever changes, that spike is still the one to run,
+and the acceptance criterion is the §11.5 invariant that a plan whose second
+statement fails leaves the first one's effect nowhere.
 
 ## ODBC
 
@@ -134,8 +171,10 @@ Phase 0, in the other direction.
    cheaper for everyone until both are true.
 3. **The data-driven extraction waits for the second dialect**, and is done from
    what two implementations actually share.
-4. **ADBC gets a spike, not a verdict**, and the spike's question is transaction
-   and DDL fidelity, not connectivity.
+4. **ADBC is refused for SQL Server**, on source availability and distribution
+   rather than on behaviour — the spike never reached the behavioural question,
+   and says so. For the engines whose ADBC drivers *are* open source, the
+   motivation is absent.
 5. **The seam is the deliverable that makes all of this cheap.** `pbps-db` now
    owns `Row`, `FromColumn` and `Param`, and `tiberius` is named in exactly one
    file — so ADBC, ODBC, `tiberius-ng` or staying put are all changes to one
@@ -144,10 +183,11 @@ Phase 0, in the other direction.
 
 ## What would reopen this
 
-- The ADBC spike showing faithful transaction control **and** a target engine
-  arriving with no healthy pure-Rust driver. Either alone is not enough: the
-  first without the second buys nothing, and the second without the first would
-  trade a maintained driver for a broken guarantee.
+- The SQL Server ADBC driver being published under an open-source licence, at
+  which point the behavioural spike becomes worth running — **and** a target
+  engine arriving with no healthy pure-Rust driver. Either alone is not enough:
+  the first without the second buys nothing, and the second without the first
+  would trade a maintained driver for an unauditable one.
 - A decision that the product's primary target is container-first, at which
   point the distribution cost in §11.3 should be re-priced explicitly rather
   than inherited.
