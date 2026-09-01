@@ -398,9 +398,16 @@ pub fn cmd_bootstrap(
             ids: &ids,
         },
         dialect.as_ref(),
-        // Bootstrap builds into an empty database: every table is created from
-        // nothing, and there are no rows for an online operation to spare.
-        &pbps_model::Hints::default(),
+        // Bootstrap builds into an empty database, so there are no rows for an
+        // online operation to spare and the strategies are dropped. The module
+        // dependencies are not: `depends_on:` exists for the edges the
+        // identifier scan cannot see, and discarding them here would make
+        // bootstrap emit a dependent module first and fail on declarations that
+        // plan perfectly well.
+        &pbps_model::Hints {
+            strategies: Default::default(),
+            module_deps: loaded.hints.module_deps.clone(),
+        },
     )
     .map_err(|errs| {
         for e in &errs {
@@ -438,12 +445,25 @@ pub fn cmd_bootstrap(
         // never mentioned it.
         let existing =
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        if !existing.schema.tables.is_empty() {
+        // Modules count as much as tables here. `CREATE OR ALTER` would not fail
+        // on a view that is already there — it would quietly replace it, with no
+        // plan, no risk classification and no approval, which is the opposite of
+        // what "builds into an empty database" promises.
+        if !existing.schema.tables.is_empty() || !existing.schema.modules.is_empty() {
+            let names: Vec<String> = existing
+                .schema
+                .tables
+                .keys()
+                .map(ToString::to_string)
+                .chain(existing.schema.modules.keys().map(ToString::to_string))
+                .collect();
             bail!(
-                "`{}` already has {} of the declared table(s); bootstrap builds into an empty \
-                 database.\nUse `pbps plan --db` and `pbps apply` to migrate it instead.",
+                "`{}` already has {} of the declared object(s): {}.\n\
+                 Bootstrap builds into an empty database; use `pbps plan --db` and `pbps apply` \
+                 to migrate it instead.",
                 target.label,
-                existing.schema.tables.len()
+                names.len(),
+                names.join(", ")
             );
         }
 
@@ -581,13 +601,24 @@ pub fn cmd_plan_db(
         // recorded is simply created again, which `CREATE OR ALTER` makes
         // harmless.
         let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+        // The policy is applied separately from the scope. The scope has to stay
+        // the recorded set, or the two checksums below would be computed over
+        // different object sets — but a module that this revision declares for
+        // the first time and that already exists in the database is outside it,
+        // and telling its author "this object is not declared" while planning
+        // the `CREATE OR ALTER` for it would be both wrong and unactionable.
         let scoped = managed_state(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
-            project.config.unmanaged,
+            pbps_config::Unmanaged::Ignore,
         )
         .await?;
+        let mut for_policy = scoped.clone();
+        for_policy
+            .unmanaged_modules
+            .retain(|m| !loaded.schema.modules.contains_key(m));
+        report_unmanaged(&for_policy, project.config.unmanaged)?;
 
         // The plan is computed against the environment *as queried*, so the
         // queried state had better be the recorded one. When it is not, the
@@ -1020,9 +1051,13 @@ async fn apply_staged_under_lock(
                 "`{}` has moved since the checkpoint at entry #{}.\n\
                  checkpoint: {checkpoint}\n\
                  database:   {live}\n\
-                 Something changed while this deployment was half-finished. `pbps verify` shows \
-                 what; the remaining statements must not run against a database nobody planned \
-                 for.",
+                 Either something changed while this deployment was half-finished, or the \
+                 statement after the checkpoint committed and the checkpoint for it could not \
+                 be written (a lost connection between the two). `pbps verify` shows which: if \
+                 the difference is exactly the next statement of this plan, that statement is \
+                 already done. Resuming cannot decide that for you — the remaining statements \
+                 must not run against a database nobody planned for — so take the database as \
+                 it stands with `pbps baseline --reason ...` and plan the rest from there.",
                 target.label,
                 entry.id
             );
@@ -1183,6 +1218,24 @@ async fn preflight(
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_mssql::impact::RenameTarget],
 ) -> anyhow::Result<()> {
+    // The edition, asked again. `plan --db` checked it, but nothing binds a
+    // saved plan to an environment: the same file can be applied to a different
+    // server, or to the same one after an edition change, and an `ONLINE = ON`
+    // statement rejected halfway through an apply is precisely what the check
+    // at plan time exists to prevent (ADR-0003).
+    let edition = pbps_mssql::edition::edition(conn).await?;
+    let refused = pbps_mssql::edition::online_not_supported(&plan.changes, &edition);
+    if !refused.is_empty() {
+        bail!(
+            "this plan carries `strategy: online` for {}, and this server runs {}, which has no \
+             online index operations.\n\
+             The plan was approved against an edition that supports it. Recompute it against \
+             this environment with `pbps plan --db`.",
+            refused.join(", "),
+            edition.name()
+        );
+    }
+
     let mut blocked = Vec::new();
     for target in rename_targets {
         let report = pbps_mssql::impact::rename_impact(conn, target).await?;

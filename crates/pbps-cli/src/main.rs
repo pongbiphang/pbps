@@ -962,7 +962,16 @@ fn cmd_plan(
     if check && dev.is_some() {
         bail!("--check is the CI file check; it changes nothing and connects to nothing");
     }
-    if let Some(spec) = dev::spec(project, dev)? {
+    // The refusal above is for the flag; the `dev:` block in pbps.yml has to be
+    // skipped rather than refused, or a project that configures one could never
+    // run `plan --check` at all. Either way --check must not start a container
+    // or open a connection: it is the read-only file check CI runs.
+    let dev_spec = if check {
+        None
+    } else {
+        dev::spec(project, dev)?
+    };
+    if let Some(spec) = dev_spec {
         let rehearsal = dev::rehearse(
             project,
             &spec,

@@ -106,7 +106,10 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
   FROM sys.objects o
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
-  LEFT JOIN sys.tables pt ON pt.object_id = o.parent_object_id
+  -- sys.objects rather than sys.tables for the parent: a trigger may be
+  -- attached to a view (INSTEAD OF), and joining only tables would leave it
+  -- with no `on:` and a declaration that cannot be loaded back.
+  LEFT JOIN sys.objects pt ON pt.object_id = o.parent_object_id
   LEFT JOIN sys.schemas ps ON ps.schema_id = pt.schema_id
  WHERE o.is_ms_shipped = 0
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')

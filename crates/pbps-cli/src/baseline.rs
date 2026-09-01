@@ -129,19 +129,20 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     // root. Without it a project in a subdirectory lists nothing, and — since
     // the identity file is still found — the plan comes back as "no changes"
     // against a baseline that holds no tables at all.
-    let listing = git(
-        root,
-        &[
-            "ls-tree",
-            "-r",
-            "--full-tree",
-            "--name-only",
-            rev,
-            "--",
-            &rel,
-        ],
-    )
-    .map_err(|e| anyhow::anyhow!("cannot read `{rel}` at `{rev}`: {e}"))?;
+    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", rev];
+    // `schema_dir: .` puts the declarations at the repo root, where the relative
+    // path is empty — and an empty pathspec is an error, not "everything". The
+    // whole tree is what "everything" looks like as arguments.
+    if !rel.is_empty() {
+        args.push("--");
+        args.push(&rel);
+    }
+    let listing = git(root, &args).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read `{}` at `{rev}`: {e}",
+            if rel.is_empty() { "." } else { &rel }
+        )
+    })?;
 
     let mut schema = Schema::default();
     let mut count = 0usize;
@@ -207,8 +208,18 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 /// `rev-parse --show-prefix` asks git for the same answer in git's own terms, so
 /// only git's notion of the path has to be right.
 fn relative_to(path: &Path) -> anyhow::Result<String> {
-    // The path itself may not exist yet — a first run has no identity file — but
-    // its parent directory does, and that is what git needs to resolve.
+    // A directory can be asked about directly, and has to be: `schema_dir: .`
+    // makes the declarations directory the project root, whose parent is
+    // normally outside the worktree — asking git there would fail on a
+    // perfectly valid configuration. Everything else is resolved through its
+    // parent, because the path itself may not exist yet (a first run has no
+    // identity file).
+    if path.is_dir() {
+        let prefix = git(path, &["rev-parse", "--show-prefix"])?;
+        // At the repo root the prefix is empty, which is the right pathspec for
+        // "everything"; otherwise it ends in a slash that git does not need.
+        return Ok(prefix.trim().trim_end_matches('/').to_owned());
+    }
     let Some(name) = path.file_name() else {
         anyhow::bail!("`{}` names no file", path.display());
     };

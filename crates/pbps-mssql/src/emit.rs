@@ -257,11 +257,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
 
         Change::AddIndex { table, name, index } => one(create_index(table, name, index, strategy)?),
 
+        // No ONLINE clause, deliberately. SQL Server accepts `WITH (ONLINE =
+        // ON)` on a drop only for a **clustered** index, where the drop rebuilds
+        // the table as a heap and there is something to do online; every index
+        // this emitter creates is nonclustered (introspection excludes clustered
+        // ones), so the clause would be rejected even on Enterprise. Dropping a
+        // nonclustered index is metadata anyway, which is why nothing is lost.
         Change::DropIndex { table, name } => one(format!(
-            "DROP INDEX {} ON {}{};",
+            "DROP INDEX {} ON {};",
             quote(name)?,
-            qualified(table)?,
-            online(strategy)
+            qualified(table)?
         )),
 
         // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
@@ -952,13 +957,6 @@ mod tests {
             ]
         );
         assert_eq!(
-            online_sql_of(&Change::DropIndex {
-                table: tname("dbo.order_line"),
-                name: "ix_old".into(),
-            }),
-            ["DROP INDEX [ix_old] ON [dbo].[order_line] WITH (ONLINE = ON);"]
-        );
-        assert_eq!(
             online_sql_of(&Change::AlterColumnNullability {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.order_line.note"),
@@ -989,6 +987,13 @@ mod tests {
     #[test]
     fn online_is_left_off_the_statements_that_cannot_take_it() {
         for change in [
+            // A nonclustered index drop belongs here too: the option exists on
+            // DROP INDEX only for a clustered index, and the emitter creates no
+            // clustered ones.
+            Change::DropIndex {
+                table: tname("dbo.order_line"),
+                name: "ix_old".into(),
+            },
             Change::DropForeignKey {
                 table: tname("dbo.order_line"),
                 name: "fk_line_order".into(),

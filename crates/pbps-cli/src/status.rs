@@ -199,13 +199,31 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {
-        row.state = "drift";
-        row.detail = Some(format!(
-            "the database no longer matches entry #{}; run `pbps verify --env {name}`",
-            entry.id
-        ));
+        record_drift(&mut row, entry.id, name);
     }
     row
+}
+
+/// Notes a checksum mismatch on a row, without ever displacing `staged`.
+///
+/// An environment sitting on a staged checkpoint is mid-deployment whatever
+/// else is true of it: `plan --db` and a fresh `apply` both still refuse, and
+/// the way out is `--resume` or a new baseline. Overwriting the word with
+/// "drift" would send the operator to the drift workflow instead, which cannot
+/// finish the deployment they are actually in.
+fn record_drift(row: &mut EnvStatus, entry_id: i64, name: &str) {
+    if row.state == "staged" {
+        let so_far = row.detail.take().unwrap_or_default();
+        row.detail = Some(format!(
+            "{so_far} — and it has moved since that checkpoint, which \
+             `pbps verify --env {name}` will show"
+        ));
+        return;
+    }
+    row.state = "drift";
+    row.detail = Some(format!(
+        "the database no longer matches entry #{entry_id}; run `pbps verify --env {name}`"
+    ));
 }
 
 /// One line per environment, aligned so a wide estate stays scannable.
@@ -270,6 +288,27 @@ mod tests {
             locked_by: None,
             checked_at: "2026-08-31T09:20:00Z".into(),
         }
+    }
+
+    /// Mid-deployment outranks drift: the operator needs `--resume`, and the
+    /// drift workflow cannot finish a half-applied staged plan.
+    #[test]
+    fn a_staged_environment_stays_staged_when_it_also_drifts() {
+        let mut r = row("prod", "staged");
+        r.detail = Some("a staged apply stopped after 2 of 5 statement(s)".into());
+        record_drift(&mut r, 7, "prod");
+        assert_eq!(r.state, "staged");
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("2 of 5"), "{detail}");
+        assert!(detail.contains("moved since that checkpoint"), "{detail}");
+    }
+
+    #[test]
+    fn an_ordinary_environment_is_marked_drifted() {
+        let mut r = row("prod", "ok");
+        record_drift(&mut r, 7, "prod");
+        assert_eq!(r.state, "drift");
+        assert!(r.detail.unwrap().contains("entry #7"));
     }
 
     #[test]

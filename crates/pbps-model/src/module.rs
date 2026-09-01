@@ -222,12 +222,17 @@ pub fn creation_order(
                 continue;
             }
             let declared = deps.get(name).is_some_and(|d| d.contains(other));
-            if declared || references(&module.definition, other) {
+            // A trigger's target is not named in its definition — the emitter
+            // writes it into the `ON` clause — so the `on:` has to be read
+            // directly. It matters only when the target is itself a module: a
+            // trigger on a view has to be created after that view.
+            let attached = module.on.as_ref().is_some_and(|t| t == other);
+            if declared || attached || references(&module.definition, other) {
                 set.insert(other);
             }
         }
-        // A trigger's table is not a module, so it plays no part here; tables
-        // are created by an earlier ordering class in any case.
+        // A trigger on a *table* plays no part here: tables are created by an
+        // earlier ordering class in any case.
         needs.insert(name, set);
     }
 
@@ -283,10 +288,22 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
             (ModuleKind::Trigger, None) => problems.push(format!(
                 "trigger `{name}` does not say which table it is on (`on:`)"
             )),
-            (ModuleKind::Trigger, Some(table)) if !schema.tables.contains_key(table) => problems
-                .push(format!(
-                    "trigger `{name}` is on `{table}`, which is not declared here"
-                )),
+            // A view is as valid a target as a table: SQL Server supports
+            // `INSTEAD OF` triggers on views, and `pull` reconstructs the `on:`
+            // from what it finds — so refusing one here would make a database
+            // that has one impossible to round-trip.
+            (ModuleKind::Trigger, Some(target))
+                if !schema.tables.contains_key(target)
+                    && !matches!(
+                        schema.modules.get(target).map(|m| m.kind),
+                        Some(ModuleKind::View)
+                    ) =>
+            {
+                problems.push(format!(
+                    "trigger `{name}` is on `{target}`, which is not declared here as a table or \
+                     a view"
+                ));
+            }
             (ModuleKind::Trigger, Some(_)) => {}
             (kind, Some(table)) => problems.push(format!(
                 "`{name}` is a {kind} and cannot be `on: {table}`; only a trigger names a table"
@@ -438,6 +455,47 @@ mod tests {
 
         schema.tables.insert(n("dbo.absent"), Table::default());
         assert!(check_names(&schema).is_empty());
+    }
+
+    /// SQL Server allows `INSTEAD OF` triggers on views, and `pull` rebuilds
+    /// the `on:` from whatever it finds — so a target that is a declared view
+    /// has to load, or such a database could never be round-tripped.
+    #[test]
+    fn a_trigger_may_be_attached_to_a_declared_view() {
+        let mut schema = Schema::default();
+        schema.modules.insert(n("dbo.v"), view("SELECT 1 AS one"));
+        let mut trigger = module(ModuleKind::Trigger, "INSTEAD OF INSERT AS SELECT 1");
+        trigger.on = Some(n("dbo.v"));
+        schema.modules.insert(n("dbo.trg"), trigger);
+        assert!(
+            check_names(&schema).is_empty(),
+            "{:?}",
+            check_names(&schema)
+        );
+
+        // And the view has to exist before the trigger can be attached to it.
+        // The definition never names it — the emitter writes it into the `ON`
+        // clause — so only `on:` can supply that edge.
+        let order = creation_order(&schema.modules, &ModuleDeps::default());
+        assert_eq!(order, vec![n("dbo.v"), n("dbo.trg")]);
+    }
+
+    /// A target that is neither a declared table nor a declared view is still
+    /// refused: the trigger would be created on an object pbps does not manage.
+    #[test]
+    fn a_trigger_on_a_procedure_is_still_refused() {
+        let mut schema = Schema::default();
+        schema
+            .modules
+            .insert(n("dbo.p"), module(ModuleKind::Procedure, "AS SELECT 1"));
+        let mut trigger = module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1");
+        trigger.on = Some(n("dbo.p"));
+        schema.modules.insert(n("dbo.trg"), trigger);
+        assert!(
+            check_names(&schema)[0].contains("not declared here as a table or a view"),
+            "{:?}",
+            check_names(&schema)
+        );
     }
 
     /// `on:` on a view would read as if it did something; it does not, and a

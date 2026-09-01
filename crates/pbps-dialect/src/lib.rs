@@ -221,7 +221,23 @@ pub trait Dialect {
     fn normalize_definition(&self, definition: &str) -> String {
         let mut out = String::with_capacity(definition.len());
         let mut in_space = false;
+        // The quote character currently open, if any. Whitespace inside a string
+        // literal or a quoted identifier is data, not layout: collapsing
+        // `SELECT 'a  b'` to `SELECT 'a b'` would make two module bodies that
+        // return different rows compare equal, and `diff_modules` would never
+        // emit the `AlterModule` that fixes it.
+        let mut quote: Option<char> = None;
         for ch in definition.trim().chars() {
+            if let Some(q) = quote {
+                // A doubled `''` needs no special case: the first closes the
+                // literal and the second opens it again, and everything between
+                // them is copied either way.
+                if if q == '[' { ch == ']' } else { ch == q } {
+                    quote = None;
+                }
+                out.push(ch);
+                continue;
+            }
             if ch.is_whitespace() {
                 in_space = true;
                 continue;
@@ -230,6 +246,9 @@ pub trait Dialect {
                 out.push(' ');
             }
             in_space = false;
+            if matches!(ch, '\'' | '"' | '[') {
+                quote = Some(ch);
+            }
             out.push(ch);
         }
         out
@@ -421,6 +440,34 @@ mod tests {
             d.normalize_definition("select a from t"),
             d.normalize_definition("SELECT a FROM t"),
             "case is meaningful inside string literals, so it is kept"
+        );
+    }
+
+    /// Whitespace stops being layout the moment it is inside a literal or a
+    /// quoted identifier. Collapsing it there would make two module bodies that
+    /// return different rows compare equal, and the change would never be
+    /// planned at all.
+    #[test]
+    fn whitespace_inside_a_literal_is_data() {
+        let d = MinimalDialect;
+        assert_ne!(
+            d.normalize_definition("SELECT 'a  b'"),
+            d.normalize_definition("SELECT 'a b'")
+        );
+        assert_ne!(
+            d.normalize_definition("SELECT [a  b] FROM t"),
+            d.normalize_definition("SELECT [a b] FROM t")
+        );
+        // Layout around the literal is still layout.
+        assert_eq!(
+            d.normalize_definition("SELECT   'a  b'\n  FROM t"),
+            d.normalize_definition("SELECT 'a  b' FROM t")
+        );
+        // A doubled quote closes and reopens; the text after it is still inside
+        // the literal, so its spacing survives too.
+        assert_ne!(
+            d.normalize_definition("SELECT 'it''s  here'"),
+            d.normalize_definition("SELECT 'it''s here'")
         );
     }
 

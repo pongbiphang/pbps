@@ -1182,3 +1182,63 @@ fn a_project_below_the_repo_root_reads_its_own_baseline() {
         "the baseline was not found; the plan re-creates the table:\n{s}"
     );
 }
+
+/// `--check` is the file check CI runs: it changes nothing and connects to
+/// nothing. Refusing an explicit `--dev` is not enough — a `dev:` block in
+/// pbps.yml would otherwise start a container behind the same command.
+#[test]
+fn check_mode_ignores_a_configured_dev_database() {
+    let d = Demo::new("checkdev");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\ndev:\n  url_env: PBPS_NO_SUCH_VARIABLE\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    // The variable is deliberately unset: reaching `dev::spec` at all fails on
+    // it, so a pass proves the dev database was never resolved.
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("PBPS_NO_SUCH_VARIABLE"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The flag is still refused outright, because asking for one explicitly and
+    // being silently ignored is worse than being told.
+    let o = d.run(&["plan", "--check", "--dev", "docker://mssql"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("--check"), "{}", stderr(&o));
+}
+
+/// `depends_on:` exists for the edges the identifier scan cannot see. Bootstrap
+/// builds from nothing and so drops the online strategies, but dropping the
+/// dependencies with them would make it emit a dependent module first and fail
+/// on declarations that plan perfectly well.
+#[test]
+fn bootstrap_honours_declared_module_dependencies() {
+    let d = Demo::new("bootdeps");
+    d.table(ONE_COLUMN);
+    // Neither definition names the other, so only `depends_on:` can order them.
+    d.module(
+        "dbo.first.yml",
+        "view: dbo.first\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    d.module(
+        "dbo.second.yml",
+        "view: dbo.second\ndepends_on: [dbo.first]\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    d.run(&["plan"]);
+
+    let sql_path = d.dir.join("boot.sql");
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    let first = sql.find("[dbo].[first]").expect(&sql);
+    let second = sql.find("[dbo].[second]").expect(&sql);
+    assert!(first < second, "dependency order was discarded:\n{sql}");
+}
