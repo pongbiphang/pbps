@@ -968,7 +968,10 @@ database is work with clearly drawn boundaries.
 | Testing | `insta` | Snapshot tests for the AST, diagnostic output and generated SQL |
 
 **Explicitly not used**: `sqlx` (compile-time checking is meaningless for dynamic
-DDL), `diesel`, and any SQL parser (unnecessary once the format is YAML).
+DDL, and its MSSQL backend was removed in 0.7 and has not returned), `diesel`,
+and any SQL parser (unnecessary once the format is YAML). A universal connection
+layer — ODBC, ADBC — is a separate question with its own answer; see
+[ADR-0007](ADR-0007-connection-strategy.md) and open question 11.
 
 ### 11.4 Distribution
 
@@ -1186,6 +1189,27 @@ engine already supported.
     Until it does, `deny.toml` carries the four findings as documented
     exceptions with this entry as their reason, which is a statement about
     where the fix lives, not about how much they matter.
+
+11. **Whether a universal connection layer belongs here** — answered in part;
+    see [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive
+    sounding like an answer to question 10 and to dialect breadth at once, and
+    they are only an answer to the first. A connection layer replaces
+    `pbps-db` — about 300 lines — and none of the type catalogue, emitter,
+    introspection, validation or probes that make up the real per-engine cost;
+    three engines answer "what objects exist" from three different catalogs,
+    and no connectivity standard makes those one query. So a universal layer is
+    never adopted to reduce dialect work. It may one day be adopted for driver
+    maintenance, which is a different and much narrower claim, and it would be
+    paid for with the property 11.3 bought: one binary, nothing to install.
+
+    ADBC is left open rather than refused, because its SQL Server driver wraps
+    Microsoft's own `go-mssqldb` and is therefore better maintained than what
+    question 10 is about. What it must first be shown to do is honour §7.5 —
+    one plan, one transaction, all or nothing — since ADBC is built for
+    analytic reads. That is a spike, not a documentation question. Dialect
+    plugins are declined separately and for unrelated reasons (no stable Rust
+    ABI, and a plugin API would freeze `ChangeSet` while the model is still
+    moving).
 
 ---
 

@@ -5,7 +5,7 @@ the schema should look like; the tool works out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
-  through [docs/ADR-0006-optional-ui.md](docs/ADR-0006-optional-ui.md)
+  through [docs/ADR-0007-connection-strategy.md](docs/ADR-0007-connection-strategy.md)
 
 **Phases 0 through 3.5 are complete**, for SQL Server: tables, columns, keys,
 constraints and indexes, plus views, procedures, functions and triggers. Two
