@@ -1422,7 +1422,7 @@ async fn preflight(
         };
         let count = rows
             .first()
-            .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
+            .and_then(|r| r.try_get_at::<i32>(0).ok().flatten())
             .unwrap_or(0);
         if count > 0 {
             failures.push(format!("{count} {}", probe.description));

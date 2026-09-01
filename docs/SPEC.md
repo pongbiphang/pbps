@@ -956,7 +956,7 @@ database is work with clearly drawn boundaries.
 
 | Purpose | Crate | Notes |
 |---|---|---|
-| SQL Server | `tiberius` | Pure Rust; **no ODBC driver to install** — decisive for air-gapped environments |
+| SQL Server | `tiberius` | Pure Rust; **no driver to install** — one static binary, decisive for air-gapped environments. No upstream release since 2024-07, and its pinned TLS stack now carries findings no upgrade can reach: see open question 10, which is a live item rather than a note |
 | PostgreSQL | `tokio-postgres` | Phase 5 |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
@@ -1008,6 +1008,18 @@ Phase 3.5 adds one more, for the same reason:
    `sys.sql_modules` equals the declaration that produced it. If it did not,
    every apply would be followed by a drift report that never goes quiet.
 
+Separately from correctness, CI enforces **supply chain** with `cargo-deny`:
+advisories, licences, sources and duplicate versions. It is a scheduled job as
+well as a push job, because the interesting failure is a change this repository
+did not make — an advisory published against a dependency that was fine
+yesterday.
+
+It earned its place on its first run. The exposure of open question 10 had been
+checked by hand an hour earlier and pronounced clean; the hand check had looked
+at the driver and its direct TLS dependencies and never thought to look at
+`rustls-webpki`, where all three vulnerabilities actually were. That is the
+argument for the job in one sentence: a person checks the crates they think of.
+
 ---
 
 ## 12. Phases
@@ -1030,14 +1042,34 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
 
 **Why depth precedes the second dialect.** The obvious ordering is the opposite:
 breadth of engines is the number every comparison table counts, and Flyway and
-Liquibase win it outright. It is refused for the same reason 14.3 places Phase
-3.1 ahead of everything — a second dialect doubles the surface that every later
-feature must be built twice for, and it does so while the first engine still
-cannot express reference data, grants or an organization's own rules. A team
-evaluating pbps for SQL Server today is not blocked by the absence of
-PostgreSQL; it is blocked by the parts of *its own* estate pbps still cannot
-manage. Dialects are added afterwards, one at a time, once what a dialect has to
-implement has stopped moving.
+Liquibase win it outright. Two costs argue against taking it first, and it is
+worth stating them at their real size rather than their rhetorical one.
+
+The first is **the engine-specific surface**, which is smaller than "everything
+doubles" but lands unevenly. Measured on this repository, `pbps-mssql` is about
+7,000 lines against roughly 10,700 in the dialect-agnostic crates and 7,300 in
+the CLI: a second dialect re-implements what *becomes SQL* and what *reads the
+catalog* — the type catalogue, the emitter, introspection, validation, the
+probes and the live suite — while the model, the differ, the loader, `docs` and
+the policy engine are written once. Phase 4 is placed first because that split
+falls badly for it: reference data and grants are dominated by exactly the
+per-engine half, so building them after a second dialect builds them twice,
+while `policies:` and the analyzer catalogue would not have been.
+
+The second cost is larger and is not measured in lines: **every model decision
+must then be resolved for two engines before it can ship**, and it is paid in
+design, which is the expensive phase. This is not hypothetical — ADR-0004 and
+ADR-0005 each already carry a recorded PostgreSQL collision, so designing them
+against one decided engine is a different problem from designing them against
+two open ones.
+
+Against both stands the fact that a team evaluating pbps for SQL Server today is
+not blocked by the absence of PostgreSQL; it is blocked by the parts of *its
+own* estate pbps still cannot manage. Dialects are added afterwards, one at a
+time, once what a dialect has to implement has stopped moving — **unless a
+specific user is blocked on PostgreSQL**, which is the one input that reverses
+the whole ordering, since every argument above assumes an existing user on the
+engine already supported.
 
 ---
 
@@ -1121,6 +1153,39 @@ implement has stopped moving.
    test applied to every model decision, and two known collisions are already
    recorded (function overloading in ADR-0002, default and schema privileges
    in ADR-0005).
+
+10. **The driver supply chain** — a recorded risk that has already come due.
+    `tiberius` was chosen for the property in 11.3 (pure Rust, nothing to
+    install) and has had no release since 2024-07-19. It pins `tokio-rustls
+    0.24`, which resolves `rustls 0.21` and with it `rustls-webpki 0.101.7`.
+
+    On 2026-09-01 the first `cargo-deny` run against that tree reported **three
+    vulnerabilities, none of them reachable by `cargo update`**:
+    RUSTSEC-2026-0098 and RUSTSEC-2026-0099 (name constraints accepted where
+    they should be rejected — certificate validation, which is the decision
+    every connection to a production database rests on) and RUSTSEC-2026-0104
+    (a reachable panic parsing a CRL, not believed reachable here since no CRL
+    checking is configured). Every fix requires `rustls-webpki >= 0.103`, which
+    requires `rustls 0.22` or newer, which the pinned driver forbids. The
+    exposure is therefore not theoretical and not deferrable by patching: **the
+    driver is the fix.**
+
+    Two things make that tractable rather than alarming. The architecture
+    already isolates the driver — after the seam was tightened it is named in
+    exactly one file, and rows and parameters cross the boundary as this
+    project's own types, so a replacement touches `pbps-db` and nothing else.
+    And a drop-in continuation exists: `tiberius-ng` keeps the library name, so
+    only the dependency line changes, and a trial swap on 2026-09-01 resolved
+    all four findings (`rustls 0.23`, `rustls-webpki 0.103`) and passed the
+    whole offline suite.
+
+    What is *not* yet established is the part that matters most: the trial was
+    never run against a real engine. **The live suite of 11.5 is the acceptance
+    test for this change** — a driver is exactly the layer whose defects a
+    unit test cannot see — so the move lands with that job green, not before.
+    Until it does, `deny.toml` carries the four findings as documented
+    exceptions with this entry as their reason, which is a statement about
+    where the fix lives, not about how much they matter.
 
 ---
 

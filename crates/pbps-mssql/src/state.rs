@@ -126,7 +126,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
         return Err(LedgerError::NotInitialized);
     }
     let limit = limit as i32;
-    let rows = conn.query_with(SELECT_HISTORY, &[&limit]).await?;
+    let rows = conn.query_with(SELECT_HISTORY, &[limit.into()]).await?;
     rows.iter().map(entry_from_row).collect()
 }
 
@@ -147,12 +147,12 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
         .query_with(
             INSERT_STATE,
             &[
-                &kind,
-                &snapshot.git_sha.as_deref(),
-                &snapshot.plan_checksum.as_deref(),
-                &state_json.as_str(),
-                &snapshot.operator.as_str(),
-                &snapshot.reason.as_deref(),
+                kind.into(),
+                snapshot.git_sha.as_deref().into(),
+                snapshot.plan_checksum.as_deref().into(),
+                state_json.as_str().into(),
+                snapshot.operator.as_str().into(),
+                snapshot.reason.as_deref().into(),
             ],
         )
         .await?;
@@ -184,7 +184,7 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     let Some(highest) = doomed.first().copied() else {
         return Ok(0);
     };
-    Ok(conn.execute_with(DELETE_UP_TO, &[&highest]).await?)
+    Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
 }
 
 /// Takes the apply lock, or reports who already holds it.
@@ -193,7 +193,7 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
     // The insert is the gate, not the preceding read: a check-then-insert would
     // let two pipelines through the check together. The read only happens after
     // the insert has already failed, and then only to name the holder.
-    match conn.execute_with(INSERT_LOCK, &[&holder]).await {
+    match conn.execute_with(INSERT_LOCK, &[holder.into()]).await {
         Ok(_) => Ok(()),
         Err(e) => match lock_holder(conn).await? {
             Some(info) => Err(LedgerError::Locked(info)),

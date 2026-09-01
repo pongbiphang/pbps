@@ -1,0 +1,80 @@
+# Supply-chain policy, enforced by the `deny` job in CI (SPEC 11.5).
+#
+# This exists because two of the project's dependencies are small enough that
+# "is it still maintained, is it still clean" cannot be answered from memory:
+# `serde-saphyr` (open question 1) and `tiberius` (open question 10).
+
+[advisories]
+version = 2
+# Every entry here must name the advisory, why it does not endanger this tool,
+# and what would make it removable. An `ignore` without those is a silent
+# downgrade of the check that justified the file.
+#
+# Everything listed here today has one cause and one fix. `tiberius 0.12.3`
+# pins `tokio-rustls 0.24`, which resolves `rustls 0.21` and with it
+# `rustls-webpki 0.101.7`. Every patched version named below requires
+# `rustls-webpki >= 0.103`, which requires `rustls 0.22` or newer — so none of
+# these is separately fixable, and `cargo update` cannot reach any of them.
+# **The fix is the driver move in SPEC open question 10**, which was verified
+# on 2026-09-01 to resolve all four: `tiberius-ng 0.13` pulls
+# `tokio-rustls 0.26` -> `rustls 0.23` -> `rustls-webpki 0.103`.
+#
+# These entries exist so the check stays usable while that decision is taken.
+# They are not a judgement that the findings are unimportant — two of them are
+# certificate-validation defects, and this tool opens a TLS connection to a
+# production database. Delete all four the moment the driver moves; if they are
+# still here when it has, the file is lying.
+ignore = [
+    # Name constraints for URI names were incorrectly accepted.
+    "RUSTSEC-2026-0098",
+    # Name constraints were accepted for certificates asserting a wildcard name.
+    "RUSTSEC-2026-0099",
+    # Reachable panic parsing a certificate revocation list. Not believed
+    # reachable here — the driver configures no CRL checking — but it travels
+    # with the other two and leaves with them.
+    "RUSTSEC-2026-0104",
+    # `rustls-pemfile` is unmaintained (repository archived 2025-08); its code
+    # lives on in `rustls-pki-types`. Informational, not a vulnerability.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+version = 2
+# The whole tree is permissive today. A copyleft dependency arriving unnoticed
+# would be a licensing decision made by a transitive upgrade, which is exactly
+# what this list prevents.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = []
+
+[[licenses.clarify]]
+name = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate versions are a warning, not a failure: they are usually somebody
+# else's transitive pin and blocking a build on one would be noise. They are
+# still worth seeing, because a duplicated TLS stack is how a patched advisory
+# quietly keeps an unpatched copy alive.
+multiple-versions = "warn"
+# A wildcard on a third-party crate means an unreviewed upgrade can arrive on
+# any build, and there are none. Every current hit is this workspace depending
+# on itself by path with no version requirement, which is correct for crates
+# that are not published yet and must be given real versions before they are —
+# `allow-wildcard-paths` does not cover it, because it exempts private crates
+# only. A warning keeps that on the record without gating the build on a
+# publishing task.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

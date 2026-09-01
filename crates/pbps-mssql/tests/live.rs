@@ -966,7 +966,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
             .query(&probe.sql)
             .await
             .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
-        let n: i32 = rows[0].try_get(0).unwrap().unwrap();
+        let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
         counts.push((probe.description, n));
     }
     db.drop().await;
