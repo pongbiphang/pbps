@@ -2393,6 +2393,13 @@ fn explain_offers_no_apply_command_for_a_preview() {
 /// The command is advertised as copy-pastable, so a plan under a path with a
 /// space in it has to survive the paste rather than arrive at `apply` as two
 /// arguments.
+///
+/// Only the space case is asserted end to end. Which *other* characters are
+/// quoted is pinned by `explain`'s own unit tests, on values chosen rather than
+/// inherited: an assertion that a plain path stays unquoted would depend on the
+/// shape of the ambient temp directory, and on Windows that is
+/// `C:\Users\RUNNER~1\...` — which is how the tilde rule was found in the first
+/// place, one CI cycle too late.
 #[test]
 fn the_approval_command_quotes_a_path_a_shell_would_split() {
     let d = Demo::new("quotedpath");
@@ -2407,21 +2414,8 @@ fn the_approval_command_quotes_a_path_a_shell_would_split() {
         .lines()
         .find(|l| l.trim_start().starts_with("pbps "))
         .unwrap_or_else(|| panic!("no command in:\n{out}"));
-    assert!(line.contains("\""), "the path must be quoted: {line}");
+    assert!(line.contains('"'), "the path must be quoted: {line}");
     assert!(line.contains("release plans"), "{line}");
-
-    // A path with nothing special in it stays unquoted: quoting everything
-    // would make the ordinary case look like it needs care.
-    let plain = stdout(&d.run(&[
-        "explain",
-        "--plan",
-        d.dir.join("plan.json").to_str().unwrap(),
-    ]));
-    let line = plain
-        .lines()
-        .find(|l| l.trim_start().starts_with("pbps "))
-        .unwrap();
-    assert!(!line.contains("\""), "{line}");
 }
 
 /// `doctor` asks "is this environment ready", and for an unreachable target it

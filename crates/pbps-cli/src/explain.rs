@@ -413,9 +413,57 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
 /// emit, and silently emitting the wrong one would be worse than an obviously
 /// odd-looking path.
 fn shell_arg(value: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=<>".contains(c);
-    if !value.is_empty() && value.chars().all(safe) {
+    // `~` is in the safe set, but only away from the front. It means
+    // home-directory expansion at the start of a word and nothing at all
+    // anywhere else — and every Windows short path is full of it
+    // (`C:\Users\RUNNER~1\...`), so treating it as unsafe outright would put
+    // quotes around the ordinary case on an entire platform.
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=<>~".contains(c);
+    if !value.is_empty() && !value.starts_with('~') && value.chars().all(safe) {
         return value.to_owned();
     }
     format!("\"{value}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line is advertised as copy-pastable, so a path a shell would take
+    /// apart has to survive the paste — and one it would not must stay bare, or
+    /// the ordinary case looks like it needs care.
+    #[test]
+    fn only_a_value_a_shell_would_reinterpret_is_quoted() {
+        assert_eq!(shell_arg("plan.json"), "plan.json");
+        assert_eq!(shell_arg("/tmp/plans/plan.json"), "/tmp/plans/plan.json");
+        assert_eq!(shell_arg("<environment>"), "<environment>");
+        assert_eq!(
+            shell_arg("/tmp/release plans/plan.json"),
+            "\"/tmp/release plans/plan.json\""
+        );
+    }
+
+    /// Windows short paths are full of `~`, which means home-directory
+    /// expansion only at the *start* of a word. Treating it as unsafe outright
+    /// would quote the ordinary case on a whole platform — which is exactly how
+    /// this was found, by the Windows job.
+    #[test]
+    fn a_tilde_is_special_only_at_the_front() {
+        assert_eq!(
+            shell_arg("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json"),
+            "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json"
+        );
+        assert_eq!(shell_arg("~/plans/plan.json"), "\"~/plans/plan.json\"");
+    }
+
+    /// The negative cases. An empty value must not vanish into the command
+    /// line, and a value carrying a quote of its own is left visibly odd rather
+    /// than escaped in one of the three mutually incompatible ways the shells
+    /// this line is read in would each want.
+    #[test]
+    fn an_empty_or_quote_bearing_value_is_not_silently_mangled() {
+        assert_eq!(shell_arg(""), "\"\"");
+        assert_eq!(shell_arg("a\"b"), "\"a\"b\"");
+        assert_eq!(shell_arg("$(rm -rf /)"), "\"$(rm -rf /)\"");
+    }
 }
