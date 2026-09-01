@@ -831,7 +831,43 @@ premise), a resident daemon (pbps is a CLI; a daemon changes the security and
 operations profile entirely), and built-in chat integrations (an exec hook
 outlives any API).
 
-### 9.5 Machine-readable output and exit codes
+### 9.5 Explaining a plan
+
+**`pbps explain --plan plan.json`** is the deployment gate's own view of a saved
+plan, and it is not for the author of the change — the author has the
+declarations, the diff and the merge request. It is for whoever holds `plan.json`
+and has to decide whether to type `--allow destructive`: a DBA, a release
+manager, an auditor, who may have no checkout, no credentials and no intention of
+reading T-SQL. Until this command existed, the first human-facing artifact they
+met was effectively `plan.sql`.
+
+It answers, from the file alone:
+
+| Question | From |
+|---|---|
+| Is this applyable at all? | `origin` — a preview says so in its own terms (7.3) |
+| What does it change? | the typed ChangeSet, grouped by table |
+| Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
+| How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
+| What is checked first? | the derived pre-flight probes (7.5), by description |
+| What exactly do I type? | the `apply` command, `--allow` and `--staged` filled in |
+| What am I approving? | the plan checksum `apply` will recompute |
+
+A target is **optional**: `--db` / `--env` adds the one question no file can
+answer — whether that environment is mid-deployment on a staged checkpoint. It
+stays optional because a command needing credentials is a command the reviewer
+cannot run, which puts them back to being briefed by the person asking for the
+approval.
+
+`explain` always exits 0. A plan full of destructive changes is what it exists to
+describe well; the gate is `apply --allow`, and having two commands fail on the
+same condition would make the reviewer's own tool look like the failure.
+
+Every `plan` also opens with the same summary — how many changes across how many
+tables, then each risk class with its explanation — so the first screenful says
+what shape the plan is rather than what its first line happens to be.
+
+### 9.6 Machine-readable output and exit codes
 
 Every read-only command takes `--format human|json` and, in JSON, emits one
 envelope:
@@ -1346,14 +1382,15 @@ pbps plan --db ... --out plan.json --sql plan.sql
   -> a five-line summary and the exact approval command
 
 pbps explain --plan plan.json
-  -> the reviewer's explanation, no credentials required
+  -> the reviewer's explanation, no credentials required (9.5)
 ```
 
 Implementation status: the `init` link of this journey is built, including
 `--from`, staged round-trip validation, an every-file preview and installing
-`pbps.yml` last. The typed findings envelope and the three exit codes of 9.5 are
-built and cover `validate`, `fmt`, `plan`, `verify` and `status`. The remaining
-Phase 3.1 links are in progress.
+`pbps.yml` last. The typed findings envelope and the three exit codes of 9.6 are
+built and cover `validate`, `fmt`, `plan`, `verify`, `status` and `explain`. The
+plan summary and `explain` (9.5) are built. The remaining Phase 3.1 links are in
+progress.
 
 Acceptance criteria for that slice:
 

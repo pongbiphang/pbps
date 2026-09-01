@@ -5,6 +5,7 @@ mod db;
 mod declaration_file;
 mod deploy;
 mod dev;
+mod explain;
 mod hooks;
 mod init;
 mod output;
@@ -111,6 +112,22 @@ enum Command {
         /// connection string to a server pbps may create a scratch database on
         #[arg(long)]
         dev: Option<String>,
+    },
+
+    /// Explain a saved plan to whoever has to approve it
+    Explain {
+        /// The plan.json written by `pbps plan --out`
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Optionally check whether that environment is mid-deployment — the one
+        /// question the plan file cannot answer
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
@@ -425,6 +442,24 @@ fn run() -> anyhow::Result<()> {
                 &allow.into_iter().collect(),
                 staged,
                 resume,
+            )
+        }
+        Command::Explain {
+            plan,
+            target,
+            format,
+        } => {
+            // The target is optional here and nowhere else: a reviewer with no
+            // credentials must still get the whole of the file's answer.
+            let target = match (&target.db, &target.env) {
+                (None, None) => None,
+                _ => Some(target.resolve(&project)?),
+            };
+            explain::cmd_explain(
+                &project,
+                &plan,
+                target.as_ref(),
+                format == OutputFormat::Json,
             )
         }
         Command::Validate { format } => cmd_validate(&project, format),

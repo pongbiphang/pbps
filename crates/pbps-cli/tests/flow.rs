@@ -1653,3 +1653,179 @@ fn text_is_still_accepted_as_a_name_for_human() {
     assert_eq!(code(&d.run(&["validate", "--format", "text"])), 0);
     assert_eq!(code(&d.run(&["validate", "--format", "human"])), 0);
 }
+
+// ---- Phase 3.1: the plan summary and `explain` ----
+
+/// A plan builder for the explain tests: two changes, three risk classes, one
+/// table — enough that a summary and a grouped risk list have something to say.
+fn risky_plan(d: &Demo) -> PathBuf {
+    d.table(concat!(
+        "table: dbo.customer\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "  pii: {type: nvarchar(50)}\n",
+        "  code: {type: nvarchar(20)}\n",
+        "primary_key: [id]\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(concat!(
+        "table: dbo.customer\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "  code: {type: nvarchar(10), nullable: false}\n",
+        "primary_key: [id]\n"
+    ));
+    assert_eq!(
+        code(&d.run(&["drop", "dbo.customer.pii", "--reason", "REG-1"])),
+        0
+    );
+    let path = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--out", path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    path
+}
+
+/// The first screenful has to say how big the plan is and what kind of trouble
+/// it carries; a sixty-table plan and a one-table drop must not open the same
+/// way.
+#[test]
+fn every_plan_opens_with_a_summary_of_its_size_and_risks() {
+    let d = Demo::new("summary");
+    risky_plan(&d);
+    let out = stdout(&d.run(&["plan"]));
+
+    assert!(out.contains("2 change(s) across 1 table(s)"), "{out}");
+    assert!(out.contains("destructive"), "{out}");
+    assert!(
+        out.contains("data is lost, and no plan brings it back"),
+        "the class must be explained, not just named: {out}"
+    );
+    // The summary comes before the change list, or it is not a summary.
+    let summary_at = out.find("2 change(s) across").unwrap();
+    let list_at = out.find("drop column pii").unwrap();
+    assert!(summary_at < list_at, "{out}");
+}
+
+/// A plan with nothing risky in it must say so, rather than leaving the reader
+/// to notice an absence.
+#[test]
+fn a_plan_with_no_risk_says_it_needs_no_allow() {
+    let d = Demo::new("norisk");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("needs no --allow"), "{out}");
+    assert!(!out.contains("needs approval to apply"), "{out}");
+}
+
+/// `explain` is for the reviewer at the deployment gate: no checkout, no
+/// credentials, and every question they have to answer in one place.
+#[test]
+fn explain_answers_the_reviewers_questions_without_a_connection() {
+    let d = Demo::new("explain");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+
+    // What, why, how, and the exact command that approves it.
+    assert!(out.contains("drop column pii"), "{out}");
+    assert!(out.contains("data is lost"), "{out}");
+    assert!(
+        out.contains("one transaction, all or nothing"),
+        "the execution mode must be stated: {out}"
+    );
+    assert!(
+        out.contains("--allow destructive,narrowing,not-null"),
+        "the approval command must be copy-pastable: {out}"
+    );
+    // The probes are what a reviewer most wants and cannot get from plan.sql.
+    assert!(
+        out.contains("Checks that run before the first statement"),
+        "{out}"
+    );
+    assert!(out.contains("NOT NULL would reject"), "{out}");
+    // And the one thing the file cannot answer must be named as unanswered
+    // rather than quietly omitted.
+    assert!(out.contains("Not checked: no --db or --env"), "{out}");
+}
+
+/// An offline plan is a preview, and a reviewer must not be able to read this
+/// output and believe they are approving something applyable (SPEC §7.3).
+#[test]
+fn explain_says_a_preview_is_a_preview() {
+    let d = Demo::new("explainprev");
+    let plan = risky_plan(&d);
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    assert!(out.contains("`apply` will refuse it"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["applyable"], false);
+    assert_eq!(v["findings"][0]["id"], "plan.preview");
+}
+
+/// The checksum is what makes the approval mean something: it is what `apply`
+/// recomputes, so the reviewer has to be shown the one they are approving.
+#[test]
+fn explain_json_carries_the_checksum_and_the_risk_detail() {
+    let d = Demo::new("explainjson");
+    let plan = risky_plan(&d);
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["data"]["mode"], "transactional");
+    assert_eq!(v["data"]["change_count"], 2);
+    assert_eq!(v["data"]["table_count"], 1);
+    assert_eq!(v["data"]["checksum"].as_str().unwrap().len(), 64);
+    assert_eq!(v["data"]["risks"][0]["class"], "destructive");
+    assert!(!v["data"]["risks"][0]["why"].as_str().unwrap().is_empty());
+    assert_eq!(v["data"]["probes"].as_array().unwrap().len(), 2);
+    // No target was given, so the field must be absent rather than a guess.
+    assert!(v["data"].get("target").is_none(), "{v}");
+}
+
+/// Explaining is not gating. A plan full of destructive changes is exactly what
+/// this command exists to describe, and failing on one would make the
+/// reviewer's own tool look broken in their terminal.
+#[test]
+fn explain_never_fails_on_a_risky_plan() {
+    let d = Demo::new("explainexit");
+    let plan = risky_plan(&d);
+    assert_eq!(
+        code(&d.run(&["explain", "--plan", plan.to_str().unwrap()])),
+        0
+    );
+
+    // But a plan that is not there, or not a plan, is a tool failure.
+    let o = d.run(&["explain", "--plan", "nowhere.json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    std::fs::write(d.dir.join("junk.json"), "{\"nope\": 1}").unwrap();
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        d.dir.join("junk.json").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+}

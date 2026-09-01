@@ -61,6 +61,31 @@ impl RiskClass {
         }
     }
 
+    /// What can go wrong, in the operator's words.
+    ///
+    /// The doc comments above say the same thing to whoever reads this file;
+    /// this says it to the reviewer at the deployment gate, who is deciding
+    /// whether to type `--allow destructive` at four in the afternoon and has
+    /// not read this file. A risk class the reviewer cannot explain is one they
+    /// will approve out of habit.
+    pub const fn why(self) -> &'static str {
+        match self {
+            RiskClass::Rename => {
+                "the old name disappears: views, procedures and any application still using it break"
+            }
+            RiskClass::Destructive => "data is lost, and no plan brings it back",
+            RiskClass::Narrowing => {
+                "the new type may not hold what is already stored: values can be truncated or the statement rejected"
+            }
+            RiskClass::NotNull => {
+                "existing NULLs would violate the constraint and the statement fails"
+            }
+            RiskClass::Constraint => {
+                "existing rows may not satisfy the new constraint and the statement fails"
+            }
+        }
+    }
+
     pub const ALL: [RiskClass; 5] = [
         RiskClass::Rename,
         RiskClass::Destructive,
@@ -431,6 +456,17 @@ impl ChangeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--allow` names a class and the gate explains it; a class that gained a
+    /// name without an explanation would reach a reviewer as a bare word.
+    #[test]
+    fn every_risk_class_has_a_name_and_a_reason() {
+        for r in RiskClass::ALL {
+            assert!(!r.as_str().is_empty());
+            assert!(r.why().len() > 20, "{r} needs a real explanation");
+            assert_eq!(r.as_str().parse::<RiskClass>().unwrap(), r);
+        }
+    }
     use crate::schema::Column;
 
     fn col(s: &str) -> ColumnRef {

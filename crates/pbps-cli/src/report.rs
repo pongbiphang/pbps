@@ -103,12 +103,61 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
         .join(", ")
 }
 
+/// The headline: how much, where, and how risky.
+///
+/// Printed above the change list so that the first thing a reader sees is the
+/// shape of the plan rather than its first line. A plan touching sixty tables
+/// scrolls past; a plan touching one and dropping a column does not, and the two
+/// must not look the same for the first screenful (SPEC §14.1).
+///
+/// Stable by construction: the counts come from the typed ChangeSet and the risk
+/// order is [`RiskClass::ALL`], so two runs over the same plan produce the same
+/// text and a diff of two summaries means the plans really differ.
+pub fn summary(cs: &ChangeSet) -> String {
+    if cs.is_empty() {
+        return String::new();
+    }
+    let tables: std::collections::BTreeSet<String> = cs
+        .changes
+        .iter()
+        .map(|p| p.change.table().to_string())
+        .collect();
+    let mut out = format!(
+        "\n  {} change(s) across {} table(s).\n",
+        cs.changes.len(),
+        tables.len()
+    );
+
+    let risks = cs.risks();
+    if risks.is_empty() {
+        out.push_str("  No risk class applies; this plan needs no --allow.\n");
+        return out;
+    }
+    for class in RiskClass::ALL {
+        if !risks.contains(&class) {
+            continue;
+        }
+        let n = cs
+            .changes
+            .iter()
+            .filter(|p| p.risks.contains(&class))
+            .count();
+        out.push_str(&format!(
+            "    {:<12} {n:>3} change(s) — {}\n",
+            class.as_str(),
+            class.why()
+        ));
+    }
+    out
+}
+
 pub fn plan(cs: &ChangeSet) -> String {
     if cs.is_empty() {
         return "No changes.\n".to_owned();
     }
 
-    let mut out = changes(cs);
+    let mut out = summary(cs);
+    out.push_str(&changes(cs));
     let risks = cs.risks();
     if !risks.is_empty() {
         out.push_str(&format!(
