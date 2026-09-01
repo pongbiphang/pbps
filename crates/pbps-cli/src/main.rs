@@ -1266,14 +1266,10 @@ fn resolve_with_intent(
     let mut blockers = original.clone();
 
     if may_prompt && prompt::interactive() {
-        loop {
-            // The copy-pastable commands are *not* printed above the prompt.
-            // They are the no-TTY answer (§6.4), and offering to do the thing
-            // while telling the user to go and type it is one instruction too
-            // many.
-            let Some(answers) = prompt::ask(&blockers) else {
-                break;
-            };
+        // The copy-pastable commands are *not* printed above the prompt. They
+        // are the no-TTY answer (§6.4), and offering to do the thing while
+        // telling the user to go and type it is one instruction too many.
+        while let Some(answers) = prompt::ask(&blockers) {
             let before = intents.len();
             intents.extend(answers);
             if intents.len() == before {
