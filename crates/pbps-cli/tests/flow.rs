@@ -1742,10 +1742,12 @@ fn explain_answers_the_reviewers_questions_without_a_connection() {
         out.contains("one transaction, all or nothing"),
         "the execution mode must be stated: {out}"
     );
-    assert!(
-        out.contains("--allow destructive,narrowing,not-null"),
-        "the approval command must be copy-pastable: {out}"
-    );
+    // The risks are named with what each one means; the *approval command* is
+    // asserted separately, on an applyable plan — this fixture is a preview,
+    // which has nothing to approve.
+    assert!(out.contains("destructive"), "{out}");
+    assert!(out.contains("narrowing"), "{out}");
+    assert!(out.contains("not-null"), "{out}");
     // The probes are what a reviewer most wants and cannot get from plan.sql.
     assert!(
         out.contains("Checks that run before the first statement"),
@@ -1887,7 +1889,9 @@ fn doctor_names_an_unset_connection_variable_without_echoing_anything() {
     .unwrap();
 
     let o = d.run(&["doctor"]);
-    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    // Exit 1, not 2: `doctor` could not look at this environment, so it did not
+    // answer its own question about it (SPEC 9.8, and see `doctor::outcome`).
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("PBPS_DOCTOR_UNSET"), "{out}");
     assert!(out.contains("unconfigured"), "{out}");
@@ -2165,22 +2169,19 @@ fn explain_works_in_a_directory_with_no_project() {
 #[test]
 fn the_approval_command_explain_prints_carries_a_target() {
     let d = Demo::new("approvecmd");
-    let plan = risky_plan(&d);
-    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    d.table(ONE_COLUMN);
+    // An applyable plan, since a preview has no approval command at all.
+    let plan = write_plan(&d, "target.json", "transactional");
 
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
     let line = out
         .lines()
         .find(|l| l.trim_start().starts_with("pbps apply"))
         .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
-    assert!(line.contains("--env"), "{line}");
     assert!(line.contains("--plan"), "{line}");
-    assert!(
-        line.contains("--allow destructive,narrowing,not-null"),
-        "{line}"
-    );
     // A redacted --db label is not a connection string and must never be
     // printed as though it were; the placeholder is the honest form.
-    assert!(line.contains("<environment>"), "{line}");
+    assert!(line.contains("--env <environment>"), "{line}");
 }
 
 /// A project with no environments is the shape a consumer meets first, and it
@@ -2351,4 +2352,99 @@ fn stopping_part_way_through_the_loop_still_records_nothing() {
     let text = stdout(&out);
     assert!(text.contains("pbps rename dbo.t.customer_name"), "{text}");
     assert!(text.contains("pbps rename dbo.t.customer_zip"), "{text}");
+}
+
+// ---- Third review round ----
+
+/// An offline plan cannot be applied at all — `apply` refuses a `Preview`
+/// structurally, whatever target and whatever `--allow` (SPEC 7.3). Printing an
+/// apply command anyway had the report contradict its own first line and hand
+/// the reviewer something that cannot work.
+#[test]
+fn explain_offers_no_apply_command_for_a_preview() {
+    let d = Demo::new("previewcmd");
+    let plan = risky_plan(&d);
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+
+    assert!(!out.contains("pbps apply"), "{out}");
+    assert!(out.contains("This plan cannot be applied"), "{out}");
+    // And it says what to do instead, or the reviewer is left with a refusal
+    // and no next step.
+    assert!(out.contains("pbps plan --env"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["applyable"], false);
+    assert!(
+        !v["data"]["approve_with"]
+            .as_str()
+            .unwrap()
+            .contains("apply"),
+        "{v}"
+    );
+}
+
+/// The command is advertised as copy-pastable, so a plan under a path with a
+/// space in it has to survive the paste rather than arrive at `apply` as two
+/// arguments.
+#[test]
+fn the_approval_command_quotes_a_path_a_shell_would_split() {
+    let d = Demo::new("quotedpath");
+    risky_plan(&d);
+    let dir = d.dir.join("release plans");
+    std::fs::create_dir_all(&dir).unwrap();
+    let plan = dir.join("plan.json");
+    std::fs::copy(d.dir.join("plan.json"), &plan).unwrap();
+
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps "))
+        .unwrap_or_else(|| panic!("no command in:\n{out}"));
+    assert!(line.contains("\""), "the path must be quoted: {line}");
+    assert!(line.contains("release plans"), "{line}");
+
+    // A path with nothing special in it stays unquoted: quoting everything
+    // would make the ordinary case look like it needs care.
+    let plain = stdout(&d.run(&[
+        "explain",
+        "--plan",
+        d.dir.join("plan.json").to_str().unwrap(),
+    ]));
+    let line = plain
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps "))
+        .unwrap();
+    assert!(!line.contains("\""), "{line}");
+}
+
+/// `doctor` asks "is this environment ready", and for an unreachable target it
+/// did not answer that question — it could not look. That is exit 1, not 2, or
+/// a pipeline routes a firewall to the author of the schema change (SPEC 9.8).
+#[test]
+fn doctor_exits_one_when_it_could_not_look_and_two_when_it_looked() {
+    let d = Demo::new("doctorexit");
+    // Could not look: the variable naming the connection string is not set.
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_EXIT_UNSET\n",
+    )
+    .unwrap();
+    let o = d.run(&["doctor"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    // The finding is still in the report; only the exit code differs.
+    assert!(stdout(&o).contains("unconfigured"), "{}", stdout(&o));
+
+    // Looked, and found something: a declaration the dialect rejects, with no
+    // environments to be unreachable.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+    assert_eq!(code(&d.run(&["doctor"])), FINDING);
 }

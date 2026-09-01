@@ -47,7 +47,9 @@ pub struct Explanation {
     pub change_count: usize,
     pub table_count: usize,
     pub risks: Vec<RiskDetail>,
-    /// The exact command that approves this plan, `--allow` included.
+    /// The exact command that approves this plan, `--allow` included — or, for
+    /// a preview, the command that produces an applyable plan instead. Which
+    /// one it is is [`Explanation::applyable`].
     pub approve_with: String,
     pub probes: Vec<String>,
     /// Statements the plan will run. Counted, not listed: the SQL is
@@ -157,29 +159,42 @@ fn explain(
         })
         .collect();
 
-    // `apply` requires exactly one of --db / --env, so a command printed
-    // without one fails the moment it is pasted. The environment's *name* is
-    // used when there is one; a --db target contributes only its redacted
-    // label, which is not a connection string and must never be printed as if
-    // it were, so that case gets the placeholder too.
-    let mut approve = format!(
-        "pbps apply --env {} --plan {}",
-        env.unwrap_or("<environment>"),
-        path.display()
-    );
-    if !present.is_empty() {
-        approve.push_str(&format!(
-            " --allow {}",
-            present
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    if plan.mode == PlanMode::Staged {
-        approve.push_str(" --staged");
-    }
+    // An offline plan has no approval command, because there is nothing to
+    // approve: `apply` refuses a `Preview` structurally, whatever target and
+    // whatever `--allow` it is given (§7.3). Printing one anyway would have the
+    // report contradict its own first line — which says the plan is a preview —
+    // and hand the reviewer something that cannot work.
+    let approve = if plan.origin.is_applyable() {
+        // `apply` requires exactly one of --db / --env, so a command printed
+        // without one fails the moment it is pasted. The environment's *name*
+        // is used when there is one; a --db target contributes only its
+        // redacted label, which is not a connection string and must never be
+        // printed as if it were, so that case gets the placeholder too.
+        let mut approve = format!(
+            "pbps apply --env {} --plan {}",
+            shell_arg(env.unwrap_or("<environment>")),
+            shell_arg(&path.display().to_string())
+        );
+        if !present.is_empty() {
+            approve.push_str(&format!(
+                " --allow {}",
+                present
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if plan.mode == PlanMode::Staged {
+            approve.push_str(" --staged");
+        }
+        approve
+    } else {
+        format!(
+            "pbps plan --env <environment> --out {}",
+            shell_arg(&path.display().to_string())
+        )
+    };
 
     Ok(Explanation {
         applyable: plan.origin.is_applyable(),
@@ -374,6 +389,33 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         }
     }
 
-    out.push_str(&format!("\nTo approve and run it:\n  {}\n", e.approve_with));
+    out.push_str(&format!(
+        "\n{}\n  {}\n",
+        if e.applyable {
+            "To approve and run it:"
+        } else {
+            "This plan cannot be applied. To produce one that can:"
+        },
+        e.approve_with
+    ));
     out
+}
+
+/// One argument, quoted if a shell would otherwise take it apart.
+///
+/// The approval command is advertised as copy-pastable, and a plan under
+/// `/tmp/release plans/` would otherwise arrive at `apply` as two arguments.
+/// Double quotes rather than single: they are understood by POSIX shells,
+/// PowerShell and `cmd` alike, and this one line is read on all three.
+///
+/// A value containing a double quote is left to the reader — escaping it
+/// correctly differs between those three shells, so there is no one spelling to
+/// emit, and silently emitting the wrong one would be worse than an obviously
+/// odd-looking path.
+fn shell_arg(value: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=<>".contains(c);
+    if !value.is_empty() && value.chars().all(safe) {
+        return value.to_owned();
+    }
+    format!("\"{value}\"")
 }

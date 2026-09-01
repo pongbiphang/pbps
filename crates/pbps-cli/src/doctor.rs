@@ -54,6 +54,11 @@ pub struct EnvDiagnosis {
     /// Whether `strategy: online` can be honoured here (ADR-0003 decision 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_online: Option<bool>,
+
+    /// Whether this server accepts `CREATE OR ALTER`, which every module
+    /// statement depends on (ADR-0002).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_create_or_alter: Option<bool>,
     /// The permissions pbps needs and this account does not hold.
     pub missing_permissions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,11 +137,12 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
                     server_version: None,
                     edition: None,
                     supports_online: None,
+                    supports_create_or_alter: None,
                     missing_permissions: Vec::new(),
                     detail: Some(e.to_string()),
                 },
             };
-            findings.extend(env_findings(&d));
+            findings.extend(env_findings(&d, counts.modules > 0));
             environments.push(d);
         }
     }
@@ -161,6 +167,36 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
     } else {
         print!("{}", render(&report));
     }
+    outcome(&report)
+}
+
+/// Which of the three exit codes this report ends on (SPEC §9.8).
+///
+/// The default — any error finding means 2 — is wrong for this one command.
+/// `doctor` asks "is this environment ready", and for an unreachable or
+/// unconfigured target it did not *answer* that question: it could not look.
+/// That is exit 1, "the command could not answer", and the distinction is the
+/// whole reason the three codes exist — a pipeline running `doctor --env prod`
+/// must route a firewall or a missing credential to whoever runs CI, not to the
+/// author of the schema change.
+///
+/// Everything else it found — invalid declarations, a missing permission, an
+/// environment mid-deployment — it found by looking, so those stay at 2.
+fn outcome(report: &output::Report<Diagnosis>) -> anyhow::Result<()> {
+    let unanswerable = report
+        .findings
+        .iter()
+        .filter(|f| {
+            f.severity == output::Severity::Error
+                && matches!(f.id, "environment.unreachable" | "environment.unconfigured")
+        })
+        .count();
+    if unanswerable > 0 {
+        // The detail is already in the report above; this line is what `main`
+        // prints after "error:", so it names the count rather than repeating one
+        // environment's message as though it were the only one.
+        anyhow::bail!("{unanswerable} environment(s) could not be checked; see the report above");
+    }
     report.outcome()
 }
 
@@ -172,6 +208,7 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
         server_version: None,
         edition: None,
         supports_online: None,
+        supports_create_or_alter: None,
         missing_permissions: Vec::new(),
         detail: None,
     };
@@ -188,6 +225,12 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
     d.server_version = pbps_mssql::doctor::server_version(&mut conn).await.ok();
     if let Ok(ed) = pbps_mssql::edition::edition(&mut conn).await {
         d.supports_online = Some(ed.supports_online());
+        // Asked of the version *and* the edition together: Azure reports
+        // 12.0.x and supports the syntax regardless (see the dialect function).
+        d.supports_create_or_alter = d
+            .server_version
+            .as_deref()
+            .map(|v| pbps_mssql::doctor::supports_create_or_alter(v, ed.name()));
         d.edition = Some(match &ed {
             // Named as unrecognised rather than passed through: the tool is
             // about to treat it as limited, and an operator reading their own
@@ -243,7 +286,7 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
     d
 }
 
-fn env_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
+fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding> {
     let mut out = Vec::new();
     match d.state {
         // Unreachable and unconfigured are errors: this is the command whose
@@ -309,6 +352,24 @@ fn env_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
             format!("{}: the account lacks {gap}", d.environment),
         ));
     }
+    // Only when this project actually has modules. The emitter writes
+    // `CREATE OR ALTER` for every one of them and for nothing else, so on a
+    // project of plain tables an old server is perfectly deployable — and a
+    // readiness error there would be the check crying wolf.
+    if declares_modules && d.supports_create_or_alter == Some(false) {
+        out.push(
+            output::Finding::error(
+                "server.no-create-or-alter",
+                format!(
+                    "{}: this server predates SQL Server 2016 SP1, so it will reject the \
+                     `CREATE OR ALTER` every module statement uses (ADR-0002). This project \
+                     declares module(s), so an apply would fail here",
+                    d.environment
+                ),
+            )
+            .remedy("upgrade the server to 2016 SP1 or later, or remove the declared modules"),
+        );
+    }
     if d.supports_online == Some(false) {
         out.push(output::Finding::note(
             "edition.no-online",
@@ -348,6 +409,9 @@ fn render(report: &output::Report<Diagnosis>) -> String {
             }
             if let Some(ed) = &e.edition {
                 out.push_str(&format!("                 edition {ed}\n"));
+            }
+            if e.supports_create_or_alter == Some(false) {
+                out.push_str("                 no CREATE OR ALTER (pre-2016 SP1)\n");
             }
             if let Some(dd) = &e.detail {
                 out.push_str(&format!("                 {dd}\n"));

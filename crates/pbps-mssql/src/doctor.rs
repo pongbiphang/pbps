@@ -106,6 +106,46 @@ pub fn missing(held: &BTreeSet<String>) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Whether this server accepts `CREATE OR ALTER`, which every module statement
+/// the emitter writes depends on (ADR-0002: SQL Server 2016 SP1+).
+///
+/// # Why the edition is part of the question
+///
+/// Azure SQL Database and Managed Instance report `ProductVersion` **12.0.x**
+/// and have supported `CREATE OR ALTER` since long before this tool existed.
+/// A check on the version number alone would refuse the two targets a
+/// cloud-native user is most likely to have, which is a worse failure than the
+/// gap it closes — so Azure is answered by its edition, not its version.
+///
+/// # Why "cannot tell" means yes
+///
+/// A version string this cannot parse must not manufacture a refusal. The
+/// consequence of a wrong "no" is a readiness error on a server that would have
+/// worked; the consequence of a wrong "yes" is the failure that exists today.
+/// Only the first of those is caused by this function, so it says yes when it
+/// does not know.
+pub fn supports_create_or_alter(product_version: &str, edition_raw: &str) -> bool {
+    if edition_raw.to_ascii_lowercase().contains("azure") {
+        return true;
+    }
+    let mut parts = product_version.split('.');
+    let (Some(Ok(major)), Some(_minor), Some(Ok(build))) = (
+        parts.next().map(str::parse::<u32>),
+        parts.next(),
+        parts.next().map(str::parse::<u32>),
+    ) else {
+        return true;
+    };
+    match major {
+        // 2017 and later.
+        m if m > 13 => true,
+        // 2016: RTM is 13.0.1601, SP1 is 13.0.4001. The feature arrived in SP1.
+        13 => build >= 4001,
+        // 2014 and earlier, on a non-Azure server.
+        _ => false,
+    }
+}
+
 /// The server's own version banner, for the report.
 pub async fn server_version(conn: &mut Conn) -> Result<String, DbError> {
     let rows = conn
@@ -188,6 +228,42 @@ mod tests {
     #[test]
     fn control_alone_satisfies_the_list() {
         assert!(missing(&set(&["CONTROL"])).is_empty());
+    }
+
+    #[test]
+    fn the_create_or_alter_floor_is_2016_sp1() {
+        assert!(!supports_create_or_alter(
+            "13.0.1601.5",
+            "Developer Edition"
+        ));
+        assert!(supports_create_or_alter("13.0.4001.0", "Developer Edition"));
+        assert!(supports_create_or_alter("16.0.1000.6", "Standard Edition"));
+        assert!(!supports_create_or_alter("11.0.7001.0", "Standard Edition"));
+    }
+
+    /// Azure SQL Database and Managed Instance report 12.0.x and have supported
+    /// `CREATE OR ALTER` throughout. Refusing them on the version number would
+    /// break the two targets a cloud-native user is most likely to have — a
+    /// worse failure than the gap the check closes.
+    #[test]
+    fn azure_is_answered_by_its_edition_not_its_version() {
+        assert!(supports_create_or_alter("12.0.2000.8", "SQL Azure"));
+        assert!(supports_create_or_alter(
+            "12.0.2000.8",
+            "SQL Azure Managed Instance"
+        ));
+        // The same version on a real on-premises server is 2014, which cannot.
+        assert!(!supports_create_or_alter("12.0.2000.8", "Standard Edition"));
+    }
+
+    /// A version string this cannot read must not manufacture a refusal: a
+    /// wrong "no" blocks a server that would have worked, and this function
+    /// would be the only cause of it.
+    #[test]
+    fn an_unreadable_version_is_not_treated_as_too_old() {
+        assert!(supports_create_or_alter("", ""));
+        assert!(supports_create_or_alter("unknown", "Developer Edition"));
+        assert!(supports_create_or_alter("13", "Developer Edition"));
     }
 
     /// The negative case: an empty answer is a real state — a login mapped to

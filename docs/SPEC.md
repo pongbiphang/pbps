@@ -915,7 +915,7 @@ It answers, from the file alone:
 | Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
 | How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
 | What is checked first? | the derived pre-flight probes (7.5), by description |
-| What exactly do I type? | the `apply` command, with the target, `--allow` and `--staged` filled in |
+| What exactly do I type? | the `apply` command, with the target, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
 | What am I approving? | the plan checksum `apply` will recompute |
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
@@ -1010,6 +1010,13 @@ A pipeline that cannot tell 1 from 2 sends half of every alert to the wrong
 person. `status` is the deliberate exception and always exits 0: it is a report
 rather than a gate (9.4), so its JSON carries findings at warning severity and
 the per-environment truth stays in `state`.
+
+`doctor` splits its own findings across 1 and 2, and the split is the same one:
+an unreachable or unconfigured environment is a question it *could not answer*,
+so that is 1, while everything it found by looking — invalid declarations, a
+missing permission, an environment mid-deployment — is 2. A pipeline running
+`doctor --env prod` must route a firewall or a missing credential to whoever
+runs CI, not to the author of the schema change.
 
 **The vendor formats are converted outside the binary.** GitHub's
 `::error file=,line=::` and GitLab's code-quality JSON change on someone else's
