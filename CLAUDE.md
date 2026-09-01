@@ -29,6 +29,16 @@ cargo clippy --workspace --all-targets    # must be warning-free
 cargo fmt --all
 ```
 
+- Touching dependencies also means `cargo deny check` (policy in `deny.toml`,
+  enforced by CI's `deny` job, weekly as well as on push). Every `ignore` entry
+  must name the advisory, why it does not endanger the tool, and what removes
+  it — an entry without those is a silent downgrade of the check. The current
+  four all have one cause and one fix; see SPEC open question 10.
+- The live tests need a container runtime. In an environment where `docker
+  info` fails, check whether `dockerd` is merely not started before concluding
+  they cannot be run — that mistake cost a round of "cannot verify" in an
+  earlier session.
+
 ## Architectural boundaries
 
 ```
@@ -45,7 +55,9 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a *change* becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact
 pbps-db        Connections (tiberius) plus transaction framing. Owns "there is
-               a network"; ledger types and prune policy, no T-SQL
+               a network"; ledger types and prune policy, no T-SQL. **`tiberius`
+               is named in exactly one file** — `Row`, `FromColumn` and `Param`
+               are this crate's own, so a driver change touches nothing else
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
@@ -316,6 +328,27 @@ argument; `sql_expression_dependencies` returning one row per referenced
 *column*; and check constraints arriving as dependencies of their own table.
 The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
+
+**Open supply-chain item, live rather than filed away** (SPEC open question
+10): `tiberius` has had no release since 2024-07 and pins `rustls 0.21`, whose
+`rustls-webpki 0.101.7` carries three vulnerabilities — two of them certificate
+validation — that no `cargo update` can reach, because every fix needs
+`rustls 0.22+`. `deny.toml` holds them as documented exceptions naming the fix.
+The fix is the driver: `tiberius-ng` keeps the library name, so the change is
+one dependency line, and on 2026-09-01 it passed all fourteen live tests against
+SQL Server 2025. **What is left is a decision, not an unknown** — do not treat
+the exceptions as settled, and delete all four when the driver moves.
+
+**No universal connection layer** (ADR-0007, open question 11). ODBC and ADBC
+sound like an answer both to that item and to dialect breadth; they answer only
+the first. A connection layer replaces `pbps-db`'s ~300 lines and none of the
+type catalogue, emitter, introspection, validation or probes. ADBC is refused
+for SQL Server specifically: its driver's source is not published and its
+licence forbids reverse engineering, which a tool claiming "the reviewed plan is
+exactly what runs" cannot accept — and a proprietary binary cannot be forked,
+so it is *less* recourse than the stale crate, not more. Dialect plugins are
+declined separately: no stable Rust ABI, and a plugin API would freeze
+`ChangeSet` while the model still moves.
 
 **In progress**: Phase 3.1, the usability foundation of SPEC 14. `init` is
 built; next are `doctor`, plan summaries and `explain`, one typed JSON output
