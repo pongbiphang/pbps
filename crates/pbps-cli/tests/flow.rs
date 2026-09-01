@@ -1916,8 +1916,8 @@ fn doctor_tells_an_empty_checkout_from_no_checkout() {
 /// `doctor`'s permissions query has never met a real `sys.fn_my_permissions`
 /// until this runs, and a catalog query that is wrong offline is wrong
 /// silently: it returns an empty set, which `missing` reads as "this account
-/// holds nothing" and reports as five errors. Only a live server can tell the
-/// two apart.
+/// holds nothing" and reports as one error per required permission. Only a live
+/// server can tell the two apart.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
@@ -2133,4 +2133,92 @@ fn the_declaration_schema_describes_what_the_loader_accepts() {
     // the format documents.
     assert!(table["properties"].get("renamed_from").is_some(), "{table}");
     assert!(table["properties"].get("strategy").is_some(), "{table}");
+}
+
+// ---- Review follow-ups on the Phase 3.1 PR ----
+
+/// The command's one promise: a reviewer holding nothing but plan.json, in a
+/// directory with no project, still gets the whole of the file's answer. The
+/// plan names its own dialect, so there is nothing left to discover.
+#[test]
+fn explain_works_in_a_directory_with_no_project() {
+    let d = Demo::new("explainbare");
+    let plan = risky_plan(&d);
+
+    let elsewhere = std::env::temp_dir().join(format!("pbps-reviewer-{}", std::process::id()));
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&elsewhere)
+        .args(["explain", "--plan", plan.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("drop column pii"), "{}", stdout(&o));
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+/// The approval command has to survive being pasted. `apply` requires exactly
+/// one of --db / --env, so one printed without a target fails immediately —
+/// which would make the single most important line of the report the one that
+/// does not work.
+#[test]
+fn the_approval_command_explain_prints_carries_a_target() {
+    let d = Demo::new("approvecmd");
+    let plan = risky_plan(&d);
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps apply"))
+        .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
+    assert!(line.contains("--env"), "{line}");
+    assert!(line.contains("--plan"), "{line}");
+    assert!(
+        line.contains("--allow destructive,narrowing,not-null"),
+        "{line}"
+    );
+    // A redacted --db label is not a connection string and must never be
+    // printed as though it were; the placeholder is the honest form.
+    assert!(line.contains("<environment>"), "{line}");
+}
+
+/// A project with no environments is the shape a consumer meets first, and it
+/// must not be the one that arrives as a parse error (SPEC 9.8).
+#[test]
+fn status_json_stays_json_when_there_are_no_environments() {
+    let d = Demo::new("statusempty");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&["status", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "status");
+    assert_eq!(v["data"].as_array().unwrap().len(), 0);
+    assert_eq!(v["findings"][0]["id"], "project.no-environments");
+    // Still `ok`: status is a report, not a gate, and it always exits 0.
+    assert_eq!(v["result"], "ok");
+}
+
+/// The schema's whole justification is that it accepts exactly what the loader
+/// accepts. A module file names one kind; a file with none, or with two, is
+/// refused by `convert_module`, so the schema has to refuse it too or an editor
+/// blesses a declaration `validate` cannot load.
+#[test]
+fn the_module_schema_demands_exactly_one_kind() {
+    let d = Demo::new("moduleschema");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&["schema"]))).unwrap();
+    let branches = v["$defs"]["ModuleDto"]["oneOf"].as_array().unwrap();
+
+    assert_eq!(branches.len(), 4, "{v}");
+    for kind in ["view", "procedure", "function", "trigger"] {
+        let branch = branches
+            .iter()
+            .find(|b| b["required"] == serde_json::json!([kind]))
+            .unwrap_or_else(|| panic!("no branch for {kind}: {v}"));
+        // The type is pinned as well as the presence: `required` is satisfied
+        // by an explicit null, which YAML writes as often as not (`view:` with
+        // nothing after it), and the loader reads that as absent.
+        assert_eq!(branch["properties"][kind]["type"], "string", "{branch}");
+    }
 }

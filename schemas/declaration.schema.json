@@ -334,6 +334,48 @@
       "additionalProperties": false,
       "required": [
         "definition"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "view": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "view"
+          ]
+        },
+        {
+          "properties": {
+            "procedure": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "procedure"
+          ]
+        },
+        {
+          "properties": {
+            "function": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "function"
+          ]
+        },
+        {
+          "properties": {
+            "trigger": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "trigger"
+          ]
+        }
       ]
     }
   },

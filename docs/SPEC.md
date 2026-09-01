@@ -915,14 +915,19 @@ It answers, from the file alone:
 | Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
 | How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
 | What is checked first? | the derived pre-flight probes (7.5), by description |
-| What exactly do I type? | the `apply` command, `--allow` and `--staged` filled in |
+| What exactly do I type? | the `apply` command, with the target, `--allow` and `--staged` filled in |
 | What am I approving? | the plan checksum `apply` will recompute |
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It
 stays optional because a command needing credentials is a command the reviewer
 cannot run, which puts them back to being briefed by the person asking for the
-approval.
+approval. Without `--env` it needs no *project* either: the dialect comes from
+the plan file, so a reviewer handed nothing but `plan.json`, in a directory with
+no `pbps.yml`, still gets the whole answer. Reading the dialect from the plan is
+also the more honest choice where a project does exist — a plan computed for one
+engine must be explained as that engine, not as whatever the local config
+selects.
 
 `explain` always exits 0. A plan full of destructive changes is what it exists to
 describe well; the gate is `apply --allow`, and having two commands fail on the

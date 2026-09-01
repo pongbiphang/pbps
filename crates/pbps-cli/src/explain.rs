@@ -76,18 +76,23 @@ pub struct TargetState {
 }
 
 pub fn cmd_explain(
-    project: &pbps_config::Project,
     path: &std::path::Path,
     target: Option<&db::Target>,
+    env: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read the plan `{}`", path.display()))?;
     let plan: SavedPlan = serde_json::from_str(&raw)
         .with_context(|| format!("`{}` is not a pbps plan", path.display()))?;
-    let dialect = crate::dialect(project)?;
+    // The dialect comes from the *plan*, not from a pbps.yml. That is what lets
+    // this command run in a directory that has no project at all — the reviewer
+    // may have been handed nothing but the file. It is also more honest where a
+    // project does exist: a plan computed for one engine must be explained as
+    // that engine, not as whatever the local config happens to select.
+    let dialect = dialect_of(&plan)?;
 
-    let explanation = explain(&plan, dialect.as_ref(), path, target)?;
+    let explanation = explain(&plan, dialect.as_ref(), path, target, env)?;
     let findings = findings(&plan, &explanation);
 
     if json {
@@ -108,11 +113,26 @@ pub fn cmd_explain(
     Ok(())
 }
 
+/// The dialect this plan was computed for.
+///
+/// A plan names its own engine (`SavedPlan::dialect`) precisely so a plan
+/// computed for one and applied to another is nonsense the file can catch;
+/// reading it here is the same check, made earlier and without a connection.
+fn dialect_of(plan: &SavedPlan) -> anyhow::Result<Box<dyn Dialect>> {
+    match plan.dialect.as_str() {
+        "mssql" => Ok(Box::new(pbps_mssql::Mssql)),
+        other => {
+            anyhow::bail!("this plan was computed for `{other}`, which this build cannot explain")
+        }
+    }
+}
+
 fn explain(
     plan: &SavedPlan,
     dialect: &dyn Dialect,
     path: &std::path::Path,
     target: Option<&db::Target>,
+    env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
     let tables: std::collections::BTreeSet<String> = cs
@@ -137,7 +157,16 @@ fn explain(
         })
         .collect();
 
-    let mut approve = format!("pbps apply --plan {}", path.display());
+    // `apply` requires exactly one of --db / --env, so a command printed
+    // without one fails the moment it is pasted. The environment's *name* is
+    // used when there is one; a --db target contributes only its redacted
+    // label, which is not a connection string and must never be printed as if
+    // it were, so that case gets the placeholder too.
+    let mut approve = format!(
+        "pbps apply --env {} --plan {}",
+        env.unwrap_or("<environment>"),
+        path.display()
+    );
     if !present.is_empty() {
         approve.push_str(&format!(
             " --allow {}",

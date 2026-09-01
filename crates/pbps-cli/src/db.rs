@@ -45,6 +45,19 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
     }
 }
 
+/// A target from a bare connection string, with no project to consult.
+///
+/// `explain` is the only caller: it answers for a reviewer who may have no
+/// checkout, so it cannot go through [`target`], which needs a `Project` to
+/// resolve an `--env` name. There is nothing to resolve here — a connection
+/// string is already the answer.
+pub fn target_from_connection(connection: &str) -> Target {
+    Target {
+        label: redact(connection),
+        connection: connection.to_owned(),
+    }
+}
+
 /// The parts of a connection string that are safe to print.
 ///
 /// Command output lands in CI logs, in tickets and in chat. A connection string

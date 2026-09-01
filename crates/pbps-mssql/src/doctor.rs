@@ -26,7 +26,7 @@ use crate::catalog::get;
 /// the deployment account exactly what it needs should be able to see the list,
 /// and "make it an owner" is the advice that makes every such organization say
 /// no to the tool.
-pub const REQUIRED: [(&str, &str); 5] = [
+pub const REQUIRED: [(&str, &str); 6] = [
     (
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -40,7 +40,19 @@ pub const REQUIRED: [(&str, &str); 5] = [
         "creating __pbps_state and __pbps_lock on first use",
     ),
     ("ALTER", "every change to a table in a schema pbps manages"),
-    ("INSERT", "recording a state snapshot in the ledger"),
+    (
+        "INSERT",
+        "recording a state snapshot, and taking the deployment lock",
+    ),
+    // The worst gap to be missing, and the easiest to overlook: `apply` takes
+    // the lock with INSERT and releases it with DELETE. Without this the schema
+    // change commits and *then* the release fails, leaving a stale lock that
+    // blocks the next pipeline — which is precisely the failure `doctor` exists
+    // to catch beforehand. `state prune` needs it too.
+    (
+        "DELETE",
+        "releasing the deployment lock after an apply, and `state prune`",
+    ),
 ];
 
 /// The database-scoped permissions the connected account effectively holds.
@@ -63,8 +75,8 @@ pub async fn permissions(conn: &mut Conn) -> Result<BTreeSet<String>, DbError> {
 /// Which of [`REQUIRED`] the account does not hold.
 ///
 /// `CONTROL` short-circuits the whole list: it implies every permission below
-/// it, and an account that holds it would otherwise be reported as missing all
-/// five while being able to do all five.
+/// it, and an account that holds it would otherwise be reported as missing the
+/// whole list while being able to do all of it.
 pub fn missing(held: &BTreeSet<String>) -> Vec<(&'static str, &'static str)> {
     if held.contains("CONTROL") {
         return Vec::new();
@@ -109,6 +121,7 @@ mod tests {
             "CREATE TABLE",
             "ALTER",
             "INSERT",
+            "DELETE",
         ]);
         assert!(missing(&held).is_empty());
     }
@@ -120,12 +133,29 @@ mod tests {
     fn a_missing_permission_is_reported_with_its_reason() {
         let held = set(&["VIEW DEFINITION", "SELECT"]);
         let gaps = missing(&held);
-        assert_eq!(gaps.len(), 3);
+        assert_eq!(gaps.len(), 4);
         assert!(gaps.iter().any(|(n, why)| *n == "ALTER" && !why.is_empty()));
     }
 
-    /// CONTROL implies the rest. Reporting an owner as missing all five would
-    /// be the check crying wolf on the most common setup there is.
+    /// An account that can take the lock but not release it is the dangerous
+    /// shape: `apply` commits the schema change and only then fails, leaving a
+    /// stale lock. `doctor` has to name it before the deployment, not after.
+    #[test]
+    fn holding_insert_without_delete_is_still_a_gap() {
+        let held = set(&[
+            "VIEW DEFINITION",
+            "SELECT",
+            "CREATE TABLE",
+            "ALTER",
+            "INSERT",
+        ]);
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, "DELETE");
+    }
+
+    /// CONTROL implies the rest. Reporting an owner as missing every entry
+    /// would be the check crying wolf on the most common setup there is.
     #[test]
     fn control_alone_satisfies_the_list() {
         assert!(missing(&set(&["CONTROL"])).is_empty());

@@ -425,6 +425,21 @@ fn run() -> anyhow::Result<()> {
     if let Command::Man { out } = &cli.command {
         return integration::cmd_man(out);
     }
+    // `explain` needs a project only to look an --env name up in pbps.yml. The
+    // reviewer this command exists for may have been handed nothing but
+    // plan.json, in a directory with no project at all — and the plan carries
+    // its own dialect, so there is nothing else to discover. Requiring a
+    // checkout here would break the command's one promise.
+    if let Command::Explain {
+        plan,
+        target,
+        format,
+    } = &cli.command
+        && target.env.is_none()
+    {
+        let target = target.db.as_deref().map(db::target_from_connection);
+        return explain::cmd_explain(plan, target.as_ref(), None, *format == OutputFormat::Json);
+    }
     let project = Project::discover(&start)?;
 
     match cli.command {
@@ -433,6 +448,21 @@ fn run() -> anyhow::Result<()> {
         | Command::Completions { .. }
         | Command::Man { .. } => {
             unreachable!("these return before project discovery")
+        }
+        // Only the --env form reaches here; the rest returned above.
+        Command::Explain {
+            plan,
+            target,
+            format,
+        } => {
+            let env = target.env.clone();
+            let target = target.resolve(&project)?;
+            explain::cmd_explain(
+                &plan,
+                Some(&target),
+                env.as_deref(),
+                format == OutputFormat::Json,
+            )
         }
         Command::Plan {
             target,
@@ -516,24 +546,6 @@ fn run() -> anyhow::Result<()> {
                 &allow.into_iter().collect(),
                 staged,
                 resume,
-            )
-        }
-        Command::Explain {
-            plan,
-            target,
-            format,
-        } => {
-            // The target is optional here and nowhere else: a reviewer with no
-            // credentials must still get the whole of the file's answer.
-            let target = match (&target.db, &target.env) {
-                (None, None) => None,
-                _ => Some(target.resolve(&project)?),
-            };
-            explain::cmd_explain(
-                &project,
-                &plan,
-                target.as_ref(),
-                format == OutputFormat::Json,
             )
         }
         Command::Doctor { env, format } => {

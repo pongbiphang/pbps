@@ -20,7 +20,7 @@
 use pbps_config::Project;
 use pbps_db::Conn;
 
-use crate::db;
+use crate::{db, output};
 
 /// One environment's line. Serialized as-is for `--format json`, so anyone who
 /// wants their own web view has a stable shape to render.
@@ -77,6 +77,27 @@ impl EnvStatus {
 
 pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
     if project.config.environments.is_empty() {
+        // Still through the envelope when JSON was asked for. A consumer that
+        // got prose here would have to special-case the one project shape it is
+        // most likely to meet first — and it would meet it as a parse error,
+        // which reads as "the tool broke" rather than "there is nothing to
+        // report" (SPEC §9.8).
+        if json {
+            let report = output::Report::new(
+                "status",
+                vec![
+                    output::Finding::warning(
+                        "project.no-environments",
+                        "no environments are configured",
+                    )
+                    .at(project.config_file(), None)
+                    .remedy("add `environments:` to pbps.yml with `url_env:` naming the variable"),
+                ],
+                Some(Vec::<EnvStatus>::new()),
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
         println!(
             "No environments are configured. Add them to pbps.yml:\n\n\
              environments:\n  prod:\n    url_env: PROD_CONN\n\n\
@@ -120,7 +141,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
             .iter()
             .filter(|r| r.state != "ok")
             .map(|r| {
-                let mut f = crate::output::Finding::warning(
+                let mut f = output::Finding::warning(
                     match r.state {
                         "drift" => "state.drift",
                         "staged" => "state.mid-deployment",
@@ -141,11 +162,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&crate::output::Report::new(
-                "status",
-                findings,
-                Some(&rows)
-            ))?
+            serde_json::to_string_pretty(&output::Report::new("status", findings, Some(&rows)))?
         );
     } else {
         print!("{}", render(&rows));

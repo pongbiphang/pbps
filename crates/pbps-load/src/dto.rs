@@ -40,8 +40,25 @@ pub struct KindProbe {
 /// The leading key is both the kind and the name — `view: dbo.active_customer`
 /// — for the same reason `table:` is: the file name carries no meaning, so the
 /// identity has to be inside the file.
+// The four kind keys are individually optional in Rust because serde has to
+// read the file before it can say which one is present — but the loader
+// requires exactly one, and a schema that did not say so would bless a file
+// with none, or with two, that `convert_module` then refuses. The whole point
+// of generating the schema is that it accepts exactly what the loader accepts,
+// so the constraint is stated here rather than left to the derive.
+//
+// Each branch pins the key's *type* as well as its presence: JSON Schema's
+// `required` is satisfied by an explicit null, which YAML writes as often as
+// not (`view:` with nothing after it), and the loader would read that as
+// absent.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("oneOf" = [
+    serde_json::json!({"required": ["view"], "properties": {"view": {"type": "string"}}}),
+    serde_json::json!({"required": ["procedure"], "properties": {"procedure": {"type": "string"}}}),
+    serde_json::json!({"required": ["function"], "properties": {"function": {"type": "string"}}}),
+    serde_json::json!({"required": ["trigger"], "properties": {"trigger": {"type": "string"}}}),
+]))]
 pub struct ModuleDto {
     #[serde(default)]
     #[schemars(with = "Option<String>")]
