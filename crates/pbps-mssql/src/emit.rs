@@ -192,7 +192,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::SetPrimaryKey { table, from, to } => {
             let mut out = Vec::new();
             if let Some(pk) = from {
-                out.push(drop_primary_key(table, pk, strategy)?);
+                out.push(drop_primary_key(table, pk)?);
             }
             if let Some(pk) = to {
                 out.push(Statement::new(format!(
@@ -542,22 +542,19 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
 
 /// Drops the primary key, looking its name up when the declarations do not
 /// carry one.
-fn drop_primary_key(
-    table: &TableName,
-    pk: &PrimaryKey,
-    strategy: Strategy,
-) -> Result<Statement, DialectError> {
+/// No ONLINE clause: the option is accepted on a constraint drop only when the
+/// constraint's index is clustered, and the model does not record clusteredness
+/// — [`crate::introspect`] does not read it back, so a primary key adopted as
+/// `NONCLUSTERED` is indistinguishable here from a clustered one. Emitting the
+/// hint on a guess would produce a statement the server rejects outright, which
+/// is worse than an offline drop of a key that was going to be rebuilt anyway.
+fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, DialectError> {
     let q = qualified(table)?;
     Ok(match &pk.name {
-        Some(n) => Statement::new(format!(
-            "ALTER TABLE {q} DROP CONSTRAINT {}{};",
-            quote(n)?,
-            online(strategy)
-        )),
+        Some(n) => Statement::new(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n)?)),
         None => Statement::new(format!(
-            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@pk) + N'{}';\n    EXEC(@sql);\nEND",
-            literal(&q),
-            online(strategy)
+            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@pk);\n    EXEC(@sql);\nEND",
+            literal(&q)
         ))
         .own_batch(),
     })

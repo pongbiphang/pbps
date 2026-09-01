@@ -200,12 +200,17 @@ pub fn render_module(
 
     s.push_str("\ndefinition: |-\n");
     for line in module.definition.trim_end().lines() {
-        if line.trim().is_empty() {
-            // An indented blank line is trailing whitespace; a bare one is not,
-            // and both read back as the same empty line.
+        if line.is_empty() {
+            // A truly empty line needs no indent, and writing one would put
+            // trailing whitespace in the file for nothing.
             s.push('\n');
         } else {
-            let _ = writeln!(s, "  {}", line.trim_end());
+            // Everything else goes out verbatim, trailing spaces included. They
+            // look like something to tidy up and are not: a line inside a
+            // multiline T-SQL literal ends where its author put it, and
+            // trimming here would have `pbps fmt` quietly change what the module
+            // returns — the one thing a formatter must never do.
+            let _ = writeln!(s, "  {line}");
         }
     }
     s
@@ -276,6 +281,27 @@ fn needs_quotes(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A formatter that changes what the code does is worse than no formatter.
+    /// Trailing spaces on a line inside a multiline T-SQL literal are part of
+    /// the string, so `fmt` has to leave them where their author put them —
+    /// they look exactly like whitespace to tidy up, which is the trap.
+    #[test]
+    fn trailing_spaces_inside_a_literal_survive_formatting() {
+        let module = pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            on: None,
+            definition: "SELECT 'first  \nsecond' AS note".into(),
+        };
+        let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
+        let out = render_module(&name, &module, &Default::default());
+        assert!(out.contains("SELECT 'first  "), "{out}");
+
+        let back = crate::load_module_str(Path::new("dbo.v.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}"));
+        assert_eq!(back.module.definition, module.definition);
+    }
 
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)

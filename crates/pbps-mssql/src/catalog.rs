@@ -102,7 +102,12 @@ SELECT i.object_id, i.name, i.is_unique,
 const MODULES: &str = "\
 SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
        m.definition AS definition,
-       ps.name AS parent_schema, pt.name AS parent_table
+       ps.name AS parent_schema, pt.name AS parent_table,
+       -- Persisted with the module and re-applied on every execution, so they
+       -- are part of what it does. NULL for a module with no readable
+       -- definition, which is refused for its own reason first.
+       CONVERT(bit, ISNULL(m.uses_quoted_identifier, 1)) AS quoted_identifier,
+       CONVERT(bit, ISNULL(m.uses_ansi_nulls, 1)) AS ansi_nulls
   FROM sys.objects o
   JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.sql_modules m ON m.object_id = o.object_id
@@ -212,7 +217,10 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         let parent = opt::<&str>(&row, "parent_schema")?
             .zip(opt::<&str>(&row, "parent_table")?)
             .map(|(s, t)| (s.to_owned(), t.to_owned()));
+        let quoted: bool = get(&row, "quoted_identifier")?;
+        let ansi_nulls: bool = get(&row, "ansi_nulls")?;
         raw.modules.push(RawModule {
+            default_set_options: quoted && ansi_nulls,
             schema: get::<&str>(&row, "schema_name")?.to_owned(),
             name: get::<&str>(&row, "object_name")?.to_owned(),
             kind,

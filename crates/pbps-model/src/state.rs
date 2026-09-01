@@ -9,7 +9,14 @@
 use crate::ids::IdsFile;
 use crate::schema::Schema;
 
-pub const CURRENT_VERSION: u32 = 1;
+/// The current state-snapshot format version.
+///
+/// Bumped to 2 when `Schema` grew `modules`. What a state records is what a
+/// drift check compares, so an older client would deserialize a new snapshot,
+/// silently ignore the modules in it, introspect only tables, and report a
+/// clean verification for an environment whose managed procedure has drifted.
+/// Readers refuse a version they do not understand instead.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -146,10 +153,52 @@ impl StateSnapshot {
     pub fn matches(&self, actual: &Schema) -> bool {
         &self.schema == actual
     }
+
+    /// Refuses a snapshot this build cannot read faithfully.
+    ///
+    /// Called at every read, because serde would otherwise accept a newer file
+    /// by ignoring the fields it does not know — and the fields a state gains
+    /// are the objects a drift check compares. Silently reporting "no drift"
+    /// about half a schema is the one answer this tool must never give.
+    pub fn check_version(&self) -> Result<(), String> {
+        if self.version == CURRENT_VERSION {
+            return Ok(());
+        }
+        Err(format!(
+            "this is a version {} state and this build of pbps reads version {CURRENT_VERSION}. \
+             {}",
+            self.version,
+            if self.version < CURRENT_VERSION {
+                "It was recorded by an older pbps; re-record it with `pbps baseline --reason ...`."
+            } else {
+                "It was recorded by a newer pbps; upgrade this one rather than reading it \
+                 partially."
+            }
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Serde accepts a newer file by ignoring what it does not know, and the
+    /// fields a state gains are the objects a drift check compares. "No drift"
+    /// about half a schema is the one answer this tool must never give.
+    #[test]
+    fn a_state_from_another_format_version_is_refused() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Baseline,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert!(snap.check_version().is_ok());
+
+        snap.version = CURRENT_VERSION - 1;
+        assert!(snap.check_version().unwrap_err().contains("older pbps"));
+        snap.version = CURRENT_VERSION + 1;
+        assert!(snap.check_version().unwrap_err().contains("newer pbps"));
+    }
     use super::*;
     use crate::ids::IdsFile;
     use crate::name::TableName;

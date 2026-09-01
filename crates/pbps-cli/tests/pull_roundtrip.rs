@@ -114,6 +114,7 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: None,
+                default_set_options: true,
             },
             RawModule {
                 schema: "dbo".into(),
@@ -124,6 +125,7 @@ fn full_catalog() -> RawCatalog {
                         .into(),
                 ),
                 parent: Some(("dbo".into(), "customer".into())),
+                default_set_options: true,
             },
         ],
     }

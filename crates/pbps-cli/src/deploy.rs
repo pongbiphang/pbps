@@ -23,13 +23,6 @@ use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot};
 
 use crate::db::{self, Target};
 
-/// Introspects, cuts the result down to the managed set, and reports whatever
-/// the read itself could not express.
-///
-/// Every connected command starts here. The warnings are printed rather than
-/// returned because ignoring them is never right: a drift check that silently
-/// skipped a computed column would report "no drift" about a database it only
-/// half read.
 /// A scoped live state, plus the declared modules the read could not express.
 ///
 /// The second list cannot live in [`pbps_diff::Scoped`] — "pbps cannot read
@@ -39,8 +32,14 @@ use crate::db::{self, Target};
 /// by name and outside the scoped schema in fact.
 pub struct Managed {
     pub scoped: pbps_diff::Scoped,
-    /// Declared modules that exist but cannot be read back, already described.
-    pub unreadable: Vec<String>,
+    /// Every module in the database that introspection cannot express, by name,
+    /// with the reason already rendered.
+    ///
+    /// Returned in full rather than filtered to the managed set, because the
+    /// caller that most needs it is asking about a name that has *never* been
+    /// recorded: a newly declared module that collides with an encrypted one
+    /// already standing there.
+    pub unreadable: Vec<(pbps_model::ObjectName, String)>,
 }
 
 /// The scoped state alone, which is all any caller but `bootstrap` needs.
@@ -55,6 +54,13 @@ async fn managed_state(
         .scoped)
 }
 
+/// Introspects, cuts the result down to the managed set, and reports whatever
+/// the read itself could not express.
+///
+/// Every connected command starts here. The warnings are printed rather than
+/// returned because ignoring them is never right: a drift check that silently
+/// skipped a computed column would report "no drift" about a database it only
+/// half read.
 async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
@@ -72,16 +78,16 @@ async fn managed_state_full(
     // would propose creating one that is already there.
     let mut unreadable = Vec::new();
     for m in &pulled.unmanaged_modules {
-        if m.name
-            .parse::<pbps_model::ObjectName>()
-            .is_ok_and(|n| modules.contains(&n))
-        {
+        let Ok(name) = m.name.parse::<pbps_model::ObjectName>() else {
+            continue;
+        };
+        if modules.contains(&name) {
             eprintln!(
                 "warning: {} {} is declared, but {}; it is left alone",
                 m.kind, m.name, m.why
             );
-            unreadable.push(format!("{} {} ({})", m.kind, m.name, m.why));
         }
+        unreadable.push((name, format!("{} {} ({})", m.kind, m.name, m.why)));
     }
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
@@ -482,9 +488,15 @@ pub fn cmd_bootstrap(
         // reaches the scoped schema — introspection cannot express it — so
         // without this the target reads as empty and `CREATE OR ALTER` replaces
         // the object that is standing there.
+        let unreadable_declared: Vec<&str> = existing
+            .unreadable
+            .iter()
+            .filter(|(n, _)| declared_modules.contains(n))
+            .map(|(_, why)| why.as_str())
+            .collect();
         if !existing.scoped.schema.tables.is_empty()
             || !existing.scoped.schema.modules.is_empty()
-            || !existing.unreadable.is_empty()
+            || !unreadable_declared.is_empty()
         {
             let names: Vec<String> = existing
                 .scoped
@@ -500,7 +512,7 @@ pub fn cmd_bootstrap(
                         .keys()
                         .map(ToString::to_string),
                 )
-                .chain(existing.unreadable.iter().cloned())
+                .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
                 .collect();
             bail!(
                 "`{}` already has {} of the declared object(s): {}.\n\
@@ -652,13 +664,36 @@ pub fn cmd_plan_db(
         // the first time and that already exists in the database is outside it,
         // and telling its author "this object is not declared" while planning
         // the `CREATE OR ALTER` for it would be both wrong and unactionable.
-        let scoped = managed_state(
+        let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
             pbps_config::Unmanaged::Ignore,
         )
         .await?;
+        // A declared name standing on an object introspection cannot express is
+        // not something to plan around. It is absent from the scoped schema, so
+        // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`
+        // would replace it — removing, silently, the very options that made it
+        // unreadable (ADR-0002: what pbps cannot reproduce, it does not touch).
+        let colliding: Vec<&str> = managed
+            .unreadable
+            .iter()
+            .filter(|(n, _)| loaded.schema.modules.contains_key(n))
+            .map(|(_, why)| why.as_str())
+            .collect();
+        if !colliding.is_empty() {
+            bail!(
+                "`{}` already holds {} declared object(s) that pbps cannot read back: {}.\n\
+                 Planning would propose creating them, and `CREATE OR ALTER` would replace what \
+                 is there. Remove the declaration, or recreate the object in a form pbps can \
+                 express.",
+                target.label,
+                colliding.len(),
+                colliding.join(", ")
+            );
+        }
+        let scoped = managed.scoped;
         let mut for_policy = scoped.clone();
         for_policy
             .unmanaged_modules
@@ -891,7 +926,17 @@ pub fn cmd_apply(
     }
 
     let statements = crate::statements(&plan.changes, dialect.as_ref())?;
-    reject_non_transactional(&statements)?;
+    // Only for a transactional plan. A staged one exists *because* its
+    // statement cannot run inside a transaction (ADR-0003): `plan --db
+    // --staged` accepts it deliberately, and rejecting it here would leave
+    // staged execution refusing the only kind of change it is for.
+    //
+    // Nothing the T-SQL emitter writes is marked non-transactional yet, so this
+    // is latent — which is the reason to fix it now rather than when the first
+    // such statement arrives and the guard swallows every staged apply.
+    if !staged {
+        reject_non_transactional(&statements)?;
+    }
     let targets = pbps_mssql::impact::RenameTarget::from_changes(&plan.changes);
 
     let recorded = db::runtime()?.block_on(async {
@@ -1281,9 +1326,25 @@ async fn preflight(
         );
     }
 
+    // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
+    // module changes sort before the table changes precisely so that the drop
+    // runs first (ADR-0002). The catalog is queried before anything executes, so
+    // it still sees the dependency — and reporting it would refuse a plan whose
+    // own first statement removes the obstacle.
+    let dropped: std::collections::BTreeSet<String> = plan
+        .changes
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|p| p.change.module_name())
+        .map(ToString::to_string)
+        .collect();
+
     let mut blocked = Vec::new();
     for target in rename_targets {
-        let report = pbps_mssql::impact::rename_impact(conn, target).await?;
+        let mut report = pbps_mssql::impact::rename_impact(conn, target).await?;
+        report.blocking.retain(|r| !dropped.contains(&r.name));
+        report.advisory.retain(|r| !dropped.contains(&r.name));
         if report.is_empty() {
             continue;
         }

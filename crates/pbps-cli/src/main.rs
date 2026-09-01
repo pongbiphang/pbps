@@ -898,6 +898,22 @@ fn cmd_plan(
         );
     }
 
+    // Drop ordering is computed over the *baseline's* modules, so it needs the
+    // annotations that travelled with that revision. A module this revision
+    // removes declares no `depends_on:` any more, and the edge it recorded is
+    // one the identifier scan could not find — so without this the drops fall
+    // back to name order and can remove a dependency before its dependent.
+    // Declared hints win where both sides have an entry: the current revision is
+    // the one being planned. (`plan --db` cannot do the same; its baseline is
+    // the ledger, which records the state, not the annotations beside it.)
+    let mut hints = loaded.hints.clone();
+    for (name, deps) in &base.hints.module_deps {
+        hints
+            .module_deps
+            .entry(name.clone())
+            .or_insert_with(|| deps.clone());
+    }
+
     let cs = pbps_diff::diff(
         Side {
             schema: &base.schema,
@@ -908,7 +924,7 @@ fn cmd_plan(
             ids: &res.ids,
         },
         dialect.as_ref(),
-        &loaded.hints,
+        &hints,
     )
     .map_err(|errs| {
         for e in &errs {

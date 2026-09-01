@@ -114,6 +114,16 @@ pub struct RawModule {
     pub definition: Option<String>,
     /// A trigger's table, as `(schema, table)`.
     pub parent: Option<(String, String)>,
+    /// Whether the module was created with `QUOTED_IDENTIFIER` and `ANSI_NULLS`
+    /// both ON, which is what a `CREATE OR ALTER` sent by pbps will run under.
+    ///
+    /// SQL Server persists these two with the module and re-applies them on
+    /// every execution, so a module created with either OFF behaves differently
+    /// from the same text recreated by pbps — double-quoted tokens become string
+    /// literals, or `= NULL` starts matching rows. The model has nowhere to keep
+    /// them (they are options, not definition), so such a module is inventoried
+    /// rather than claimed to round-trip (ADR-0002).
+    pub default_set_options: bool,
 }
 
 /// Maps `sys.objects.type` codes onto the model's kinds.
@@ -618,6 +628,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
             continue;
         };
+        if !m.default_set_options {
+            unmanageable(
+                "it was created with QUOTED_IDENTIFIER or ANSI_NULLS OFF, which pbps cannot \
+                 restate — recreating it would change how it behaves",
+            );
+            continue;
+        }
         let Some((on, definition)) = split_module(m.kind, stored, m.parent.is_some()) else {
             unmanageable(
                 "its definition is not of a shape pbps can reproduce (a view with options such \
@@ -957,6 +974,7 @@ mod module_tests {
             kind,
             definition: definition.map(str::to_owned),
             parent: None,
+            default_set_options: true,
         }
     }
 
@@ -1040,6 +1058,30 @@ mod module_tests {
         );
         assert!(
             p.unmanaged_modules[1].why.contains("SCHEMABINDING"),
+            "{:?}",
+            p.unmanaged_modules
+        );
+    }
+
+    /// SQL Server persists QUOTED_IDENTIFIER and ANSI_NULLS with the module and
+    /// re-applies them on every execution, so a module created with either OFF
+    /// does not mean the same thing as the identical text recreated by pbps.
+    /// The model has nowhere to keep them, so the honest answer is an inventory
+    /// entry rather than a claim that it round-trips.
+    #[test]
+    fn a_module_with_nondefault_set_options_is_inventoried() {
+        let mut m = module(
+            "dbo",
+            "v_quirk",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_quirk AS SELECT 1"),
+        );
+        m.default_set_options = false;
+        let p = assemble(&catalog_with(vec![m]));
+        assert!(p.schema.modules.is_empty());
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert!(
+            p.unmanaged_modules[0].why.contains("QUOTED_IDENTIFIER"),
             "{:?}",
             p.unmanaged_modules
         );

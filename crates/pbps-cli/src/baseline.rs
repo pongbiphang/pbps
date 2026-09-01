@@ -62,6 +62,8 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
             let snap: StateSnapshot = serde_json::from_str(&text).map_err(|e| {
                 anyhow::anyhow!("baseline file `{}` is malformed: {e}", path.display())
             })?;
+            snap.check_version()
+                .map_err(|e| anyhow::anyhow!("baseline file `{}`: {e}", path.display()))?;
             Ok(Baseline {
                 schema: snap.schema,
                 ids: snap.ids,

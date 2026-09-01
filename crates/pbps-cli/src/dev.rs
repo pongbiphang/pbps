@@ -327,16 +327,27 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                 table,
                 name,
                 constraint,
-            } => spelling.push(format!(
-                "check {name} on {table}: declared `{}`, the engine stores `{}`",
-                constraint.expression,
-                engine
+            } => {
+                // A spelling difference needs two spellings. When the engine has
+                // no constraint by that name the plan simply did not create it,
+                // which is non-convergence — and `converged()` looks only at
+                // `structural`, so calling it a spelling would pass the
+                // rehearsal with the constraint missing.
+                let stored = engine
                     .tables
                     .get(table)
                     .and_then(|t| t.checks.get(name))
-                    .map(|c| c.expression.as_str())
-                    .unwrap_or("(absent)")
-            )),
+                    .map(|c| c.expression.as_str());
+                match stored {
+                    Some(stored) => spelling.push(format!(
+                        "check {name} on {table}: declared `{}`, the engine stores `{stored}`",
+                        constraint.expression
+                    )),
+                    None => structural.push(format!(
+                        "check {name} on {table} is declared but the plan did not create it"
+                    )),
+                }
+            }
             Change::AlterColumnDefault { column, to, .. } => spelling.push(format!(
                 "default on {column}: declared `{}`, the engine stores `{}`",
                 to.as_deref().unwrap_or("(none)"),
@@ -543,6 +554,43 @@ mod tests {
         let (structural, spelling) = classify(&remaining, &Schema::default());
         assert!(structural.is_empty(), "{structural:?}");
         assert!(spelling.is_empty(), "{spelling:?}");
+    }
+
+    /// A spelling difference needs two spellings. When the engine has nothing
+    /// by that name the plan did not create the constraint at all — and
+    /// `converged()` looks only at `structural`, so calling it a spelling would
+    /// pass the rehearsal with the check missing from the database.
+    #[test]
+    fn a_check_the_plan_never_created_is_structural() {
+        let table: pbps_model::TableName = "dbo.t".parse().unwrap();
+        let remaining = ChangeSet {
+            changes: vec![planned(Change::AddCheck {
+                table: table.clone(),
+                name: "ck_positive".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "qty > 0".into(),
+                },
+            })],
+        };
+
+        // Nothing in the engine: the plan failed to create it.
+        let (structural, spelling) = classify(&remaining, &Schema::default());
+        assert_eq!(structural.len(), 1, "{structural:?}");
+        assert!(spelling.is_empty(), "{spelling:?}");
+
+        // The same name present, spelled the engine's way: a spelling after all.
+        let mut engine = Schema::default();
+        let mut t = pbps_model::Table::default();
+        t.checks.insert(
+            "ck_positive".into(),
+            pbps_model::CheckConstraint {
+                expression: "([qty]>(0))".into(),
+            },
+        );
+        engine.tables.insert(table, t);
+        let (structural, spelling) = classify(&remaining, &engine);
+        assert!(structural.is_empty(), "{structural:?}");
+        assert_eq!(spelling.len(), 1, "{spelling:?}");
     }
 
     /// The safe default is the loud one: a change kind nobody has classified

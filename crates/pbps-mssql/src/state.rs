@@ -229,6 +229,9 @@ fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
             id,
             message: e.to_string(),
         })?;
+    snapshot
+        .check_version()
+        .map_err(|message| LedgerError::BadEntry { id, message })?;
     Ok(LedgerEntry {
         id,
         // NULL is impossible: the column is NOT NULL with a default. Treating a
