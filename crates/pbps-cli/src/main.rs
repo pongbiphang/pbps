@@ -743,6 +743,12 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
             );
         }
     }
+    // `load` produces the specific reason (a missing directory, N problem(s));
+    // without this the run ends on the generic bail below and never says what
+    // was wrong.
+    if let Err(e) = &loaded {
+        eprintln!("  {e:#}");
+    }
     match &ids {
         Ok(Some(i)) => println!(
             "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",

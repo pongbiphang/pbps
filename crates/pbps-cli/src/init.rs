@@ -37,6 +37,44 @@ pub struct InitArgs {
     url_env: Option<String>,
 }
 
+/// Owns the staging tree until it has been installed.
+///
+/// Staging holds a complete project — pbps.yml, the identity file and every
+/// declaration — inside the user's root, so a failure that leaves one behind
+/// puts a second, invisible project beside theirs. Making that a `Drop` rather
+/// than a line before each `return` is what keeps a later `?` from becoming the
+/// one path that strands it: `preview` already was.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // `commit` removes the tree itself on both of its paths, so on the
+        // ordinary run this finds nothing and the error is the right thing to
+        // discard.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Keeps `schema/` in git when it holds no declarations yet.
+const GITKEEP: &str = ".gitkeep";
+
+/// What `commit` found where the declaration directory goes, so a rollback can
+/// put back exactly what it displaced.
+enum Displaced {
+    Nothing,
+    EmptyDirectory,
+    /// The directory held only an empty `.gitkeep`, the file init writes
+    /// itself. Nothing of the user's is in it, so putting it back is writing
+    /// the same empty file again.
+    GitKeep,
+}
+
 struct Prepared {
     schema: Schema,
     ids: IdsFile,
@@ -155,9 +193,9 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         }
         eprintln!("  They are left untouched and do not appear in any plan.");
     }
-    let stage = stage_project(&root, &prepared)?;
-    preview(&root, &stage)?;
-    commit(&root, &stage)?;
+    let stage = Staging(stage_project(&root, &prepared)?);
+    preview(&root, stage.path())?;
+    commit(&root, stage.path())?;
 
     println!("Initialized pbps project at `{}`.", root.display());
     if !prepared.warnings.is_empty() {
@@ -192,13 +230,43 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolves `path` to an absolute path with no `..` left in it.
+///
+/// `Project::discover` walks this path's ancestors, and a lexical `..` puts
+/// directories that are not ancestors on that walk: `pbps --project ../sibling
+/// init` run from inside a project would refuse because it "is already inside"
+/// the very project it is escaping. `std::path::absolute` does not help — on
+/// Unix it keeps `..` on purpose, because dropping it lexically names the wrong
+/// directory whenever a component is a symlink. So the deepest existing prefix
+/// is canonicalized, which resolves `..` against the real filesystem, and the
+/// part that does not exist yet is appended to it.
 fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_owned());
+    let joined = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("cannot determine the current directory")?
+            .join(path)
+    };
+
+    let mut existing = joined.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return Ok(missing.iter().rev().fold(resolved, |mut out, name| {
+                out.push(name);
+                out
+            }));
+        }
+        // `file_name` is None for a path ending in `..`, which can only happen
+        // when its parent does not exist either. Nothing can be resolved then,
+        // so hand back the joined path rather than invent a normalization.
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Ok(joined);
+        };
+        missing.push(name.to_owned());
+        existing = parent;
     }
-    Ok(std::env::current_dir()
-        .context("cannot determine the current directory")?
-        .join(path))
 }
 
 fn refuse_existing(root: &Path) -> anyhow::Result<()> {
@@ -218,8 +286,17 @@ fn refuse_existing(root: &Path) -> anyhow::Result<()> {
     }
     let schema = root.join("schema");
     if schema.is_dir() {
-        let first = std::fs::read_dir(&schema)?.next().transpose()?;
-        if let Some(entry) = first {
+        // A lone, empty `.gitkeep` is the file init writes itself, so refusing
+        // it would block the very layout init is about to produce. The
+        // emptiness is the whole tolerance: a `.gitkeep` someone wrote into
+        // holds their content, and init replaces this file with its own.
+        for entry in std::fs::read_dir(&schema)? {
+            let entry = entry?;
+            if entry.file_name() == GITKEEP
+                && entry.metadata().map(|m| m.len() == 0).unwrap_or(false)
+            {
+                continue;
+            }
             bail!(
                 "`{}` is not empty (it contains `{}`); init will not overwrite project data",
                 schema.display(),
@@ -321,6 +398,13 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("cannot create staging directory `{}`", schema_dir.display()))?;
 
     let result = (|| -> anyhow::Result<()> {
+        // git tracks files, not directories, so a project initialized with no
+        // declarations would lose `schema/` on the first clone and every
+        // command would then fail on a directory the user never deleted. The
+        // loader only reads `.yml`/`.yaml`, so this file is invisible to it.
+        std::fs::write(schema_dir.join(GITKEEP), "")
+            .with_context(|| format!("cannot stage `{}`", schema_dir.join(GITKEEP).display()))?;
+
         for (name, table) in &prepared.schema.tables {
             let path = declaration_file::path(&schema_dir, name, None)?;
             std::fs::write(&path, pbps_load::render(name, table, &[], None))
@@ -449,17 +533,29 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         return Err(error);
     }
 
-    let mut had_empty_schema = false;
+    let mut displaced = Displaced::Nothing;
     let mut schema_moved = false;
     let result = (|| -> anyhow::Result<()> {
-        had_empty_schema = final_schema.is_dir();
-        if had_empty_schema && let Err(source) = std::fs::remove_dir(&final_schema) {
-            // The directory may have changed after the initial emptiness check.
-            // Never remove its contents: they belong to the user.
-            return Err(anyhow::Error::new(source).context(format!(
-                "cannot replace the empty declaration directory `{}`",
-                final_schema.display()
-            )));
+        if final_schema.is_dir() {
+            let keep = final_schema.join(GITKEEP);
+            // `refuse_existing` has already established that an empty
+            // `.gitkeep` is the only thing this directory may hold, so removing
+            // it removes a file init writes itself. A failure here needs no
+            // branch: `remove_dir` below then reports the real obstacle.
+            displaced = if keep.is_file() {
+                let _ = std::fs::remove_file(&keep);
+                Displaced::GitKeep
+            } else {
+                Displaced::EmptyDirectory
+            };
+            if let Err(source) = std::fs::remove_dir(&final_schema) {
+                // The directory may have changed after the initial emptiness
+                // check. Never remove its contents: they belong to the user.
+                return Err(anyhow::Error::new(source).context(format!(
+                    "cannot replace the empty declaration directory `{}`",
+                    final_schema.display()
+                )));
+            }
         }
 
         std::fs::rename(&staged_schema, &final_schema).with_context(|| {
@@ -481,8 +577,15 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         if schema_moved {
             let _ = std::fs::remove_dir_all(&final_schema);
         }
-        if had_empty_schema {
-            let _ = std::fs::create_dir(&final_schema);
+        match &displaced {
+            Displaced::Nothing => {}
+            Displaced::EmptyDirectory => {
+                let _ = std::fs::create_dir(&final_schema);
+            }
+            Displaced::GitKeep => {
+                let _ = std::fs::create_dir(&final_schema);
+                let _ = std::fs::write(final_schema.join(GITKEEP), "");
+            }
         }
         // Released last, so no other init can reach the schema move while this
         // rollback is undoing it.
@@ -508,19 +611,24 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
 /// every destination is installed.
 fn install_file_no_replace(source: impl AsRef<Path>, destination: &Path) -> anyhow::Result<()> {
     let source = source.as_ref();
-    std::fs::hard_link(source, destination).with_context(|| {
-        if destination.exists() {
+    std::fs::hard_link(source, destination).map_err(|source_error| {
+        // The kind is the only honest witness. Probing `destination.exists()`
+        // is both racy and wrong for the other failures: a filesystem with no
+        // hard links (exFAT, SMB without the unix extensions) or an EPERM would
+        // have been reported as an existing file that is not there.
+        let context = if source_error.kind() == std::io::ErrorKind::AlreadyExists {
             format!(
                 "refusing to replace `{}`; it appeared while init was preparing its output",
                 destination.display()
             )
         } else {
             format!(
-                "cannot install `{}` at `{}` without replacing an existing file",
+                "cannot install `{}` at `{}`.\ninit installs files with a hard link so that it can never replace existing data; a filesystem that does not support one cannot be initialized in place.",
                 source.display(),
                 destination.display()
             )
-        }
+        };
+        anyhow::Error::new(source_error).context(context)
     })
 }
 
@@ -566,6 +674,112 @@ mod tests {
         let parsed = Config::parse(&text, Path::new("pbps.yml")).unwrap();
         assert_eq!(parsed.environments["null"].url_env, "null");
         assert!(text.contains("\"null\""), "{text}");
+    }
+
+    #[test]
+    fn a_parent_component_is_resolved_before_the_project_is_discovered() {
+        // `Project::discover` walks this path's ancestors, so a lexical `..`
+        // would put the project being escaped from on that walk.
+        let root = std::env::temp_dir().join(format!("pbps-init-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let real = root.canonicalize().unwrap();
+
+        let resolved = absolute(&root.join("a/b/../newproj")).unwrap();
+        assert_eq!(resolved, real.join("a/newproj"));
+        assert!(
+            !resolved.components().any(|c| c.as_os_str() == ".."),
+            "{resolved:?}"
+        );
+        // A path that exists resolves to itself, and a genuinely nested one
+        // still has the parent on its ancestor walk.
+        assert_eq!(absolute(&root.join("a/b")).unwrap(), real.join("a/b"));
+        assert_eq!(
+            absolute(&root.join("a/b/deep/newproj")).unwrap(),
+            real.join("a/b/deep/newproj")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staging_is_discarded_unless_it_was_installed() {
+        let root = std::env::temp_dir().join(format!("pbps-init-staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join(".pbps-init-x");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("pbps.yml"), "generated\n").unwrap();
+
+        drop(Staging(stage.clone()));
+        assert!(
+            !stage.exists(),
+            "a complete project must not be left in the user's root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_link_failure_that_is_not_a_collision_reports_its_own_cause() {
+        let root = std::env::temp_dir().join(format!("pbps-init-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("pbps.yml");
+        std::fs::write(&destination, "user data\n").unwrap();
+
+        // Source missing and destination present: probing the destination would
+        // blame a collision for a failure that is nothing of the kind, which is
+        // exactly what a filesystem without hard links would also be told.
+        let error = install_file_no_replace(root.join("absent"), &destination).unwrap_err();
+        assert!(
+            !error.to_string().contains("refusing to replace"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("cannot install"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "user data\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lone_gitkeep_does_not_look_like_project_data() {
+        let root = std::env::temp_dir().join(format!("pbps-init-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("schema")).unwrap();
+        std::fs::write(root.join("schema").join(GITKEEP), "").unwrap();
+        refuse_existing(&root).expect("init writes this file itself");
+
+        // A `.gitkeep` someone wrote into holds their content, and init would
+        // replace it, so it is project data like any other file.
+        std::fs::write(root.join("schema").join(GITKEEP), "mine\n").unwrap();
+        let error = refuse_existing(&root).unwrap_err();
+        assert!(error.to_string().contains("is not empty"), "{error:#}");
+
+        std::fs::write(root.join("schema").join(GITKEEP), "").unwrap();
+        std::fs::write(root.join("schema").join("dbo.t.yml"), "table: dbo.t\n").unwrap();
+        let error = refuse_existing(&root).unwrap_err();
+        assert!(error.to_string().contains("is not empty"), "{error:#}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rollback_puts_back_the_gitkeep_it_displaced() {
+        let root = std::env::temp_dir().join(format!("pbps-init-keep-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join(".pbps-init-test");
+        std::fs::create_dir_all(stage.join("schema")).unwrap();
+        std::fs::write(stage.join("schema.ids.json"), "generated ids\n").unwrap();
+        // No staged pbps.yml, so the install fails after the schema move.
+        std::fs::create_dir_all(root.join("schema")).unwrap();
+        std::fs::write(root.join("schema").join(GITKEEP), "").unwrap();
+
+        commit(&root, &stage).unwrap_err();
+        assert!(
+            root.join("schema").join(GITKEEP).is_file(),
+            "the rollback must restore the layout it displaced"
+        );
+        assert!(!root.join("schema.ids.json").exists(), "claim not released");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

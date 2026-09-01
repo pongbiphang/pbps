@@ -347,6 +347,132 @@ fn init_creates_a_complete_valid_project_without_an_existing_config() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// git tracks files, not directories. A project initialized with no
+/// declarations used to lose `schema/` on the first clone, and every command
+/// then failed on a directory the user had never deleted.
+#[test]
+fn an_initialized_project_survives_a_clone() {
+    let root = std::env::temp_dir().join(format!("pbps-init-clone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let origin = root.join("origin");
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&origin)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(origin.join("schema/.gitkeep").is_file());
+    // The listing must name every file init creates, or the preview is not one.
+    assert!(stdout(&o).contains(".gitkeep"), "{}", stdout(&o));
+
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+    };
+    git(&["init", "-q"], &origin);
+    git(&["config", "user.email", "d@e.f"], &origin);
+    git(&["config", "user.name", "demo"], &origin);
+    git(&["add", "-A"], &origin);
+    git(&["commit", "-qm", "init"], &origin);
+
+    let clone = root.join("clone");
+    git(
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+        &root,
+    );
+    assert!(
+        clone.join("schema").is_dir(),
+        "the declaration directory did not survive the clone"
+    );
+
+    for command in ["validate", "plan"] {
+        let o = Command::new(BIN)
+            .arg("--project")
+            .arg(&clone)
+            .arg(command)
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "{command}: {}", stderr(&o));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The file init writes itself cannot be the thing that blocks init.
+#[test]
+fn init_accepts_a_declaration_directory_holding_only_an_empty_gitkeep() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("schema")).unwrap();
+    std::fs::write(dir.join("schema/.gitkeep"), "").unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(dir.join("pbps.yml").is_file());
+    assert!(dir.join("schema/.gitkeep").is_file());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pbps-init-")),
+        "the staging directory must not survive a successful init"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Project::discover` walks the target's ancestors, so a lexical `..` used to
+/// put the project being escaped from on that walk and refuse a sibling.
+#[test]
+fn init_into_a_sibling_directory_is_not_refused_by_the_project_it_escapes() {
+    let root = std::env::temp_dir().join(format!("pbps-init-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let inside = root.join("a/b");
+    std::fs::create_dir_all(&inside).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&inside)
+        .args(["init", "--env", "prod"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = Command::new(BIN)
+        .args(["--project", "../newproj", "init", "--env", "dev"])
+        .current_dir(&inside)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(root.join("a/newproj/pbps.yml").is_file());
+
+    // The guard itself still holds: a directory genuinely under the project is
+    // refused.
+    let o = Command::new(BIN)
+        .args(["--project", "nested", "init", "--env", "dev"])
+        .current_dir(&inside)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(stderr(&o).contains("already inside"), "{}", stderr(&o));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn init_refuses_existing_files_without_changing_them() {
     let dir = std::env::temp_dir().join(format!("pbps-init-existing-{}", std::process::id()));
