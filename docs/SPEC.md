@@ -20,8 +20,10 @@ Compared with what exists:
 
 | Tool | Model | Gap |
 |---|---|---|
-| Flyway / Liquibase | Imperative | Verbose; the current schema is never visible at a glance; refactoring is hard |
-| Atlas | Declarative | Rename intent exists (`renamed_from`, v0.22+) but matches by name with no identity anchor, so two branches' renames can merge silently; HCL learning curve; SQL Server, saved-plan approval and drift detection sit behind the Pro plan and its cloud registry |
+| Flyway | Imperative | Verbose; the current schema is never visible at a glance; refactoring is hard. A pure executor — review, approval and audit are left to the user. Since the Teams tier ended in 2025, undo, drift detection and code analysis are Enterprise-only |
+| Liquibase | Imperative | The same imperative gap, plus a changelog dialect to learn and a JVM to carry. Community moved to the Functional Source License in 5.0; policy checks, the drift report and the tamper-evident audit trail are in the paid Secure tier |
+| Atlas | Declarative | Rename intent exists (`renamed_from`, v0.22+) but matches by name with no identity anchor, so two branches' renames can merge silently; HCL learning curve; SQL Server, saved-plan approval and drift detection sit behind the Pro plan and its cloud registry, as do views, functions, triggers and grants. The declarative path expects a connection and approval in real time, which a disconnected environment cannot give |
+| Bytebase | Governance platform | Answers the review question well — 100+ built-in rules, an approval queue, background drift detection — but as **a server that is the source of truth**: policies, approvals and history live in its own database rather than in git, so it is a second system of record, and it is an operated service rather than a binary in the pipeline |
 | Skeema | Declarative | MySQL only |
 | DACPAC | Declarative | Tied to the SQL Server + Visual Studio ecosystem; rename and accidental-drop risk |
 
@@ -72,7 +74,7 @@ machinery and never appear in the ids file (see 4.5).
   The boundary runs between business data (history — never touched) and
   reference data (code — rows the application logic depends on): the latter
   is declarable through an explicit `data:` block, designed in
-  [ADR-0004](ADR-0004-reference-data.md) and targeted at Phase 5.
+  [ADR-0004](ADR-0004-reference-data.md) and targeted at Phase 4.
 - **No cross-dialect abstract type system.** One schema is bound to one dialect.
   "Supports multiple databases" means the tool can drive MSSQL and PostgreSQL, not
   that one set of files deploys to both.
@@ -911,7 +913,7 @@ pbps/
     pbps-dialect/   The Dialect trait plus shared helpers
     pbps-mssql/     MSSQL: type normalization, SQL generation, introspection,
                     dependency queries
-    pbps-pg/        PostgreSQL (Phase 4)
+    pbps-pg/        PostgreSQL (Phase 5)
     pbps-db/        Connection abstraction, __pbps_state access, locking
     pbps-docs/      Documentation and ERD rendering (9.4); pure, no dialect
     pbps-cli/       clap, interactive prompts, diagnostic output
@@ -955,7 +957,7 @@ database is work with clearly drawn boundaries.
 | Purpose | Crate | Notes |
 |---|---|---|
 | SQL Server | `tiberius` | Pure Rust; **no ODBC driver to install** — decisive for air-gapped environments |
-| PostgreSQL | `tokio-postgres` | Phase 4 |
+| PostgreSQL | `tokio-postgres` | Phase 5 |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
 | Diagnostics | `miette` | Errors with source spans; the heart of the Phase 1 product experience |
@@ -1016,14 +1018,26 @@ Phase 3.5 adds one more, for the same reason:
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
 | **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
-| **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions | Makes the safe path the shortest path without changing the deployment model |
+| **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
-| **Phase 4** | The PostgreSQL dialect | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
-| **Phase 5** | Declarative reference data ([ADR-0004](ADR-0004-reference-data.md)) and roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)); extended properties and data-catalogue integration; more dialects | Two more of Atlas's Pro-gated features land in the free core |
+| **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
+| **Phase 5** | The PostgreSQL dialect; then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
+| **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
 
 When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
-at the same time**, even though it is not implemented. If Phase 4 forces a large
+at the same time**, even though it is not implemented. If Phase 5 forces a large
 change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
+
+**Why depth precedes the second dialect.** The obvious ordering is the opposite:
+breadth of engines is the number every comparison table counts, and Flyway and
+Liquibase win it outright. It is refused for the same reason 14.3 places Phase
+3.1 ahead of everything — a second dialect doubles the surface that every later
+feature must be built twice for, and it does so while the first engine still
+cannot express reference data, grants or an organization's own rules. A team
+evaluating pbps for SQL Server today is not blocked by the absence of
+PostgreSQL; it is blocked by the parts of *its own* estate pbps still cannot
+manage. Dialects are added afterwards, one at a time, once what a dialect has to
+implement has stopped moving.
 
 ---
 
@@ -1084,8 +1098,29 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
    membership stay environment-local. The differing risk model becomes two new
    classes (`grant-widen`, `revoke`), and roles join the ids file because
    dropping one destroys per-environment membership — the generalized identity
-   criterion. Implementation targets Phase 5; the ids-file format extension is
+   criterion. Implementation targets Phase 4; the ids-file format extension is
    pinned now.
+
+8. **Whether a UI belongs here** — settled; see
+   [ADR-0006](ADR-0006-optional-ui.md). The refusal in 14.3 is of a *hosted
+   control plane that holds the approval*, not of a screen. An optional local
+   companion is admissible under one constraint: every action it takes ends as
+   a git commit or an ordinary CLI invocation, and it stores no authoritative
+   state of its own. It is placed in Phase 6 because a UI built before the
+   typed JSON of 3.1 would have to parse human output or reimplement
+   validation, which 14.2 forbids.
+
+9. **How many dialects, and when** — settled by ordering rather than by
+   design: depth on the engine already supported comes first (Phase 4), the
+   second dialect after it (Phase 5). Breadth is the number every comparison
+   table counts and the one competitors built on JDBC-style abstractions win
+   outright; matching it is not the goal, because here each dialect is a real
+   implementation — a type catalogue, an emitter, introspection, normalization
+   and a live suite. The reasoning is with the phase table in 12. What is
+   *not* deferred is the abstraction: PostgreSQL's shape continues to be the
+   test applied to every model decision, and two known collisions are already
+   recorded (function overloading in ADR-0002, default and schema privileges
+   in ADR-0005).
 
 ---
 
@@ -1094,10 +1129,19 @@ change to `pbps-model`, the Phase 0 abstraction was drawn in the wrong place.
 This review compares the **workflow**, not merely the object checklist. Atlas has
 a strong lint / policy / CI story and a guided migration workflow; Skeema makes
 the common inspect-and-push loop deliberately small and supplies practical lints
-and workspace validation. pbps is already stronger where its product thesis is
+and workspace validation; Bytebase reaches reviewers who never open a terminal;
+Flyway is trivial to start. pbps is already stronger where its product thesis is
 strongest — explicit identity, reviewable saved plans, per-environment state and
 air-gapped operation — but several ordinary tasks still require the user to
 understand the architecture before they can succeed at all.
+
+Reviewed against Flyway, Liquibase, Atlas, Bytebase and Skeema as of
+2026-09-01. Three findings drove changes elsewhere in this document rather than
+rows below: the ordering of Phases 4 and 5 (12, open question 9), the terms on
+which a UI is admissible ([ADR-0006](ADR-0006-optional-ui.md), open question
+8), and two refusals that had not been written down where a user would see
+them — ORM-model loaders and the distinction between a screen and a control
+plane (14.3).
 
 Competitor capabilities change, so this is a **point-in-time product review, not
 a compatibility contract**. A capability belongs here only when it makes pbps
@@ -1118,6 +1162,9 @@ around the typed plan and its checksum.
 | Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
 | Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
 | Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed. A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
+| Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet, keeping the existing split: `Change::intrinsic_risks()` for what needs no dialect, dialect-computed findings attached to `PlannedChange::risks`. Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
+| Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
+| Wire pbps into a pipeline that stays upgradeable | The documented pipelines of 10 are copy-pasted, and a copy cannot be upgraded — the same objection that rules out a generator | A first-party, versioned CI component (a GitHub Action, a GitLab CI template) wrapping the existing commands and their exit codes. It differs from a generator in the one way that matters: it is *referenced* by version, so a fix reaches every user, and it adds no capability the CLI lacks | **P2** |
 | Assert domain invariants beyond structural convergence | The derived probes cover the hazards a change implies; teams also have rules no diff can imply ("every order has a customer") | A later `tests:` format runs read-only SQL assertions in the optional dev database and at target pre-flight. It is **deliberately separate from the probes of 7.5**, which are derived from the typed ChangeSet and are never replaced by hand-written ones — a probe nobody remembered to write is a probe that does not exist. `tests:` covers what no diff can imply, cannot mutate data, and gets an ADR before it is built | **P2** |
 
 ### 14.2 The recommended first slice
@@ -1194,6 +1241,19 @@ arrives again as a reasonable-sounding request.
   argument of 1.1 there is a structural one: the gate's granularity is *this
   reviewed plan*, and a policy living outside git would be a second gate that
   nobody reviewed and that can change an outcome without anyone noticing.
+  **What this refuses is a control plane that holds the approval, not a
+  screen**: an optional local UI is admissible on the terms of
+  [ADR-0006](ADR-0006-optional-ui.md) — it renders the typed JSON, composes
+  intent as a commit, and stores nothing authoritative. The test is the same
+  one: after it is switched off, is every decision still in git?
+- **One source of truth for the declarations.** The declaration files are it.
+  Reading the desired schema out of an ORM's models instead — the loader
+  ecosystem that is a competitor's main adoption engine — is refused, because
+  the second source wins every disagreement silently: identity, drop reasons
+  and `strategy:` have nowhere to live in a model class, and the reviewable
+  artifact stops being the thing that is deployed. Generating declarations
+  *once*, from a database (`pull`) or by hand, and then owning them, is the
+  supported path.
 - **No second plugin execution engine.** Organization-specific orchestration
   stays in CI and in the exec hooks; built-in policy stays declarative and
   bounded. The test is one question: **does the extension need to run between
@@ -1209,8 +1269,12 @@ arrives again as a reasonable-sounding request.
 
 This ordering is deliberate. Broadening the object model improves coverage, and
 Phase 3.5 did exactly that — but `init` / `doctor` / `explain` improve the first
-hour and every failure after it. The same argument now places Phase 3.1 ahead of
-Phase 4, unless a specific user is blocked on PostgreSQL.
+hour and every failure after it. The same argument, applied twice more, produces
+the order in 12: usability (3.1), then the depth of what one engine can express
+(4), then the second dialect (5), then the screen that makes all of it legible
+to someone without a terminal (6). Each step is refused a place earlier than
+that for the same reason — it would be built against a surface that is still
+moving, by users who cannot yet succeed at the step before it.
 
 ---
 

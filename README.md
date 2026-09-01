@@ -5,7 +5,7 @@ the schema should look like; the tool works out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
-  through [docs/ADR-0005-roles-and-grants.md](docs/ADR-0005-roles-and-grants.md)
+  through [docs/ADR-0006-optional-ui.md](docs/ADR-0006-optional-ui.md)
 
 **Phases 0 through 3.5 are complete**, for SQL Server: tables, columns, keys,
 constraints and indexes, plus views, procedures, functions and triggers. Two
@@ -31,8 +31,13 @@ groups of commands:
 | `status` (`--format json`) | One screen across every configured environment |
 
 Phase 3.1 is in progress: `init` is complete; `doctor`, plan summaries,
-`explain`, typed read-only output, editor schemas and completions are next (see
-[SPEC §14](docs/SPEC.md)). PostgreSQL is Phase 4.
+`explain`, typed read-only output, editor schemas, completions and the
+interactive rename prompt are next (see [SPEC §14](docs/SPEC.md)). After it,
+Phase 4 deepens what one engine can express — reference data, roles and grants,
+declarative policies — and PostgreSQL follows in Phase 5. Depth precedes the
+second dialect on purpose: a team evaluating pbps for SQL Server is not blocked
+by the absence of PostgreSQL, it is blocked by the parts of its own estate that
+are not yet expressible.
 
 ### Starting a project
 
@@ -100,6 +105,24 @@ dev:                              # optional: the throwaway engine for `plan --d
 The dev database is always optional. Without one, previews fall back to
 lightweight normalization and say so — the tool has to remain usable where there
 is no Docker and no network.
+
+## What pbps deliberately does not do
+
+Every item here is a request that arrives sounding reasonable. They are refused
+for one shared reason: each would be **shorter, but would route around the typed
+plan, its checksum, a human's recorded intent, or the git audit trail** — which
+between them are the product. The full reasoning is in
+[SPEC §14.3](docs/SPEC.md).
+
+| Not shipped | Why, in one line |
+|---|---|
+| A one-step `push` / `sync` | If a shorter path existed it would become the path everyone uses, and the reviewed one would quietly die. `plan`, then `apply --plan`, stays two steps |
+| Automatic rename detection | Similarity may *order the candidates* for a human; it may never decide. A wrong guess drops a column, and no flag may supply the answer non-interactively — a confirmation that can be written once into a CI file has stopped being a confirmation |
+| One-step rollback | A historical state is exported and applied as a **new forward plan** through the ordinary gate, the way `git revert` writes a commit rather than rewriting history. It restores structure, not data, and says so where you use it |
+| A hosted policy or approval service | Policies, reports and schemas are files; they work air-gapped. A policy outside git is a second gate nobody reviewed. A *local* UI is a different thing and is planned ([ADR-0006](docs/ADR-0006-optional-ui.md)) |
+| A plugin execution engine | The test is whether the extension must run *between* "plan approved" and "statements executed". If it must, it makes the checksum describe something other than what runs. Before a plan and after an apply are already served by hooks and CI |
+| Reading the schema from your ORM's models | The second source wins every disagreement silently, and identity, drop reasons and execution strategy have nowhere to live in a model class. Generate declarations once with `pull`, then own them |
+| Editing `plan.sql` by hand | It is an artifact, not a source file; the checksum exists so that what was reviewed is what runs |
 
 ## Development
 

@@ -1,6 +1,6 @@
 # ADR-0005: Roles and grants — and the generalized identity criterion
 
-- Status: decided (design; implementation targeted at Phase 5, ids-file
+- Status: decided (design; implementation targeted at Phase 4, ids-file
   extension pinned now)
 - Date: 2026-08-31
 - Related: docs/SPEC.md §5, §8.1, §8.2, §13.4, §13.7, §12;
@@ -74,7 +74,7 @@ recreating one destroys per-environment membership. Therefore:
   drops: "why was this access removed" is precisely an auditor's question.
 - The ids file gains a `roles` section with `r_`-prefixed uids — a compatible
   evolution under the existing `version` field. Pinning this format now is
-  the reason this ADR exists ahead of its Phase 5 implementation.
+  the reason this ADR exists ahead of its Phase 4 implementation.
 
 ## Risk classes
 
@@ -111,10 +111,10 @@ access-control direction gets its mechanism.
 - **Column-level grants deferred**; object-level first.
 - **Server-level objects** (logins, server roles) are out of scope.
 - **PostgreSQL variance** (default privileges, schema and sequence grants) is
-  Phase 4 touchstone material, alongside function overloading from ADR-0002.
+  Phase 5 touchstone material, alongside function overloading from ADR-0002.
 
 ## Placement
 
-Phase 5 for implementation. The ids-file `roles` section and the `r_` uid
+Phase 4 for implementation. The ids-file `roles` section and the `r_` uid
 prefix are pinned now, because identity formats are the most expensive thing
 in this project to change late (SPEC §12, Phase 0's lesson).
