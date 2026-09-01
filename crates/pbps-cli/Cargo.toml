@@ -22,10 +22,13 @@ pbps-db.workspace = true
 pbps-docs.workspace = true
 tokio.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 

@@ -714,6 +714,16 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
+| `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
+| `pbps schema` / `completions` / `man` | Editor schemas, shell completions and man pages, generated from the binary's own definitions (see 9.7) |
+
+Two of these will use a connection when one is offered but never require it:
+`explain --db` adds whether the target is mid-deployment, and `doctor` checks
+each configured environment as well as the project.
+
+| Command | Purpose |
+|---|---|
+| `pbps doctor` | Whether this project — and each environment it can reach — is ready to deploy from (see 9.5) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still do the whole job locally**.
@@ -922,7 +932,33 @@ Every `plan` also opens with the same summary — how many changes across how ma
 tables, then each risk class with its explanation — so the first screenful says
 what shape the plan is rather than what its first line happens to be.
 
-### 9.7 Machine-readable output and exit codes
+### 9.7 Editor, shell and manual integration
+
+Three commands, all of which answer **without a project**: requiring one would
+mean a user could not install completions until after succeeding at the thing
+completions exist to help them do.
+
+- **`pbps schema [--kind declaration|config]`** prints a JSON Schema, generated
+  from `pbps-load`'s DTOs and `pbps-config`'s `Config` — the very types the
+  loader reads. There is no second description of the format to keep in step,
+  which is the failure mode every hand-written editor schema eventually has. In
+  particular `deny_unknown_fields` reaches the editor as
+  `additionalProperties: false`, so the schema refuses exactly what the loader
+  refuses; a schema that accepted more would be worse than shipping none.
+  Written to a file, it is the whole of the air-gapped path: no network, no
+  service. Each schema carries `x-pbps-schema-version` and the tool version, so
+  a copy found on disk can say whether it is the one this binary produces.
+- **`pbps completions <shell>`** and **`pbps man --out <dir>`** are generated
+  from the `clap` command tree the binary already holds. Man pages are one per
+  command, named `pbps-<command>`: a single page documenting twenty subcommands
+  is the page nobody reads, and `man pbps-apply` is what an operator types.
+
+Copies of both schemas live in `schemas/`, for editors that resolve a `$schema`
+URL and for anyone browsing the repository. A test regenerates them and fails if
+they differ, so the checked-in copy cannot drift from the binary either — a stale
+copy blesses files the loader refuses, and does it quietly.
+
+### 9.8 Machine-readable output and exit codes
 
 Every read-only command takes `--format human|json` and, in JSON, emits one
 envelope:
@@ -1440,12 +1476,18 @@ pbps explain --plan plan.json
   -> the reviewer's explanation, no credentials required (9.6)
 ```
 
-Implementation status: the `init` link of this journey is built, including
-`--from`, staged round-trip validation, an every-file preview and installing
-`pbps.yml` last. The typed findings envelope and the three exit codes of 9.7 are
-built and cover `validate`, `fmt`, `plan`, `verify`, `status` and `explain`. The
-plan summary and `explain` (9.6) are built, and `doctor` (9.5) with them. The remaining Phase 3.1 links are in
-progress.
+Implementation status: **every P0 row of 14.1 is built.** `init` (with `--from`,
+staged round-trip validation, an every-file preview and installing `pbps.yml`
+last); `doctor` (9.5); the plan summary and `explain` (9.6); `schema`,
+`completions` and `man` (9.7); the typed findings envelope and the three exit
+codes (9.8), covering `validate`, `fmt`, `plan`, `explain`, `doctor`, `verify`
+and `status`; and the interactive prompt of 6.3, which was the last part of
+"intent is recorded by a human, in git" still missing.
+
+What remains in 14.1 is P1 and P2, and belongs to the later phases: the
+`policies:` block, operational estimates, `state show / diff / export`, the
+documented pipelines, the wider analyzer catalogue, the optional UI and a
+versioned CI component.
 
 Acceptance criteria for that slice:
 

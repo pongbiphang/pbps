@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+schemars.workspace = true
 serde-saphyr.workspace = true
 thiserror.workspace = true
 

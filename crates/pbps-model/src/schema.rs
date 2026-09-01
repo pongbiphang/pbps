@@ -157,7 +157,24 @@ pub struct ForeignKey {
     pub on_update: ReferentialAction,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// `JsonSchema` is derived here and nowhere else in the model.
+///
+/// This enum is not merely a domain value: it is a set of literal words a user
+/// types into a declaration file, and the editor schema of SPEC §14.1 is
+/// generated from the loader's own types precisely so the two cannot drift.
+/// Mirroring the variants in `pbps-load` to avoid the derive would recreate the
+/// drift the generation exists to prevent.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferentialAction {
     #[default]

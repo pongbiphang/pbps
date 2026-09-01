@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "dialect": {
+      "$ref": "#/$defs/DialectName"
+    },
+    "schema_dir": {
+      "type": "string",
+      "default": "schema"
+    },
+    "ids_file": {
+      "type": "string",
+      "default": "schema.ids.json"
+    },
+    "environments": {
+      "description": "Deployment targets, by name. Optional: a project that only ever passes\n`--db` explicitly needs none.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Environment"
+      }
+    },
+    "hooks": {
+      "$ref": "#/$defs/Hooks",
+      "default": {}
+    },
+    "unmanaged": {
+      "$ref": "#/$defs/Unmanaged",
+      "default": "ignore"
+    },
+    "dev": {
+      "description": "The optional dev database (SPEC §9.3). Absent means previews stay\noffline, which is the default and a supported way to work.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Dev"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dialect"
+  ],
+  "$defs": {
+    "DialectName": {
+      "description": "The target database dialect.\n\nA project is bound to exactly one dialect. \"Supports multiple databases\" means\nthe tool can drive different databases, not that one set of declarations\ndeploys to both (SPEC §1.3).",
+      "type": "string",
+      "enum": [
+        "mssql",
+        "postgres"
+      ]
+    },
+    "Environment": {
+      "description": "One deployment target.\n\n# Why there is no `url:` field\n\nA connection string carries a password, and `pbps.yml` is committed to git.\nThe config therefore names the **environment variable** that holds the\nstring, never the string. This is not an inconvenience to be worked around\nwith a second, undocumented field: an inline `url:` would be a credential in\nversion control, and the one thing worse than not having the feature is\nhaving it and being surprised by it.",
+      "type": "object",
+      "properties": {
+        "url_env": {
+          "description": "The name of the environment variable holding the ADO.NET connection\nstring, e.g. `PROD_CONN`.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Shown by `pbps status`, for humans reading a list of environments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url_env"
+      ]
+    },
+    "Hooks": {
+      "description": "Exec points (SPEC §9.4): pbps runs a command, and the command does the\ntalking.\n\nThere are no Slack or Teams integrations here on purpose. An exec hook\noutlives any chat API, holds no credentials of its own, and lets a team\ndeliver drift alerts through whatever they already run.",
+      "type": "object",
+      "properties": {
+        "on_apply": {
+          "description": "Run after a successful `apply`, with the plan JSON on stdin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_drift": {
+          "description": "Run when `verify` finds drift, with the drift report JSON on stdin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Unmanaged": {
+      "description": "How to treat objects in the database that the declarations do not mention\n(SPEC §8.2).\n\n`Ignore` is the default because it is the precondition for gradual adoption:\npbps has to be able to share a database with tooling that was there first.",
+      "type": "string",
+      "enum": [
+        "ignore",
+        "warn",
+        "error"
+      ]
+    },
+    "Dev": {
+      "description": "The optional throwaway engine of SPEC §9.3.\n\n# Why it is always optional\n\nThe air-gap promise stands: with no dev database the preview degrades to\nlightweight normalization and says so. This differs from Atlas, where a dev\ndatabase is required for many operations — and the difference is deliberate,\nbecause a tool that cannot answer without Docker cannot be used where this\none has to be.\n\nA dev-verified plan is still a **preview**. Applyable plans come only from\n`plan --db` against the target, and this does not move that line.",
+      "type": "object",
+      "properties": {
+        "url_env": {
+          "description": "The name of an environment variable holding a connection string to a\nthrowaway server — never the string itself, for the reason\n[`Environment`] gives.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "docker": {
+          "description": "A container image to start and throw away, e.g.\n`mcr.microsoft.com/mssql/server:2022-latest`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "x-pbps-schema-version": 1,
+  "x-pbps-tool-version": "0.0.0"
+}

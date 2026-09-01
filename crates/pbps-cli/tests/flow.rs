@@ -2062,3 +2062,75 @@ fn without_a_terminal_nothing_is_asked_and_no_input_changes_nothing() {
         );
     }
 }
+
+// ---- Phase 3.1: editor schemas, completions, man pages ----
+
+/// All three answer without a project. Requiring one would mean a user could
+/// not install completions until after they had succeeded at the thing
+/// completions are meant to help them do.
+#[test]
+fn the_integration_commands_need_no_project() {
+    let nowhere = std::env::temp_dir().join(format!("pbps-noproj-{}", std::process::id()));
+    std::fs::create_dir_all(&nowhere).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&nowhere)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let o = run(&["schema"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["title"], "pbps declaration");
+
+    let o = run(&["schema", "--kind", "config"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("dialect"), "{}", stdout(&o));
+
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let o = run(&["completions", shell]);
+        assert_eq!(code(&o), 0, "{shell}: {}", stderr(&o));
+        assert!(stdout(&o).contains("pbps"), "{shell}");
+    }
+
+    let man = nowhere.join("man");
+    let o = run(&["man", "--out", man.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // One page per command: a single page documenting all of them is the page
+    // nobody reads, and `man pbps-apply` is what an operator types.
+    assert!(man.join("pbps.1").exists());
+    assert!(man.join("pbps-apply.1").exists());
+    assert!(man.join("pbps-doctor.1").exists());
+
+    let _ = std::fs::remove_dir_all(&nowhere);
+}
+
+/// The schema exists to catch a typo before `validate` does, and that only
+/// works if it refuses what the loader refuses.
+#[test]
+fn the_declaration_schema_describes_what_the_loader_accepts() {
+    let d = Demo::new("schema");
+    let o = d.run(&["schema"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let table = &v["$defs"]["TableDto"];
+    assert_eq!(table["additionalProperties"], serde_json::json!(false));
+    // `columns` has no default in the loader, so the schema must require it —
+    // an editor that accepted a table with no columns would bless a file every
+    // later command fails on.
+    let required: Vec<&str> = table["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"table"), "{table}");
+    assert!(required.contains(&"columns"), "{table}");
+    // And the one-shot annotation must be describable, or an editor flags what
+    // the format documents.
+    assert!(table["properties"].get("renamed_from").is_some(), "{table}");
+    assert!(table["properties"].get("strategy").is_some(), "{table}");
+}

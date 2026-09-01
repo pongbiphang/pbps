@@ -60,7 +60,9 @@ pbps-db        Connections (tiberius) plus transaction framing. Owns "there is
                are this crate's own, so a driver change touches nothing else
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
-pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
+pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
+               `output` is the one typed findings envelope every read-only
+               command speaks; `prompt` is the TTY intent channel of SPEC 6.3
 ```
 
 - Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
@@ -154,7 +156,7 @@ expensive to reconstruct.
 
 ## Current status
 
-**Phases 0-3.5 complete** for SQL Server. The test and clippy bar is in
+**Phases 0-3.5 and 3.1 complete** for SQL Server. The test and clippy bar is in
 "Development environment" above; counts change too often to record here.
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
@@ -162,7 +164,9 @@ and pbps.yml installed last so a failed onboarding run leaves no partial project
 
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
-`docs` (`--format` / `--out` / `--title`).
+`docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
+(`--env`), `schema` (`--kind`), `completions`, `man`. Every read-only command
+takes `--format human|json`; `--no-input` is global.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
 `plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
@@ -308,15 +312,61 @@ Phase 3.5 additions worth knowing before touching them:
     Deriving that name anywhere else would be a second copy of the emitter's
     statement order.
 
-**Not done in Phase 1**: the interactive prompt (third intent channel, TTY
-only). CLI commands and YAML annotations both work; nothing is blocked.
+Phase 3.1 additions worth knowing before touching them:
 
-**Live tests**: the SPEC §11.5 invariants plus the Phase 3 and 3.5 ones (the
+34. **There are three exit codes, and the split is the feature.** 0 clean, 2 the
+    command answered and found something to act on, 1 the command could not
+    answer. `Found` (was `DriftFound`) carries the 2; an empty message means the
+    detail is already printed. A pipeline that cannot tell 1 from 2 wakes the
+    wrong person half the time.
+35. **One findings envelope, not one shape per command** (`cli::output`). A
+    command's own payload rides in `data` — `verify`'s drift report, `status`'s
+    rows, `explain`'s explanation — and never replaces the envelope. `id` is
+    stable and is what a future `policies:` block will re-weight, so it must
+    survive a reworded message. **The hook payload is deliberately not wrapped**:
+    a script's input must not change shape because someone added a flag for
+    their own eyes.
+36. **`status` findings are warnings on purpose.** It always exits 0 (decision
+    25), so an error-severity finding would make `result` disagree with the exit
+    code. The per-environment truth is in `state`.
+37. **The vendor annotation formats stay outside the binary**
+    (`scripts/findings-to-github.py`). Each one compiled in has to be kept
+    working forever, including for users who run neither.
+38. **`doctor` reimplements nothing and writes nothing.** It calls
+    `validate_findings`, the same function `validate` runs — a readiness command
+    that disagreed with `validate` would be worse than one that never looked.
+    Permissions are *asked for* (`sys.fn_my_permissions`), never tried, and
+    named one by one with what each is for: "make it db_owner" is the advice
+    that makes an organization say no to the tool.
+39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
+    command, and the reviewer may have no checkout and no credentials; the gate
+    is `apply --allow`. A target is optional and answers only the question no
+    file can — whether that environment is mid-deployment.
+40. **The prompt is a wrapper, never a shortcut.** Answers become ordinary
+    `Intent`s through the same `resolve`, so the artifact is identical.
+    Similarity orders the candidates and never decides; nothing is charitably
+    interpreted; a partial answer records nothing. `--no-input` declines a
+    prompt and can never answer one — that is why it is safe in an alias, and
+    why SPEC 14.3 still refuses `--assume-renames`.
+41. **The editor schemas are generated from the loader's own types**, so
+    `deny_unknown_fields` reaches an editor as `additionalProperties: false`.
+    A schema that accepted more than the loader would be worse than none. The
+    copies in `schemas/` are pinned to the binary by a test; regenerate with
+    `pbps schema --kind <k> --out schemas/<file>`.
+42. **`db::git_sha` takes the project root.** It used to run git in the
+    process's working directory, so `--project` elsewhere stamped plans and
+    ledger entries with a commit from an unrelated repository.
+
+All three intent channels now exist: the CLI commands, the YAML annotations, and
+the TTY prompt of SPEC 6.3.
+
+**Live tests**: the SPEC §11.5 invariants plus the Phase 3, 3.5 and 3.1 ones (the
 ledger round-trip, the lock admitting one holder, a failed statement rolling the
 whole plan back, the rename-impact queries, the probes counting real rows, a
 staged checkpoint surviving `state_json`, a cross-schema rename stopping at the
-name its statement declared, and the module round-trip through
-`sys.sql_modules`) run against a real SQL Server in Docker:
+name its statement declared, the module round-trip through
+`sys.sql_modules`, and `doctor` reading a real edition and permission set) run
+against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The
 script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
@@ -350,15 +400,12 @@ so it is *less* recourse than the stale crate, not more. Dialect plugins are
 declined separately: no stable Rust ABI, and a plugin API would freeze
 `ChangeSet` while the model still moves.
 
-**In progress**: Phase 3.1, the usability foundation of SPEC 14. `init` is
-built; next are `doctor`, plan summaries and `explain`, one typed JSON output
-across the read-only commands, editor schemas, shell completions and the
-interactive rename prompt of SPEC 6.3 — the third intent channel, and the only
-part of "intent is recorded by a human, in git" still missing. It is placed
-ahead of the next dialect deliberately: broadening the object model improves
-coverage, but these improve the first hour and every failure after it.
+**Phase 3.1 is complete** — the usability foundation of SPEC 14, and every P0 row
+of 14.1. It was placed ahead of the next dialect deliberately: broadening the
+object model improves coverage, but these improve the first hour and every
+failure after it.
 
-Then **Phase 4, depth on SQL Server before breadth across engines**: declarative
+**Next — Phase 4, depth on SQL Server before breadth across engines**: declarative
 reference data (ADR-0004), roles and grants (ADR-0005), the `policies:` block
 and a wider built-in analyzer catalogue. The ordering was chosen against the
 obvious one — engine count is what every comparison table measures — because a

@@ -55,13 +55,24 @@ sha2       = "0.10"
 thiserror  = "2"
 anyhow     = "1"
 miette     = "7"
-clap       = { version = "4", features = ["derive"] }
+# `string`: the man-page generator renames each subcommand to `pbps-<name>` at
+# runtime, and without it clap only accepts a `&'static str` there.
+clap       = { version = "4", features = ["derive", "string"] }
+# Completions and man pages are generated from the same command tree clap
+# already holds, so there is no second description of the CLI to keep in step.
+clap_complete = "4"
+clap_mangen   = "0.2"
 indexmap   = { version = "2", features = ["serde"] }
 
 # YAML: see docs/ADR-0001-yaml-crate.md. Only pbps-load may depend on it
 # directly; every other crate goes through pbps-load, which keeps a future
 # replacement a bounded piece of work.
 serde-saphyr = "1.2"
+
+# JSON Schema for the editor integration of SPEC 14.1, generated from the
+# loader's and the config's own types so the two cannot drift. `indexmap2`
+# because column order is meaningful and `TableDto::columns` is an IndexMap.
+schemars = { version = "1", features = ["indexmap2"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

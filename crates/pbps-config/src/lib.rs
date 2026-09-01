@@ -40,7 +40,9 @@ pub enum ConfigError {
 /// A project is bound to exactly one dialect. "Supports multiple databases" means
 /// the tool can drive different databases, not that one set of declarations
 /// deploys to both (SPEC §1.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DialectName {
     Mssql,
@@ -67,7 +69,17 @@ impl std::fmt::Display for DialectName {
 ///
 /// `Ignore` is the default because it is the precondition for gradual adoption:
 /// pbps has to be able to share a database with tooling that was there first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Unmanaged {
     #[default]
@@ -86,7 +98,9 @@ pub enum Unmanaged {
 /// with a second, undocumented field: an inline `url:` would be a credential in
 /// version control, and the one thing worse than not having the feature is
 /// having it and being surprised by it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Environment {
     /// The name of the environment variable holding the ADO.NET connection
@@ -114,7 +128,9 @@ impl Environment {
 /// There are no Slack or Teams integrations here on purpose. An exec hook
 /// outlives any chat API, holds no credentials of its own, and lets a team
 /// deliver drift alerts through whatever they already run.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
     /// Run after a successful `apply`, with the plan JSON on stdin.
@@ -138,7 +154,9 @@ pub struct Hooks {
 ///
 /// A dev-verified plan is still a **preview**. Applyable plans come only from
 /// `plan --db` against the target, and this does not move that line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Dev {
     /// The name of an environment variable holding a connection string to a
@@ -153,7 +171,9 @@ pub struct Dev {
     pub docker: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub dialect: DialectName,

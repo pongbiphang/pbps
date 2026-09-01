@@ -9,6 +9,7 @@ mod doctor;
 mod explain;
 mod hooks;
 mod init;
+mod integration;
 mod output;
 mod prompt;
 mod report;
@@ -64,7 +65,7 @@ use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
     version,
     about = "Declarative database schema version control"
 )]
-struct Cli {
+pub struct Cli {
     /// Project directory. Existing commands search upwards for pbps.yml; init
     /// creates it here. Defaults to the current directory.
     #[arg(long, global = true)]
@@ -122,6 +123,32 @@ enum Command {
         /// connection string to a server pbps may create a scratch database on
         #[arg(long)]
         dev: Option<String>,
+    },
+
+    /// Print the JSON Schema for the declaration format or for pbps.yml
+    ///
+    /// For editors, including air-gapped ones: `pbps schema --kind declaration
+    /// --out .pbps-declaration.schema.json` needs no network and no service.
+    Schema {
+        /// declaration (default) or config
+        #[arg(long, default_value = "declaration")]
+        kind: integration::SchemaKind,
+
+        /// Where to write. Defaults to standard output
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+
+    /// Print a shell completion script
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
+
+    /// Write one man page per command into a directory
+    Man {
+        #[arg(long, short, default_value = "man")]
+        out: PathBuf,
     },
 
     /// Check whether this project and its environments are ready
@@ -381,10 +408,32 @@ fn run() -> anyhow::Result<()> {
     if let Command::Init(args) = &cli.command {
         return init::cmd_init(&start, args);
     }
+    // Like `init`, these three answer without a project. Requiring one would
+    // mean a user could not get completions installed until after they had
+    // succeeded at the thing completions are meant to help them do.
+    //
+    // Written as three `if let`s rather than one match with a catch-all: the
+    // catch-all is what `wildcard_enum_match_arm` exists to refuse, and here it
+    // would be right to refuse it — a new command that needs no project would
+    // otherwise fall silently into "discover a project first".
+    if let Command::Schema { kind, out } = &cli.command {
+        return integration::cmd_schema(*kind, out.as_deref());
+    }
+    if let Command::Completions { shell } = &cli.command {
+        return integration::cmd_completions(*shell);
+    }
+    if let Command::Man { out } = &cli.command {
+        return integration::cmd_man(out);
+    }
     let project = Project::discover(&start)?;
 
     match cli.command {
-        Command::Init(_) => unreachable!("init returns before project discovery"),
+        Command::Init(_)
+        | Command::Schema { .. }
+        | Command::Completions { .. }
+        | Command::Man { .. } => {
+            unreachable!("these return before project discovery")
+        }
         Command::Plan {
             target,
             since,

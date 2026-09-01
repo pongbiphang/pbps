@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pbps declaration",
+  "description": "One pbps declaration file: a table, or one view, procedure, function or\ntrigger. The leading key is both the kind and the name.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/TableDto"
+    },
+    {
+      "$ref": "#/$defs/ModuleDto"
+    }
+  ],
+  "$defs": {
+    "TableDto": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent: the name this table was renamed from. Removed from the\nfile once `pbps plan` has absorbed it into the identity file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "strategy": {
+          "description": "Execution hints (ADR-0003). Persistent, unlike `renamed_from`: `fmt`\nkeeps it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StrategyDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "columns": {
+          "description": "`IndexMap` preserves the declaration order in the document, which decides\nthe column layout of `CREATE TABLE`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ColumnDto"
+          }
+        },
+        "primary_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PrimaryKeyDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unique": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        },
+        "foreign_keys": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ForeignKeyDto"
+          }
+        },
+        "checks": {
+          "description": "Constraint name to check expression.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "indexes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/IndexDto"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "columns"
+      ]
+    },
+    "StrategyDto": {
+      "description": "`deny_unknown_fields` is what turns a typo into an error instead of a\nsilent no-op — the whole point of ADR-0003's \"validate rejects unknown keys\".",
+      "type": "object",
+      "properties": {
+        "online": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ColumnDto": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean",
+          "default": true
+        },
+        "default": {
+          "description": "The default-value expression, kept verbatim.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "identity": {
+          "description": "`[seed, increment]`",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "default": null
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "deprecated": {
+          "description": "Present means deprecated; the value is the reason. The date comes from\ngit and is not written here.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`TableDto::renamed_from`].",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "PrimaryKeyDto": {
+      "description": "A primary key may be written as a bare column list, leaving the name to the\ndatabase, or with an explicit constraint name.\n\nThe named form is not there for looks: when `pbps pull` reverse-generates from\nan existing database, losing the original constraint name would make the next\ndiff want to rename it.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "columns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "name",
+            "columns"
+          ]
+        }
+      ]
+    },
+    "ForeignKeyDto": {
+      "type": "object",
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "references": {
+          "description": "`dbo.region(region_id)` or `dbo.region(a, b)`.",
+          "type": "string"
+        },
+        "on_delete": {
+          "$ref": "#/$defs/ReferentialAction",
+          "default": "no_action"
+        },
+        "on_update": {
+          "$ref": "#/$defs/ReferentialAction",
+          "default": "no_action"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "columns",
+        "references"
+      ]
+    },
+    "ReferentialAction": {
+      "description": "`JsonSchema` is derived here and nowhere else in the model.\n\nThis enum is not merely a domain value: it is a set of literal words a user\ntypes into a declaration file, and the editor schema of SPEC §14.1 is\ngenerated from the loader's own types precisely so the two cannot drift.\nMirroring the variants in `pbps-load` to avoid the derive would recreate the\ndrift the generation exists to prevent.",
+      "type": "string",
+      "enum": [
+        "no_action",
+        "cascade",
+        "set_null",
+        "set_default"
+      ]
+    },
+    "IndexDto": {
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Each entry is `column` or `column desc`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "unique": {
+          "type": "boolean",
+          "default": false
+        },
+        "where": {
+          "description": "The filtered-index predicate. The YAML key is `where`, which is a Rust\nkeyword, hence the rename.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "columns"
+      ]
+    },
+    "ModuleDto": {
+      "description": "One view, procedure, function or trigger (ADR-0002).\n\nThe leading key is both the kind and the name — `view: dbo.active_customer`\n— for the same reason `table:` is: the file name carries no meaning, so the\nidentity has to be inside the file.",
+      "type": "object",
+      "properties": {
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "procedure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "function": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "trigger": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "on": {
+          "description": "The table a trigger is on. Meaningless — and rejected — on anything else.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "definition": {
+          "description": "The body. What it starts with depends on the kind; see\n[`pbps_model::Module`].",
+          "type": "string"
+        },
+        "depends_on": {
+          "description": "Modules that must be created first, where the identifier scan cannot see\nthe dependency. Persistent, like `strategy:`, and preserved by `fmt`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "definition"
+      ]
+    }
+  },
+  "x-pbps-schema-version": 1,
+  "x-pbps-tool-version": "0.0.0"
+}
