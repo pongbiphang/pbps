@@ -5,6 +5,7 @@ mod db;
 mod deploy;
 mod dev;
 mod hooks;
+mod init;
 mod report;
 mod status;
 
@@ -38,8 +39,8 @@ use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
     about = "Declarative database schema version control"
 )]
 struct Cli {
-    /// Project directory containing pbps.yml. Defaults to searching upwards from
-    /// the current directory.
+    /// Project directory. Existing commands search upwards for pbps.yml; init
+    /// creates it here. Defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
 
@@ -49,6 +50,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a new project, optionally adopting an existing database
+    Init(init::InitArgs),
+
     /// Compare the declarations against a baseline and produce a change plan
     Plan {
         /// Compute an applyable plan against this environment as queried
@@ -291,9 +295,17 @@ fn run() -> anyhow::Result<()> {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
     };
+
+    // `init` is the one command whose job is to create pbps.yml, so making it
+    // pass discovery first would turn the first-run path into an impossibility.
+    // Every other command keeps the ordinary upward discovery behaviour.
+    if let Command::Init(args) = &cli.command {
+        return init::cmd_init(&start, args);
+    }
     let project = Project::discover(&start)?;
 
     match cli.command {
+        Command::Init(_) => unreachable!("init returns before project discovery"),
         Command::Plan {
             target,
             since,

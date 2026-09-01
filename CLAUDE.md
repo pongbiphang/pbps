@@ -139,6 +139,9 @@ expensive to reconstruct.
 **Phases 0-3.5 complete** for SQL Server. The test and clippy bar is in
 "Development environment" above; counts change too often to record here.
 
+First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
+and pbps.yml installed last so a failed onboarding run leaves no partial project.
+
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
 `docs` (`--format` / `--out` / `--title`).
@@ -308,9 +311,9 @@ argument; `sql_expression_dependencies` returning one row per referenced
 The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
 
-**Next**: Phase 3.1, the usability foundation of SPEC 14 — `init`, `doctor`,
-plan summaries and `explain`, one typed JSON output across the read-only
-commands, editor schemas and completions. It is placed ahead of the next dialect
+**In progress**: Phase 3.1, the usability foundation of SPEC 14. `init` is
+built; next are `doctor`, plan summaries and `explain`, one typed JSON output
+across the read-only commands, editor schemas and shell completions. It is placed ahead of the next dialect
 deliberately: broadening the object model improves coverage, but these improve
 the first hour and every failure after it.
 

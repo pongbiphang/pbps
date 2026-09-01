@@ -1,0 +1,511 @@
+//! First-run project creation (SPEC §14.2).
+//!
+//! `init` is deliberately separate from ordinary project discovery: it creates
+//! the file discovery is looking for. More importantly, it stages a complete,
+//! loadable project before making any of it visible. Onboarding is where a
+//! network failure, an invalid path, or a loader mismatch is most likely; none
+//! of those should leave a directory that merely looks initialized.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, bail};
+use clap::Args;
+use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project, Unmanaged};
+use pbps_dialect::Dialect as _;
+use pbps_model::{IdsFile, Schema};
+
+use crate::{context, db};
+
+/// Arguments for `pbps init`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Database dialect for the new project
+    #[arg(long, default_value = "mssql", value_parser = ["mssql"])]
+    dialect: String,
+
+    /// Add this named environment to pbps.yml
+    #[arg(long, conflicts_with = "from")]
+    env: Option<String>,
+
+    /// Adopt this environment now by reverse-generating its declarations
+    #[arg(long, value_name = "ENVIRONMENT")]
+    from: Option<String>,
+
+    /// Environment variable holding the connection string (defaults to <ENV>_CONN)
+    #[arg(long, value_name = "VARIABLE")]
+    url_env: Option<String>,
+}
+
+struct Prepared {
+    schema: Schema,
+    ids: IdsFile,
+    config: Config,
+    config_text: String,
+    warnings: Vec<String>,
+    unmanaged: Vec<pbps_mssql::introspect::UnmanagedModule>,
+}
+
+/// Creates a project at `root` without requiring one to exist already.
+pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
+    let root = absolute(root)?;
+    let dialect = match args.dialect.as_str() {
+        "mssql" => DialectName::Mssql,
+        // clap currently prevents this, but keeping the match exhaustive at the
+        // boundary makes a future second value an intentional implementation.
+        other => bail!("unsupported dialect `{other}`"),
+    };
+
+    let environment = args.from.as_ref().or(args.env.as_ref());
+    if args.url_env.is_some() && environment.is_none() {
+        bail!("--url-env needs an environment; pass --env <name> or --from <name>");
+    }
+    if let Some(name) = environment {
+        validate_environment_name(name)?;
+    }
+    let url_env = match environment {
+        Some(name) => Some(match &args.url_env {
+            Some(var) => var.clone(),
+            None => default_url_env(name)?,
+        }),
+        None => None,
+    };
+    if let Some(var) = &url_env {
+        validate_variable_name(var)?;
+    }
+
+    match Project::discover(&root) {
+        Ok(project) => bail!(
+            "`{}` is already inside the pbps project rooted at `{}`",
+            root.display(),
+            project.root.display()
+        ),
+        Err(ConfigError::NotFound { .. }) => {}
+        Err(error) => return Err(error.into()),
+    }
+    refuse_existing(&root)?;
+
+    let mut environments = BTreeMap::new();
+    if let (Some(name), Some(var)) = (environment, &url_env) {
+        environments.insert(
+            name.clone(),
+            Environment {
+                url_env: var.clone(),
+                description: None,
+            },
+        );
+    }
+    let config = Config {
+        dialect,
+        schema_dir: PathBuf::from("schema"),
+        ids_file: PathBuf::from("schema.ids.json"),
+        environments,
+        hooks: Hooks::default(),
+        unmanaged: Unmanaged::Ignore,
+        dev: None,
+    };
+    let config_text = render_config(&config);
+
+    let (schema, ids, warnings, unmanaged) = match (&args.from, &url_env) {
+        (Some(_), Some(var)) => {
+            let connection = std::env::var(var).with_context(|| {
+                format!(
+                    "cannot adopt the database because ${var} is not set.\nExport it, then run the same `pbps init --from ...` command again."
+                )
+            })?;
+            let pulled = db::runtime()?.block_on(async {
+                let mut conn = pbps_db::Conn::connect(&connection).await?;
+                pbps_mssql::catalog::introspect(&mut conn).await
+            })?;
+            let ids = mint_ids(&pulled.schema)?;
+            (
+                pulled.schema,
+                ids,
+                pulled.warnings,
+                pulled.unmanaged_modules,
+            )
+        }
+        (None, _) => (
+            Schema::default(),
+            IdsFile::default(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        (Some(_), None) => unreachable!("--from always resolves a url variable"),
+    };
+
+    let prepared = Prepared {
+        schema,
+        ids,
+        config,
+        config_text,
+        warnings,
+        unmanaged,
+    };
+    for warning in &prepared.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if !prepared.unmanaged.is_empty() {
+        eprintln!(
+            "note: {} object(s) in this database cannot be managed:",
+            prepared.unmanaged.len()
+        );
+        for module in &prepared.unmanaged {
+            eprintln!("  {} {} — {}", module.kind, module.name, module.why);
+        }
+        eprintln!("  They are left untouched and do not appear in any plan.");
+    }
+    let stage = stage_project(&root, &prepared)?;
+    preview(&root, &stage)?;
+    commit(&root, &stage)?;
+
+    println!("Initialized pbps project at `{}`.", root.display());
+    if !prepared.warnings.is_empty() {
+        println!(
+            "{} catalog item(s) could not be expressed; see the warnings above.",
+            prepared.warnings.len()
+        );
+    }
+    if !prepared.unmanaged.is_empty() {
+        println!(
+            "{} module(s) were inventoried as unmanaged; pbps will leave them untouched.",
+            prepared.unmanaged.len()
+        );
+    }
+    match environment {
+        Some(name) => {
+            println!("Next: `pbps validate`");
+            if args.from.is_some() {
+                println!(
+                    "Then commit the generated files; after editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
+                );
+            } else {
+                println!(
+                    "To adopt the existing database first, run `pbps pull --env {name}`; otherwise add declarations under `schema/`."
+                );
+            }
+        }
+        None => println!(
+            "Next: add declarations under `schema/`, then run `pbps validate` and `pbps plan`."
+        ),
+    }
+    Ok(())
+}
+
+fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    Ok(std::env::current_dir()
+        .context("cannot determine the current directory")?
+        .join(path))
+}
+
+fn refuse_existing(root: &Path) -> anyhow::Result<()> {
+    let config = root.join(pbps_config::CONFIG_FILE);
+    if config.exists() {
+        bail!(
+            "`{}` already exists; this project is already initialized",
+            config.display()
+        );
+    }
+    let ids = root.join("schema.ids.json");
+    if ids.exists() {
+        bail!(
+            "`{}` already exists; init will not overwrite project data",
+            ids.display()
+        );
+    }
+    let schema = root.join("schema");
+    if schema.is_dir() && !pbps_load::schema_files(&schema)?.is_empty() {
+        bail!(
+            "`{}` already contains declarations; init will not overwrite them",
+            schema.display()
+        );
+    }
+    if schema.exists() && !schema.is_dir() {
+        bail!("`{}` exists but is not a directory", schema.display());
+    }
+    Ok(())
+}
+
+fn default_url_env(name: &str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(name.len() + 5);
+    for ch in name.chars() {
+        match ch {
+            'a'..='z' => out.push(ch.to_ascii_uppercase()),
+            'A'..='Z' | '0'..='9' | '_' => out.push(ch),
+            '-' => out.push('_'),
+            _ => bail!("environment name `{name}` cannot be converted to a variable name"),
+        }
+    }
+    out.push_str("_CONN");
+    Ok(out)
+}
+
+fn validate_environment_name(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z'))
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        bail!(
+            "environment name `{name}` must start with a letter and contain only letters, digits, `_` or `-`"
+        );
+    }
+    Ok(())
+}
+
+fn validate_variable_name(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        bail!(
+            "environment variable `{name}` must start with a letter or `_` and contain only letters, digits or `_`"
+        );
+    }
+    Ok(())
+}
+
+fn render_config(config: &Config) -> String {
+    let mut out = format!(
+        "# Generated by pbps {}; config schema 1.\ndialect: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        config.dialect
+    );
+    if !config.environments.is_empty() {
+        out.push_str("environments:\n");
+        for (name, environment) in &config.environments {
+            out.push_str(&format!(
+                "  {name}:\n    url_env: {}\n",
+                environment.url_env
+            ));
+        }
+    }
+    out
+}
+
+fn mint_ids(schema: &Schema) -> anyhow::Result<IdsFile> {
+    pbps_diff::resolve(schema, &IdsFile::default(), &[], &context())
+        .map(|resolved| resolved.ids)
+        .map_err(|blockers| {
+            anyhow::anyhow!(
+                "init could not mint identities for the pulled schema: {} blocker(s)",
+                blockers.len()
+            )
+        })
+}
+
+fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("cannot create project directory `{}`", root.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stage = root.join(format!(".pbps-init-{}-{nonce}", std::process::id()));
+    let schema_dir = stage.join(&prepared.config.schema_dir);
+    std::fs::create_dir_all(&schema_dir)
+        .with_context(|| format!("cannot create staging directory `{}`", schema_dir.display()))?;
+
+    let result = (|| -> anyhow::Result<()> {
+        for (name, table) in &prepared.schema.tables {
+            let path = schema_dir.join(format!("{}.{}.yml", name.schema, name.name));
+            std::fs::write(&path, pbps_load::render(name, table, &[], None))
+                .with_context(|| format!("cannot stage `{}`", path.display()))?;
+        }
+        for (name, module) in &prepared.schema.modules {
+            let path = schema_dir.join(format!(
+                "{}.{}.{}.yml",
+                name.schema,
+                name.name,
+                module.kind.as_str()
+            ));
+            std::fs::write(
+                &path,
+                pbps_load::render_module(name, module, &Default::default()),
+            )
+            .with_context(|| format!("cannot stage `{}`", path.display()))?;
+        }
+        std::fs::write(stage.join(pbps_config::CONFIG_FILE), &prepared.config_text)
+            .context("cannot stage pbps.yml")?;
+        std::fs::write(
+            stage.join(&prepared.config.ids_file),
+            format!("{}\n", serde_json::to_string_pretty(&prepared.ids)?),
+        )
+        .context("cannot stage schema.ids.json")?;
+
+        // Validate from the serialized files, not the values that produced
+        // them. This catches renderer/loader drift before the project appears.
+        let project = Project::load(&stage.join(pbps_config::CONFIG_FILE))?;
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).map_err(|errors| {
+            anyhow::anyhow!("the staged declarations have {} problem(s)", errors.len())
+        })?;
+        if loaded.schema != prepared.schema {
+            bail!("the staged declarations do not round-trip to the pulled schema");
+        }
+        let dialect = pbps_mssql::Mssql;
+        let mut dialect_problems = Vec::new();
+        for (name, table) in &loaded.schema.tables {
+            dialect_problems.extend(
+                dialect
+                    .validate_table(name, table)
+                    .into_iter()
+                    .map(|problem| format!("{name}: {problem}")),
+            );
+        }
+        for (name, module) in &loaded.schema.modules {
+            dialect_problems.extend(
+                dialect
+                    .validate_module(name, module)
+                    .into_iter()
+                    .map(|problem| format!("{name}: {problem}")),
+            );
+        }
+        dialect_problems.extend(pbps_model::module::check_names(&loaded.schema));
+        dialect_problems.extend(pbps_model::module::check_dependencies(
+            &loaded.schema,
+            &loaded.hints.module_deps,
+        ));
+        if !dialect_problems.is_empty() {
+            bail!(
+                "the staged declarations are not valid for mssql:\n  {}",
+                dialect_problems.join("\n  ")
+            );
+        }
+        let ids: IdsFile = serde_json::from_str(&std::fs::read_to_string(project.ids_file())?)?;
+        ids.validate()?;
+        if ids != prepared.ids {
+            bail!("the staged identity file does not round-trip");
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    Ok(stage)
+}
+
+fn preview(root: &Path, stage: &Path) -> anyhow::Result<()> {
+    println!("Files to create:");
+    let mut files = Vec::new();
+    collect_files(stage, &mut files)?;
+    files.sort();
+    for path in files {
+        let relative = path.strip_prefix(stage).unwrap_or(&path);
+        println!("  {}", root.join(relative).display());
+    }
+    Ok(())
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Commits the staged tree with pbps.yml last.
+///
+/// Discovery treats pbps.yml as the marker that a project exists. Moving that
+/// marker last means another process can observe either no project or the whole
+/// project, never a config pointing at files that have not arrived yet.
+fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
+    let final_schema = root.join("schema");
+    let staged_schema = stage.join("schema");
+    let had_empty_schema = final_schema.is_dir();
+    if had_empty_schema {
+        std::fs::remove_dir(&final_schema).with_context(|| {
+            format!(
+                "cannot replace the empty declaration directory `{}`",
+                final_schema.display()
+            )
+        })?;
+    }
+
+    let mut schema_moved = false;
+    let mut ids_moved = false;
+    let result = (|| -> anyhow::Result<()> {
+        std::fs::rename(&staged_schema, &final_schema).with_context(|| {
+            format!(
+                "cannot install declarations at `{}`",
+                final_schema.display()
+            )
+        })?;
+        schema_moved = true;
+
+        std::fs::rename(stage.join("schema.ids.json"), root.join("schema.ids.json"))
+            .context("cannot install schema.ids.json")?;
+        ids_moved = true;
+
+        std::fs::rename(
+            stage.join(pbps_config::CONFIG_FILE),
+            root.join(pbps_config::CONFIG_FILE),
+        )
+        .context("cannot install pbps.yml")?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if ids_moved {
+            let _ = std::fs::remove_file(root.join("schema.ids.json"));
+        }
+        if schema_moved {
+            let _ = std::fs::remove_dir_all(&final_schema);
+        }
+        if had_empty_schema {
+            let _ = std::fs::create_dir(&final_schema);
+        }
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_dir(stage) {
+        eprintln!(
+            "warning: project is complete, but the empty staging directory `{}` could not be removed: {error}",
+            stage.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_names_have_deterministic_connection_variables() {
+        assert_eq!(default_url_env("prod").unwrap(), "PROD_CONN");
+        assert_eq!(default_url_env("qa-east").unwrap(), "QA_EAST_CONN");
+    }
+
+    #[test]
+    fn unsafe_yaml_names_are_rejected() {
+        assert!(validate_environment_name("prod: hacked").is_err());
+        assert!(validate_environment_name("9prod").is_err());
+        assert!(validate_variable_name("PROD-CONN").is_err());
+    }
+
+    #[test]
+    fn generated_config_carries_tool_and_schema_versions() {
+        let config = Config {
+            dialect: DialectName::Mssql,
+            schema_dir: PathBuf::from("schema"),
+            ids_file: PathBuf::from("schema.ids.json"),
+            environments: BTreeMap::new(),
+            hooks: Hooks::default(),
+            unmanaged: Unmanaged::Ignore,
+            dev: None,
+        };
+        let text = render_config(&config);
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains("config schema 1"), "{text}");
+        Config::parse(&text, Path::new("pbps.yml")).unwrap();
+    }
+}

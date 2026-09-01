@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 env:
@@ -67,6 +67,11 @@ jobs:
           done
           echo "SQL Server never became ready" >&2; exit 1
       - run: cargo test -p pbps-mssql --test live -- --ignored
+      # Phase 3.1's onboarding path and the optional dev rehearsal both cross
+      # the CLI/database boundary, so the dialect-only suite cannot exercise
+      # them. Keep these ignored in ordinary jobs and run them here against the
+      # same real engine.
+      - run: cargo test -p pbps-cli --test flow -- --ignored
 
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.

@@ -13,6 +13,7 @@ groups of commands:
 
 | No database needed | Purpose |
 |---|---|
+| `init` (`--env` / `--from` / `--url-env`) | Create a complete project, optionally adopting an existing database |
 | `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`) | Compare against a baseline and produce a change plan |
 | `plan --dev` | Rehearse the plan in a throwaway engine: does it compile, does it converge (optional) |
 | `validate`, `fmt` (`--check`) | Static checks and canonical formatting |
@@ -29,8 +30,28 @@ groups of commands:
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |
 
-Next is Phase 3.1 — `init`, `doctor` and `explain`, so that the safe path is
-also the shortest one (see [SPEC §14](docs/SPEC.md)). PostgreSQL is Phase 4.
+Phase 3.1 is in progress: `init` is complete; `doctor`, plan summaries,
+`explain`, typed read-only output, editor schemas and completions are next (see
+[SPEC §14](docs/SPEC.md)). PostgreSQL is Phase 4.
+
+### Starting a project
+
+For a new declaration-first project:
+
+```bash
+pbps init --env prod --url-env PROD_CONN
+```
+
+To adopt the database named by `$PROD_CONN` in the same step:
+
+```bash
+pbps init --from prod --url-env PROD_CONN
+```
+
+When `--url-env` is omitted, the variable name is derived deterministically
+(`prod` becomes `PROD_CONN`). `init` previews every path, stages and validates
+the complete output, and installs `pbps.yml` last; it refuses existing project
+files rather than overwriting them.
 
 ### Declaring a view
 
