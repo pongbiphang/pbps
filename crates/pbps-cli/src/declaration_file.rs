@@ -49,7 +49,10 @@ fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     hasher.update(name.name.as_bytes());
     hasher.update([0]);
     hasher.update(kind.map(ModuleKind::as_str).unwrap_or("table").as_bytes());
-    format!("pbps-{hash:x}{kind_suffix}.yml", hash = hasher.finalize())
+    // `~` is deliberately outside `component`'s safe alphabet (a literal one
+    // becomes `%7E`), so no readable schema/object pair can ever occupy this
+    // hashed namespace.
+    format!("~pbps-{hash:x}{kind_suffix}.yml", hash = hasher.finalize())
 }
 
 /// Returns a declaration path whose parent is exactly `directory`.
@@ -111,5 +114,24 @@ mod tests {
         let generated = path(dir, &name, None).unwrap();
         assert!(generated.file_name().unwrap().len() <= 240);
         assert_eq!(generated.parent(), Some(dir));
+    }
+
+    #[test]
+    fn hashed_names_cannot_collide_with_the_readable_namespace() {
+        let long = ObjectName::new("資料".repeat(128), "表".repeat(128));
+        let hashed = filename(&long, Some(ModuleKind::View));
+        assert!(hashed.starts_with("~pbps-"), "{hashed}");
+
+        // Recreate the old collision shape: a table whose schema and name make
+        // the hashed module filename when joined with dots. The leading `~` is
+        // percent-encoded on the readable path, so the two stay distinct.
+        let stem = hashed
+            .strip_prefix('~')
+            .unwrap()
+            .strip_suffix(".view.yml")
+            .unwrap();
+        let readable = filename(&ObjectName::new(format!("~{stem}"), "view"), None);
+        assert_ne!(hashed, readable);
+        assert!(readable.starts_with("%7E"), "{readable}");
     }
 }

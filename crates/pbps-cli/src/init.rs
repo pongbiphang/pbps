@@ -425,6 +425,15 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// marker last means another process can observe either no project or the whole
 /// project, never a config pointing at files that have not arrived yet.
 fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
+    // Introspection may take minutes. Anything that appeared while it was
+    // running belongs to the user or another init and must win. This recheck
+    // catches directories and declarations; the file installs below are also
+    // atomic no-replace operations, closing the race after this check.
+    if let Err(error) = refuse_existing(root) {
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(error.context("the project changed while init was preparing its output"));
+    }
+
     let final_schema = root.join("schema");
     let staged_schema = stage.join("schema");
     let had_empty_schema = final_schema.is_dir();
@@ -450,15 +459,13 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         })?;
         schema_moved = true;
 
-        std::fs::rename(stage.join("schema.ids.json"), root.join("schema.ids.json"))
-            .context("cannot install schema.ids.json")?;
+        install_file_no_replace(stage.join("schema.ids.json"), &root.join("schema.ids.json"))?;
         ids_moved = true;
 
-        std::fs::rename(
+        install_file_no_replace(
             stage.join(pbps_config::CONFIG_FILE),
-            root.join(pbps_config::CONFIG_FILE),
-        )
-        .context("cannot install pbps.yml")?;
+            &root.join(pbps_config::CONFIG_FILE),
+        )?;
         Ok(())
     })();
 
@@ -475,13 +482,38 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(stage);
         return Err(error);
     }
-    if let Err(error) = std::fs::remove_dir(stage) {
+    if let Err(error) = std::fs::remove_dir_all(stage) {
         eprintln!(
-            "warning: project is complete, but the empty staging directory `{}` could not be removed: {error}",
+            "warning: project is complete, but staging directory `{}` could not be removed: {error}",
             stage.display()
         );
     }
     Ok(())
+}
+
+/// Installs one staged file without ever replacing an existing destination.
+///
+/// Staging lives under the project root, so source and destination are on one
+/// filesystem. A hard link is therefore an atomic create-if-absent on Unix and
+/// Windows; unlike `rename`, it fails when another process created the target
+/// during introspection. The staging link is removed with the staging tree once
+/// every destination is installed.
+fn install_file_no_replace(source: impl AsRef<Path>, destination: &Path) -> anyhow::Result<()> {
+    let source = source.as_ref();
+    std::fs::hard_link(source, destination).with_context(|| {
+        if destination.exists() {
+            format!(
+                "refusing to replace `{}`; it appeared while init was preparing its output",
+                destination.display()
+            )
+        } else {
+            format!(
+                "cannot install `{}` at `{}` without replacing an existing file",
+                source.display(),
+                destination.display()
+            )
+        }
+    })
 }
 
 #[cfg(test)]
@@ -526,5 +558,51 @@ mod tests {
         let parsed = Config::parse(&text, Path::new("pbps.yml")).unwrap();
         assert_eq!(parsed.environments["null"].url_env, "null");
         assert!(text.contains("\"null\""), "{text}");
+    }
+
+    #[test]
+    fn a_destination_that_appeared_is_never_replaced() {
+        let root =
+            std::env::temp_dir().join(format!("pbps-init-no-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let staged = root.join("staged");
+        let destination = root.join("pbps.yml");
+        std::fs::write(&staged, "generated\n").unwrap();
+        std::fs::write(&destination, "user data\n").unwrap();
+
+        let error = install_file_no_replace(&staged, &destination).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to replace"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "user data\n"
+        );
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "generated\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_commit_recheck_discards_staging_not_new_user_data() {
+        let root =
+            std::env::temp_dir().join(format!("pbps-init-commit-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join(".pbps-init-test");
+        std::fs::create_dir_all(stage.join("schema")).unwrap();
+        std::fs::write(stage.join("schema.ids.json"), "generated ids\n").unwrap();
+        std::fs::write(stage.join("pbps.yml"), "generated config\n").unwrap();
+        // Simulates a file created while a long catalog read was in progress.
+        std::fs::write(root.join("pbps.yml"), "user config\n").unwrap();
+
+        let error = commit(&root, &stage).unwrap_err();
+        assert!(error.to_string().contains("project changed"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("pbps.yml")).unwrap(),
+            "user config\n"
+        );
+        assert!(!stage.exists(), "staging must be discarded on the race");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
