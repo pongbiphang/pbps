@@ -422,11 +422,34 @@ commands from 6.1.
 ```
 $ pbps plan
 
-  dbo.customer
-    ? customer_name disappeared and full_name is new
-      > this is a rename: customer_name -> full_name
-        no, drop customer_name and add full_name
+  dbo.customer: customer_name disappeared, full_name is new
+    1) customer_name was renamed to full_name
+    2) customer_name was dropped (you will be asked why)
+  Which is it? [1-2, or blank to stop]
 ```
+
+The answers are ordinary intents and go through the same `resolve` call the
+commands do, so this channel produces no artifact of its own: one entry in the
+identity file, in git, reviewed in the merge request.
+
+Four properties hold it to that:
+
+- **A terminal means both streams.** stdin alone is not enough (output
+  redirected to a file means nobody sees the question); stderr alone is not
+  enough (a captured stdin means nobody can answer it). `--no-input` declines
+  the prompt everywhere, and `plan --check` never prompts at all — it is the
+  read-only CI check, and a question there hangs a pipeline.
+- **Similarity orders; it never decides.** The candidates are ranked by
+  normalized edit distance, case-insensitively, with the names themselves as the
+  tiebreak so the numbering is the same on every machine. Every pairing is still
+  offered — ordering is not filtering — and so is every drop.
+- **Nothing is charitably interpreted.** A blank line, a closed stdin, a word, a
+  number out of range: each ends the prompt and records nothing, and stopping
+  part-way abandons the answers already given. A partial answer written to the
+  identity file would be a decision the user never made.
+- **A drop still needs a reason**, asked as a second question and never
+  defaulted. An empty one ends the prompt rather than writing a tombstone that
+  explains nothing.
 
 ### 6.4 Behaviour without a TTY
 

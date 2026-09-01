@@ -1978,3 +1978,87 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
         "no part of a connection string may reach the report"
     );
 }
+
+// ---- Phase 3.1: the interactive prompt (SPEC 6.3) ----
+
+/// The conversation itself is unit-tested in `prompt`; what only the real binary
+/// can show is the wiring — that a terminal is what turns the prompt on, and
+/// that the answer reaches the identity file through the ordinary resolve.
+///
+/// Linux only: this drives a pseudo-terminal through util-linux `script`, whose
+/// flags differ on BSD and which does not exist on Windows. Asserting it on the
+/// one platform where the harness is stable beats asserting it nowhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_turns_the_prompt_on_and_the_answer_is_recorded() {
+    let d = Demo::new("prompt");
+    d.table("table: dbo.t\ncolumns:\n  customer_name: {type: nvarchar(50)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        // `script` is not installed. Skipping beats failing a suite over a
+        // missing test fixture, and the conversation is covered by unit tests.
+        return;
+    };
+    let text = stdout(&out);
+    assert!(
+        text.contains("customer_name was renamed to full_name"),
+        "the likely rename must be offered first: {text}"
+    );
+    assert_eq!(code(&out), 0, "{text}");
+
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("full_name"), "{ids}");
+    // And the recorded answer must be a rename, not a drop-and-add: a tombstone
+    // here would mean the prompt wrote something other than what was chosen.
+    assert!(!ids.contains("tombstones"), "{ids}");
+}
+
+/// With no terminal — every CI run — the behaviour of SPEC 6.4 is unchanged, and
+/// `--no-input` must not change it either. The flag declines a prompt; it can
+/// never answer one (SPEC 14.3).
+#[test]
+fn without_a_terminal_nothing_is_asked_and_no_input_changes_nothing() {
+    let d = Demo::new("noinput");
+    d.table("table: dbo.t\ncolumns:\n  customer_name: {type: nvarchar(50)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
+
+    for args in [&["plan"][..], &["--no-input", "plan"][..]] {
+        let o = d.run(args);
+        assert_eq!(code(&o), FINDING, "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("pbps rename dbo.t.customer_name full_name"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.ids_path()).unwrap(),
+            before,
+            "{args:?}: an unanswered question must record nothing"
+        );
+    }
+}

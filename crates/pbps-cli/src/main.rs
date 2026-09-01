@@ -10,6 +10,7 @@ mod explain;
 mod hooks;
 mod init;
 mod output;
+mod prompt;
 mod report;
 mod status;
 
@@ -68,6 +69,14 @@ struct Cli {
     /// creates it here. Defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
+
+    /// Never ask a question, even on a terminal.
+    ///
+    /// It declines the prompt; it can never answer one. No flag may supply
+    /// rename or drop intent (SPEC §14.3), so this only ever makes the run more
+    /// conservative — which is why it is safe to put in a shell alias.
+    #[arg(long, global = true)]
+    no_input: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -437,6 +446,10 @@ fn run() -> anyhow::Result<()> {
                 out.as_deref(),
                 sql.as_deref(),
                 dev.as_deref(),
+                // `--check` is the CI file check and changes nothing, so it must
+                // not be able to ask a question either: a prompt there would
+                // hang a pipeline on a run that was supposed to be read-only.
+                !cli.no_input && !check,
             )
         }
         Command::Apply {
@@ -1161,6 +1174,64 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
     }
 }
 
+/// Resolves identity, asking the user when there is one and a question to ask.
+///
+/// The prompt of SPEC §6.3 is a convenience wrapper over §6.1: what it produces
+/// is exactly the intents `pbps rename` and `pbps drop` produce, resolved by the
+/// same call. So a declined or impossible prompt has nothing to undo — it falls
+/// through to §6.4's copy-pastable commands, which is also the behaviour with no
+/// terminal at all.
+fn resolve_with_intent(
+    project: &Project,
+    loaded: &pbps_load::Loaded,
+    ids: &IdsFile,
+    may_prompt: bool,
+) -> anyhow::Result<Option<pbps_diff::Resolution>> {
+    let blockers = match pbps_diff::resolve(&loaded.schema, ids, &loaded.intents, &context()) {
+        Ok(r) => return Ok(Some(r)),
+        Err(b) => b,
+    };
+    if may_prompt && prompt::interactive() {
+        // The copy-pastable commands are *not* printed first here. They are the
+        // no-TTY answer (§6.4), and printing them above a prompt asking the same
+        // question would tell the user to go and type something while offering
+        // to do it for them.
+        if let Some(answers) = prompt::ask(&blockers) {
+            let mut intents = loaded.intents.clone();
+            intents.extend(answers);
+            // Resolved again from scratch rather than patched: the answers are
+            // ordinary intents, and running them through the same call is what
+            // makes the prompt a wrapper rather than a second implementation of
+            // identity resolution.
+            match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
+                Ok(r) => {
+                    // Written now, so that the answers survive whatever the rest
+                    // of this plan does. They are the user's decisions, and
+                    // losing them to a later failure would mean asking again.
+                    // Silently: the caller compares against the pre-prompt
+                    // mapping and prints one "updated" line, and two messages
+                    // about one file would read as two files.
+                    write_ids(project, &r.ids)?;
+                    return Ok(Some(r));
+                }
+                Err(again) => {
+                    eprintln!("{}", report::blockers(&again));
+                    return Ok(None);
+                }
+            }
+        }
+        // Declined, or answered with something that is not an option. Falling
+        // through to the no-TTY output rather than exiting quietly: the user
+        // still needs the commands, and they may well have stopped because they
+        // wanted to think about it somewhere other than a prompt.
+        eprintln!("\nNothing was recorded.");
+        eprintln!("{}", report::blockers(&blockers));
+        return Ok(None);
+    }
+    eprintln!("{}", report::blockers(&blockers));
+    Ok(None)
+}
+
 fn cmd_plan(
     project: &Project,
     source: &baseline::Source,
@@ -1168,15 +1239,15 @@ fn cmd_plan(
     out: Option<&std::path::Path>,
     sql: Option<&std::path::Path>,
     dev: Option<&str>,
+    may_prompt: bool,
 ) -> anyhow::Result<()> {
     let loaded = load(project)?;
     let ids = read_ids(project)?;
     let dialect = dialect(project)?;
 
-    let res = match pbps_diff::resolve(&loaded.schema, &ids, &loaded.intents, &context()) {
-        Ok(r) => r,
-        Err(blockers) => {
-            eprintln!("{}", report::blockers(&blockers));
+    let res = match resolve_with_intent(project, &loaded, &ids, may_prompt)? {
+        Some(r) => r,
+        None => {
             // A finding, not a tool failure: pbps did its job and is asking a
             // question only a human can answer (SPEC §6.1). CI must be able to
             // tell that apart from "the tool broke".
