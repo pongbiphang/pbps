@@ -26,7 +26,7 @@ use crate::catalog::get;
 /// the deployment account exactly what it needs should be able to see the list,
 /// and "make it an owner" is the advice that makes every such organization say
 /// no to the tool.
-pub const REQUIRED: [(&str, &str); 6] = [
+pub const REQUIRED: [(&str, &str); 9] = [
     (
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -52,6 +52,25 @@ pub const REQUIRED: [(&str, &str); 6] = [
     (
         "DELETE",
         "releasing the deployment lock after an apply, and `state prune`",
+    ),
+    // SQL Server gates each module kind on its own database-level CREATE, on
+    // top of ALTER on the schema, so `CREATE OR ALTER VIEW` needs CREATE VIEW
+    // even when the object already exists. A trigger is the exception and is
+    // deliberately absent: a DML trigger is authorized by ALTER on the table it
+    // is on, which is already required above.
+    //
+    // Demanded even of a project that declares no modules. `doctor` answers
+    // "can I deploy from here", and the cost of asking for a permission that
+    // goes unused is one line in a grant script; the cost of the other mistake
+    // is an apply that fails on the day someone adds their first view.
+    ("CREATE VIEW", "creating or restating a declared view"),
+    (
+        "CREATE PROCEDURE",
+        "creating or restating a declared stored procedure",
+    ),
+    (
+        "CREATE FUNCTION",
+        "creating or restating a declared function",
     ),
 ];
 
@@ -115,14 +134,7 @@ mod tests {
 
     #[test]
     fn an_account_holding_everything_is_missing_nothing() {
-        let held = set(&[
-            "VIEW DEFINITION",
-            "SELECT",
-            "CREATE TABLE",
-            "ALTER",
-            "INSERT",
-            "DELETE",
-        ]);
+        let held: BTreeSet<String> = REQUIRED.iter().map(|(n, _)| (*n).to_owned()).collect();
         assert!(missing(&held).is_empty());
     }
 
@@ -133,7 +145,7 @@ mod tests {
     fn a_missing_permission_is_reported_with_its_reason() {
         let held = set(&["VIEW DEFINITION", "SELECT"]);
         let gaps = missing(&held);
-        assert_eq!(gaps.len(), 4);
+        assert_eq!(gaps.len(), REQUIRED.len() - 2);
         assert!(gaps.iter().any(|(n, why)| *n == "ALTER" && !why.is_empty()));
     }
 
@@ -142,16 +154,33 @@ mod tests {
     /// stale lock. `doctor` has to name it before the deployment, not after.
     #[test]
     fn holding_insert_without_delete_is_still_a_gap() {
-        let held = set(&[
-            "VIEW DEFINITION",
-            "SELECT",
-            "CREATE TABLE",
-            "ALTER",
-            "INSERT",
-        ]);
+        let mut held: BTreeSet<String> = REQUIRED.iter().map(|(n, _)| (*n).to_owned()).collect();
+        held.remove("DELETE");
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].0, "DELETE");
+    }
+
+    /// A trigger is authorized by ALTER on the table it is on, not by a CREATE
+    /// of its own. Demanding one would send an organization to grant a
+    /// permission its deployment does not use — and this list only stays
+    /// credible if every entry on it is really needed.
+    #[test]
+    fn only_the_three_module_kinds_that_need_a_create_have_one() {
+        let creates: Vec<&str> = REQUIRED
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| n.starts_with("CREATE "))
+            .collect();
+        assert_eq!(
+            creates,
+            [
+                "CREATE TABLE",
+                "CREATE VIEW",
+                "CREATE PROCEDURE",
+                "CREATE FUNCTION"
+            ]
+        );
     }
 
     /// CONTROL implies the rest. Reporting an owner as missing every entry

@@ -238,6 +238,16 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
             state: "uninitialized",
             detail: Some("this environment has a ledger but no entries".to_owned()),
         },
+        // A database pbps has never touched is reachable, and saying otherwise
+        // would send the reviewer to look at the network while the server sits
+        // there answering. `latest` distinguishes "no ledger at all" from "a
+        // ledger with no entries" precisely so callers can, and this one has to
+        // — `uninitialized` is one of the states this report advertises.
+        Err(pbps_db::LedgerError::NotInitialized) => TargetState {
+            environment: target.label.clone(),
+            state: "uninitialized",
+            detail: Some("pbps has recorded no state in this database yet".to_owned()),
+        },
         // Unreachable is reported, not fatal: the file half of the explanation
         // is the whole point of the command and must survive a reviewer who has
         // read access to nothing.

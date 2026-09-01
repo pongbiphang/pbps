@@ -2222,3 +2222,133 @@ fn the_module_schema_demands_exactly_one_kind() {
         assert_eq!(branch["properties"][kind]["type"], "string", "{branch}");
     }
 }
+
+// ---- Second review round ----
+
+/// One blocker is not one question. A table that lost two columns and gained
+/// two arrives as a single `AmbiguousColumns` holding all four names, so
+/// answering it once leaves the other pair ambiguous — and before the prompt
+/// looped, the answer already given was discarded as well, which made a
+/// two-column rename impossible to complete interactively.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_prompt_keeps_asking_until_every_ambiguity_is_answered() {
+    let d = Demo::new("multiprompt");
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  customer_name: {type: nvarchar(50)}\n",
+        "  customer_zip: {type: nvarchar(10)}\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  full_name: {type: nvarchar(50)}\n",
+        "  postcode: {type: nvarchar(10)}\n"
+    ));
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            // The likeliest pairing is offered first each round, so "1" twice
+            // is the ordinary answer to "yes, both of these".
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n1\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        return; // `script` is not installed; the conversation is unit-tested.
+    };
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(
+        text.contains("rename column customer_name -> full_name"),
+        "{text}"
+    );
+    assert!(
+        text.contains("rename column customer_zip -> postcode"),
+        "{text}"
+    );
+
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(
+        ids.contains("full_name") && ids.contains("postcode"),
+        "{ids}"
+    );
+    assert!(!ids.contains("tombstones"), "neither was a drop: {ids}");
+}
+
+/// Stopping part-way through must still record nothing, now that the loop
+/// carries answers between rounds. A half-answered ambiguity written to the ids
+/// file would be a decision the user never finished making.
+#[cfg(target_os = "linux")]
+#[test]
+fn stopping_part_way_through_the_loop_still_records_nothing() {
+    let d = Demo::new("multistop");
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  customer_name: {type: nvarchar(50)}\n",
+        "  customer_zip: {type: nvarchar(10)}\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  full_name: {type: nvarchar(50)}\n",
+        "  postcode: {type: nvarchar(10)}\n"
+    ));
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            // Answer the first, then decline the second.
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        return;
+    };
+    assert_eq!(code(&out), FINDING, "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(d.ids_path()).unwrap(),
+        before,
+        "an unfinished answer must record nothing"
+    );
+    // And the commands cover the *whole* original problem, not just the part
+    // the user had not reached. Nothing was recorded, so they are back where
+    // they started; a list omitting the question they did answer would send
+    // them to fix half of it.
+    let text = stdout(&out);
+    assert!(text.contains("pbps rename dbo.t.customer_name"), "{text}");
+    assert!(text.contains("pbps rename dbo.t.customer_zip"), "{text}");
+}

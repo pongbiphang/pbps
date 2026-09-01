@@ -1242,52 +1242,75 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
 /// same call. So a declined or impossible prompt has nothing to undo — it falls
 /// through to §6.4's copy-pastable commands, which is also the behaviour with no
 /// terminal at all.
+///
+/// # Why this loops
+///
+/// One blocker is not one question. A table that lost two columns and gained two
+/// reaches here as a single `AmbiguousColumns` holding all four names, and
+/// answering it names one pair — the other pair is still ambiguous. Asking once
+/// per blocker would therefore make a two-column rename impossible to complete
+/// interactively *and* throw away the answer already given, which is the worst
+/// of both. So each round of answers is folded in and identity re-resolved, and
+/// whatever is still ambiguous is asked again.
 fn resolve_with_intent(
     project: &Project,
     loaded: &pbps_load::Loaded,
     ids: &IdsFile,
     may_prompt: bool,
 ) -> anyhow::Result<Option<pbps_diff::Resolution>> {
-    let blockers = match pbps_diff::resolve(&loaded.schema, ids, &loaded.intents, &context()) {
+    let mut intents = loaded.intents.clone();
+    let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
         Ok(r) => return Ok(Some(r)),
         Err(b) => b,
     };
+    let mut blockers = original.clone();
+
     if may_prompt && prompt::interactive() {
-        // The copy-pastable commands are *not* printed first here. They are the
-        // no-TTY answer (§6.4), and printing them above a prompt asking the same
-        // question would tell the user to go and type something while offering
-        // to do it for them.
-        if let Some(answers) = prompt::ask(&blockers) {
-            let mut intents = loaded.intents.clone();
+        loop {
+            // The copy-pastable commands are *not* printed above the prompt.
+            // They are the no-TTY answer (§6.4), and offering to do the thing
+            // while telling the user to go and type it is one instruction too
+            // many.
+            let Some(answers) = prompt::ask(&blockers) else {
+                break;
+            };
+            let before = intents.len();
             intents.extend(answers);
-            // Resolved again from scratch rather than patched: the answers are
+            if intents.len() == before {
+                // A round that asked and learned nothing. Nothing here produces
+                // that today, but looping forever on a blocker with no choices
+                // would be a hang rather than a bug report.
+                break;
+            }
+            // Re-resolved from scratch rather than patched: the answers are
             // ordinary intents, and running them through the same call is what
             // makes the prompt a wrapper rather than a second implementation of
             // identity resolution.
             match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
                 Ok(r) => {
-                    // Written now, so that the answers survive whatever the rest
-                    // of this plan does. They are the user's decisions, and
-                    // losing them to a later failure would mean asking again.
+                    // Written now, so the answers survive whatever the rest of
+                    // this plan does. They are the user's decisions, and losing
+                    // them to a later failure would mean asking again.
                     // Silently: the caller compares against the pre-prompt
                     // mapping and prints one "updated" line, and two messages
                     // about one file would read as two files.
                     write_ids(project, &r.ids)?;
                     return Ok(Some(r));
                 }
-                Err(again) => {
-                    eprintln!("{}", report::blockers(&again));
-                    return Ok(None);
-                }
+                Err(again) => blockers = again,
             }
         }
         // Declined, or answered with something that is not an option. Falling
         // through to the no-TTY output rather than exiting quietly: the user
         // still needs the commands, and they may well have stopped because they
         // wanted to think about it somewhere other than a prompt.
+        //
+        // The commands printed are for the *original* blockers, not whatever is
+        // left after a partial round. Nothing was recorded, so the user is back
+        // where they started — and a list covering only the questions they had
+        // not reached yet would silently omit the ones they had.
         eprintln!("\nNothing was recorded.");
-        eprintln!("{}", report::blockers(&blockers));
-        return Ok(None);
+        blockers = original;
     }
     eprintln!("{}", report::blockers(&blockers));
     Ok(None)
