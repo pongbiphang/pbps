@@ -49,7 +49,14 @@ pub fn module(name: &ObjectName, module: &Module) -> Vec<DialectError> {
     // inside a definition would be sent to the server verbatim and rejected —
     // and a user who wrote it meant to split the object into pieces that
     // `CREATE OR ALTER` cannot express.
-    if body.lines().any(|l| l.trim().eq_ignore_ascii_case("go")) {
+    //
+    // Read off the code, not the raw text: T-SQL allows the word inside a
+    // literal or a comment, and a procedure that returns or documents a script
+    // is a perfectly ordinary thing to want to manage.
+    if pbps_model::module::code_only(body)
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("go"))
+    {
         errs.push(invalid(format!(
             "{} `{name}` contains a `GO` batch separator; a module is one batch, and `GO` is a \
              client instruction rather than something the server understands",
@@ -509,6 +516,27 @@ mod tests {
             &a_module(ModuleKind::View, "WITH ENCRYPTION AS SELECT 1"),
         );
         assert!(e.contains("cannot be read back"), "{e}");
+    }
+
+    /// `GO` is a client instruction, but the two letters are ordinary text
+    /// inside a literal or a comment — and a procedure that returns or
+    /// documents a deployment script is a perfectly ordinary thing to manage.
+    #[test]
+    fn go_inside_a_literal_or_a_comment_is_not_a_batch_separator() {
+        for body in [
+            "AS SELECT 'first line\nGO\nsecond line' AS script",
+            "AS /* the caller runs\nGO\nafterwards */ SELECT 1",
+            "AS SELECT 1 -- GO",
+        ] {
+            let e = module_errors("dbo.p", &a_module(ModuleKind::Procedure, body));
+            assert!(!e.contains("batch separator"), "{body}: {e}");
+        }
+        // A real one is still refused.
+        let e = module_errors(
+            "dbo.p",
+            &a_module(ModuleKind::Procedure, "AS SELECT 1\nGO\nSELECT 2"),
+        );
+        assert!(e.contains("batch separator"), "{e}");
     }
 
     /// The option is tokens, not one exact string. A spelling that slipped

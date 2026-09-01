@@ -71,9 +71,27 @@ fn online(strategy: Strategy) -> &'static str {
 ///
 /// A change the emitter cannot express is not online: it will fail the plan for
 /// its own reasons, with its own error.
+///
+/// The two emissions are compared rather than the text searched. Searching
+/// would read the user's own SQL — a column default of `'ONLINE = ON'`, a check
+/// comparing against that string — and report an online clause the statement
+/// does not have, refusing a valid plan on Standard edition. What differs
+/// between the two emissions is exactly what the strategy added, and nothing
+/// else can get into that difference.
 pub fn takes_online(change: &Change) -> bool {
-    emit(change, Strategy { online: true })
-        .is_ok_and(|stmts| stmts.iter().any(|s| s.sql.contains("ONLINE = ON")))
+    let sql = |online| {
+        emit(change, Strategy { online }).map(|stmts| {
+            stmts
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    };
+    match (sql(true), sql(false)) {
+        (Ok(with), Ok(without)) => with != without,
+        _ => false,
+    }
 }
 
 pub fn emit(change: &Change, strategy: Strategy) -> Sql {
@@ -974,6 +992,31 @@ mod tests {
                 "ALTER TABLE [dbo].[order_line] ADD CONSTRAINT [uq_line] UNIQUE ([order_id]) WITH (ONLINE = ON);"
             ]
         );
+    }
+
+    /// Whether a change carries the clause is decided by comparing the two
+    /// emissions, never by searching the text: a default or a check the user
+    /// wrote can contain those very words, and a search would refuse a valid
+    /// plan on Standard edition over a string literal.
+    #[test]
+    fn an_expression_that_mentions_online_is_not_an_online_statement() {
+        let mut column = Column::new(ty("nvarchar(20)"));
+        column.default = Some("'ONLINE = ON'".into());
+        assert!(!takes_online(&Change::AddColumn {
+            uid: uid("c_k7x2mq"),
+            table: tname("dbo.order_line"),
+            name: "note".into(),
+            column: Box::new(column),
+        }));
+        assert!(!takes_online(&Change::AddCheck {
+            table: tname("dbo.order_line"),
+            name: "ck_note".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "note <> 'ONLINE = ON'".into(),
+            },
+        }));
+        // And a statement that really takes it still says so.
+        assert!(takes_online(&an_index()));
     }
 
     /// `WITH (ONLINE = ON)` is a syntax error on a statement that is metadata

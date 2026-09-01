@@ -532,10 +532,12 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
 
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for (name, table) in &pulled.schema.tables {
         let path = dir.join(format!("{}.{}.yml", name.schema, name.name));
         std::fs::write(&path, pbps_load::render(name, table, &[], None))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
     }
     // Modules go into files of their own, named for the kind as well as the
     // object: a view and a table cannot collide in the database, so they must
@@ -552,7 +554,35 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
             pbps_load::render_module(name, module, &Default::default()),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
     }
+
+    // What a forced pull did not write, it removes. Leaving it would be worse
+    // than deleting it: a declaration for an object that is gone plans its
+    // recreation, and a view that became a procedure would leave
+    // `dbo.x.view.yml` beside `dbo.x.procedure.yml` — two files declaring one
+    // name, which `validate` refuses and every later load fails on. `--force`
+    // already means "replace my declarations with this database"; this is the
+    // rest of that sentence.
+    let mut removed = Vec::new();
+    for path in pbps_load::schema_files(&dir).unwrap_or_default() {
+        if written.contains(&path) {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("cannot remove the stale `{}`", path.display()))?;
+        removed.push(path);
+    }
+    if !removed.is_empty() {
+        eprintln!(
+            "removed {} declaration file(s) for objects this database does not have:",
+            removed.len()
+        );
+        for p in &removed {
+            eprintln!("  {}", p.display());
+        }
+    }
+
     write_ids(project, &res.ids)?;
 
     println!(

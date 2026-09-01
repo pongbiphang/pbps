@@ -198,15 +198,8 @@ async fn run(
     // The suffix is random rather than derived from the process id and the
     // clock: two CI containers on one host routinely get the same pid within
     // the same second, and the collision shows up as one run failing to create
-    // a database the other is using. `RandomState` is seeded per process by the
-    // OS, which is exactly the property wanted here.
-    let salt = {
-        use std::hash::{BuildHasher as _, Hasher as _};
-        std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
-    };
-    let name = format!("pbps_dev_{}_{salt:016x}", std::process::id());
+    // a database the other is using.
+    let name = format!("pbps_dev_{}_{}", std::process::id(), random_hex());
     conn.execute(&format!("CREATE DATABASE [{name}];"))
         .await
         .with_context(|| format!("cannot create the scratch database `{name}`"))?;
@@ -388,6 +381,20 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
     (structural, spelling)
 }
 
+/// Sixteen hex digits from the OS.
+///
+/// `RandomState` is seeded per process by the operating system and is in std,
+/// which is why there is no `rand` dependency here for two uses of it. Each
+/// call builds a fresh hasher, so two calls do not repeat.
+fn random_hex() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    // Without a write the hasher would return its seed, which is per
+    // `RandomState` rather than per call.
+    h.write_usize(std::process::id() as usize);
+    format!("{:016x}", h.finish())
+}
+
 /// A container started for one rehearsal and removed when it ends.
 struct Container {
     id: String,
@@ -402,7 +409,13 @@ impl Container {
         // A password per run, never one written in the source: the container is
         // throwaway, but a fixed credential in a published binary is the kind
         // of thing that ends up somewhere it was not meant to.
-        let password = format!("Pbps!{}{}", std::process::id(), crate::unix_seconds());
+        //
+        // From OS randomness, not the process id and the clock. The port is
+        // published, so on a shared host anything else that can reach it could
+        // derive the password from a launch second and a small pid range, and
+        // then connect as sa while the rehearsal is deciding whether the plan
+        // converges.
+        let password = format!("Pbps!{}{}", random_hex(), random_hex());
         eprintln!("dev: starting {image} (a throwaway container)...");
 
         let out = std::process::Command::new("docker")

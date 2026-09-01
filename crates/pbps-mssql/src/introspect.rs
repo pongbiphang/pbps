@@ -317,16 +317,24 @@ fn qualified_name(s: &str, mut i: usize) -> Option<(Vec<String>, usize)> {
     let mut parts = Vec::new();
     loop {
         let rest = &s[i..];
-        if let Some(stripped) = rest.strip_prefix('[') {
-            // `]]` is an escaped bracket inside a quoted identifier.
+        // `"name"` is the ANSI spelling of `[name]` and means the same thing
+        // under QUOTED_IDENTIFIER ON, which is the only setting pbps manages
+        // (see `RawModule::default_set_options`). Refusing it would inventory a
+        // perfectly reproducible module as unmanageable over a choice of quote.
+        let quoted = rest
+            .strip_prefix('[')
+            .map(|r| (r, ']'))
+            .or_else(|| rest.strip_prefix('"').map(|r| (r, '"')));
+        if let Some((stripped, close)) = quoted {
+            // A doubled closing character is an escaped one inside the name.
             let mut part = String::new();
             let mut chars = stripped.char_indices();
             let end = loop {
                 let (at, ch) = chars.next()?;
-                if ch == ']' {
-                    match stripped[at + 1..].starts_with(']') {
+                if ch == close {
+                    match stripped[at + ch.len_utf8()..].starts_with(close) {
                         true => {
-                            part.push(']');
+                            part.push(close);
                             chars.next();
                         }
                         false => break at,
@@ -336,7 +344,7 @@ fn qualified_name(s: &str, mut i: usize) -> Option<(Vec<String>, usize)> {
                 }
             };
             parts.push(part);
-            i += end + 2;
+            i += end + 1 + close.len_utf8();
         } else {
             let end = rest
                 .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '@' || c == '#'))
@@ -1197,6 +1205,24 @@ mod module_tests {
             split_module(
                 ModuleKind::Procedure,
                 "CREATE PROC dbo.p AS SELECT 1",
+                false
+            )
+            .is_some()
+        );
+
+        // The ANSI spelling of a quoted name means the same thing as brackets
+        // under QUOTED_IDENTIFIER ON, which is the only setting pbps manages.
+        let split = split_module(
+            ModuleKind::View,
+            "CREATE VIEW \"dbo\".\"active customer\" AS SELECT 1",
+            false,
+        );
+        assert_eq!(split, Some((None, "SELECT 1".to_owned())), "ANSI quoting");
+        // Including its doubled-quote escape.
+        assert!(
+            split_module(
+                ModuleKind::View,
+                "CREATE VIEW \"dbo\".\"say \"\"hi\"\"\" AS SELECT 1",
                 false
             )
             .is_some()

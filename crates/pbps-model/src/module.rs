@@ -154,8 +154,109 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
+/// The definition with everything that is not code blanked out.
+///
+/// String literals and both comment forms are replaced by spaces, character for
+/// character, so line structure and offsets survive. A **quoted identifier**
+/// (`[name]`, or `"name"` under QUOTED_IDENTIFIER ON, which is the only setting
+/// pbps manages) is passed through untouched: it is a name, which is exactly
+/// what the callers are looking for.
+///
+/// # Why this is still not parsing SQL
+///
+/// It answers only "is this position inside a literal or a comment", which
+/// every SQL lexer agrees on and no dialect argues about. Nothing here
+/// understands what the code *says* — that rule (§8.2) is about comparison, and
+/// this feeds two questions that are not comparisons: which modules a
+/// definition names, and whether it contains a `GO`. Both were asked of the raw
+/// text before, where a name inside a comment invented a dependency edge and a
+/// `GO` inside a literal refused a valid procedure.
+pub fn code_only(definition: &str) -> String {
+    enum At {
+        Code,
+        /// Inside `'...'`: blanked, because its contents are data.
+        Literal,
+        /// Inside `[...]` or `"..."`: kept, because its contents are a name.
+        Ident(char),
+        Line,
+        /// Carrying how many characters have been consumed, so that the `*` of
+        /// the opener cannot also close it (`/*/`).
+        Block(usize),
+    }
+    let mut out = String::with_capacity(definition.len());
+    let mut at = At::Code;
+    let bytes = definition.as_bytes();
+    // A newline always survives: it ends a line comment, and the `GO` check
+    // reads lines.
+    fn blank(out: &mut String, ch: char) {
+        if ch == '\n' {
+            out.push('\n');
+        } else {
+            for _ in 0..ch.len_utf8() {
+                out.push(' ');
+            }
+        }
+    }
+    for (i, ch) in definition.char_indices() {
+        match at {
+            At::Literal => {
+                // A doubled `''` needs no special case: the first closes and the
+                // second opens again, and everything between is blanked either
+                // way.
+                if ch == '\'' {
+                    at = At::Code;
+                }
+                blank(&mut out, ch);
+            }
+            At::Ident(q) => {
+                if if q == '[' { ch == ']' } else { ch == q } {
+                    at = At::Code;
+                }
+                out.push(ch);
+            }
+            At::Line => {
+                if ch == '\n' {
+                    at = At::Code;
+                }
+                blank(&mut out, ch);
+            }
+            At::Block(seen) => {
+                at = if ch == '/' && seen >= 2 && bytes[i - 1] == b'*' {
+                    At::Code
+                } else {
+                    At::Block(seen + 1)
+                };
+                blank(&mut out, ch);
+            }
+            At::Code => {
+                let next = bytes.get(i + ch.len_utf8()).copied();
+                match (ch, next) {
+                    ('-', Some(b'-')) => {
+                        at = At::Line;
+                        blank(&mut out, ch);
+                    }
+                    ('/', Some(b'*')) => {
+                        at = At::Block(0);
+                        blank(&mut out, ch);
+                    }
+                    ('\'', _) => {
+                        at = At::Literal;
+                        blank(&mut out, ch);
+                    }
+                    ('[' | '"', _) => {
+                        at = At::Ident(ch);
+                        out.push(ch);
+                    }
+                    _ => out.push(ch),
+                }
+            }
+        }
+    }
+    out
+}
+
 fn scannable(definition: &str) -> String {
-    let lowered = definition.to_ascii_lowercase();
+    let lowered = code_only(definition).to_ascii_lowercase();
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
@@ -521,6 +622,31 @@ mod tests {
             "{:?}",
             check_names(&schema)
         );
+    }
+
+    /// A name inside a comment or a string is not a reference. Inventing the
+    /// edge is worse than missing one: it can close a cycle, and a cycle falls
+    /// back to name order — while `depends_on:` can only *add* edges, so the
+    /// user has no way to take the invented one back.
+    #[test]
+    fn a_name_in_a_comment_or_a_literal_is_not_a_dependency() {
+        let target: ObjectName = "dbo.active_customer".parse().unwrap();
+        for definition in [
+            "SELECT 1 -- superseded by dbo.active_customer",
+            "/* see dbo.active_customer */ SELECT 1",
+            "SELECT 'dbo.active_customer' AS note",
+        ] {
+            assert!(
+                !references(definition, &target),
+                "{definition} must not count as a reference"
+            );
+        }
+        // A quoted identifier still does: it is a name, not text.
+        assert!(references("SELECT * FROM [dbo].[active_customer]", &target));
+        assert!(references(
+            "SELECT * FROM \"dbo\".\"active_customer\"",
+            &target
+        ));
     }
 
     /// An ordering edge that silently does not exist is the failure this check
