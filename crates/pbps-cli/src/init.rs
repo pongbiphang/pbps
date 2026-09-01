@@ -15,7 +15,7 @@ use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project,
 use pbps_dialect::Dialect as _;
 use pbps_model::{IdsFile, Schema};
 
-use crate::{context, db};
+use crate::{context, db, declaration_file};
 
 /// Arguments for `pbps init`.
 #[derive(Debug, Args)]
@@ -177,7 +177,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             println!("Next: `pbps validate`");
             if args.from.is_some() {
                 println!(
-                    "Then commit the generated files; after editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
+                    "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
                 );
             } else {
                 println!(
@@ -217,11 +217,15 @@ fn refuse_existing(root: &Path) -> anyhow::Result<()> {
         );
     }
     let schema = root.join("schema");
-    if schema.is_dir() && !pbps_load::schema_files(&schema)?.is_empty() {
-        bail!(
-            "`{}` already contains declarations; init will not overwrite them",
-            schema.display()
-        );
+    if schema.is_dir() {
+        let first = std::fs::read_dir(&schema)?.next().transpose()?;
+        if let Some(entry) = first {
+            bail!(
+                "`{}` is not empty (it contains `{}`); init will not overwrite project data",
+                schema.display(),
+                entry.path().display()
+            );
+        }
     }
     if schema.exists() && !schema.is_dir() {
         bail!("`{}` exists but is not a directory", schema.display());
@@ -277,12 +281,20 @@ fn render_config(config: &Config) -> String {
         out.push_str("environments:\n");
         for (name, environment) in &config.environments {
             out.push_str(&format!(
-                "  {name}:\n    url_env: {}\n",
-                environment.url_env
+                "  {}:\n    url_env: {}\n",
+                yaml_string(name),
+                yaml_string(&environment.url_env)
             ));
         }
     }
     out
+}
+
+/// JSON string syntax is a valid YAML double-quoted scalar. Always quoting the
+/// generated values is simpler and safer than maintaining a second copy of the
+/// declaration renderer's null/bool/number detection here.
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 fn mint_ids(schema: &Schema) -> anyhow::Result<IdsFile> {
@@ -310,17 +322,12 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
 
     let result = (|| -> anyhow::Result<()> {
         for (name, table) in &prepared.schema.tables {
-            let path = schema_dir.join(format!("{}.{}.yml", name.schema, name.name));
+            let path = declaration_file::path(&schema_dir, name, None)?;
             std::fs::write(&path, pbps_load::render(name, table, &[], None))
                 .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }
         for (name, module) in &prepared.schema.modules {
-            let path = schema_dir.join(format!(
-                "{}.{}.{}.yml",
-                name.schema,
-                name.name,
-                module.kind.as_str()
-            ));
+            let path = declaration_file::path(&schema_dir, name, Some(module.kind))?;
             std::fs::write(
                 &path,
                 pbps_load::render_module(name, module, &Default::default()),
@@ -421,13 +428,15 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
     let final_schema = root.join("schema");
     let staged_schema = stage.join("schema");
     let had_empty_schema = final_schema.is_dir();
-    if had_empty_schema {
-        std::fs::remove_dir(&final_schema).with_context(|| {
-            format!(
-                "cannot replace the empty declaration directory `{}`",
-                final_schema.display()
-            )
-        })?;
+    if had_empty_schema && let Err(source) = std::fs::remove_dir(&final_schema) {
+        // The directory may have changed after the initial emptiness check.
+        // Never remove its contents: they belong to the user. Only discard our
+        // staging tree before reporting the race or permission error.
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(anyhow::Error::new(source).context(format!(
+            "cannot replace the empty declaration directory `{}`",
+            final_schema.display()
+        )));
     }
 
     let mut schema_moved = false;
@@ -494,11 +503,19 @@ mod tests {
 
     #[test]
     fn generated_config_carries_tool_and_schema_versions() {
+        let mut environments = BTreeMap::new();
+        environments.insert(
+            "null".to_owned(),
+            Environment {
+                url_env: "null".to_owned(),
+                description: None,
+            },
+        );
         let config = Config {
             dialect: DialectName::Mssql,
             schema_dir: PathBuf::from("schema"),
             ids_file: PathBuf::from("schema.ids.json"),
-            environments: BTreeMap::new(),
+            environments,
             hooks: Hooks::default(),
             unmanaged: Unmanaged::Ignore,
             dev: None,
@@ -506,6 +523,8 @@ mod tests {
         let text = render_config(&config);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
         assert!(text.contains("config schema 1"), "{text}");
-        Config::parse(&text, Path::new("pbps.yml")).unwrap();
+        let parsed = Config::parse(&text, Path::new("pbps.yml")).unwrap();
+        assert_eq!(parsed.environments["null"].url_env, "null");
+        assert!(text.contains("\"null\""), "{text}");
     }
 }

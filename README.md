@@ -48,6 +48,13 @@ To adopt the database named by `$PROD_CONN` in the same step:
 pbps init --from prod --url-env PROD_CONN
 ```
 
+After adopting an existing database, commit the generated files and initialize
+its ledger before making the first connected plan:
+
+```bash
+pbps baseline --env prod --reason initial-adoption
+```
+
 When `--url-env` is omitted, the variable name is derived deterministically
 (`prod` becomes `PROD_CONN`). `init` previews every path, stages and validates
 the complete output, and installs `pbps.yml` last; it refuses existing project

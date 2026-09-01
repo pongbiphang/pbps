@@ -2,6 +2,7 @@
 
 mod baseline;
 mod db;
+mod declaration_file;
 mod deploy;
 mod dev;
 mod hooks;
@@ -504,7 +505,13 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         } else {
             Vec::new()
         };
-        if !existing.is_empty() || project.ids_file().exists() {
+        // `init` deliberately creates a versioned empty identity file. That is
+        // still a pristine project, not user data for pull to overwrite. A
+        // non-empty or malformed file remains a hard stop before connecting.
+        let identities_exist = read_ids_opt(project)?.is_some_and(|ids| {
+            !ids.tables.is_empty() || !ids.columns.is_empty() || !ids.tombstones.is_empty()
+        });
+        if !existing.is_empty() || identities_exist {
             bail!(
                 "this project already has declarations; pull would overwrite them.\n                 Re-run with --force if that is what you want, or pull into a fresh project and merge."
             );
@@ -546,7 +553,7 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for (name, table) in &pulled.schema.tables {
-        let path = dir.join(format!("{}.{}.yml", name.schema, name.name));
+        let path = declaration_file::path(&dir, name, None)?;
         std::fs::write(&path, pbps_load::render(name, table, &[], None))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
@@ -555,12 +562,7 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     // object: a view and a table cannot collide in the database, so they must
     // not collide on disk either (ADR-0002).
     for (name, module) in &pulled.schema.modules {
-        let path = dir.join(format!(
-            "{}.{}.{}.yml",
-            name.schema,
-            name.name,
-            module.kind.as_str()
-        ));
+        let path = declaration_file::path(&dir, name, Some(module.kind))?;
         std::fs::write(
             &path,
             pbps_load::render_module(name, module, &Default::default()),

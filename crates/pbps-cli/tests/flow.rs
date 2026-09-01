@@ -352,7 +352,10 @@ fn init_refuses_existing_files_without_changing_them() {
     let dir = std::env::temp_dir().join(format!("pbps-init-existing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("schema")).unwrap();
-    let declaration = dir.join("schema/keep.yml");
+    // Non-YAML files matter too. A common `.gitkeep` used to pass the initial
+    // check, then make the commit fail after staging and leave the staging tree
+    // behind.
+    let declaration = dir.join("schema/.gitkeep");
     std::fs::write(&declaration, "do not touch me\n").unwrap();
 
     let o = Command::new(BIN)
@@ -369,6 +372,14 @@ fn init_refuses_existing_files_without_changing_them() {
     );
     assert!(!dir.join("pbps.yml").exists());
     assert!(!dir.join("schema.ids.json").exists());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pbps-init-")),
+        "a refusal must not leave a staging directory"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -391,6 +402,35 @@ fn init_from_a_missing_connection_variable_leaves_no_project() {
     assert!(!dir.join("pbps.yml").exists());
     assert!(!dir.join("schema.ids.json").exists());
     assert!(!dir.join("schema").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pull_accepts_the_pristine_identity_file_created_by_init() {
+    let dir = std::env::temp_dir().join(format!("pbps-init-pull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let init = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["init", "--env", "source"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&init), 0, "{}", stderr(&init));
+
+    let pull = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args([
+            "pull",
+            "--db",
+            "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&pull), 1);
+    let err = stderr(&pull);
+    assert!(!err.contains("already has declarations"), "{err}");
+    assert!(err.contains("cannot reach"), "pull should connect: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1218,6 +1258,11 @@ fn init_from_a_real_database_produces_a_valid_project() {
         .output()
         .unwrap();
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("pbps baseline --env source --reason initial-adoption"),
+        "{}",
+        stdout(&o)
+    );
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(
         !all.contains(&connection),

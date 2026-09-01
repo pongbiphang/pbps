@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # `master` is the current default branch. Keep `main` subscribed as well so
+    # a future branch rename cannot silently remove post-merge coverage.
+    branches: [master, main]
   pull_request:
 
 env:
