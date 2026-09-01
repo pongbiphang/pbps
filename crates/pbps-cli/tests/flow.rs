@@ -91,6 +91,14 @@ fn code(o: &Output) -> i32 {
     o.status.code().unwrap_or(-1)
 }
 
+/// The command ran correctly and found something the user must act on.
+///
+/// Distinct from 1, which means the tool could not answer at all (SPEC §14.1).
+/// Asserting the exact code rather than "non-zero" is the point: a pipeline
+/// that treats an unreachable database the same as an invalid declaration wakes
+/// the wrong person, and only a test can hold the two apart.
+const FINDING: i32 = 2;
+
 const ONE_COLUMN: &str = "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n";
 
 #[test]
@@ -121,8 +129,8 @@ fn an_ambiguous_rename_is_blocked_and_the_exact_command_is_printed() {
 
     assert_eq!(
         code(&o),
-        1,
-        "an ambiguity must exit non-zero, or CI cannot block on it"
+        FINDING,
+        "an ambiguity must exit as a finding, or CI cannot block on it"
     );
     let msg = stderr(&o);
     assert!(
@@ -177,7 +185,7 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
 
     d.table(ONE_COLUMN);
     let o = d.run(&["plan"]);
-    assert_eq!(code(&o), 1, "a drop without a reason must be blocked");
+    assert_eq!(code(&o), FINDING, "a drop without a reason must be blocked");
     assert!(stderr(&o).contains("--reason"), "{}", stderr(&o));
 
     assert_eq!(
@@ -219,7 +227,7 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
     let before = std::fs::read_to_string(d.ids_path()).unwrap();
 
     let o = d.run(&["plan", "--check"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
     assert!(
         stderr(&o).contains("the identity file is out of date"),
         "{}",
@@ -259,7 +267,7 @@ fn an_invalid_declaration_is_rejected() {
     let d = Demo::new("invalid");
     d.table("table: no_schema_prefix\ncolumns:\n  a: {type: int}\n");
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
 }
 
 /// An offline plan is a preview and the file has to say so in its own terms
@@ -645,8 +653,8 @@ fn fmt_normalises_and_check_mode_never_writes() {
     let o = d.run(&["fmt", "--check"]);
     assert_eq!(
         code(&o),
-        1,
-        "a file that is not canonical should exit non-zero"
+        FINDING,
+        "a file that is not canonical should exit as a finding"
     );
     assert_eq!(
         std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
@@ -699,7 +707,7 @@ fn fmt_strips_a_renamed_from_only_after_plan_absorbs_it() {
     );
 
     // Absorbed now: fmt reports the file as non-canonical, then strips it.
-    assert_eq!(code(&d.run(&["fmt", "--check"])), 1);
+    assert_eq!(code(&d.run(&["fmt", "--check"])), FINDING);
     assert_eq!(code(&d.run(&["fmt"])), 0);
     let stripped = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
     assert!(
@@ -729,7 +737,11 @@ fn validate_rejects_one_name_mapped_to_two_uids() {
     std::fs::write(d.ids_path(), ids.to_string()).unwrap();
 
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1, "a scrambled identity file must fail validate");
+    assert_eq!(
+        code(&o),
+        FINDING,
+        "a scrambled identity file must fail validate"
+    );
     let msg = stderr(&o);
     assert!(
         msg.contains("both point at"),
@@ -852,7 +864,7 @@ fn validate_rejects_what_the_engine_would_refuse() {
         "table: dbo.t\ncolumns:\n  id: {type: jsonb}\n  code: {type: int}\nprimary_key: [code]\n",
     );
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
     let err = stderr(&o);
     assert!(err.contains("has no type `jsonb`"), "{err}");
     assert!(err.contains("must be NOT NULL"), "{err}");
@@ -1538,4 +1550,106 @@ fn bootstrap_honours_declared_module_dependencies() {
     let first = sql.find("[dbo].[first]").expect(&sql);
     let second = sql.find("[dbo].[second]").expect(&sql);
     assert!(first < second, "dependency order was discarded:\n{sql}");
+}
+
+// ---- Phase 3.1: one machine-readable shape, and three exit codes ----
+
+/// The whole point of the JSON view is that a frontend can point at the line
+/// without re-parsing a rendered diagnostic.
+#[test]
+fn validate_json_carries_the_id_the_file_and_the_line() {
+    let d = Demo::new("vjson");
+    // A semantic error rather than a dialect one: only the loader has a span,
+    // because the dialect is span-free by design (constraint 1 in CLAUDE.md).
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint}\nindexes:\n  ix:\n    columns: [id sideways]\n");
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["command"], "validate");
+    assert_eq!(v["result"], "findings");
+    let f = &v["findings"][0];
+    assert_eq!(f["id"], "load.semantic", "{v}");
+    assert_eq!(f["severity"], "error");
+    assert!(
+        f["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("dbo.t.yml"),
+        "{v}"
+    );
+    assert_eq!(f["location"]["line"], 6, "{v}");
+}
+
+/// A successful run must still produce the envelope: a consumer that only ever
+/// sees JSON when something is wrong cannot tell "clean" from "did not run".
+#[test]
+fn validate_json_of_a_clean_project_is_ok_with_no_findings() {
+    let d = Demo::new("vjsonok");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(v["data"]["tables"], 1);
+    assert_eq!(v["data"]["dialect"], "mssql");
+}
+
+/// `fmt --check` and `fmt` answer the same question and must not need two
+/// parsers; `mode` is what separates "must be fixed" from "was fixed".
+#[test]
+fn fmt_json_names_each_file_and_which_mode_ran() {
+    let d = Demo::new("fjson");
+    d.table("table:  dbo.t\ncolumns:\n  id:  {type: BIGINT}\n");
+
+    let o = d.run(&["fmt", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["mode"], "check");
+    assert_eq!(v["findings"][0]["id"], "fmt.not-canonical");
+    assert_eq!(v["findings"][0]["remedy"], "pbps fmt");
+
+    let o = d.run(&["fmt", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["mode"], "write");
+    assert_eq!(v["result"], "ok", "a file that was fixed is not a finding");
+    assert_eq!(v["findings"][0]["id"], "fmt.rewritten");
+    assert_eq!(v["findings"][0]["severity"], "note");
+}
+
+/// The negative case the split exists for: a project that cannot be found is a
+/// tool failure, not a finding, and the two must not share an exit code — a
+/// drift-watch pipeline routes them to different people (SPEC §14.1).
+#[test]
+fn a_broken_declaration_and_a_missing_project_have_different_exit_codes() {
+    let d = Demo::new("codes");
+    d.table("table: no_schema_prefix\ncolumns:\n  a: {type: int}\n");
+    assert_eq!(code(&d.run(&["validate"])), FINDING);
+
+    let nowhere = std::env::temp_dir().join(format!("pbps-none-{}", std::process::id()));
+    std::fs::create_dir_all(&nowhere).unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&nowhere)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let _ = std::fs::remove_dir_all(&nowhere);
+}
+
+/// `--format text` was the spelling the connected commands took before `human`
+/// became the one word across all of them; a pipeline already passing it must
+/// not break to gain a synonym.
+#[test]
+fn text_is_still_accepted_as_a_name_for_human() {
+    let d = Demo::new("alias");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["validate", "--format", "text"])), 0);
+    assert_eq!(code(&d.run(&["validate", "--format", "human"])), 0);
 }

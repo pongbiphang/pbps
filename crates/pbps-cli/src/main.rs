@@ -7,21 +7,43 @@ mod deploy;
 mod dev;
 mod hooks;
 mod init;
+mod output;
 mod report;
 mod status;
 
-/// Drift was found. Not a failure of the tool, so it must not look like one.
+/// The command ran correctly and found something the user must act on.
 ///
-/// A scheduled drift-watch pipeline (SPEC §10) needs to tell "the database
-/// moved" from "the tool could not reach it": the first pages the schema owner,
-/// the second pages whoever runs CI. One exit code for both would send every
-/// alert to the wrong person half the time.
+/// Not a failure of the tool, so it must not look like one. A scheduled
+/// drift-watch pipeline (SPEC §10) needs to tell "the database moved" from "the
+/// tool could not reach it": the first pages the schema owner, the second pages
+/// whoever runs CI. One exit code for both would send every alert to the wrong
+/// person half the time — and the same split holds for every read-only command,
+/// which is why this is not specific to drift (SPEC §14.1).
+///
+/// Three codes in total: 0 success, [`EXIT_FINDING`] a finding, 1 anything that
+/// stopped the tool from answering.
 #[derive(Debug, thiserror::Error)]
-#[error("drift found")]
-pub struct DriftFound;
+#[error("{0}")]
+pub struct Found(String);
 
-/// The exit code for [`DriftFound`].
-const EXIT_DRIFT: i32 = 2;
+impl Found {
+    /// A finding whose detail has already been printed.
+    ///
+    /// The empty message is load-bearing: [`main`] prints nothing for it, so a
+    /// report that has already listed twelve problems is not followed by a
+    /// thirteenth line restating that there were problems.
+    pub fn reported() -> Self {
+        Found(String::new())
+    }
+
+    /// A finding whose one-line summary is the whole of the output.
+    pub fn new(message: impl Into<String>) -> Self {
+        Found(message.into())
+    }
+}
+
+/// The exit code for [`Found`].
+const EXIT_FINDING: i32 = 2;
 
 use std::path::PathBuf;
 
@@ -92,13 +114,21 @@ enum Command {
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
-    Validate,
+    Validate {
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
 
     /// Rewrite the declarations in canonical form
     Fmt {
         /// Only check; exit non-zero if any file needs rewriting, and change nothing
         #[arg(long)]
         check: bool,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Record a column rename
@@ -181,7 +211,7 @@ enum Command {
         target: TargetArgs,
 
         /// text (default) or json
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
 
@@ -224,7 +254,7 @@ enum Command {
     /// One screen across every configured environment
     Status {
         /// text (default) or json
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
 
@@ -248,10 +278,15 @@ enum StateCommand {
     },
 }
 
-/// How a machine-readable command should speak.
+/// How a read-only command should speak.
+///
+/// `text` is kept as an alias for `human`: it is what the connected commands
+/// took before this became the one spelling across all of them (SPEC §14.1),
+/// and a pipeline that already passes it should not break to gain a synonym.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum OutputFormat {
-    Text,
+    #[value(name = "human", alias = "text")]
+    Human,
     Json,
 }
 
@@ -280,10 +315,15 @@ impl TargetArgs {
 
 fn main() {
     if let Err(e) = run() {
-        // Drift has already printed its own report; repeating "error: drift
-        // found" underneath it would add nothing but noise.
-        if e.downcast_ref::<DriftFound>().is_some() {
-            std::process::exit(EXIT_DRIFT);
+        if let Some(found) = e.downcast_ref::<Found>() {
+            // A report that already listed what it found prints nothing more;
+            // repeating "error: drift found" underneath it would add noise, not
+            // information.
+            let message = found.to_string();
+            if !message.is_empty() {
+                eprintln!("{message}");
+            }
+            std::process::exit(EXIT_FINDING);
         }
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -387,8 +427,8 @@ fn run() -> anyhow::Result<()> {
                 resume,
             )
         }
-        Command::Validate => cmd_validate(&project),
-        Command::Fmt { check } => cmd_fmt(&project, check),
+        Command::Validate { format } => cmd_validate(&project, format),
+        Command::Fmt { check, format } => cmd_fmt(&project, check, format),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
             cmd_intent(
@@ -626,18 +666,49 @@ fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     }
 }
 
-/// Loads the declarations, printing every error in one pass.
-fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
+/// Loads the declarations, returning every error in one pass.
+///
+/// Silent, because `validate` has to decide how to render these — as miette
+/// diagnostics or as JSON findings — and a helper that had already printed them
+/// would leave it choosing between saying nothing and saying it twice.
+fn load_quiet(project: &Project) -> Result<pbps_load::Loaded, Vec<pbps_load::LoadError>> {
     let dir = project.schema_dir();
     if !dir.is_dir() {
-        bail!("no declarations directory at `{}`", dir.display());
+        return Err(vec![pbps_load::LoadError::Io {
+            path: dir.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no declarations directory"),
+        }]);
     }
-    pbps_load::load_schema_dir(&dir).map_err(|errs| {
+    pbps_load::load_schema_dir(&dir)
+}
+
+/// Loads the declarations, printing every error in one pass.
+fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
+    load_quiet(project).map_err(|errs| {
         for e in &errs {
-            eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+            print_load_error(e);
         }
         anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
     })
+}
+
+/// Renders one load error the way a person should see it.
+///
+/// The loader's own diagnostics already carry the source excerpt and the caret,
+/// so they are rendered rather than reduced to their message — the JSON view
+/// takes the reduced form instead, because a caret is not something a consumer
+/// can act on.
+fn print_load_error(e: &pbps_load::LoadError) {
+    eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+}
+
+/// One load error as a typed finding.
+fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
+    let f = output::Finding::error(e.id(), e.to_string());
+    match e.path() {
+        Some(p) => f.at(p, e.line()),
+        None => f,
+    }
 }
 
 /// Reads the identity file, or `None` when the project has none yet.
@@ -685,7 +756,7 @@ fn context() -> Context {
     }
 }
 
-fn cmd_validate(project: &Project) -> anyhow::Result<()> {
+fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
     // Identity consistency is validate's job too (SPEC §5.3): two branches each
     // adding a same-named column merge cleanly at the line level — two uids, two
     // lines — so no git conflict flags it, and only a check can.
@@ -694,25 +765,33 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
     // broken declaration *and* a scrambled identity file together, and the rule
     // everywhere else in this tool is to report every problem in one pass rather
     // than fix-one-run-again.
-    let loaded = load(project);
+    let loaded = load_quiet(project);
     let ids = read_ids_opt(project);
     let dialect = dialect(project)?;
+
+    let mut findings = Vec::new();
+    if let Err(errs) = &loaded {
+        findings.extend(errs.iter().map(load_finding));
+    }
 
     // Three layers, all reported in the same pass: the loader checks shape, the
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the identity file checks below stand alone.
-    let mut dialect_problems = 0usize;
     if let Ok(l) = &loaded {
         for (name, table) in &l.schema.tables {
             for e in dialect.validate_table(name, table) {
-                eprintln!("  {name}: {e}");
-                dialect_problems += 1;
+                findings.push(output::Finding::error(
+                    "dialect.rejected",
+                    format!("{name}: {e}"),
+                ));
             }
         }
         for (name, module) in &l.schema.modules {
             for e in dialect.validate_module(name, module) {
-                eprintln!("  {name}: {e}");
-                dialect_problems += 1;
+                findings.push(output::Finding::error(
+                    "dialect.rejected",
+                    format!("{name}: {e}"),
+                ));
             }
         }
         // Two problems only the whole schema can see: a module named after a
@@ -720,34 +799,74 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
         // surface as an engine error at apply time, on a database that is
         // already half-changed.
         for problem in pbps_model::module::check_names(&l.schema) {
-            eprintln!("  {problem}");
-            dialect_problems += 1;
+            findings.push(output::Finding::error("schema.name-collision", problem));
         }
         // And a third: a `depends_on:` naming a module nobody declared. It is
         // silently a no-op in the ordering, so nothing else would ever say so.
         for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
-            eprintln!("  {problem}");
-            dialect_problems += 1;
-        }
-        if dialect_problems == 0 {
-            println!(
-                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
-                dialect.name(),
-                l.schema.tables.len(),
-                l.schema
-                    .tables
-                    .values()
-                    .map(|t| t.columns.len())
-                    .sum::<usize>(),
-                l.schema.modules.len()
-            );
+            findings.push(output::Finding::error("schema.unknown-dependency", problem));
         }
     }
-    // `load` produces the specific reason (a missing directory, N problem(s));
-    // without this the run ends on the generic bail below and never says what
-    // was wrong.
-    if let Err(e) = &loaded {
-        eprintln!("  {e:#}");
+    if let Err(e) = &ids {
+        findings.push(
+            output::Finding::error("identity.inconsistent", format!("{e:#}"))
+                .at(project.ids_file(), None),
+        );
+    }
+
+    let data = ValidateData {
+        dialect: dialect.name(),
+        tables: loaded.as_ref().map(|l| l.schema.tables.len()).unwrap_or(0),
+        columns: loaded
+            .as_ref()
+            .map(|l| l.schema.tables.values().map(|t| t.columns.len()).sum())
+            .unwrap_or(0),
+        modules: loaded.as_ref().map(|l| l.schema.modules.len()).unwrap_or(0),
+        identity: match &ids {
+            Ok(Some(i)) => Some(IdentityCounts {
+                tables: i.tables.len(),
+                columns: i.columns.len(),
+                tombstones: i.tombstones.len(),
+            }),
+            _ => None,
+        },
+    };
+    let report = output::Report::new("validate", findings, Some(data));
+
+    if format == OutputFormat::Json {
+        return report.emit_json();
+    }
+
+    // The human view keeps the loader's own diagnostics, which quote the source
+    // and point a caret at the value. Reducing them to the finding's one-line
+    // message here would throw away the part that makes them worth having.
+    if let Err(errs) = &loaded {
+        for e in errs {
+            print_load_error(e);
+        }
+    }
+    let unlocated: Vec<output::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.id != "load.io" && f.id != "load.yaml" && f.id != "load.semantic")
+        .cloned()
+        .collect();
+    eprint!("{}", output::human(&unlocated));
+
+    if let Ok(l) = &loaded
+        && unlocated.is_empty()
+    {
+        println!(
+            "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
+            dialect.name(),
+            l.schema.tables.len(),
+            l.schema
+                .tables
+                .values()
+                .map(|t| t.columns.len())
+                .sum::<usize>(),
+            l.schema.modules.len()
+        );
     }
     match &ids {
         Ok(Some(i)) => println!(
@@ -760,15 +879,32 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
             "No identity file yet at `{}`; run `pbps plan` to create it.",
             project.ids_file().display()
         ),
-        Err(e) => eprintln!("  {e:#}"),
+        Err(_) => {}
     }
 
-    match (loaded.is_err() || dialect_problems > 0, ids.is_err()) {
-        (false, false) => Ok(()),
-        (true, false) => bail!("the declarations did not validate"),
-        (false, true) => bail!("the identity file did not validate"),
-        (true, true) => bail!("neither the declarations nor the identity file validated"),
-    }
+    report.outcome()
+}
+
+/// What `validate` counted, for `--format json`.
+///
+/// Present even when the run failed: a consumer showing "3 of 40 tables are
+/// broken" needs the 40, and a payload that vanished on failure would make the
+/// only interesting case the one with no context.
+#[derive(serde::Serialize)]
+struct ValidateData {
+    dialect: &'static str,
+    tables: usize,
+    columns: usize,
+    modules: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<IdentityCounts>,
+}
+
+#[derive(serde::Serialize)]
+struct IdentityCounts {
+    tables: usize,
+    columns: usize,
+    tombstones: usize,
 }
 
 /// Canonicalizes every declaration file.
@@ -776,7 +912,7 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
 /// This rewrites each file in full, so ordinary YAML comments are lost —
 /// explanatory prose belongs in a `description` field (SPEC §4.2, "the tool owns
 /// the file format").
-fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
+fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Result<()> {
     let dir = project.schema_dir();
     let files = pbps_load::schema_files(&dir)
         .with_context(|| format!("cannot list `{}`", dir.display()))?;
@@ -791,11 +927,18 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     // user reaches for fmt; treating it as "nothing absorbed" keeps every
     // annotation, which is the safe direction. `validate` and `plan` still refuse
     // to run on it, so the corruption is not swallowed.
+    let mut findings: Vec<output::Finding> = Vec::new();
     let ids = match read_ids(project) {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("warning: {e:#}");
-            eprintln!("warning: every `renamed_from` will be kept; run `pbps validate` to fix it");
+            findings.push(
+                output::Finding::warning(
+                    "identity.unreadable",
+                    format!("{e:#}; every `renamed_from` will be kept until it is fixed"),
+                )
+                .at(project.ids_file(), None)
+                .remedy("pbps validate"),
+            );
             IdsFile::default()
         }
     };
@@ -805,8 +948,17 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
         let original = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read `{}`", path.display()))?;
         let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
-            for e in &errs {
-                eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+            // A file that does not parse cannot be canonicalized, and guessing
+            // at what it meant would be the tool rewriting something it did not
+            // understand. This is a tool failure rather than a finding: `fmt`
+            // did not get to answer its own question.
+            if format == OutputFormat::Human {
+                for e in &errs {
+                    print_load_error(e);
+                }
+            } else {
+                let report = output::Report::plain("fmt", errs.iter().map(load_finding).collect());
+                let _ = report.emit_json();
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
@@ -840,32 +992,76 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
         }
     }
 
-    if changed.is_empty() {
-        println!("All {} file(s) are already in canonical form.", files.len());
-        return Ok(());
+    // In check mode an unformatted file is the finding; in write mode it has
+    // just been fixed, so it is a note. The same list either way — a consumer
+    // asking "what did fmt touch" gets one answer whichever mode ran.
+    for (p, _) in &changed {
+        findings.push(if check {
+            output::Finding::error("fmt.not-canonical", "not in canonical form")
+                .at(p, None)
+                .remedy("pbps fmt")
+        } else {
+            output::Finding::note("fmt.rewritten", "rewritten in canonical form").at(p, None)
+        });
+    }
+    // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
+    // cannot tell "this rename happened" from "this rename never applied": a
+    // `renamed_from` naming a column that never existed also looks absorbed,
+    // because the ids file records no history to distinguish them. Naming what
+    // went is the only thing that lets the user catch the typo.
+    if !check {
+        for (p, absorbed) in &changed {
+            for i in absorbed {
+                findings.push(
+                    output::Finding::note(
+                        "fmt.annotation-dropped",
+                        format!("dropped a redundant annotation: {}", report::intent(i)),
+                    )
+                    .at(p, None),
+                );
+            }
+        }
     }
 
+    let report = output::Report::new(
+        "fmt",
+        findings,
+        Some(FmtData {
+            checked: files.len(),
+            changed: changed.len(),
+            mode: if check { "check" } else { "write" },
+        }),
+    );
+    if format == OutputFormat::Json {
+        return report.emit_json();
+    }
+
+    eprint!("{}", output::human(&report.findings));
+    if changed.is_empty() {
+        println!("All {} file(s) are already in canonical form.", files.len());
+        return report.outcome();
+    }
     if check {
-        for (p, _) in &changed {
-            eprintln!("  needs rewriting: {}", p.display());
-        }
-        bail!(
+        return Err(Found::new(format!(
             "{} file(s) are not in canonical form; run `pbps fmt`",
             changed.len()
-        );
+        ))
+        .into());
     }
-    for (p, absorbed) in &changed {
+    for (p, _absorbed) in &changed {
         println!("rewrote {}", p.display());
-        // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
-        // cannot tell "this rename happened" from "this rename never applied": a
-        // `renamed_from` naming a column that never existed also looks absorbed,
-        // because the ids file records no history to distinguish them. Naming what
-        // went is the only thing that lets the user catch the typo.
-        for i in absorbed {
-            println!("  dropped a redundant annotation: {}", report::intent(i));
-        }
     }
-    Ok(())
+    report.outcome()
+}
+
+/// What `fmt` looked at, for `--format json`.
+#[derive(serde::Serialize)]
+struct FmtData {
+    checked: usize,
+    changed: usize,
+    /// `check` or `write`. The findings mean different things in each, and a
+    /// consumer must not have to infer which ran from their severity.
+    mode: &'static str,
 }
 
 /// Records one intent: re-resolves identity with it, then writes the identity
@@ -890,7 +1086,7 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
         }
         Err(blockers) => {
             eprintln!("{}", report::blockers(&blockers));
-            bail!("identity could not be resolved")
+            Err(Found::new("identity could not be resolved").into())
         }
     }
 }
@@ -911,18 +1107,23 @@ fn cmd_plan(
         Ok(r) => r,
         Err(blockers) => {
             eprintln!("{}", report::blockers(&blockers));
-            bail!(
-                "some changes could not be decided automatically; express the intent with the commands above and retry"
-            );
+            // A finding, not a tool failure: pbps did its job and is asking a
+            // question only a human can answer (SPEC §6.1). CI must be able to
+            // tell that apart from "the tool broke".
+            return Err(Found::new(
+                "some changes could not be decided automatically; express the intent with the commands above and retry",
+            )
+            .into());
         }
     };
 
     if res.ids != ids {
         if check {
-            bail!(
+            return Err(Found::new(format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_file().display()
-            );
+            ))
+            .into());
         }
         write_ids(project, &res.ids)?;
         println!("updated {}", project.ids_file().display());
@@ -1058,10 +1259,10 @@ fn cmd_plan(
         )?;
         print!("{}", report::rehearsal(&rehearsal));
         if !rehearsal.converged() {
-            bail!(
-                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n\
-                 differences above are what would be left behind"
-            );
+            return Err(Found::new(
+                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                 differences above are what would be left behind",
+            )
+            .into());
         }
     }
     Ok(())

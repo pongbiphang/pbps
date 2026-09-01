@@ -12,7 +12,7 @@
 //! `status` is a report, not a gate. An environment that has drifted is
 //! information here and a failure in `pbps verify`, which is the command CI
 //! runs and the one with an exit code that means something (see
-//! [`crate::DriftFound`]). Two commands failing on the same condition would
+//! [`crate::Found`]). Two commands failing on the same condition would
 //! make the pipeline's intent ambiguous — and a `status` that failed because
 //! one of six environments was unreachable would be useless for exactly the
 //! situation it is best at.
@@ -111,7 +111,42 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        // Every finding here is a warning, and deliberately so. `status` is a
+        // report, not a gate (see the module header): it always exits 0, so a
+        // finding at error severity would make `result` say the command failed
+        // while the exit code said it succeeded. The per-environment truth is
+        // in `state`, which is the field a consumer should key off.
+        let findings = rows
+            .iter()
+            .filter(|r| r.state != "ok")
+            .map(|r| {
+                let mut f = crate::output::Finding::warning(
+                    match r.state {
+                        "drift" => "state.drift",
+                        "staged" => "state.mid-deployment",
+                        "uninitialized" => "state.uninitialized",
+                        "unreachable" => "environment.unreachable",
+                        _ => "environment.unconfigured",
+                    },
+                    match &r.detail {
+                        Some(d) => format!("{}: {} — {d}", r.environment, r.state),
+                        None => format!("{}: {}", r.environment, r.state),
+                    },
+                );
+                if r.state == "staged" {
+                    f = f.remedy("pbps apply --plan <plan.json> --staged --resume");
+                }
+                f
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::output::Report::new(
+                "status",
+                findings,
+                Some(&rows)
+            ))?
+        );
     } else {
         print!("{}", render(&rows));
     }

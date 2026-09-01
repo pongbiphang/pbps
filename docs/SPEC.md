@@ -831,6 +831,61 @@ premise), a resident daemon (pbps is a CLI; a daemon changes the security and
 operations profile entirely), and built-in chat integrations (an exec hook
 outlives any API).
 
+### 9.5 Machine-readable output and exit codes
+
+Every read-only command takes `--format human|json` and, in JSON, emits one
+envelope:
+
+```json
+{
+  "schema_version": 1,
+  "tool_version": "0.1.0",
+  "command": "validate",
+  "result": "findings",
+  "findings": [
+    {
+      "id": "load.semantic",
+      "severity": "error",
+      "message": "invalid index column: `sideways` is not asc or desc",
+      "location": { "file": "schema/dbo.t.yml", "line": 6 },
+      "remedy": "pbps fmt"
+    }
+  ],
+  "data": { "dialect": "mssql", "tables": 12, "columns": 94, "modules": 3 }
+}
+```
+
+**One shape, not one per command.** A consumer — a CI annotator, the optional UI
+of [ADR-0006](ADR-0006-optional-ui.md), a team's own dashboard — renders what
+every command found without growing a parser per command. What a command
+uniquely produces rides in `data` (`verify`'s drift report, `status`'s
+environment rows) rather than replacing the envelope.
+
+`id` is stable and is the identifier a later `policies:` block raises or lowers
+the severity of (14.1), so it must survive a reworded message. `schema_version`
+is the version of the envelope alone; it moves when a consumer would have to
+change, which the tool version does not.
+
+Three exit codes, and the split is the point:
+
+| Code | Meaning | Who it wakes |
+|---|---|---|
+| 0 | The command answered and found nothing | nobody |
+| 2 | The command answered and found something to act on — invalid declarations, an unformatted file, a stale ids file, unresolved identity, drift, a plan that does not converge | whoever owns the change or the schema |
+| 1 | The command could not answer — an unreachable database, an unreadable file, contradictory flags | whoever runs CI |
+
+A pipeline that cannot tell 1 from 2 sends half of every alert to the wrong
+person. `status` is the deliberate exception and always exits 0: it is a report
+rather than a gate (9.4), so its JSON carries findings at warning severity and
+the per-environment truth stays in `state`.
+
+**The vendor formats are converted outside the binary.** GitHub's
+`::error file=,line=::` and GitLab's code-quality JSON change on someone else's
+schedule, and each one compiled in has to be kept working by this project
+forever, including for users who run neither. `scripts/findings-to-github.py`
+reads the envelope from stdin and preserves the exit code; a team whose CI is
+the third system copies and edits it (14.3).
+
 ---
 
 ## 10. The CI/CD flow
@@ -1296,7 +1351,9 @@ pbps explain --plan plan.json
 
 Implementation status: the `init` link of this journey is built, including
 `--from`, staged round-trip validation, an every-file preview and installing
-`pbps.yml` last. The remaining Phase 3.1 links are in progress.
+`pbps.yml` last. The typed findings envelope and the three exit codes of 9.5 are
+built and cover `validate`, `fmt`, `plan`, `verify` and `status`. The remaining
+Phase 3.1 links are in progress.
 
 Acceptance criteria for that slice:
 

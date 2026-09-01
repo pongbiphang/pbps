@@ -283,12 +283,45 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         })
     })?;
 
-    // The hook always receives JSON, whatever the human asked for on stdout:
-    // a script's payload should not change shape because someone added a flag
-    // for their own eyes.
+    // The hook always receives the bare report, whatever the human asked for on
+    // stdout: a script's payload should not change shape because someone added
+    // a flag for their own eyes, and it must not gain an envelope because
+    // stdout did.
     let payload = format!("{}\n", serde_json::to_string_pretty(&report)?);
+
+    let mut findings = Vec::new();
+    if report.has_drift() {
+        findings.push(
+            crate::output::Finding::error(
+                "state.drift",
+                format!(
+                    "`{}` no longer matches its recorded state ({} difference(s))",
+                    target.label,
+                    report.changes.changes.len()
+                ),
+            )
+            .remedy("pbps pull | pbps plan --db … && pbps apply | pbps baseline --reason \"…\""),
+        );
+    }
+    for table in &report.unmanaged {
+        findings.push(crate::output::Finding::note(
+            "state.unmanaged",
+            format!("{table} is in the database and outside the managed set; it was not compared"),
+        ));
+    }
+
     if json {
-        print!("{payload}");
+        // The envelope, not the bare report: a consumer reading `verify` beside
+        // `validate` should not need a second parser for one of them (SPEC
+        // §14.1). The report itself is unchanged, one level down in `data`.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::output::Report::new(
+                "verify",
+                findings,
+                Some(&report)
+            ))?
+        );
     } else {
         print!("{}", crate::report::drift(&report));
     }
@@ -301,7 +334,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     }
     // A distinct exit code so a scheduled pipeline can tell "the database moved"
     // from "the tool could not run" — the two need different people woken up.
-    Err(crate::DriftFound.into())
+    Err(crate::Found::reported().into())
 }
 
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
