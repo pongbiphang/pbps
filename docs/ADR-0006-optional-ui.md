@@ -77,12 +77,32 @@ Concretely, three things it may do and one it may not:
   storage would be exactly the second gate §14.3 refuses, and — worse here —
   the one an auditor cannot reach from git.
 
-**Local-first, single-user.** It ships as `pbps ui`, serving on loopback, taking
-credentials from the same environment variables the CLI uses (§8.1, and the
-`url_env:` rule that no connection string is ever written down). A shared,
-multi-user deployment would need standing credentials to every environment,
-which is precisely the concentration the trust model avoids; that is a separate
-product decision and is not implied by this one.
+**Local-first, single-user — and that is the open-source scope.** It ships as
+`pbps ui`, serving on loopback, taking credentials from the same environment
+variables the CLI uses (§8.1, and the `url_env:` rule that no connection string
+is ever written down).
+
+The line is drawn here deliberately, and it is a product decision as well as a
+technical one: **the single-user local UI belongs to the open-source core; a
+multi-tenant or hosted deployment is explicitly out of that scope and reserved
+as a possible commercial offering.** Two things follow, and both matter more
+than the licensing question.
+
+The first is that the open-source promise stays complete without the commercial
+one. Everything this ADR admits — rendering the typed JSON, composing intent as
+a commit, triggering the checksum-pinned plan — works for one person on one
+machine, with no server, no account and no network beyond the database. A user
+who never buys anything is not left holding a demo.
+
+The second is that the constraint above does not become negotiable at the
+boundary. A multi-tenant deployment needs standing credentials to every
+environment, which is the concentration §8.1's trust model exists to avoid, and
+commercial pressure pushes hardest in exactly the direction this ADR refuses —
+towards the UI holding the approval, because that is what an approval queue is
+for. **Whatever is built there gets its own ADR and re-argues that point from
+scratch; it does not inherit permission from this one.** Recording it now is
+cheap; discovering it after the fact, when a customer has already been sold the
+queue, is not.
 
 ## Why "git built in" is the right shape
 
@@ -121,6 +141,9 @@ this ADR declines to be:
 - **Direct SQL execution against a target** (the "SQL editor" every competitor
   has). Refused: it is the shortest path around the declarations, and everything
   it changes becomes drift the next plan tries to remove.
-- **Hosting it.** Not refused, but not decided here; it needs its own ADR,
-  because standing credentials to N environments is a different trust model,
-  not a deployment detail.
+- **Hosting it, or serving more than one person.** Not refused, and now
+  positioned — it is where a commercial offering would sit rather than part of
+  the open-source core — but not designed here. Standing credentials to N
+  environments is a different trust model, not a deployment detail, and the
+  refusal above (the UI never holds the approval) has to be re-argued on its own
+  terms in that ADR rather than carried over as settled.

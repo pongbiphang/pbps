@@ -378,4 +378,8 @@ SaaS refuses *a control plane that holds the approval*, not a screen: the UI
 renders the typed JSON of Phase 3.1, composes intent as a git commit, triggers
 the same checksum-pinned plan, and stores nothing authoritative. It is late
 because a UI built before that JSON exists would have to parse human output or
-reimplement validation.
+reimplement validation. **Scope is single-user and local, and that is the
+open-source boundary** — multi-tenant or hosted is reserved as a possible
+commercial offering and gets its own ADR. It does not inherit permission from
+ADR-0006: commercial pressure pushes hardest towards the UI holding the
+approval, which is the one thing ADR-0006 refuses.

@@ -1042,7 +1042,7 @@ not by a version number.
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
 | **Phase 5** | The PostgreSQL dialect; then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
-| **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
+| **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a single-user viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own. Multi-tenant and hosted deployment are out of the open-source scope by decision, and get their own ADR | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
 
 When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
 at the same time**, even though it is not implemented. If Phase 5 forces a large
