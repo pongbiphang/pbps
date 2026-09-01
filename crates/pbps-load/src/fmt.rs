@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::{Intent, PrimaryKey, Strategy, Table, TableName};
+use pbps_model::{Intent, Module, ObjectName, PrimaryKey, Strategy, Table, TableName};
 
 /// Renders one table as canonical YAML.
 ///
@@ -168,6 +168,54 @@ pub fn render(
     s
 }
 
+/// Renders one module as canonical YAML (ADR-0002).
+///
+/// The definition goes out as a literal block scalar (`|`), which is the only
+/// YAML form that keeps SQL exactly as written: no escaping, no line joining,
+/// and the round trip is byte-for-byte. A definition with trailing whitespace
+/// or no final newline would come back subtly different, so the block is
+/// written with `|-` and the text normalized to it — which is `fmt`'s job
+/// anyway, and never changes what the SQL means.
+///
+/// `depends_on` is persistent, like `strategy:`: it is an answer about this
+/// project that stays true, so rewriting the file must not lose it.
+pub fn render_module(
+    name: &ObjectName,
+    module: &Module,
+    depends_on: &std::collections::BTreeSet<ObjectName>,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{}: {}", module.kind.as_str(), scalar(&name.to_string()));
+
+    if let Some(d) = &module.description {
+        let _ = writeln!(s, "description: {}", scalar(d));
+    }
+    if let Some(on) = &module.on {
+        let _ = writeln!(s, "on: {}", scalar(&on.to_string()));
+    }
+    if !depends_on.is_empty() {
+        let names: Vec<String> = depends_on.iter().map(ToString::to_string).collect();
+        let _ = writeln!(s, "depends_on: {}", seq(&names));
+    }
+
+    s.push_str("\ndefinition: |-\n");
+    for line in module.definition.trim_end().lines() {
+        if line.is_empty() {
+            // A truly empty line needs no indent, and writing one would put
+            // trailing whitespace in the file for nothing.
+            s.push('\n');
+        } else {
+            // Everything else goes out verbatim, trailing spaces included. They
+            // look like something to tidy up and are not: a line inside a
+            // multiline T-SQL literal ends where its author put it, and
+            // trimming here would have `pbps fmt` quietly change what the module
+            // returns — the one thing a formatter must never do.
+            let _ = writeln!(s, "  {line}");
+        }
+    }
+    s
+}
+
 fn action(a: pbps_model::ReferentialAction) -> &'static str {
     use pbps_model::ReferentialAction as R;
     match a {
@@ -234,6 +282,27 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// A formatter that changes what the code does is worse than no formatter.
+    /// Trailing spaces on a line inside a multiline T-SQL literal are part of
+    /// the string, so `fmt` has to leave them where their author put them —
+    /// they look exactly like whitespace to tidy up, which is the trap.
+    #[test]
+    fn trailing_spaces_inside_a_literal_survive_formatting() {
+        let module = pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            on: None,
+            definition: "SELECT 'first  \nsecond' AS note".into(),
+        };
+        let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
+        let out = render_module(&name, &module, &Default::default());
+        assert!(out.contains("SELECT 'first  "), "{out}");
+
+        let back = crate::load_module_str(Path::new("dbo.v.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}"));
+        assert_eq!(back.module.definition, module.definition);
+    }
+
     fn round_trip(yaml: &str) {
         let a = crate::load_table_str(Path::new("t.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
@@ -248,6 +317,57 @@ mod tests {
         // Idempotence: formatting an already-formatted file must change nothing.
         let out2 = render(&b.name, &b.table, &b.intents, b.strategy.as_ref());
         assert_eq!(out, out2, "fmt is not idempotent");
+    }
+
+    fn module_round_trip(yaml: &str) -> String {
+        let a = crate::load_module_str(Path::new("m.yml"), yaml)
+            .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
+        let out = render_module(&a.name, &a.module, &a.depends_on);
+        let b = crate::load_module_str(Path::new("m.yml"), &out).unwrap_or_else(|e| {
+            panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
+        });
+        assert_eq!(a.name, b.name, "output:\n{out}");
+        assert_eq!(a.module, b.module, "output:\n{out}");
+        assert_eq!(a.depends_on, b.depends_on, "output:\n{out}");
+        assert_eq!(
+            render_module(&b.name, &b.module, &b.depends_on),
+            out,
+            "fmt is not idempotent"
+        );
+        out
+    }
+
+    /// The definition is SQL, and SQL is exactly the kind of text YAML quoting
+    /// mangles: a `#`, a `:` or a leading `-` in the wrong place would come
+    /// back as something else. A literal block keeps it verbatim.
+    #[test]
+    fn a_view_round_trips_with_its_sql_intact() {
+        let out = module_round_trip(
+            "view: dbo.active_customer\ndescription: Customers that are not legacy records\ndefinition: |-\n  SELECT customer_id, full_name  -- the columns callers use\n  FROM dbo.customer\n  WHERE legacy_code IS NULL\n",
+        );
+        assert!(out.contains("definition: |-"), "{out}");
+        assert!(out.contains("  WHERE legacy_code IS NULL"), "{out}");
+    }
+
+    /// `depends_on` is persistent, like `strategy:` — an answer about the
+    /// project that stays true, so rewriting the file must not lose it.
+    #[test]
+    fn a_modules_persistent_annotations_survive_formatting() {
+        let out = module_round_trip(
+            "view: dbo.top\ndepends_on: [dbo.middle, dbo.base]\ndefinition: |-\n  SELECT 1\n",
+        );
+        assert!(out.contains("depends_on: [dbo.base, dbo.middle]"), "{out}");
+    }
+
+    #[test]
+    fn a_trigger_keeps_the_table_it_is_on() {
+        let out = module_round_trip(
+            "trigger: dbo.trg_customer_audit\non: dbo.customer\ndefinition: |-\n  AFTER INSERT\n  AS INSERT INTO dbo.audit (n) SELECT COUNT(*) FROM inserted;\n",
+        );
+        assert!(
+            out.starts_with("trigger: dbo.trg_customer_audit\non: dbo.customer\n"),
+            "{out}"
+        );
     }
 
     #[test]

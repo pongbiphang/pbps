@@ -31,7 +31,13 @@ use crate::ids::IdsFile;
 use crate::schema::Schema;
 
 /// The current plan-file format version.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// Bumped to 2 when `mode` and `strategy` arrived. Both change what *executing*
+/// the plan does, and serde would let an older `apply` read the file, ignore the
+/// unknown fields, and run a staged plan inside a transaction with the reviewed
+/// online strategy silently dropped. `apply` compares this exactly, so an older
+/// deployment host refuses the artifact instead.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -47,6 +53,43 @@ pub enum PlanOrigin {
 impl PlanOrigin {
     pub const fn is_applyable(self) -> bool {
         matches!(self, PlanOrigin::Database)
+    }
+}
+
+/// How a plan is to be executed (ADR-0003 decision 2).
+///
+/// The default is the rule of SPEC §7.5 and is not weakened by this enum
+/// existing: a [`PlanMode::Transactional`] plan is still all or nothing. What
+/// [`PlanMode::Staged`] adds is a way through for the operation a transaction
+/// cannot hold at all — isolated in a deployment of its own, applied statement
+/// by statement with each completion recorded, and resumable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanMode {
+    /// One plan, one transaction, all or nothing.
+    #[default]
+    Transactional,
+    /// One logical change, applied outside a transaction with a per-statement
+    /// checkpoint in the ledger.
+    Staged,
+}
+
+impl PlanMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PlanMode::Transactional => "transactional",
+            PlanMode::Staged => "staged",
+        }
+    }
+
+    pub const fn is_staged(self) -> bool {
+        matches!(self, PlanMode::Staged)
+    }
+}
+
+impl std::fmt::Display for PlanMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -68,6 +111,19 @@ pub struct SavedPlan {
     pub version: u32,
 
     pub origin: PlanOrigin,
+
+    /// How this plan is to be executed.
+    ///
+    /// It is a value in the file, not a flag at apply time, for the same reason
+    /// [`PlanOrigin`] is: what the deployment gate approved has to be what
+    /// runs. `apply` refuses a mismatch between the file and the flag rather
+    /// than silently doing whichever the operator typed.
+    ///
+    /// Defaulted on read so that the field can be omitted from a transactional
+    /// plan; a file old enough to predate it is refused by the version check
+    /// instead, since an old *reader* is the dangerous direction.
+    #[serde(default)]
+    pub mode: PlanMode,
 
     /// The dialect the SQL was emitted for. A plan computed for one engine and
     /// applied to another is nonsense that the file should be able to catch.
@@ -111,6 +167,7 @@ impl SavedPlan {
         Self {
             version: CURRENT_VERSION,
             origin,
+            mode: PlanMode::Transactional,
             dialect: dialect.into(),
             created_at: created_at.into(),
             git_sha: None,
@@ -123,6 +180,11 @@ impl SavedPlan {
     /// This plan's own fingerprint. See [`plan_checksum`].
     pub fn checksum(&self) -> String {
         plan_checksum(self)
+    }
+
+    pub fn staged(mut self) -> Self {
+        self.mode = PlanMode::Staged;
+        self
     }
 }
 
@@ -305,7 +367,31 @@ mod tests {
     #[test]
     fn the_format_version_is_written() {
         let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":1"#), "{json}");
+        assert!(json.contains(r#""version":2"#), "{json}");
         assert!(json.contains(r#""origin":"database""#), "{json}");
+    }
+
+    /// The mode is part of the pinned artifact: a plan approved as staged must
+    /// not be applyable as a transactional one, and the checksum is what makes
+    /// "approved" mean anything.
+    #[test]
+    fn the_execution_mode_is_pinned_by_the_checksum() {
+        let plain = plan_over(ChangeSet::default());
+        let staged = plan_over(ChangeSet::default()).staged();
+        assert_eq!(plain.mode, PlanMode::Transactional);
+        assert!(staged.mode.is_staged());
+        assert_ne!(plain.checksum(), staged.checksum());
+    }
+
+    /// Plans written before staged apply existed carry no `mode` at all, and
+    /// they are transactional plans — the field must default, not fail.
+    #[test]
+    fn a_plan_without_a_mode_reads_as_transactional() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&plan_over(ChangeSet::default())).unwrap())
+                .unwrap();
+        json.as_object_mut().unwrap().remove("mode");
+        let back: SavedPlan = serde_json::from_value(json).unwrap();
+        assert_eq!(back.mode, PlanMode::Transactional);
     }
 }

@@ -23,6 +23,37 @@ use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot};
 
 use crate::db::{self, Target};
 
+/// A scoped live state, plus the declared modules the read could not express.
+///
+/// The second list cannot live in [`pbps_diff::Scoped`] — "pbps cannot read
+/// this back" is a dialect fact, and the differ knows no dialect — but a caller
+/// that has to decide whether an object is *there* needs both: a module the
+/// catalog holds and introspection cannot reproduce is inside the managed set
+/// by name and outside the scoped schema in fact.
+pub struct Managed {
+    pub scoped: pbps_diff::Scoped,
+    /// Every module in the database that introspection cannot express, by name,
+    /// with the reason already rendered.
+    ///
+    /// Returned in full rather than filtered to the managed set, because the
+    /// caller that most needs it is asking about a name that has *never* been
+    /// recorded: a newly declared module that collides with an encrypted one
+    /// already standing there.
+    pub unreadable: Vec<(pbps_model::ObjectName, String)>,
+}
+
+/// The scoped state alone, which is all any caller but `bootstrap` needs.
+async fn managed_state(
+    conn: &mut Conn,
+    ids: &IdsFile,
+    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    unmanaged: pbps_config::Unmanaged,
+) -> anyhow::Result<pbps_diff::Scoped> {
+    Ok(managed_state_full(conn, ids, modules, unmanaged)
+        .await?
+        .scoped)
+}
+
 /// Introspects, cuts the result down to the managed set, and reports whatever
 /// the read itself could not express.
 ///
@@ -30,21 +61,95 @@ use crate::db::{self, Target};
 /// returned because ignoring them is never right: a drift check that silently
 /// skipped a computed column would report "no drift" about a database it only
 /// half read.
-async fn managed_state(
+async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
+    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
     unmanaged: pbps_config::Unmanaged,
-) -> anyhow::Result<pbps_diff::Scoped> {
+) -> anyhow::Result<Managed> {
     let pulled = pbps_mssql::catalog::introspect(conn)
         .await
         .context("cannot read the database catalog")?;
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
     }
+    // A module pbps cannot read is not a module it can leave to chance: it is
+    // inside the managed set by name and outside it in fact, so the next plan
+    // would propose creating one that is already there.
+    let mut unreadable = Vec::new();
+    for m in &pulled.unmanaged_modules {
+        let Ok(name) = m.name.parse::<pbps_model::ObjectName>() else {
+            continue;
+        };
+        if modules.contains(&name) {
+            eprintln!(
+                "warning: {} {} is declared, but {}; it is left alone",
+                m.kind, m.name, m.why
+            );
+        }
+        unreadable.push((name, format!("{} {} ({})", m.kind, m.name, m.why)));
+    }
 
-    let scoped = pbps_diff::scope(&pulled.schema, ids);
+    let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     report_unmanaged(&scoped, unmanaged)?;
-    Ok(scoped)
+    Ok(Managed { scoped, unreadable })
+}
+
+/// The modules the declarations name, for the commands that record a state.
+///
+/// `snapshot` and `baseline` write down what the environment is; a module the
+/// declarations manage has to be in that record, or the next `verify` would not
+/// be watching it. The ids file is already required by both, so requiring the
+/// declarations to parse as well changes nothing about when they can run.
+fn declared_modules(
+    project: &Project,
+) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ObjectName>> {
+    Ok(managed_modules(None, Some(&crate::load(project)?.schema)))
+}
+
+/// The modules a plan leaves the environment holding.
+///
+/// Built from the recorded state plus the plan's own changes rather than from
+/// the declarations, so that `apply` still needs nothing but the plan file — the
+/// same reason the plan carries its ids (SPEC §7.3, and constraint 23).
+fn modules_after(
+    recorded: &pbps_model::StateSnapshot,
+    changes: &pbps_model::ChangeSet,
+) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+    let mut set: std::collections::BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
+    for p in &changes.changes {
+        // Every module change names its module and nothing else does, so the
+        // accessor is the whole classification; only the direction is left.
+        let Some(name) = p.change.module_name() else {
+            continue;
+        };
+        if matches!(p.change, pbps_model::Change::DropModule { .. }) {
+            set.remove(name);
+        } else {
+            set.insert(name.clone());
+        }
+    }
+    set
+}
+
+/// The modules a command is answerable for.
+///
+/// Two callers, two questions (see [`pbps_diff::scope`]): `verify` asks whether
+/// this environment has moved since it was recorded, so the recorded state's
+/// modules are the set; everything that plans or records asks what the state
+/// should be, so the declarations count too.
+fn managed_modules(
+    recorded: Option<&pbps_model::StateSnapshot>,
+    declared: Option<&pbps_model::Schema>,
+) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Some(s) = recorded {
+        set.extend(s.schema.modules.keys().cloned());
+    }
+    if let Some(s) = declared {
+        set.extend(s.modules.keys().cloned());
+    }
+    set
 }
 
 /// Applies the `unmanaged:` policy of SPEC §8.2 to what fell outside the scope.
@@ -52,19 +157,24 @@ fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    if scoped.unmanaged.is_empty() {
+    if scoped.unmanaged.is_empty() && scoped.unmanaged_modules.is_empty() {
         return Ok(());
     }
-    let names: Vec<String> = scoped.unmanaged.iter().map(ToString::to_string).collect();
+    let names: Vec<String> = scoped
+        .unmanaged
+        .iter()
+        .chain(&scoped.unmanaged_modules)
+        .map(ToString::to_string)
+        .collect();
     match policy {
         pbps_config::Unmanaged::Ignore => {}
         pbps_config::Unmanaged::Warn => eprintln!(
-            "warning: {} table(s) in this database are not declared and are left alone: {}",
+            "warning: {} object(s) in this database are not declared and are left alone: {}",
             names.len(),
             names.join(", ")
         ),
         pbps_config::Unmanaged::Error => bail!(
-            "`unmanaged: error` in pbps.yml, and {} table(s) here are not declared: {}.\n\
+            "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
              Declare them (`pbps pull` reverse-generates them) or relax the setting.",
             names.len(),
             names.join(", ")
@@ -114,7 +224,14 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         };
 
         let recorded_ids = baseline.snapshot.ids.clone();
-        let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
+        let recorded_modules = managed_modules(Some(&baseline.snapshot), None);
+        let scoped = managed_state(
+            &mut conn,
+            &recorded_ids,
+            &recorded_modules,
+            project.config.unmanaged,
+        )
+        .await?;
 
         // The live side is identified by what is actually there, not by the
         // recorded mapping. Comparing two sides that share one identity file
@@ -133,6 +250,10 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 ids: &observed,
             },
             dialect.as_ref(),
+            // Drift emits no SQL, so there is no execution to give a hint
+            // about; passing the declarations' strategies here would put a
+            // hint nobody can act on into a report about what already happened.
+            &pbps_model::Hints::default(),
         )
         .map_err(|errs| {
             for e in &errs {
@@ -187,13 +308,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
+    let declared_modules = declared_modules(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let scoped =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
         // Comparing against the recorded state is the whole guard. A snapshot
@@ -244,13 +367,15 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
+    let declared_modules = declared_modules(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let scoped =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
         let mut snapshot = with_provenance(StateSnapshot::new(
@@ -286,6 +411,7 @@ pub fn cmd_bootstrap(
     let loaded = crate::load(project)?;
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     if ids.tables.is_empty() && !loaded.schema.tables.is_empty() {
         bail!(
@@ -305,6 +431,16 @@ pub fn cmd_bootstrap(
             ids: &ids,
         },
         dialect.as_ref(),
+        // Bootstrap builds into an empty database, so there are no rows for an
+        // online operation to spare and the strategies are dropped. The module
+        // dependencies are not: `depends_on:` exists for the edges the
+        // identifier scan cannot see, and discarding them here would make
+        // bootstrap emit a dependent module first and fail on declarations that
+        // plan perfectly well.
+        &pbps_model::Hints {
+            strategies: Default::default(),
+            module_deps: loaded.hints.module_deps.clone(),
+        },
     )
     .map_err(|errs| {
         for e in &errs {
@@ -340,13 +476,51 @@ pub fn cmd_bootstrap(
         // managed set would fail halfway through on the first CREATE of a table
         // that is already there, leaving a partly built schema and a ledger that
         // never mentioned it.
-        let existing = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
-        if !existing.schema.tables.is_empty() {
+        let existing =
+            managed_state_full(&mut conn, &ids, &declared_modules, project.config.unmanaged)
+                .await?;
+        // Modules count as much as tables here. `CREATE OR ALTER` would not fail
+        // on a view that is already there — it would quietly replace it, with no
+        // plan, no risk classification and no approval, which is the opposite of
+        // what "builds into an empty database" promises.
+        // The unreadable ones count too. A declared view that is already there
+        // with SCHEMABINDING, or a procedure created WITH ENCRYPTION, never
+        // reaches the scoped schema — introspection cannot express it — so
+        // without this the target reads as empty and `CREATE OR ALTER` replaces
+        // the object that is standing there.
+        let unreadable_declared: Vec<&str> = existing
+            .unreadable
+            .iter()
+            .filter(|(n, _)| declared_modules.contains(n))
+            .map(|(_, why)| why.as_str())
+            .collect();
+        if !existing.scoped.schema.tables.is_empty()
+            || !existing.scoped.schema.modules.is_empty()
+            || !unreadable_declared.is_empty()
+        {
+            let names: Vec<String> = existing
+                .scoped
+                .schema
+                .tables
+                .keys()
+                .map(ToString::to_string)
+                .chain(
+                    existing
+                        .scoped
+                        .schema
+                        .modules
+                        .keys()
+                        .map(ToString::to_string),
+                )
+                .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
+                .collect();
             bail!(
-                "`{}` already has {} of the declared table(s); bootstrap builds into an empty \
-                 database.\nUse `pbps plan --db` and `pbps apply` to migrate it instead.",
+                "`{}` already has {} of the declared object(s): {}.\n\
+                 Bootstrap builds into an empty database; use `pbps plan --db` and `pbps apply` \
+                 to migrate it instead.",
                 target.label,
-                existing.schema.tables.len()
+                names.len(),
+                names.join(", ")
             );
         }
 
@@ -359,7 +533,8 @@ pub fn cmd_bootstrap(
         // The state recorded is what the engine actually built, read back — not
         // what was declared. Expressions come back in the engine's stored form,
         // and only that form compares equal on the next drift check (SPEC §8.2).
-        let built = managed_state(&mut conn, &ids, project.config.unmanaged).await?;
+        let built =
+            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         let snapshot = with_provenance(StateSnapshot::new(
             StateKind::Bootstrap,
             built.schema,
@@ -438,6 +613,7 @@ pub fn cmd_plan_db(
     target: &Target,
     out: Option<&std::path::Path>,
     sql_out: Option<&std::path::Path>,
+    staged: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "plan --db")?;
     let loaded = crate::load(project)?;
@@ -473,8 +649,56 @@ pub fn cmd_plan_db(
                 target.label
             );
         };
+        refuse_mid_deployment(&entry, &target.label)?;
         let recorded_ids = entry.snapshot.ids.clone();
-        let scoped = managed_state(&mut conn, &recorded_ids, project.config.unmanaged).await?;
+        // The baseline's module scope is the **recorded** state's, never the
+        // declarations': `apply` has only the plan file and the ledger, so a
+        // scope that needed a checkout would make the two checksums disagree on
+        // a host with none. A declared module that exists but was never
+        // recorded is simply created again, which `CREATE OR ALTER` makes
+        // harmless.
+        let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+        // The policy is applied separately from the scope. The scope has to stay
+        // the recorded set, or the two checksums below would be computed over
+        // different object sets — but a module that this revision declares for
+        // the first time and that already exists in the database is outside it,
+        // and telling its author "this object is not declared" while planning
+        // the `CREATE OR ALTER` for it would be both wrong and unactionable.
+        let managed = managed_state_full(
+            &mut conn,
+            &recorded_ids,
+            &recorded_modules,
+            pbps_config::Unmanaged::Ignore,
+        )
+        .await?;
+        // A declared name standing on an object introspection cannot express is
+        // not something to plan around. It is absent from the scoped schema, so
+        // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`
+        // would replace it — removing, silently, the very options that made it
+        // unreadable (ADR-0002: what pbps cannot reproduce, it does not touch).
+        let colliding: Vec<&str> = managed
+            .unreadable
+            .iter()
+            .filter(|(n, _)| loaded.schema.modules.contains_key(n))
+            .map(|(_, why)| why.as_str())
+            .collect();
+        if !colliding.is_empty() {
+            bail!(
+                "`{}` already holds {} declared object(s) that pbps cannot read back: {}.\n\
+                 Planning would propose creating them, and `CREATE OR ALTER` would replace what \
+                 is there. Remove the declaration, or recreate the object in a form pbps can \
+                 express.",
+                target.label,
+                colliding.len(),
+                colliding.join(", ")
+            );
+        }
+        let scoped = managed.scoped;
+        let mut for_policy = scoped.clone();
+        for_policy
+            .unmanaged_modules
+            .retain(|m| !loaded.schema.modules.contains_key(m));
+        report_unmanaged(&for_policy, project.config.unmanaged)?;
 
         // The plan is computed against the environment *as queried*, so the
         // queried state had better be the recorded one. When it is not, the
@@ -503,6 +727,7 @@ pub fn cmd_plan_db(
                 ids: &resolved.ids,
             },
             dialect.as_ref(),
+            &loaded.hints,
         )
         .map_err(|errs| {
             for e in &errs {
@@ -511,6 +736,28 @@ pub fn cmd_plan_db(
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
 
+        // The edition is a connection-time fact, and it is the only place the
+        // two edition-dependent questions of ADR-0003 can be answered
+        // honestly: whether ONLINE will be accepted at all, and whether an
+        // addition that is metadata-only on Enterprise rewrites every row
+        // here. An offline plan has to assume the conservative answer.
+        let edition = pbps_mssql::edition::edition(&mut conn).await?;
+        let refused = pbps_mssql::edition::online_not_supported(&cs, &edition);
+        if !refused.is_empty() {
+            bail!(
+                "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
+                 index operations.\n\
+                 The statement would fail partway through the apply. Remove the hint, or deploy \
+                 this change to an edition that supports it.",
+                refused.join(", "),
+                target.label,
+                edition.name()
+            );
+        }
+        for w in pbps_mssql::edition::size_of_data_warnings(&cs, &edition) {
+            eprintln!("warning: {w}");
+        }
+
         Ok((
             cs,
             live,
@@ -518,10 +765,29 @@ pub fn cmd_plan_db(
         ))
     })?;
 
-    // §7.5: a statement that cannot run inside a transaction fails **here**,
-    // not halfway through an apply with no way back.
     let statements = crate::statements(&cs, dialect.as_ref())?;
-    reject_non_transactional(&statements)?;
+    if staged {
+        // A staged plan is one logical change isolated in a deployment of its
+        // own (ADR-0003). The limit is the whole point: what cannot be rolled
+        // back must not be able to take four unrelated changes down with it,
+        // and a resume that had to reason about which of five changes were
+        // half-done would be guessing.
+        if cs.changes.len() > 1 {
+            bail!(
+                "--staged applies one logical change, and this plan has {}.\n\
+                 Stage the change that needs it in a revision of its own; the rest can go \
+                 through an ordinary transactional apply.",
+                cs.changes.len()
+            );
+        }
+        if cs.is_empty() {
+            bail!("there is nothing to stage: this plan is empty");
+        }
+    } else {
+        // §7.5: a statement that cannot run inside a transaction fails **here**,
+        // not halfway through an apply with no way back.
+        reject_non_transactional(&statements)?;
+    }
 
     println!("Baseline: {baseline_description}");
     print!("{}", crate::report::plan(&cs));
@@ -538,6 +804,15 @@ pub fn cmd_plan_db(
         resolved.ids,
     );
     plan.git_sha = db::git_sha();
+    if staged {
+        plan = plan.staged();
+        println!(
+            "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
+             recorded in the ledger as it completes. Apply it with `pbps apply --staged`, and \n\
+             continue an interrupted run with `--staged --resume`.",
+            statements.len()
+        );
+    }
 
     if let Some(path) = out {
         crate::write_plan(path, &plan)?;
@@ -567,6 +842,8 @@ pub fn cmd_apply(
     target: &Target,
     plan_path: &std::path::Path,
     allow: &std::collections::BTreeSet<pbps_model::RiskClass>,
+    staged: bool,
+    resume: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "apply")?;
     let dialect = crate::dialect(project)?;
@@ -605,6 +882,23 @@ pub fn cmd_apply(
             dialect.name()
         );
     }
+    // The mode lives in the file because that is what the gate approved; the
+    // flag exists so that the CI configuration says out loud which kind of
+    // deployment this is. A disagreement between them is somebody's mistake,
+    // and running whichever was typed would be the tool choosing the loser.
+    if plan.mode.is_staged() != staged {
+        bail!(
+            "`{}` is a {} plan and `--staged` was {}.\n\
+             A staged plan runs outside a transaction and is applied with `--staged`; a \
+             transactional one is not.",
+            plan_path.display(),
+            plan.mode,
+            if staged { "given" } else { "not given" }
+        );
+    }
+    if resume && !staged {
+        bail!("--resume continues a staged apply; pass --staged as well");
+    }
 
     if plan.changes.is_empty() {
         println!("The plan is empty; nothing to apply.");
@@ -632,7 +926,17 @@ pub fn cmd_apply(
     }
 
     let statements = crate::statements(&plan.changes, dialect.as_ref())?;
-    reject_non_transactional(&statements)?;
+    // Only for a transactional plan. A staged one exists *because* its
+    // statement cannot run inside a transaction (ADR-0003): `plan --db
+    // --staged` accepts it deliberately, and rejecting it here would leave
+    // staged execution refusing the only kind of change it is for.
+    //
+    // Nothing the T-SQL emitter writes is marked non-transactional yet, so this
+    // is latent — which is the reason to fix it now rather than when the first
+    // such statement arrives and the guard swallows every staged apply.
+    if !staged {
+        reject_non_transactional(&statements)?;
+    }
     let targets = pbps_mssql::impact::RenameTarget::from_changes(&plan.changes);
 
     let recorded = db::runtime()?.block_on(async {
@@ -644,18 +948,34 @@ pub fn cmd_apply(
         // pre-flight that passed while another pipeline was mid-apply would
         // have been answered about a database that is already moving.
         pbps_mssql::state::lock(&mut conn, &operator).await?;
-        let result = apply_under_lock(
-            &mut conn,
-            project,
-            target,
-            &plan,
-            &plan_checksum,
-            &statements,
-            &targets,
-            dialect.as_ref(),
-            &operator,
-        )
-        .await;
+        let result = if staged {
+            apply_staged_under_lock(
+                &mut conn,
+                project,
+                target,
+                &plan,
+                &plan_checksum,
+                &statements,
+                &targets,
+                dialect.as_ref(),
+                &operator,
+                resume,
+            )
+            .await
+        } else {
+            apply_under_lock(
+                &mut conn,
+                project,
+                target,
+                &plan,
+                &plan_checksum,
+                &statements,
+                &targets,
+                dialect.as_ref(),
+                &operator,
+            )
+            .await
+        };
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
         let released = pbps_mssql::state::unlock(&mut conn).await;
@@ -665,9 +985,10 @@ pub fn cmd_apply(
     })?;
 
     println!(
-        "Applied {} change(s) to `{}`; recorded as entry #{recorded}.",
+        "Applied {} change(s) to `{}`{}; recorded as entry #{recorded}.",
         plan.changes.changes.len(),
-        target.label
+        target.label,
+        if staged { " (staged)" } else { "" }
     );
     if let Some(hook) = &project.config.hooks.on_apply {
         crate::hooks::run(hook, &raw, "on_apply");
@@ -694,8 +1015,16 @@ async fn apply_under_lock(
             target.label
         );
     };
+    refuse_mid_deployment(&entry, &target.label)?;
     let recorded_ids = entry.snapshot.ids.clone();
-    let scoped = managed_state(conn, &recorded_ids, project.config.unmanaged).await?;
+    let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+    let scoped = managed_state(
+        conn,
+        &recorded_ids,
+        &recorded_modules,
+        project.config.unmanaged,
+    )
+    .await?;
 
     // The drift check, and the whole reason a coarse `--allow` is safe: this
     // plan is only valid against the environment it was computed against, down
@@ -721,7 +1050,13 @@ async fn apply_under_lock(
     // What gets recorded is the database read back, not the plan applied to the
     // old state. Expressions come back in the engine's stored form, and only
     // that form compares equal on the next drift check (SPEC §8.2).
-    let after = managed_state(conn, &plan.ids, project.config.unmanaged).await?;
+    let after = managed_state(
+        conn,
+        &plan.ids,
+        &modules_after(&entry.snapshot, &plan.changes),
+        project.config.unmanaged,
+    )
+    .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -736,6 +1071,254 @@ async fn apply_under_lock(
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
 
+/// A staged apply: one logical change, run statement by statement outside a
+/// transaction, with each completion recorded (ADR-0003 decision 2).
+///
+/// # Why the ledger is written between statements
+///
+/// Nothing here rolls back — that is the whole reason the plan is staged. So
+/// the only thing that can make a mid-way failure visible rather than
+/// mysterious is a record written as each statement completes; and once that
+/// record exists, `--resume` has somewhere honest to start from.
+///
+/// # Why resume re-checks the database
+///
+/// A checkpoint says what the database looked like when the run stopped. Half a
+/// deployment sitting in an environment is exactly when somebody reaches in by
+/// hand, so the drift discipline applies to a half-finished plan as much as to
+/// a finished one: the live state has to still equal the checkpoint, or the
+/// remaining statements are being run against something nobody planned for.
+#[allow(clippy::too_many_arguments)]
+async fn apply_staged_under_lock(
+    conn: &mut Conn,
+    project: &Project,
+    target: &Target,
+    plan: &pbps_model::SavedPlan,
+    plan_checksum: &str,
+    statements: &[pbps_dialect::Statement],
+    rename_targets: &[pbps_mssql::impact::RenameTarget],
+    dialect: &dyn pbps_dialect::Dialect,
+    operator: &str,
+    resume: bool,
+) -> anyhow::Result<i64> {
+    let Some(entry) = pbps_mssql::state::latest(conn).await? else {
+        bail!(
+            "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
+            target.label
+        );
+    };
+
+    let start = if resume {
+        let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
+            (Some(p), StateKind::Staged) => p.clone(),
+            _ => bail!(
+                "`{}` has no staged apply in progress: its newest entry (#{}) is an ordinary \
+                 {} state.\n\
+                 Run `pbps apply --staged` without `--resume` to start this plan.",
+                target.label,
+                entry.id,
+                entry.snapshot.kind
+            ),
+        };
+        if entry.snapshot.plan_checksum.as_deref() != Some(plan_checksum) {
+            bail!(
+                "entry #{} is a checkpoint of a different plan (checksum {}).\n\
+                 Resume the plan that was interrupted, not this one.",
+                entry.id,
+                entry.snapshot.plan_checksum.as_deref().unwrap_or("none")
+            );
+        }
+        // The drift check, applied to a half-finished plan. The mapping is the
+        // checkpoint's own — which names every managed table as the catalog had
+        // it at that moment, intermediate rename names included. Using the
+        // plan's here instead would leave a table that is mid-rename out of both
+        // sides, and a change someone made to it while the deployment was
+        // paused would pass unseen into the closing entry.
+        let after_modules = modules_after(&entry.snapshot, &plan.changes);
+        let at_checkpoint = &entry.snapshot.ids;
+        let scoped = managed_state(
+            conn,
+            at_checkpoint,
+            &after_modules,
+            project.config.unmanaged,
+        )
+        .await?;
+        let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
+        let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, at_checkpoint);
+        if live != checkpoint {
+            bail!(
+                "`{}` has moved since the checkpoint at entry #{}.\n\
+                 checkpoint: {checkpoint}\n\
+                 database:   {live}\n\
+                 Either something changed while this deployment was half-finished, or the \
+                 statement after the checkpoint committed and the checkpoint for it could not \
+                 be written (a lost connection between the two). `pbps verify` shows which: if \
+                 the difference is exactly the next statement of this plan, that statement is \
+                 already done. Resuming cannot decide that for you — the remaining statements \
+                 must not run against a database nobody planned for — so take the database as \
+                 it stands with `pbps baseline --reason ...` and plan the rest from there.",
+                target.label,
+                entry.id
+            );
+        }
+        println!(
+            "Resuming at statement {} of {} (checkpoint entry #{}).",
+            progress.completed + 1,
+            statements.len(),
+            entry.id
+        );
+        if progress.total != statements.len() {
+            bail!(
+                "the checkpoint recorded {} statement(s) and this plan emits {}; they are not the \
+                 same run.",
+                progress.total,
+                statements.len()
+            );
+        }
+        progress.completed
+    } else {
+        if entry.snapshot.staged.is_some() {
+            bail!(
+                "`{}` is mid-deployment: entry #{} is a staged checkpoint ({} of {} statements).\n\
+                 Finish it with `pbps apply --staged --resume --plan ...`, or take the database \
+                 as it stands with `pbps baseline --reason ...`.",
+                target.label,
+                entry.id,
+                entry.snapshot.staged.as_ref().map_or(0, |p| p.completed),
+                entry.snapshot.staged.as_ref().map_or(0, |p| p.total)
+            );
+        }
+        let recorded_ids = entry.snapshot.ids.clone();
+        let recorded_modules = managed_modules(Some(&entry.snapshot), None);
+        let scoped = managed_state(
+            conn,
+            &recorded_ids,
+            &recorded_modules,
+            project.config.unmanaged,
+        )
+        .await?;
+        let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+        if live != plan.baseline.checksum {
+            bail!(
+                "`{}` is no longer the database this plan was computed against.\n\
+                 plan baseline: {}\n\
+                 database now:  {live}\n\
+                 Something changed since the plan was approved. `pbps verify` shows what; \
+                 then recompute the plan with `pbps plan --db --staged`.",
+                target.label,
+                plan.baseline.checksum
+            );
+        }
+        // Only on a fresh start. The probes name objects as the catalog had
+        // them before the first statement, and after a partial run some of
+        // those names have already moved — a probe answered about the wrong
+        // object is worse than one that was not asked.
+        preflight(conn, dialect, plan, rename_targets).await?;
+        0
+    };
+
+    let total = statements.len();
+    // The names the catalog has right now. It starts at whatever the newest
+    // entry recorded — the last ordinary state on a fresh run, the checkpoint
+    // on a resume — and each statement moves it, using what the emitter said
+    // that statement does (`Statement::renames`).
+    let mut live_ids = entry.snapshot.ids.clone();
+    println!(
+        "Applying {} statement(s) without a transaction...",
+        total - start
+    );
+    for (i, stmt) in statements.iter().enumerate().skip(start) {
+        if let Err(e) = conn.execute(&stmt.sql).await {
+            return Err(anyhow::anyhow!(
+                "the database rejected statement {} of {total}, and nothing was rolled back \
+                 (a staged apply runs outside a transaction):\n{}\n\n{e}\n\n\
+                 The ledger records everything that did complete. Fix the cause, then continue \
+                 with `pbps apply --staged --resume`.",
+                i + 1,
+                stmt.sql
+            ));
+        }
+
+        // Applied before the checkpoint is taken: this statement has committed,
+        // so the names it moved are the names the catalog has now.
+        for (from, to) in &stmt.renames {
+            live_ids.rename_table(from, to);
+        }
+
+        // The unmanaged policy is deliberately not enforced between two
+        // committed statements. It is a hygiene gate for the start of a
+        // command, where it already ran, and failing it here would abort
+        // *after* the DDL committed and leave no checkpoint to resume from.
+        let after = managed_state(
+            conn,
+            &live_ids,
+            &modules_after(&entry.snapshot, &plan.changes),
+            pbps_config::Unmanaged::Ignore,
+        )
+        .await?;
+        // Scoped and identified by `live_ids`, not by the plan's mapping: a
+        // checkpoint records the database as it stands, and halfway through a
+        // rename that moves both the schema and the name, the table stands at
+        // neither end. `--resume` reads this mapping back and compares against
+        // it, so a hand-made change to that table while the deployment is
+        // paused is seen rather than carried silently into the closing entry.
+        let mut checkpoint = pbps_model::StateSnapshot::new(
+            StateKind::Staged,
+            after.schema,
+            live_ids.clone(),
+            operator,
+        );
+        checkpoint.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+        checkpoint.plan_checksum = Some(plan_checksum.to_owned());
+        checkpoint.staged = Some(pbps_model::StagedProgress {
+            completed: i + 1,
+            total,
+            last_statement: stmt.sql.clone(),
+        });
+        let id = pbps_mssql::state::record(conn, &checkpoint).await?;
+        println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
+    }
+
+    // The closing entry is an ordinary apply with no staged marker: its absence
+    // is what tells every later command this environment is no longer
+    // mid-deployment.
+    let after = managed_state(
+        conn,
+        &plan.ids,
+        &modules_after(&entry.snapshot, &plan.changes),
+        project.config.unmanaged,
+    )
+    .await?;
+    let mut snapshot = pbps_model::StateSnapshot::new(
+        pbps_model::StateKind::Apply,
+        after.schema,
+        plan.ids.clone(),
+        operator,
+    );
+    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.plan_checksum = Some(plan_checksum.to_owned());
+    Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+}
+
+/// Refuses to act on an environment that is half-way through a staged apply.
+///
+/// Planning or applying anything else on top of an unfinished staged plan
+/// builds on a state nobody approved: the recorded baseline is a checkpoint,
+/// not a deployment anybody signed off.
+fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::Result<()> {
+    let Some(progress) = &entry.snapshot.staged else {
+        return Ok(());
+    };
+    bail!(
+        "`{label}` is mid-deployment: entry #{} is a staged checkpoint ({} of {} statements).\n\
+         Finish it with `pbps apply --staged --resume --plan ...`, or take the database as it \
+         stands with `pbps baseline --reason ...`.",
+        entry.id,
+        progress.completed,
+        progress.total
+    )
+}
+
 /// The pre-flight of §7.5: dependency impact, then probes against the data.
 async fn preflight(
     conn: &mut Conn,
@@ -743,13 +1326,47 @@ async fn preflight(
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_mssql::impact::RenameTarget],
 ) -> anyhow::Result<()> {
+    // The edition, asked again. `plan --db` checked it, but nothing binds a
+    // saved plan to an environment: the same file can be applied to a different
+    // server, or to the same one after an edition change, and an `ONLINE = ON`
+    // statement rejected halfway through an apply is precisely what the check
+    // at plan time exists to prevent (ADR-0003).
+    let edition = pbps_mssql::edition::edition(conn).await?;
+    let refused = pbps_mssql::edition::online_not_supported(&plan.changes, &edition);
+    if !refused.is_empty() {
+        bail!(
+            "this plan carries `strategy: online` for {}, and this server runs {}, which has no \
+             online index operations.\n\
+             The plan was approved against an edition that supports it. Recompute it against \
+             this environment with `pbps plan --db`.",
+            refused.join(", "),
+            edition.name()
+        );
+    }
+
+    // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
+    // module changes sort before the table changes precisely so that the drop
+    // runs first (ADR-0002). The catalog is queried before anything executes, so
+    // it still sees the dependency — and reporting it would refuse a plan whose
+    // own first statement removes the obstacle.
+    let dropped: std::collections::BTreeSet<String> = plan
+        .changes
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|p| p.change.module_name())
+        .map(ToString::to_string)
+        .collect();
+
     let mut blocked = Vec::new();
     for target in rename_targets {
-        let report = pbps_mssql::impact::rename_impact(conn, target).await?;
+        let mut report = pbps_mssql::impact::rename_impact(conn, target).await?;
+        report.blocking.retain(|r| !dropped.contains(&r.name));
+        report.advisory.retain(|r| !dropped.contains(&r.name));
         if report.is_empty() {
             continue;
         }
-        println!("\nRenaming {} affects:", report.target);
+        println!("\n{} {} affects:", target.verb(), report.target);
         for r in &report.advisory {
             let detail = r
                 .detail
@@ -857,7 +1474,9 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
     }
     bail!(
         "{} statement(s) in this plan cannot run inside a transaction, and \"one plan, one \
-         transaction\" is not negotiable:\n  {}\nSplit them into a deployment of their own.",
+         transaction\" is not negotiable:\n  {}\n\
+         Isolate the change in a revision of its own and plan it with `pbps plan --db --staged`, \n\
+         which runs it statement by statement with a checkpoint in the ledger (ADR-0003).",
         offenders.len(),
         offenders.join("\n  ")
     )

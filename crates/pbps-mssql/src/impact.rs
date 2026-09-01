@@ -24,7 +24,7 @@
 //! checklist in front of a human for exactly that reason.
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ColumnRef, TableName};
+use pbps_model::{Change, ColumnRef, ObjectName, TableName};
 
 use crate::catalog::{get, opt};
 
@@ -33,6 +33,11 @@ use crate::catalog::{get, opt};
 pub enum RenameTarget {
     Table(TableName),
     Column(ColumnRef),
+    /// A module about to be dropped. Not a rename — but a module rename *is* a
+    /// drop plus a create (ADR-0002), and the question the catalog is asked is
+    /// the same one: what still refers to this name. Without it the referrers
+    /// of a dropped view are never reported and are simply left broken.
+    Module(ObjectName),
 }
 
 impl RenameTarget {
@@ -44,6 +49,17 @@ impl RenameTarget {
         match self {
             RenameTarget::Table(t) => t,
             RenameTarget::Column(c) => &c.table,
+            // A module has no table; it *is* the object the dependency rows
+            // point at, and tables and modules share one namespace.
+            RenameTarget::Module(m) => m,
+        }
+    }
+
+    /// The verb to use when reporting the impact.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            RenameTarget::Table(_) | RenameTarget::Column(_) => "Renaming",
+            RenameTarget::Module(_) => "Dropping",
         }
     }
 
@@ -58,6 +74,10 @@ impl RenameTarget {
                 Change::RenameColumn { table, from, .. } => {
                     Some(RenameTarget::Column(table.column(from)))
                 }
+                // A module rename reaches the plan as this drop plus a create,
+                // so the drop side is where the catalog has to be asked what
+                // still points at the old name.
+                Change::DropModule { name, .. } => Some(RenameTarget::Module(name.clone())),
                 // Exhaustive rather than `_`: a change added later that also
                 // moves a name must be considered here, and a catch-all would
                 // let it through silently.
@@ -77,7 +97,9 @@ impl RenameTarget {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::DropIndex { .. } => None,
+                | Change::DropIndex { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. } => None,
             })
             .collect()
     }
@@ -88,6 +110,7 @@ impl std::fmt::Display for RenameTarget {
         match self {
             RenameTarget::Table(t) => write!(f, "table {t}"),
             RenameTarget::Column(c) => write!(f, "column {c}"),
+            RenameTarget::Module(m) => write!(f, "module {m}"),
         }
     }
 }
@@ -200,7 +223,7 @@ pub async fn rename_impact(
     };
 
     let dependencies = match target {
-        RenameTarget::Table(_) => {
+        RenameTarget::Table(_) | RenameTarget::Module(_) => {
             conn.query_with(DEPENDENCIES_TABLE, &[&table.as_str()])
                 .await?
         }
@@ -322,6 +345,38 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().unwrap()
+    }
+
+    /// A module rename reaches the plan as a drop plus a create, so the drop is
+    /// where the catalog can still be asked what points at the old name. Left
+    /// out, the views and procedures that referred to it are simply broken by
+    /// an approved apply, with nothing said beforehand.
+    #[test]
+    fn a_module_drop_is_a_target_and_a_create_is_not() {
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::DropModule {
+                    name: "dbo.active_customer".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                }),
+                PlannedChange::new(Change::CreateModule {
+                    name: "dbo.live_customer".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        on: None,
+                        definition: "SELECT 1".into(),
+                    }),
+                }),
+            ],
+        };
+        let targets = RenameTarget::from_changes(&changes);
+        assert_eq!(
+            targets,
+            vec![RenameTarget::Module("dbo.active_customer".parse().unwrap())]
+        );
+        assert_eq!(targets[0].verb(), "Dropping");
+        assert_eq!(targets[0].to_string(), "module dbo.active_customer");
     }
 
     #[test]

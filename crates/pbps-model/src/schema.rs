@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 
+use crate::module::{Module, ObjectName};
 use crate::name::TableName;
 use crate::types::ColumnType;
 
@@ -25,6 +26,18 @@ use crate::types::ColumnType;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
+
+    /// Views, procedures, functions and triggers (ADR-0002).
+    ///
+    /// They live in the same [`Schema`] as the tables because they are part of
+    /// the desired state and of the drift comparison — but they carry no data,
+    /// so they get none of the identity machinery and never appear in the ids
+    /// file.
+    ///
+    /// Defaulted on read: every state snapshot and plan written before modules
+    /// existed is a project with no modules, not a broken file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<ObjectName, Module>,
 }
 
 impl Schema {

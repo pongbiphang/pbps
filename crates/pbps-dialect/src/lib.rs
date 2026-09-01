@@ -32,7 +32,9 @@
 
 use std::borrow::Cow;
 
-use pbps_model::{Change, ChangeSet, ColumnType, RiskClass, Table, TableName};
+use pbps_model::{
+    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Strategy, Table, TableName,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
@@ -119,6 +121,27 @@ pub struct Statement {
     /// specific (certain ONLINE index operations, full-text). Defaulting to
     /// `true` is therefore right, and the emitter marks the exceptions.
     pub transactional: bool,
+
+    /// The object renames this statement performs, `(from, to)`, in order.
+    ///
+    /// # Why the emitter has to say this
+    ///
+    /// One [`pbps_model::Change::RenameTable`] can need two statements — SQL
+    /// Server's `sp_rename` cannot move a table between schemas and `ALTER
+    /// SCHEMA TRANSFER` cannot rename it — and between them the table carries a
+    /// name that appears in neither the baseline nor the plan. A staged apply
+    /// checkpoints after every statement, so that intermediate name is the only
+    /// one under which the table can be found, and a checkpoint that cannot
+    /// find it records the environment without it.
+    ///
+    /// Working the name out anywhere else would mean a second copy of the
+    /// emitter's statement order, and the two would drift. The emitter knows
+    /// what its own SQL does to a name, so it says so — the same reason SQL
+    /// itself is written in exactly one place.
+    ///
+    /// Empty for every statement that renames nothing, which is nearly all of
+    /// them.
+    pub renames: Vec<(TableName, TableName)>,
 }
 
 impl Statement {
@@ -127,7 +150,14 @@ impl Statement {
             sql: sql.into(),
             own_batch: false,
             transactional: true,
+            renames: Vec::new(),
         }
+    }
+
+    /// Records that this statement moves `from` to `to`.
+    pub fn renaming(mut self, from: TableName, to: TableName) -> Self {
+        self.renames.push((from, to));
+        self
     }
 
     pub fn own_batch(mut self) -> Self {
@@ -199,6 +229,125 @@ pub trait Dialect {
     /// Quotes an identifier for embedding in SQL.
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError>;
 
+    /// The comparison form of a module definition (ADR-0002).
+    ///
+    /// # Why this is normalization and not parsing
+    ///
+    /// SPEC §8.2's rule stands: the database is the normalizer, and after an
+    /// apply the stored text is read back so that both sides of the drift check
+    /// live in the engine's own space. This is the *other* comparison — the
+    /// declaration against the baseline — where the two texts were written by
+    /// different hands and only whitespace and line endings may separate them.
+    /// Anything still different after this is re-emitted as `CREATE OR ALTER`,
+    /// which is idempotent and lossless: the cost of a false positive is
+    /// restating one definition.
+    ///
+    /// Case is deliberately **kept**. Two definitions differing only in the case
+    /// of a keyword are still two different texts to the engine's stored form,
+    /// and folding case here would also fold it inside string literals, where
+    /// it means something.
+    fn normalize_definition(&self, definition: &str) -> String {
+        // What the scanner is in the middle of. Layout is only layout in
+        // `Code`: inside a literal or a quoted identifier the spacing is data,
+        // and after `--` the *line ending* is what stops the comment, so
+        // collapsing it would splice the next line into the comment and make
+        // two bodies that run differently compare equal.
+        enum At {
+            Code,
+            Quoted(char),
+            Line,
+            /// Carrying how many non-space characters have been consumed, so
+            /// that the `*` of the opener cannot also close it (`/*/`).
+            Block(usize),
+        }
+
+        let mut out = String::with_capacity(definition.len());
+        let mut in_space = false;
+        let mut at = At::Code;
+        let text = definition.trim();
+        let bytes = text.as_bytes();
+
+        for (i, ch) in text.char_indices() {
+            match at {
+                At::Quoted(q) => {
+                    // A doubled `''` needs no special case: the first closes the
+                    // literal and the second opens it again, and everything
+                    // between them is copied either way.
+                    if if q == '[' { ch == ']' } else { ch == q } {
+                        at = At::Code;
+                    }
+                    out.push(ch);
+                }
+                At::Line => {
+                    if ch == '\n' {
+                        // The newline is the comment's terminator, so it is
+                        // structure. Its own trailing spaces are not.
+                        while out.ends_with(' ') {
+                            out.pop();
+                        }
+                        out.push('\n');
+                        at = At::Code;
+                        in_space = false;
+                    } else if ch.is_whitespace() {
+                        in_space = true;
+                    } else {
+                        if in_space {
+                            out.push(' ');
+                        }
+                        in_space = false;
+                        out.push(ch);
+                    }
+                }
+                At::Block(seen) => {
+                    // A block comment ends at `*/` wherever it falls, so nothing
+                    // inside it is structure and its layout collapses like code.
+                    if ch.is_whitespace() {
+                        in_space = true;
+                    } else {
+                        if in_space {
+                            out.push(' ');
+                        }
+                        in_space = false;
+                        out.push(ch);
+                        at = if ch == '/' && seen >= 2 && out.ends_with("*/") {
+                            At::Code
+                        } else {
+                            At::Block(seen + 1)
+                        };
+                    }
+                }
+                At::Code => {
+                    if ch.is_whitespace() {
+                        in_space = true;
+                        continue;
+                    }
+                    if in_space && !out.is_empty() && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    in_space = false;
+                    let next = bytes.get(i + ch.len_utf8()).copied();
+                    at = match (ch, next) {
+                        ('-', Some(b'-')) => At::Line,
+                        ('/', Some(b'*')) => At::Block(0),
+                        ('\'' | '"' | '[', _) => At::Quoted(ch),
+                        _ => At::Code,
+                    };
+                    out.push(ch);
+                }
+            }
+        }
+        out
+    }
+
+    /// Checks whether this dialect supports the features the module uses.
+    ///
+    /// The default is "no objection", which is the honest answer from a dialect
+    /// that does not implement modules: `validate` says what it checked, and
+    /// this one checked nothing.
+    fn validate_module(&self, _name: &ObjectName, _module: &Module) -> Vec<DialectError> {
+        Vec::new()
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see
@@ -210,7 +359,12 @@ pub trait Dialect {
     /// Returning a `Vec` is necessary: PostgreSQL has to split a type change and
     /// a nullability change into two `ALTER COLUMN` statements, whereas SQL Server
     /// can merge them into one.
-    fn emit(&self, change: &Change) -> Result<Vec<Statement>, DialectError>;
+    ///
+    /// `strategy` says *how* to get there (ADR-0003) and never *where* to go: a
+    /// dialect that cannot honour a hint on this statement emits the statement
+    /// without it rather than failing, because the desired state is the same
+    /// either way and refusing would turn a performance hint into an outage.
+    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError>;
 
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///
@@ -357,6 +511,87 @@ mod tests {
         assert!(!s.non_transactional().transactional);
     }
 
+    /// Line endings and indentation are what separate a definition someone
+    /// pasted from the same definition someone reindented. Neither is a change
+    /// worth re-stating a view for.
+    #[test]
+    fn definition_comparison_ignores_layout_but_not_case() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.normalize_definition("  SELECT a,\r\n       b\n  FROM t\n"),
+            d.normalize_definition("SELECT a, b FROM t")
+        );
+        assert_ne!(
+            d.normalize_definition("select a from t"),
+            d.normalize_definition("SELECT a FROM t"),
+            "case is meaningful inside string literals, so it is kept"
+        );
+    }
+
+    /// Whitespace stops being layout the moment it is inside a literal or a
+    /// quoted identifier. Collapsing it there would make two module bodies that
+    /// return different rows compare equal, and the change would never be
+    /// planned at all.
+    #[test]
+    fn whitespace_inside_a_literal_is_data() {
+        let d = MinimalDialect;
+        assert_ne!(
+            d.normalize_definition("SELECT 'a  b'"),
+            d.normalize_definition("SELECT 'a b'")
+        );
+        assert_ne!(
+            d.normalize_definition("SELECT [a  b] FROM t"),
+            d.normalize_definition("SELECT [a b] FROM t")
+        );
+        // Layout around the literal is still layout.
+        assert_eq!(
+            d.normalize_definition("SELECT   'a  b'\n  FROM t"),
+            d.normalize_definition("SELECT 'a  b' FROM t")
+        );
+        // A doubled quote closes and reopens; the text after it is still inside
+        // the literal, so its spacing survives too.
+        assert_ne!(
+            d.normalize_definition("SELECT 'it''s  here'"),
+            d.normalize_definition("SELECT 'it''s here'")
+        );
+    }
+
+    /// A `--` comment runs to the end of its line, so that line ending is
+    /// structure, not layout. Collapsing it splices the next statement into the
+    /// comment — and two bodies that execute differently would compare equal,
+    /// which means the change is never planned.
+    #[test]
+    fn a_line_comment_keeps_the_newline_that_ends_it() {
+        let d = MinimalDialect;
+        assert_ne!(
+            d.normalize_definition("SELECT 1 -- note\nUNION ALL SELECT 2"),
+            d.normalize_definition("SELECT 1 -- note UNION ALL SELECT 2")
+        );
+        // Indentation around the comment is still only indentation.
+        assert_eq!(
+            d.normalize_definition("SELECT 1   --  note\n   UNION ALL SELECT 2"),
+            d.normalize_definition("SELECT 1 -- note\nUNION ALL SELECT 2")
+        );
+    }
+
+    /// A block comment ends at `*/` wherever that falls, so nothing inside it
+    /// is structure — but a quote inside one must not be read as opening a
+    /// literal, and `/*/` must not close what it opened.
+    #[test]
+    fn a_block_comment_collapses_but_does_not_confuse_the_scanner() {
+        let d = MinimalDialect;
+        assert_eq!(
+            d.normalize_definition("SELECT /* it's\n   fine */ 1"),
+            d.normalize_definition("SELECT /* it's fine */ 1")
+        );
+        // If the opener's own `*` closed the comment, the `'` would be read as
+        // starting a literal and everything after it would keep its spacing.
+        assert_eq!(
+            d.normalize_definition("SELECT /*/ ' */ a  b"),
+            "SELECT /*/ ' */ a b"
+        );
+    }
+
     /// A dialect that has not implemented probes must say "I checked nothing",
     /// never "nothing is wrong".
     #[test]
@@ -430,7 +665,7 @@ impl Dialect for MinimalDialect {
         Vec::new()
     }
 
-    fn emit(&self, _change: &Change) -> Result<Vec<Statement>, DialectError> {
+    fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         Err(DialectError::Unsupported {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),

@@ -52,8 +52,8 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
 ```
 
 - Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
-  `state`, `impact`) are async; the CLI `block_on`s them per command. Phase 4
-  adds `pbps-pg`.
+  `state`, `impact`, `edition`) are async; the CLI `block_on`s them per command.
+  Phase 4 adds `pbps-pg`.
 - `spikes/` is workspace-`exclude`d: standalone evaluation crates, not product
   code.
 
@@ -80,6 +80,38 @@ Each of these was paid for — stop and think before breaking one.
    (declaration order matters for CREATE TABLE) but its equality ignores order.
 6. **Only rename and drop need human intent.** Everything else is automatic.
    Never prompt non-interactively — fail with a copy-pastable command.
+7. **Only data-bearing objects get identity.** Tables and columns have uids,
+   tombstones and rename intent because a wrong guess destroys data. Modules
+   (views, procedures, functions, triggers) carry none: they never enter the ids
+   file, a rename is drop + add, and git is the audit trail (ADR-0002).
+8. **Annotations travel beside the model, never inside it.** `strategy:` and
+   `depends_on:` change *how* to get somewhere, not *where* — both are invisible
+   in the database, so either one inside `Schema` breaks constraint 1. They come
+   back from `pbps-load` as `Loaded.hints` and reach the differ as `Hints`.
+
+## Product guardrails (SPEC 14.3)
+
+Each of these refuses a path that is **shorter but bypasses the typed plan, the
+checksum, a human's recorded intent, or the git audit trail**. They arrive as
+reasonable-sounding requests; the reason they were refused is the part that is
+expensive to reconstruct.
+
+- **No `push`.** `plan` then `apply --plan` stays two steps. A shorter path would
+  become the path everyone uses, and the reviewed one would die.
+- **Rename suggestions, never rename decisions.** Similarity may order the
+  candidates in the TTY prompt (SPEC 6.3, still unbuilt), one pair at a time.
+  **No non-interactive flag may supply identity intent** — a confirmation that
+  can be written once into a CI file has stopped being a confirmation.
+- **`revert`, not rollback.** A historical state is exported and applied as a new
+  forward plan through the ordinary gate. It restores structure, not data, and
+  says so at the point of use. Never one step.
+- **No policy SaaS.** Policies and reports are files or stdout, air-gapped. A
+  policy outside git is a second gate nobody reviewed.
+- **No plugin execution engine.** The test: does it need to run *between* "plan
+  approved" and "statements executed"? Then no — it makes the checksum describe
+  something other than what runs, and anything it changes outside the
+  declarations becomes permanent drift. Before a plan or after an apply is
+  already served by the exec hooks and CI.
 
 ## Format traps (all found the hard way)
 
@@ -104,17 +136,18 @@ Each of these was paid for — stop and think before breaking one.
 
 ## Current status
 
-**Phases 0-3 complete** for SQL Server. The test and clippy bar is in
+**Phases 0-3.5 complete** for SQL Server. The test and clippy bar is in
 "Development environment" above; counts change too often to record here.
 
-Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`),
+Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
 `docs` (`--format` / `--out` / `--title`).
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
-`plan --db`, `apply` (`--plan` / `--allow`), `verify` (`--format json`),
-`snapshot` (`--force`), `baseline` (`--reason`), `bootstrap` (`--sql`),
-`state prune` (`--keep`), `unlock`, `status` (`--format json`).
+`plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
+`--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
+(`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
+`status` (`--format json`).
 
 Decisions that changed from the original spec (SPEC is in sync):
 
@@ -136,8 +169,8 @@ Decisions that changed from the original spec (SPEC is in sync):
    after apply the DB's stored form is read back into `state_json`, and the
    differ side uses the dialect's lightweight normalization.
 10. **`apply` is one transaction per plan, all or nothing**: non-transactional
-    statements fail at plan time; pre-flight (rename impact, SCHEMABINDING)
-    runs before the first statement.
+    statements fail at plan time unless the plan is staged (see 26);
+    pre-flight (rename impact, SCHEMABINDING) runs before the first statement.
 11. **`__pbps_state` protects against mistakes, not tampering**: only the
     deployment account writes `__pbps_state` / `__pbps_lock`; the audit
     baseline is git + CI logs.
@@ -152,19 +185,20 @@ Phase 2 additions worth knowing before touching them:
     (`numeric`→`decimal`, `float(24)`→`real`, `varchar`→`varchar(1)`);
     introspection reads the stored form back, and any gap is a phantom diff.
 14. **`pull` never drops what it cannot express** (computed columns, UDTs,
-    clustered indexes): each becomes a warning, and a table with no expressible
-    columns is left out whole. The round-trip `load(render(pulled)) == pulled`
-    is pinned by `pbps-cli/tests/pull_roundtrip.rs`.
+    clustered indexes, unmanageable modules): each becomes a warning or an
+    inventory entry, and a table with no expressible columns is left out whole.
+    The round-trip `load(render(pulled)) == pulled` is pinned by
+    `pbps-cli/tests/pull_roundtrip.rs`, for modules as well as tables.
 15. **Default/check expressions are compared after peeling the engine's stored
     parentheses** (`((0))` → `0`), only when they wrap the whole string.
 16. **`strategy:` is persistent, unlike `renamed_from`** — it lives beside the
-    model (`Loaded.strategies`, never in `Schema`, or constraint 1 breaks) and
-    `fmt` preserves it. Unknown keys are rejected: a typo that became a no-op
-    would leave the user believing a large table is altered online when it is
-    not (ADR-0003). The emitter honours `online` in Phase 3.
-17. **`pull` inventories what it cannot manage.** Views, procedures, functions
-    and triggers are listed as unmanaged rather than ignored (ADR-0002); they
-    are separate from `warnings`, which are defects in the pull itself.
+    model (`Loaded.hints`, never in `Schema`, or constraint 1 breaks) and `fmt`
+    preserves it. Unknown keys are rejected: a typo that became a no-op would
+    leave the user believing a large table is altered online when it is not
+    (ADR-0003).
+17. **`pull` inventories what it cannot manage.** Everything it finds and
+    cannot express is listed with the reason (ADR-0002); that is separate from
+    `warnings`, which are defects in the pull itself.
 18. **`docs` output must stay deterministic and self-contained** — identical
     declarations produce byte-identical files, and the HTML references nothing
     external (the air-gap rule applies to artifacts). That is why the ERD
@@ -191,10 +225,10 @@ Phase 3 additions worth knowing before touching them:
     `preflight::AsStored` translates through the plan's renames, and tables the
     plan creates are skipped. Check expressions are deliberately *not*
     rewritten; that probe fails to run and is reported as unchecked.
-23. **A saved plan carries `origin` and the post-plan `ids`.** `Preview` is a
-    value in the file, so `apply` refuses it structurally; the ids make apply
-    self-contained on a host with no checkout, and recording the baseline's
-    mapping instead would say a rename never happened.
+23. **A saved plan carries `origin`, `mode` and the post-plan `ids`.**
+    `Preview` is a value in the file, so `apply` refuses it structurally; the
+    ids make apply self-contained on a host with no checkout, and recording the
+    baseline's mapping instead would say a rename never happened.
 24. **`apply` takes the lock before the pre-flight, and releases it on every
     path.** A check that passed while another pipeline was mid-apply was
     answered about a moving database; a lock left behind blocks the pipeline
@@ -203,32 +237,85 @@ Phase 3 additions worth knowing before touching them:
     scheduled drift-watch wakes different people for each. `status` always
     exits 0 — it is a report, and one unreachable environment must not cost
     the operator the other five lines.
+26. **ONLINE is edition-dependent, and only a connection knows the edition.**
+    The emitter writes `WITH (ONLINE = ON)` where the statement takes one — a
+    UNIQUE constraint is index-backed and does, a foreign key and a check are
+    metadata only and the clause is a syntax error there — and `plan --db`
+    reads `SERVERPROPERTY('Edition')` and refuses before writing a plan the
+    server would reject. An offline plan says the hint is unverified.
+27. **The dev database is always optional** (`plan --dev`). Without one the
+    preview degrades to lightweight normalization and says so; with one, the
+    rehearsal reports structural differences as a failure and spelling
+    differences *with the engine's stored form*, which is the only place that
+    form can come from. `--dev` and `--db` are refused together: a rehearsal is
+    a preview's question.
+
+Phase 3.5 additions worth knowing before touching them:
+
+28. **Modules are matched by name and have no uid** (constraint 7). The managed
+    set for them is therefore supplied per command: `verify` passes the
+    recorded state's modules, the commands that record a state pass the
+    declared ones, and `apply` passes the recorded set plus what its own plan
+    creates — which is what keeps it applyable with no checkout.
+29. **The emitter adds no terminator to a module.** The engine stores what was
+    sent, introspection reads it back, and a semicolon the declaration did not
+    have would come back inside the body and read as a change on every plan.
+30. **`introspect::split_module` may refuse.** It reads exactly as far as
+    `emit::module_definition` writes; a view with `WITH SCHEMABINDING` has
+    nowhere to keep its options, so the module is inventoried as unmanaged
+    rather than recreated later without them.
+31. **Module changes bracket the table changes.** Drops sort first (a
+    SCHEMABINDING view blocks a rename), creates last (they select columns that
+    must exist), and within each group the order comes from an identifier scan
+    over the definition text — of the **code only**, so a name in a comment or
+    a literal invents no edge — with `depends_on:` as the escape hatch.
+    *Known limitation*: an alter that **releases** a schema-bound dependency
+    would have to run first, and one rank cannot serve both directions. Left
+    unfixed on purpose; the reasoning and the trade are in ADR-0002 under
+    "Known limitation".
+32. **A staged plan is one logical change, and its mode lives in the file.**
+    `apply --staged` runs it outside a transaction with a `staged` ledger entry
+    per completed statement; `--resume` re-checks the live state against the
+    checkpoint before continuing. An unfinished checkpoint makes the
+    environment mid-deployment: `plan --db` and a fresh `apply` refuse, and
+    `status` reports `staged`.
+33. **A checkpoint's `ids` are the names at that checkpoint**, not the plan's.
+    One `RenameTable` can take two statements, and between them the table is at
+    `[new schema].[old name]` — a name in neither the baseline nor the plan.
+    Each `Statement` therefore declares its own renames, the staged loop
+    replays them, and the checkpoint records what the catalog actually has.
+    Deriving that name anywhere else would be a second copy of the emitter's
+    statement order.
 
 **Not done in Phase 1**: the interactive prompt (third intent channel, TTY
 only). CLI commands and YAML annotations both work; nothing is blocked.
 
-**Live tests**: the SPEC §11.5 invariants plus the Phase 3 ones (the ledger
-round-trip, the lock admitting one holder, a failed statement rolling the whole
-plan back, the rename-impact queries, the probes counting real rows) run
-against a real SQL Server in Docker: `scripts/live-tests.sh` (set
-`PBPS_TEST_PORT` if 14330 is taken), or set `PBPS_TEST_DB` and `cargo test -p
-pbps-mssql --test live -- --ignored`. They are `#[ignore]`d so the ordinary
-suite stays offline; CI has a dedicated job. When touching the emitter, the
-catalog queries or the ledger, run them — they have caught four bugs the unit
-suite structurally could not: FK ordering between two new tables; `EXEC()`
-rejecting function calls in its argument; `sql_expression_dependencies`
-returning one row per referenced *column*; and check constraints arriving as
-dependencies of their own table.
+**Live tests**: the SPEC §11.5 invariants plus the Phase 3 and 3.5 ones (the
+ledger round-trip, the lock admitting one holder, a failed statement rolling the
+whole plan back, the rename-impact queries, the probes counting real rows, a
+staged checkpoint surviving `state_json`, a cross-schema rename stopping at the
+name its statement declared, and the module round-trip through
+`sys.sql_modules`) run against a real SQL Server in Docker:
+`scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken), or set
+`PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The
+script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
+rehearsal. They are `#[ignore]`d so the ordinary suite stays offline; CI has a
+dedicated job. When touching the emitter, the catalog queries or the ledger, run
+them — they have caught four bugs the unit suite structurally could not: FK
+ordering between two new tables; `EXEC()` rejecting function calls in its
+argument; `sql_expression_dependencies` returning one row per referenced
+*column*; and check constraints arriving as dependencies of their own table.
+The module round-trip is in the same category: only a real `sys.sql_modules` can
+say whether what the emitter sent is what comes back.
 
-**Not done in Phase 3**: the optional dev database of §9.3 (a throwaway engine
-for higher-fidelity previews — always optional, and a dev-verified plan is
-still a preview), and the emitter honouring `strategy: online` with
-edition-aware classification at `plan --db` (ADR-0003). Neither blocks
-anything: the first only sharpens a preview, and `strategy:` is parsed,
-preserved and validated already.
+**Next**: Phase 3.1, the usability foundation of SPEC 14 — `init`, `doctor`,
+plan summaries and `explain`, one typed JSON output across the read-only
+commands, editor schemas and completions. It is placed ahead of the next dialect
+deliberately: broadening the object model improves coverage, but these improve
+the first hour and every failure after it.
 
-**Phase 3.5 next**: the module model for views / SPs / functions / triggers
-(ADR-0002), and staged apply for non-transactional operations (ADR-0003).
-`Statement::transactional` and `--staged`'s refusal path already exist; what
-is missing is the per-statement ledger record and `--resume`.
-`pbps-dialect::MinimalDialect` remains only as pbps-diff's test stand-in.
+Then Phase 4, the PostgreSQL dialect — the touchstone for the `Dialect`
+abstraction. One module-model question is already known to be waiting there:
+PostgreSQL identifies a function by name **plus argument types**, so "the name
+is the identity" needs revisiting (ADR-0002). Phase 5 holds declarative
+reference data (ADR-0004) and roles and grants (ADR-0005).

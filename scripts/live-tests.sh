@@ -29,4 +29,8 @@ for _ in $(seq 1 60); do
 done
 
 export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
-exec cargo test -p pbps-mssql --test live -- --ignored "$@"
+
+# The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
+# which needs the same server and is `#[ignore]`d for the same reason.
+cargo test -p pbps-mssql --test live -- --ignored "$@"
+exec cargo test -p pbps-cli --test flow -- --ignored "$@"

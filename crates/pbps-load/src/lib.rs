@@ -13,20 +13,32 @@ pub mod fmt;
 
 use std::path::Path;
 
-use pbps_model::{Schema, Strategies, TableName};
+use pbps_model::{Hints, Schema, TableName};
 
-pub use convert::LoadedTable;
+pub use convert::{LoadedModule, LoadedTable};
 pub use error::{LoadError, Semantic, SourceFile};
-pub use fmt::render;
+pub use fmt::{render, render_module};
 pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
+///
+/// Three things, deliberately apart: the state, the one-shot intent, and the
+/// persistent annotations that say *how* rather than *where* (`strategy:`,
+/// `depends_on:`). Only the first may ever take part in a comparison of two
+/// states — see inviolable constraint 1.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loaded {
     pub schema: Schema,
     pub intents: Vec<Intent>,
-    /// Only the tables that declared one; absence means the default.
-    pub strategies: Strategies,
+    /// Only what was declared; absence means the default.
+    pub hints: Hints,
+}
+
+/// What one declaration file turned out to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedFile {
+    Table(Box<LoadedTable>),
+    Module(Box<LoadedModule>),
 }
 
 /// Loads one table from a string. `path` is used only in diagnostics.
@@ -41,21 +53,76 @@ pub fn load_table_str(path: &Path, text: &str) -> Result<LoadedTable, Vec<LoadEr
     convert::convert(&src, dto)
 }
 
+/// Loads one module from a string. `path` is used only in diagnostics.
+pub fn load_module_str(path: &Path, text: &str) -> Result<LoadedModule, Vec<LoadError>> {
+    let src = SourceFile::new(path, text);
+    let dto: dto::ModuleDto = serde_saphyr::from_str(text).map_err(|e| {
+        vec![LoadError::Yaml {
+            path: path.to_owned(),
+            message: e.to_string(),
+        }]
+    })?;
+    convert::convert_module(&src, dto)
+}
+
+/// Loads one file of either kind.
+///
+/// The leading key decides, and it is read in a pass of its own: trying the
+/// table shape first and falling back on failure would answer a misspelled
+/// `colunms:` with a complaint about a missing `definition:`.
+pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadError>> {
+    let probe: dto::KindProbe = serde_saphyr::from_str(text).map_err(|e| {
+        vec![LoadError::Yaml {
+            path: path.to_owned(),
+            message: e.to_string(),
+        }]
+    })?;
+    if probe.table.is_some() {
+        return load_table_str(path, text).map(|t| LoadedFile::Table(Box::new(t)));
+    }
+    if probe.view.is_some()
+        || probe.procedure.is_some()
+        || probe.function.is_some()
+        || probe.trigger.is_some()
+    {
+        return load_module_str(path, text).map(|m| LoadedFile::Module(Box::new(m)));
+    }
+    Err(vec![LoadError::Yaml {
+        path: path.to_owned(),
+        message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:` \
+                  or `trigger:`"
+            .to_owned(),
+    }])
+}
+
+pub fn load_file(path: &Path) -> Result<LoadedFile, Vec<LoadError>> {
+    let text = read(path)?;
+    load_file_str(path, &text)
+}
+
 pub fn load_table_file(path: &Path) -> Result<LoadedTable, Vec<LoadError>> {
-    let text = std::fs::read_to_string(path).map_err(|source| {
+    let text = read(path)?;
+    load_table_str(path, &text)
+}
+
+fn read(path: &Path) -> Result<String, Vec<LoadError>> {
+    std::fs::read_to_string(path).map_err(|source| {
         vec![LoadError::Io {
             path: path.to_owned(),
             source,
         }]
-    })?;
-    load_table_str(path, &text)
+    })
 }
 
 /// Loads a whole directory.
 ///
-/// File names carry no meaning — the table name comes from the `table:` key
+/// File names carry no meaning — the object's name comes from the leading key
 /// inside the file. That lets users split things into subdirectories by topic
-/// without tying file names to table names.
+/// without tying file names to object names.
+///
+/// Tables and modules share one `seen` map because SQL Server keeps them in one
+/// namespace per schema: a view named after a table is a collision the engine
+/// would only report at apply time, on a database that is already half-changed.
 pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files).map_err(|source| {
@@ -74,27 +141,43 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
         std::collections::BTreeMap::new();
 
     for path in files {
-        match load_table_file(&path) {
-            Ok(mut t) => {
-                if let Some(first) = seen.get(&t.name) {
-                    errs.push(LoadError::Yaml {
-                        path: path.clone(),
-                        message: format!(
-                            "table `{}` was already declared in `{}`",
-                            t.name,
-                            first.display()
-                        ),
-                    });
-                    continue;
-                }
-                seen.insert(t.name.clone(), path);
+        let file = match load_file(&path) {
+            Ok(f) => f,
+            Err(mut e) => {
+                errs.append(&mut e);
+                continue;
+            }
+        };
+
+        let name = match &file {
+            LoadedFile::Table(t) => t.name.clone(),
+            LoadedFile::Module(m) => m.name.clone(),
+        };
+        if let Some(first) = seen.get(&name) {
+            errs.push(LoadError::Yaml {
+                path: path.clone(),
+                message: format!("`{name}` was already declared in `{}`", first.display()),
+            });
+            continue;
+        }
+        seen.insert(name.clone(), path);
+
+        match file {
+            LoadedFile::Table(t) => {
+                let mut t = *t;
                 loaded.intents.append(&mut t.intents);
                 if let Some(s) = t.strategy {
-                    loaded.strategies.insert(t.name.clone(), s);
+                    loaded.hints.strategies.insert(name.clone(), s);
                 }
-                loaded.schema.tables.insert(t.name, t.table);
+                loaded.schema.tables.insert(name, t.table);
             }
-            Err(mut e) => errs.append(&mut e),
+            LoadedFile::Module(m) => {
+                let m = *m;
+                if !m.depends_on.is_empty() {
+                    loaded.hints.module_deps.insert(name.clone(), m.depends_on);
+                }
+                loaded.schema.modules.insert(name, m.module);
+            }
         }
     }
 
@@ -400,6 +483,87 @@ indexes:
         );
     }
 
+    // ---- modules (ADR-0002) ----
+
+    const A_VIEW: &str =
+        "view: dbo.active_customer\ndefinition: |-\n  SELECT customer_id FROM dbo.customer\n";
+
+    fn load_module(text: &str) -> LoadedModule {
+        match load_module_str(Path::new("schema/dbo.v.yml"), text) {
+            Ok(m) => m,
+            Err(e) => panic!("expected the load to succeed, got: {}", render(&e)),
+        }
+    }
+
+    #[test]
+    fn the_leading_key_decides_the_kind_and_the_name() {
+        let m = load_module(A_VIEW);
+        assert_eq!(m.name.to_string(), "dbo.active_customer");
+        assert_eq!(m.module.kind, pbps_model::ModuleKind::View);
+        assert_eq!(
+            m.module.definition.trim(),
+            "SELECT customer_id FROM dbo.customer"
+        );
+        assert!(m.module.on.is_none());
+
+        for (text, kind) in [
+            (
+                "procedure: dbo.p\ndefinition: AS SELECT 1\n",
+                pbps_model::ModuleKind::Procedure,
+            ),
+            (
+                "function: dbo.f\ndefinition: () RETURNS int AS BEGIN RETURN 1 END\n",
+                pbps_model::ModuleKind::Function,
+            ),
+            (
+                "trigger: dbo.t\non: dbo.customer\ndefinition: AFTER INSERT AS SELECT 1\n",
+                pbps_model::ModuleKind::Trigger,
+            ),
+        ] {
+            assert_eq!(load_module(text).module.kind, kind);
+        }
+    }
+
+    /// A file has to be one object. Two leading keys is not a shape the tool
+    /// can guess its way through, and guessing is what it exists not to do.
+    #[test]
+    fn a_file_declaring_two_objects_is_rejected() {
+        let e = load_module_str(
+            Path::new("m.yml"),
+            "view: dbo.v\nprocedure: dbo.p\ndefinition: AS SELECT 1\n",
+        )
+        .expect_err("two leading keys must not load");
+        assert!(render(&e).contains("2 objects at once"), "{}", render(&e));
+    }
+
+    #[test]
+    fn a_file_with_no_leading_key_says_which_keys_exist() {
+        let e = load_file_str(Path::new("m.yml"), "definition: AS SELECT 1\n")
+            .expect_err("a file with no leading key must not load");
+        assert!(render(&e).contains("`view:`"), "{}", render(&e));
+    }
+
+    #[test]
+    fn a_misspelled_module_field_is_rejected() {
+        let e = load_module_str(Path::new("m.yml"), "view: dbo.v\ndefinitoin: SELECT 1\n")
+            .expect_err("a typo must not load");
+        assert!(render(&e).contains("definitoin"), "{}", render(&e));
+    }
+
+    /// The dispatch reads the leading key in a pass of its own, so a typo
+    /// inside a table file is reported as a table problem — not as a module
+    /// missing its `definition:`.
+    #[test]
+    fn dispatch_reports_the_error_of_the_kind_that_was_declared() {
+        let e = load_file_str(
+            Path::new("t.yml"),
+            "table: dbo.t\ncolunms:\n  a: {type: int}\n",
+        )
+        .expect_err("a typo must not load");
+        assert!(render(&e).contains("colunms"), "{}", render(&e));
+        assert!(!render(&e).contains("definition"), "{}", render(&e));
+    }
+
     // ---- directory loading ----
 
     #[test]
@@ -418,12 +582,35 @@ indexes:
         )
         .unwrap();
 
+        std::fs::write(nested.join("v.yml"), A_VIEW).unwrap();
+
         let loaded = load_schema_dir(&dir).unwrap();
         assert_eq!(
             loaded.schema.tables.len(),
             2,
             "subdirectories should be scanned recursively"
         );
+        assert_eq!(
+            loaded.schema.modules.len(),
+            1,
+            "modules load from the same directory as tables"
+        );
+
+        // Tables and modules share one namespace in the database, so they share
+        // one here: a view named after a table would fail at apply time, on a
+        // database that is already half-changed.
+        std::fs::write(
+            dir.join("clash.yml"),
+            "view: dbo.customer\ndefinition: SELECT 1\n",
+        )
+        .unwrap();
+        let e = load_schema_dir(&dir).unwrap_err();
+        assert!(
+            render(&e).contains("was already declared"),
+            "{}",
+            render(&e)
+        );
+        std::fs::remove_file(dir.join("clash.yml")).unwrap();
 
         // File names carry no meaning, so two files declaring one table must be
         // rejected.

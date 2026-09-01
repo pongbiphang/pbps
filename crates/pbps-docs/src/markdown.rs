@@ -18,13 +18,14 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     let _ = writeln!(s, "# {title}\n");
     let _ = writeln!(
         s,
-        "{} table(s), {} column(s).\n",
+        "{} table(s), {} column(s), {} module(s).\n",
         schema.tables.len(),
         schema
             .tables
             .values()
             .map(|t| t.columns.len())
-            .sum::<usize>()
+            .sum::<usize>(),
+        schema.modules.len()
     );
 
     s.push_str("## Diagram\n\n```mermaid\n");
@@ -36,9 +37,34 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    modules_section(&mut s, schema);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
     s
+}
+
+/// Views, procedures, functions and triggers, with their definitions.
+///
+/// The definition is included in full rather than summarized: it *is* the
+/// object (ADR-0002), and a reader asking "what does this view do" is asking to
+/// read it.
+fn modules_section(s: &mut String, schema: &Schema) {
+    if schema.modules.is_empty() {
+        return;
+    }
+    s.push_str("\n## Views, procedures, functions and triggers\n");
+    for (name, m) in &schema.modules {
+        let _ = writeln!(s, "\n### `{name}`\n");
+        let on =
+            m.on.as_ref()
+                .map(|t| format!(" on `{t}`"))
+                .unwrap_or_default();
+        let _ = writeln!(s, "*{}{on}*\n", m.kind);
+        if let Some(d) = &m.description {
+            let _ = writeln!(s, "{d}\n");
+        }
+        let _ = writeln!(s, "```sql\n{}\n```", m.definition.trim_end());
+    }
 }
 
 fn one_table(s: &mut String, name: &TableName, table: &Table) {

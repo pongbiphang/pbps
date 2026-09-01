@@ -17,10 +17,12 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
 use crate::schema::{
     CheckConstraint, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
 };
+use crate::strategy::Strategy;
 use crate::types::ColumnType;
 use crate::uid::Uid;
 
@@ -212,10 +214,32 @@ pub enum Change {
         table: TableName,
         name: String,
     },
+
+    // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
+    // is drop + add and the audit trail is git.
+    CreateModule {
+        name: ObjectName,
+        module: Box<Module>,
+    },
+    /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
+    /// create — preserves the permissions granted on the object, which is the
+    /// DACPAC pain point this avoids.
+    AlterModule {
+        name: ObjectName,
+        module: Box<Module>,
+    },
+    DropModule {
+        name: ObjectName,
+        kind: ModuleKind,
+    },
 }
 
 impl Change {
-    /// The table this change acts on. Used for grouping in output and for ordering.
+    /// The object this change acts on, for grouping in output and for ordering.
+    ///
+    /// For a module change it is the module's own qualified name: tables and
+    /// modules share one namespace, so one type covers both and a plan groups
+    /// by "the thing being changed" either way.
     pub fn table(&self) -> &TableName {
         match self {
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
@@ -236,6 +260,37 @@ impl Change {
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
+            Change::CreateModule { name, .. }
+            | Change::AlterModule { name, .. }
+            | Change::DropModule { name, .. } => name,
+        }
+    }
+
+    /// The module this change acts on, if it is a module change at all.
+    pub fn module_name(&self) -> Option<&ObjectName> {
+        match self {
+            Change::CreateModule { name, .. }
+            | Change::AlterModule { name, .. }
+            | Change::DropModule { name, .. } => Some(name),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. } => None,
         }
     }
 
@@ -247,6 +302,13 @@ impl Change {
         let mut r = BTreeSet::new();
         match self {
             Change::DropTable { .. } | Change::DropColumn { .. } | Change::DropIndex { .. } => {
+                r.insert(RiskClass::Destructive);
+            }
+            // What a dropped module destroys is the validity of whatever
+            // depends on it, not data — so it faces the gate, but needs no
+            // tombstone and no reason: the definition is in git history, which
+            // is this object family's audit trail (ADR-0002).
+            Change::DropModule { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             Change::RenameTable { .. } | Change::RenameColumn { .. } => {
@@ -282,13 +344,19 @@ impl Change {
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
-            | Change::AddIndex { .. } => {}
+            | Change::AddIndex { .. }
+            // Neither creating nor re-stating a module risks anything: a failed
+            // CREATE OR ALTER rolls back with the plan's transaction and the
+            // environment is unchanged.
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. } => {}
         }
         r
     }
 }
 
-/// A change together with the risks that have been determined for it.
+/// A change together with the risks that have been determined for it, and the
+/// execution strategy it is to be carried out with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     #[serde(flatten)]
@@ -296,6 +364,16 @@ pub struct PlannedChange {
 
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub risks: BTreeSet<RiskClass>,
+
+    /// How to get there, never where to go (ADR-0003).
+    ///
+    /// It travels *with the change* rather than being looked up at emit time
+    /// because the plan file is the reviewed artifact: an approver reading
+    /// plan.json has to be able to see that this index will be rebuilt online,
+    /// and a hint resolved later against a YAML file the deployment host may
+    /// not even have is a hint nobody reviewed.
+    #[serde(default, skip_serializing_if = "Strategy::is_default")]
+    pub strategy: Strategy,
 }
 
 impl PlannedChange {
@@ -303,11 +381,20 @@ impl PlannedChange {
     /// knowledge are added separately by the differ.
     pub fn new(change: Change) -> Self {
         let risks = change.intrinsic_risks();
-        Self { change, risks }
+        Self {
+            change,
+            risks,
+            strategy: Strategy::default(),
+        }
     }
 
     pub fn with_risk(mut self, r: RiskClass) -> Self {
         self.risks.insert(r);
+        self
+    }
+
+    pub fn with_strategy(mut self, s: Strategy) -> Self {
+        self.strategy = s;
         self
     }
 }
@@ -499,5 +586,67 @@ mod tests {
     fn every_change_reports_its_table() {
         assert_eq!(drop_column().table().to_string(), "dbo.customer");
         assert_eq!(add_column().table().to_string(), "dbo.customer");
+    }
+
+    // ---- modules (ADR-0002) ----
+
+    fn a_view() -> crate::module::Module {
+        crate::module::Module {
+            kind: crate::module::ModuleKind::View,
+            description: None,
+            on: None,
+            definition: "SELECT customer_id FROM dbo.customer".into(),
+        }
+    }
+
+    /// Dropping a module destroys the validity of its dependents, so it faces
+    /// the gate — but creating or re-stating one risks nothing, because a
+    /// failed CREATE OR ALTER rolls back with the plan.
+    #[test]
+    fn only_dropping_a_module_is_risky() {
+        let create = Change::CreateModule {
+            name: "dbo.active_customer".parse().unwrap(),
+            module: Box::new(a_view()),
+        };
+        let alter = Change::AlterModule {
+            name: "dbo.active_customer".parse().unwrap(),
+            module: Box::new(a_view()),
+        };
+        let drop = Change::DropModule {
+            name: "dbo.active_customer".parse().unwrap(),
+            kind: crate::module::ModuleKind::View,
+        };
+        assert!(create.intrinsic_risks().is_empty());
+        assert!(alter.intrinsic_risks().is_empty());
+        assert_eq!(
+            drop.intrinsic_risks(),
+            BTreeSet::from([RiskClass::Destructive])
+        );
+    }
+
+    #[test]
+    fn a_module_change_reports_its_own_name() {
+        let c = Change::CreateModule {
+            name: "dbo.active_customer".parse().unwrap(),
+            module: Box::new(a_view()),
+        };
+        assert_eq!(c.table().to_string(), "dbo.active_customer");
+        assert_eq!(
+            c.module_name().map(ToString::to_string).as_deref(),
+            Some("dbo.active_customer")
+        );
+        assert!(add_column().module_name().is_none());
+    }
+
+    #[test]
+    fn module_changes_round_trip_through_json() {
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateModule {
+                name: "dbo.active_customer".parse().unwrap(),
+                module: Box::new(a_view()),
+            })],
+        };
+        let back: ChangeSet = serde_json::from_str(&serde_json::to_string(&cs).unwrap()).unwrap();
+        assert_eq!(cs, back);
     }
 }

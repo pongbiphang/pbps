@@ -15,6 +15,60 @@ use std::collections::BTreeMap;
 
 use pbps_model::ReferentialAction;
 
+/// Which kind of declaration a file holds.
+///
+/// Read first, with unknown fields deliberately **allowed**: this pass only
+/// answers "table or module", and the real DTO for that answer is what rejects
+/// a misspelled field — with a message naming the right shape rather than
+/// "unknown field `colunms`" from whichever variant happened to be tried first.
+#[derive(Debug, serde::Deserialize)]
+pub struct KindProbe {
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub procedure: Option<String>,
+    #[serde(default)]
+    pub function: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+}
+
+/// One view, procedure, function or trigger (ADR-0002).
+///
+/// The leading key is both the kind and the name — `view: dbo.active_customer`
+/// — for the same reason `table:` is: the file name carries no meaning, so the
+/// identity has to be inside the file.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleDto {
+    #[serde(default)]
+    pub view: Option<Spanned<String>>,
+    #[serde(default)]
+    pub procedure: Option<Spanned<String>>,
+    #[serde(default)]
+    pub function: Option<Spanned<String>>,
+    #[serde(default)]
+    pub trigger: Option<Spanned<String>>,
+
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// The table a trigger is on. Meaningless — and rejected — on anything else.
+    #[serde(default)]
+    pub on: Option<Spanned<String>>,
+
+    /// The body. What it starts with depends on the kind; see
+    /// [`pbps_model::Module`].
+    pub definition: String,
+
+    /// Modules that must be created first, where the identifier scan cannot see
+    /// the dependency. Persistent, like `strategy:`, and preserved by `fmt`.
+    #[serde(default)]
+    pub depends_on: Vec<Spanned<String>>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableDto {

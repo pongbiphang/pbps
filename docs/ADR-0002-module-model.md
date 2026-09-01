@@ -1,6 +1,6 @@
 # ADR-0002: The module model — views, procedures, functions, triggers
 
-- Status: decided (design; implementation targeted at Phase 3.5)
+- Status: accepted; built in Phase 3.5 for SQL Server
 - Date: 2026-08-30
 - Related: docs/SPEC.md §1.2, §7.4, §8.2, §12, §13.6
 
@@ -109,6 +109,47 @@ The failure mode is safe by construction: a wrong order fails the CREATE
 inside the plan's transaction, everything rolls back, and the environment is
 unchanged. The escape hatch is an explicit `depends_on:` list in the module
 file.
+
+### Known limitation: an alter that releases a schema-bound dependency
+
+Module changes bracket the table changes: drops first, creates and alters
+last. "Alters last" is right for the common case — a view that starts
+selecting a column the same plan adds must be restated *after* the column
+exists — and wrong for one case that also occurs:
+
+> A `WITH SCHEMABINDING` function references `customer.phone`. One revision
+> both rewrites the function to stop referencing it **and** drops the column.
+> The engine refuses the drop while the old, still schema-bound definition
+> stands, so the alter has to run **first**.
+
+One ordering rank cannot serve both, and a plan may contain one of each.
+Telling them apart needs two things the model does not have: whether the
+module is schema-bound (a SCHEMABINDING *view* has nowhere to keep the option
+and is inventoried as unmanaged, so only functions reach here carrying it),
+and a comparison of the old and new definitions' references against the tables
+this plan touches. `depends_on:` cannot express it either — it orders modules
+among themselves, not against table changes.
+
+**Not fixed, deliberately.** The fix that works is to stop using
+`CREATE OR ALTER` for such a module and bracket the table changes with a drop
+and a create, which is already how a module rename is ordered. That destroys
+the object's GRANTs — the DACPAC pain point this ADR chose `CREATE OR ALTER`
+to avoid — and pbps does not record permissions, so it could neither warn
+about the loss nor put them back (they arrive with roles and grants, ADR-0005).
+
+The trade is therefore between two failure modes, and the current one is the
+better of the two:
+
+| | today | with drop + create |
+|---|---|---|
+| when it fails | at apply, loudly | after apply, at the next query |
+| database | rolled back, untouched | changed, GRANTs gone |
+| what the tool reports | an error | success, and no drift |
+| recovery | none needed | a human, from a backup |
+
+An apply that succeeds, verifies clean, and leaves the application unable to
+read its own view is worse than one that refuses. Revisit this with ADR-0005,
+when permissions are something pbps can carry across a drop.
 
 ## Onboarding
 

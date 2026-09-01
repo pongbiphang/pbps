@@ -8,11 +8,11 @@ use serde_saphyr::Spanned;
 use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Intent,
-    PrimaryKey, Strategy, Table, TableName, UniqueConstraint,
+    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Intent, Module,
+    ModuleKind, ObjectName, PrimaryKey, Strategy, Table, TableName, UniqueConstraint,
 };
 
-use crate::dto::{PrimaryKeyDto, TableDto};
+use crate::dto::{ModuleDto, PrimaryKeyDto, TableDto};
 use crate::error::{LoadError, SourceFile, to_span};
 
 /// The result of loading one declaration file.
@@ -24,6 +24,16 @@ pub struct LoadedTable {
     /// `None` when the file declares no `strategy:` block. Kept out of `table`
     /// so that `Schema` equality stays a question about the database alone.
     pub strategy: Option<Strategy>,
+}
+
+/// The result of loading one module declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedModule {
+    pub name: ObjectName,
+    pub module: Module,
+    /// Kept out of `module` so that `Schema` equality stays a question about
+    /// the database alone: creation order is invisible there (ADR-0002).
+    pub depends_on: std::collections::BTreeSet<ObjectName>,
 }
 
 /// Parses a `Spanned` string, labelling any failure on that value.
@@ -248,5 +258,90 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         }
         [_, dir] => Err(bad(&format!("`{dir}` is not asc or desc"))),
         _ => Err(bad("wrong number of parts")),
+    }
+}
+
+/// DTO to domain model for one module.
+pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, Vec<LoadError>> {
+    let mut errs = Vec::new();
+
+    // Exactly one leading key names the object, and it is also the kind. Two of
+    // them is not a file the tool can guess its way through: which one is the
+    // object and which one a stray line is precisely what it cannot know.
+    let named: Vec<(ModuleKind, &Spanned<String>)> = [
+        (ModuleKind::View, &dto.view),
+        (ModuleKind::Procedure, &dto.procedure),
+        (ModuleKind::Function, &dto.function),
+        (ModuleKind::Trigger, &dto.trigger),
+    ]
+    .into_iter()
+    .filter_map(|(kind, v)| v.as_ref().map(|v| (kind, v)))
+    .collect();
+
+    let (kind, name_value) = match named.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(vec![LoadError::Yaml {
+                path: std::path::PathBuf::from(&src.name),
+                message: "a declaration file starts with `table:`, `view:`, `procedure:`, \
+                          `function:` or `trigger:`"
+                    .to_owned(),
+            }]);
+        }
+        many => {
+            let kinds: Vec<&str> = many.iter().map(|(k, _)| k.as_str()).collect();
+            return Err(vec![LoadError::semantic(
+                src,
+                to_span(&many[0].1.defined),
+                format!(
+                    "this file declares {} objects at once: {}",
+                    many.len(),
+                    kinds.join(", ")
+                ),
+                "one object per file",
+            )]);
+        }
+    };
+
+    let name: Option<ObjectName> = match parse_at(src, name_value, "invalid object name") {
+        Ok(n) => Some(n),
+        Err(e) => {
+            errs.push(e.with_help(
+                "an object name must have the two parts `schema.object`, e.g. `dbo.active_customer`",
+            ));
+            None
+        }
+    };
+
+    let mut on = None;
+    if let Some(v) = &dto.on {
+        match parse_at::<TableName>(src, v, "invalid table name in `on`") {
+            Ok(t) => on = Some(t),
+            Err(e) => errs.push(e),
+        }
+    }
+
+    let mut depends_on = std::collections::BTreeSet::new();
+    for v in &dto.depends_on {
+        match parse_at::<ObjectName>(src, v, "invalid object name in `depends_on`") {
+            Ok(n) => {
+                depends_on.insert(n);
+            }
+            Err(e) => errs.push(e),
+        }
+    }
+
+    match (name, errs.is_empty()) {
+        (Some(name), true) => Ok(LoadedModule {
+            name,
+            module: Module {
+                kind,
+                description: dto.description,
+                on,
+                definition: dto.definition,
+            },
+            depends_on,
+        }),
+        _ => Err(errs),
     }
 }

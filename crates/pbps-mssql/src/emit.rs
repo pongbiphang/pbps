@@ -18,8 +18,8 @@
 
 use pbps_dialect::{DialectError, Statement};
 use pbps_model::{
-    Change, Column, ForeignKey, Index, PrimaryKey, ReferentialAction, Table, TableName,
-    UniqueConstraint,
+    Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
+    ReferentialAction, Strategy, Table, TableName, UniqueConstraint,
 };
 
 use crate::ident::{literal, quote};
@@ -41,7 +41,60 @@ fn default_constraint_name(table: &TableName, column: &str) -> String {
     format!("DF_{}_{}", table.name, column)
 }
 
-pub fn emit(change: &Change) -> Sql {
+/// The `WITH (ONLINE = ON)` suffix, where the statement takes one.
+///
+/// # Why an unsupported edition is not caught here
+///
+/// ONLINE index operations are Enterprise-only, and the emitter is offline: it
+/// cannot know which edition this plan will meet. `plan --db` reads
+/// `SERVERPROPERTY('Edition')` and refuses there (see [`crate::edition`]),
+/// where the answer is a fact rather than a guess (ADR-0003 decision 3).
+fn online(strategy: Strategy) -> &'static str {
+    if strategy.online {
+        " WITH (ONLINE = ON)"
+    } else {
+        ""
+    }
+}
+
+/// Whether this change's statements would actually carry `WITH (ONLINE = ON)`.
+///
+/// # Why this is asked of the emitter rather than listed
+///
+/// Only some statements take the clause: a UNIQUE constraint is index-backed
+/// and does, a foreign key and a check are metadata only and it is a syntax
+/// error there. A second list of change kinds saying so would be a copy of
+/// knowledge that lives above, and the two would drift — with the cost falling
+/// on [`crate::edition::online_not_supported`], which would refuse a plan the
+/// server would have run happily. Emitting is pure and cheap, so it answers for
+/// itself.
+///
+/// A change the emitter cannot express is not online: it will fail the plan for
+/// its own reasons, with its own error.
+///
+/// The two emissions are compared rather than the text searched. Searching
+/// would read the user's own SQL — a column default of `'ONLINE = ON'`, a check
+/// comparing against that string — and report an online clause the statement
+/// does not have, refusing a valid plan on Standard edition. What differs
+/// between the two emissions is exactly what the strategy added, and nothing
+/// else can get into that difference.
+pub fn takes_online(change: &Change) -> bool {
+    let sql = |online| {
+        emit(change, Strategy { online }).map(|stmts| {
+            stmts
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    };
+    match (sql(true), sql(false)) {
+        (Ok(with), Ok(without)) => with != without,
+        _ => false,
+    }
+}
+
+pub fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
         Change::CreateTable { name, table, .. } => create_table(name, table),
 
@@ -97,11 +150,12 @@ pub fn emit(change: &Change) -> Sql {
         } => {
             let normalized = types::normalize(to)?;
             one(format!(
-                "ALTER TABLE {} ALTER COLUMN {} {} {};",
+                "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
                 qualified(&column.table)?,
                 quote(&column.name)?,
                 normalized,
-                null_clause(*to_nullable)
+                null_clause(*to_nullable),
+                online(strategy)
             ))
         }
 
@@ -113,11 +167,12 @@ pub fn emit(change: &Change) -> Sql {
         } => {
             let normalized = types::normalize(ty)?;
             one(format!(
-                "ALTER TABLE {} ALTER COLUMN {} {} {};",
+                "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
                 qualified(&column.table)?,
                 quote(&column.name)?,
                 normalized,
-                null_clause(*to_nullable)
+                null_clause(*to_nullable),
+                online(strategy)
             ))
         }
 
@@ -159,9 +214,10 @@ pub fn emit(change: &Change) -> Sql {
             }
             if let Some(pk) = to {
                 out.push(Statement::new(format!(
-                    "ALTER TABLE {} ADD {};",
+                    "ALTER TABLE {} ADD {}{};",
                     qualified(table)?,
-                    primary_key_clause(pk)?
+                    primary_key_clause(pk)?,
+                    online(strategy)
                 )));
             }
             Ok(out)
@@ -172,10 +228,11 @@ pub fn emit(change: &Change) -> Sql {
             name,
             constraint,
         } => one(format!(
-            "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({});",
+            "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({}){};",
             qualified(table)?,
             quote(name)?,
-            column_list(&constraint.columns)?
+            column_list(&constraint.columns)?,
+            online(strategy)
         )),
 
         Change::AddForeignKey {
@@ -199,8 +256,13 @@ pub fn emit(change: &Change) -> Sql {
             constraint.expression
         )),
 
-        // All three are the same statement; the risk they carry differs, but the
-        // engine has one way to remove a table-level constraint.
+        // No ONLINE clause on any of the three, for two different reasons. A
+        // foreign key and a check are metadata only, where the clause is a
+        // syntax error rather than a no-op. A UNIQUE constraint *is* backed by
+        // an index, but dropping one takes the option only when that index is
+        // clustered — and this emitter writes no CLUSTERED, so every constraint
+        // it creates is nonclustered and the statement would be rejected even on
+        // Enterprise. Building one online is a different matter: see AddUnique.
         Change::DropUnique { table, name }
         | Change::DropForeignKey { table, name }
         | Change::DropCheck { table, name } => one(format!(
@@ -209,14 +271,83 @@ pub fn emit(change: &Change) -> Sql {
             quote(name)?
         )),
 
-        Change::AddIndex { table, name, index } => one(create_index(table, name, index)?),
+        Change::AddIndex { table, name, index } => one(create_index(table, name, index, strategy)?),
 
+        // No ONLINE clause, deliberately. SQL Server accepts `WITH (ONLINE =
+        // ON)` on a drop only for a **clustered** index, where the drop rebuilds
+        // the table as a heap and there is something to do online; every index
+        // this emitter creates is nonclustered (introspection excludes clustered
+        // ones), so the clause would be rejected even on Enterprise. Dropping a
+        // nonclustered index is metadata anyway, which is why nothing is lost.
         Change::DropIndex { table, name } => one(format!(
             "DROP INDEX {} ON {};",
             quote(name)?,
             qualified(table)?
         )),
+
+        // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
+        // because it is idempotent: it **preserves the permissions** granted on
+        // the object, which drop + create silently destroys (ADR-0002).
+        Change::CreateModule { name, module } | Change::AlterModule { name, module } => Ok(vec![
+            Statement::new(module_definition(name, module)?).own_batch(),
+        ]),
+
+        Change::DropModule { name, kind } => {
+            one(format!("DROP {} {};", keyword(*kind), qualified(name)?))
+        }
     }
+}
+
+/// The T-SQL keyword for a module kind.
+const fn keyword(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::View => "VIEW",
+        ModuleKind::Procedure => "PROCEDURE",
+        ModuleKind::Function => "FUNCTION",
+        ModuleKind::Trigger => "TRIGGER",
+    }
+}
+
+/// The whole `CREATE OR ALTER` statement for a module.
+///
+/// The emitter composes the prefix and the declaration holds the body, so SQL
+/// still appears exactly once here — and the text this produces is the text the
+/// engine stores verbatim in `sys.sql_modules`, which is what makes the
+/// round trip of [`crate::introspect::split_module`] exact for anything pbps
+/// wrote (ADR-0002).
+///
+/// It is [`Statement::own_batch`] because T-SQL requires it: `CREATE VIEW`,
+/// `CREATE PROCEDURE`, `CREATE FUNCTION` and `CREATE TRIGGER` must each be the
+/// only statement in their batch.
+pub fn module_definition(name: &ObjectName, module: &Module) -> Result<String, DialectError> {
+    let body = module.definition.trim();
+    if body.is_empty() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!("module `{name}` has an empty definition"),
+        });
+    }
+    let head = format!(
+        "CREATE OR ALTER {} {}",
+        keyword(module.kind),
+        qualified(name)?
+    );
+    Ok(match module.kind {
+        // The `AS` is the emitter's, so a view's definition is just its query —
+        // which is what a reader of the declarations wants to see.
+        ModuleKind::View => format!("{head}\nAS\n{body}"),
+        ModuleKind::Trigger => {
+            let on = module.on.as_ref().ok_or_else(|| DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!("trigger `{name}` does not say which table it is on"),
+            })?;
+            format!("{head}\nON {}\n{body}", qualified(on)?)
+        }
+        // A parameter list is part of the object's contract, and modelling
+        // T-SQL parameter syntax would mean parsing SQL. So everything after
+        // the name is the user's.
+        ModuleKind::Procedure | ModuleKind::Function => format!("{head}\n{body}"),
+    })
 }
 
 fn one(sql: String) -> Sql {
@@ -302,7 +433,12 @@ fn foreign_key_clause(name: &str, fk: &ForeignKey) -> Result<String, DialectErro
     Ok(s)
 }
 
-fn create_index(table: &TableName, name: &str, index: &Index) -> Result<String, DialectError> {
+fn create_index(
+    table: &TableName,
+    name: &str,
+    index: &Index,
+    strategy: Strategy,
+) -> Result<String, DialectError> {
     let keys = index
         .columns
         .iter()
@@ -328,6 +464,7 @@ fn create_index(table: &TableName, name: &str, index: &Index) -> Result<String, 
     if let Some(filter) = &index.filter {
         s.push_str(&format!(" WHERE ({filter})"));
     }
+    s.push_str(online(strategy));
     s.push(';');
     Ok(s)
 }
@@ -377,7 +514,14 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         )));
     }
     for (n, idx) in &table.indexes {
-        out.push(Statement::new(create_index(name, n, idx)?));
+        // No ONLINE here: the table was created by the statement above it and
+        // holds no rows, so there is nothing for an online build to spare.
+        out.push(Statement::new(create_index(
+            name,
+            n,
+            idx,
+            Strategy::default(),
+        )?));
     }
     Ok(out)
 }
@@ -387,17 +531,22 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
     // `sp_rename` cannot move a table between schemas, and `ALTER SCHEMA
     // TRANSFER` cannot rename it. A rename that does both therefore needs both,
     // in this order: transfer first, then rename inside the new schema.
+    // Each statement declares what it does to the name (`Statement::renaming`).
+    // Between the two the table is at `[new schema].[old name]`, which is in
+    // neither the baseline nor the plan — and a staged apply checkpoints there.
     let mut current = from.clone();
     if from.schema != to.schema {
+        let moved = TableName::new(to.schema.clone(), current.name.clone());
         out.push(
             Statement::new(format!(
                 "ALTER SCHEMA {} TRANSFER {};",
                 quote(&to.schema)?,
                 qualified(&current)?
             ))
-            .own_batch(),
+            .own_batch()
+            .renaming(current.clone(), moved.clone()),
         );
-        current = TableName::new(to.schema.clone(), current.name.clone());
+        current = moved;
     }
     if current.name != to.name {
         out.push(
@@ -408,7 +557,8 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
                 literal(&qualified(&current)?),
                 literal(&to.name)
             ))
-            .own_batch(),
+            .own_batch()
+            .renaming(current.clone(), to.clone()),
         );
     }
     Ok(out)
@@ -416,6 +566,12 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
 
 /// Drops the primary key, looking its name up when the declarations do not
 /// carry one.
+/// No ONLINE clause: the option is accepted on a constraint drop only when the
+/// constraint's index is clustered, and the model does not record clusteredness
+/// — [`crate::introspect`] does not read it back, so a primary key adopted as
+/// `NONCLUSTERED` is indistinguishable here from a clustered one. Emitting the
+/// hint on a guess would produce a statement the server rejects outright, which
+/// is worse than an offline drop of a key that was going to be rebuilt anyway.
 fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, DialectError> {
     let q = qualified(table)?;
     Ok(match &pk.name {
@@ -461,7 +617,19 @@ mod tests {
         s.parse().unwrap()
     }
     fn sql_of(c: &Change) -> Vec<String> {
-        emit(c).unwrap().into_iter().map(|s| s.sql).collect()
+        emit(c, Strategy::default())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.sql)
+            .collect()
+    }
+
+    fn online_sql_of(c: &Change) -> Vec<String> {
+        emit(c, Strategy { online: true })
+            .unwrap()
+            .into_iter()
+            .map(|s| s.sql)
+            .collect()
     }
 
     #[test]
@@ -620,6 +788,54 @@ mod tests {
         );
     }
 
+    /// Each statement declares what it does to the name, so nothing downstream
+    /// has to re-derive the emitter's statement order. A staged apply
+    /// checkpoints between these two, and `[app].[old_name]` is the only name
+    /// under which the table can be found at that moment.
+    #[test]
+    fn a_cross_schema_rename_declares_both_halves_of_the_move() {
+        let stmts = emit(
+            &Change::RenameTable {
+                uid: uid("t_k7x2mq"),
+                from: tname("dbo.old_name"),
+                to: tname("app.new_name"),
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+        assert_eq!(
+            stmts[0].renames,
+            [(tname("dbo.old_name"), tname("app.old_name"))]
+        );
+        assert_eq!(
+            stmts[1].renames,
+            [(tname("app.old_name"), tname("app.new_name"))]
+        );
+
+        // A rename within one schema is one statement and has no intermediate.
+        let stmts = emit(
+            &Change::RenameTable {
+                uid: uid("t_k7x2mq"),
+                from: tname("dbo.old_name"),
+                to: tname("dbo.new_name"),
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0].renames,
+            [(tname("dbo.old_name"), tname("dbo.new_name"))]
+        );
+
+        // And a statement that renames nothing says nothing.
+        assert!(
+            emit(&an_index(), Strategy::default()).expect("emit")[0]
+                .renames
+                .is_empty()
+        );
+    }
+
     /// A column drop must clear its default constraint first, and the name is
     /// looked up because a column pbps did not create carries a generated one.
     #[test]
@@ -754,21 +970,182 @@ mod tests {
 
     #[test]
     fn statements_that_declare_variables_get_their_own_batch() {
-        let stmts = emit(&Change::DropColumn {
-            uid: uid("c_k7x2mq"),
-            column: cref("dbo.t.legacy"),
-        })
+        let stmts = emit(
+            &Change::DropColumn {
+                uid: uid("c_k7x2mq"),
+                column: cref("dbo.t.legacy"),
+            },
+            Strategy::default(),
+        )
         .unwrap();
         assert!(stmts[0].own_batch);
     }
 
     #[test]
     fn a_table_with_no_columns_is_refused() {
-        let r = emit(&Change::CreateTable {
-            uid: uid("t_k7x2mq"),
-            name: tname("dbo.empty"),
-            table: Box::new(Table::default()),
-        });
+        let r = emit(
+            &Change::CreateTable {
+                uid: uid("t_k7x2mq"),
+                name: tname("dbo.empty"),
+                table: Box::new(Table::default()),
+            },
+            Strategy::default(),
+        );
         assert!(r.is_err());
+    }
+
+    // ---- strategy: online (ADR-0003) ----
+
+    fn an_index() -> Change {
+        Change::AddIndex {
+            table: tname("dbo.order_line"),
+            name: "ix_order_line_order".into(),
+            index: Box::new(Index {
+                columns: vec![IndexColumn {
+                    name: "order_id".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            }),
+        }
+    }
+
+    /// The hint is what a user wrote to keep a large table in service; if the
+    /// emitter dropped it, the tool would report an online rebuild and take an
+    /// exclusive lock instead.
+    #[test]
+    fn online_reaches_the_statements_that_take_it() {
+        assert_eq!(
+            online_sql_of(&an_index()),
+            [
+                "CREATE INDEX [ix_order_line_order] ON [dbo].[order_line] ([order_id] ASC) WITH (ONLINE = ON);"
+            ]
+        );
+        assert_eq!(
+            online_sql_of(&Change::AlterColumnNullability {
+                uid: uid("c_k7x2mq"),
+                column: cref("dbo.order_line.note"),
+                ty: ty("nvarchar(100)"),
+                to_nullable: false,
+            }),
+            [
+                "ALTER TABLE [dbo].[order_line] ALTER COLUMN [note] nvarchar(100) NOT NULL WITH (ONLINE = ON);"
+            ]
+        );
+        assert_eq!(
+            online_sql_of(&Change::AddUnique {
+                table: tname("dbo.order_line"),
+                name: "uq_line".into(),
+                constraint: UniqueConstraint {
+                    columns: vec!["order_id".into()],
+                },
+            }),
+            [
+                "ALTER TABLE [dbo].[order_line] ADD CONSTRAINT [uq_line] UNIQUE ([order_id]) WITH (ONLINE = ON);"
+            ]
+        );
+    }
+
+    /// Whether a change carries the clause is decided by comparing the two
+    /// emissions, never by searching the text: a default or a check the user
+    /// wrote can contain those very words, and a search would refuse a valid
+    /// plan on Standard edition over a string literal.
+    #[test]
+    fn an_expression_that_mentions_online_is_not_an_online_statement() {
+        let mut column = Column::new(ty("nvarchar(20)"));
+        column.default = Some("'ONLINE = ON'".into());
+        assert!(!takes_online(&Change::AddColumn {
+            uid: uid("c_k7x2mq"),
+            table: tname("dbo.order_line"),
+            name: "note".into(),
+            column: Box::new(column),
+        }));
+        assert!(!takes_online(&Change::AddCheck {
+            table: tname("dbo.order_line"),
+            name: "ck_note".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "note <> 'ONLINE = ON'".into(),
+            },
+        }));
+        // And a statement that really takes it still says so.
+        assert!(takes_online(&an_index()));
+    }
+
+    /// `WITH (ONLINE = ON)` is a syntax error on a statement that is metadata
+    /// only, so a hint that reached one would turn a performance annotation
+    /// into a failed deployment.
+    #[test]
+    fn online_is_left_off_the_statements_that_cannot_take_it() {
+        for change in [
+            // The two nonclustered drops belong here too: the option exists on
+            // a drop only for a clustered index, and the emitter creates no
+            // clustered ones.
+            Change::DropUnique {
+                table: tname("dbo.order_line"),
+                name: "uq_line".into(),
+            },
+            Change::DropIndex {
+                table: tname("dbo.order_line"),
+                name: "ix_old".into(),
+            },
+            Change::DropForeignKey {
+                table: tname("dbo.order_line"),
+                name: "fk_line_order".into(),
+            },
+            Change::DropCheck {
+                table: tname("dbo.order_line"),
+                name: "ck_line_qty".into(),
+            },
+            Change::AddCheck {
+                table: tname("dbo.order_line"),
+                name: "ck_line_qty".into(),
+                constraint: CheckConstraint {
+                    expression: "qty > 0".into(),
+                },
+            },
+        ] {
+            for sql in online_sql_of(&change) {
+                assert!(!sql.contains("ONLINE"), "{sql}");
+            }
+        }
+    }
+
+    /// A table created by the same plan holds no rows, so an online build would
+    /// buy nothing and would only add noise to the plan a human reads.
+    #[test]
+    fn a_new_tables_indexes_are_not_built_online() {
+        let mut t = Table::default();
+        t.columns
+            .insert("order_id".into(), Column::new(ty("bigint")).not_null());
+        t.indexes.insert(
+            "ix_new".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "order_id".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            },
+        );
+        let sql = online_sql_of(&Change::CreateTable {
+            uid: uid("t_k7x2mq"),
+            name: tname("dbo.order_line"),
+            table: Box::new(t),
+        });
+        assert!(sql.iter().all(|s| !s.contains("ONLINE")), "{sql:?}");
+    }
+
+    /// Without the hint nothing changes at all: `strategy:` is opt-in, and a
+    /// project that never writes one must get byte-identical SQL.
+    #[test]
+    fn without_the_hint_the_sql_is_untouched() {
+        assert_eq!(
+            sql_of(&an_index()),
+            ["CREATE INDEX [ix_order_line_order] ON [dbo].[order_line] ([order_id] ASC);"]
+        );
     }
 }

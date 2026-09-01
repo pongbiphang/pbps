@@ -3,6 +3,7 @@
 mod baseline;
 mod db;
 mod deploy;
+mod dev;
 mod hooks;
 mod report;
 mod status;
@@ -73,6 +74,16 @@ enum Command {
         /// Write the plan as a SQL script (a preview; never hand-edited)
         #[arg(long)]
         sql: Option<PathBuf>,
+
+        /// Plan one logical change for a staged apply: run outside a transaction,
+        /// one statement at a time, with a checkpoint in the ledger. Needs --db/--env
+        #[arg(long)]
+        staged: bool,
+
+        /// Rehearse the plan against a throwaway engine: "docker://<image>", or a
+        /// connection string to a server pbps may create a scratch database on
+        #[arg(long)]
+        dev: Option<String>,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
@@ -149,6 +160,14 @@ enum Command {
         /// Risk classes this deployment is approved for, comma-separated
         #[arg(long, value_delimiter = ',')]
         allow: Vec<pbps_model::RiskClass>,
+
+        /// Apply a staged plan: outside a transaction, one statement at a time
+        #[arg(long)]
+        staged: bool,
+
+        /// Continue a staged apply that stopped part-way through
+        #[arg(long, requires = "staged")]
+        resume: bool,
     },
 
     /// Check the live database against its recorded state
@@ -282,6 +301,8 @@ fn run() -> anyhow::Result<()> {
             check,
             out,
             sql,
+            staged,
+            dev,
         } => {
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
@@ -295,23 +316,63 @@ fn run() -> anyhow::Result<()> {
                 if base.is_some() {
                     bail!("--base and --db name two different baselines; pass one of them");
                 }
+                if dev.is_some() {
+                    // A rehearsal answers "would this compile and converge",
+                    // which is a preview's question. `plan --db` produces the
+                    // artifact the deployment gate approves, and mixing the two
+                    // would invite a dev-verified plan to be read as a
+                    // target-verified one (SPEC §9.3).
+                    bail!(
+                        "--dev rehearses a preview and --db computes the plan for a real \
+                         environment; run them separately"
+                    );
+                }
                 let target = target.resolve(&project)?;
-                return deploy::cmd_plan_db(&project, &target, out.as_deref(), sql.as_deref());
+                return deploy::cmd_plan_db(
+                    &project,
+                    &target,
+                    out.as_deref(),
+                    sql.as_deref(),
+                    staged,
+                );
+            }
+            if staged {
+                // Staged execution is a property of a plan that is going to be
+                // applied, and an offline plan never is (SPEC §7.3).
+                bail!(
+                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env"
+                );
             }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
                 None if since == "HEAD" => baseline::default_source(&project),
                 None => baseline::Source::Git { rev: since },
             };
-            cmd_plan(&project, &source, check, out.as_deref(), sql.as_deref())
+            cmd_plan(
+                &project,
+                &source,
+                check,
+                out.as_deref(),
+                sql.as_deref(),
+                dev.as_deref(),
+            )
         }
         Command::Apply {
             target,
             plan,
             allow,
+            staged,
+            resume,
         } => {
             let target = target.resolve(&project)?;
-            deploy::cmd_apply(&project, &target, &plan, &allow.into_iter().collect())
+            deploy::cmd_apply(
+                &project,
+                &target,
+                &plan,
+                &allow.into_iter().collect(),
+                staged,
+                resume,
+            )
         }
         Command::Validate => cmd_validate(&project),
         Command::Fmt { check } => cmd_fmt(&project, check),
@@ -447,15 +508,17 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         eprintln!("warning: {w}");
     }
 
-    // Modules are not managed yet (ADR-0002), but staying quiet about them
-    // would tell the user the database is fully covered when it is not.
+    // What pbps cannot manage it still names (ADR-0002): an encrypted module or
+    // one whose shape the emitter cannot reproduce is left alone, and a pull
+    // that stayed quiet about it would tell the user the database is fully
+    // covered when it is not.
     if !pulled.unmanaged_modules.is_empty() {
         eprintln!(
-            "note: {} object(s) exist in the database that pbps does not manage yet:",
+            "note: {} object(s) in this database cannot be managed:",
             pulled.unmanaged_modules.len()
         );
         for m in &pulled.unmanaged_modules {
-            eprintln!("  {} {}", m.kind, m.name);
+            eprintln!("  {} {} — {}", m.kind, m.name, m.why);
         }
         eprintln!(
             "  They are left untouched: pbps will neither change nor drop them, and they do not appear in any plan."
@@ -469,16 +532,63 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
 
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for (name, table) in &pulled.schema.tables {
         let path = dir.join(format!("{}.{}.yml", name.schema, name.name));
         std::fs::write(&path, pbps_load::render(name, table, &[], None))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
     }
+    // Modules go into files of their own, named for the kind as well as the
+    // object: a view and a table cannot collide in the database, so they must
+    // not collide on disk either (ADR-0002).
+    for (name, module) in &pulled.schema.modules {
+        let path = dir.join(format!(
+            "{}.{}.{}.yml",
+            name.schema,
+            name.name,
+            module.kind.as_str()
+        ));
+        std::fs::write(
+            &path,
+            pbps_load::render_module(name, module, &Default::default()),
+        )
+        .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
+
+    // What a forced pull did not write, it removes. Leaving it would be worse
+    // than deleting it: a declaration for an object that is gone plans its
+    // recreation, and a view that became a procedure would leave
+    // `dbo.x.view.yml` beside `dbo.x.procedure.yml` — two files declaring one
+    // name, which `validate` refuses and every later load fails on. `--force`
+    // already means "replace my declarations with this database"; this is the
+    // rest of that sentence.
+    let mut removed = Vec::new();
+    for path in pbps_load::schema_files(&dir).unwrap_or_default() {
+        if written.contains(&path) {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("cannot remove the stale `{}`", path.display()))?;
+        removed.push(path);
+    }
+    if !removed.is_empty() {
+        eprintln!(
+            "removed {} declaration file(s) for objects this database does not have:",
+            removed.len()
+        );
+        for p in &removed {
+            eprintln!("  {}", p.display());
+        }
+    }
+
     write_ids(project, &res.ids)?;
 
     println!(
-        "Pulled {} table(s) into `{}` and minted `{}`.",
+        "Pulled {} table(s) and {} module(s) into `{}` and minted `{}`.",
         pulled.schema.tables.len(),
+        pulled.schema.modules.len(),
         dir.display(),
         project.ids_file().display()
     );
@@ -585,16 +695,37 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
                 dialect_problems += 1;
             }
         }
+        for (name, module) in &l.schema.modules {
+            for e in dialect.validate_module(name, module) {
+                eprintln!("  {name}: {e}");
+                dialect_problems += 1;
+            }
+        }
+        // Two problems only the whole schema can see: a module named after a
+        // table, and a trigger on a table nobody declares. Both would otherwise
+        // surface as an engine error at apply time, on a database that is
+        // already half-changed.
+        for problem in pbps_model::module::check_names(&l.schema) {
+            eprintln!("  {problem}");
+            dialect_problems += 1;
+        }
+        // And a third: a `depends_on:` naming a module nobody declared. It is
+        // silently a no-op in the ordering, so nothing else would ever say so.
+        for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
+            eprintln!("  {problem}");
+            dialect_problems += 1;
+        }
         if dialect_problems == 0 {
             println!(
-                "Declarations are valid for {}: {} table(s), {} column(s).",
+                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
                 dialect.name(),
                 l.schema.tables.len(),
                 l.schema
                     .tables
                     .values()
                     .map(|t| t.columns.len())
-                    .sum::<usize>()
+                    .sum::<usize>(),
+                l.schema.modules.len()
             );
         }
     }
@@ -653,24 +784,32 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     for path in &files {
         let original = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read `{}`", path.display()))?;
-        let loaded = pbps_load::load_table_str(path, &original).map_err(|errs| {
+        let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
             for e in &errs {
                 eprintln!("{:?}", miette::Report::msg(format!("{e}")));
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
 
-        let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = loaded
-            .intents
-            .iter()
-            .cloned()
-            .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
-        let rendered = pbps_load::render(
-            &loaded.name,
-            &loaded.table,
-            &pending,
-            loaded.strategy.as_ref(),
-        );
+        let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
+            pbps_load::LoadedFile::Module(m) => (
+                // A module has no one-shot annotations to absorb: it carries no
+                // identity, so there is no rename intent to record (ADR-0002).
+                pbps_load::render_module(&m.name, &m.module, &m.depends_on),
+                Vec::new(),
+            ),
+            pbps_load::LoadedFile::Table(t) => {
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = t
+                    .intents
+                    .iter()
+                    .cloned()
+                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                (
+                    pbps_load::render(&t.name, &t.table, &pending, t.strategy.as_ref()),
+                    absorbed,
+                )
+            }
+        };
         if rendered == original {
             continue;
         }
@@ -742,6 +881,7 @@ fn cmd_plan(
     check: bool,
     out: Option<&std::path::Path>,
     sql: Option<&std::path::Path>,
+    dev: Option<&str>,
 ) -> anyhow::Result<()> {
     let loaded = load(project)?;
     let ids = read_ids(project)?;
@@ -788,6 +928,22 @@ fn cmd_plan(
         );
     }
 
+    // Drop ordering is computed over the *baseline's* modules, so it needs the
+    // annotations that travelled with that revision. A module this revision
+    // removes declares no `depends_on:` any more, and the edge it recorded is
+    // one the identifier scan could not find — so without this the drops fall
+    // back to name order and can remove a dependency before its dependent.
+    // Declared hints win where both sides have an entry: the current revision is
+    // the one being planned. (`plan --db` cannot do the same; its baseline is
+    // the ledger, which records the state, not the annotations beside it.)
+    let mut hints = loaded.hints.clone();
+    for (name, deps) in &base.hints.module_deps {
+        hints
+            .module_deps
+            .entry(name.clone())
+            .or_insert_with(|| deps.clone());
+    }
+
     let cs = pbps_diff::diff(
         Side {
             schema: &base.schema,
@@ -798,6 +954,7 @@ fn cmd_plan(
             ids: &res.ids,
         },
         dialect.as_ref(),
+        &hints,
     )
     .map_err(|errs| {
         for e in &errs {
@@ -808,6 +965,17 @@ fn cmd_plan(
 
     println!("Baseline: {}", base.description);
     print!("{}", report::plan(&cs));
+
+    // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
+    // offline plan has no edition to ask. Saying so is the honest form of a
+    // preview — the alternative is a plan.sql that reads as verified and turns
+    // out to be Enterprise-only at the deployment gate.
+    if cs.changes.iter().any(|c| c.strategy.online) {
+        println!(
+            "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
+             Enterprise-only, and only `pbps plan --db` can read the target's edition."
+        );
+    }
 
     if let Some(path) = out {
         // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
@@ -838,6 +1006,43 @@ fn cmd_plan(
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         println!("wrote {}", path.display());
+    }
+
+    // The dev database is optional and is asked last: everything above is what
+    // a plan produces with no engine in the room, and it must be identical
+    // whether or not one is available (SPEC §9.3).
+    if check && dev.is_some() {
+        bail!("--check is the CI file check; it changes nothing and connects to nothing");
+    }
+    // The refusal above is for the flag; the `dev:` block in pbps.yml has to be
+    // skipped rather than refused, or a project that configures one could never
+    // run `plan --check` at all. Either way --check must not start a container
+    // or open a connection: it is the read-only file check CI runs.
+    let dev_spec = if check {
+        None
+    } else {
+        dev::spec(project, dev)?
+    };
+    if let Some(spec) = dev_spec {
+        let rehearsal = dev::rehearse(
+            project,
+            &spec,
+            &base.schema,
+            &base.ids,
+            &base.hints,
+            &loaded.schema,
+            &res.ids,
+            &statements(&cs, dialect.as_ref())?,
+            dialect.as_ref(),
+            &loaded.hints,
+        )?;
+        print!("{}", report::rehearsal(&rehearsal));
+        if !rehearsal.converged() {
+            bail!(
+                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n\
+                 differences above are what would be left behind"
+            );
+        }
     }
     Ok(())
 }
@@ -879,7 +1084,7 @@ fn statements(
     for p in &cs.changes {
         statements.extend(
             dialect
-                .emit(&p.change)
+                .emit(&p.change, p.strategy)
                 .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?,
         );
     }

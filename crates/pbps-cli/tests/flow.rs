@@ -10,17 +10,32 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 struct Demo {
+    /// The project directory: where `pbps.yml` is.
     dir: PathBuf,
+    /// The git working tree, which is the project directory unless the demo was
+    /// built nested. Removed on drop, so it has to be tracked separately.
+    root: PathBuf,
 }
 
 impl Demo {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("pbps-flow-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        Self::nested(name, "")
+    }
+
+    /// A project `sub` levels below the repo root. `sub` empty puts them at the
+    /// same place, which is the ordinary case.
+    fn nested(name: &str, sub: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("pbps-flow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = if sub.is_empty() {
+            root.clone()
+        } else {
+            root.join(sub)
+        };
         std::fs::create_dir_all(dir.join("schema")).unwrap();
         std::fs::write(dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
 
-        let d = Self { dir };
+        let d = Self { dir, root };
         d.git(&["init", "-q"]);
         d.git(&["config", "user.email", "d@e.f"]);
         d.git(&["config", "user.name", "demo"]);
@@ -30,7 +45,7 @@ impl Demo {
     fn git(&self, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
-            .arg(&self.dir)
+            .arg(&self.root)
             .args(args)
             .output()
             .unwrap();
@@ -62,7 +77,7 @@ impl Demo {
 
 impl Drop for Demo {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -349,7 +364,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
-        "version": 1,
+        "version": 3,
         "kind": "baseline",
         "schema": { "tables": { "dbo.t": { "columns": {
             "id": { "type": "bigint", "nullable": false }
@@ -509,6 +524,30 @@ fn plan_sql_writes_a_tsql_preview() {
         script.contains("CREATE TABLE [dbo].[t] (\n    [id] bigint NOT NULL\n);"),
         "{script}"
     );
+}
+
+/// `strategy: online` has to survive the whole path — load, ids, diff, plan
+/// file, emitter — or a user who declared it would get an exclusive-lock
+/// rebuild on the large table they annotated to avoid exactly that (ADR-0003).
+#[test]
+fn an_online_strategy_reaches_the_emitted_sql_and_says_it_is_unverified() {
+    let d = Demo::new("plan-sql-online");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\nstrategy:\n  online: true\ncolumns:\n  id: {type: bigint, nullable: false}\nindexes:\n  ix_t_id:\n    columns: [id]\n",
+    );
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(script.contains("WITH (ONLINE = ON);"), "{script}");
+    // An offline plan cannot read the target's edition, and a preview that
+    // reads as verified is the one thing worse than no preview.
+    assert!(stdout(&o).contains("unverified"), "{}", stdout(&o));
 }
 
 /// A rename plans as sp_rename — proof the dialect, not a drop+add, is in charge.
@@ -758,6 +797,318 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
     assert!(!err.contains("connect"), "it must not have tried: {err}");
 }
 
+// ---- Phase 3.5: the module model (ADR-0002) ----
+
+impl Demo {
+    fn module(&self, file: &str, body: &str) {
+        std::fs::write(self.dir.join("schema").join(file), body).unwrap();
+    }
+}
+
+const A_VIEW: &str = "view: dbo.active_t\ndefinition: |-\n  SELECT id FROM dbo.t WHERE id > 0\n";
+
+/// A module is part of the desired state, so it must reach the plan and the
+/// SQL — and it must do so as `CREATE OR ALTER`, which preserves the
+/// permissions granted on the object (ADR-0002).
+#[test]
+fn a_view_plans_as_create_or_alter() {
+    let d = Demo::new("module-plan");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+
+    let sql_path = d.dir.join("preview.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("+ create view"), "{}", stdout(&o));
+
+    let script = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        // No terminator is added: the stored text is what pbps sent, and a
+        // semicolon the declaration did not have would come back as part of the
+        // body and read as a change on every plan thereafter.
+        script.contains(
+            "CREATE OR ALTER VIEW [dbo].[active_t]\nAS\nSELECT id FROM dbo.t WHERE id > 0"
+        ),
+        "{script}"
+    );
+    // The view selects a column, so the table has to exist first.
+    assert!(
+        script.find("CREATE TABLE").unwrap() < script.find("CREATE OR ALTER").unwrap(),
+        "{script}"
+    );
+}
+
+/// Modules carry no data, so they carry no identity: a removed one is a drop
+/// that needs no tombstone and no reason — but it still faces the gate, because
+/// what it destroys is the validity of whatever depends on it.
+#[test]
+fn a_removed_module_drops_without_intent_but_needs_approval() {
+    let d = Demo::new("module-drop");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    std::fs::remove_file(d.dir.join("schema/v.yml")).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a module drop must not need intent recorded first: {}",
+        stderr(&o)
+    );
+    assert!(stdout(&o).contains("- drop view"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("--allow destructive"), "{}", stdout(&o));
+    assert!(
+        !std::fs::read_to_string(d.ids_path())
+            .unwrap()
+            .contains("active_t"),
+        "a module must never enter the identity file"
+    );
+}
+
+/// Reindenting a definition is not a change. A tool that re-stated every view
+/// on every deploy would teach reviewers to skim the plan.
+#[test]
+fn reformatting_a_definition_is_not_a_change() {
+    let d = Demo::new("module-noop");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.module(
+        "v.yml",
+        "view: dbo.active_t\ndefinition: |-\n  SELECT id\n  FROM dbo.t\n  WHERE id > 0\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+}
+
+/// SQL Server keeps tables and modules in one namespace per schema, so a view
+/// named after a table is a collision the engine would only report at apply
+/// time — on a database that is already half-changed.
+#[test]
+fn a_module_named_after_a_table_is_refused() {
+    let d = Demo::new("module-clash");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", "view: dbo.t\ndefinition: SELECT 1\n");
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("already declared"), "{}", stderr(&o));
+}
+
+/// A trigger has to name a table that is actually managed here, or pbps would
+/// be maintaining a trigger on an object it knows nothing about.
+#[test]
+fn a_trigger_on_an_undeclared_table_is_refused() {
+    let d = Demo::new("module-trigger");
+    d.table(ONE_COLUMN);
+    d.module(
+        "trg.yml",
+        "trigger: dbo.trg_audit\non: dbo.absent\ndefinition: |-\n  AFTER INSERT AS SELECT 1;\n",
+    );
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    assert!(stderr(&o).contains("not declared here"), "{}", stderr(&o));
+}
+
+/// `fmt` owns the file format for modules too, and a definition is exactly the
+/// kind of text YAML quoting mangles.
+#[test]
+fn fmt_canonicalises_a_module_file() {
+    let d = Demo::new("module-fmt");
+    d.table(ONE_COLUMN);
+    d.module(
+        "v.yml",
+        "view: dbo.active_t\ndefinition: \"SELECT id FROM dbo.t\"\n",
+    );
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let written = std::fs::read_to_string(d.dir.join("schema/v.yml")).unwrap();
+    assert!(written.contains("definition: |-"), "{written}");
+    assert_eq!(
+        code(&d.run(&["fmt", "--check"])),
+        0,
+        "fmt is not idempotent"
+    );
+}
+
+// ---- Phase 3.5: staged apply (ADR-0003 decision 2) ----
+
+/// Staged execution is a property of a plan that is going to be applied, and an
+/// offline plan never is. Accepting the flag there would write "staged" into a
+/// preview nobody can apply.
+#[test]
+fn staged_needs_a_target() {
+    let d = Demo::new("staged-offline");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--staged"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("--db or --env"), "{}", stderr(&o));
+}
+
+/// Writes a plan file by hand: the mode check is a property of the artifact,
+/// and it is made before the plan's contents matter at all — so an empty change
+/// list is enough, and nothing here has to connect.
+fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
+    let path = d.dir.join(name);
+    let plan = format!(
+        r#"{{
+  "version": 2,
+  "origin": "database",
+  "mode": "{mode}",
+  "dialect": "mssql",
+  "created_at": "2026-08-31T09:00:00Z",
+  "baseline": {{ "description": "prod as queried (entry #1)", "checksum": "deadbeef" }},
+  "changes": {{ "changes": [] }},
+  "ids": {{ "version": 1, "tables": {{}}, "columns": {{}} }}
+}}
+"#
+    );
+    std::fs::write(&path, plan).unwrap();
+    path
+}
+
+/// The mode lives in the file because that is what the deployment gate
+/// approved; running whichever the operator typed would be the tool choosing
+/// the loser of a disagreement.
+#[test]
+fn apply_refuses_a_mode_the_plan_does_not_declare() {
+    let d = Demo::new("staged-mode");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+
+    let unreachable = "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p";
+
+    // A transactional plan applied with --staged.
+    let plain = write_plan(&d, "plain.json", "transactional");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        unreachable,
+        "--plan",
+        plain.to_str().unwrap(),
+        "--staged",
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("transactional plan"), "{}", stderr(&o));
+
+    // ...and a staged plan applied without it.
+    let staged = write_plan(&d, "staged.json", "staged");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        unreachable,
+        "--plan",
+        staged.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("staged plan"), "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("connect"),
+        "the refusal must happen before connecting: {}",
+        stderr(&o)
+    );
+}
+
+/// `--resume` continues a staged apply, so asking for it on a transactional one
+/// is a mistake worth naming rather than quietly ignoring.
+#[test]
+fn resume_without_staged_is_refused() {
+    let d = Demo::new("staged-resume");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    let plain = write_plan(&d, "plain.json", "transactional");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plain.to_str().unwrap(),
+        "--resume",
+    ]);
+    assert_ne!(code(&o), 0);
+}
+
+// ---- the optional dev database (SPEC §9.3) ----
+
+/// A rehearsal answers a preview's question; `plan --db` produces the artifact
+/// the deployment gate approves. Combining them would invite a dev-verified
+/// plan to be read as a target-verified one.
+#[test]
+fn dev_and_db_are_refused_together() {
+    let d = Demo::new("dev-and-db");
+    d.table(ONE_COLUMN);
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--dev",
+        "docker://mcr.microsoft.com/mssql/server:2022-latest",
+    ]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("separately"), "{}", stderr(&o));
+}
+
+/// The air-gap promise of §9.1: with no dev database configured, `plan` does
+/// exactly what it always did and says nothing about one.
+#[test]
+fn a_plan_without_a_dev_database_never_mentions_one() {
+    let d = Demo::new("dev-absent");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("rehearsal"), "{}", stdout(&o));
+}
+
+/// `dev.url_env` names the variable, never the string. An unset one has to say
+/// which variable and offer the flag, or a developer is left guessing.
+#[test]
+fn an_unset_dev_variable_names_itself() {
+    let d = Demo::new("dev-env");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\ndev:\n  url_env: PBPS_DEV_CONN_ABSENT\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 1);
+    assert!(
+        stderr(&o).contains("PBPS_DEV_CONN_ABSENT"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// The rehearsal itself, against a real engine: the declarations have to
+/// compile and the plan has to converge on them (SPEC §9.3, §11.5 invariant 3).
+///
+/// `#[ignore]`d like the other live tests — run it with
+/// `PBPS_TEST_DB=... cargo test -p pbps-cli --test flow -- --ignored`, or
+/// through `scripts/live-tests.sh`, which sets the variable.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_rehearsal_against_a_real_engine_reports_convergence() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("dev-live");
+    d.table(ONE_COLUMN);
+    d.module("v.yml", A_VIEW);
+
+    let o = d.run(&["plan", "--dev", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("Dev rehearsal:"), "{out}");
+    assert!(out.contains("converges"), "{out}");
+    // Edition honesty: a green rehearsal must not read as a promise about the
+    // target, and the scratch database must be gone either way.
+    assert!(out.contains("still a preview"), "{out}");
+}
+
 /// A password must not reach a log even when the command fails, and the failure
 /// message is the easiest place to leak one.
 #[test]
@@ -797,4 +1148,97 @@ fn plan_check_and_db_are_refused_together() {
     let o = d.run(&["plan", "--check", "--db", "Server=x;Database=y"]);
     assert_eq!(code(&o), 1);
     assert!(stderr(&o).contains("--check"), "{}", stderr(&o));
+}
+
+/// The project does not have to be the repo root, and the baseline's git paths
+/// have to be right when it is not.
+///
+/// The regression this pins is platform-shaped: computing the path by
+/// canonicalizing and stripping the toplevel prefix works on Linux and fails on
+/// Windows, where `canonicalize` returns a `\\?\` verbatim path and the temp
+/// directory arrives in 8.3 short form. What reached `git show` was then an
+/// absolute path, which resolves to the root tree — and a tree listing parsed
+/// as JSON reports "the identity file is malformed", naming nothing that would
+/// lead anyone to the path. A nested project exercises the same conversion on
+/// every platform.
+#[test]
+fn a_project_below_the_repo_root_reads_its_own_baseline() {
+    let d = Demo::nested("nested", "db/app");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The second plan is the one that has to read the first one's ids file back
+    // out of git: an empty baseline would report the table as newly created.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("extra"), "{s}");
+    assert!(
+        !s.to_lowercase().contains("create table"),
+        "the baseline was not found; the plan re-creates the table:\n{s}"
+    );
+}
+
+/// `--check` is the file check CI runs: it changes nothing and connects to
+/// nothing. Refusing an explicit `--dev` is not enough — a `dev:` block in
+/// pbps.yml would otherwise start a container behind the same command.
+#[test]
+fn check_mode_ignores_a_configured_dev_database() {
+    let d = Demo::new("checkdev");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\ndev:\n  url_env: PBPS_NO_SUCH_VARIABLE\n",
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    // The variable is deliberately unset: reaching `dev::spec` at all fails on
+    // it, so a pass proves the dev database was never resolved.
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("PBPS_NO_SUCH_VARIABLE"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The flag is still refused outright, because asking for one explicitly and
+    // being silently ignored is worse than being told.
+    let o = d.run(&["plan", "--check", "--dev", "docker://mssql"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("--check"), "{}", stderr(&o));
+}
+
+/// `depends_on:` exists for the edges the identifier scan cannot see. Bootstrap
+/// builds from nothing and so drops the online strategies, but dropping the
+/// dependencies with them would make it emit a dependent module first and fail
+/// on declarations that plan perfectly well.
+#[test]
+fn bootstrap_honours_declared_module_dependencies() {
+    let d = Demo::new("bootdeps");
+    d.table(ONE_COLUMN);
+    // Neither definition names the other, so only `depends_on:` can order them.
+    d.module(
+        "dbo.first.yml",
+        "view: dbo.first\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    d.module(
+        "dbo.second.yml",
+        "view: dbo.second\ndepends_on: [dbo.first]\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    d.run(&["plan"]);
+
+    let sql_path = d.dir.join("boot.sql");
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    let first = sql.find("[dbo].[first]").expect(&sql);
+    let second = sql.find("[dbo].[second]").expect(&sql);
+    assert!(first < second, "dependency order was discarded:\n{sql}");
 }

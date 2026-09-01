@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use pbps_dialect::DialectError;
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
-    ReferentialAction, Schema, Table, TableName, TypeArg, UniqueConstraint,
+    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Module,
+    ObjectName, PrimaryKey, ReferentialAction, Schema, Table, TableName, TypeArg, UniqueConstraint,
 };
 
 use crate::types;
@@ -100,50 +100,47 @@ pub struct RawIndexColumn {
     pub is_descending: bool,
 }
 
-/// One view, procedure, function or trigger.
-///
-/// Modules are not managed yet ([ADR-0002](../../../docs/ADR-0002-module-model.md)
-/// targets Phase 3.5), but they must be *seen*: a pull that silently ignores
-/// half the database breaks the adoption story that justifies pull at all. So
-/// they are counted and reported, never converted.
+/// One view, procedure, function or trigger, as `sys.objects` and
+/// `sys.sql_modules` report it (ADR-0002).
 #[derive(Debug, Clone)]
 pub struct RawModule {
     pub schema: String,
     pub name: String,
-    /// `sys.objects.type_desc`, mapped to a word a user recognises.
     pub kind: ModuleKind,
+    /// The definition as stored — the whole `CREATE ...` text, verbatim.
+    ///
+    /// `None` for a CLR object and for one created `WITH ENCRYPTION`: neither
+    /// has a readable definition, and neither can be managed.
+    pub definition: Option<String>,
+    /// A trigger's table, as `(schema, table)`.
+    pub parent: Option<(String, String)>,
+    /// Whether the module was created with `QUOTED_IDENTIFIER` and `ANSI_NULLS`
+    /// both ON, which is what a `CREATE OR ALTER` sent by pbps will run under.
+    ///
+    /// SQL Server persists these two with the module and re-applies them on
+    /// every execution, so a module created with either OFF behaves differently
+    /// from the same text recreated by pbps — double-quoted tokens become string
+    /// literals, or `= NULL` starts matching rows. The model has nowhere to keep
+    /// them (they are options, not definition), so such a module is inventoried
+    /// rather than claimed to round-trip (ADR-0002).
+    pub default_set_options: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ModuleKind {
-    View,
-    Procedure,
-    Function,
-    Trigger,
-}
-
-impl ModuleKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ModuleKind::View => "view",
-            ModuleKind::Procedure => "procedure",
-            ModuleKind::Function => "function",
-            ModuleKind::Trigger => "trigger",
-        }
+/// Maps `sys.objects.type` codes onto the model's kinds.
+///
+/// Returns `None` for anything that is not a module, so an unknown code is
+/// skipped rather than mislabelled.
+pub fn kind_from_type_code(code: &str) -> Option<ModuleKind> {
+    match code.trim() {
+        "V" => Some(ModuleKind::View),
+        "P" | "PC" => Some(ModuleKind::Procedure),
+        "FN" | "IF" | "TF" | "FS" | "FT" => Some(ModuleKind::Function),
+        "TR" => Some(ModuleKind::Trigger),
+        _ => None,
     }
-
-    /// Maps `sys.objects.type` codes. Returns `None` for anything that is not a
-    /// module, so an unknown code is skipped rather than mislabelled.
-    pub fn from_type_code(code: &str) -> Option<Self> {
-        match code.trim() {
-            "V" => Some(ModuleKind::View),
-            "P" | "PC" => Some(ModuleKind::Procedure),
-            "FN" | "IF" | "TF" | "FS" | "FT" => Some(ModuleKind::Function),
-            "TR" => Some(ModuleKind::Trigger),
-            _ => None,
-        }
-    }
 }
+
+pub use pbps_model::ModuleKind;
 
 /// Everything read from one database.
 #[derive(Debug, Clone, Default)]
@@ -165,10 +162,13 @@ pub struct Pulled {
     /// the caller must show these, because each one is a difference that would
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
-    /// Views, procedures, functions and triggers found but not managed
-    /// (ADR-0002). Separate from `warnings` because these are not defects in
-    /// the pull — they are an inventory of what the tool does not cover yet,
-    /// and the user needs the count and the names, not one line each.
+    /// Modules the database has that pbps cannot manage: a CLR object, one
+    /// created `WITH ENCRYPTION`, or one whose stored text does not have the
+    /// shape the emitter can reproduce.
+    ///
+    /// Separate from `warnings` because these are not defects in the pull —
+    /// they are an inventory of what is left alone, and the user needs the
+    /// count and the names.
     pub unmanaged_modules: Vec<UnmanagedModule>,
 }
 
@@ -177,6 +177,192 @@ pub struct Pulled {
 pub struct UnmanagedModule {
     pub kind: &'static str,
     pub name: String,
+    /// Why it is not managed, in the operator's words.
+    pub why: String,
+}
+
+/// Splits a stored definition back into the body a declaration carries.
+///
+/// # Why this is not parsing SQL
+///
+/// It reads exactly as far as the emitter writes and no further: the
+/// `CREATE [OR ALTER] <kind> <name>` prefix, plus a view's `AS` and a trigger's
+/// `ON <table>`. Everything after that is returned untouched. For anything pbps
+/// wrote the round trip is exact, because [`crate::emit::module_definition`]
+/// produced that prefix; for a hand-written module it is a best-effort read,
+/// and when the scan meets something it cannot account for it returns `None`
+/// rather than guessing — the module is then reported as unmanaged, which is
+/// the rule `pull` already follows for everything it cannot express.
+///
+/// A view with options between its name and `AS` (`WITH SCHEMABINDING`) is one
+/// of those cases. The model has nowhere to keep them, and dropping them
+/// silently would have the next apply recreate the view *without*
+/// SCHEMABINDING — a change nobody asked for, in the one direction that
+/// removes a guarantee.
+/// `has_parent` says whether the catalog can supply the trigger's target. When
+/// it can, an unqualified `ON customer` is no obstacle: the schema the text
+/// omits is exactly what `sys.objects` records, and `assemble` substitutes it.
+/// Refusing there would inventory as unmanageable the commonest spelling of a
+/// perfectly reproducible trigger.
+pub fn split_module(
+    kind: ModuleKind,
+    stored: &str,
+    has_parent: bool,
+) -> Option<(Option<TableName>, String)> {
+    let s = stored;
+    let mut i = keyword(s, 0, "create")?;
+    // `OR ALTER` is optional: pbps emits it, a hand-written module has not.
+    if let Some(next) = keyword(s, i, "or") {
+        i = keyword(s, next, "alter")?;
+    }
+    i = keyword_prefix(
+        s,
+        i,
+        match kind {
+            ModuleKind::View => "view",
+            ModuleKind::Procedure => "proc",
+            ModuleKind::Function => "function",
+            ModuleKind::Trigger => "trigger",
+        },
+    )?;
+
+    let (_, after_name) = qualified_name(s, skip_ws(s, i))?;
+    let mut i = skip_ws(s, after_name);
+
+    match kind {
+        ModuleKind::View => {
+            // Anything but `AS` here is an option the model cannot hold.
+            let at = keyword(s, i, "as")?;
+            Some((None, s[at..].trim().to_owned()))
+        }
+        ModuleKind::Trigger => {
+            i = keyword(s, i, "on")?;
+            let (table, after) = qualified_name(s, skip_ws(s, i))?;
+            let on = match table.as_slice() {
+                [schema, name] => Some(TableName::new(schema.clone(), name.clone())),
+                // An unqualified table means the default schema of whoever
+                // created it, which the definition text does not record — so it
+                // is readable only when the catalog can answer instead.
+                [_] if has_parent => None,
+                _ => return None,
+            };
+            Some((on, s[after..].trim().to_owned()))
+        }
+        ModuleKind::Procedure | ModuleKind::Function => {
+            Some((None, s[after_name..].trim().to_owned()))
+        }
+    }
+}
+
+/// Whitespace plus the two comment forms, which may sit anywhere the emitter's
+/// prefix has a gap.
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    loop {
+        let rest = &s[i..];
+        let trimmed = rest.trim_start();
+        i = s.len() - trimmed.len();
+        if trimmed.starts_with("--") {
+            i += trimmed.find('\n').map_or(trimmed.len(), |n| n + 1);
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            match trimmed.find("*/") {
+                Some(end) => i += end + 2,
+                None => return s.len(),
+            }
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Matches one keyword case-insensitively, skipping whatever whitespace and
+/// comments precede it, and returns the offset just after it.
+///
+/// A keyword has to end at a word boundary, or `VIEWS` would match `VIEW` and
+/// the split would take the rest of a word for the object's name.
+fn keyword(s: &str, i: usize, word: &str) -> Option<usize> {
+    let i = skip_ws(s, i);
+    let rest = &s[i..];
+    if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let after = i + word.len();
+    match s[after..].chars().next() {
+        Some(c) if c.is_alphanumeric() || c == '_' => None,
+        _ => Some(after),
+    }
+}
+
+/// As [`keyword`], but the word may continue: `PROC` is a legal abbreviation of
+/// `PROCEDURE`, and both have to be accepted from a hand-written module.
+fn keyword_prefix(s: &str, i: usize, prefix: &str) -> Option<usize> {
+    let i = skip_ws(s, i);
+    let rest = &s[i..];
+    if rest.len() < prefix.len() || !rest[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    Some(skip_word_tail(s, i + prefix.len()))
+}
+
+/// Steps over whatever is left of an identifier-shaped word.
+fn skip_word_tail(s: &str, i: usize) -> usize {
+    s[i..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(s.len(), |n| i + n)
+}
+
+/// Reads `a`, `a.b` or `[a].[b]`, returning the parts and the offset after.
+fn qualified_name(s: &str, mut i: usize) -> Option<(Vec<String>, usize)> {
+    let mut parts = Vec::new();
+    loop {
+        let rest = &s[i..];
+        // `"name"` is the ANSI spelling of `[name]` and means the same thing
+        // under QUOTED_IDENTIFIER ON, which is the only setting pbps manages
+        // (see `RawModule::default_set_options`). Refusing it would inventory a
+        // perfectly reproducible module as unmanageable over a choice of quote.
+        let quoted = rest
+            .strip_prefix('[')
+            .map(|r| (r, ']'))
+            .or_else(|| rest.strip_prefix('"').map(|r| (r, '"')));
+        if let Some((stripped, close)) = quoted {
+            // A doubled closing character is an escaped one inside the name.
+            let mut part = String::new();
+            let mut chars = stripped.char_indices();
+            let end = loop {
+                let (at, ch) = chars.next()?;
+                if ch == close {
+                    match stripped[at + ch.len_utf8()..].starts_with(close) {
+                        true => {
+                            part.push(close);
+                            chars.next();
+                        }
+                        false => break at,
+                    }
+                } else {
+                    part.push(ch);
+                }
+            };
+            parts.push(part);
+            i += end + 1 + close.len_utf8();
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '@' || c == '#'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            parts.push(rest[..end].to_owned());
+            i += end;
+        }
+        let after_part = i;
+        let j = skip_ws(s, i);
+        if s[j..].starts_with('.') {
+            i = skip_ws(s, j + 1);
+            continue;
+        }
+        return Some((parts, after_part));
+    }
 }
 
 /// Rebuilds the declared type from what the catalog stores.
@@ -429,17 +615,62 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         schema.tables.insert(names.remove(&id).unwrap(), table);
     }
 
-    // Sorted so that two pulls of the same database report the same order —
-    // the inventory ends up in a commit message or a ticket often enough that
-    // shifting order would be noise.
-    let mut unmanaged_modules: Vec<UnmanagedModule> = raw
-        .modules
-        .iter()
-        .map(|m| UnmanagedModule {
-            kind: m.kind.as_str(),
-            name: format!("{}.{}", m.schema, m.name),
-        })
-        .collect();
+    // Modules (ADR-0002). Each one either becomes part of the desired state or
+    // is inventoried as unmanaged with the reason — never quietly dropped, for
+    // the same reason a computed column is not: a module missing from the
+    // declarations is a module the next plan would propose destroying.
+    let mut unmanaged_modules: Vec<UnmanagedModule> = Vec::new();
+    for m in &raw.modules {
+        let name = ObjectName::new(m.schema.clone(), m.name.clone());
+        let mut unmanageable = |why: &str| {
+            unmanaged_modules.push(UnmanagedModule {
+                kind: m.kind.as_str(),
+                name: name.to_string(),
+                why: why.to_owned(),
+            });
+        };
+
+        let Some(stored) = &m.definition else {
+            unmanageable(
+                "its definition cannot be read back (a CLR object, or created WITH ENCRYPTION)",
+            );
+            continue;
+        };
+        if !m.default_set_options {
+            unmanageable(
+                "it was created with QUOTED_IDENTIFIER or ANSI_NULLS OFF, which pbps cannot \
+                 restate — recreating it would change how it behaves",
+            );
+            continue;
+        }
+        let Some((on, definition)) = split_module(m.kind, stored, m.parent.is_some()) else {
+            unmanageable(
+                "its definition is not of a shape pbps can reproduce (a view with options such \
+                 as SCHEMABINDING, or a trigger on an unqualified table)",
+            );
+            continue;
+        };
+        // The catalog knows a trigger's table even when the definition text
+        // does not qualify it, so the more reliable answer wins.
+        let on = m
+            .parent
+            .as_ref()
+            .map(|(s, t)| ObjectName::new(s.clone(), t.clone()))
+            .or(on);
+
+        schema.modules.insert(
+            name,
+            Module {
+                kind: m.kind,
+                // A description lives in the declarations, not in the database;
+                // pulling one back is not possible and pretending otherwise
+                // would make every pulled module compare unequal.
+                description: None,
+                on,
+                definition,
+            },
+        );
+    }
     unmanaged_modules.sort();
     unmanaged_modules.dedup();
 
@@ -744,53 +975,140 @@ mod module_tests {
         }
     }
 
-    fn module(schema: &str, name: &str, kind: ModuleKind) -> RawModule {
+    fn module(schema: &str, name: &str, kind: ModuleKind, definition: Option<&str>) -> RawModule {
         RawModule {
             schema: schema.into(),
             name: name.into(),
             kind,
+            definition: definition.map(str::to_owned),
+            parent: None,
+            default_set_options: true,
         }
     }
 
-    /// ADR-0002: modules are not managed, but a pull that does not even mention
-    /// them tells the user the database is fully covered when half of it is not.
+    /// ADR-0002: a module pbps can read becomes part of the desired state, and
+    /// what it reads back is the *body* — the prefix is the emitter's, and
+    /// keeping it would make every declaration compare unequal to the database
+    /// it came from.
     #[test]
-    fn modules_are_inventoried_rather_than_ignored() {
+    fn readable_modules_become_part_of_the_schema() {
         let p = assemble(&catalog_with(vec![
-            module("dbo", "v_active", ModuleKind::View),
-            module("dbo", "sp_reprice", ModuleKind::Procedure),
+            module(
+                "dbo",
+                "v_active",
+                ModuleKind::View,
+                Some("CREATE OR ALTER VIEW [dbo].[v_active]\nAS\nSELECT id FROM dbo.customer"),
+            ),
+            module(
+                "dbo",
+                "sp_reprice",
+                ModuleKind::Procedure,
+                Some(
+                    "CREATE PROCEDURE dbo.sp_reprice @pct int AS UPDATE dbo.customer SET id = id;",
+                ),
+            ),
         ]));
+        assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
+        assert_eq!(p.schema.modules.len(), 2);
         assert_eq!(
-            p.unmanaged_modules,
-            vec![
-                UnmanagedModule {
-                    kind: "procedure",
-                    name: "dbo.sp_reprice".into()
-                },
-                UnmanagedModule {
-                    kind: "view",
-                    name: "dbo.v_active".into()
-                },
-            ]
+            p.schema.modules[&"dbo.v_active".parse::<ObjectName>().unwrap()].definition,
+            "SELECT id FROM dbo.customer"
         );
-        // They are an inventory, not defects: the tables still came through and
-        // nothing was added to `warnings`.
-        assert_eq!(p.warnings, Vec::<String>::new());
-        assert_eq!(p.schema.tables.len(), 1);
+        assert_eq!(
+            p.schema.modules[&"dbo.sp_reprice".parse::<ObjectName>().unwrap()].definition,
+            "@pct int AS UPDATE dbo.customer SET id = id;"
+        );
+    }
+
+    /// A trigger's table comes from the catalog, which knows it even when the
+    /// definition text leaves it unqualified.
+    #[test]
+    fn a_trigger_keeps_the_table_it_is_on() {
+        let mut trg = module(
+            "dbo",
+            "trg_audit",
+            ModuleKind::Trigger,
+            Some("CREATE TRIGGER dbo.trg_audit ON dbo.customer AFTER INSERT AS SELECT 1;"),
+        );
+        trg.parent = Some(("dbo".into(), "customer".into()));
+        let p = assemble(&catalog_with(vec![trg]));
+        let m = &p.schema.modules[&"dbo.trg_audit".parse::<ObjectName>().unwrap()];
+        assert_eq!(
+            m.on.as_ref().map(ToString::to_string).as_deref(),
+            Some("dbo.customer")
+        );
+        assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");
+    }
+
+    /// A module whose definition cannot be read, or whose shape the emitter
+    /// could not reproduce, is inventoried with the reason — never dropped in
+    /// silence, which would leave the next plan proposing its destruction.
+    #[test]
+    fn unmanageable_modules_are_inventoried_with_the_reason() {
+        let p = assemble(&catalog_with(vec![
+            // Encrypted or CLR: no definition at all.
+            module("dbo", "sp_secret", ModuleKind::Procedure, None),
+            // A view whose options the model cannot hold. Recreating it without
+            // SCHEMABINDING would silently remove a guarantee.
+            module(
+                "dbo",
+                "v_bound",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT 1"),
+            ),
+        ]));
+        assert!(p.schema.modules.is_empty());
+        assert_eq!(p.unmanaged_modules.len(), 2);
+        assert!(
+            p.unmanaged_modules[0].why.contains("ENCRYPTION"),
+            "{:?}",
+            p.unmanaged_modules
+        );
+        assert!(
+            p.unmanaged_modules[1].why.contains("SCHEMABINDING"),
+            "{:?}",
+            p.unmanaged_modules
+        );
+    }
+
+    /// SQL Server persists QUOTED_IDENTIFIER and ANSI_NULLS with the module and
+    /// re-applies them on every execution, so a module created with either OFF
+    /// does not mean the same thing as the identical text recreated by pbps.
+    /// The model has nowhere to keep them, so the honest answer is an inventory
+    /// entry rather than a claim that it round-trips.
+    #[test]
+    fn a_module_with_nondefault_set_options_is_inventoried() {
+        let mut m = module(
+            "dbo",
+            "v_quirk",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_quirk AS SELECT 1"),
+        );
+        m.default_set_options = false;
+        let p = assemble(&catalog_with(vec![m]));
+        assert!(p.schema.modules.is_empty());
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert!(
+            p.unmanaged_modules[0].why.contains("QUOTED_IDENTIFIER"),
+            "{:?}",
+            p.unmanaged_modules
+        );
     }
 
     #[test]
     fn a_database_with_no_modules_reports_an_empty_inventory() {
-        assert!(assemble(&raw_one_table()).unmanaged_modules.is_empty());
+        let p = assemble(&raw_one_table());
+        assert!(p.unmanaged_modules.is_empty());
+        assert!(p.schema.modules.is_empty());
     }
 
     /// The order must not depend on what the server happened to return.
     #[test]
     fn the_inventory_is_sorted_and_deduplicated() {
         let p = assemble(&catalog_with(vec![
-            module("dbo", "zzz", ModuleKind::View),
-            module("app", "aaa", ModuleKind::Trigger),
-            module("dbo", "zzz", ModuleKind::View),
+            module("dbo", "zzz", ModuleKind::View, None),
+            module("app", "aaa", ModuleKind::Trigger, None),
+            module("dbo", "zzz", ModuleKind::View, None),
         ]));
         assert_eq!(
             p.unmanaged_modules
@@ -813,15 +1131,133 @@ mod module_tests {
             ("TR", Some("trigger")),
         ] {
             assert_eq!(
-                ModuleKind::from_type_code(code).map(ModuleKind::as_str),
+                kind_from_type_code(code).map(ModuleKind::as_str),
                 want,
                 "type code {code}"
             );
         }
         // A table is not a module, and neither is a constraint; mislabelling one
         // would put it in the inventory as something the user must act on.
-        assert_eq!(ModuleKind::from_type_code("U"), None);
-        assert_eq!(ModuleKind::from_type_code("PK"), None);
-        assert_eq!(ModuleKind::from_type_code("D"), None);
+        assert_eq!(kind_from_type_code("U"), None);
+        assert_eq!(kind_from_type_code("PK"), None);
+        assert_eq!(kind_from_type_code("D"), None);
+    }
+
+    // ---- splitting a stored definition (ADR-0002) ----
+
+    /// The round trip that matters: what the emitter writes, the splitter has
+    /// to give back. Anything else and every apply would be followed by drift.
+    #[test]
+    fn what_the_emitter_writes_splits_back_into_the_body() {
+        let name: ObjectName = "dbo.active_customer".parse().unwrap();
+        for (kind, on, body) in [
+            (
+                ModuleKind::View,
+                None,
+                "SELECT customer_id\nFROM dbo.customer",
+            ),
+            (ModuleKind::Procedure, None, "@since date\nAS\nSELECT 1;"),
+            (
+                ModuleKind::Function,
+                None,
+                "(@a int)\nRETURNS int\nAS\nBEGIN RETURN @a; END",
+            ),
+            (
+                ModuleKind::Trigger,
+                Some("dbo.customer"),
+                "AFTER INSERT\nAS SELECT 1;",
+            ),
+        ] {
+            let module = Module {
+                kind,
+                description: None,
+                on: on.map(|t| t.parse().unwrap()),
+                definition: body.to_owned(),
+            };
+            let stored = crate::emit::module_definition(&name, &module).expect("emit");
+            let (back_on, back_body) = split_module(kind, &stored, false)
+                .unwrap_or_else(|| panic!("could not split:\n{stored}"));
+            assert_eq!(back_body, body, "{kind}");
+            assert_eq!(back_on, module.on, "{kind}");
+        }
+    }
+
+    /// A hand-written module was not written by the emitter, and the shapes it
+    /// takes are the whole reason the splitter is tolerant.
+    #[test]
+    fn hand_written_spellings_still_split() {
+        for stored in [
+            "create view dbo.v as select 1",
+            "CREATE   VIEW   [dbo] . [v]\n  AS  select 1",
+            "-- who and why\nCREATE VIEW dbo.v\nAS select 1",
+            "/* header */ CREATE OR ALTER VIEW dbo.v AS select 1",
+        ] {
+            let split = split_module(ModuleKind::View, stored, false);
+            assert!(split.is_some(), "{stored}");
+            assert!(
+                split.unwrap().1.to_lowercase().contains("select 1"),
+                "{stored}"
+            );
+        }
+        // `PROC` is a legal abbreviation, and a definition using it is not a
+        // module pbps should refuse to manage.
+        assert!(
+            split_module(
+                ModuleKind::Procedure,
+                "CREATE PROC dbo.p AS SELECT 1",
+                false
+            )
+            .is_some()
+        );
+
+        // The ANSI spelling of a quoted name means the same thing as brackets
+        // under QUOTED_IDENTIFIER ON, which is the only setting pbps manages.
+        let split = split_module(
+            ModuleKind::View,
+            "CREATE VIEW \"dbo\".\"active customer\" AS SELECT 1",
+            false,
+        );
+        assert_eq!(split, Some((None, "SELECT 1".to_owned())), "ANSI quoting");
+        // Including its doubled-quote escape.
+        assert!(
+            split_module(
+                ModuleKind::View,
+                "CREATE VIEW \"dbo\".\"say \"\"hi\"\"\" AS SELECT 1",
+                false
+            )
+            .is_some()
+        );
+
+        // An unqualified trigger target is the commonest spelling of all, and
+        // the catalog knows the schema even though the text does not. The split
+        // leaves `on` empty for `assemble` to fill from `sys.objects`.
+        let split = split_module(
+            ModuleKind::Trigger,
+            "CREATE TRIGGER dbo.trg ON customer AFTER INSERT AS SELECT 1",
+            true,
+        );
+        assert_eq!(split, Some((None, "AFTER INSERT AS SELECT 1".to_owned())));
+    }
+
+    /// When the scan meets something it cannot account for it must return
+    /// nothing rather than guess: a wrong split would silently drop part of the
+    /// definition, and the next apply would recreate the object without it.
+    #[test]
+    fn an_unaccountable_definition_does_not_split() {
+        for stored in [
+            "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT 1",
+            // Unqualified, and this time the catalog has no parent to fall back
+            // on: guessing a schema would attach the trigger to the wrong table.
+            "CREATE TRIGGER trg ON customer AFTER INSERT AS SELECT 1",
+            "ALTER VIEW dbo.v AS SELECT 1",
+            "",
+        ] {
+            let kind = if stored.contains("TRIGGER") {
+                ModuleKind::Trigger
+            } else {
+                ModuleKind::View
+            };
+            assert!(split_module(kind, stored, false).is_none(), "{stored}");
+        }
     }
 }
