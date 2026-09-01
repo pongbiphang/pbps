@@ -28,11 +28,34 @@ fn component(value: &str) -> String {
     out
 }
 
+/// Windows resolves these stems as devices even with an extension appended, so
+/// `CON.customer.yml` cannot be created there. They are legal quoted SQL Server
+/// schema names, and only the leading stem is interpreted, so the escape is
+/// applied to the schema component alone.
+///
+/// The first byte is percent-encoded rather than prefixed: `component` emits
+/// `%` only for bytes outside its safe alphabet, and the escaped byte is
+/// alphanumeric, so no other identifier can encode to the same string. The
+/// escape is unconditional — declarations are written into git and must resolve
+/// to the same filename on every platform that checks the repository out.
+fn escape_reserved_stem(encoded: String) -> String {
+    const RESERVED: [&str; 24] = [
+        "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+        "LPT9",
+    ];
+    if !RESERVED.iter().any(|r| encoded.eq_ignore_ascii_case(r)) {
+        return encoded;
+    }
+    let (first, rest) = encoded.split_at(1);
+    format!("%{:02X}{rest}", first.as_bytes()[0])
+}
+
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     let kind_suffix = kind.map(|k| format!(".{}", k.as_str())).unwrap_or_default();
     let readable = format!(
         "{}.{}{}.yml",
-        component(&name.schema),
+        escape_reserved_stem(component(&name.schema)),
         component(&name.name),
         kind_suffix
     );
@@ -114,6 +137,39 @@ mod tests {
         let generated = path(dir, &name, None).unwrap();
         assert!(generated.file_name().unwrap().len() <= 240);
         assert_eq!(generated.parent(), Some(dir));
+    }
+
+    #[test]
+    fn windows_device_stems_never_lead_a_generated_filename() {
+        let dir = Path::new("schema");
+        for reserved in ["CON", "con", "PRN", "AUX", "nul", "COM1", "lpt9"] {
+            let generated = path(dir, &ObjectName::new(reserved, "customer"), None).unwrap();
+            let stem = generated.file_name().unwrap().to_string_lossy().to_string();
+            let leading = stem.split('.').next().unwrap().to_string();
+            assert!(
+                !leading.eq_ignore_ascii_case(reserved),
+                "`{reserved}` still leads `{stem}`"
+            );
+            assert!(leading.starts_with('%'), "{stem}");
+        }
+
+        // The escape must not swallow names that merely start with a device
+        // name, and must not collide with any other identifier: `%43` can only
+        // come from this escape, because `C` is inside `component`'s alphabet.
+        assert_eq!(
+            path(dir, &ObjectName::new("CONTROL", "customer"), None).unwrap(),
+            dir.join("CONTROL.customer.yml")
+        );
+        assert_eq!(
+            path(dir, &ObjectName::new("CON", "customer"), None).unwrap(),
+            dir.join("%43ON.customer.yml")
+        );
+        // Only the leading stem is interpreted by Windows, so an object named
+        // after a device stays readable.
+        assert_eq!(
+            path(dir, &ObjectName::new("dbo", "CON"), None).unwrap(),
+            dir.join("dbo.CON.yml")
+        );
     }
 
     #[test]

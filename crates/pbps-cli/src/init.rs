@@ -436,21 +436,32 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
 
     let final_schema = root.join("schema");
     let staged_schema = stage.join("schema");
-    let had_empty_schema = final_schema.is_dir();
-    if had_empty_schema && let Err(source) = std::fs::remove_dir(&final_schema) {
-        // The directory may have changed after the initial emptiness check.
-        // Never remove its contents: they belong to the user. Only discard our
-        // staging tree before reporting the race or permission error.
+    let final_ids = root.join("schema.ids.json");
+
+    // schema.ids.json is installed first and released last: it is the exclusive
+    // claim on this root. The recheck above cannot serialize two inits on its
+    // own, because `rename` of a directory replaces an existing *empty* one on
+    // Unix — both would believe they owned `schema`, and the loser's rollback
+    // would delete the winner's declarations. An atomic no-replace link stops
+    // the loser here, before it has touched anything.
+    if let Err(error) = install_file_no_replace(stage.join("schema.ids.json"), &final_ids) {
         let _ = std::fs::remove_dir_all(stage);
-        return Err(anyhow::Error::new(source).context(format!(
-            "cannot replace the empty declaration directory `{}`",
-            final_schema.display()
-        )));
+        return Err(error);
     }
 
+    let mut had_empty_schema = false;
     let mut schema_moved = false;
-    let mut ids_moved = false;
     let result = (|| -> anyhow::Result<()> {
+        had_empty_schema = final_schema.is_dir();
+        if had_empty_schema && let Err(source) = std::fs::remove_dir(&final_schema) {
+            // The directory may have changed after the initial emptiness check.
+            // Never remove its contents: they belong to the user.
+            return Err(anyhow::Error::new(source).context(format!(
+                "cannot replace the empty declaration directory `{}`",
+                final_schema.display()
+            )));
+        }
+
         std::fs::rename(&staged_schema, &final_schema).with_context(|| {
             format!(
                 "cannot install declarations at `{}`",
@@ -458,9 +469,6 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
             )
         })?;
         schema_moved = true;
-
-        install_file_no_replace(stage.join("schema.ids.json"), &root.join("schema.ids.json"))?;
-        ids_moved = true;
 
         install_file_no_replace(
             stage.join(pbps_config::CONFIG_FILE),
@@ -470,15 +478,15 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
     })();
 
     if let Err(error) = result {
-        if ids_moved {
-            let _ = std::fs::remove_file(root.join("schema.ids.json"));
-        }
         if schema_moved {
             let _ = std::fs::remove_dir_all(&final_schema);
         }
         if had_empty_schema {
             let _ = std::fs::create_dir(&final_schema);
         }
+        // Released last, so no other init can reach the schema move while this
+        // rollback is undoing it.
+        let _ = std::fs::remove_file(&final_ids);
         let _ = std::fs::remove_dir_all(stage);
         return Err(error);
     }
@@ -581,6 +589,75 @@ mod tests {
             "user data\n"
         );
         assert_eq!(std::fs::read_to_string(&staged).unwrap(), "generated\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The recheck alone cannot serialize two inits: on Unix `rename` replaces
+    /// an existing *empty* directory, so both could pass the recheck and both
+    /// move `schema` — then the loser's rollback deletes the directory the
+    /// winner had already installed, leaving pbps.yml and schema.ids.json with
+    /// no `schema/` beside them.
+    ///
+    /// The staged directory is empty on purpose: that is what plain `pbps init`
+    /// produces, and a populated one would make the second `rename` fail with
+    /// ENOTEMPTY and hide the race.
+    #[test]
+    fn a_losing_init_never_removes_the_winners_declarations() {
+        let root = std::env::temp_dir().join(format!("pbps-init-two-{}", std::process::id()));
+        for round in 0..100 {
+            let root = root.join(format!("round-{round}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            // The empty declaration directory init tolerates, which is exactly
+            // what makes the directory move replace rather than fail.
+            std::fs::create_dir(root.join("schema")).unwrap();
+
+            let stages: Vec<PathBuf> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+                .iter()
+                .map(|which| {
+                    let stage = root.join(format!(".pbps-init-{which}"));
+                    std::fs::create_dir_all(stage.join("schema")).unwrap();
+                    std::fs::write(stage.join("schema.ids.json"), which).unwrap();
+                    std::fs::write(stage.join("pbps.yml"), which).unwrap();
+                    stage
+                })
+                .collect();
+
+            let barrier = std::sync::Barrier::new(stages.len());
+            let outcomes: Vec<bool> = std::thread::scope(|scope| {
+                let handles: Vec<_> = stages
+                    .iter()
+                    .map(|stage| {
+                        let (root, barrier) = (&root, &barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            commit(root, stage).is_ok()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            assert_eq!(
+                outcomes.iter().filter(|ok| **ok).count(),
+                1,
+                "exactly one init may claim the root, got {outcomes:?}"
+            );
+            // The winner's project must be whole: the reported failure left
+            // pbps.yml and schema.ids.json behind with no `schema/`.
+            let winner = std::fs::read_to_string(root.join("pbps.yml")).unwrap_or_else(|e| {
+                panic!("round {round}: an init succeeded but left no config: {e}")
+            });
+            assert_eq!(
+                std::fs::read_to_string(root.join("schema.ids.json")).ok(),
+                Some(winner),
+                "round {round}: the identity file does not belong to the init that won"
+            );
+            assert!(
+                root.join("schema").is_dir(),
+                "round {round}: the loser deleted the directory the winner installed"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
