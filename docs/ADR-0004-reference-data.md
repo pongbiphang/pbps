@@ -1,6 +1,6 @@
 # ADR-0004: Declarative reference data — the `data:` block
 
-- Status: decided (design; implementation targeted at Phase 5)
+- Status: decided (design; implementation targeted at Phase 4)
 - Date: 2026-08-31
 - Related: docs/SPEC.md §1.3, §7.5, §8.2, §12;
   [ADR-0002](ADR-0002-module-model.md);
@@ -110,6 +110,6 @@ same onboarding story as structure.
 
 ## Placement
 
-Phase 5. The block is an additive, optional extension of the table file, so —
+Phase 4. The block is an additive, optional extension of the table file, so —
 unlike `strategy:`, which changed load's return type — nothing forces it to
 land early.

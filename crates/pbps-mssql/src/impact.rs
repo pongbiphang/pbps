@@ -224,12 +224,15 @@ pub async fn rename_impact(
 
     let dependencies = match target {
         RenameTarget::Table(_) | RenameTarget::Module(_) => {
-            conn.query_with(DEPENDENCIES_TABLE, &[&table.as_str()])
+            conn.query_with(DEPENDENCIES_TABLE, &[table.as_str().into()])
                 .await?
         }
         RenameTarget::Column(c) => {
-            conn.query_with(DEPENDENCIES_COLUMN, &[&table.as_str(), &c.name.as_str()])
-                .await?
+            conn.query_with(
+                DEPENDENCIES_COLUMN,
+                &[table.as_str().into(), c.name.as_str().into()],
+            )
+            .await?
         }
     };
     for row in dependencies {
@@ -259,7 +262,7 @@ pub async fn rename_impact(
     };
 
     for row in conn
-        .query_with(COMPUTED_COLUMNS, &[&table.as_str()])
+        .query_with(COMPUTED_COLUMNS, &[table.as_str().into()])
         .await?
     {
         let definition: Option<&str> = opt(&row, "definition")?;
@@ -272,7 +275,10 @@ pub async fn rename_impact(
         }
     }
 
-    for row in conn.query_with(EXPRESSIONS, &[&table.as_str()]).await? {
+    for row in conn
+        .query_with(EXPRESSIONS, &[table.as_str().into()])
+        .await?
+    {
         let definition: Option<&str> = opt(&row, "definition")?;
         if mentions(definition.unwrap_or_default(), &column.name) {
             report.advisory.push(Referrer {
@@ -283,7 +289,10 @@ pub async fn rename_impact(
         }
     }
 
-    for row in conn.query_with(NAMED_OBJECTS, &[&table.as_str()]).await? {
+    for row in conn
+        .query_with(NAMED_OBJECTS, &[table.as_str().into()])
+        .await?
+    {
         let name = get::<&str>(&row, "name")?;
         if name.contains(column.name.as_str()) {
             report.advisory.push(Referrer {

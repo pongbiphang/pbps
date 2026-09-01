@@ -162,7 +162,7 @@ justifies pull in the first place.
 
 - **MSSQL-first.** PostgreSQL identifies a function by name **plus argument
   types** (overloading), so "the name is the identity" needs revisiting in
-  Phase 4. Flagged now as a touchstone item for the `Dialect` abstraction.
+  Phase 5. Flagged now as a touchstone item for the `Dialect` abstraction.
 - **GRANTs stay unmanaged** (open question 7); `CREATE OR ALTER` merely avoids
   destroying them.
 - **Only DML triggers on managed tables.** DDL and server-level triggers are

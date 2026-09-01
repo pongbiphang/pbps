@@ -29,6 +29,16 @@ cargo clippy --workspace --all-targets    # must be warning-free
 cargo fmt --all
 ```
 
+- Touching dependencies also means `cargo deny check` (policy in `deny.toml`,
+  enforced by CI's `deny` job, weekly as well as on push). Every `ignore` entry
+  must name the advisory, why it does not endanger the tool, and what removes
+  it — an entry without those is a silent downgrade of the check. The current
+  four all have one cause and one fix; see SPEC open question 10.
+- The live tests need a container runtime. In an environment where `docker
+  info` fails, check whether `dockerd` is merely not started before concluding
+  they cannot be run — that mistake cost a round of "cannot verify" in an
+  earlier session.
+
 ## Architectural boundaries
 
 ```
@@ -45,7 +55,9 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a *change* becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact
 pbps-db        Connections (tiberius) plus transaction framing. Owns "there is
-               a network"; ledger types and prune policy, no T-SQL
+               a network"; ledger types and prune policy, no T-SQL. **`tiberius`
+               is named in exactly one file** — `Row`, `FromColumn` and `Param`
+               are this crate's own, so a driver change touches nothing else
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
@@ -53,7 +65,7 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks
 
 - Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
   `state`, `impact`, `edition`) are async; the CLI `block_on`s them per command.
-  Phase 4 adds `pbps-pg`.
+  Phase 5 adds `pbps-pg`.
 - `spikes/` is workspace-`exclude`d: standalone evaluation crates, not product
   code.
 
@@ -106,7 +118,13 @@ expensive to reconstruct.
   forward plan through the ordinary gate. It restores structure, not data, and
   says so at the point of use. Never one step.
 - **No policy SaaS.** Policies and reports are files or stdout, air-gapped. A
-  policy outside git is a second gate nobody reviewed.
+  policy outside git is a second gate nobody reviewed. This refuses a control
+  plane that *holds the approval*, not a screen — an optional local UI is
+  planned on ADR-0006's terms (renders the typed JSON, commits intent to git,
+  stores nothing authoritative).
+- **One source of truth for the declarations.** No ORM-model loaders: the second
+  source wins every disagreement silently, and identity, drop reasons and
+  `strategy:` have nowhere to live in a model class.
 - **No plugin execution engine.** The test: does it need to run *between* "plan
   approved" and "statements executed"? Then no — it makes the checksum describe
   something other than what runs, and anything it changes outside the
@@ -311,14 +329,57 @@ argument; `sql_expression_dependencies` returning one row per referenced
 The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
 
+**Open supply-chain item, live rather than filed away** (SPEC open question
+10): `tiberius` has had no release since 2024-07 and pins `rustls 0.21`, whose
+`rustls-webpki 0.101.7` carries three vulnerabilities — two of them certificate
+validation — that no `cargo update` can reach, because every fix needs
+`rustls 0.22+`. `deny.toml` holds them as documented exceptions naming the fix.
+The fix is the driver: `tiberius-ng` keeps the library name, so the change is
+one dependency line, and on 2026-09-01 it passed all fourteen live tests against
+SQL Server 2025. **What is left is a decision, not an unknown** — do not treat
+the exceptions as settled, and delete all four when the driver moves.
+
+**No universal connection layer** (ADR-0007, open question 11). ODBC and ADBC
+sound like an answer both to that item and to dialect breadth; they answer only
+the first. A connection layer replaces `pbps-db`'s ~300 lines and none of the
+type catalogue, emitter, introspection, validation or probes. ADBC is refused
+for SQL Server specifically: its driver's source is not published and its
+licence forbids reverse engineering, which a tool claiming "the reviewed plan is
+exactly what runs" cannot accept — and a proprietary binary cannot be forked,
+so it is *less* recourse than the stale crate, not more. Dialect plugins are
+declined separately: no stable Rust ABI, and a plugin API would freeze
+`ChangeSet` while the model still moves.
+
 **In progress**: Phase 3.1, the usability foundation of SPEC 14. `init` is
 built; next are `doctor`, plan summaries and `explain`, one typed JSON output
-across the read-only commands, editor schemas and shell completions. It is placed ahead of the next dialect
-deliberately: broadening the object model improves coverage, but these improve
-the first hour and every failure after it.
+across the read-only commands, editor schemas, shell completions and the
+interactive rename prompt of SPEC 6.3 — the third intent channel, and the only
+part of "intent is recorded by a human, in git" still missing. It is placed
+ahead of the next dialect deliberately: broadening the object model improves
+coverage, but these improve the first hour and every failure after it.
 
-Then Phase 4, the PostgreSQL dialect — the touchstone for the `Dialect`
-abstraction. One module-model question is already known to be waiting there:
-PostgreSQL identifies a function by name **plus argument types**, so "the name
-is the identity" needs revisiting (ADR-0002). Phase 5 holds declarative
-reference data (ADR-0004) and roles and grants (ADR-0005).
+Then **Phase 4, depth on SQL Server before breadth across engines**: declarative
+reference data (ADR-0004), roles and grants (ADR-0005), the `policies:` block
+and a wider built-in analyzer catalogue. The ordering was chosen against the
+obvious one — engine count is what every comparison table measures — because a
+second dialect doubles the surface every later feature is built twice for, and
+does it while the first engine still cannot express an organization's own rules.
+The reasoning is in SPEC 12 and open question 9.
+
+**Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
+abstraction; two collisions are already known to be waiting — PostgreSQL
+identifies a function by name **plus argument types**, so "the name is the
+identity" needs revisiting (ADR-0002), and default and schema privileges do the
+same to ADR-0005. Deferring the dialect does not defer the abstraction: PG stays
+the test applied to every model decision.
+
+**Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
+SaaS refuses *a control plane that holds the approval*, not a screen: the UI
+renders the typed JSON of Phase 3.1, composes intent as a git commit, triggers
+the same checksum-pinned plan, and stores nothing authoritative. It is late
+because a UI built before that JSON exists would have to parse human output or
+reimplement validation. **Scope is single-user and local, and that is the
+open-source boundary** — multi-tenant or hosted is reserved as a possible
+commercial offering and gets its own ADR. It does not inherit permission from
+ADR-0006: commercial pressure pushes hardest towards the UI holding the
+approval, which is the one thing ADR-0006 refuses.

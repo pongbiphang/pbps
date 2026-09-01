@@ -6,6 +6,10 @@ on:
     # a future branch rename cannot silently remove post-merge coverage.
     branches: [master, main]
   pull_request:
+  schedule:
+    # The advisory database moves on its own. Without a scheduled run, a new
+    # finding against an unchanged dependency would wait for the next push.
+    - cron: "17 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +42,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+
+  # Supply chain (SPEC 11.5, open questions 1 and 10). Two of this project's
+  # dependencies are small enough that "is it still maintained, is it still
+  # clean" has to be answered by something other than memory.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
 
   # The SPEC 11.5 invariants against a real SQL Server (bootstrap == introspect,
   # apply(plan(A->B)) converges on B). Linux only: the service container needs a

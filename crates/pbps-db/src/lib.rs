@@ -12,7 +12,14 @@
 //! is what stops the ledger's meaning from being defined twice.
 //!
 //! The driver is `tiberius` — pure Rust, so a single static binary needs no
-//! ODBC driver installed on the host (SPEC §11.3).
+//! driver installed on the host (SPEC §11.3).
+//!
+//! **`tiberius` is named nowhere but this file.** That is deliberate: the driver
+//! is a recorded supply-chain risk (SPEC open question 10), and this module is
+//! the seam it would be replaced through. [`Row`], [`FromColumn`] and [`Param`]
+//! exist for that reason alone — re-exporting the driver's own types would be
+//! shorter, and would make a replacement an API change for every caller instead
+//! of an edit to one file.
 
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
@@ -21,7 +28,6 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 pub mod ledger;
 
 pub use ledger::{LedgerEntry, LedgerError, LockInfo};
-pub use tiberius::{Row, ToSql};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -59,6 +65,100 @@ pub enum DbError {
 /// hurried, because a long-running ALTER is exactly what this tool exists to
 /// run.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One row of a result set.
+pub struct Row(tiberius::Row);
+
+/// A type that can be read out of a result column.
+///
+/// The blanket implementation covers whatever the driver can already convert,
+/// so this adds no per-type work; what it adds is a signature callers can name
+/// without naming the driver.
+pub trait FromColumn<'a>: Sized {
+    fn from_column(row: &'a Row, col: &str) -> Result<Option<Self>, DbError>;
+    fn from_index(row: &'a Row, idx: usize) -> Result<Option<Self>, DbError>;
+}
+
+impl<'a, T: tiberius::FromSql<'a>> FromColumn<'a> for T {
+    fn from_column(row: &'a Row, col: &str) -> Result<Option<Self>, DbError> {
+        Ok(row.0.try_get::<T, _>(col)?)
+    }
+
+    fn from_index(row: &'a Row, idx: usize) -> Result<Option<Self>, DbError> {
+        Ok(row.0.try_get::<T, _>(idx)?)
+    }
+}
+
+impl Row {
+    /// Reads one column by name; `None` when it is NULL.
+    pub fn try_get<'a, T: FromColumn<'a>>(&'a self, col: &str) -> Result<Option<T>, DbError> {
+        T::from_column(self, col)
+    }
+
+    /// Reads one column by position; `None` when it is NULL.
+    ///
+    /// Position is the wrong way to read a catalog query and the right way to
+    /// read a preflight probe: a probe's SQL is generated from the plan, so its
+    /// single count column has no name anyone can rely on.
+    pub fn try_get_at<'a, T: FromColumn<'a>>(&'a self, idx: usize) -> Result<Option<T>, DbError> {
+        T::from_index(self, idx)
+    }
+}
+
+/// A value bound into a parameterized statement.
+///
+/// A closed set rather than a trait: these are the only shapes the ledger and
+/// the impact queries bind, and an enum is what lets the driver stay unnamed
+/// outside this file. Adding a variant is deliberate work, which is the point —
+/// a parameter that is not one of these usually means SQL is being built where
+/// it should not be.
+#[derive(Clone, Copy, Debug)]
+pub enum Param<'a> {
+    I32(i32),
+    I64(i64),
+    Str(&'a str),
+    /// A string that may be NULL — a ledger entry's git sha, checksum or reason.
+    OptStr(Option<&'a str>),
+}
+
+impl From<i32> for Param<'_> {
+    fn from(v: i32) -> Self {
+        Param::I32(v)
+    }
+}
+
+impl From<i64> for Param<'_> {
+    fn from(v: i64) -> Self {
+        Param::I64(v)
+    }
+}
+
+impl<'a> From<&'a str> for Param<'a> {
+    fn from(v: &'a str) -> Self {
+        Param::Str(v)
+    }
+}
+
+impl<'a> From<Option<&'a str>> for Param<'a> {
+    fn from(v: Option<&'a str>) -> Self {
+        Param::OptStr(v)
+    }
+}
+
+impl Param<'_> {
+    /// Borrows the payload as something the driver can bind.
+    ///
+    /// The reference points into the enum itself, so it lives exactly as long
+    /// as the caller's parameter slice.
+    fn as_sql(&self) -> &dyn tiberius::ToSql {
+        match self {
+            Param::I32(v) => v,
+            Param::I64(v) => v,
+            Param::Str(v) => v,
+            Param::OptStr(v) => v,
+        }
+    }
+}
 
 /// An open SQL Server connection.
 pub struct Conn {
@@ -100,7 +200,12 @@ impl Conn {
     /// [`Conn::execute_with`], which bind it rather than paste it.
     pub async fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
         let stream = self.client.simple_query(sql).await?;
-        Ok(stream.into_first_result().await?)
+        Ok(stream
+            .into_first_result()
+            .await?
+            .into_iter()
+            .map(Row)
+            .collect())
     }
 
     /// Runs one batch of statements and discards any results.
@@ -117,10 +222,16 @@ impl Conn {
     pub async fn query_with(
         &mut self,
         sql: &str,
-        params: &[&dyn ToSql],
+        params: &[Param<'_>],
     ) -> Result<Vec<Row>, DbError> {
-        let stream = self.client.query(sql, params).await?;
-        Ok(stream.into_first_result().await?)
+        let bound: Vec<&dyn tiberius::ToSql> = params.iter().map(Param::as_sql).collect();
+        let stream = self.client.query(sql, &bound).await?;
+        Ok(stream
+            .into_first_result()
+            .await?
+            .into_iter()
+            .map(Row)
+            .collect())
     }
 
     /// Runs one parameterized statement and returns the number of rows affected.
@@ -129,8 +240,9 @@ impl Conn {
     /// is user-supplied: a reason, an operator's name, a whole JSON snapshot.
     /// Binding is not politeness here — a `'` in an operator's name would end
     /// the statement.
-    pub async fn execute_with(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, DbError> {
-        let result = self.client.execute(sql, params).await?;
+    pub async fn execute_with(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64, DbError> {
+        let bound: Vec<&dyn tiberius::ToSql> = params.iter().map(Param::as_sql).collect();
+        let result = self.client.execute(sql, &bound).await?;
         Ok(result.rows_affected().iter().sum())
     }
 
@@ -159,5 +271,36 @@ impl Conn {
     pub async fn rollback(&mut self) -> Result<(), DbError> {
         self.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;")
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conversions are what call sites rely on to stay readable
+    /// (`snapshot.reason.as_deref().into()`), so each shape has to land in its
+    /// own variant rather than the nearest one that compiles.
+    #[test]
+    fn every_bound_shape_converts_to_its_own_variant() {
+        assert!(matches!(Param::from(7_i32), Param::I32(7)));
+        assert!(matches!(Param::from(7_i64), Param::I64(7)));
+        assert!(matches!(Param::from("dbo"), Param::Str("dbo")));
+        assert!(matches!(
+            Param::from(Some("abc")),
+            Param::OptStr(Some("abc"))
+        ));
+    }
+
+    /// A ledger entry with no git sha must reach the server as NULL, not as an
+    /// empty string: `status` and the drift report both distinguish "this state
+    /// was recorded outside a checkout" from "recorded at commit ''". Collapsing
+    /// the two here would be invisible until someone read the ledger.
+    #[test]
+    fn an_absent_string_is_not_an_empty_one() {
+        let absent = Param::from(None::<&str>);
+        let empty = Param::from("");
+        assert!(matches!(absent, Param::OptStr(None)));
+        assert!(matches!(empty, Param::Str("")));
     }
 }
