@@ -2442,3 +2442,92 @@ fn doctor_exits_one_when_it_could_not_look_and_two_when_it_looked() {
     d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
     assert_eq!(code(&d.run(&["doctor"])), FINDING);
 }
+
+// ---- Fourth review round ----
+
+/// `plan --check` is the command CI runs, so its findings have to reach the
+/// annotator like every other read-only command's (SPEC 9.8). Without
+/// `--format json` here, missing intent and a stale identity file were the two
+/// findings a pipeline could not consume.
+#[test]
+fn plan_check_speaks_json_like_every_other_read_only_command() {
+    let d = Demo::new("planjson");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // A stale identity file.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["findings"][0]["id"], "identity.stale");
+    assert_eq!(v["findings"][0]["remedy"], "pbps plan");
+
+    // And missing intent, which is the other thing --check exists to catch.
+    d.table("table: dbo.t\ncolumns:\n  ident: {type: bigint, nullable: false}\n");
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "identity.ambiguous-columns");
+    assert!(
+        v["findings"][0]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("pbps rename dbo.t.id ident"),
+        "the copy-pastable command must survive into JSON: {v}"
+    );
+}
+
+/// A clean plan still produces the envelope, with the shape of the change set
+/// as data — a consumer that only ever sees JSON when something is wrong cannot
+/// tell "clean" from "did not run".
+#[test]
+fn plan_json_of_a_clean_run_carries_the_change_summary() {
+    let d = Demo::new("planjsonok");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["data"]["changes"], 1);
+    assert_eq!(v["data"]["tables"], 1);
+    // The empty baseline is a warning, not silence: everything reading as newly
+    // created is the one thing most easily mistaken for a real plan.
+    assert_eq!(v["findings"][0]["id"], "baseline.empty");
+}
+
+/// `baseline`, `apply` and `unlock` each require exactly one of --db / --env, so
+/// a per-environment remedy without one is a command that fails when pasted —
+/// and these are aimed at whoever is meeting the environment for the first time.
+#[test]
+fn every_per_environment_remedy_names_its_environment() {
+    let d = Demo::new("remedyenv");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_REMEDY_UNSET\n",
+    )
+    .unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    for f in v["findings"].as_array().unwrap() {
+        let Some(remedy) = f["remedy"].as_str() else {
+            continue;
+        };
+        if !remedy.starts_with("pbps ") && !remedy.contains(": pbps ") {
+            continue;
+        }
+        // Every pbps command named in a per-environment remedy needs a target.
+        if ["baseline", "apply", "unlock"]
+            .iter()
+            .any(|c| remedy.contains(&format!("pbps {c}")))
+        {
+            assert!(remedy.contains("--env "), "{remedy}");
+        }
+    }
+}

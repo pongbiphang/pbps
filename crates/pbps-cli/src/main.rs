@@ -123,6 +123,11 @@ enum Command {
         /// connection string to a server pbps may create a scratch database on
         #[arg(long)]
         dev: Option<String>,
+
+        /// human (default) or json. Only meaningful with --check, which is the
+        /// read-only file check CI runs
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Print the JSON Schema for the declaration format or for pbps.yml
@@ -473,6 +478,7 @@ fn run() -> anyhow::Result<()> {
             sql,
             staged,
             dev,
+            format,
         } => {
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
@@ -521,14 +527,18 @@ fn run() -> anyhow::Result<()> {
             cmd_plan(
                 &project,
                 &source,
-                check,
-                out.as_deref(),
-                sql.as_deref(),
-                dev.as_deref(),
-                // `--check` is the CI file check and changes nothing, so it must
-                // not be able to ask a question either: a prompt there would
-                // hang a pipeline on a run that was supposed to be read-only.
-                !cli.no_input && !check,
+                PlanOptions {
+                    check,
+                    out: out.as_deref(),
+                    sql: sql.as_deref(),
+                    dev: dev.as_deref(),
+                    // `--check` is the CI file check and changes nothing, so it
+                    // must not be able to ask a question either: a prompt there
+                    // would hang a pipeline on a run that was supposed to be
+                    // read-only.
+                    may_prompt: !cli.no_input && !check,
+                    format,
+                },
             )
         }
         Command::Apply {
@@ -1257,10 +1267,11 @@ fn resolve_with_intent(
     loaded: &pbps_load::Loaded,
     ids: &IdsFile,
     may_prompt: bool,
-) -> anyhow::Result<Option<pbps_diff::Resolution>> {
+    quiet: bool,
+) -> anyhow::Result<Result<pbps_diff::Resolution, Vec<pbps_diff::Blocker>>> {
     let mut intents = loaded.intents.clone();
     let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
-        Ok(r) => return Ok(Some(r)),
+        Ok(r) => return Ok(Ok(r)),
         Err(b) => b,
     };
     let mut blockers = original.clone();
@@ -1291,7 +1302,7 @@ fn resolve_with_intent(
                     // mapping and prints one "updated" line, and two messages
                     // about one file would read as two files.
                     write_ids(project, &r.ids)?;
-                    return Ok(Some(r));
+                    return Ok(Ok(r));
                 }
                 Err(again) => blockers = again,
             }
@@ -1308,29 +1319,79 @@ fn resolve_with_intent(
         eprintln!("\nNothing was recorded.");
         blockers = original;
     }
-    eprintln!("{}", report::blockers(&blockers));
-    Ok(None)
+    // Silent when the caller is going to render these itself — as JSON, where a
+    // prose report on stderr beside a JSON document on stdout would be two
+    // descriptions of one failure.
+    if !quiet {
+        eprintln!("{}", report::blockers(&blockers));
+    }
+    Ok(Err(blockers))
+}
+
+/// What `plan` produced, for `--format json`.
+///
+/// The changes are counted rather than listed: the typed change set is what
+/// `--out` writes, and `explain` is what renders it. Two spellings of the same
+/// list, one of them abbreviated, is how a consumer comes to read the wrong one.
+#[derive(serde::Serialize)]
+struct PlanData {
+    baseline: String,
+    changes: usize,
+    tables: usize,
+    risks: Vec<&'static str>,
+}
+
+/// What an offline `plan` was asked to do.
+///
+/// Grouped rather than passed one by one: the list grew past the point where a
+/// call site reads as anything but a row of booleans, and `cmd_plan(.., true,
+/// false, ..)` is how the wrong flag gets wired to the wrong behaviour.
+struct PlanOptions<'a> {
+    check: bool,
+    out: Option<&'a std::path::Path>,
+    sql: Option<&'a std::path::Path>,
+    dev: Option<&'a str>,
+    /// False when there is no terminal, when `--no-input` was given, and always
+    /// under `--check` — the read-only CI check must not be able to ask a
+    /// question, or a pipeline hangs on one nobody can see.
+    may_prompt: bool,
+    format: OutputFormat,
 }
 
 fn cmd_plan(
     project: &Project,
     source: &baseline::Source,
-    check: bool,
-    out: Option<&std::path::Path>,
-    sql: Option<&std::path::Path>,
-    dev: Option<&str>,
-    may_prompt: bool,
+    opts: PlanOptions<'_>,
 ) -> anyhow::Result<()> {
+    let PlanOptions {
+        check,
+        out,
+        sql,
+        dev,
+        may_prompt,
+        format,
+    } = opts;
     let loaded = load(project)?;
     let ids = read_ids(project)?;
     let dialect = dialect(project)?;
 
-    let res = match resolve_with_intent(project, &loaded, &ids, may_prompt)? {
-        Some(r) => r,
-        None => {
+    let json = format == OutputFormat::Json;
+    let mut findings: Vec<output::Finding> = Vec::new();
+
+    let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
+        Ok(r) => r,
+        Err(blockers) => {
             // A finding, not a tool failure: pbps did its job and is asking a
             // question only a human can answer (SPEC §6.1). CI must be able to
             // tell that apart from "the tool broke".
+            if json {
+                let report = output::Report::new(
+                    "plan",
+                    blockers.iter().map(report::blocker_finding).collect(),
+                    None::<PlanData>,
+                );
+                return report.emit_json();
+            }
             return Err(Found::new(
                 "some changes could not be decided automatically; express the intent with the commands above and retry",
             )
@@ -1340,14 +1401,28 @@ fn cmd_plan(
 
     if res.ids != ids {
         if check {
-            return Err(Found::new(format!(
+            let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_file().display()
-            ))
-            .into());
+            );
+            if json {
+                let report = output::Report::new(
+                    "plan",
+                    vec![
+                        output::Finding::error("identity.stale", message)
+                            .at(project.ids_file(), None)
+                            .remedy("pbps plan"),
+                    ],
+                    None::<PlanData>,
+                );
+                return report.emit_json();
+            }
+            return Err(Found::new(message).into());
         }
         write_ids(project, &res.ids)?;
-        println!("updated {}", project.ids_file().display());
+        if !json {
+            println!("updated {}", project.ids_file().display());
+        }
     }
 
     // plan never rewrites the user's YAML (SPEC §6.2), so without this line
@@ -1359,15 +1434,29 @@ fn cmd_plan(
         .iter()
         .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids))
     {
-        println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+        findings.push(
+            output::Finding::note(
+                "fmt.redundant-annotation",
+                "the `renamed_from` annotation(s) just absorbed into the identity file are now redundant",
+            )
+            .remedy("pbps fmt"),
+        );
+        if !json {
+            println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+        }
     }
 
     let base = baseline::load(project, source)?;
     if base.is_empty_fallback {
-        eprintln!(
-            "warning: the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
+        let message = format!(
+            "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
             base.description
         );
+        if json {
+            findings.push(output::Finding::warning("baseline.empty", message));
+        } else {
+            eprintln!("warning: {message}");
+        }
     }
 
     // Drop ordering is computed over the *baseline's* modules, so it needs the
@@ -1405,14 +1494,23 @@ fn cmd_plan(
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
 
-    println!("Baseline: {}", base.description);
-    print!("{}", report::plan(&cs));
+    if !json {
+        println!("Baseline: {}", base.description);
+        print!("{}", report::plan(&cs));
+    }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
     // offline plan has no edition to ask. Saying so is the honest form of a
     // preview — the alternative is a plan.sql that reads as verified and turns
     // out to be Enterprise-only at the deployment gate.
-    if cs.changes.iter().any(|c| c.strategy.online) {
+    if cs.changes.iter().any(|c| c.strategy.online) && json {
+        findings.push(output::Finding::note(
+            "strategy.online-unverified",
+            "`strategy: online` is emitted unverified: online index operations are Enterprise-only, \
+             and only `pbps plan --db` can read the target's edition",
+        ));
+    }
+    if cs.changes.iter().any(|c| c.strategy.online) && !json {
         println!(
             "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
              Enterprise-only, and only `pbps plan --db` can read the target's edition."
@@ -1437,17 +1535,21 @@ fn cmd_plan(
         );
         plan.git_sha = db::git_sha(project.root());
         write_plan(path, &plan)?;
-        println!(
-            "\nwrote {} (a preview; `apply` will refuse it)",
-            path.display()
-        );
+        if !json {
+            println!(
+                "\nwrote {} (a preview; `apply` will refuse it)",
+                path.display()
+            );
+        }
     }
 
     if let Some(path) = sql {
         let script = render_sql(&cs, dialect.as_ref(), &base.description)?;
         std::fs::write(path, script)
             .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("wrote {}", path.display());
+        if !json {
+            println!("wrote {}", path.display());
+        }
     }
 
     // The dev database is optional and is asked last: everything above is what
@@ -1465,6 +1567,29 @@ fn cmd_plan(
     } else {
         dev::spec(project, dev)?
     };
+    if json {
+        // The dev rehearsal is skipped in this mode rather than half-reported:
+        // it prints its own multi-line report and starts a container, neither of
+        // which belongs inside a JSON document. `--check`, which is what CI runs
+        // with `--format json`, already refuses a dev database above.
+        let tables: std::collections::BTreeSet<String> = cs
+            .changes
+            .iter()
+            .map(|p| p.change.table().to_string())
+            .collect();
+        let report = output::Report::new(
+            "plan",
+            findings,
+            Some(PlanData {
+                baseline: base.description.clone(),
+                changes: cs.changes.len(),
+                tables: tables.len(),
+                risks: cs.risks().iter().map(|r| r.as_str()).collect(),
+            }),
+        );
+        return report.emit_json();
+    }
+
     if let Some(spec) = dev_spec {
         let rehearsal = dev::rehearse(
             project,

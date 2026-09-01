@@ -36,6 +36,34 @@ pub fn blockers(list: &[Blocker]) -> String {
     out
 }
 
+/// One blocker as a typed finding: a stable id, what happened, and the commands
+/// that resolve it.
+///
+/// The remedy is the same text the human view prints — there is one description
+/// of how to resolve an ambiguity, and a second one written for JSON would drift
+/// from it the first time a command gained a flag.
+pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
+    let id = match b {
+        Blocker::AmbiguousColumns { .. } => "identity.ambiguous-columns",
+        Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
+        Blocker::DropColumnNeedsReason { .. } => "identity.drop-column-needs-reason",
+        Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
+        Blocker::UnusedIntent { .. } => "identity.unused-intent",
+    };
+    let text = one_blocker(b);
+    // The first line says what happened; the rest are the commands.
+    let (message, remedy) = match text.split_once("\n\n") {
+        Some((head, tail)) => (head.trim().to_owned(), tail.trim().to_owned()),
+        None => (text.trim().to_owned(), String::new()),
+    };
+    let f = crate::output::Finding::error(id, message);
+    if remedy.is_empty() {
+        f
+    } else {
+        f.remedy(remedy)
+    }
+}
+
 fn one_blocker(b: &Blocker) -> String {
     match b {
         Blocker::AmbiguousColumns {

@@ -155,7 +155,14 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
                     },
                 );
                 if r.state == "staged" {
-                    f = f.remedy("pbps apply --plan <plan.json> --staged --resume");
+                    // Named, for the same reason as `doctor`'s: `apply` requires
+                    // a target, and `status` is the command that reports on six
+                    // environments at once — a remedy without the name leaves
+                    // the reader to work out which of the six it meant.
+                    f = f.remedy(format!(
+                        "pbps apply --env {} --plan <plan.json> --staged --resume",
+                        r.environment
+                    ));
                 }
                 f
             })

@@ -709,7 +709,7 @@ back is structure: a column that was dropped returns empty (14.3).
 |---|---|
 | `pbps plan` | Resolve identity ambiguities, update the identity file, and compare against a baseline to produce a change plan |
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
-| `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
+| `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
@@ -965,7 +965,8 @@ copy blesses files the loader refuses, and does it quietly.
 
 ### 9.8 Machine-readable output and exit codes
 
-Every read-only command takes `--format human|json` and, in JSON, emits one
+Every read-only command — `plan`, `validate`, `fmt`, `explain`, `doctor`,
+`verify`, `status` — takes `--format human|json` and, in JSON, emits one
 envelope:
 
 ```json

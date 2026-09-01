@@ -318,7 +318,15 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 "state.uninitialized",
                 format!("{}: pbps has recorded no state here yet", d.environment),
             )
-            .remedy("pbps baseline --reason \"adopting this environment\""),
+            // Every per-environment remedy names the environment. `baseline`,
+            // `apply` and `unlock` each require exactly one of --db / --env, so
+            // a remedy without one is a command that fails the moment it is
+            // pasted — and this one is aimed at a first-time user, who has the
+            // least standing to work out why.
+            .remedy(format!(
+                "pbps baseline --env {} --reason \"adopting this environment\"",
+                d.environment
+            )),
         ),
         "mid-deployment" => out.push(
             output::Finding::error(
@@ -331,7 +339,10 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                         .unwrap_or("a staged apply is unfinished")
                 ),
             )
-            .remedy("pbps apply --plan <plan.json> --staged --resume"),
+            .remedy(format!(
+                "pbps apply --env {} --plan <plan.json> --staged --resume",
+                d.environment
+            )),
         ),
         "locked" => out.push(
             output::Finding::warning(
@@ -342,7 +353,10 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                     d.detail.as_deref().unwrap_or("the lock is held")
                 ),
             )
-            .remedy("if no apply is running: pbps unlock"),
+            .remedy(format!(
+                "if no apply is running: pbps unlock --env {}",
+                d.environment
+            )),
         ),
         _ => {}
     }
