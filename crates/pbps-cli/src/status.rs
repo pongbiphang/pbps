@@ -205,18 +205,26 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
             (row.locked_by, row.lock_unknown) = read_lock(&mut conn).await;
             return row;
         }
-        // Not here, though: `NotInitialized` means `dbo.__pbps_state` is
-        // absent, and nothing can have taken a lock without `ensure_tables`
-        // creating that table first. Asking anyway would query a lock table
-        // that does not exist and report `lock-unknown` on every environment
-        // pbps has never deployed to — a warning about the ordinary case.
+        // And here too. `NotInitialized` means `dbo.__pbps_state` is absent,
+        // and no path *the tool controls* takes a lock without `ensure_tables`
+        // creating that table first — but a hand-dropped state table leaves the
+        // lock behind, live row and all, which is the same half-present ledger
+        // `doctor` already reports on. The next apply recreates the state table
+        // and then fails to take the lock, so hiding it here costs the operator
+        // the one line that explains that failure.
+        //
+        // Safe on a database pbps has never touched, because `lock_holder` now
+        // asks whether the lock table exists first: absent answers `None`,
+        // which is a different thing from unreadable, which stays an error.
         Err(pbps_db::LedgerError::NotInitialized) => {
-            return EnvStatus::failed(
+            let mut row = EnvStatus::failed(
                 name,
                 "uninitialized",
                 "pbps has never recorded a state here".to_owned(),
                 checked_at,
             );
+            (row.locked_by, row.lock_unknown) = read_lock(&mut conn).await;
+            return row;
         }
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
     };

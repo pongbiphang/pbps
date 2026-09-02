@@ -202,15 +202,46 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
     }
 }
 
+/// Whether the *lock* table exists.
+///
+/// Asked separately from [`is_initialized`], which asks about the state table.
+/// The two travel together in every path the tool controls — `lock` calls
+/// `ensure_tables` — but a hand-dropped `dbo.__pbps_state` leaves the lock
+/// behind, and a caller that inferred one from the other then reported "no
+/// lock" about a lock that was really there.
+pub async fn lock_exists(conn: &mut Conn) -> Result<bool, DbError> {
+    let rows = conn
+        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL THEN 0 ELSE 1 END AS present;")
+        .await?;
+    let present: i32 = match rows.first() {
+        Some(row) => get(row, "present")?,
+        None => return Err(DbError::BadRow("`present` returned no row".into())),
+    };
+    Ok(present == 1)
+}
+
 /// Releases the lock. `false` means it was not held.
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
-    if !is_initialized(conn).await? {
+    // The *lock* table, not the state table. Guarding on `is_initialized` meant
+    // a database whose `__pbps_state` had been dropped by hand reported "not
+    // held" and left a live lock in place — with no command able to clear it.
+    if !lock_exists(conn).await? {
         return Ok(false);
     }
     Ok(conn.execute_with(DELETE_LOCK, &[]).await? > 0)
 }
 
+/// Who holds the deployment lock, if anyone.
+///
+/// A missing lock table answers `None` rather than failing: nothing can be
+/// holding a lock that does not exist. That is deliberately *not* the same as
+/// the table being unreadable, which stays an error — callers report the two
+/// differently, and "I could not look" must never be flattened into "nothing
+/// there".
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
+    if !lock_exists(conn).await? {
+        return Ok(None);
+    }
     let rows = conn.query(SELECT_LOCK).await?;
     match rows.first() {
         Some(row) => Ok(Some(LockInfo {

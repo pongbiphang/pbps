@@ -988,8 +988,10 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
 /// The permission check against a real least-privilege login.
 ///
 /// This is the shape the check exists for and the shape no unit test can
-/// verify: `sa` holds `CONTROL` and short-circuits the whole list, which is how
-/// three permission bugs survived the first live test. It is also the only way
+/// verify: `sa` holds `CONTROL`, which used to short-circuit the whole list —
+/// that is how three permission bugs survived the first live test, and the
+/// shortcut has since been removed for a fourth reason (see
+/// `a_deny_beats_control_and_the_readiness_check_sees_it`). It is also the only way
 /// to find out whether `HAS_PERMS_BY_NAME` really answers the question — that
 /// a grant on a *schema* satisfies a requirement the earlier version asked for
 /// on the database, and reported as missing.
@@ -1276,4 +1278,127 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await;
     let _ = name;
+}
+
+/// `DENY` at a narrower securable beats an inherited `CONTROL`, and the
+/// readiness check has to see it.
+///
+/// `missing` used to return early on `CONTROL` at the database. The reasoning
+/// was that `CONTROL` implies everything below it — true of grants, and beside
+/// the point, because the inputs are `HAS_PERMS_BY_NAME` answers that already
+/// account for inheritance. So the shortcut bought nothing for an owner and
+/// discarded the only answer that matters here.
+///
+/// Only a real server can settle it: whether `fn_my_permissions` still lists
+/// `CONTROL` under a `DENY`, whether the scoped question answers 0, and whether
+/// the DDL actually fails are three separate facts, and the shortcut was built
+/// on the first one alone.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
+    let mut db = TestDb::create("doctordeny").await;
+    let login = format!("pbps_ctl_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsControl!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master;              IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];              CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    db.conn
+        .execute("CREATE SCHEMA [app];")
+        .await
+        .expect("create app schema");
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; GRANT CONTROL TO [{login}];"
+        ))
+        .await
+        .expect("grant control");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    // The premise: an owner is clean, and is clean *without* the shortcut —
+    // its scoped answers come back full on their own.
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.database.contains("CONTROL"),
+        "the test's premise is wrong if this login lacks CONTROL: {held:?}"
+    );
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "an owner must not be reported as missing anything: {:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    db.conn
+        .execute(&format!("DENY ALTER ON SCHEMA::app TO [{login}];"))
+        .await
+        .expect("deny");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+        .await
+        .expect("read permissions");
+    // All three facts, because the old shortcut was built on the first alone.
+    assert!(
+        held.database.contains("CONTROL"),
+        "CONTROL is still listed under a DENY, which is the trap: {held:?}"
+    );
+    assert!(
+        !held.schemas["app"].contains("ALTER"),
+        "the scoped question has to see the DENY: {held:?}"
+    );
+    let denied = lp.execute("CREATE TABLE app.denied_probe (id int);").await;
+    assert!(
+        denied.is_err(),
+        "the premise is wrong if the DDL succeeds under the DENY"
+    );
+
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::app"),
+        "an account that cannot alter its managed schema must not pass readiness: {gaps:?}"
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
 }

@@ -457,17 +457,28 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
 
 /// Which of [`REQUIRED`] the account does not hold, and where.
 ///
-/// `CONTROL` on the database short-circuits the whole list: it implies every
-/// permission below it, and an account that holds it would otherwise be
-/// reported as missing all of them while being able to do all of them.
+/// # Why `CONTROL` on the database is not a shortcut
+///
+/// It was one, and that was wrong. The reasoning — `CONTROL` implies every
+/// permission below it, so an owner would otherwise be reported as missing
+/// everything — mistook the *inputs* for raw grants. They are not:
+/// [`permissions`] asks `HAS_PERMS_BY_NAME` at each securable, which already
+/// accounts for inheritance, so an owner's answers come back full without any
+/// help here. The shortcut therefore bought nothing in the case it was written
+/// for, and threw away the only answer that matters in the case it was not.
+///
+/// That case is `DENY`, which beats an inherited `CONTROL` at the narrower
+/// securable and can arrive through any role the principal is in. Measured
+/// against a real server rather than reasoned about: with `CONTROL` on the
+/// database and `DENY ALTER ON SCHEMA::app`, `sys.fn_my_permissions` still
+/// lists `CONTROL`, `HAS_PERMS_BY_NAME` correctly answers 0 for that `ALTER`,
+/// and `CREATE TABLE app.t` really does fail. The short-circuit read the first
+/// of those three and called the account ready.
 ///
 /// A schema that produced no row is left alone: it does not exist yet, so
 /// nothing can be said about permissions on it, and saying it anyway would
 /// report a gap on every first deployment.
 pub fn missing(held: &Held) -> Vec<Gap> {
-    if held.database.contains("CONTROL") {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for r in &REQUIRED {
         match r.needed {
@@ -620,10 +631,6 @@ pub async fn server_version(conn: &mut Conn) -> Result<String, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn set(items: &[&str]) -> BTreeSet<String> {
-        items.iter().map(|s| (*s).to_owned()).collect()
-    }
 
     /// Every schema-scoped permission on every asked schema, and every
     /// database-scoped one on the database.
@@ -985,15 +992,36 @@ mod tests {
         assert_eq!(db_scoped.len(), 4);
     }
 
-    /// CONTROL implies the rest. Reporting an owner as missing every entry
-    /// would be the check crying wolf on the most common setup there is.
+    /// An owner is recognised by its *answers*, not by the `CONTROL` token.
+    ///
+    /// `HAS_PERMS_BY_NAME` accounts for inheritance, so a `CONTROL` holder's
+    /// per-securable answers come back full on their own — which is why the
+    /// short-circuit that used to sit at the top of `missing` bought nothing
+    /// here, while costing the whole answer in the test below.
     #[test]
-    fn control_alone_satisfies_the_list() {
-        let held = Held {
-            database: set(&["CONTROL"]),
-            ..Held::default()
-        };
-        assert!(missing(&held).is_empty());
+    fn an_owner_is_missing_nothing_without_a_control_shortcut() {
+        let mut held = everything(&["dbo", "app"]);
+        held.database.insert("CONTROL".to_owned());
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// And the case the shortcut hid. `DENY` beats an inherited `CONTROL` at
+    /// the narrower securable and can arrive through any role the principal is
+    /// in, so the two signals genuinely disagree — measured against a real
+    /// server: with `CONTROL` on the database and `DENY ALTER ON SCHEMA::app`,
+    /// `sys.fn_my_permissions` still lists `CONTROL`, `HAS_PERMS_BY_NAME`
+    /// answers 0, and `CREATE TABLE app.t` fails. Reading the first of those
+    /// three and returning early called that account ready.
+    #[test]
+    fn a_deny_at_a_narrower_scope_is_a_gap_even_with_control() {
+        let mut held = everything(&["app"]);
+        held.database.insert("CONTROL".to_owned());
+        held.schemas.get_mut("app").unwrap().remove("ALTER");
+
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "ALTER");
+        assert_eq!(gaps[0].securable(), "SCHEMA::app");
     }
 
     /// The negative case: an empty answer is a real state — a login mapped to

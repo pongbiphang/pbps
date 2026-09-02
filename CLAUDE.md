@@ -366,7 +366,13 @@ Phase 3.1 additions worth knowing before touching them:
     "most changes" instead, and the real check belongs in the plan-aware
     pre-flight. A declared schema the database **lacks** is a readiness *error*
     (pbps never emits `CREATE SCHEMA`), which is a different question from
-    leaving it unasked for permissions.
+    leaving it unasked for permissions. `CONTROL` on the database is also **not
+    a shortcut past the list**: the inputs are `HAS_PERMS_BY_NAME` answers,
+    which already account for inheritance, so an owner comes back clean without
+    one — while a `DENY` at a narrower securable beats an inherited `CONTROL`,
+    still leaves `CONTROL` listed in `sys.fn_my_permissions`, and really does
+    make the DDL fail. Returning early on that one signal called such an
+    account ready.
 39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
     command, and the reviewer may have no checkout and no credentials; the gate
     is `apply --allow`. A target is optional and answers only the question no
@@ -409,8 +415,13 @@ Phase 3.1 additions worth knowing before touching them:
     calls `ensure_tables`, so a lock held over an empty ledger is what a *first*
     `bootstrap` looks like while it runs — and what an interrupted one leaves
     behind. Not in the `NotInitialized` branch, though: `dbo.__pbps_state` being
-    absent means nothing ever took a lock, and asking anyway would report
-    `lock-unknown` on every environment pbps has never deployed to.
+    absent means nothing ever took a lock **by any path the tool controls** —
+    but a hand-dropped state table leaves the lock behind, so both branches read
+    it. What makes that safe on a first run is that `lock_holder` and `unlock`
+    now ask whether the **lock** table exists (`state::lock_exists`, not
+    `is_initialized`): absent answers "no lock", which is a different thing from
+    unreadable, which stays an error. `unlock` had the same confusion and could
+    not release a lock that outlived its state table.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

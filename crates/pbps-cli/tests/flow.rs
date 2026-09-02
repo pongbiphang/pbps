@@ -4169,6 +4169,168 @@ fn status_reports_a_lock_held_over_an_empty_ledger() {
     );
 }
 
+/// The other half-present ledger: `dbo.__pbps_state` dropped by hand while
+/// `dbo.__pbps_lock` survives with a live row.
+///
+/// The round-27 fix read the lock only when the ledger was *empty*, on the
+/// reasoning that nothing can take a lock without `ensure_tables` creating the
+/// state table first. True of every path the tool controls, and beside the
+/// point: a hand-dropped state table leaves the lock behind, the next apply
+/// recreates the table and then fails to take that lock, and `status` was
+/// hiding the one line that explains the failure.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_reports_a_lock_that_outlived_its_state_table() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statuslockorphan");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_ORPHAN_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-orphaned-apply")
+            .await
+            .expect("take the lock");
+        // The state table goes, the lock stays. Stated rather than assumed:
+        // `latest` must now answer `NotInitialized`, which is the branch that
+        // used to return without looking.
+        conn.execute("DROP TABLE dbo.__pbps_state;")
+            .await
+            .expect("drop the state table");
+        assert!(
+            matches!(
+                pbps_mssql::state::latest(&mut conn).await,
+                Err(pbps_db::LedgerError::NotInitialized)
+            ),
+            "the premise: the state table is gone"
+        );
+        assert!(
+            pbps_mssql::state::lock_holder(&mut conn)
+                .await
+                .unwrap()
+                .is_some(),
+            "the premise: the lock survived"
+        );
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        // Also the negative case for `unlock`, which guarded on the *state*
+        // table and so could not release a lock that outlived it.
+        assert!(
+            pbps_mssql::state::unlock(&mut conn).await.unwrap(),
+            "unlock must release a lock whose state table is gone"
+        );
+        let _ = conn.execute("DROP TABLE dbo.__pbps_lock;").await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(
+        v["data"][0]["locked_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("the-orphaned-apply")),
+        "the surviving lock is missing from the row: {v}"
+    );
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "{v}"
+    );
+}
+
+/// And the ordinary first run, which must stay quiet: a database pbps has
+/// never touched has no lock table, and reading it has to answer "no lock"
+/// rather than "I could not look". `lock_unknown` on every fresh environment
+/// would be a warning about the commonest case there is.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_says_nothing_about_a_lock_on_a_database_with_no_ledger() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statusnoledger");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_FRESH_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(v["data"][0]["locked_by"].is_null(), "{v}");
+    assert!(
+        v["data"][0]["lock_unknown"].is_null(),
+        "a missing lock table is not an unreadable one: {v}"
+    );
+}
+
 /// One difference the differ cannot phrase must not delete the ones it can.
 /// `pbps_diff::diff` accumulates every change it can express and only then
 /// returns `Err(errs)`, so `verify` — which reports rather than approves — was
