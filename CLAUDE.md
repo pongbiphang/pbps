@@ -341,7 +341,9 @@ Phase 3.1 additions worth knowing before touching them:
     cannot be granted lower), `ALTER` / `VIEW DEFINITION` and the probes'
     `SELECT` per **managed** schema, and `INSERT` / `DELETE` plus the ledger's
     own `SELECT` on the ledger and lock *objects* (falling back to their schema
-    only until those tables exist). `SELECT` is listed twice on purpose: the
+    only until those tables exist), plus `ALTER` on the ledger's schema **while
+    the ledger does not yet exist** — `CREATE TABLE` at the database does not by
+    itself let an account create a table in a schema. `SELECT` is listed twice on purpose: the
     probes read managed tables and the ledger read is two tables in `dbo`, and
     one entry made the wrong demand in both directions. The ledger's schema is
     **not** forced into the managed set — a project managing only `app` never

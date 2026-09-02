@@ -3729,3 +3729,38 @@ fn pull_refuses_when_it_cannot_tell_whether_declarations_exist() {
 // trips the *read* guard one line earlier and produces that guard's envelope,
 // so a test built on one would assert a passing behaviour that already worked.
 // That mistake has been made three times on this branch already.
+
+// ---- Twenty-first review round ----
+
+/// `db::target` refuses both flags for every other command; `explain`'s
+/// project-free path bypassed that resolver and silently preferred `--db`
+/// while still printing `--env` in the approval command. The reviewer would
+/// validate one database and paste a command that applies to another.
+#[test]
+fn explain_refuses_a_db_and_an_env_together() {
+    let d = Demo::new("explainbothtargets");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        "Server=x;Database=y",
+        "--env",
+        "prod",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("pass one of them"),
+        "the refusal must be the shared one, not a connection failure: {}",
+        stderr(&o)
+    );
+    // And nothing was explained: an approval command naming the wrong target
+    // is the specific harm here.
+    assert!(
+        !stdout(&o).contains("pbps apply"),
+        "no approval command may be printed: {}",
+        stdout(&o)
+    );
+}

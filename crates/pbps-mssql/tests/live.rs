@@ -1089,6 +1089,37 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // DELETE are granted on *those two objects* rather than on the schema. Only
     // an object-scope question can see that grant; a schema-scope one reports
     // it missing, which is the same over-demand at one level further down.
+    // Before the ledger exists, creating it needs ALTER on its schema on top of
+    // the database-level CREATE TABLE. This is the case a `doctor` that said
+    // "ready" would strand at the first `ensure_tables`, so it is checked
+    // against a real server rather than reasoned about.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE ALTER ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke alter");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    // As a project that manages `app`, so the gap can only be the ledger's own
+    // creation requirement and not the ordinary managed-schema `ALTER`.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+        "an account that cannot create the ledger must not pass readiness: {gaps:?}"
+    );
+    db.conn
+        .execute(&format!(
+            "USE [{}]; GRANT ALTER ON SCHEMA::dbo TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("restore alter");
+
     pbps_mssql::state::ensure_tables(&mut db.conn)
         .await
         .expect("create the ledger");
@@ -1114,6 +1145,27 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     assert!(
         gaps.is_empty(),
         "a grant on the ledger objects alone was reported as missing: {gaps:?}"
+    );
+
+    // And once the ledger exists, the creation permission is spent: writing rows
+    // needs INSERT and DELETE, not ALTER. Asked as a project that manages `app`
+    // rather than `dbo` — with `dbo` managed, ALTER there is required for the
+    // ordinary reason and this would say nothing.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE ALTER ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke alter again");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        !gaps.iter().any(|g| g.permission == "ALTER"),
+        "ALTER on the ledger schema must not be demanded once it exists: {gaps:?}"
     );
 
     drop(lp);

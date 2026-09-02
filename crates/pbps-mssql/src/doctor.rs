@@ -43,6 +43,22 @@ pub enum Needed {
     /// Needed on every schema pbps manages, and on `dbo`, where the ledger
     /// tables live.
     Managed,
+    /// Needed on the ledger's schema, but only while the ledger does not exist.
+    ///
+    /// `CREATE TABLE` at the database is not enough to create
+    /// `dbo.__pbps_state`: SQL Server also wants `ALTER` on the schema the
+    /// table lands in. Removing the ledger's schema from the managed set (which
+    /// it had to be, for a project that declares nothing in `dbo`) took that
+    /// check away with it — so an account could pass `doctor` and then fail
+    /// inside `ensure_tables` on its very first deployment. An over-demand
+    /// turned into an under-demand, which is the worse direction: the first
+    /// annoys, the second says "ready" and then breaks.
+    ///
+    /// Only while the tables do not exist. Once they do, writing rows needs
+    /// `INSERT` and `DELETE`, not `ALTER`, and demanding it forever would be
+    /// the over-demand coming back.
+    LedgerCreation,
+
     /// Needed only on the ledger and the lock themselves.
     ///
     /// Asked for on those two **objects**, not on their schema. A careful DBA
@@ -77,7 +93,7 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// The schema the ledger and the lock live in.
 pub const LEDGER_SCHEMA: &str = "dbo";
 
-pub const REQUIRED: [Requirement; 10] = [
+pub const REQUIRED: [Requirement; 11] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -98,6 +114,11 @@ pub const REQUIRED: [Requirement; 10] = [
         "SELECT",
         "reading the recorded state and the deployment lock",
         Needed::Ledger,
+    ),
+    req(
+        "ALTER",
+        "creating __pbps_state and __pbps_lock in their schema on first use",
+        Needed::LedgerCreation,
     ),
     req(
         "CREATE TABLE",
@@ -259,7 +280,12 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
     // every first deployment.
     let schema_perms: Vec<&str> = REQUIRED
         .iter()
-        .filter(|r| matches!(r.needed, Needed::Managed | Needed::Ledger))
+        .filter(|r| {
+            matches!(
+                r.needed,
+                Needed::Managed | Needed::Ledger | Needed::LedgerCreation
+            )
+        })
         .map(|r| r.name)
         .collect();
     let ledger_perms: Vec<&str> = REQUIRED
@@ -399,6 +425,19 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // narrowest place a grant can sit and the only question that can
             // see one. Where they do not exist yet, the schema is the only
             // place a grant *can* be, so that is what is asked instead.
+            // Only while the ledger is still to be created. Once it exists the
+            // creation permission is spent, and asking for it forever would be
+            // the over-demand this whole enum exists to remove.
+            Needed::LedgerCreation if held.ledger_objects.is_empty() => {
+                if !held.ledger_schema.contains(r.name) {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
+                    });
+                }
+            }
+            Needed::LedgerCreation => {}
             Needed::Ledger if !held.ledger_objects.is_empty() => {
                 for (object, granted) in &held.ledger_objects {
                     if !granted.contains(r.name) {
@@ -514,7 +553,7 @@ mod tests {
             // the other half.
             ledger_schema: REQUIRED
                 .iter()
-                .filter(|r| matches!(r.needed, Needed::Ledger))
+                .filter(|r| matches!(r.needed, Needed::Ledger | Needed::LedgerCreation))
                 .map(|r| r.name.to_owned())
                 .collect(),
             ledger_objects: BTreeMap::new(),
@@ -634,6 +673,39 @@ mod tests {
         // Only `dbo` came back from `sys.schemas`; `app` is still to be created.
         let held = everything(&["dbo"]);
         assert!(missing(&held).is_empty());
+    }
+
+    /// The regression the previous round's fix introduced, in the worse
+    /// direction. `CREATE TABLE` at the database does not by itself let an
+    /// account create `dbo.__pbps_state`: SQL Server also wants `ALTER` on the
+    /// schema the table lands in. Dropping the ledger's schema from the managed
+    /// set — which it had to be, for a project declaring nothing in `dbo` —
+    /// took that check with it, so `doctor` said ready and `ensure_tables`
+    /// failed on the first deployment.
+    #[test]
+    fn creating_the_ledger_needs_alter_on_its_schema() {
+        let mut held = everything(&["app"]);
+        assert!(
+            held.ledger_objects.is_empty(),
+            "this is the before-first-deployment case"
+        );
+        held.ledger_schema.remove("ALTER");
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "ALTER");
+        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert!(gaps[0].why.contains("first use"), "{gaps:?}");
+    }
+
+    /// And spent once the tables exist: writing rows needs `INSERT` and
+    /// `DELETE`, not `ALTER`. Demanding it forever would be the over-demand
+    /// coming back by another route.
+    #[test]
+    fn an_existing_ledger_no_longer_needs_alter_on_its_schema() {
+        let mut held = ledger_granted_on_the_objects_only(&["app"]);
+        held.ledger_schema.clear();
+        assert!(!held.ledger_objects.is_empty());
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
     /// The narrowest least-privilege shape there is: `INSERT` and `DELETE`

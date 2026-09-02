@@ -905,7 +905,10 @@ below the database, so they are asked for there; `ALTER`, `VIEW DEFINITION` and
 the probes' `SELECT` are asked for on each **managed** schema, and `INSERT`,
 `DELETE` and the ledger's own `SELECT` on the ledger and lock **objects**
 themselves, falling back to their schema only while those tables do not exist
-yet. `SELECT` appears twice because it is needed in two places for two reasons:
+yet — plus `ALTER` on that schema while the ledger has still to be created,
+because `CREATE TABLE` at the database does not by itself authorize creating a
+table in a given schema. `SELECT` appears twice because it is needed in two
+places for two reasons:
 the probes count rows in managed tables, and reading the recorded state is a
 read of two tables in `dbo`. The ledger's schema is not treated as a managed one
 — a project that declares nothing in `dbo` never touches a `dbo` table and must

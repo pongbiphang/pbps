@@ -494,7 +494,18 @@ fn run() -> anyhow::Result<()> {
         // to suppress the whole report, the same mistake an unset `url_env`
         // made one layer down and for the same reason.
         let resolved = match (&target.db, &target.env) {
-            (Some(db), _) => explain::Target::Reachable(db::target_from_connection(db)),
+            // Refused, not silently preferred, exactly as `db::target` refuses
+            // it for every other command. Taking `--db` and ignoring `--env`
+            // would check one target and print an approval command naming the
+            // other — the reviewer validates one database and pastes a command
+            // that applies to a different one. That is the single worst thing
+            // this command can produce.
+            (Some(_), Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "--db and --env name the same thing; pass one of them"
+                ));
+            }
+            (Some(db), None) => explain::Target::Reachable(db::target_from_connection(db)),
             (None, Some(_)) => explain::Target::from(
                 Project::discover(&start)
                     .map_err(anyhow::Error::from)
