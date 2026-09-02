@@ -3118,3 +3118,43 @@ fn explain_calls_a_never_initialized_database_uninitialized() {
         "a reachable database pbps has never touched is not unreachable: {v}"
     );
 }
+
+// ---- Self-review: the same pattern, a third time ----
+
+/// Found by sweeping this branch for the shape the review kept catching — an
+/// error read as good news. `server_version` and `edition` were `.ok()` and
+/// `if let Ok`, so a server whose version could not be read never had the
+/// 2016-SP1 `CREATE OR ALTER` gate applied, and `doctor` could still say
+/// `ready` for a server that would reject every module statement in the plan.
+///
+/// The live counterpart is the control: against a real server the capabilities
+/// *are* read, so no such finding appears and the fields are populated.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_reports_server_capabilities_or_says_it_could_not_read_them() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctorcaps");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+
+    // Read successfully, so both capability answers are present and the
+    // "undetermined" finding is absent. An empty `supports_create_or_alter`
+    // must never be able to pass for "fine".
+    assert!(env["supports_create_or_alter"].is_boolean(), "{v}");
+    assert!(env["supports_online"].is_boolean(), "{v}");
+    assert!(env.get("server_capabilities_unknown").is_none(), "{v}");
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "server.capabilities-unknown"),
+        "{v}"
+    );
+}

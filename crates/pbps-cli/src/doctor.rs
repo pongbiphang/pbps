@@ -66,6 +66,11 @@ pub struct EnvDiagnosis {
     /// `missing_permissions` means "not determined" rather than "none".
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permissions_unknown: bool,
+
+    /// Set when the version or edition could not be read, so an absent
+    /// `supports_create_or_alter` means "not determined" rather than "fine".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_capabilities_unknown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -142,6 +147,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 supports_create_or_alter: None,
                 missing_permissions: Vec::new(),
                 permissions_unknown: false,
+                server_capabilities_unknown: None,
                 detail: Some(format!("{e:#}")),
             },
         };
@@ -178,6 +184,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     supports_create_or_alter: None,
                     missing_permissions: Vec::new(),
                     permissions_unknown: false,
+                    server_capabilities_unknown: None,
                     detail: Some(e.to_string()),
                 },
             };
@@ -232,6 +239,7 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
                         | "environment.unconfigured"
                         | "permission.unknown"
                         | "state.lock-unknown"
+                        | "server.capabilities-unknown"
                 )
         })
         .count()
@@ -271,6 +279,7 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
         supports_create_or_alter: None,
         missing_permissions: Vec::new(),
         permissions_unknown: false,
+        server_capabilities_unknown: None,
         detail: None,
     };
     let mut conn = match Conn::connect(connection).await {
@@ -283,22 +292,34 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
         }
     };
 
-    d.server_version = pbps_mssql::doctor::server_version(&mut conn).await.ok();
-    if let Ok(ed) = pbps_mssql::edition::edition(&mut conn).await {
-        d.supports_online = Some(ed.supports_online());
-        // Asked of the version *and* the edition together: Azure reports
-        // 12.0.x and supports the syntax regardless (see the dialect function).
-        d.supports_create_or_alter = d
-            .server_version
-            .as_deref()
-            .map(|v| pbps_mssql::doctor::supports_create_or_alter(v, ed.name()));
-        d.edition = Some(match &ed {
-            // Named as unrecognised rather than passed through: the tool is
-            // about to treat it as limited, and an operator reading their own
-            // edition string back without comment would not know that.
-            Edition::Unknown(raw) => format!("{raw} (unrecognised; treated as limited)"),
-            known @ (Edition::Full(_) | Edition::Limited(_)) => known.name().to_owned(),
-        });
+    // `.ok()` and `if let Ok` would be the third instance in this function of
+    // an error read as good news: with the version or the edition unread,
+    // `supports_create_or_alter` is never computed, so the 2016-SP1 gate does
+    // not run — and `doctor` could still say `ready` for a server that will
+    // reject every module statement in the plan.
+    match pbps_mssql::doctor::server_version(&mut conn).await {
+        Ok(v) => d.server_version = Some(v),
+        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+    }
+    match pbps_mssql::edition::edition(&mut conn).await {
+        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+        Ok(ed) => {
+            d.supports_online = Some(ed.supports_online());
+            // Asked of the version *and* the edition together: Azure reports
+            // 12.0.x and supports the syntax regardless (see the dialect
+            // function).
+            d.supports_create_or_alter = d
+                .server_version
+                .as_deref()
+                .map(|v| pbps_mssql::doctor::supports_create_or_alter(v, ed.name()));
+            d.edition = Some(match &ed {
+                // Named as unrecognised rather than passed through: the tool is
+                // about to treat it as limited, and an operator reading their
+                // own edition string back without comment would not know that.
+                Edition::Unknown(raw) => format!("{raw} (unrecognised; treated as limited)"),
+                known @ (Edition::Full(_) | Edition::Limited(_)) => known.name().to_owned(),
+            });
+        }
     }
     match pbps_mssql::doctor::permissions(&mut conn).await {
         Ok(held) => {
@@ -458,6 +479,16 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             )),
         ),
         _ => {}
+    }
+    if let Some(why) = &d.server_capabilities_unknown {
+        out.push(output::Finding::error(
+            "server.capabilities-unknown",
+            format!(
+                "{}: this server's version or edition could not be read ({why}), so whether it \
+                 accepts `CREATE OR ALTER` and online index operations is undetermined",
+                d.environment
+            ),
+        ));
     }
     if d.permissions_unknown {
         out.push(
