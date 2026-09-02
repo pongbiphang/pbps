@@ -95,6 +95,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         crate::dialect(project),
     )?;
     let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
+    // The schemas the permission check asks about. Declarations that do not
+    // load leave this empty, which is not a silence: `dbo` is always asked
+    // about (the ledger lives there) and the declarations themselves are
+    // already reported as findings above.
+    let managed_schemas = managed_schemas(project);
 
     if !project.ids_file().exists() {
         findings.push(
@@ -148,7 +153,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 let label = name.unwrap_or_else(|| target.label.clone());
                 let rt =
                     output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
-                rt.block_on(examine(&label, target.connection()))
+                rt.block_on(examine(&label, target.connection(), &managed_schemas))
             }
             Err(e) => EnvDiagnosis {
                 environment: name.unwrap_or_else(|| "the given target".to_owned()),
@@ -187,7 +192,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
-                Ok(conn) => rt.block_on(examine(&name, &conn)),
+                Ok(conn) => rt.block_on(examine(&name, &conn, &managed_schemas)),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
@@ -285,8 +290,29 @@ fn outcome(report: &output::Report<Diagnosis>) -> anyhow::Result<()> {
     report.outcome()
 }
 
+/// The schemas this project manages, for the permission check.
+///
+/// Declarations that do not load give an empty list rather than an error: the
+/// load failure is already a finding of its own, and `dbo` is asked about
+/// regardless because the ledger lives there. Answering "no schemas" is
+/// therefore the same shape as answering "a project with nothing declared yet",
+/// which is a real and common state.
+fn managed_schemas(project: &Project) -> Vec<String> {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return Vec::new();
+    };
+    let mut out: std::collections::BTreeSet<String> = loaded
+        .schema
+        .tables
+        .keys()
+        .map(|t| t.schema.clone())
+        .collect();
+    out.extend(loaded.schema.modules.keys().map(|m| m.schema.clone()));
+    out.into_iter().collect()
+}
+
 /// Everything one environment can be asked without writing to it.
-async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
+async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnosis {
     let mut d = EnvDiagnosis {
         environment: name.to_owned(),
         state: "unreachable",
@@ -338,11 +364,14 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn).await {
+    match pbps_mssql::doctor::permissions(&mut conn, schemas).await {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()
-                .map(|(name, why)| format!("{name} — {why}"))
+                // The securable is part of the answer, not decoration: "you
+                // lack ALTER" sends someone to ask for it on the database,
+                // which is the over-grant this check exists to avoid.
+                .map(|g| format!("{} on {} — {}", g.permission, g.securable(), g.why))
                 .collect();
         }
         // Not merely noted in `detail`: with the list left empty, a successful

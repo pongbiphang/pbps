@@ -890,14 +890,25 @@ Two rules hold it in place:
   looked.
 - **It writes nothing.** This is the command someone runs when they are not yet
   sure what they are pointed at, which is quite possibly production — so the
-  permissions are *asked for* (`sys.fn_my_permissions`) rather than tried, and
-  the ledger is read rather than created. It cannot leave a project or a database
-  changed.
+  permissions are *asked for* (`sys.fn_my_permissions`, `HAS_PERMS_BY_NAME`)
+  rather than tried, and the ledger is read rather than created. It cannot leave
+  a project or a database changed.
 
 Permissions are named individually rather than as "make it `db_owner`". An
 organization that grants the deployment account exactly what it needs should be
 able to see the list; "make it an owner" is the advice that makes that
 organization say no to the tool.
+
+**Each is asked for at the securable where it is actually needed**, and the
+report names that securable. The four `CREATE` permissions cannot be granted
+below the database, so they are asked for there; `ALTER`, `SELECT` and
+`VIEW DEFINITION` are asked for on each managed schema, and `INSERT` and
+`DELETE` only on the schema holding the ledger and the lock. Asking for all of
+them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE')`
+alone answers — reports gaps a correctly granted least-privilege account does
+not have, and the remedy an operator then reaches for is the database-wide grant
+this list exists to avoid. A declared schema that does not exist yet is left
+unasked rather than reported: that is every first deployment.
 
 ### 9.6 Explaining a plan
 

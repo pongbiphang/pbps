@@ -984,3 +984,115 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     // Rows, not groups: two rows share id 1.
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
+
+/// The permission check against a real least-privilege login.
+///
+/// This is the shape the check exists for and the shape no unit test can
+/// verify: `sa` holds `CONTROL` and short-circuits the whole list, which is how
+/// three permission bugs survived the first live test. It is also the only way
+/// to find out whether `HAS_PERMS_BY_NAME` really answers the question — that
+/// a grant on a *schema* satisfies a requirement the earlier version asked for
+/// on the database, and reported as missing.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
+    let mut db = TestDb::create("doctorperm").await;
+    let login = format!("pbps_lp_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    // Exactly what a careful DBA would grant, and nothing more: the schema-scoped
+    // permissions on the schema, the four CREATEs at the database (SQL Server
+    // will not grant them lower), and no database-wide ALTER or SELECT at all.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+        .await
+        .expect("read permissions");
+
+    // The point of the whole change: none of these are held on the *database*,
+    // which is what the first version of this check asked about.
+    assert!(
+        !held.database.contains("ALTER"),
+        "the test's own premise is wrong if this login has database-wide ALTER: {held:?}"
+    );
+    assert!(!held.database.contains("CONTROL"), "{held:?}");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.is_empty(),
+        "a correctly granted least-privilege login was reported as missing: {gaps:?}"
+    );
+
+    // The negative case, and the dangerous one: it can take the deployment lock
+    // but not release it. `apply` would commit the schema change and only then
+    // fail, leaving a stale lock for the next pipeline.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE DELETE ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].permission, "DELETE");
+    assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+
+    drop(lp);
+    let name = db.name.clone();
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    let _ = name;
+}

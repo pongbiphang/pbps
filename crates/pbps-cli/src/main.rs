@@ -847,7 +847,9 @@ fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
 /// Silent, because `validate` has to decide how to render these — as miette
 /// diagnostics or as JSON findings — and a helper that had already printed them
 /// would leave it choosing between saying nothing and saying it twice.
-fn load_quiet(project: &Project) -> Result<pbps_load::Loaded, Vec<pbps_load::LoadError>> {
+pub(crate) fn load_quiet(
+    project: &Project,
+) -> Result<pbps_load::Loaded, Vec<pbps_load::LoadError>> {
     let dir = project.schema_dir();
     if !dir.is_dir() {
         return Err(vec![pbps_load::LoadError::Io {

@@ -335,9 +335,15 @@ Phase 3.1 additions worth knowing before touching them:
 38. **`doctor` reimplements nothing and writes nothing.** It calls
     `validate_findings`, the same function `validate` runs — a readiness command
     that disagreed with `validate` would be worse than one that never looked.
-    Permissions are *asked for* (`sys.fn_my_permissions`), never tried, and
-    named one by one with what each is for: "make it db_owner" is the advice
-    that makes an organization say no to the tool.
+    Permissions are *asked for* (`sys.fn_my_permissions`, `HAS_PERMS_BY_NAME`),
+    never tried, and named one by one with what each is for **and at the
+    securable where it is needed**: the four `CREATE`s at the database (they
+    cannot be granted lower), `ALTER` / `SELECT` / `VIEW DEFINITION` per managed
+    schema, `INSERT` / `DELETE` only where the ledger lives. Asking at database
+    scope alone reports gaps a least-privilege account does not have, and the
+    remedy it then invites is exactly the "make it db_owner" this list exists to
+    avoid. A declared schema that does not exist yet is left unasked — that is
+    every first deployment.
 39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
     command, and the reviewer may have no checkout and no credentials; the gate
     is `apply --allow`. A target is optional and answers only the question no
@@ -365,7 +371,11 @@ ledger round-trip, the lock admitting one holder, a failed statement rolling the
 whole plan back, the rename-impact queries, the probes counting real rows, a
 staged checkpoint surviving `state_json`, a cross-schema rename stopping at the
 name its statement declared, the module round-trip through
-`sys.sql_modules`, and `doctor` reading a real edition and permission set) run
+`sys.sql_modules`, `doctor` reading a real edition and permission set, and the
+readiness check against a **real least-privilege login** created and granted
+inside the test container — `sa` holds `CONTROL` and short-circuits the whole
+permission list, which is how three permission bugs survived the first live
+test) run
 against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The
