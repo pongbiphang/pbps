@@ -52,6 +52,10 @@ pub struct Explanation {
     pub checksum: String,
     pub change_count: usize,
     pub table_count: usize,
+    /// Counted apart from tables: `Change::table()` returns a module's own name
+    /// for a module change, so folding them together called a one-view plan
+    /// "1 table" (ADR-0002 — they are different kinds of object).
+    pub module_count: usize,
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
@@ -77,7 +81,7 @@ pub struct RiskDetail {
 #[derive(serde::Serialize)]
 pub struct TargetState {
     pub environment: String,
-    /// `ready`, `mid-deployment` or `uninitialized`.
+    /// `ready`, `locked`, `mid-deployment`, `uninitialized` or `unreachable`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -184,11 +188,7 @@ fn explain(
     env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
-    let tables: std::collections::BTreeSet<String> = cs
-        .changes
-        .iter()
-        .map(|p| p.change.table().to_string())
-        .collect();
+    let (table_count, module_count) = report::touched(cs);
 
     let present = cs.risks();
     let risks: Vec<RiskDetail> = RiskClass::ALL
@@ -260,7 +260,8 @@ fn explain(
         },
         checksum: plan.checksum(),
         change_count: cs.changes.len(),
-        table_count: tables.len(),
+        table_count,
+        module_count,
         risks,
         approve_with: approve,
         probes: dialect
@@ -278,10 +279,33 @@ fn explain(
 
 /// The one question the file cannot answer.
 fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
+    // The lock is read first, and a held one wins. During an ordinary
+    // transactional apply the newest ledger entry is a completed snapshot, so
+    // `latest` alone reports `ready` — handing the reviewer an approval command
+    // while the environment is being changed underneath them, which is the one
+    // thing this check exists to prevent.
     let checked = db::runtime()?.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
-        pbps_mssql::state::latest(&mut conn).await
+        if let Ok(Some(lock)) = pbps_mssql::state::lock_holder(&mut conn).await {
+            return Ok(Err(lock));
+        }
+        pbps_mssql::state::latest(&mut conn).await.map(Ok)
     });
+    let checked = match checked {
+        Ok(Err(lock)) => {
+            return Ok(TargetState {
+                environment: target.label.clone(),
+                state: "locked",
+                detail: Some(format!(
+                    "an apply is running (held by {} since {}), so this environment is \
+                     changing right now",
+                    lock.locked_by, lock.locked_at
+                )),
+            });
+        }
+        Ok(Ok(entry)) => Ok(entry),
+        Err(e) => Err(e),
+    };
     Ok(match checked {
         Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
             let progress = entry.snapshot.staged.as_ref().expect("just matched");
@@ -392,8 +416,10 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     out.push_str(&format!("  checksum    {}\n", e.checksum));
 
     out.push_str(&format!(
-        "\nWhat it changes\n  {} change(s) across {} table(s), {} statement(s).\n",
-        e.change_count, e.table_count, e.statement_count
+        "\nWhat it changes\n  {} change(s) across {}, {} statement(s).\n",
+        e.change_count,
+        report::objects(e.table_count, e.module_count),
+        e.statement_count
     ));
     out.push_str(&report::changes(&plan.changes));
 

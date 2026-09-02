@@ -44,8 +44,8 @@ pub struct Diagnosis {
 #[derive(serde::Serialize)]
 pub struct EnvDiagnosis {
     pub environment: String,
-    /// `ready`, `mid-deployment`, `uninitialized`, `locked`, `unreachable` or
-    /// `unconfigured`.
+    /// `ready`, `mid-deployment`, `uninitialized`, `locked`, `lock-unknown`,
+    /// `unreachable` or `unconfigured`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_version: Option<String>,
@@ -195,7 +195,10 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
             f.severity == output::Severity::Error
                 && matches!(
                     f.id,
-                    "environment.unreachable" | "environment.unconfigured" | "permission.unknown"
+                    "environment.unreachable"
+                        | "environment.unconfigured"
+                        | "permission.unknown"
+                        | "state.lock-unknown"
                 )
         })
         .count()
@@ -287,6 +290,15 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
     d.state = match pbps_mssql::state::is_initialized(&mut conn).await {
         Ok(false) => "uninitialized",
         Ok(true) => match pbps_mssql::state::lock_holder(&mut conn).await {
+            // A lock this could not read is not an absent lock. Falling through
+            // to `latest` here let a denied or damaged `__pbps_lock` be reported
+            // as `ready` — `doctor` saying no deployment is active without ever
+            // having established it, which is the same mistake as an empty
+            // `missing_permissions` meaning "none missing".
+            Err(e) => {
+                d.detail = Some(format!("could not read the deployment lock: {e}"));
+                "lock-unknown"
+            }
             Ok(Some(lock)) => {
                 d.detail = Some(format!(
                     "held by {} since {}; an apply is running, or one died without releasing",
@@ -294,7 +306,7 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
                 ));
                 "locked"
             }
-            _ => match pbps_mssql::state::latest(&mut conn).await {
+            Ok(None) => match pbps_mssql::state::latest(&mut conn).await {
                 Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
                     let p = entry.snapshot.staged.as_ref().expect("just matched");
                     d.detail = Some(format!(
@@ -376,6 +388,22 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 "pbps apply --env {} --plan <plan.json> --staged --resume",
                 d.environment
             )),
+        ),
+        // Unanswerable, like `permission.unknown`: `doctor` could not establish
+        // whether a deployment is running, and "probably not" is not an answer
+        // this command is allowed to give.
+        "lock-unknown" => out.push(
+            output::Finding::error(
+                "state.lock-unknown",
+                format!(
+                    "{}: {}",
+                    d.environment,
+                    d.detail
+                        .as_deref()
+                        .unwrap_or("the deployment lock could not be read")
+                ),
+            )
+            .remedy("grant SELECT on dbo.__pbps_lock, or check that the table is intact"),
         ),
         "locked" => out.push(
             output::Finding::warning(

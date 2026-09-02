@@ -1344,6 +1344,10 @@ struct PlanData {
     baseline: String,
     changes: usize,
     tables: usize,
+    /// Counted apart from tables: a module change's `Change::table()` is the
+    /// module's own name, so folding them together called a one-view plan
+    /// "1 table" (ADR-0002).
+    modules: usize,
     risks: Vec<&'static str>,
 }
 
@@ -1645,18 +1649,15 @@ fn cmd_plan(
     }
 
     if json {
-        let tables: std::collections::BTreeSet<String> = cs
-            .changes
-            .iter()
-            .map(|p| p.change.table().to_string())
-            .collect();
+        let (tables, modules) = report::touched(&cs);
         let report = output::Report::new(
             "plan",
             findings,
             Some(PlanData {
                 baseline: base.description.clone(),
                 changes: cs.changes.len(),
-                tables: tables.len(),
+                tables,
+                modules,
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
             }),
         );

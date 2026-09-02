@@ -141,19 +141,44 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
 /// Stable by construction: the counts come from the typed ChangeSet and the risk
 /// order is [`RiskClass::ALL`], so two runs over the same plan produce the same
 /// text and a diff of two summaries means the plans really differ.
+/// How many distinct tables and how many modules a change set touches.
+///
+/// `Change::table()` returns the *object* name, which for a view, procedure,
+/// function or trigger is the module's own name — so counting its distinct
+/// values called a one-view plan "1 table". `module_name()` is what separates
+/// them, and it exists precisely because they are different kinds of object
+/// (ADR-0002).
+pub fn touched(cs: &ChangeSet) -> (usize, usize) {
+    let mut tables = std::collections::BTreeSet::new();
+    let mut modules = std::collections::BTreeSet::new();
+    for p in &cs.changes {
+        match p.change.module_name() {
+            Some(m) => modules.insert(m.to_string()),
+            None => tables.insert(p.change.table().to_string()),
+        };
+    }
+    (tables.len(), modules.len())
+}
+
+/// "3 table(s)", "2 module(s)", or both — never a count of one naming the
+/// other.
+pub fn objects(tables: usize, modules: usize) -> String {
+    match (tables, modules) {
+        (0, m) => format!("{m} module(s)"),
+        (t, 0) => format!("{t} table(s)"),
+        (t, m) => format!("{t} table(s) and {m} module(s)"),
+    }
+}
+
 pub fn summary(cs: &ChangeSet) -> String {
     if cs.is_empty() {
         return String::new();
     }
-    let tables: std::collections::BTreeSet<String> = cs
-        .changes
-        .iter()
-        .map(|p| p.change.table().to_string())
-        .collect();
+    let (tables, modules) = touched(cs);
     let mut out = format!(
-        "\n  {} change(s) across {} table(s).\n",
+        "\n  {} change(s) across {}.\n",
         cs.changes.len(),
-        tables.len()
+        objects(tables, modules)
     );
 
     let risks = cs.risks();

@@ -2721,3 +2721,150 @@ fn explain_json_emits_an_envelope_when_the_plan_cannot_be_read() {
         assert_eq!(v["findings"][0]["id"], "plan.unreadable");
     }
 }
+
+// ---- Eighth review round ----
+
+/// `Change::table()` returns a module's own name for a module change, so
+/// counting its distinct values called a one-view plan "1 table". Modules are a
+/// different kind of object (ADR-0002) and are counted apart.
+#[test]
+fn a_plan_of_modules_is_not_reported_as_a_plan_of_tables() {
+    let d = Demo::new("modulecount");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.module("v.yml", A_VIEW);
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("1 module(s)"), "{out}");
+    assert!(!out.contains("1 table(s)"), "a view is not a table: {out}");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["plan", "--format", "json"]))).unwrap();
+    assert_eq!(v["data"]["modules"], 1, "{v}");
+    assert_eq!(v["data"]["tables"], 0, "{v}");
+}
+
+/// And a plan touching both says both, rather than folding one into the other's
+/// count.
+#[test]
+fn a_plan_touching_tables_and_modules_counts_them_separately() {
+    let d = Demo::new("bothcount");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    d.module("v.yml", A_VIEW);
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("1 table(s) and 1 module(s)"), "{out}");
+}
+
+/// `verify` could not answer, so it must say so through the envelope like every
+/// other read-only command — not leave stdout empty for the converter to
+/// report as its own generic failure.
+#[test]
+fn verify_json_emits_an_envelope_when_it_cannot_connect() {
+    let d = Demo::new("verifyjson");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&[
+        "verify",
+        "--db",
+        "Server=127.0.0.1,1;Database=nope;User Id=u;Password=p;TrustServerCertificate=true",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "environment.unreachable");
+    // And still no connection string anywhere in it.
+    assert!(!stdout(&o).contains("Password"), "{}", stdout(&o));
+}
+
+/// `explain --db` must not call a target ready while an apply holds the lock.
+/// During an ordinary transactional apply the newest ledger entry is a
+/// completed snapshot, so reading `latest` alone reports `ready` — and hands
+/// the reviewer an approval command for an environment that is changing
+/// underneath them.
+///
+/// Live, because only a real ledger can hold a real lock.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn explain_reports_a_locked_target_rather_than_a_ready_one() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("explainlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let plan = write_plan(&d, "target.json", "transactional");
+
+    // A ledger with an ordinary completed entry, and a lock held on top of it.
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    let held = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &connection,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&held), 0, "{}", stderr(&held));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&held)).unwrap();
+    // With no apply running the target is ready; that is the control.
+    assert_eq!(v["data"]["target"]["state"], "ready", "{v}");
+
+    // Now take the lock the way an apply does, and ask again.
+    d.git(&["init", "-q"]);
+    let locked = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "pbps-test-mssql",
+            "/opt/mssql-tools18/bin/sqlcmd",
+            "-C",
+            "-S",
+            "localhost",
+            "-U",
+            "sa",
+            "-P",
+            "Pbps!Test12345",
+            "-Q",
+            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+        ])
+        .output();
+    if locked.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container; the control above already ran.
+    }
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &connection,
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let _ = d.run(&["unlock", "--db", &connection]);
+
+    assert_eq!(v["data"]["target"]["state"], "locked", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "target.not-ready"),
+        "{v}"
+    );
+}

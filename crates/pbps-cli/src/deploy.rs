@@ -210,7 +210,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     let dialect = crate::dialect(project)?;
     let checked_at = crate::now();
 
-    let report = db::runtime()?.block_on(async {
+    let report = match db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
@@ -281,7 +281,29 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             changes,
             unmanaged: scoped.unmanaged,
         })
-    })?;
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            // Unanswerable: `verify` was asked whether this database still
+            // matches its recorded state, and it could not look. Without
+            // this the JSON path returned before its own branch, leaving
+            // stdout empty — so a consumer got the converter's generic
+            // "produced no output" instead of a report naming the target
+            // (SPEC §9.8).
+            if json {
+                let report = crate::output::Report::plain(
+                    "verify",
+                    vec![crate::output::Finding::error(
+                        "environment.unreachable",
+                        format!("{}: {e:#}", target.label),
+                    )],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
 
     // The hook always receives the bare report, whatever the human asked for on
     // stdout: a script's payload should not change shape because someone added
