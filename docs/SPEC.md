@@ -903,7 +903,8 @@ organization say no to the tool.
 report names that securable. The four `CREATE` permissions cannot be granted
 below the database, so they are asked for there; `ALTER`, `SELECT` and
 `VIEW DEFINITION` are asked for on each managed schema, and `INSERT` and
-`DELETE` only on the schema holding the ledger and the lock. Asking for all of
+`DELETE` on the ledger and lock **objects** themselves, falling back to their
+schema only while those tables do not exist yet. Asking for all of
 them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE')`
 alone answers — reports gaps a correctly granted least-privilege account does
 not have, and the remedy an operator then reaches for is the database-wide grant

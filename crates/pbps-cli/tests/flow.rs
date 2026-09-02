@@ -3511,3 +3511,41 @@ fn explain_json_emits_an_envelope_when_a_plan_cannot_be_rendered() {
     // never reaches the emitter, and the test would pass without testing this.
     assert_eq!(v["findings"][0]["id"], "plan.unexplainable", "{v}");
 }
+
+// ---- Seventeenth review round ----
+
+/// A `--base` that is missing, malformed or of an unsupported version is a
+/// failure of the *input*: the command never got as far as comparing anything.
+/// It escaped before the JSON branch, so an offline `plan` in CI printed
+/// nothing at all for the commonest way of pointing it at the wrong file.
+#[test]
+fn plan_json_emits_an_envelope_when_the_baseline_cannot_be_read() {
+    let d = Demo::new("planbadbase");
+    d.table(ONE_COLUMN);
+    // The identity check runs first, so the project has to be settled or the
+    // test would pass on a `identity.stale` finding instead — a different
+    // envelope, from a different guard.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    for base in ["nowhere.json", "junk.json"] {
+        if base == "junk.json" {
+            std::fs::write(d.dir.join(base), "not a state snapshot").unwrap();
+        }
+        let path = d.dir.join(base);
+        let o = d.run(&[
+            "plan",
+            "--check",
+            "--base",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&o), 1, "{base}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{base}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "baseline.unreadable", "{v}");
+    }
+}

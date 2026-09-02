@@ -458,7 +458,14 @@ pub fn shell_arg(value: &str) -> Option<String> {
         value.contains(['$', '`', '"', '\n']) || value.ends_with('\\') || value.contains("\\\\");
     // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
     // quote character to wrap them in.
-    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%']);
+    //
+    // `!` is in the list for a narrower reason: it is inert in a default `cmd`,
+    // but under `setlocal enabledelayedexpansion` it expands *inside* double
+    // quotes, so a path or environment name containing `!NAME!` would silently
+    // become a different value on the one shell where this is hardest to
+    // notice. Whether delayed expansion is on is not knowable from here, so the
+    // safe reading is that it might be.
+    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%', '!']);
     if expands || cmd_metacharacters {
         return None;
     }

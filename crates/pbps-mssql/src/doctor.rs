@@ -43,9 +43,18 @@ pub enum Needed {
     /// Needed on every schema pbps manages, and on `dbo`, where the ledger
     /// tables live.
     Managed,
-    /// Needed only on `dbo`: these are for the ledger and the lock, and
-    /// demanding them on an application schema would be asking for a write
-    /// permission the deployment never uses there.
+    /// Needed only on the ledger and the lock themselves.
+    ///
+    /// Asked for on those two **objects**, not on their schema. A careful DBA
+    /// grants `INSERT` and `DELETE` on `dbo.__pbps_state` and `dbo.__pbps_lock`
+    /// and nowhere else, and a schema-scoped question reports that as missing —
+    /// the same over-demand this enum was introduced to remove, one level
+    /// further down. `HAS_PERMS_BY_NAME` accounts for inheritance, so a grant
+    /// on the schema or the database still answers 1 at object scope.
+    ///
+    /// Before the tables exist there is nothing to ask about, so the question
+    /// falls back to the schema — which is the only place a grant *can* sit in
+    /// advance of a first deployment.
     Ledger,
 }
 
@@ -141,6 +150,12 @@ pub struct Held {
     /// A schema absent from this map was **not asked about**, which is not the
     /// same as holding nothing there — see [`missing`].
     pub schemas: BTreeMap<String, BTreeSet<String>>,
+
+    /// Per ledger object, the permissions effective on it.
+    ///
+    /// Empty when the ledger does not exist yet, in which case [`missing`]
+    /// falls back to the schema answer.
+    pub ledger_objects: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// A permission that is needed and not held, and the securable it is missing on.
@@ -148,17 +163,33 @@ pub struct Held {
 pub struct Gap {
     pub permission: &'static str,
     pub why: &'static str,
-    /// The schema it is missing on, or `None` for the database itself.
-    pub schema: Option<String>,
+    /// Where it is missing, already spelled the way a `GRANT` names it.
+    pub securable: Securable,
+}
+
+/// The securable a [`Gap`] is about, kept typed so the report cannot spell one
+/// of them wrongly and so a caller can tell them apart without parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Securable {
+    Database,
+    Schema(String),
+    Object(String),
+}
+
+impl std::fmt::Display for Securable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Securable::Database => f.write_str("the database"),
+            Securable::Schema(s) => write!(f, "SCHEMA::{s}"),
+            Securable::Object(o) => write!(f, "OBJECT::{o}"),
+        }
+    }
 }
 
 impl Gap {
     /// How the securable is named in a `GRANT`, which is how the report names it.
     pub fn securable(&self) -> String {
-        match &self.schema {
-            Some(s) => format!("SCHEMA::{s}"),
-            None => "the database".to_owned(),
-        }
+        self.securable.to_string()
     }
 }
 
@@ -197,9 +228,17 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
     wanted.insert(LEDGER_SCHEMA);
     let wanted: Vec<&str> = wanted.into_iter().collect();
 
+    // Ledger permissions are still asked at schema scope as well: that is the
+    // fallback for a database where the ledger does not exist yet, which is
+    // every first deployment.
     let schema_perms: Vec<&str> = REQUIRED
         .iter()
         .filter(|r| matches!(r.needed, Needed::Managed | Needed::Ledger))
+        .map(|r| r.name)
+        .collect();
+    let ledger_perms: Vec<&str> = REQUIRED
+        .iter()
+        .filter(|r| matches!(r.needed, Needed::Ledger))
         .map(|r| r.name)
         .collect();
 
@@ -240,9 +279,50 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         }
     }
 
+    // The ledger and the lock at object scope. A careful DBA grants INSERT and
+    // DELETE on exactly these two tables and nowhere else, and only this
+    // question can see that grant. `sys.objects` filters to what exists: before
+    // the first deployment there is nothing to ask about, and `missing` then
+    // falls back to the schema answer above.
+    let mut params: Vec<Param<'_>> = Vec::new();
+    let mut perm_slots = Vec::new();
+    for p in &ledger_perms {
+        params.push(Param::from(*p));
+        perm_slots.push(format!("(@P{})", params.len()));
+    }
+    let mut object_slots = Vec::new();
+    for t in [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE] {
+        params.push(Param::from(t));
+        object_slots.push(format!("@P{}", params.len()));
+    }
+    let sql = format!(
+        "SELECT o.n AS [object], p.n AS permission, \
+         HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
+         FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n) \
+         WHERE OBJECT_ID(o.n, N'U') IS NOT NULL;",
+        object_slots
+            .iter()
+            .map(|s| format!("({s})"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        perm_slots.join(", ")
+    );
+
+    let mut ledger_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let object: &str = get(row, "object")?;
+        let permission: &str = get(row, "permission")?;
+        let held: i32 = row.try_get("held")?.unwrap_or(0);
+        let entry = ledger_objects.entry(object.to_owned()).or_default();
+        if held != 0 {
+            entry.insert(permission.trim().to_ascii_uppercase());
+        }
+    }
+
     Ok(Held {
         database,
         schemas: per_schema,
+        ledger_objects,
     })
 }
 
@@ -267,7 +347,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     out.push(Gap {
                         permission: r.name,
                         why: r.why,
-                        schema: None,
+                        securable: Securable::Database,
                     });
                 }
             }
@@ -277,7 +357,22 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                         out.push(Gap {
                             permission: r.name,
                             why: r.why,
-                            schema: Some(schema.clone()),
+                            securable: Securable::Schema(schema.clone()),
+                        });
+                    }
+                }
+            }
+            // Object scope where the tables exist, because that is the
+            // narrowest place a grant can sit and the only question that can
+            // see one. Where they do not exist yet, the schema is the only
+            // place a grant *can* be, so that is what is asked instead.
+            Needed::Ledger if !held.ledger_objects.is_empty() => {
+                for (object, granted) in &held.ledger_objects {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Object(object.clone()),
                         });
                     }
                 }
@@ -289,7 +384,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     out.push(Gap {
                         permission: r.name,
                         why: r.why,
-                        schema: Some(LEDGER_SCHEMA.to_owned()),
+                        securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
                     });
                 }
             }
@@ -382,7 +477,35 @@ mod tests {
                 .iter()
                 .map(|s| ((*s).to_owned(), schema_perms.clone()))
                 .collect(),
+            // The ledger not existing yet is the default here, so `missing`
+            // falls back to the schema. `with_ledger_objects` below is the
+            // other half.
+            ledger_objects: BTreeMap::new(),
         }
+    }
+
+    /// The same holdings, but with the ledger tables present and carrying
+    /// exactly the ledger permissions at object scope — and *nothing* at schema
+    /// scope, which is the least-privilege shape this must accept.
+    fn ledger_granted_on_the_objects_only(schemas: &[&str]) -> Held {
+        let ledger: BTreeSet<String> = REQUIRED
+            .iter()
+            .filter(|r| matches!(r.needed, Needed::Ledger))
+            .map(|r| r.name.to_owned())
+            .collect();
+        let mut held = everything(schemas);
+        for granted in held.schemas.values_mut() {
+            for p in &ledger {
+                granted.remove(p);
+            }
+        }
+        held.ledger_objects = [
+            (pbps_db::ledger::STATE_TABLE.to_owned(), ledger.clone()),
+            (pbps_db::ledger::LOCK_TABLE.to_owned(), ledger),
+        ]
+        .into_iter()
+        .collect();
+        held
     }
 
     #[test]
@@ -454,6 +577,52 @@ mod tests {
         assert!(missing(&held).is_empty());
     }
 
+    /// The narrowest least-privilege shape there is: `INSERT` and `DELETE`
+    /// granted on `dbo.__pbps_state` and `dbo.__pbps_lock` themselves and
+    /// nowhere else. A schema-scoped question reports that as missing — the
+    /// same over-demand the `Needed` split was introduced to remove, one level
+    /// further down.
+    #[test]
+    fn a_grant_on_the_ledger_objects_alone_satisfies_the_ledger_requirements() {
+        let held = ledger_granted_on_the_objects_only(&["dbo", "app"]);
+        assert!(
+            !held.schemas["dbo"].contains("INSERT"),
+            "the test's premise is wrong if the schema still carries it"
+        );
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// Still the dangerous shape, now at object scope: it can take the lock and
+    /// not release it, so `apply` commits the schema change and only then fails.
+    #[test]
+    fn losing_delete_on_the_lock_object_is_still_a_gap() {
+        let mut held = ledger_granted_on_the_objects_only(&["dbo"]);
+        held.ledger_objects
+            .get_mut(pbps_db::ledger::LOCK_TABLE)
+            .unwrap()
+            .remove("DELETE");
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "DELETE");
+        assert_eq!(gaps[0].securable(), "OBJECT::dbo.__pbps_lock");
+    }
+
+    /// Before a first deployment the ledger does not exist, so there is no
+    /// object to ask about and the schema is the only place a grant can sit.
+    /// Asking at object scope anyway would report a gap on every first run.
+    #[test]
+    fn without_a_ledger_yet_the_question_falls_back_to_the_schema() {
+        let held = everything(&["dbo"]);
+        assert!(held.ledger_objects.is_empty());
+        assert!(missing(&held).is_empty());
+
+        let mut held = everything(&["dbo"]);
+        held.schemas.get_mut("dbo").unwrap().remove("INSERT");
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+    }
+
     /// A trigger is authorized by ALTER on the table it is on, not by a CREATE
     /// of its own. Demanding one would send an organization to grant a
     /// permission its deployment does not use.
@@ -508,6 +677,7 @@ mod tests {
         let held = Held {
             database: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
+            ledger_objects: BTreeMap::new(),
         };
         assert_eq!(missing(&held).len(), REQUIRED.len());
     }

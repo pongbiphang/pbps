@@ -1085,6 +1085,37 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     assert_eq!(gaps[0].permission, "DELETE");
     assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
 
+    // And the narrowest shape of all: the ledger tables exist, and INSERT and
+    // DELETE are granted on *those two objects* rather than on the schema. Only
+    // an object-scope question can see that grant; a schema-scope one reports
+    // it missing, which is the same over-demand at one level further down.
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             REVOKE INSERT, DELETE ON SCHEMA::dbo FROM [{login}]; \
+             GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_state TO [{login}]; \
+             GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_lock TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant on the ledger objects");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+        .await
+        .expect("read permissions");
+    assert!(
+        !held.schemas["dbo"].contains("INSERT"),
+        "the premise is wrong if the schema grant survived the revoke: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.is_empty(),
+        "a grant on the ledger objects alone was reported as missing: {gaps:?}"
+    );
+
     drop(lp);
     let name = db.name.clone();
     db.drop().await;

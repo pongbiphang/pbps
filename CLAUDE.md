@@ -339,7 +339,8 @@ Phase 3.1 additions worth knowing before touching them:
     never tried, and named one by one with what each is for **and at the
     securable where it is needed**: the four `CREATE`s at the database (they
     cannot be granted lower), `ALTER` / `SELECT` / `VIEW DEFINITION` per managed
-    schema, `INSERT` / `DELETE` only where the ledger lives. Asking at database
+    schema, `INSERT` / `DELETE` on the ledger and lock *objects* (falling back
+    to their schema only until those tables exist). Asking at database
     scope alone reports gaps a least-privilege account does not have, and the
     remedy it then invites is exactly the "make it db_owner" this list exists to
     avoid. A declared schema that does not exist yet is left unasked — that is

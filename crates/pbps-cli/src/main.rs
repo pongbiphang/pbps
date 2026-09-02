@@ -1633,7 +1633,15 @@ fn cmd_plan(
         }
     }
 
-    let base = baseline::load(project, source)?;
+    // A `--base` that is missing, malformed or of an unsupported version is a
+    // failure of the *input*, not of the plan: the command never got as far as
+    // comparing anything, so it is unanswerable rather than a finding.
+    let base = output::or_unanswerable(
+        "plan",
+        json,
+        "baseline.unreadable",
+        baseline::load(project, source),
+    )?;
     if base.is_empty_fallback {
         let message = format!(
             "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",

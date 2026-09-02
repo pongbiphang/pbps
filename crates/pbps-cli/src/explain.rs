@@ -637,6 +637,22 @@ mod tests {
         assert_eq!(shell_arg("C:\\plans\\"), None);
     }
 
+    /// `!` is inert in a default `cmd` and expands *inside double quotes* under
+    /// `setlocal enabledelayedexpansion`. Whether that is on is not knowable
+    /// from here, so the safe reading is that it might be — a path or
+    /// environment name carrying `!NAME!` would otherwise become a different
+    /// value on the one shell where it is hardest to notice.
+    #[test]
+    fn a_delayed_expansion_mark_is_refused_rather_than_quoted() {
+        assert_eq!(shell_arg("prod!PBPS_ENV!"), None);
+        assert_eq!(shell_arg("/tmp/plans/a!b.json"), None);
+        // The ordinary case is untouched.
+        assert_eq!(
+            shell_arg("/tmp/plans/ab.json").unwrap(),
+            "/tmp/plans/ab.json"
+        );
+    }
+
     /// The cases no spelling covers. POSIX single quotes would make `$` and a
     /// backtick literal but **`cmd` does not treat `'` as quoting at all**, so
     /// `&`, `|`, `<` and `>` stay live inside them — an earlier version of this
