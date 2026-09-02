@@ -3793,3 +3793,28 @@ fn explain_json_emits_an_envelope_when_the_target_flags_conflict() {
     assert_eq!(v["result"], "unanswerable", "{v}");
     assert_eq!(v["findings"][0]["id"], "target.conflicting", "{v}");
 }
+
+/// Flag validations run before `cmd_plan` and its JSON handling, which is
+/// exactly why they escaped the envelope. A consumer told "produced no output"
+/// cannot say which flags contradicted each other.
+#[test]
+fn plan_json_emits_an_envelope_when_the_flags_contradict() {
+    let d = Demo::new("planflags");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    for args in [
+        vec!["plan", "--check", "--db", "Server=x;Database=y"],
+        vec!["plan", "--staged"],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "json"]);
+        let o = d.run(&argv);
+        assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+    }
+}

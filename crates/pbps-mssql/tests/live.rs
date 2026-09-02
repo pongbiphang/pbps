@@ -1169,6 +1169,23 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         "ALTER on the ledger schema must not be demanded once it exists: {gaps:?}"
     );
 
+    // A declared schema the database does not have. Only a real `sys.schemas`
+    // can answer this, and it is the case `doctor` used to pass in silence:
+    // nothing in the tool emits `CREATE SCHEMA`, so the first
+    // `CREATE TABLE [nowhere].[...]` would have failed right after a clean
+    // readiness report.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.absent_schemas.contains("nowhere"),
+        "a declared schema the database lacks must be reported: {held:?}"
+    );
+    assert!(
+        !held.absent_schemas.contains("dbo"),
+        "the ledger's schema is not a declaration problem: {held:?}"
+    );
+
     drop(lp);
     let name = db.name.clone();
     db.drop().await;

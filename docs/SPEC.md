@@ -932,6 +932,13 @@ project, always, to cover a statement most deployments never emit. That is the
 instead: `ALTER` covers *most* table changes, not every one. Catching the real
 case belongs in the plan-aware pre-flight, which does see the statements.
 
+**A declared schema the database does not have is a readiness error**, not a
+permission one and not a silence. Nothing in pbps emits `CREATE SCHEMA`, so a
+project declaring `app.customer` against a database with no `app` fails on its
+first statement; `doctor` names the schema and gives the `CREATE SCHEMA` as the
+remedy. This is distinct from leaving that schema *unasked* for permissions,
+which remains right — there is no securable to ask about.
+
 ### 9.6 Explaining a plan
 
 **`pbps explain --plan plan.json`** is the deployment gate's own view of a saved

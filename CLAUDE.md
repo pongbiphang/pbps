@@ -358,7 +358,9 @@ Phase 3.1 additions worth knowing before touching them:
     TRANSFER`), but `doctor` sees no plan, so demanding it would require
     near-ownership of every managed schema always — the claim is narrowed to
     "most changes" instead, and the real check belongs in the plan-aware
-    pre-flight.
+    pre-flight. A declared schema the database **lacks** is a readiness *error*
+    (pbps never emits `CREATE SCHEMA`), which is a different question from
+    leaving it unasked for permissions.
 39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
     command, and the reviewer may have no checkout and no credentials; the gate
     is `apply --allow`. A target is optional and answers only the question no

@@ -225,6 +225,17 @@ pub struct Held {
     /// project that manages only `app` and never touches a `dbo` table.
     pub schemas: BTreeMap<String, BTreeSet<String>>,
 
+    /// Managed schemas the database does not have.
+    ///
+    /// Not a permission problem, and not nothing either. The emitter never
+    /// writes `CREATE SCHEMA` — a plan declaring `app.customer` against a
+    /// database with no `app` emits `CREATE TABLE [app].[customer]` and fails —
+    /// so an absent managed schema is a readiness problem in its own right.
+    /// Leaving it merely *unasked* (which is right for the permission
+    /// question, since there is no securable to ask about) let `doctor` exit 0
+    /// immediately before the deployment failed.
+    pub absent_schemas: BTreeSet<String>,
+
     /// The schema-scoped permissions effective on the ledger's schema.
     ///
     /// Kept apart from `schemas` because it answers a different question:
@@ -410,6 +421,14 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
     }
 
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
+    // Asked for and not returned by `sys.schemas` means the database does not
+    // have it. The ledger's schema is excluded: `dbo` always exists, and if it
+    // somehow did not, that is not a declaration problem.
+    let absent_schemas: BTreeSet<String> = schemas
+        .iter()
+        .filter(|name| name.as_str() != LEDGER_SCHEMA && !per_schema.contains_key(*name))
+        .cloned()
+        .collect();
     // Managed means declared. `dbo` stays only if the project actually declares
     // something in it.
     let managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
@@ -418,6 +437,7 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
     Ok(Held {
         database,
         schemas: per_schema,
+        absent_schemas,
         ledger_schema,
         ledger_objects,
     })
@@ -590,6 +610,9 @@ mod tests {
                 .iter()
                 .map(|s| ((*s).to_owned(), schema_perms.clone()))
                 .collect(),
+            // Everything asked about exists in this helper; the absent case has
+            // its own test below.
+            absent_schemas: BTreeSet::new(),
             // The ledger not existing yet is the default here, so `missing`
             // falls back to the ledger *schema*, which therefore carries the
             // ledger permissions. `ledger_granted_on_the_objects_only` below is
@@ -901,6 +924,7 @@ mod tests {
         let held = Held {
             database: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
+            absent_schemas: BTreeSet::new(),
             ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
         };

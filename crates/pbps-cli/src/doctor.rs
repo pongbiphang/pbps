@@ -67,6 +67,14 @@ pub struct EnvDiagnosis {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub permissions_unknown: bool,
 
+    /// Declared schemas this database does not have.
+    ///
+    /// A readiness problem rather than a permission one: nothing in the tool
+    /// emits `CREATE SCHEMA`, so a plan declaring `app.customer` against a
+    /// database with no `app` fails on its first statement.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absent_schemas: Vec<String>,
+
     /// Set when the version or edition could not be read, so an absent
     /// `supports_create_or_alter` means "not determined" rather than "fine".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +172,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 supports_create_or_alter: None,
                 missing_permissions: Vec::new(),
                 permissions_unknown: false,
+                absent_schemas: Vec::new(),
                 server_capabilities_unknown: None,
                 detail: Some(format!("{e:#}")),
             },
@@ -206,6 +215,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     supports_create_or_alter: None,
                     missing_permissions: Vec::new(),
                     permissions_unknown: false,
+                    absent_schemas: Vec::new(),
                     server_capabilities_unknown: None,
                     detail: Some(e.to_string()),
                 },
@@ -322,6 +332,7 @@ async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnos
         supports_create_or_alter: None,
         missing_permissions: Vec::new(),
         permissions_unknown: false,
+        absent_schemas: Vec::new(),
         server_capabilities_unknown: None,
         detail: None,
     };
@@ -373,6 +384,7 @@ async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnos
                 // which is the over-grant this check exists to avoid.
                 .map(|g| format!("{} on {} — {}", g.permission, g.securable(), g.why))
                 .collect();
+            d.absent_schemas = held.absent_schemas.iter().cloned().collect();
         }
         // Not merely noted in `detail`: with the list left empty, a successful
         // ledger read could go on to set `ready`, and `doctor` would print
@@ -556,6 +568,22 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             "permission.missing",
             format!("{}: the account lacks {gap}", d.environment),
         ));
+    }
+    for schema in &d.absent_schemas {
+        // An error, not a note: nothing in this tool creates a schema, so the
+        // first `CREATE TABLE [schema].[...]` fails. `doctor` exiting 0 here
+        // was the readiness command clearing a deployment it could see would
+        // break.
+        out.push(
+            output::Finding::error(
+                "schema.absent",
+                format!(
+                    "{}: the declarations use schema `{schema}`, which this database does not                      have — pbps never creates a schema, so the first table in it will fail",
+                    d.environment
+                ),
+            )
+            .remedy(format!("CREATE SCHEMA [{schema}];")),
+        );
     }
     // Only when this project actually has modules. The emitter writes
     // `CREATE OR ALTER` for every one of them and for nothing else, so on a

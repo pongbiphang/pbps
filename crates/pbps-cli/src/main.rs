@@ -565,17 +565,35 @@ fn run() -> anyhow::Result<()> {
             dev,
             format,
         } => {
+            // Every refusal below goes through the envelope, not `bail!`. These
+            // are flag validations, so they run *before* `cmd_plan` and its
+            // JSON handling — which is exactly why they escaped it. A consumer
+            // told "produced no output" cannot say which flags contradicted.
+            let json = format == OutputFormat::Json;
+            //
+            // `Infallible` rather than `()`: `bail!` diverged, and replacing it
+            // with a call that merely *usually* returns `Err` would let a later
+            // edit fall through a refusal into the work it refuses. With this
+            // signature the compiler knows `refuse(..)?` cannot continue.
+            let refuse = |message: &str| -> anyhow::Result<std::convert::Infallible> {
+                output::or_unanswerable(
+                    "plan",
+                    json,
+                    "flags.conflicting",
+                    Err(anyhow::anyhow!("{message}")),
+                )
+            };
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
             // the deployment wants the plan for that environment.
             if target.db.is_some() || target.env.is_some() {
                 if check {
-                    bail!(
-                        "--check is the CI file check; it never connects, so it cannot take --db"
-                    );
+                    refuse(
+                        "--check is the CI file check; it never connects, so it cannot take --db",
+                    )?;
                 }
                 if base.is_some() {
-                    bail!("--base and --db name two different baselines; pass one of them");
+                    refuse("--base and --db name two different baselines; pass one of them")?;
                 }
                 if dev.is_some() {
                     // A rehearsal answers "would this compile and converge",
@@ -583,12 +601,17 @@ fn run() -> anyhow::Result<()> {
                     // artifact the deployment gate approves, and mixing the two
                     // would invite a dev-verified plan to be read as a
                     // target-verified one (SPEC §9.3).
-                    bail!(
+                    refuse(
                         "--dev rehearses a preview and --db computes the plan for a real \
-                         environment; run them separately"
-                    );
+                         environment; run them separately",
+                    )?;
                 }
-                let target = target.resolve(&project)?;
+                let target = output::or_unanswerable(
+                    "plan",
+                    json,
+                    "environment.unconfigured",
+                    target.resolve(&project),
+                )?;
                 return deploy::cmd_plan_db(
                     &project,
                     &target,
@@ -600,9 +623,9 @@ fn run() -> anyhow::Result<()> {
             if staged {
                 // Staged execution is a property of a plan that is going to be
                 // applied, and an offline plan never is (SPEC §7.3).
-                bail!(
-                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env"
-                );
+                refuse(
+                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env",
+                )?;
             }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
