@@ -3714,3 +3714,18 @@ fn pull_refuses_when_it_cannot_tell_whether_declarations_exist() {
         "pull must not have touched the declarations path"
     );
 }
+
+// ---- Nineteenth review round ----
+//
+// Two writes escaped the envelope: `fmt` rewriting a declaration, and `plan`
+// writing the identity file. Both are fixed in `crates/pbps-cli/src/main.rs`
+// and **neither carries a test**, which is worth stating rather than papering
+// over with one that passes elsewhere.
+//
+// Making a write fail while the matching read succeeds needs either permission
+// bits or an immutable flag. This suite may run as root, which defeats the
+// first, and it runs on Windows too, which defeats the second. Every cheaper
+// fixture — a directory where the file goes, a file where the directory goes —
+// trips the *read* guard one line earlier and produces that guard's envelope,
+// so a test built on one would assert a passing behaviour that already worked.
+// That mistake has been made three times on this branch already.

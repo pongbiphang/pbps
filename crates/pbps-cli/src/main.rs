@@ -1292,8 +1292,18 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         }
         changed.push((path.clone(), absorbed));
         if !check {
-            std::fs::write(path, &rendered)
-                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            // The rewrite is what `fmt` is for, so failing it is the command
+            // not finishing — and the path is the whole of the remedy, which a
+            // consumer only gets if the envelope names it. Same wrapper as the
+            // listing and the read above; this write was simply missed when
+            // those two were done.
+            output::or_unanswerable(
+                "fmt",
+                json,
+                "load.io",
+                std::fs::write(path, &rendered)
+                    .with_context(|| format!("cannot write `{}`", path.display())),
+            )?;
         }
     }
 
@@ -1624,7 +1634,17 @@ fn cmd_plan(
             }
             return Err(Found::new(message).into());
         }
-        write_ids(project, &res.ids)?;
+        // The identity file is the artifact `plan` exists to maintain — it is
+        // what the MR reviews and what every later comparison matches by uid
+        // — so failing to write it is as much a failure of the command as
+        // failing to write `--out`. Those two were wrapped a commit earlier;
+        // this one, the more important of the three, was not.
+        output::or_unanswerable(
+            "plan",
+            json,
+            "identity.unwritable",
+            write_ids(project, &res.ids),
+        )?;
         if !json {
             println!("updated {}", project.ids_file().display());
         }
