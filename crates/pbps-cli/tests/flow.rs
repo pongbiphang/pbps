@@ -3431,3 +3431,37 @@ fn a_command_without_an_envelope_does_not_gain_one_from_the_discovery_wrapper() 
         );
     }
 }
+
+/// A change the differ cannot express is a *reachable* planning failure — it
+/// needs only a declaration that adds IDENTITY to an existing column (decision
+/// 5: it cannot be done with ALTER) — and it left `plan --format json` printing
+/// prose on stderr and nothing on stdout.
+///
+/// Each unexpressible change becomes its own finding rather than one collapsed
+/// message: the differ hands back one error per change, and the column name in
+/// it is the entire remedy.
+#[test]
+fn plan_json_emits_an_envelope_when_a_change_cannot_be_expressed() {
+    let d = Demo::new("unexpressible");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The same column, now IDENTITY: a change ALTER cannot make.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "change.unexpressible", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("IDENTITY")),
+        "the message must name what cannot be done: {v}"
+    );
+}

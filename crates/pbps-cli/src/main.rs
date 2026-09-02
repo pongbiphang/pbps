@@ -1675,8 +1675,24 @@ fn cmd_plan(
         &hints,
     )
     .map_err(|errs| {
-        for e in &errs {
-            eprintln!("  {e}");
+        // Structured, not wrapped through `or_unanswerable`: the differ hands
+        // back one error per change it cannot express, and collapsing them into
+        // a single message would throw away the column name that is the whole
+        // remedy. Each becomes its own finding, carrying the id a future
+        // `policies:` block can re-weight.
+        if json {
+            let report = output::Report::plain(
+                "plan",
+                errs.iter()
+                    .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
+                    .collect(),
+            )
+            .unanswerable();
+            let _ = report.emit_json();
+        } else {
+            for e in &errs {
+                eprintln!("  {e}");
+            }
         }
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
