@@ -1017,7 +1017,8 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute(&format!(
             "USE [{0}]; \
              CREATE USER [{login}] FOR LOGIN [{login}]; \
-             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
              GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
             db.name
         ))

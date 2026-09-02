@@ -93,7 +93,11 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// The schema the ledger and the lock live in.
 pub const LEDGER_SCHEMA: &str = "dbo";
 
-pub const REQUIRED: [Requirement; 11] = [
+/// The tables `state::ensure_tables` creates, and therefore the ones whose
+/// absence still requires the create-time permission.
+pub const LEDGER_TABLES: [&str; 2] = [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE];
+
+pub const REQUIRED: [Requirement; 12] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -125,9 +129,23 @@ pub const REQUIRED: [Requirement; 11] = [
         "creating __pbps_state and __pbps_lock on first use",
         Needed::Database,
     ),
+    // "most", not "every": a rename that moves a table *between* schemas is
+    // emitted as `ALTER SCHEMA ... TRANSFER`, which wants `CONTROL` on the
+    // table itself on top of `ALTER` on the destination. That is deliberately
+    // not demanded — see the note below `REQUIRED` — so this entry must not
+    // claim to cover it.
     req(
         "ALTER",
-        "every change to a table in a schema pbps manages",
+        "most changes to a table in a schema pbps manages",
+        Needed::Managed,
+    ),
+    // A foreign key is `ALTER TABLE ... REFERENCES ...`, and SQL Server wants
+    // `REFERENCES` on the *referenced* table for it. `ALTER` on the schema does
+    // not imply it, so an account holding exactly the rest of this list passed
+    // readiness and failed on one of the commonest changes there is.
+    req(
+        "REFERENCES",
+        "adding a foreign key, which the engine authorizes on the referenced table",
         Needed::Managed,
     ),
     req(
@@ -171,6 +189,26 @@ pub const REQUIRED: [Requirement; 11] = [
         Needed::Database,
     ),
 ];
+
+// # A permission deliberately absent: `CONTROL`
+//
+// A rename that moves a table between schemas is emitted as
+// `ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on
+// the transferred table — not with the `ALTER` above. So an account holding
+// everything in this list can still fail on that one statement.
+//
+// It is not demanded, and the reason is the same one this whole list exists
+// for. `doctor` never sees a plan, so it would have to require `CONTROL` on
+// every managed schema from every project, always. `CONTROL` on a schema is
+// close to owning it, cross-schema renames are rare, and demanding ownership
+// up front to cover a rare statement is exactly the "just make it db_owner"
+// pressure this list refuses to apply.
+//
+// The honest version is therefore a narrower claim rather than a broader
+// demand: `ALTER` says "most changes", not "every change". Catching the real
+// case belongs in the plan-aware pre-flight, which does see the statements —
+// it is recorded in SPEC §9.5 as a known gap rather than silently covered.
+//
 
 /// What the connected account effectively holds, per securable.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -343,7 +381,7 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         perm_slots.push(format!("(@P{})", params.len()));
     }
     let mut object_slots = Vec::new();
-    for t in [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE] {
+    for t in LEDGER_TABLES {
         params.push(Param::from(t));
         object_slots.push(format!("@P{}", params.len()));
     }
@@ -428,7 +466,12 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // Only while the ledger is still to be created. Once it exists the
             // creation permission is spent, and asking for it forever would be
             // the over-demand this whole enum exists to remove.
-            Needed::LedgerCreation if held.ledger_objects.is_empty() => {
+            // Per table, not "any of them exists". `ensure_tables` recreates
+            // whichever is missing, so one surviving table does not mean the
+            // creation permission is spent — and reading `ledger_objects` as a
+            // single yes/no let an account with the lock table but not the
+            // state table pass readiness and fail on the next `record`.
+            Needed::LedgerCreation if held.ledger_objects.len() < LEDGER_TABLES.len() => {
                 if !held.ledger_schema.contains(r.name) {
                     out.push(Gap {
                         permission: r.name,
@@ -695,6 +738,56 @@ mod tests {
         assert_eq!(gaps[0].permission, "ALTER");
         assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
         assert!(gaps[0].why.contains("first use"), "{gaps:?}");
+    }
+
+    /// One surviving ledger table is not a created ledger. `ensure_tables`
+    /// recreates whichever is missing, so reading `ledger_objects` as a single
+    /// yes/no let an account with the lock table but not the state table pass
+    /// readiness and then fail on its next `record`.
+    #[test]
+    fn a_half_present_ledger_still_needs_the_creation_permission() {
+        let mut held = ledger_granted_on_the_objects_only(&["app"]);
+        held.ledger_objects.remove(pbps_db::ledger::STATE_TABLE);
+        assert_eq!(held.ledger_objects.len(), 1, "exactly one survives");
+        held.ledger_schema.clear();
+
+        let gaps = missing(&held);
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+            "the table still to be created needs the creation permission: {gaps:?}"
+        );
+    }
+
+    /// A foreign key is authorized on the *referenced* table, and `ALTER` on
+    /// the schema does not imply it — so an account holding everything else
+    /// passed readiness and failed on one of the commonest changes there is.
+    #[test]
+    fn adding_a_foreign_key_needs_references_on_the_managed_schema() {
+        let mut held = everything(&["app"]);
+        held.schemas.get_mut("app").unwrap().remove("REFERENCES");
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "REFERENCES");
+        assert_eq!(gaps[0].securable(), "SCHEMA::app");
+    }
+
+    /// `CONTROL` is deliberately absent (see the note above `Held`), so the
+    /// `ALTER` entry must not claim to cover a cross-schema transfer. This
+    /// pins the claim, because a later edit widening it back would make the
+    /// list assert something the engine does not honour.
+    #[test]
+    fn the_alter_requirement_does_not_claim_to_cover_every_change() {
+        let alter = REQUIRED
+            .iter()
+            .find(|r| r.name == "ALTER" && matches!(r.needed, Needed::Managed))
+            .expect("managed ALTER");
+        assert!(alter.why.contains("most"), "{}", alter.why);
+        assert!(!alter.why.contains("every"), "{}", alter.why);
+        assert!(
+            !REQUIRED.iter().any(|r| r.name == "CONTROL"),
+            "CONTROL is not demanded; see the note above `Held`"
+        );
     }
 
     /// And spent once the tables exist: writing rows needs `INSERT` and

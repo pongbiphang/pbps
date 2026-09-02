@@ -3764,3 +3764,32 @@ fn explain_refuses_a_db_and_an_env_together() {
         stdout(&o)
     );
 }
+
+// ---- Twenty-second review round ----
+
+/// The refusal added one round earlier was a bare `return`, which put back the
+/// escape the rest of `explain` had just been cured of. A new refusal is still
+/// an answer, and a consumer has to be able to read it.
+#[test]
+fn explain_json_emits_an_envelope_when_the_target_flags_conflict() {
+    let d = Demo::new("explainbothjson");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        "Server=x;Database=y",
+        "--env",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "target.conflicting", "{v}");
+}

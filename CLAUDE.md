@@ -350,7 +350,15 @@ Phase 3.1 additions worth knowing before touching them:
     touches a `dbo` table. Asking at database scope alone reports gaps a
     least-privilege account does not have, and the remedy it then invites is
     exactly the "make it db_owner" this list exists to avoid. A securable that
-    does not exist yet is left unasked — that is every first deployment.
+    does not exist yet is left unasked — that is every first deployment, and the
+    create-time `ALTER` is required per ledger table still missing, not once for
+    the pair. `REFERENCES` is on the list because a foreign key is authorized on
+    the *referenced* table and `ALTER` does not imply it. **`CONTROL` is
+    deliberately absent**: a cross-schema rename needs it (`ALTER SCHEMA ...
+    TRANSFER`), but `doctor` sees no plan, so demanding it would require
+    near-ownership of every managed schema always — the claim is narrowed to
+    "most changes" instead, and the real check belongs in the plan-aware
+    pre-flight.
 39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
     command, and the reviewer may have no checkout and no credentials; the gate
     is `apply --allow`. A target is optional and answers only the question no

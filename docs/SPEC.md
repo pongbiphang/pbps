@@ -917,7 +917,20 @@ them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE'
 alone answers — reports gaps a correctly granted least-privilege account does
 not have, and the remedy an operator then reaches for is the database-wide grant
 this list exists to avoid. A declared schema that does not exist yet is left
-unasked rather than reported: that is every first deployment.
+unasked rather than reported: that is every first deployment, and the
+create-time `ALTER` on the ledger's schema is required only while the ledger
+tables are still missing — per table, since `ensure_tables` recreates whichever
+one is gone.
+
+**One permission is deliberately absent, and the gap is recorded rather than
+covered.** A rename that moves a table between schemas is emitted as
+`ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on the
+transferred table. `doctor` never sees a plan, so demanding it would mean
+requiring `CONTROL` — close to ownership — on every managed schema of every
+project, always, to cover a statement most deployments never emit. That is the
+"make it db_owner" pressure this list exists to refuse. The claim is narrowed
+instead: `ALTER` covers *most* table changes, not every one. Catching the real
+case belongs in the plan-aware pre-flight, which does see the statements.
 
 ### 9.6 Explaining a plan
 

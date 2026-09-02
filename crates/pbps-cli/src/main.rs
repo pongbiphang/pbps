@@ -501,9 +501,19 @@ fn run() -> anyhow::Result<()> {
             // that applies to a different one. That is the single worst thing
             // this command can produce.
             (Some(_), Some(_)) => {
-                return Err(anyhow::anyhow!(
-                    "--db and --env name the same thing; pass one of them"
-                ));
+                // Through the envelope like every other refusal this command
+                // can make. Added as a bare `return` one round earlier, which
+                // reintroduced the escape the rest of `explain` had just been
+                // cured of — a new refusal is still an answer the consumer has
+                // to be able to read.
+                return output::or_unanswerable(
+                    "explain",
+                    *format == OutputFormat::Json,
+                    "target.conflicting",
+                    Err(anyhow::anyhow!(
+                        "--db and --env name the same thing; pass one of them"
+                    )),
+                );
             }
             (Some(db), None) => explain::Target::Reachable(db::target_from_connection(db)),
             (None, Some(_)) => explain::Target::from(
@@ -1866,6 +1876,17 @@ fn cmd_plan(
         )?
     };
     if let Some(spec) = dev_spec {
+        // Rendered first, and wrapped in its own right. As an argument it was
+        // evaluated *before* the wrapper was entered, so an emitter refusal
+        // here escaped exactly the envelope the call around it was added to
+        // guarantee. A `?` inside an argument list is invisible at a glance,
+        // which is why this is a separate statement now.
+        let statements = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unrenderable",
+            statements(&cs, dialect.as_ref()),
+        )?;
         let rehearsal = output::or_unanswerable(
             "plan",
             json,
@@ -1878,7 +1899,7 @@ fn cmd_plan(
                 &base.hints,
                 &loaded.schema,
                 &res.ids,
-                &statements(&cs, dialect.as_ref())?,
+                &statements,
                 dialect.as_ref(),
                 &loaded.hints,
             ),
