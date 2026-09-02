@@ -4626,3 +4626,67 @@ fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
     // see what was read even though it cannot be pasted.
     assert!(out.contains("<plan path> is:"), "{out}");
 }
+
+// ---- Thirty-first review round ----
+
+/// The other place round 30's lossy path went, and the worse one: serde's
+/// `Path` impl **fails** on a path that is not UTF-8, so a `PathBuf` in
+/// `Location.file` made that failure the whole envelope's. `explain --plan
+/// <non-UTF-8> --format json` on an unreadable plan printed nothing at all and
+/// exited 1 with `error: path contains invalid UTF-8 characters` — the
+/// one-envelope contract broken by the envelope itself.
+///
+/// `Location.file` is a `String` now, built with `to_str`, and the location is
+/// dropped when the path cannot be spelled. Dropping the pointer keeps the
+/// finding; a lossy pointer would name a different file.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let d = Demo::new("lossyenvelope");
+    d.table(ONE_COLUMN);
+    let name = std::ffi::OsStr::from_bytes(b"bad-\xff-.json");
+    let bad = d.dir.join(name);
+    std::fs::write(&bad, "{ not json").unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .arg("explain")
+        .arg("--plan")
+        .arg(&bad)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {:?}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "plan.unreadable", "{v}");
+    // No location rather than a lossy one: a consumer keying off
+    // `location.file` would open the wrong file, or none.
+    assert!(v["findings"][0]["location"].is_null(), "{v}");
+
+    // The negative case in the same shape: an ordinary path still carries its
+    // location, so the fix did not simply stop reporting them.
+    let ok = d.dir.join("also-bad.json");
+    std::fs::write(&ok, "{ not json").unwrap();
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        ok.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "plan.unreadable", "{v}");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("also-bad.json")),
+        "{v}"
+    );
+}

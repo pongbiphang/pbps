@@ -654,6 +654,41 @@ mod tests {
         assert_eq!(shell_arg("C:\\plans\\"), None);
     }
 
+    /// A value beginning `-` cannot be carried in that position at all, so
+    /// quoting is not an option and the placeholder is the only honest answer.
+    /// Measured rather than assumed: `pbps explain --plan -plan.json` answers
+    /// "unexpected argument '-p' found", and the shell strips quotes before
+    /// clap sees the value, so `"-plan.json"` fares no better.
+    ///
+    /// `--plan=-plan.json` does work, and emitting every option in that form
+    /// would carry these values. Not taken: it changes the shape of every
+    /// advertised command, and every test that reads one, to buy an environment
+    /// name or plan path that begins with a hyphen.
+    #[test]
+    fn a_leading_hyphen_is_refused_because_no_quoting_can_carry_it() {
+        assert_eq!(shell_arg("-prod"), None);
+        assert_eq!(shell_arg("-plan.json"), None);
+        assert_eq!(shell_arg("--env"), None);
+        // Only at the front: a hyphen anywhere else is an ordinary character,
+        // and `blue-green` is a perfectly good environment name.
+        assert_eq!(shell_arg("blue-green").unwrap(), "blue-green");
+        assert_eq!(shell_arg("/tmp/a-b.json").unwrap(), "/tmp/a-b.json");
+    }
+
+    /// `@` is `~`'s shape one shell further out: in PowerShell a token
+    /// *beginning* `@` in argument position is splatting, so `@args` emitted
+    /// bare would be replaced by the current argument array rather than passed
+    /// as the string it is. Quoting makes PowerShell read it literally, so
+    /// unlike a leading hyphen this one is quoted rather than refused.
+    #[test]
+    fn a_leading_at_is_quoted_because_powershell_would_splat_it() {
+        assert_eq!(shell_arg("@args").unwrap(), "\"@args\"");
+        assert_eq!(shell_arg("@prod").unwrap(), "\"@prod\"");
+        // Away from the front it means nothing anywhere, and this is an
+        // ordinary environment name.
+        assert_eq!(shell_arg("deploy@prod").unwrap(), "deploy@prod");
+    }
+
     /// `!` is inert in a default `cmd` and expands *inside double quotes* under
     /// `setlocal enabledelayedexpansion`. Whether that is on is not knowable
     /// from here, so the safe reading is that it might be — a path or

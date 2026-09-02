@@ -450,9 +450,30 @@ pub fn shell_arg(value: &str) -> Option<String> {
     // `C:UsersRUNNER~1plan.json`. It was added here to stop Windows paths being
     // quoted, which had the direction backwards — those are exactly the values
     // that need the quotes.
+    //
+    // `@` is the same shape as `~`, one shell further out: in PowerShell a token
+    // *beginning* `@` in argument position is splatting, so `@args` would be
+    // replaced by the current argument array rather than passed as the string
+    // it is. Away from the front it means nothing, and `deploy@prod` is a
+    // perfectly ordinary environment name — so the front is where it is
+    // refused, and quoting it below makes PowerShell read it literally.
     let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:@+=~".contains(c);
-    if !value.is_empty() && !value.starts_with('~') && value.chars().all(bare) {
+    if !value.is_empty() && !value.starts_with(['~', '@', '-']) && value.chars().all(bare) {
         return Some(value.to_owned());
+    }
+
+    // A leading `-` is refused outright rather than quoted, because quoting
+    // does not help: the shell strips the quotes and clap still receives an
+    // argument beginning `-` and reads it as a flag — measured, not assumed
+    // (`pbps explain --plan -plan.json` answers "unexpected argument '-p'").
+    //
+    // `--plan=-plan.json` *does* work, and emitting every option in that form
+    // would carry these values. Not taken: it changes the shape of every
+    // command this module advertises, and every test that reads one, to buy an
+    // environment name or plan path beginning with a hyphen. The placeholder is
+    // the established answer for a value that cannot be pasted, and this is one.
+    if value.starts_with('-') {
+        return None;
     }
 
     // Double quotes hold for a value a shell would only *split* — a space, most

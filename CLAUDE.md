@@ -443,7 +443,20 @@ Phase 3.1 additions worth knowing before touching them:
     which `shell_arg` neither refuses nor leaves bare — so a lossy path came
     back neatly quoted, naming a file that does not exist. A path that cannot be
     spelled is in the same position as one that cannot be quoted: the
-    placeholder, with the literal printed where nothing can execute it.
+    placeholder, with the literal printed where nothing can execute it. The same
+    path must also stay out of `output::Location`, whose `file` is a **`String`**
+    for this reason: serde's `Path` impl *fails* on non-UTF-8, so a `PathBuf`
+    there made that failure the whole envelope's — `explain --format json`
+    printed nothing at all. `Finding::at` drops the location rather than store a
+    lossy one that points at a different file.
+49. **`shell_arg` has now been wrong about shells five times.** Single quotes in
+    `cmd`; backslashes; `!` under delayed expansion; a leading `-`, which no
+    quoting can carry because the shell strips the quotes and clap then reads a
+    flag (the `--opt=value` form would work, and was declined — it changes every
+    advertised command to buy a hyphen-leading name); and a leading `@`, which
+    PowerShell splats in argument position. Every one was found by someone
+    testing rather than by reasoning, which is the argument for the placeholder
+    being the default answer rather than the last resort.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

@@ -19,7 +19,7 @@
 //!
 //! [ADR-0006]: ../../../docs/ADR-0006-optional-ui.md
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -44,9 +44,16 @@ pub enum Severity {
 }
 
 /// Where in the working tree a finding is.
+///
+/// The file is a `String`, not a `PathBuf`, and that is the whole point: serde's
+/// `Path` impl **fails** on a path that is not UTF-8, and a `PathBuf` here made
+/// that failure the whole envelope's. `explain --plan <non-UTF-8> --format json`
+/// on an unreadable plan printed nothing at all and exited 1 with `error: path
+/// contains invalid UTF-8 characters` — the one-envelope contract broken by the
+/// envelope itself. Holding a `String` makes that unrepresentable.
 #[derive(Debug, Clone, Serialize)]
 pub struct Location {
-    pub file: PathBuf,
+    pub file: String,
     /// 1-based, when the diagnostic knows one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
@@ -104,9 +111,17 @@ impl Finding {
         }
     }
 
+    /// Attaches a location — unless the path cannot be spelled.
+    ///
+    /// `to_str`, not `display()`. A lossy rendering would put a name in
+    /// `location.file` that points at a *different* file, and a consumer keying
+    /// off that field would open the wrong one or none; the same reasoning that
+    /// keeps a lossy path out of an advertised command. Dropping the location
+    /// loses the pointer and keeps the finding, which is the smaller loss — the
+    /// message still names what happened.
     pub fn at(mut self, file: impl AsRef<Path>, line: Option<usize>) -> Self {
-        self.location = Some(Location {
-            file: file.as_ref().to_path_buf(),
+        self.location = file.as_ref().to_str().map(|file| Location {
+            file: file.to_owned(),
             line,
         });
         self
@@ -270,8 +285,8 @@ pub fn human(findings: &[Finding]) -> String {
     for f in findings {
         let where_ = match &f.location {
             Some(l) => match l.line {
-                Some(line) => format!("{}:{line}: ", l.file.display()),
-                None => format!("{}: ", l.file.display()),
+                Some(line) => format!("{}:{line}: ", l.file),
+                None => format!("{}: ", l.file),
             },
             None => String::new(),
         };
