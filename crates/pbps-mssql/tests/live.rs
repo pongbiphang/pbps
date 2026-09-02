@@ -1169,6 +1169,33 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         "ALTER on the ledger schema must not be demanded once it exists: {gaps:?}"
     );
 
+    // A declared schema spelled differently from the catalog. On a
+    // case-insensitive database `App` and `app` are the same schema, and the
+    // server says so — but the answer used to come back under the *catalog's*
+    // spelling, so the caller looked up the name it asked with and missed.
+    // `doctor` then called an existing schema absent and advised creating it.
+    // Its own batch: `CREATE SCHEMA` must be the first statement in one, so it
+    // cannot share a batch with the `USE`.
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    db.conn
+        .execute("CREATE SCHEMA [app];")
+        .await
+        .expect("create app schema");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.absent_schemas.is_empty(),
+        "a schema that exists under another casing must not be reported absent: {held:?}"
+    );
+    assert!(
+        held.schemas.contains_key("App"),
+        "the answer must come back under the requested spelling: {held:?}"
+    );
+
     // A declared schema the database does not have. Only a real `sys.schemas`
     // can answer this, and it is the case `doctor` used to pass in silence:
     // nothing in the tool emits `CREATE SCHEMA`, so the first

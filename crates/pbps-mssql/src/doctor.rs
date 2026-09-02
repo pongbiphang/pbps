@@ -355,14 +355,26 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
     let mut schema_slots = Vec::new();
     for s in &wanted {
         params.push(Param::from(*s));
-        schema_slots.push(format!("@P{}", params.len()));
+        schema_slots.push(format!("(@P{})", params.len()));
     }
+    // The **requested** spelling comes back, not the catalog's. Matching is the
+    // server's job — `w.n = s.name` compares under the database's collation, so
+    // a case-insensitive database matches `App` to its `app` — but the caller
+    // then looks the answer up by the name it asked with. Selecting `s.name`
+    // returned `app` for a request of `App`, so the Rust-side lookup missed,
+    // and `doctor` reported the schema absent and advised creating one that
+    // already exists.
+    //
+    // `QUOTENAME(s.name)` stays the catalog's spelling: that argument names a
+    // real securable, not a map key.
     let sql = format!(
-        "SELECT s.name AS [schema], p.n AS permission, \
+        "SELECT w.n AS [schema], p.n AS permission, \
          HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', p.n) AS held \
-         FROM sys.schemas AS s CROSS JOIN (VALUES {}) AS p(n) WHERE s.name IN ({});",
-        perm_slots.join(", "),
-        schema_slots.join(", ")
+         FROM (VALUES {}) AS w(n) \
+         JOIN sys.schemas AS s ON s.name = w.n \
+         CROSS JOIN (VALUES {}) AS p(n);",
+        schema_slots.join(", "),
+        perm_slots.join(", ")
     );
 
     let mut per_schema: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

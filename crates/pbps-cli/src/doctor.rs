@@ -574,16 +574,24 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
         // first `CREATE TABLE [schema].[...]` fails. `doctor` exiting 0 here
         // was the readiness command clearing a deployment it could see would
         // break.
-        out.push(
-            output::Finding::error(
-                "schema.absent",
-                format!(
-                    "{}: the declarations use schema `{schema}`, which this database does not                      have — pbps never creates a schema, so the first table in it will fail",
-                    d.environment
-                ),
-            )
-            .remedy(format!("CREATE SCHEMA [{schema}];")),
+        let mut finding = output::Finding::error(
+            "schema.absent",
+            format!(
+                "{}: the declarations use schema `{schema}`, which this database does not \
+                 have — pbps never creates a schema, so the first table in it will fail",
+                d.environment
+            ),
         );
+        // Through the dialect's own quoting, exactly like the emitter. A remedy
+        // is advertised as copy-pastable, so an unescaped `]` in a schema name
+        // turns one statement into several — the same lesson `shell_arg`
+        // learned three times, in SQL instead of a shell. Where the name cannot
+        // be quoted at all, no command is offered rather than a broken one: the
+        // message already names the schema.
+        if let Ok(quoted) = pbps_mssql::ident::quote(schema) {
+            finding = finding.remedy(format!("CREATE SCHEMA {quoted};"));
+        }
+        out.push(finding);
     }
     // Only when this project actually has modules. The emitter writes
     // `CREATE OR ALTER` for every one of them and for nothing else, so on a
@@ -662,4 +670,70 @@ fn render(report: &output::Report<Diagnosis>) -> String {
         out.push_str(&output::human(&report.findings));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn absent(schema: &str) -> EnvDiagnosis {
+        EnvDiagnosis {
+            environment: "prod".to_owned(),
+            state: "ready",
+            server_version: None,
+            edition: None,
+            supports_online: None,
+            supports_create_or_alter: None,
+            missing_permissions: Vec::new(),
+            permissions_unknown: false,
+            absent_schemas: vec![schema.to_owned()],
+            server_capabilities_unknown: None,
+            detail: None,
+        }
+    }
+
+    fn remedy(schema: &str) -> Option<String> {
+        env_findings(&absent(schema), false)
+            .into_iter()
+            .find(|f| f.id == "schema.absent")
+            .and_then(|f| f.remedy)
+    }
+
+    /// The remedy is advertised as copy-pastable, so it goes through the
+    /// dialect's own quoting. An unescaped `]` turns one statement into several
+    /// — the lesson `shell_arg` learned three times, in SQL this time.
+    #[test]
+    fn the_create_schema_remedy_is_quoted_by_the_dialect() {
+        assert_eq!(remedy("app").as_deref(), Some("CREATE SCHEMA [app];"));
+        assert_eq!(
+            remedy("sales]archive").as_deref(),
+            Some("CREATE SCHEMA [sales]]archive];")
+        );
+        // The shape that made this urgent: pasted unescaped it would run a
+        // second statement. Counting semicolons is the wrong property — this
+        // name contains two of its own, and they are harmless *inside* the
+        // brackets. The property that matters is that the whole name is one
+        // identifier, which is exactly "unescaping the interior gives the name
+        // back".
+        let name = "x]; DROP TABLE audit;--";
+        let crafted = remedy(name).unwrap();
+        let interior = crafted
+            .strip_prefix("CREATE SCHEMA [")
+            .and_then(|r| r.strip_suffix("];"))
+            .unwrap_or_else(|| panic!("not a single quoted identifier: {crafted}"));
+        assert_eq!(interior.replace("]]", "]"), name, "{crafted}");
+    }
+
+    /// A name the dialect cannot quote at all gets no command rather than a
+    /// broken one. The message already names the schema, so nothing is lost.
+    #[test]
+    fn a_schema_name_that_cannot_be_quoted_is_offered_no_command() {
+        assert_eq!(remedy("with\0nul"), None);
+        // And the finding itself is still reported.
+        assert!(
+            env_findings(&absent("with\0nul"), false)
+                .iter()
+                .any(|f| f.id == "schema.absent")
+        );
+    }
 }
