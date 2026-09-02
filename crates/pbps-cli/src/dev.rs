@@ -441,21 +441,27 @@ impl Container {
         }
         let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
 
-        let container = Container {
-            id: id.clone(),
+        // **One** guard, mutated in place. It used to be built twice — once with
+        // an empty connection string to own the cleanup while the port was
+        // looked up, then again, shadowing the first, once the connection string
+        // was known. A shadowed binding is not dropped early: it lives to the
+        // end of the function, so the first guard's `Drop` ran `docker rm -f` on
+        // the container the second had just handed to the caller. `rehearse`
+        // then connected to a container that no longer existed.
+        //
+        // Building it before the port lookup is the point of the guard, not an
+        // accident of ordering: `docker run` has already created the container
+        // by then, so every path out of this function from here on has to be one
+        // that removes it. `?` below is such a path precisely because there is
+        // only one owner now.
+        let mut container = Container {
+            id,
             connection: String::new(),
         };
-        let port = match Self::published_port(&id) {
-            Ok(p) => p,
-            Err(e) => {
-                drop(container);
-                return Err(e);
-            }
-        };
-        let connection = format!(
+        let port = Self::published_port(&container.id)?;
+        container.connection = format!(
             "Server=127.0.0.1,{port};User Id=sa;Password={password};TrustServerCertificate=true"
         );
-        let container = Container { id, connection };
         container.wait_until_ready()?;
         Ok(container)
     }

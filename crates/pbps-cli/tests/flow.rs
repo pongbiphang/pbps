@@ -4690,3 +4690,60 @@ fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
         "{v}"
     );
 }
+
+// ---- Thirty-third review round ----
+
+/// `plan --dev docker://<image>` end to end, which is the one path through
+/// `dev.rs` that had **no automated coverage at all** — every other `--dev`
+/// test passes a connection string, so `Container::start` was never run.
+///
+/// That is how it shipped removing the container it had just returned. It built
+/// the cleanup guard twice, the second binding shadowing the first, and a
+/// shadowed binding is not dropped early: it lives to the end of the function,
+/// so the first guard's `Drop` ran `docker rm -f` on the container handed to the
+/// caller. Every `plan --dev docker://...` run then failed with "cannot reach
+/// the dev database: connection refused", from the day the feature was written.
+///
+/// Opt-in through `PBPS_TEST_DEV_IMAGE` because it starts a second SQL Server:
+/// `scripts/live-tests.sh` sets it, CI's live job deliberately does not.
+#[test]
+#[ignore = "needs docker and a SQL Server image; set PBPS_TEST_DEV_IMAGE (see scripts/live-tests.sh)"]
+fn a_dev_container_outlives_the_call_that_started_it() {
+    let Ok(image) = std::env::var("PBPS_TEST_DEV_IMAGE") else {
+        panic!("PBPS_TEST_DEV_IMAGE is not set");
+    };
+
+    let d = Demo::new("devdocker");
+    // A check constraint the engine stores in its own spelling, so a rehearsal
+    // that really talked to a server has something to report. Reaching that
+    // finding at all proves the container was still there to be talked to.
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "checks:\n",
+        "  ck_pos: \"id > 0\"\n"
+    ));
+
+    let o = d.run(&[
+        "plan",
+        "--dev",
+        &format!("docker://{image}"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    // Not `rehearsal.unavailable`, which is what a removed container produces.
+    assert!(
+        ids.contains(&"rehearsal.spelling"),
+        "the rehearsal did not reach a live engine: {v}"
+    );
+}

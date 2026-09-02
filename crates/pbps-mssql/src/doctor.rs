@@ -72,6 +72,23 @@ pub enum Needed {
     /// falls back to the schema — which is the only place a grant *can* sit in
     /// advance of a first deployment.
     Ledger,
+
+    /// Needed on a table a declared foreign key *points at* which lies outside
+    /// the schemas this project manages.
+    ///
+    /// `REFERENCES` is authorized on the referenced table, and the pre-flight
+    /// probe for an added foreign key reads it (`NOT EXISTS (SELECT 1 FROM
+    /// <parent> ...)`) — so both are needed there, and neither is covered by
+    /// anything asked about the managed schemas. `validate` accepts a foreign
+    /// key whose target is undeclared, and the emitter really does write
+    /// `REFERENCES [shared].[parent]`, so this is reachable from an ordinary
+    /// project rather than a contrived one.
+    ///
+    /// Asked at **object** scope, and only for targets outside the managed
+    /// schemas: one inside them is already covered by the `Managed` entries,
+    /// and demanding anything on the whole of someone else's schema is the
+    /// over-demand this enum exists to avoid.
+    Referenced,
 }
 
 /// A permission pbps needs, what needs it, and where it has to be held.
@@ -97,7 +114,7 @@ pub const LEDGER_SCHEMA: &str = "dbo";
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 12] = [
+pub const REQUIRED: [Requirement; 14] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -147,6 +164,20 @@ pub const REQUIRED: [Requirement; 12] = [
         "REFERENCES",
         "adding a foreign key, which the engine authorizes on the referenced table",
         Needed::Managed,
+    ),
+    // The same two, one securable further out. A foreign key into a schema the
+    // project does not manage is authorized on *that* table, and the probe for
+    // it reads *that* table — neither of which any question about the managed
+    // schemas can see.
+    req(
+        "REFERENCES",
+        "a foreign key into a table this project does not manage",
+        Needed::Referenced,
+    ),
+    req(
+        "SELECT",
+        "the pre-flight probe for that foreign key, which reads the referenced table",
+        Needed::Referenced,
     ),
     req(
         "INSERT",
@@ -249,6 +280,16 @@ pub struct Held {
     /// Empty when the ledger does not exist yet, in which case [`missing`]
     /// falls back to the schema answer.
     pub ledger_objects: BTreeMap<String, BTreeSet<String>>,
+
+    /// Per foreign-key target outside the managed schemas, the permissions
+    /// effective on that **object**.
+    ///
+    /// A target the database does not have is absent from this map rather than
+    /// present and empty: there is no securable to ask about, and reporting a
+    /// gap there would fire on every project whose referenced table is created
+    /// by something else's deployment. That the table is missing at all is a
+    /// question for `plan --db`, which sees the change; `doctor` sees no plan.
+    pub referenced_objects: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// A permission that is needed and not held, and the securable it is missing on.
@@ -307,7 +348,11 @@ impl Gap {
 /// schemas are not there yet. Joining against `sys.schemas` leaves those
 /// unasked rather than reported as gaps — the alternative would fire on the
 /// most common first run there is.
-pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, DbError> {
+pub async fn permissions(
+    conn: &mut Conn,
+    schemas: &[String],
+    referenced: &[String],
+) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
         .await?;
@@ -432,6 +477,55 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         }
     }
 
+    // Foreign-key targets outside the managed schemas, also at object scope —
+    // but **without** the `OBJECT_ID(...) IS NOT NULL` filter the ledger query
+    // uses, and that difference is deliberate.
+    //
+    // Metadata visibility hides an object from a principal with no permission
+    // on it, so that filter cannot tell "not there" from "not allowed to see".
+    // For the ledger that is harmless: a hidden table falls back to the schema
+    // question, which still reports a gap. Here it would drop the object from
+    // the map entirely and `missing` would say nothing — under-reporting the
+    // one case that matters. So every named target is asked about, and
+    // `HAS_PERMS_BY_NAME` answering 0 becomes a gap whether the table is absent
+    // or invisible. Both of those fail the apply, and the operator can tell
+    // which from the name.
+    let mut referenced_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if !referenced.is_empty() {
+        let referenced_perms: Vec<&str> = REQUIRED
+            .iter()
+            .filter(|r| matches!(r.needed, Needed::Referenced))
+            .map(|r| r.name)
+            .collect();
+        let mut params: Vec<Param<'_>> = Vec::new();
+        let mut perm_slots = Vec::new();
+        for p in &referenced_perms {
+            params.push(Param::from(*p));
+            perm_slots.push(format!("(@P{})", params.len()));
+        }
+        let mut object_slots = Vec::new();
+        for t in referenced {
+            params.push(Param::from(t.as_str()));
+            object_slots.push(format!("(@P{})", params.len()));
+        }
+        let sql = format!(
+            "SELECT o.n AS [object], p.n AS permission, \
+             HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
+             FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n);",
+            object_slots.join(", "),
+            perm_slots.join(", ")
+        );
+        for row in &conn.query_with(&sql, &params).await? {
+            let object: &str = get(row, "object")?;
+            let permission: &str = get(row, "permission")?;
+            let held: i32 = row.try_get("held")?.unwrap_or(0);
+            let entry = referenced_objects.entry(object.to_owned()).or_default();
+            if held != 0 {
+                entry.insert(permission.trim().to_ascii_uppercase());
+            }
+        }
+    }
+
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
@@ -452,6 +546,7 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         absent_schemas,
         ledger_schema,
         ledger_objects,
+        referenced_objects,
     })
 }
 
@@ -535,6 +630,20 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             // `__pbps_lock` alone pass readiness. `ensure_tables` then created
             // `__pbps_state`, and the next state read was denied by a
             // permission `doctor` had never asked about, at either scope.
+            // Every named target, present in the map or not: `permissions`
+            // asks about all of them precisely so that "absent" and "invisible"
+            // both land here as a gap rather than as silence.
+            Needed::Referenced => {
+                for (object, granted) in &held.referenced_objects {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Object(object.clone()),
+                        });
+                    }
+                }
+            }
             Needed::Ledger => {
                 // Both tables missing means both fall back to the same schema,
                 // and the operator needs one `GRANT`, not two identical lines
@@ -663,6 +772,7 @@ mod tests {
                 .map(|r| r.name.to_owned())
                 .collect(),
             ledger_objects: BTreeMap::new(),
+            referenced_objects: BTreeMap::new(),
         }
     }
 
@@ -1027,6 +1137,12 @@ mod tests {
     /// The negative case: an empty answer is a real state — a login mapped to
     /// no user in this database — and must not be mistaken for "fine". `dbo`
     /// always exists, so it is always asked about and always reported.
+    ///
+    /// Counted against the requirements that *apply* rather than against
+    /// `REQUIRED.len()`. A project with no foreign key out of its own schemas
+    /// has nothing for the `Referenced` entries to be missing on, and a raw
+    /// length equality would have made adding them look like a regression here
+    /// while saying nothing about what this test is for.
     #[test]
     fn holding_nothing_is_reported_as_missing_everything() {
         let held = Held {
@@ -1035,8 +1151,54 @@ mod tests {
             absent_schemas: BTreeSet::new(),
             ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
+            referenced_objects: BTreeMap::new(),
         };
-        assert_eq!(missing(&held).len(), REQUIRED.len());
+        let applicable = REQUIRED
+            .iter()
+            .filter(|r| !matches!(r.needed, Needed::Referenced))
+            .count();
+        assert_eq!(missing(&held).len(), applicable);
+    }
+
+    /// A foreign key into a schema this project does not manage. `REFERENCES`
+    /// is authorized on the referenced table and the pre-flight probe reads it,
+    /// and neither is covered by anything asked about the managed schemas — so
+    /// a login could pass readiness and fail during `apply`.
+    #[test]
+    fn a_foreign_key_out_of_the_managed_schemas_is_asked_about_its_target() {
+        let mut held = everything(&["app"]);
+        held.referenced_objects
+            .insert("shared.parent".to_owned(), BTreeSet::new());
+
+        let gaps = missing(&held);
+        for permission in ["REFERENCES", "SELECT"] {
+            assert!(
+                gaps.iter().any(|g| g.permission == permission
+                    && g.securable() == "OBJECT::shared.parent"),
+                "{permission} on the referenced table was not asked for: {gaps:?}"
+            );
+        }
+        // And nothing wider: demanding anything on the whole of somebody else's
+        // schema is the over-demand this check exists to avoid.
+        assert!(
+            !gaps.iter().any(|g| g.securable() == "SCHEMA::shared"),
+            "{gaps:?}"
+        );
+    }
+
+    /// Held on the target, so nothing is reported — the ordinary case for a
+    /// deployment account a DBA has granted correctly.
+    #[test]
+    fn a_granted_foreign_key_target_reports_nothing() {
+        let mut held = everything(&["app"]);
+        held.referenced_objects.insert(
+            "shared.parent".to_owned(),
+            ["REFERENCES", "SELECT"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
     #[test]

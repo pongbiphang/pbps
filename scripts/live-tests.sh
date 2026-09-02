@@ -30,6 +30,19 @@ done
 
 export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
 
+# The `--dev docker://` path starts a *second*, throwaway server of its own, so
+# it is opt-in rather than always-on: naming an image here is what enables it.
+# Set locally and deliberately left out of CI's live job, which already runs one
+# SQL Server as a service container — a second on the same runner is a memory
+# and flakiness cost that belongs in a CI decision of its own, not at the tail of
+# a feature branch.
+#
+# It is worth having at all because that path had no automated coverage
+# whatsoever, which is how `Container::start` shipped removing the container it
+# had just returned: `plan --dev docker://...` failed with "connection refused"
+# for every user, and no test ran it.
+export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
+
 # The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
 # which needs the same server and is `#[ignore]`d for the same reason.
 cargo test -p pbps-mssql --test live -- --ignored "$@"

@@ -1052,7 +1052,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
         .await
         .expect("read permissions");
 
@@ -1080,7 +1080,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1106,7 +1106,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
     // As a project that manages `app`, so the gap can only be the ledger's own
     // creation requirement and not the ordinary managed-schema `ALTER`.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1137,7 +1137,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("grant on the ledger objects");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
         .await
         .expect("read permissions");
     assert!(
@@ -1161,7 +1161,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("drop the state table");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
         .await
         .expect("read permissions");
     assert_eq!(
@@ -1215,7 +1215,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke alter again");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1239,7 +1239,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute("CREATE SCHEMA [app];")
         .await
         .expect("create app schema");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()], &[])
         .await
         .expect("read permissions");
     assert!(
@@ -1256,7 +1256,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // nothing in the tool emits `CREATE SCHEMA`, so the first
     // `CREATE TABLE [nowhere].[...]` would have failed right after a clean
     // readiness report.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()], &[])
         .await
         .expect("read permissions");
     assert!(
@@ -1350,7 +1350,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
         .await
         .expect("read permissions");
     assert!(
@@ -1368,7 +1368,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         .await
         .expect("deny");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
         .await
         .expect("read permissions");
     // All three facts, because the old shortcut was built on the first alone.
@@ -1507,6 +1507,148 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
             .await
             .expect("an absent lock table is not an error")
             .is_none()
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
+/// A foreign key into a schema the project does not manage.
+///
+/// `validate` accepts one whose target is undeclared — the target is somebody
+/// else's table — but the emitter still writes `REFERENCES [shared].[parent]`,
+/// which SQL Server authorizes on *that* table, and the pre-flight probe for
+/// the change reads it. Neither is covered by any question about the managed
+/// schemas, so a login could pass `doctor` and fail during `apply`.
+///
+/// Live because the whole question is what a real server authorizes: only it
+/// can say that `ALTER` on `app` does not carry `REFERENCES` on `shared.parent`.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target() {
+    let mut db = TestDb::create("fkacross").await;
+    let login = format!("pbps_fk_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsForeignKey!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    // `CREATE SCHEMA` must be the first statement in its batch, so one each.
+    db.conn.execute("CREATE SCHEMA [app];").await.expect("app");
+    db.conn
+        .execute("CREATE SCHEMA [shared];")
+        .await
+        .expect("shared");
+    db.conn
+        .execute(
+            "CREATE TABLE shared.parent (id bigint NOT NULL CONSTRAINT pk_parent PRIMARY KEY);",
+        )
+        .await
+        .expect("the unmanaged parent table");
+    // Everything a project managing `app` needs, and nothing at all on
+    // `shared` — the shape a DBA produces when told "grant them their schema".
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::app TO [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+        ))
+        .await
+        .expect("grant");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    // The premise: with no foreign key out of `app`, this login is ready. If it
+    // were not, the assertion below would pass for the wrong reason.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "the premise is wrong if this login is short of something else: {:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    // And with one, the target it points at is asked about.
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &["shared.parent".to_owned()],
+    )
+    .await
+    .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    for permission in ["REFERENCES", "SELECT"] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == permission && g.securable() == "OBJECT::shared.parent"),
+            "{permission} on the referenced table was not reported: {gaps:?}"
+        );
+    }
+
+    // Granted on the object alone — the narrowest thing a DBA can do — and the
+    // report goes quiet. A schema-scoped question could not see this grant.
+    db.conn
+        .execute(&format!(
+            "GRANT REFERENCES, SELECT ON OBJECT::shared.parent TO [{login}];"
+        ))
+        .await
+        .expect("grant on the object");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &["shared.parent".to_owned()],
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "an object-scoped grant on the target must satisfy it: {:?}",
+        pbps_mssql::doctor::missing(&held)
     );
 
     drop(lp);

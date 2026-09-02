@@ -108,6 +108,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // about (the ledger lives there) and the declarations themselves are
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
+    let referenced = referenced_tables(project, &managed_schemas);
 
     if !project.ids_file().exists() {
         findings.push(
@@ -161,7 +162,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 let label = name.unwrap_or_else(|| target.label.clone());
                 let rt =
                     output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
-                rt.block_on(examine(&label, target.connection(), &managed_schemas))
+                rt.block_on(examine(
+                    &label,
+                    target.connection(),
+                    &managed_schemas,
+                    &referenced,
+                ))
             }
             Err(e) => EnvDiagnosis {
                 environment: name.unwrap_or_else(|| "the given target".to_owned()),
@@ -201,7 +207,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
-                Ok(conn) => rt.block_on(examine(&name, &conn, &managed_schemas)),
+                Ok(conn) => rt.block_on(examine(&name, &conn, &managed_schemas, &referenced)),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
@@ -321,8 +327,43 @@ fn managed_schemas(project: &Project) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// Tables a declared foreign key points at that lie **outside** the managed
+/// schemas, spelled `schema.table` for `HAS_PERMS_BY_NAME`.
+///
+/// `validate` accepts a foreign key whose target is not declared — the target
+/// is somebody else's table, and pbps is not asked to manage it — but the
+/// emitter still writes `REFERENCES [shared].[parent]`, which SQL Server
+/// authorizes on that table, and the pre-flight probe for the change reads it.
+/// Neither is covered by any question about the managed schemas, so a login
+/// could pass `doctor` and fail during `apply`.
+///
+/// Targets *inside* the managed schemas are left out: the schema-scoped
+/// `REFERENCES` and `SELECT` already cover them, and asking twice would report
+/// the same gap at two securables.
+fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return Vec::new();
+    };
+    let managed: std::collections::BTreeSet<&str> = managed.iter().map(String::as_str).collect();
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for table in loaded.schema.tables.values() {
+        for fk in table.foreign_keys.values() {
+            let target = &fk.references_table;
+            if !managed.contains(target.schema.as_str()) {
+                out.insert(format!("{}.{}", target.schema, target.name));
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Everything one environment can be asked without writing to it.
-async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnosis {
+async fn examine(
+    name: &str,
+    connection: &str,
+    schemas: &[String],
+    referenced: &[String],
+) -> EnvDiagnosis {
     let mut d = EnvDiagnosis {
         environment: name.to_owned(),
         state: "unreachable",
@@ -375,7 +416,7 @@ async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnos
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas).await {
+    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced).await {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()

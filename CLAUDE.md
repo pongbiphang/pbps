@@ -359,7 +359,13 @@ Phase 3.1 additions worth knowing before touching them:
     does not exist yet is left unasked — that is every first deployment, and the
     create-time `ALTER` is required per ledger table still missing, not once for
     the pair. `REFERENCES` is on the list because a foreign key is authorized on
-    the *referenced* table and `ALTER` does not imply it. **`CONTROL` is
+    the *referenced* table and `ALTER` does not imply it — and when that table is
+    **outside the managed schemas**, `REFERENCES` and the probe's `SELECT` are
+    asked on the object itself (`Needed::Referenced`), because nothing asked
+    about the managed schemas can see it. That query deliberately omits the
+    `OBJECT_ID` existence filter the ledger's uses: metadata visibility cannot
+    tell absent from invisible, and here dropping the object would under-report
+    instead of falling back. **`CONTROL` is
     deliberately absent**: a cross-schema rename needs it (`ALTER SCHEMA ...
     TRANSFER`), but `doctor` sees no plan, so demanding it would require
     near-ownership of every managed schema always — the claim is narrowed to
@@ -455,7 +461,17 @@ Phase 3.1 additions worth knowing before touching them:
     there made that failure the whole envelope's — `explain --format json`
     printed nothing at all. `Finding::at` drops the location rather than store a
     lossy one that points at a different file.
-49. **`shell_arg` has now been wrong about shells five times.** Single quotes in
+49. **A guard built twice is a guard that fires early.** `dev::Container::start`
+    built its cleanup guard, then *shadowed* it with a second one holding the
+    same container id. A shadowed binding is not dropped early — it lives to the
+    end of the function — so the first guard's `Drop` ran `docker rm -f` on the
+    container just returned, and `plan --dev docker://...` failed with
+    "connection refused" from the day the feature was written. It survived
+    because **every `--dev` test passes a connection string**: the docker path
+    had no coverage at all. `scripts/live-tests.sh` now sets
+    `PBPS_TEST_DEV_IMAGE` to cover it; CI's live job deliberately does not, as a
+    second SQL Server on that runner is a CI decision of its own.
+50. **`shell_arg` has now been wrong about shells five times.** Single quotes in
     `cmd`; backslashes; `!` under delayed expansion; a leading `-`, which no
     quoting can carry because the shell strips the quotes and clap then reads a
     flag (the `--opt=value` form would work, and was declined — it changes every
