@@ -158,9 +158,11 @@ enum Command {
 
     /// Check whether this project and its environments are ready
     Doctor {
-        /// Check only this environment. Without it, every configured one
-        #[arg(long)]
-        env: Option<String>,
+        /// Check only this target. Without one, every configured environment.
+        /// `--db` is what CI passes from a secret, as for every other connected
+        /// command
+        #[command(flatten)]
+        target: TargetArgs,
 
         /// human (default) or json
         #[arg(long, default_value = "human")]
@@ -558,8 +560,15 @@ fn run() -> anyhow::Result<()> {
                 resume,
             )
         }
-        Command::Doctor { env, format } => {
-            doctor::cmd_doctor(&project, env.as_deref(), format == OutputFormat::Json)
+        Command::Doctor { target, format } => {
+            // The only connected command whose target is optional: with none it
+            // surveys every configured environment, which is what makes it
+            // worth running before a deployment.
+            let one = match (&target.db, &target.env) {
+                (None, None) => None,
+                _ => Some((target.resolve(&project)?, target.env.clone())),
+            };
+            doctor::cmd_doctor(&project, one, format == OutputFormat::Json)
         }
         Command::Validate { format } => cmd_validate(&project, format),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
@@ -1408,7 +1417,27 @@ fn cmd_plan(
             bail!("the declarations have {} problem(s)", errs.len());
         }
     };
-    let ids = read_ids(project)?;
+    // The identity file is read here for the same reason the declarations were
+    // above: `?` on it escaped before serialization, so a malformed or
+    // inconsistent ids file left stdout empty. Wrapping only `load` fixed half
+    // of one problem.
+    let ids = match read_ids(project) {
+        Ok(i) => i,
+        Err(e) => {
+            if json {
+                let report = output::Report::plain(
+                    "plan",
+                    vec![
+                        output::Finding::error("identity.unreadable", format!("{e:#}"))
+                            .at(project.ids_file(), None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
     let dialect = dialect(project)?;
 
     let mut findings: Vec<output::Finding> = Vec::new();

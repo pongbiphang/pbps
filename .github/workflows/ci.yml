@@ -88,7 +88,11 @@ jobs:
       # the CLI/database boundary, so the dialect-only suite cannot exercise
       # them. Keep these ignored in ordinary jobs and run them here against the
       # same real engine.
-      - run: cargo test -p pbps-cli --test flow -- --ignored
+      # Single-threaded: these share one SQL Server, and the deployment lock is
+      # a single row in it. Two tests taking it concurrently make each other
+      # fail, and the failure looks like a bug in the lock rather than in the
+      # test schedule.
+      - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1
 
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.

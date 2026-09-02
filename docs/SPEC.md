@@ -866,7 +866,10 @@ outlives any API).
 
 ### 9.5 Readiness (`doctor`)
 
-**`pbps doctor [--env <name>]`** answers "can I deploy from here", in one run.
+**`pbps doctor [--db … | --env <name>]`** answers "can I deploy from here", in
+one run. It is the only connected command whose target is optional: with none it
+surveys every configured environment, which is what makes it worth running
+before a deployment rather than during one.
 Before it existed, connection, engine edition, permissions, paths and ledger
 readiness each failed later, at a different command — a user adopting their first
 database learned about them in the order the commands happened to need them,

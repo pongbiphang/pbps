@@ -70,7 +70,11 @@ pub struct EnvDiagnosis {
     pub detail: Option<String>,
 }
 
-pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::Result<()> {
+pub fn cmd_doctor(
+    project: &Project,
+    one: Option<(db::Target, Option<String>)>,
+    json: bool,
+) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
     let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
 
@@ -111,7 +115,17 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
     }
 
     let mut environments = Vec::new();
-    if project.config.environments.is_empty() && env.is_none() {
+    if let Some((target, name)) = one {
+        db::require_mssql(project, "doctor")?;
+        let rt = db::runtime()?;
+        // Named by the environment when there is one, and by the *redacted*
+        // label otherwise — `db::redact` gives server/database, never the
+        // connection string CI passed in.
+        let label = name.unwrap_or_else(|| target.label.clone());
+        let d = rt.block_on(examine(&label, target.connection()));
+        findings.extend(env_findings(&d, counts.modules > 0));
+        environments.push(d);
+    } else if project.config.environments.is_empty() {
         findings.push(
             output::Finding::warning(
                 "project.no-environments",
@@ -120,10 +134,7 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
             .remedy("add `environments:` to pbps.yml with `url_env:` naming the variable"),
         );
     } else {
-        let names: Vec<String> = match env {
-            Some(name) => vec![name.to_owned()],
-            None => project.config.environments.keys().cloned().collect(),
-        };
+        let names: Vec<String> = project.config.environments.keys().cloned().collect();
         // Refused before connecting rather than after: the failure is about the
         // project, not the environment, and reporting it once beats reporting it
         // per environment.
@@ -405,8 +416,13 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             )
             .remedy("grant SELECT on dbo.__pbps_lock, or check that the table is intact"),
         ),
+        // An error, not a warning. `doctor` answers "can I deploy from here",
+        // and while the lock is held an apply is refused — so a readiness check
+        // that passed would be answering a different question than the one it
+        // was asked. Whether the holder is a live deployment or a process that
+        // died is exactly what the remedy is for; both mean "not now".
         "locked" => out.push(
-            output::Finding::warning(
+            output::Finding::error(
                 "state.locked",
                 format!(
                     "{}: {}",

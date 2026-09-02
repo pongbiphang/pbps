@@ -284,9 +284,13 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
     // `latest` alone reports `ready` — handing the reviewer an approval command
     // while the environment is being changed underneath them, which is the one
     // thing this check exists to prevent.
+    // `?`, not `if let Ok(..)`. Discarding the error here would be the same
+    // mistake this whole check exists to correct — a lock that could not be read
+    // is not an absent lock — and it was made once already, in `doctor`, one
+    // commit before this branch was written.
     let checked = db::runtime()?.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
-        if let Ok(Some(lock)) = pbps_mssql::state::lock_holder(&mut conn).await {
+        if let Some(lock) = pbps_mssql::state::lock_holder(&mut conn).await? {
             return Ok(Err(lock));
         }
         pbps_mssql::state::latest(&mut conn).await.map(Ok)

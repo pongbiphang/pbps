@@ -2868,3 +2868,91 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
         "{v}"
     );
 }
+
+// ---- Ninth review round ----
+
+/// The identity file escaped serialization the same way the declarations did,
+/// one line below the fix for them.
+#[test]
+fn plan_json_emits_an_envelope_when_the_identity_file_is_unreadable() {
+    let d = Demo::new("planids");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.ids_path(), "{ this is not json").unwrap();
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "identity.unreadable");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("schema.ids.json"),
+        "{v}"
+    );
+}
+
+/// `doctor` answers "can I deploy from here", and while the lock is held an
+/// apply is refused — so a readiness check that passed would be answering a
+/// different question than the one it was asked.
+///
+/// Live, because only a real ledger can hold a real lock.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_does_not_report_ready_while_the_lock_is_held() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctorlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    let taken = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "pbps-test-mssql",
+            "/opt/mssql-tools18/bin/sqlcmd",
+            "-C",
+            "-S",
+            "localhost",
+            "-U",
+            "sa",
+            "-P",
+            "Pbps!Test12345",
+            "-Q",
+            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+        ])
+        .output();
+    if taken.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+
+    let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let _ = d.run(&["unlock", "--db", &connection]);
+
+    assert_eq!(
+        v["result"], "findings",
+        "a held lock is not a clean report: {v}"
+    );
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let locked = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.locked")
+        .unwrap_or_else(|| panic!("no state.locked finding: {v}"));
+    assert_eq!(locked["severity"], "error", "{v}");
+    // It found this by looking, so it is a finding (exit 2), not unanswerable.
+    assert!(
+        locked["remedy"].as_str().unwrap().contains("pbps unlock"),
+        "{v}"
+    );
+}
