@@ -1492,10 +1492,10 @@ async fn preflight(
     }
 
     let mut failures = Vec::new();
-    let mut ran = 0usize;
+    let mut passed = 0usize;
+    let mut unchecked = 0usize;
     let probes = dialect.preflight(&plan.changes);
     for probe in &probes {
-        ran += 1;
         // A probe can still legitimately fail to run — a check whose expression
         // names a column this plan renames, say, since expression text is never
         // rewritten by substitution. That is not a violation and it is not
@@ -1504,6 +1504,7 @@ async fn preflight(
         let rows = match conn.query(&probe.sql).await {
             Ok(rows) => rows,
             Err(e) => {
+                unchecked += 1;
                 eprintln!(
                     "warning: could not check {} ({e}); the engine will enforce it during the apply",
                     probe.description
@@ -1511,10 +1512,27 @@ async fn preflight(
                 continue;
             }
         };
-        let count = rows
+        // A query that answered but whose count cannot be read is in exactly
+        // the same position as one that failed: nobody looked. Defaulting to
+        // zero read that silence as "no rows violate this" — the one answer a
+        // gate must never give by accident — and, worse, the probe was then
+        // counted among those that *passed*.
+        let count = match rows
             .first()
             .and_then(|r| r.try_get_at::<i32>(0).ok().flatten())
-            .unwrap_or(0);
+        {
+            Some(c) => c,
+            None => {
+                unchecked += 1;
+                eprintln!(
+                    "warning: {} returned no readable count; the engine will enforce it during \
+                     the apply",
+                    probe.description
+                );
+                continue;
+            }
+        };
+        passed += 1;
         if count > 0 {
             failures.push(format!("{count} {}", probe.description));
         }
@@ -1525,8 +1543,17 @@ async fn preflight(
             failures.join("\n  ")
         );
     }
-    if ran > 0 {
-        println!("Pre-flight: {ran} probe(s) passed against the live data.");
+    if passed > 0 {
+        println!("Pre-flight: {passed} probe(s) passed against the live data.");
+    }
+    if unchecked > 0 {
+        // Said on stdout as well as in the warnings above: an operator reading
+        // "3 probes passed" while a fourth went unchecked has been told
+        // something true and something misleading in the same breath.
+        println!(
+            "Pre-flight: {unchecked} probe(s) could not be checked here; the engine enforces \
+             them inside the transaction."
+        );
     }
 
     // "No probe" is not "no risk". Saying so keeps the operator's attention

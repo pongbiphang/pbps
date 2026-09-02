@@ -764,9 +764,27 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
 
     let dir = project.schema_dir();
     if !force {
+        // A listing that *failed* is not an empty directory. This guard is the
+        // only thing standing between an unforced `pull` and the user's
+        // declarations, so reading "I could not look" as "there is nothing
+        // there" is the one mistake it must not make — the consequence is
+        // overwriting files nobody ever saw.
         let existing = if dir.is_dir() {
-            pbps_load::schema_files(&dir).unwrap_or_default()
+            pbps_load::schema_files(&dir)
+                .with_context(|| format!("cannot list `{}`", dir.display()))?
+        } else if dir.exists() {
+            // Present and not a directory: the project is misconfigured, and
+            // "there are no declarations here" is not the right reading of it.
+            // Taken as one, an unforced pull would go on to create the
+            // directory beside it or fail halfway through writing.
+            bail!(
+                "`{}` exists and is not a directory; pbps cannot tell what declarations this \
+                 project has",
+                dir.display()
+            );
         } else {
+            // Genuinely absent, which is the ordinary adoption case: a project
+            // that has never had declarations is exactly what `pull` is for.
             Vec::new()
         };
         // `init` deliberately creates a versioned empty identity file. That is
@@ -843,7 +861,13 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     // already means "replace my declarations with this database"; this is the
     // rest of that sentence.
     let mut removed = Vec::new();
-    for path in pbps_load::schema_files(&dir).unwrap_or_default() {
+    // Same reading as the guard above, for the same reason in the other
+    // direction: a failed listing that came back empty would silently skip the
+    // cleanup and leave exactly the two-files-one-name state this block exists
+    // to prevent.
+    let present = pbps_load::schema_files(&dir)
+        .with_context(|| format!("cannot list `{}`", dir.display()))?;
+    for path in present {
         if written.contains(&path) {
             continue;
         }

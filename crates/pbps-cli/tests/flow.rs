@@ -3679,3 +3679,38 @@ fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
         "the message must name what differs: {v}"
     );
 }
+
+/// The last two pre-existing instances of "an absence read as good news",
+/// closed after the review stopped rather than left as a follow-up.
+///
+/// `pull`'s guard is the only thing between an unforced pull and the user's
+/// declarations, and it read three different "I do not know" answers as
+/// "there is nothing here": a failed listing, and a declarations path that
+/// exists but is not a directory.
+///
+/// Only the second is reachable from a test — a listing that fails on a real
+/// directory needs permissions this suite cannot rely on, since it may run as
+/// root. That one is fixed by inspection and carries no test; saying so is
+/// better than a test that passes down the path that already worked.
+#[test]
+fn pull_refuses_when_it_cannot_tell_whether_declarations_exist() {
+    let d = Demo::new("pullunlistable");
+    // A file where the declarations directory should be.
+    std::fs::remove_dir_all(d.dir.join("schema")).unwrap();
+    std::fs::write(d.dir.join("schema"), "not a directory\n").unwrap();
+
+    // The guard runs before anything connects, so the unreachable server in the
+    // connection string is never contacted — and must not be what fails.
+    let o = d.run(&["pull", "--db", "Server=x;Database=y"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("is not a directory"),
+        "the refusal must name the real problem, not a connection failure: {}",
+        stderr(&o)
+    );
+    // And it must not have begun overwriting anything.
+    assert!(
+        d.dir.join("schema").is_file(),
+        "pull must not have touched the declarations path"
+    );
+}
