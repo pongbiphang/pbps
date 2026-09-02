@@ -175,7 +175,16 @@ pub fn cmd_explain(
         }
     };
 
-    let explanation = explain(&plan, dialect.as_ref(), path, &target, env)?;
+    // The third failure the envelope has to survive, and the least obvious: a
+    // plan that reads and deserializes fine can still carry a typed change the
+    // emitter refuses (a `create_table` with no columns, say). The reviewer's
+    // command must say so rather than print nothing.
+    let explanation = output::or_unanswerable(
+        "explain",
+        json,
+        "plan.unexplainable",
+        explain(&plan, dialect.as_ref(), path, &target, env),
+    )?;
     let findings = findings(&plan, &explanation);
 
     if json {

@@ -3465,3 +3465,49 @@ fn plan_json_emits_an_envelope_when_a_change_cannot_be_expressed() {
         "the message must name what cannot be done: {v}"
     );
 }
+
+// ---- Sixteenth review round ----
+
+/// A plan that reads and deserializes perfectly can still carry a typed change
+/// the emitter refuses — a `create_table` whose table has no columns. That is a
+/// third, later failure than the two `cmd_explain` already handled, and it left
+/// the reviewer's own command printing nothing at all.
+#[test]
+fn explain_json_emits_an_envelope_when_a_plan_cannot_be_rendered() {
+    let d = Demo::new("explainunrenderable");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    assert_eq!(code(&d.run(&["plan", "--out", plan.to_str().unwrap()])), 0);
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    // Empty the created table's columns. The plan stays a structurally valid,
+    // current-version plan that deserializes cleanly — which is the point: the
+    // two earlier guards both pass, and only the emitter can refuse it.
+    let changes = v["changes"]["changes"].as_array_mut().unwrap();
+    let target = changes
+        .iter_mut()
+        .find(|c| c["op"] == "create_table")
+        .expect("the plan should create a table");
+    target["table"]["columns"] = serde_json::json!({});
+    let broken = d.dir.join("broken.json");
+    std::fs::write(&broken, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        broken.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    // Specifically the *third* guard, not one of the two that already existed:
+    // a plan.unreadable here would mean the fixture is broken in a way that
+    // never reaches the emitter, and the test would pass without testing this.
+    assert_eq!(v["findings"][0]["id"], "plan.unexplainable", "{v}");
+}

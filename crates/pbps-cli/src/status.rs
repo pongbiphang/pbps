@@ -53,6 +53,16 @@ pub struct EnvStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
 
+    /// Set when the lock could not be read, so an absent `locked_by` means
+    /// "not determined" rather than "no lock held".
+    ///
+    /// The same distinction `doctor` and `explain` make, and for the same
+    /// reason: a lock that could not be read is not an absent lock, and telling
+    /// an operator the environment is free when nobody looked is the one answer
+    /// this row must never give.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_unknown: Option<String>,
+
     /// When this line was produced, by the reporting machine's clock.
     pub checked_at: String,
 }
@@ -70,6 +80,7 @@ impl EnvStatus {
             git_sha: None,
             operator: None,
             locked_by: None,
+            lock_unknown: None,
             checked_at: checked_at.to_owned(),
         }
     }
@@ -137,41 +148,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
     }
 
     if json {
-        // Every finding here is a warning, and deliberately so. `status` is a
-        // report, not a gate (see the module header): it always exits 0, so a
-        // finding at error severity would make `result` say the command failed
-        // while the exit code said it succeeded. The per-environment truth is
-        // in `state`, which is the field a consumer should key off.
-        let findings = rows
-            .iter()
-            .filter(|r| r.state != "ok")
-            .map(|r| {
-                let mut f = output::Finding::warning(
-                    match r.state {
-                        "drift" => "state.drift",
-                        "staged" => "state.mid-deployment",
-                        "uninitialized" => "state.uninitialized",
-                        "unreachable" => "environment.unreachable",
-                        _ => "environment.unconfigured",
-                    },
-                    match &r.detail {
-                        Some(d) => format!("{}: {} — {d}", r.environment, r.state),
-                        None => format!("{}: {}", r.environment, r.state),
-                    },
-                );
-                if r.state == "staged" {
-                    // Named, for the same reason as `doctor`'s: `apply` requires
-                    // a target, and `status` is the command that reports on six
-                    // environments at once — a remedy without the name leaves
-                    // the reader to work out which of the six it meant.
-                    f = f.remedy(format!(
-                        "pbps apply --env {} --plan <plan.json> --staged --resume",
-                        crate::report::env_arg(&r.environment)
-                    ));
-                }
-                f
-            })
-            .collect();
+        let findings = findings(&rows);
         println!(
             "{}",
             serde_json::to_string_pretty(&output::Report::new("status", findings, Some(&rows)))?
@@ -209,11 +186,17 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
     };
 
-    let locked_by = pbps_mssql::state::lock_holder(&mut conn)
-        .await
-        .ok()
-        .flatten()
-        .map(|l| format!("{} since {}", l.locked_by, l.locked_at));
+    // `.ok().flatten()` here read an unreadable lock as no lock, which is the
+    // same mistake this branch corrected in `doctor` and then in `explain`.
+    // Kept apart from `state` on purpose: the ledger answered, so the row is
+    // still worth printing — what is undetermined is only the lock.
+    let (locked_by, lock_unknown) = match pbps_mssql::state::lock_holder(&mut conn).await {
+        Ok(held) => (
+            held.map(|l| format!("{} since {}", l.locked_by, l.locked_at)),
+            None,
+        ),
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     let recorded_ids = entry.snapshot.ids.clone();
     let mut row = EnvStatus {
@@ -227,6 +210,7 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         git_sha: entry.snapshot.git_sha.clone(),
         operator: Some(entry.snapshot.operator.clone()),
         locked_by,
+        lock_unknown,
         checked_at: checked_at.to_owned(),
     };
 
@@ -330,6 +314,86 @@ fn render(rows: &[EnvStatus]) -> String {
             // things an operator wants to know before they start typing.
             out.push_str(&format!("\n  {}: locked by {lock}\n", r.environment));
         }
+        if let Some(why) = &r.lock_unknown {
+            out.push_str(&format!(
+                "\n  {}: could not tell whether an apply is running ({why})\n",
+                r.environment
+            ));
+        }
+    }
+    out
+}
+
+/// The findings half of `status --format json`.
+///
+/// Extracted so it can be tested without a database: the disagreement it exists
+/// to prevent — the human view warning about a lock the JSON view never
+/// mentioned — is exactly the kind that only shows up when the two are compared,
+/// and it was reachable only through a live server before this.
+///
+/// Every finding here is a warning, and deliberately so. `status` is a report,
+/// not a gate (see the module header): it always exits 0, so a finding at error
+/// severity would make `result` say the command failed while the exit code said
+/// it succeeded. The per-environment truth is in `state`, which is the field a
+/// consumer should key off.
+fn findings(rows: &[EnvStatus]) -> Vec<output::Finding> {
+    let mut out: Vec<output::Finding> = rows
+        .iter()
+        .filter(|r| r.state != "ok")
+        .map(|r| {
+            let mut f = output::Finding::warning(
+                match r.state {
+                    "drift" => "state.drift",
+                    "staged" => "state.mid-deployment",
+                    "uninitialized" => "state.uninitialized",
+                    "unreachable" => "environment.unreachable",
+                    _ => "environment.unconfigured",
+                },
+                match &r.detail {
+                    Some(d) => format!("{}: {} — {d}", r.environment, r.state),
+                    None => format!("{}: {}", r.environment, r.state),
+                },
+            );
+            if r.state == "staged" {
+                // Named, for the same reason as `doctor`'s: `apply` requires a
+                // target, and `status` is the command that reports on six
+                // environments at once — a remedy without the name leaves the
+                // reader to work out which of the six it meant.
+                f = f.remedy(format!(
+                    "pbps apply --env {} --plan <plan.json> --staged --resume",
+                    crate::report::env_arg(&r.environment)
+                ));
+            }
+            f
+        })
+        .collect();
+
+    // A held lock is not a `state`: the environment's recorded state is whatever
+    // the ledger says, and an apply running on top of it is a second,
+    // independent fact — which is why the filter above cannot carry it. It still
+    // has to reach `findings`, or a consumer keying off them alone is told
+    // nothing about an environment where a new apply cannot start, while the
+    // human view prints "locked by ..." in the same run.
+    for r in rows {
+        if let Some(lock) = &r.locked_by {
+            out.push(output::Finding::warning(
+                "state.locked",
+                format!(
+                    "{}: an apply is in progress (held by {lock}); a new one cannot start \
+                     until it finishes or the lock is released",
+                    r.environment
+                ),
+            ));
+        }
+        if let Some(why) = &r.lock_unknown {
+            out.push(output::Finding::warning(
+                "state.lock-unknown",
+                format!(
+                    "{}: whether an apply is in progress could not be determined ({why})",
+                    r.environment
+                ),
+            ));
+        }
     }
     out
 }
@@ -350,6 +414,7 @@ mod tests {
             git_sha: Some("bd4be7412ab9c0".into()),
             operator: Some("ci-deploy".into()),
             locked_by: None,
+            lock_unknown: None,
             checked_at: "2026-08-31T09:20:00Z".into(),
         }
     }
@@ -383,6 +448,52 @@ mod tests {
         assert_eq!(lines[1].len(), lines[2].len(), "columns must align:\n{out}");
         assert!(out.contains("bd4be741"), "{out}");
         assert!(!out.contains("bd4be7412ab9c0"), "{out}");
+    }
+
+    /// The finding this round found missing. A locked environment whose ledger
+    /// is otherwise healthy has `state: "ok"`, so the state filter cannot see
+    /// it — and the human view prints "locked by ..." in the same run. The two
+    /// views disagreeing about whether an apply can start is the worst place
+    /// for them to disagree.
+    #[test]
+    fn a_held_lock_reaches_the_findings_even_when_the_state_is_ok() {
+        let mut r = row("prod", "ok");
+        r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
+        let f = findings(&[r]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].id, "state.locked");
+        assert!(f[0].message.contains("ci-deploy"), "{f:?}");
+    }
+
+    /// A lock that could not be read is not an absent lock — the same
+    /// distinction `doctor` and `explain` make. Reporting the environment as
+    /// free when nobody looked is the one answer this row must never give.
+    #[test]
+    fn a_lock_that_could_not_be_read_is_not_reported_as_no_lock() {
+        let mut r = row("prod", "ok");
+        r.lock_unknown = Some("permission denied on dbo.__pbps_lock".into());
+        let f = findings(&[r]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].id, "state.lock-unknown");
+        assert!(f[0].message.contains("permission denied"), "{f:?}");
+    }
+
+    /// The negative case: a healthy, unlocked environment produces nothing.
+    /// `status` exits 0 and a finding here would be the report crying wolf on
+    /// the state it exists to confirm.
+    #[test]
+    fn a_healthy_unlocked_environment_produces_no_findings() {
+        assert!(findings(&[row("prod", "ok")]).is_empty());
+    }
+
+    /// Both facts are independent, so both are reported: a locked environment
+    /// that has also drifted is two different things an operator must act on.
+    #[test]
+    fn a_locked_environment_that_also_drifted_reports_both() {
+        let mut r = row("prod", "drift");
+        r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
+        let ids: Vec<&str> = findings(&[r]).iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["state.drift", "state.locked"]);
     }
 
     /// A short sha must not panic the slice that shortens a long one.
