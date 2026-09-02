@@ -3380,3 +3380,54 @@ fn plan_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
     assert_eq!(v["result"], "unanswerable");
     assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
 }
+
+// ---- Fourteenth review round ----
+
+/// The last upstream site in the escaping-`?` pattern, and the only one no
+/// command body could have caught: project discovery runs before dispatch. Its
+/// failure is also the very first one a new user meets.
+#[test]
+fn every_json_command_emits_an_envelope_when_the_project_cannot_be_discovered() {
+    let d = Demo::new("nodiscovery");
+    // A directory that is not a project and has no project above it: `pbps.yml`
+    // is removed and the search must not escape into the repository this test
+    // suite itself lives in.
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+
+    for command in [
+        vec!["validate"],
+        vec!["plan", "--check"],
+        vec!["fmt", "--check"],
+        vec!["doctor"],
+        vec!["status"],
+    ] {
+        let mut args = command.clone();
+        args.extend(["--format", "json"]);
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{command:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{command:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], command[0], "{v}");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "project.undiscoverable", "{v}");
+    }
+}
+
+/// The negative half: a command that speaks no envelope must not grow one, and
+/// the human format must stay human. A JSON envelope on stdout where a script
+/// expects a rendered document would be a new bug, not a fix.
+#[test]
+fn a_command_without_an_envelope_does_not_gain_one_from_the_discovery_wrapper() {
+    let d = Demo::new("nodiscoveryhuman");
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+
+    for args in [vec!["validate"], vec!["docs"], vec!["unlock", "--env", "x"]] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}");
+        assert!(
+            !stdout(&o).trim_start().starts_with('{'),
+            "{args:?} printed an envelope on stdout: {}",
+            stdout(&o)
+        );
+    }
+}

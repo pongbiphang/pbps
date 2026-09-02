@@ -337,6 +337,46 @@ enum Command {
     },
 }
 
+impl Command {
+    /// The command name to put in an envelope, when this invocation asked for
+    /// JSON and speaks one.
+    ///
+    /// Matched exhaustively on purpose: a new read-only command with a
+    /// `--format` flag has to be added here, and the compiler says so. A
+    /// wildcard arm is how the other escapes in this pattern stayed hidden for
+    /// eleven review rounds.
+    fn json_envelope(&self) -> Option<&'static str> {
+        let (name, format) = match self {
+            Command::Plan { format, .. } => ("plan", *format),
+            Command::Doctor { format, .. } => ("doctor", *format),
+            Command::Explain { format, .. } => ("explain", *format),
+            Command::Validate { format } => ("validate", *format),
+            Command::Fmt { format, .. } => ("fmt", *format),
+            Command::Verify { format, .. } => ("verify", *format),
+            Command::Status { format, .. } => ("status", *format),
+            // Everything else either speaks no envelope (the write commands,
+            // `docs`, the intent commands) or returns before discovery.
+            Command::Init(_)
+            | Command::Schema { .. }
+            | Command::Completions { .. }
+            | Command::Man { .. }
+            | Command::Rename { .. }
+            | Command::RenameTable { .. }
+            | Command::Drop { .. }
+            | Command::DropTable { .. }
+            | Command::Docs { .. }
+            | Command::Pull { .. }
+            | Command::Apply { .. }
+            | Command::Snapshot { .. }
+            | Command::Baseline { .. }
+            | Command::Bootstrap { .. }
+            | Command::State { .. }
+            | Command::Unlock { .. } => return None,
+        };
+        (format == OutputFormat::Json).then_some(name)
+    }
+}
+
 #[derive(Subcommand)]
 enum StateCommand {
     /// Delete all but the newest snapshots
@@ -455,7 +495,21 @@ fn run() -> anyhow::Result<()> {
             *format == OutputFormat::Json,
         );
     }
-    let project = Project::discover(&start)?;
+    // Discovery is the one failure no command body can catch: it happens before
+    // dispatch, so `validate --format json` in a directory with no readable
+    // `pbps.yml` printed nothing at all and the converter reported its own
+    // generic "produced no output". It is also the first failure a new user
+    // meets. Which command was asked for, and whether it wanted JSON, is known
+    // here — which is all the envelope needs.
+    let project = match cli.command.json_envelope() {
+        Some(command) => output::or_unanswerable(
+            command,
+            true,
+            "project.undiscoverable",
+            Project::discover(&start).map_err(anyhow::Error::from),
+        )?,
+        None => Project::discover(&start)?,
+    };
 
     match cli.command {
         Command::Init(_)
