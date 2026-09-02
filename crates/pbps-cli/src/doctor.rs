@@ -146,7 +146,9 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // *redacted* label otherwise — `db::redact` gives
                 // server/database, never the connection string CI passed in.
                 let label = name.unwrap_or_else(|| target.label.clone());
-                db::runtime()?.block_on(examine(&label, target.connection()))
+                let rt =
+                    output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
+                rt.block_on(examine(&label, target.connection()))
             }
             Err(e) => EnvDiagnosis {
                 environment: name.unwrap_or_else(|| "the given target".to_owned()),
@@ -182,7 +184,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
             "project.unsupported-dialect",
             db::require_mssql(project, "doctor"),
         )?;
-        let rt = db::runtime()?;
+        let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
                 Ok(conn) => rt.block_on(examine(&name, &conn)),

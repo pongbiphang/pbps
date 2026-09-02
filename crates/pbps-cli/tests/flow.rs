@@ -3359,3 +3359,24 @@ fn fmt_json_emits_an_envelope_when_the_declarations_cannot_be_listed() {
     assert_eq!(v["result"], "unanswerable");
     assert_eq!(v["findings"][0]["id"], "load.io");
 }
+
+// ---- Twelfth review round ----
+
+/// The site the sweep above missed. `plan`'s dialect step is a bare `dialect(`
+/// call in the same module, not `crate::dialect`, so the grep that found the
+/// other seven walked past it — which is the argument for the wrapper being at
+/// the call site rather than for being better at grepping.
+#[test]
+fn plan_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("plandialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}

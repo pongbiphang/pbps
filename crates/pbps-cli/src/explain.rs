@@ -353,7 +353,21 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
     // mistake this whole check exists to correct — a lock that could not be read
     // is not an absent lock — and it was made once already, in `doctor`, one
     // commit before this branch was written.
-    let checked = db::runtime()?.block_on(async {
+    // The runtime is built here rather than with `?` for the same reason
+    // everything below degrades: `explain` always exits 0, so the one step
+    // between "a target was given" and "the connection was tried" must not be
+    // the one that can take the whole explanation down with it.
+    let rt = match db::runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Ok(TargetState {
+                environment: target.label.clone(),
+                state: "unreachable",
+                detail: Some(format!("{e:#}")),
+            });
+        }
+    };
+    let checked = rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
         // Initialization first. `lock_holder` selects from `__pbps_lock`, which
         // a never-initialized database does not have, so asking it first turned
@@ -589,13 +603,29 @@ mod tests {
     #[test]
     fn a_tilde_is_special_only_at_the_front() {
         assert_eq!(
-            shell_arg("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json").unwrap(),
-            "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json"
-        );
-        assert_eq!(
             shell_arg("~/plans/plan.json").unwrap(),
             "\"~/plans/plan.json\""
         );
+        assert_eq!(shell_arg("a~b.json").unwrap(), "a~b.json");
+    }
+
+    /// The correction to the fix above. Letting `\` through bare stopped
+    /// Windows paths being quoted, which had the direction backwards: bare is
+    /// the one form a POSIX shell reads the backslashes in, so
+    /// `C:\Users\RUNNER~1\plan.json` pasted there arrives as
+    /// `C:UsersRUNNER~1plan.json` — quietly a different, and usually absent,
+    /// file.
+    #[test]
+    fn a_windows_path_is_quoted_rather_than_left_for_a_posix_shell_to_eat() {
+        assert_eq!(
+            shell_arg("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json").unwrap(),
+            "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json\""
+        );
+        // A doubled backslash collapses to one inside POSIX double quotes, so
+        // quoting cannot carry it either and there is nothing left to try.
+        assert_eq!(shell_arg("\\\\server\\share\\plan.json"), None);
+        // And a trailing one would escape the closing quote.
+        assert_eq!(shell_arg("C:\\plans\\"), None);
     }
 
     /// The cases no spelling covers. POSIX single quotes would make `$` and a

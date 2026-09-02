@@ -420,7 +420,8 @@ pub fn describe(c: &Change) -> String {
 ///   and claimed it failed safe in `cmd`; it does not — `cmd` would split the
 ///   command at the `&` and run the remainder.
 /// - Double quotes are understood by all three for *splitting*, but POSIX
-///   shells and PowerShell still expand `$` and a backtick inside them.
+///   shells and PowerShell still expand `$` and a backtick inside them, and a
+///   POSIX shell still reads `\\` as an escape inside them.
 ///
 /// So there is no single string that is safe everywhere for a value containing
 /// both families. Rather than pick a form that is wrong on one platform, this
@@ -431,7 +432,14 @@ pub fn shell_arg(value: &str) -> Option<String> {
     // `~` is safe away from the front: it means home-directory expansion as the
     // first character of a word and nothing at all elsewhere, and every Windows
     // short path is full of it (`C:\Users\RUNNER~1\...`).
-    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=~".contains(c);
+    //
+    // `\` is deliberately *not* in this set, even though the same Windows paths
+    // are full of it too. Bare is the one form a POSIX shell reads the
+    // backslashes in: `C:\Users\RUNNER~1\plan.json` pasted unquoted arrives as
+    // `C:UsersRUNNER~1plan.json`. It was added here to stop Windows paths being
+    // quoted, which had the direction backwards — those are exactly the values
+    // that need the quotes.
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:@+=~".contains(c);
     if !value.is_empty() && !value.starts_with('~') && value.chars().all(bare) {
         return Some(value.to_owned());
     }
@@ -441,7 +449,13 @@ pub fn shell_arg(value: &str) -> Option<String> {
     // same kind, a newline, or a trailing backslash, which would escape the
     // closing quote itself — and a Windows directory path ends with one more
     // often than not.
-    let expands = value.contains(['$', '`', '"', '\n']) || value.ends_with('\\');
+    //
+    // A doubled backslash is refused for the same reason: inside POSIX double
+    // quotes it collapses to a single one, which silently rewrites the leading
+    // pair of a UNC path into a value that is still a valid path, just a
+    // different one.
+    let expands =
+        value.contains(['$', '`', '"', '\n']) || value.ends_with('\\') || value.contains("\\\\");
     // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
     // quote character to wrap them in.
     let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%']);

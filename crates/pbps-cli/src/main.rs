@@ -1500,7 +1500,12 @@ fn cmd_plan(
             return Err(e);
         }
     };
-    let dialect = dialect(project)?;
+    let dialect = output::or_unanswerable(
+        "plan",
+        json,
+        "project.unsupported-dialect",
+        dialect(project),
+    )?;
 
     let mut findings: Vec<output::Finding> = Vec::new();
 
@@ -1688,23 +1693,37 @@ fn cmd_plan(
     // skipped rather than refused, or a project that configures one could never
     // run `plan --check` at all. Either way --check must not start a container
     // or open a connection: it is the read-only file check CI runs.
+    // A rehearsal that could not be *set up* — no docker, a dev database that
+    // does not answer — is unanswerable, distinct from one that ran and found
+    // the plan does not converge (a finding, below). Confusing the two would
+    // tell CI the plan is wrong when the rehearsal never happened.
     let dev_spec = if check {
         None
     } else {
-        dev::spec(project, dev)?
+        output::or_unanswerable(
+            "plan",
+            json,
+            "rehearsal.unavailable",
+            dev::spec(project, dev),
+        )?
     };
     if let Some(spec) = dev_spec {
-        let rehearsal = dev::rehearse(
-            project,
-            &spec,
-            &base.schema,
-            &base.ids,
-            &base.hints,
-            &loaded.schema,
-            &res.ids,
-            &statements(&cs, dialect.as_ref())?,
-            dialect.as_ref(),
-            &loaded.hints,
+        let rehearsal = output::or_unanswerable(
+            "plan",
+            json,
+            "rehearsal.unavailable",
+            dev::rehearse(
+                project,
+                &spec,
+                &base.schema,
+                &base.ids,
+                &base.hints,
+                &loaded.schema,
+                &res.ids,
+                &statements(&cs, dialect.as_ref())?,
+                dialect.as_ref(),
+                &loaded.hints,
+            ),
         )?;
         // Run in both formats. Skipping it in JSON mode made an output-format
         // choice silently disable a validation the project had asked for — a
