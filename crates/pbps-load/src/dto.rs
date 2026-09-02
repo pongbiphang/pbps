@@ -53,11 +53,32 @@ pub struct KindProbe {
 // absent.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+// Each branch pins the kind key's *type* as well as its presence: JSON Schema's
+// `required` is satisfied by an explicit null, and YAML writes `view:` with
+// nothing after it as often as not — which the loader reads as absent.
+//
+// `on:` is part of the same choice, not an independent field. The loader
+// requires it on a trigger and rejects it on everything else, so a schema that
+// left it optional everywhere blessed two documents `pbps validate` refuses: a
+// trigger without a table, and a view with one. The principle this schema is
+// generated for is that it refuses exactly what the loader refuses.
 #[schemars(extend("oneOf" = [
-    serde_json::json!({"required": ["view"], "properties": {"view": {"type": "string"}}}),
-    serde_json::json!({"required": ["procedure"], "properties": {"procedure": {"type": "string"}}}),
-    serde_json::json!({"required": ["function"], "properties": {"function": {"type": "string"}}}),
-    serde_json::json!({"required": ["trigger"], "properties": {"trigger": {"type": "string"}}}),
+    serde_json::json!({
+        "required": ["view"],
+        "properties": {"view": {"type": "string"}, "on": false},
+    }),
+    serde_json::json!({
+        "required": ["procedure"],
+        "properties": {"procedure": {"type": "string"}, "on": false},
+    }),
+    serde_json::json!({
+        "required": ["function"],
+        "properties": {"function": {"type": "string"}, "on": false},
+    }),
+    serde_json::json!({
+        "required": ["trigger", "on"],
+        "properties": {"trigger": {"type": "string"}, "on": {"type": "string"}},
+    }),
 ]))]
 pub struct ModuleDto {
     #[serde(default)]

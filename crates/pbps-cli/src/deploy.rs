@@ -152,6 +152,18 @@ fn managed_modules(
     set
 }
 
+/// The `unmanaged: error` policy, refused.
+///
+/// A distinct type because `verify` has to tell it apart from every other way
+/// its work can fail. The database was reached, the catalog was read, and the
+/// command found something the project's own policy calls a problem — that is
+/// an answer (exit 2, the schema owner's), not a failure to answer (exit 1,
+/// CI's). Folded into the catch-all it came back as `environment.unreachable`
+/// about a database that had just been read successfully.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UnmanagedPolicy(String);
+
 /// Applies the `unmanaged:` policy of SPEC §8.2 to what fell outside the scope.
 fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
@@ -173,12 +185,15 @@ fn report_unmanaged(
             names.len(),
             names.join(", ")
         ),
-        pbps_config::Unmanaged::Error => bail!(
-            "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
-             Declare them (`pbps pull` reverse-generates them) or relax the setting.",
-            names.len(),
-            names.join(", ")
-        ),
+        pbps_config::Unmanaged::Error => {
+            return Err(UnmanagedPolicy(format!(
+                "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
+                 Declare them (`pbps pull` reverse-generates them) or relax the setting.",
+                names.len(),
+                names.join(", ")
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -266,19 +281,22 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // hint nobody can act on into a report about what already happened.
             &pbps_model::Hints::default(),
         );
-        // Handed back rather than turned into an error. The database was
-        // reached and a difference *was* established — the differ simply has
-        // no `Change` for it — so this is drift, not "could not look". Folding
-        // it into the catch-all below labelled it `environment.unreachable`
-        // and exited 1, which wakes whoever owns CI instead of whoever owns
-        // the schema. That split is the whole point of the three exit codes
-        // (SPEC §9.8).
-        let changes = match changes {
-            Ok(c) => c,
-            Err(errs) => return Ok(Err(errs)),
+        // Carried *in* the report, not raised as a separate outcome. The
+        // database was reached and a difference was established — the differ
+        // simply has no `Change` for it — so this is drift, and everything
+        // downstream (findings, the envelope, the `on_drift` hook, exit 2)
+        // must treat it as such. An earlier fix made it exit 2 but returned
+        // early, which skipped the hook: right verdict, and the alert that
+        // exists to carry that verdict never fired.
+        let (changes, unexpressible) = match changes {
+            Ok(c) => (c, Vec::new()),
+            Err(errs) => (
+                pbps_model::ChangeSet::default(),
+                errs.iter().map(ToString::to_string).collect(),
+            ),
         };
 
-        Ok(Ok(pbps_model::DriftReport {
+        Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
             environment: target.label.clone(),
             checked_at,
@@ -293,37 +311,26 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
             changes,
             unmanaged: scoped.unmanaged,
-        }))
+            unexpressible,
+        })
     }) {
-        Ok(Ok(r)) => r,
-        // Reached, and differing in a way the differ has no `Change` for.
-        // `verify` answered — that is exit 2 and the schema owner's problem,
-        // not exit 1 and CI's. One finding per difference, because the differ
-        // returns one per unexpressible change and the column name in it is
-        // the remedy.
-        Ok(Err(errs)) => {
-            let findings: Vec<crate::output::Finding> = errs
-                .iter()
-                .map(|e| {
-                    crate::output::Finding::error(
-                        "state.drift-unexpressible",
-                        format!("{}: {e}", target.label),
-                    )
-                })
-                .collect();
+        Ok(r) => r,
+        // The project's own policy, refused on a database that was read
+        // successfully. `verify` answered — exit 2 and the schema owner's, not
+        // exit 1 and CI's.
+        Err(e) if e.downcast_ref::<UnmanagedPolicy>().is_some() => {
+            let findings = vec![
+                crate::output::Finding::error(
+                    "state.unmanaged-refused",
+                    format!("{}: {e}", target.label),
+                )
+                .remedy("pbps pull, or relax `unmanaged:` in pbps.yml"),
+            ];
             if json {
                 return crate::output::Report::new("verify", findings, None::<()>).emit_json();
             }
-            eprintln!(
-                "`{}` no longer matches its recorded state, in {} way(s) that cannot even be \
-                 expressed as changes:",
-                target.label,
-                errs.len()
-            );
-            for e in &errs {
-                eprintln!("  {e}");
-            }
-            return Err(crate::Found::new("").into());
+            eprintln!("{e}");
+            return Err(crate::Found::reported().into());
         }
         Err(e) => {
             // Unanswerable: `verify` was asked whether this database still
@@ -359,13 +366,25 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             crate::output::Finding::error(
                 "state.drift",
                 format!(
+                    // Both counted: a difference the differ cannot phrase is
+                    // still a difference, and "0 difference(s)" beside a
+                    // drift verdict reads as a bug in the tool rather than a
+                    // fact about the database.
                     "`{}` no longer matches its recorded state ({} difference(s))",
                     target.label,
-                    report.changes.changes.len()
+                    report.changes.changes.len() + report.unexpressible.len()
                 ),
             )
             .remedy("pbps pull | pbps plan --db … && pbps apply | pbps baseline --reason \"…\""),
         );
+    }
+    // One finding per difference, because the differ returns one per
+    // unexpressible change and the column name in it is the remedy.
+    for e in &report.unexpressible {
+        findings.push(crate::output::Finding::error(
+            "state.drift-unexpressible",
+            format!("{}: {e}", target.label),
+        ));
     }
     for table in &report.unmanaged {
         findings.push(crate::output::Finding::note(

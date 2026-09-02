@@ -286,6 +286,17 @@ pub fn drift(r: &DriftReport) -> String {
     }
 
     out.push_str("\nDRIFT: the database no longer matches its recorded state.\n");
+    if !r.unexpressible.is_empty() {
+        // First, because these are the ones no workflow can resolve: `pull`
+        // cannot express them either, so the reader has to act by hand.
+        out.push_str(&format!(
+            "\n  {} difference(s) that cannot even be expressed as changes:\n",
+            r.unexpressible.len()
+        ));
+        for e in &r.unexpressible {
+            out.push_str(&format!("    {e}\n"));
+        }
+    }
     if !r.changes.is_empty() {
         out.push_str("\n  Differences found (recorded state -> database as it is now):\n");
         // The plan's own vocabulary, indented, minus its `--allow` advice: a

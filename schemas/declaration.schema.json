@@ -340,7 +340,8 @@
           "properties": {
             "view": {
               "type": "string"
-            }
+            },
+            "on": false
           },
           "required": [
             "view"
@@ -350,7 +351,8 @@
           "properties": {
             "procedure": {
               "type": "string"
-            }
+            },
+            "on": false
           },
           "required": [
             "procedure"
@@ -360,7 +362,8 @@
           "properties": {
             "function": {
               "type": "string"
-            }
+            },
+            "on": false
           },
           "required": [
             "function"
@@ -370,10 +373,14 @@
           "properties": {
             "trigger": {
               "type": "string"
+            },
+            "on": {
+              "type": "string"
             }
           },
           "required": [
-            "trigger"
+            "trigger",
+            "on"
           ]
         }
       ]

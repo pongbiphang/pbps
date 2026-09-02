@@ -2212,7 +2212,7 @@ fn the_module_schema_demands_exactly_one_kind() {
     let branches = v["$defs"]["ModuleDto"]["oneOf"].as_array().unwrap();
 
     assert_eq!(branches.len(), 4, "{v}");
-    for kind in ["view", "procedure", "function", "trigger"] {
+    for kind in ["view", "procedure", "function"] {
         let branch = branches
             .iter()
             .find(|b| b["required"] == serde_json::json!([kind]))
@@ -2221,7 +2221,26 @@ fn the_module_schema_demands_exactly_one_kind() {
         // by an explicit null, which YAML writes as often as not (`view:` with
         // nothing after it), and the loader reads that as absent.
         assert_eq!(branch["properties"][kind]["type"], "string", "{branch}");
+        // `on:` names the table a trigger fires on, and the loader rejects it
+        // on everything else. Left optional here, the published schema blessed
+        // a view with one — a document `pbps validate` refuses.
+        assert_eq!(
+            branch["properties"]["on"],
+            serde_json::json!(false),
+            "{branch}"
+        );
     }
+    // And the trigger branch requires it, which the loader also does: a trigger
+    // that does not say which table it is on is refused.
+    let trigger = branches
+        .iter()
+        .find(|b| b["required"] == serde_json::json!(["trigger", "on"]))
+        .unwrap_or_else(|| panic!("no trigger branch requiring `on`: {v}"));
+    assert_eq!(
+        trigger["properties"]["trigger"]["type"], "string",
+        "{trigger}"
+    );
+    assert_eq!(trigger["properties"]["on"]["type"], "string", "{trigger}");
 }
 
 // ---- Second review round ----
@@ -3671,12 +3690,41 @@ fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
         "reached and differing is exit 2, not 1: {v}"
     );
     assert_eq!(v["result"], "findings", "{v}");
-    assert_eq!(v["findings"][0]["id"], "state.drift-unexpressible", "{v}");
+    // By id, not by position: the report now also carries the ordinary drift
+    // summary, and asserting `findings[0]` would break on an unrelated change
+    // to their order.
+    let unexpressible = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift-unexpressible")
+        .unwrap_or_else(|| panic!("no unexpressible finding: {v}"));
     assert!(
-        v["findings"][0]["message"]
+        unexpressible["message"]
             .as_str()
             .is_some_and(|m| m.contains("IDENTITY")),
         "the message must name what differs: {v}"
+    );
+    // It reaches the *report*, which is what the `on_drift` hook receives —
+    // the whole point of carrying it there rather than on a parallel path.
+    assert_eq!(
+        v["data"]["unexpressible"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    // And the summary counts it. "0 difference(s)" beside a drift verdict
+    // reads as a bug in the tool rather than a fact about the database.
+    let summary = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift")
+        .unwrap_or_else(|| panic!("no drift summary: {v}"));
+    assert!(
+        summary["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("1 difference")),
+        "{summary}"
     );
 }
 

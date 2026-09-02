@@ -258,7 +258,13 @@ Phase 3 additions worth knowing before touching them:
     path.** A check that passed while another pipeline was mid-apply was
     answered about a moving database; a lock left behind blocks the pipeline
     that would fix it.
-25. **`verify` exits 2 on drift**, distinct from 1 for a tool failure: a
+25. **`verify` exits 2 on drift**, and drift includes what the differ cannot
+    phrase: `DriftReport.unexpressible` carries those, so the findings, the
+    envelope and the **`on_drift` hook** all see them. A parallel path for them
+    exited 2 correctly and skipped the hook, which is the one thing a scheduled
+    drift-watch exists for. `unmanaged: error` is the same shape: the database
+    was read successfully and the project's own policy refused it, so it is a
+    finding (exit 2), not `environment.unreachable` (exit 1). Distinct from 1 for a tool failure: a
     scheduled drift-watch wakes different people for each. `status` always
     exits 0 — it is a report, and one unreachable environment must not cost
     the operator the other five lines.
