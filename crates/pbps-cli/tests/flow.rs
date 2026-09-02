@@ -2224,11 +2224,17 @@ fn the_module_schema_demands_exactly_one_kind() {
         // `on:` names the table a trigger fires on, and the loader rejects it
         // on everything else. Left optional here, the published schema blessed
         // a view with one — a document `pbps validate` refuses.
-        assert_eq!(
-            branch["properties"]["on"],
-            serde_json::json!(false),
-            "{branch}"
-        );
+        assert_eq!(branch["properties"]["on"]["type"], "null", "{branch}");
+        // And the other three kind keys, or `oneOf` stops doing the work it was
+        // chosen for: with only `on:` constrained, `trigger` + `on` + `view`
+        // was disqualified from this branch and unconstrained in the trigger
+        // one, so it matched exactly one branch and was blessed.
+        for other in ["view", "procedure", "function", "trigger"] {
+            if other == kind {
+                continue;
+            }
+            assert_eq!(branch["properties"][other]["type"], "null", "{branch}");
+        }
     }
     // And the trigger branch requires it, which the loader also does: a trigger
     // that does not say which table it is on is refused.
@@ -2241,6 +2247,56 @@ fn the_module_schema_demands_exactly_one_kind() {
         "{trigger}"
     );
     assert_eq!(trigger["properties"]["on"]["type"], "string", "{trigger}");
+    for other in ["view", "procedure", "function"] {
+        assert_eq!(trigger["properties"][other]["type"], "null", "{trigger}");
+    }
+}
+
+/// The hole the `on:` constraint opened, and the reason every branch has to
+/// name the other kinds: `trigger` + `on` + `view` is disqualified from the
+/// view branch by `on`, so with the trigger branch saying nothing about `view`
+/// it matched exactly one branch — which is what `oneOf` calls valid.
+/// `convert_module` refuses it, so an editor was blessing a file `pbps
+/// validate` rejects.
+#[test]
+fn the_module_schema_refuses_a_second_kind_beside_a_trigger() {
+    let d = Demo::new("modulekinds");
+    d.table(ONE_COLUMN);
+
+    for body in [
+        "trigger: dbo.tr\non: dbo.t\nview: dbo.v\ndefinition: |-\n  AFTER INSERT AS SELECT 1\n",
+        "view: dbo.v\ntrigger: dbo.tr\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    ] {
+        d.module("dbo.two.yml", body);
+        let o = d.run(&["validate"]);
+        assert_eq!(code(&o), 2, "{body}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("2 objects at once"),
+            "{body}: {}",
+            stderr(&o)
+        );
+    }
+}
+
+/// The other direction, and why the exclusions are `{"type": "null"}` rather
+/// than `false`: YAML writes `procedure:` with nothing after it, serde reads
+/// that as absent, and the loader accepts the file. `false` would have made the
+/// schema stricter than the tool — a smaller failure than blessing what the
+/// tool refuses, but the same disagreement.
+#[test]
+fn an_empty_kind_key_is_absent_to_both_the_loader_and_the_schema() {
+    let d = Demo::new("modulenullkey");
+    d.table(ONE_COLUMN);
+
+    for body in [
+        "view: dbo.v\nprocedure:\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        "view: dbo.v\non:\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        "trigger: dbo.tr\non: dbo.t\nview:\ndefinition: |-\n  AFTER INSERT AS SELECT 1\n",
+    ] {
+        d.module("dbo.one.yml", body);
+        let o = d.run(&["validate"]);
+        assert_eq!(code(&o), 0, "{body}: {}", stderr(&o));
+    }
 }
 
 // ---- Second review round ----
@@ -3969,13 +4025,11 @@ fn the_config_schema_demands_exactly_one_dev_backend() {
         // by an explicit null, which YAML writes as `docker:` with nothing
         // after it, and serde reads that as absent.
         assert_eq!(branch["properties"][key]["type"], "string", "{branch}");
-        // And the other key is forbidden, not merely unrequired: `required`
-        // alone accepts a block naming both, which `dev::spec` refuses.
-        assert_eq!(
-            branch["properties"][other],
-            serde_json::json!(false),
-            "{branch}"
-        );
+        // And the other key is constrained, not merely unrequired: `required`
+        // alone accepts a block naming both, which `dev::spec` refuses. Pinned
+        // to null rather than `false` for the reason the module branches are:
+        // `url_env:` written empty is absent to serde, so the block resolves.
+        assert_eq!(branch["properties"][other]["type"], "null", "{branch}");
     }
 }
 
@@ -3999,4 +4053,207 @@ fn a_dev_block_naming_neither_or_both_backends_is_refused() {
             .unwrap_or_else(|e| panic!("{name}: stdout was not JSON ({e}): {}", stdout(&o)));
         assert_eq!(v["findings"][0]["id"], "rehearsal.unavailable", "{v}");
     }
+}
+
+// ---- Twenty-seventh review round ----
+
+/// A lock held over an empty ledger is exactly what a *first* `bootstrap` looks
+/// like while it runs: `state::lock` calls `ensure_tables`, so both tables
+/// exist before anything records a snapshot. `status` returned at
+/// "uninitialized" without reading the lock, so an apply in flight — and the
+/// stale lock an interrupted first bootstrap leaves behind — were invisible in
+/// the human view and the JSON alike.
+///
+/// Set up with the tool's own functions rather than a copy of the DDL: no flag
+/// produces this state, and a hand-written `INSERT` would pin the test to a
+/// ledger shape the tool is free to change.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_reports_a_lock_held_over_an_empty_ledger() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statuslock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_LOCK_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        // Whatever an earlier test left: this asserts about an *empty* ledger.
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-interrupted-bootstrap")
+            .await
+            .expect("take the lock");
+        // The premise, stated rather than assumed: the ledger really is empty
+        // while the lock is really held. If `lock` ever stopped creating the
+        // tables this test would be exercising nothing.
+        assert!(
+            matches!(pbps_mssql::state::latest(&mut conn).await, Ok(None)),
+            "the ledger should exist and be empty"
+        );
+        assert!(
+            pbps_mssql::state::lock_holder(&mut conn)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    let human = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = pbps_mssql::state::unlock(&mut conn).await;
+        let _ = conn
+            .execute("DROP TABLE dbo.__pbps_state; DROP TABLE dbo.__pbps_lock;")
+            .await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    // Still uninitialized — that half was never wrong.
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(
+        v["data"][0]["locked_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("the-interrupted-bootstrap")),
+        "the lock is missing from the row: {v}"
+    );
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "a consumer keying off findings alone is told nothing: {v}"
+    );
+    // And the human view, which is where an operator actually reads it.
+    assert!(
+        stdout(&human).contains("locked by the-interrupted-bootstrap"),
+        "{}",
+        stdout(&human)
+    );
+}
+
+/// One difference the differ cannot phrase must not delete the ones it can.
+/// `pbps_diff::diff` accumulates every change it can express and only then
+/// returns `Err(errs)`, so `verify` — which reports rather than approves — was
+/// throwing that work away: the count, the human report and the `on_drift`
+/// hook's payload all lost the expressible drift beside an altered `IDENTITY`.
+///
+/// Live, because only a real engine produces an `IDENTITY` no `ALTER` can
+/// change.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let sqlcmd = |query: &str| {
+        std::process::Command::new("docker")
+            .args([
+                "exec",
+                "pbps-test-mssql",
+                "/opt/mssql-tools18/bin/sqlcmd",
+                "-C",
+                "-S",
+                "localhost",
+                "-U",
+                "sa",
+                "-P",
+                "Pbps!Test12345",
+                "-Q",
+                query,
+            ])
+            .output()
+    };
+
+    let d = Demo::new("verifyboth");
+    d.table("table: dbo.both_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let made = sqlcmd(
+        "IF OBJECT_ID(N'dbo.both_drift', N'U') IS NOT NULL DROP TABLE dbo.both_drift; \
+         CREATE TABLE dbo.both_drift (id bigint IDENTITY(1,1) NOT NULL);",
+    );
+    if made.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+    assert_eq!(
+        code(&d.run(&["snapshot", "--db", &connection, "--force"])),
+        0
+    );
+    // Two differences at once: the IDENTITY is gone (no `Change` exists for
+    // that) and a column has been added by hand (one does).
+    let _ = sqlcmd(
+        "DROP TABLE dbo.both_drift; \
+         CREATE TABLE dbo.both_drift (id bigint NOT NULL, note nvarchar(50) NULL);",
+    );
+
+    let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let _ = sqlcmd("DROP TABLE dbo.both_drift;");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(code(&o), FINDING, "{v}");
+    assert_eq!(
+        v["data"]["unexpressible"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    // The half that used to vanish. It is what the `on_drift` hook receives,
+    // so a missing entry here is an alert that understates the damage.
+    assert_eq!(
+        v["data"]["changes"]["changes"].as_array().map(Vec::len),
+        Some(1),
+        "the expressible drift was dropped: {v}"
+    );
+    let summary = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift")
+        .unwrap_or_else(|| panic!("no drift summary: {v}"));
+    assert!(
+        summary["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("2 difference")),
+        "both halves have to be counted: {summary}"
+    );
 }

@@ -62,22 +62,53 @@ pub struct KindProbe {
 // left it optional everywhere blessed two documents `pbps validate` refuses: a
 // trigger without a table, and a view with one. The principle this schema is
 // generated for is that it refuses exactly what the loader refuses.
+//
+// Every branch pins the other three kind keys — and `on:` — to null, rather
+// than leaving them unconstrained. `oneOf` means *exactly one* branch matches,
+// so before the `on:` rule existed a two-kind document matched two branches and
+// was refused for free. Adding `on: false` broke that: `trigger` + `on` +
+// `view` was disqualified from the view branch by `on` and unconstrained in the
+// trigger branch, so it matched exactly one and the schema blessed a file
+// `convert_module` refuses. The exclusions have to be written out.
+//
+// `{"type": "null"}` rather than `false`, because that is the loader's own rule:
+// a key counts as present only when it holds a string, and YAML writes
+// `procedure:` with nothing after it — which serde reads as absent. `false`
+// would refuse that line, making the schema stricter than the tool, which is a
+// smaller failure than blessing what the tool refuses but a failure all the
+// same.
 #[schemars(extend("oneOf" = [
     serde_json::json!({
         "required": ["view"],
-        "properties": {"view": {"type": "string"}, "on": false},
+        "properties": {
+            "view": {"type": "string"},
+            "procedure": {"type": "null"}, "function": {"type": "null"},
+            "trigger": {"type": "null"}, "on": {"type": "null"},
+        },
     }),
     serde_json::json!({
         "required": ["procedure"],
-        "properties": {"procedure": {"type": "string"}, "on": false},
+        "properties": {
+            "procedure": {"type": "string"},
+            "view": {"type": "null"}, "function": {"type": "null"},
+            "trigger": {"type": "null"}, "on": {"type": "null"},
+        },
     }),
     serde_json::json!({
         "required": ["function"],
-        "properties": {"function": {"type": "string"}, "on": false},
+        "properties": {
+            "function": {"type": "string"},
+            "view": {"type": "null"}, "procedure": {"type": "null"},
+            "trigger": {"type": "null"}, "on": {"type": "null"},
+        },
     }),
     serde_json::json!({
         "required": ["trigger", "on"],
-        "properties": {"trigger": {"type": "string"}, "on": {"type": "string"}},
+        "properties": {
+            "trigger": {"type": "string"}, "on": {"type": "string"},
+            "view": {"type": "null"}, "procedure": {"type": "null"},
+            "function": {"type": "null"},
+        },
     }),
 ]))]
 pub struct ModuleDto {

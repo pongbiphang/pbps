@@ -131,7 +131,9 @@
             "docker": {
               "type": "string"
             },
-            "url_env": false
+            "url_env": {
+              "type": "null"
+            }
           },
           "required": [
             "docker"
@@ -142,7 +144,9 @@
             "url_env": {
               "type": "string"
             },
-            "docker": false
+            "docker": {
+              "type": "null"
+            }
           },
           "required": [
             "url_env"

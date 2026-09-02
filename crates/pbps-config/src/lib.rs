@@ -166,16 +166,24 @@ pub struct Hooks {
 // these types is supposed to prevent (the same reasoning as the module
 // declaration's `oneOf`).
 //
-// Each branch pins the other key to `false` rather than merely requiring its
-// own: `required` alone would accept a file naming both.
+// Each branch constrains the other key rather than merely requiring its own:
+// `required` alone would accept a file naming both.
+//
+// Pinned to null rather than to `false`, because that is `dev::spec`'s own
+// rule. It reads the two fields after serde, and YAML writes `url_env:` with
+// nothing after it — which serde reports as absent, so a block with a real
+// `docker:` beside an empty `url_env:` resolves perfectly well. `false` would
+// refuse that line: stricter than the tool rather than looser, but still a
+// disagreement, and the same one that had to be fixed in the module schema's
+// branches.
 #[schemars(extend("oneOf" = [
     serde_json::json!({
         "required": ["docker"],
-        "properties": {"docker": {"type": "string"}, "url_env": false},
+        "properties": {"docker": {"type": "string"}, "url_env": {"type": "null"}},
     }),
     serde_json::json!({
         "required": ["url_env"],
-        "properties": {"url_env": {"type": "string"}, "docker": false},
+        "properties": {"url_env": {"type": "string"}, "docker": {"type": "null"}},
     }),
 ]))]
 pub struct Dev {

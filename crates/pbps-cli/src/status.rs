@@ -159,6 +159,27 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The lock, as the two row fields carry it: who holds it, or why that could
+/// not be determined.
+///
+/// `.ok().flatten()` here read an unreadable lock as no lock, which is the same
+/// mistake this branch corrected in `doctor` and then in `explain`. Kept apart
+/// from `state` on purpose: the ledger answered, so the row is still worth
+/// printing — what is undetermined is only the lock.
+///
+/// A function rather than two copies of the match, because it is now asked at
+/// two points in `one` and the copies would have to stay identical about which
+/// of the two failure readings is the safe one.
+async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
+    match pbps_mssql::state::lock_holder(conn).await {
+        Ok(held) => (
+            held.map(|l| format!("{} since {}", l.locked_by, l.locked_at)),
+            None,
+        ),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
 async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     let mut conn = match Conn::connect(connection).await {
         Ok(c) => c,
@@ -167,14 +188,28 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
 
     let entry = match pbps_mssql::state::latest(&mut conn).await {
         Ok(Some(entry)) => entry,
+        // The ledger exists and is empty, which is exactly what a *first*
+        // `bootstrap` looks like while it runs: `state::lock` calls
+        // `ensure_tables` before anything records a snapshot, so the lock is
+        // taken and the ledger is still empty. Returning here without reading
+        // it reported "uninitialized" and nothing else — hiding both the apply
+        // in flight and the stale lock an interrupted first bootstrap leaves
+        // behind, in the human view and the JSON alike.
         Ok(None) => {
-            return EnvStatus::failed(
+            let mut row = EnvStatus::failed(
                 name,
                 "uninitialized",
                 "the ledger exists but has no entries".to_owned(),
                 checked_at,
             );
+            (row.locked_by, row.lock_unknown) = read_lock(&mut conn).await;
+            return row;
         }
+        // Not here, though: `NotInitialized` means `dbo.__pbps_state` is
+        // absent, and nothing can have taken a lock without `ensure_tables`
+        // creating that table first. Asking anyway would query a lock table
+        // that does not exist and report `lock-unknown` on every environment
+        // pbps has never deployed to — a warning about the ordinary case.
         Err(pbps_db::LedgerError::NotInitialized) => {
             return EnvStatus::failed(
                 name,
@@ -186,17 +221,7 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
     };
 
-    // `.ok().flatten()` here read an unreadable lock as no lock, which is the
-    // same mistake this branch corrected in `doctor` and then in `explain`.
-    // Kept apart from `state` on purpose: the ledger answered, so the row is
-    // still worth printing — what is undetermined is only the lock.
-    let (locked_by, lock_unknown) = match pbps_mssql::state::lock_holder(&mut conn).await {
-        Ok(held) => (
-            held.map(|l| format!("{} since {}", l.locked_by, l.locked_at)),
-            None,
-        ),
-        Err(e) => (None, Some(e.to_string())),
-    };
+    let (locked_by, lock_unknown) = read_lock(&mut conn).await;
 
     let recorded_ids = entry.snapshot.ids.clone();
     let mut row = EnvStatus {

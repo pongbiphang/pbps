@@ -266,7 +266,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // needs to catch, would be exactly what it missed.
         let observed = pbps_diff::observed_ids(&scoped.schema, &recorded_ids);
 
-        let changes = pbps_diff::diff(
+        // `diff_partial`, not `diff`: a drift report wants both halves. The
+        // `Result` form returns only the errors, and taking that branch meant
+        // one table's altered `IDENTITY` silently deleted every expressible
+        // difference the same comparison had found — an undercount in the
+        // report, in the finding count, and in the hook's payload.
+        let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &baseline.snapshot.schema,
                 ids: &recorded_ids,
@@ -288,13 +293,8 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // must treat it as such. An earlier fix made it exit 2 but returned
         // early, which skipped the hook: right verdict, and the alert that
         // exists to carry that verdict never fired.
-        let (changes, unexpressible) = match changes {
-            Ok(c) => (c, Vec::new()),
-            Err(errs) => (
-                pbps_model::ChangeSet::default(),
-                errs.iter().map(ToString::to_string).collect(),
-            ),
-        };
+        let changes = diffed.changes;
+        let unexpressible: Vec<String> = diffed.errors.iter().map(ToString::to_string).collect();
 
         Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,

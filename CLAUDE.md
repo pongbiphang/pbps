@@ -384,7 +384,12 @@ Phase 3.1 additions worth knowing before touching them:
     `pbps schema --kind <k> --out schemas/<file>`. Where a *semantic* rule
     outlives the derive's shape, it is stated as a `oneOf`: a module declares
     exactly one kind (and `on:` only on a trigger), and `dev:` names exactly one
-    backend. Both were blessing documents the tool then refuses.
+    backend. Both were blessing documents the tool then refuses. **Every branch
+    must exclude every key the others require**, and with `{"type": "null"}`
+    rather than `false`: `oneOf` means *exactly one* branch matches, so a branch
+    that constrains only its own key lets a two-kind document through the moment
+    another branch is disqualified for an unrelated reason — and `false` would
+    refuse `procedure:` written empty, which serde reads as absent.
 42. **`db::git_sha` takes the project root.** It used to run git in the
     process's working directory, so `--project` elsewhere stamped plans and
     ledger entries with a commit from an unrelated repository.
@@ -395,6 +400,17 @@ Phase 3.1 additions worth knowing before touching them:
     they reach the JSON envelope — the `--dev` half used to be a `bail!` after
     the writes, and the `--out` half was reached whenever the ids file happened
     to be current.
+44. **A drift report keeps both halves.** `diff` returns `Err(errs)` and throws
+    away the changes it *had* expressed; `diff_partial` returns both, and
+    `verify` uses it. `plan` keeps the `Result`: a plan that cannot express
+    every difference must not be applied at all, and that is the one place the
+    two callers differ.
+45. **`status` reads the lock even when the ledger is empty.** `state::lock`
+    calls `ensure_tables`, so a lock held over an empty ledger is what a *first*
+    `bootstrap` looks like while it runs — and what an interrupted one leaves
+    behind. Not in the `NotInitialized` branch, though: `dbo.__pbps_state` being
+    absent means nothing ever took a lock, and asking anyway would report
+    `lock-unknown` on every environment pbps has never deployed to.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

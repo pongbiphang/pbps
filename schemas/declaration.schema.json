@@ -341,7 +341,18 @@
             "view": {
               "type": "string"
             },
-            "on": false
+            "procedure": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            }
           },
           "required": [
             "view"
@@ -352,7 +363,18 @@
             "procedure": {
               "type": "string"
             },
-            "on": false
+            "view": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            }
           },
           "required": [
             "procedure"
@@ -363,7 +385,18 @@
             "function": {
               "type": "string"
             },
-            "on": false
+            "view": {
+              "type": "null"
+            },
+            "procedure": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            }
           },
           "required": [
             "function"
@@ -376,6 +409,15 @@
             },
             "on": {
               "type": "string"
+            },
+            "view": {
+              "type": "null"
+            },
+            "procedure": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
             }
           },
           "required": [

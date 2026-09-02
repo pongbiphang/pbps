@@ -61,6 +61,33 @@ pub fn diff(
     dialect: &dyn Dialect,
     hints: &Hints,
 ) -> Result<ChangeSet, Vec<DiffError>> {
+    let d = diff_partial(base, declared, dialect, hints);
+    if d.errors.is_empty() {
+        Ok(d.changes)
+    } else {
+        Err(d.errors)
+    }
+}
+
+/// Everything [`diff`] found, with the differences it could not express kept
+/// *beside* the ones it could rather than replacing them.
+///
+/// # Why both, and why only `verify` wants them
+///
+/// The two callers ask different questions. `plan` asks "may this be applied",
+/// and one difference the emitter has no statement for makes the answer no —
+/// a partial plan is worse than none, so it takes the `Result`.
+///
+/// `verify` asks "what is different", and that is a report. Dropping the
+/// expressible changes on the floor because *another* table had an altered
+/// `IDENTITY` undercounted the drift, and sent the `on_drift` hook a payload
+/// missing differences the differ had already phrased perfectly well.
+pub fn diff_partial(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
 
@@ -147,10 +174,10 @@ pub fn diff(
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
 
-    if !errs.is_empty() {
-        return Err(errs);
-    }
-
+    // The ordering and risk pass below runs whether or not there are errors:
+    // it is pure computation over the changes already built, and a caller that
+    // is going to *report* the partial set needs it sorted and classified
+    // exactly as a plan would be.
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
         if let Change::AlterColumnType { from, to, .. } = &p.change
@@ -189,7 +216,22 @@ pub fn diff(
             format!("{:?}", p.change),
         )
     });
-    Ok(ChangeSet { changes: planned })
+    Diffed {
+        changes: ChangeSet { changes: planned },
+        errors: errs,
+    }
+}
+
+/// What one comparison produced: the changes the differ could express, and the
+/// differences it could not.
+///
+/// Not a `Result`, deliberately — the two are not alternatives. A comparison
+/// can find both at once, and the type that says so is what stops a caller
+/// discarding one to obtain the other.
+#[derive(Debug, Default)]
+pub struct Diffed {
+    pub changes: ChangeSet,
+    pub errors: Vec<DiffError>,
 }
 
 /// Columns of a surviving table that exist on both sides: compare attributes.
@@ -968,6 +1010,64 @@ mod tests {
             err[0],
             DiffError::IdentityChangeUnsupported { .. }
         ));
+    }
+
+    /// The expressible half of the same comparison survives. `diff` accumulates
+    /// every change it can phrase and only then checks for errors, so returning
+    /// `Err(errs)` threw away work it had already done — and `verify`, whose
+    /// job is to *report* differences rather than approve them, showed only the
+    /// identity error. The nullability drift beside it went missing from the
+    /// count, the human report and the `on_drift` hook's payload alike.
+    #[test]
+    fn an_unexpressible_difference_does_not_hide_the_expressible_ones() {
+        let base = schema_of(
+            "dbo.t",
+            table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+        );
+        let mut identity_changed = Column::new(ty("int"));
+        identity_changed.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        let mut not_null = Column::new(ty("int"));
+        not_null.nullable = false;
+        let want = schema_of("dbo.t", table(&[("a", identity_changed), ("b", not_null)]));
+
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+        let sides = || {
+            (
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &want,
+                    ids: &declared_ids,
+                },
+            )
+        };
+
+        let (b, d) = sides();
+        let partial = diff_partial(b, d, &MinimalDialect, &Hints::default());
+        assert!(matches!(
+            partial.errors.as_slice(),
+            [DiffError::IdentityChangeUnsupported { .. }]
+        ));
+        assert_eq!(
+            kinds(&partial.changes),
+            ["AlterColumnNullability"],
+            "the change the differ could phrase was dropped: {:?}",
+            partial.changes
+        );
+
+        // And `diff` still refuses outright, because a plan that cannot express
+        // every difference must not be applied at all. The two callers ask
+        // different questions and this is the one place that says so.
+        let (b, d) = sides();
+        assert!(diff(b, d, &MinimalDialect, &Hints::default()).is_err());
     }
 
     /// A jump-version deploy: the entire reason uid matching exists.
