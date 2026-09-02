@@ -1377,11 +1377,36 @@ fn cmd_plan(
         may_prompt,
         format,
     } = opts;
-    let loaded = load(project)?;
+    // Decided first. Everything below can fail, and a failure that escaped
+    // before this was decided printed prose to stderr and nothing to stdout —
+    // so a consumer asking for JSON got "pbps produced no output" instead of the
+    // typed `load.*` findings it was owed.
+    let json = format == OutputFormat::Json;
+
+    let loaded = match load_quiet(project) {
+        Ok(l) => l,
+        Err(errs) => {
+            // Unanswerable rather than a finding: `plan`'s question is "what
+            // changes", and with declarations it cannot read it did not answer
+            // that. The parse errors are still the findings — the user needs
+            // them either way — and the exit code is 1 in both formats, as it
+            // was before this branch existed. `validate` is the command whose
+            // question *is* "are these valid", and there they are a finding.
+            if json {
+                let report = output::Report::plain("plan", errs.iter().map(load_finding).collect())
+                    .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for e in &errs {
+                    print_load_error(e);
+                }
+            }
+            bail!("the declarations have {} problem(s)", errs.len());
+        }
+    };
     let ids = read_ids(project)?;
     let dialect = dialect(project)?;
 
-    let json = format == OutputFormat::Json;
     let mut findings: Vec<output::Finding> = Vec::new();
 
     let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
@@ -1573,11 +1598,53 @@ fn cmd_plan(
     } else {
         dev::spec(project, dev)?
     };
+    if let Some(spec) = dev_spec {
+        let rehearsal = dev::rehearse(
+            project,
+            &spec,
+            &base.schema,
+            &base.ids,
+            &base.hints,
+            &loaded.schema,
+            &res.ids,
+            &statements(&cs, dialect.as_ref())?,
+            dialect.as_ref(),
+            &loaded.hints,
+        )?;
+        // Run in both formats. Skipping it in JSON mode made an output-format
+        // choice silently disable a validation the project had asked for — a
+        // plan that does not converge would have come back `result: "ok"`.
+        if json {
+            for d in &rehearsal.structural {
+                findings.push(output::Finding::error(
+                    "rehearsal.does-not-converge",
+                    format!("after applying the plan, the database still differs: {d}"),
+                ));
+            }
+            for d in &rehearsal.spelling {
+                findings.push(
+                    output::Finding::warning(
+                        "rehearsal.spelling",
+                        format!(
+                            "the engine stores this differently, costing one rebuilt constraint \
+                             per apply until the declaration is written in its stored form: {d}"
+                        ),
+                    )
+                    .remedy("rewrite the declaration in the form shown"),
+                );
+            }
+        } else {
+            print!("{}", report::rehearsal(&rehearsal));
+            if !rehearsal.converged() {
+                return Err(Found::new(
+                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                     differences above are what would be left behind",
+                )
+                .into());
+            }
+        }
+    }
+
     if json {
-        // The dev rehearsal is skipped in this mode rather than half-reported:
-        // it prints its own multi-line report and starts a container, neither of
-        // which belongs inside a JSON document. `--check`, which is what CI runs
-        // with `--format json`, already refuses a dev database above.
         let tables: std::collections::BTreeSet<String> = cs
             .changes
             .iter()
@@ -1593,29 +1660,9 @@ fn cmd_plan(
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
             }),
         );
+        // A non-converging rehearsal is an error finding, so `outcome` exits 2
+        // here exactly as `Found` does in the human path.
         return report.emit_json();
-    }
-
-    if let Some(spec) = dev_spec {
-        let rehearsal = dev::rehearse(
-            project,
-            &spec,
-            &base.schema,
-            &base.ids,
-            &base.hints,
-            &loaded.schema,
-            &res.ids,
-            &statements(&cs, dialect.as_ref())?,
-            dialect.as_ref(),
-            &loaded.hints,
-        )?;
-        print!("{}", report::rehearsal(&rehearsal));
-        if !rehearsal.converged() {
-            return Err(Found::new(
-                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                 differences above are what would be left behind",
-            )
-            .into());
-        }
     }
     Ok(())
 }

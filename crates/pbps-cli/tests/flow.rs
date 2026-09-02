@@ -2590,3 +2590,76 @@ fn fmt_on_an_unparseable_file_is_unanswerable_not_a_finding() {
         "{v}"
     );
 }
+
+// ---- Sixth review round ----
+
+/// Everything in `plan` can fail before it reaches the point of serializing,
+/// and a failure that escaped early printed prose to stderr and nothing to
+/// stdout — so a consumer asking for JSON got "pbps produced no output" instead
+/// of the typed findings it was owed.
+#[test]
+fn plan_json_emits_an_envelope_even_when_the_declarations_do_not_load() {
+    let d = Demo::new("planearly");
+    d.table("table: dbo.t\ncolumns: [unclosed\n");
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    // Exit 1 in both formats: `plan`'s question is "what changes", and with
+    // declarations it cannot read it did not answer that. `validate` is the
+    // command whose question *is* validity, and there the same errors are a
+    // finding.
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "load.yaml");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("dbo.t.yml"),
+        "{v}"
+    );
+    // The human format still says the same thing, the same way it always did.
+    assert_eq!(code(&d.run(&["plan", "--check"])), 1);
+}
+
+/// Choosing an output format must not disable a check the project asked for.
+/// With `dev:` configured, JSON mode skipped `dev::rehearse` entirely, so a
+/// plan that does not converge came back `result: "ok"`.
+///
+/// Live, because a rehearsal without an engine is not a rehearsal.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_rehearsal_still_runs_when_the_output_is_json() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("rehearsejson");
+    // A check constraint the engine stores in its own spelling: the difference
+    // only exists once a real engine has written it back.
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "checks:\n",
+        "  ck_pos: \"id > 0\"\n"
+    ));
+
+    let o = d.run(&["plan", "--dev", &connection, "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"rehearsal.spelling"),
+        "the rehearsal must reach the envelope, not be skipped: {v}"
+    );
+    // stdout stays one JSON document: the rehearsal's own multi-line report
+    // would corrupt it.
+    assert!(!stdout(&o).contains("Dev rehearsal:"), "{}", stdout(&o));
+}
