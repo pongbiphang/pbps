@@ -33,9 +33,27 @@ import sys
 LEVEL = {"error": "error", "warning": "warning", "note": "notice"}
 
 
-def escape(value: str) -> str:
-    """GitHub's own escaping for annotation *properties* (not the message)."""
+def escape_data(value: str) -> str:
+    """Escaping for the annotation *message*, after the `::`.
+
+    Mirrors `escapeData` in actions/toolkit.
+    """
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def escape_property(value: str) -> str:
+    r"""Escaping for a *property* value, inside `file=…,line=…`.
+
+    Mirrors `escapeProperty` in actions/toolkit, which escapes two more
+    characters than the message form: `,` separates one property from the next,
+    and `:` ends the property list. Reusing the message escaping here — which is
+    what this script did first — breaks on both, and the second is not exotic:
+    every Windows path starts `C:\`, so `file=C:\Users\...` truncated the
+    property list and the annotation stopped pointing anywhere.
+    """
+    return (
+        escape_data(value).replace(":", "%3A").replace(",", "%2C")
+    )
 
 
 def main() -> int:
@@ -72,16 +90,16 @@ def main() -> int:
     findings = report.get("findings", [])
     for f in findings:
         level = LEVEL.get(f.get("severity", "error"), "error")
-        props = [f"title=pbps {escape(f.get('id', ''))}"]
+        props = [f"title=pbps {escape_property(f.get('id', ''))}"]
         location = f.get("location")
         if location:
-            props.append(f"file={escape(location['file'])}")
+            props.append(f"file={escape_property(location['file'])}")
             if location.get("line"):
                 props.append(f"line={location['line']}")
         message = f.get("message", "")
         if f.get("remedy"):
             message += f"\n\n{f['remedy']}"
-        print(f"::{level} {','.join(props)}::{escape(message)}")
+        print(f"::{level} {','.join(props)}::{escape_data(message)}")
 
     command = report.get("command", "pbps")
     result = report.get("result", "findings")

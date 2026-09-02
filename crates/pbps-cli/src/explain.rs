@@ -89,10 +89,28 @@ pub fn cmd_explain(
     env: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read the plan `{}`", path.display()))?;
-    let plan: SavedPlan = serde_json::from_str(&raw)
-        .with_context(|| format!("`{}` is not a pbps plan", path.display()))?;
+    // Read and checked before anything else, and reported through the envelope
+    // when JSON was asked for: everything below can fail, and a failure that
+    // escaped early left stdout empty — so a consumer got the converter's
+    // generic "produced no output" instead of a report naming the bad plan.
+    let plan = match read_plan(path) {
+        Ok(p) => p,
+        Err(e) => {
+            if json {
+                // Unanswerable, not a finding: `explain` was asked what this
+                // plan does and could not read it, so it did not answer.
+                let report = output::Report::plain(
+                    "explain",
+                    vec![
+                        output::Finding::error("plan.unreadable", format!("{e:#}")).at(path, None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
     // The dialect comes from the *plan*, not from a pbps.yml. That is what lets
     // this command run in a directory that has no project at all — the reviewer
     // may have been handed nothing but the file. It is also more honest where a
@@ -119,6 +137,29 @@ pub fn cmd_explain(
     // one would make the reviewer's own tool look like a failure in their
     // terminal — the gate is `apply --allow`, which is where it belongs.
     Ok(())
+}
+
+/// Reads a plan file, refusing one this binary does not understand.
+///
+/// The version check is `apply`'s (see `deploy::cmd_apply`), made earlier. A
+/// newer plan may carry semantics this build has no idea about, and explaining
+/// it would quietly omit them — showing a reviewer an incomplete account of what
+/// they are approving, and an approval command for an artifact `apply` will
+/// refuse anyway. Better to say which version it is.
+fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read the plan `{}`", path.display()))?;
+    let plan: SavedPlan = serde_json::from_str(&raw)
+        .with_context(|| format!("`{}` is not a pbps plan", path.display()))?;
+    if plan.version != pbps_model::plan::CURRENT_VERSION {
+        anyhow::bail!(
+            "`{}` is a version {} plan and this tool understands version {}",
+            path.display(),
+            plan.version,
+            pbps_model::plan::CURRENT_VERSION
+        );
+    }
+    Ok(plan)
 }
 
 /// The dialect this plan was computed for.

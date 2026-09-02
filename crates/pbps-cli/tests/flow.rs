@@ -2663,3 +2663,61 @@ fn the_rehearsal_still_runs_when_the_output_is_json() {
     // would corrupt it.
     assert!(!stdout(&o).contains("Dev rehearsal:"), "{}", stdout(&o));
 }
+
+// ---- Seventh review round ----
+
+/// `apply` refuses a plan whose version this build does not understand, and
+/// `explain` must refuse it too. A newer plan may carry semantics this binary
+/// has no idea about — explaining it would show a reviewer an incomplete
+/// account of what they are approving, and an approval command for an artifact
+/// `apply` will reject anyway.
+#[test]
+fn explain_refuses_a_plan_version_it_does_not_understand() {
+    let d = Demo::new("planversion");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "future.json", "transactional");
+
+    // The same plan, one version ahead.
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    let bumped = raw.replace("\"version\": 2", "\"version\": 3");
+    assert_ne!(raw, bumped, "the fixture must carry a version to bump");
+    std::fs::write(&plan, bumped).unwrap();
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("version 3"), "{}", stderr(&o));
+    assert!(
+        !stdout(&o).contains("pbps apply"),
+        "a plan this build cannot read must not come with an approval command: {}",
+        stdout(&o)
+    );
+}
+
+/// The one-envelope contract holds for the failures too. A missing or malformed
+/// plan left stdout empty, so the converter reported its own generic "produced
+/// no output" instead of a report naming the bad file.
+#[test]
+fn explain_json_emits_an_envelope_when_the_plan_cannot_be_read() {
+    let d = Demo::new("explainbadplan");
+    d.table(ONE_COLUMN);
+
+    for plan in ["nowhere.json", "junk.json"] {
+        if plan == "junk.json" {
+            std::fs::write(d.dir.join(plan), "{\"nope\": 1}").unwrap();
+        }
+        let path = d.dir.join(plan);
+        let o = d.run(&[
+            "explain",
+            "--plan",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&o), 1, "{plan}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{plan}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "explain");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "plan.unreadable");
+    }
+}
