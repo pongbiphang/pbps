@@ -124,7 +124,31 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "docker": {
+              "type": "string"
+            },
+            "url_env": false
+          },
+          "required": [
+            "docker"
+          ]
+        },
+        {
+          "properties": {
+            "url_env": {
+              "type": "string"
+            },
+            "docker": false
+          },
+          "required": [
+            "url_env"
+          ]
+        }
+      ]
     }
   },
   "x-pbps-schema-version": 1,

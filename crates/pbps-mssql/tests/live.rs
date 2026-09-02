@@ -1148,6 +1148,59 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         "a grant on the ledger objects alone was reported as missing: {gaps:?}"
     );
 
+    // Half a ledger: one table dropped by hand, the other still carrying its
+    // object grants. The scope has to be chosen per table — object where the
+    // table is, schema where it is not — because the grant that will cover the
+    // one `ensure_tables` is about to recreate can only be the schema's. Asking
+    // once for the pair let this account pass readiness and then be denied on
+    // the state read, so it is checked against a real server.
+    db.conn
+        .execute(&format!("USE [{0}]; DROP TABLE dbo.__pbps_state;", db.name))
+        .await
+        .expect("drop the state table");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()])
+        .await
+        .expect("read permissions");
+    assert_eq!(
+        held.ledger_objects.len(),
+        1,
+        "the premise: exactly one ledger table survives: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    // INSERT and DELETE only: this login still holds `SELECT ON SCHEMA::dbo`
+    // from the top of the test, so the ledger read is genuinely satisfied and
+    // reporting it would be the over-demand, not the fix. The unit test covers
+    // all three by clearing the schema grants outright.
+    for permission in ["INSERT", "DELETE"] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+            "{permission} for the table still to be created was not asked for: {gaps:?}"
+        );
+    }
+    // The surviving table is still answered where its grant actually sits, or
+    // the account would be told to re-grant what it already holds.
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+        "{gaps:?}"
+    );
+
+    // Restored for the checks below: recreating the table also drops the object
+    // grants that were on the old one.
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("recreate the ledger");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_state TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("re-grant on the recreated state table");
+
     // And once the ledger exists, the creation permission is spent: writing rows
     // needs INSERT and DELETE, not ALTER. Asked as a project that manages `app`
     // rather than `dbo` — with `dbo` managed, ALTER there is required for the

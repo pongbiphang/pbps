@@ -3866,3 +3866,137 @@ fn plan_json_emits_an_envelope_when_the_flags_contradict() {
         assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
     }
 }
+
+// ---- Twenty-sixth review round ----
+
+/// `--check` is the read-only file check CI runs, and "read-only" has to hold
+/// for the artifact flags too. With a current identity file the command fell
+/// through to the unconditional `--out` / `--sql` writes, so a job that meant
+/// to check wrote a plan and a script — and a later reviewer had an artifact no
+/// deployment ever produced.
+///
+/// Refused rather than skipped: silently not writing leaves the previous run's
+/// file on disk, and the job then reviews a stale one instead of none.
+#[test]
+fn check_mode_refuses_the_flags_that_would_write_a_file() {
+    let d = Demo::new("checkwrites");
+    d.table(ONE_COLUMN);
+    // Planned and committed first, so the identity file is current: that is the
+    // state in which the writes used to be reached.
+    d.run(&["plan"]);
+    d.commit();
+
+    for flag in ["--out", "--sql"] {
+        let path = d
+            .dir
+            .join(format!("artifact{}", flag.trim_start_matches('-')));
+        let o = d.run(&["plan", "--check", flag, path.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{flag}: {}", stderr(&o));
+        assert!(stderr(&o).contains("--check"), "{flag}: {}", stderr(&o));
+        assert!(!path.exists(), "{flag} wrote {} anyway", path.display());
+    }
+}
+
+/// The same three refusals through `--format json`. The `--dev` half used to be
+/// a `bail!` deep inside the command, after the artifact writes, so a consumer
+/// asking for JSON got an empty stdout and the converter's generic "no output"
+/// — which names no flag and so cannot be acted on.
+#[test]
+fn check_mode_refusals_reach_the_json_envelope() {
+    let d = Demo::new("checkwritesjson");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    let artifact = d.dir.join("artifact.json");
+    for args in [
+        vec!["plan", "--check", "--dev", "docker://mssql"],
+        vec!["plan", "--check", "--out", artifact.to_str().unwrap()],
+        vec!["plan", "--check", "--sql", artifact.to_str().unwrap()],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "json"]);
+        let o = d.run(&argv);
+        assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+        assert!(!artifact.exists(), "{args:?} wrote the artifact anyway");
+    }
+}
+
+/// The negative case the refusals must not have swallowed: without `--check`,
+/// both artifact flags still produce their files.
+#[test]
+fn the_artifact_flags_still_write_without_check() {
+    let d = Demo::new("artifactswrite");
+    d.table(ONE_COLUMN);
+
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let o = d.run(&[
+        "plan",
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(plan.is_file(), "no {}", plan.display());
+    assert!(sql.is_file(), "no {}", sql.display());
+}
+
+/// The config schema's justification is the declaration schema's: it accepts
+/// exactly what the tool accepts. `dev::spec` requires exactly one backend and
+/// refuses both `dev: {}` and a block naming two, so a schema that left the
+/// derive's shape alone blessed a pbps.yml no `plan` can run.
+#[test]
+fn the_config_schema_demands_exactly_one_dev_backend() {
+    let d = Demo::new("devschema");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["schema", "--kind", "config"]))).unwrap();
+    let branches = v["$defs"]["Dev"]["oneOf"].as_array().unwrap();
+
+    assert_eq!(branches.len(), 2, "{v}");
+    for (key, other) in [("docker", "url_env"), ("url_env", "docker")] {
+        let branch = branches
+            .iter()
+            .find(|b| b["required"] == serde_json::json!([key]))
+            .unwrap_or_else(|| panic!("no branch for {key}: {v}"));
+        // The type is pinned as well as the presence: `required` is satisfied
+        // by an explicit null, which YAML writes as `docker:` with nothing
+        // after it, and serde reads that as absent.
+        assert_eq!(branch["properties"][key]["type"], "string", "{branch}");
+        // And the other key is forbidden, not merely unrequired: `required`
+        // alone accepts a block naming both, which `dev::spec` refuses.
+        assert_eq!(
+            branch["properties"][other],
+            serde_json::json!(false),
+            "{branch}"
+        );
+    }
+}
+
+/// The other half of that property, from the tool's side: the two shapes the
+/// schema now refuses are the two the CLI refuses. Asserted against a real
+/// `plan`, because a schema pinned only to itself would keep agreeing with a
+/// loader that had changed underneath it.
+#[test]
+fn a_dev_block_naming_neither_or_both_backends_is_refused() {
+    for (name, block) in [
+        ("devneither", "dev: {}\n"),
+        ("devboth", "dev:\n  docker: img\n  url_env: PBPS_DEV_URL\n"),
+    ] {
+        let d = Demo::new(name);
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: mssql\n{block}")).unwrap();
+        d.table(ONE_COLUMN);
+
+        let o = d.run(&["plan", "--format", "json"]);
+        assert_eq!(code(&o), 1, "{name}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{name}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["findings"][0]["id"], "rehearsal.unavailable", "{v}");
+    }
+}

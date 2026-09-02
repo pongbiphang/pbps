@@ -627,6 +627,31 @@ fn run() -> anyhow::Result<()> {
                     "--staged describes how a plan is applied, so it needs the target: pass --db or --env",
                 )?;
             }
+            // `--check` changes nothing and connects to nothing, so it
+            // contradicts every flag that produces an artifact or opens a
+            // connection. All three are refused here, together, for one reason:
+            // the `--dev` half used to be a `bail!` deep inside `cmd_plan`
+            // (after the writes), which left `--format json` with empty stdout,
+            // and the `--out` / `--sql` half was not refused at all — a
+            // supposedly read-only check wrote the files whenever the identity
+            // file happened to be current.
+            //
+            // Refused rather than skipped: silently not writing a file CI asked
+            // for leaves the previous run's plan.sql on disk, and the job then
+            // reviews an artifact no run produced.
+            if check {
+                if dev.is_some() {
+                    refuse(
+                        "--check is the CI file check; it connects to nothing, so it cannot take --dev",
+                    )?;
+                }
+                if out.is_some() {
+                    refuse("--check changes no files, so it cannot take --out")?;
+                }
+                if sql.is_some() {
+                    refuse("--check changes no files, so it cannot take --sql")?;
+                }
+            }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
                 None if since == "HEAD" => baseline::default_source(&project),
@@ -1877,13 +1902,11 @@ fn cmd_plan(
     // The dev database is optional and is asked last: everything above is what
     // a plan produces with no engine in the room, and it must be identical
     // whether or not one is available (SPEC §9.3).
-    if check && dev.is_some() {
-        bail!("--check is the CI file check; it changes nothing and connects to nothing");
-    }
-    // The refusal above is for the flag; the `dev:` block in pbps.yml has to be
-    // skipped rather than refused, or a project that configures one could never
-    // run `plan --check` at all. Either way --check must not start a container
-    // or open a connection: it is the read-only file check CI runs.
+    // `--check --dev` is refused at the flag site, through the envelope. The
+    // `dev:` block in pbps.yml is a different question and has to be *skipped*
+    // rather than refused, or a project that configures one could never run
+    // `plan --check` at all. Either way --check must not start a container or
+    // open a connection: it is the read-only file check CI runs.
     // A rehearsal that could not be *set up* — no docker, a dev database that
     // does not answer — is unanswerable, distinct from one that ran and found
     // the plan does not converge (a finding, below). Confusing the two would

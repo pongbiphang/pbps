@@ -381,10 +381,20 @@ Phase 3.1 additions worth knowing before touching them:
     `deny_unknown_fields` reaches an editor as `additionalProperties: false`.
     A schema that accepted more than the loader would be worse than none. The
     copies in `schemas/` are pinned to the binary by a test; regenerate with
-    `pbps schema --kind <k> --out schemas/<file>`.
+    `pbps schema --kind <k> --out schemas/<file>`. Where a *semantic* rule
+    outlives the derive's shape, it is stated as a `oneOf`: a module declares
+    exactly one kind (and `on:` only on a trigger), and `dev:` names exactly one
+    backend. Both were blessing documents the tool then refuses.
 42. **`db::git_sha` takes the project root.** It used to run git in the
     process's working directory, so `--project` elsewhere stamped plans and
     ledger entries with a commit from an unrelated repository.
+43. **`--check` is read-only in every direction.** It refuses `--dev`, `--out`
+    and `--sql` rather than ignoring them: a CI check that skipped the write
+    would leave the previous run's plan.sql on disk for the job to review. The
+    refusals sit with the other flag validations, before the command runs, so
+    they reach the JSON envelope — the `--dev` half used to be a `bail!` after
+    the writes, and the `--out` half was reached whenever the ids file happened
+    to be current.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

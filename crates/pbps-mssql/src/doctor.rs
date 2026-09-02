@@ -513,24 +513,45 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::LedgerCreation => {}
-            Needed::Ledger if !held.ledger_objects.is_empty() => {
-                for (object, granted) in &held.ledger_objects {
-                    if !granted.contains(r.name) {
+            // The scope is chosen per table, not once for the pair. A table
+            // that exists can only be answered at object scope, because that is
+            // where a careful DBA's grant sits; a table that does not exist yet
+            // has no object to ask about, and the grant that will cover it once
+            // `ensure_tables` creates it is the one on the schema.
+            //
+            // Asking once for the pair — "any object row came back, so use
+            // object scope" — let an account holding object grants on
+            // `__pbps_lock` alone pass readiness. `ensure_tables` then created
+            // `__pbps_state`, and the next state read was denied by a
+            // permission `doctor` had never asked about, at either scope.
+            Needed::Ledger => {
+                // Both tables missing means both fall back to the same schema,
+                // and the operator needs one `GRANT`, not two identical lines
+                // telling them to run it twice.
+                //
+                // Deduplicated against *this* requirement's own gaps rather
+                // than everything reported so far: `SELECT` is in the list
+                // twice on purpose — the probes read managed tables and the
+                // ledger read is two tables in `dbo` — and a project that
+                // manages `dbo` would otherwise have the second one swallowed
+                // by the first, losing the reason it is needed.
+                let mut reported: Vec<Securable> = Vec::new();
+                for table in LEDGER_TABLES {
+                    let (granted, securable) = match held.ledger_objects.get(table) {
+                        Some(granted) => (granted, Securable::Object(table.to_owned())),
+                        None => (
+                            &held.ledger_schema,
+                            Securable::Schema(LEDGER_SCHEMA.to_owned()),
+                        ),
+                    };
+                    if !granted.contains(r.name) && !reported.contains(&securable) {
+                        reported.push(securable.clone());
                         out.push(Gap {
                             permission: r.name,
                             why: r.why,
-                            securable: Securable::Object(object.clone()),
+                            securable,
                         });
                     }
-                }
-            }
-            Needed::Ledger => {
-                if !held.ledger_schema.contains(r.name) {
-                    out.push(Gap {
-                        permission: r.name,
-                        why: r.why,
-                        securable: Securable::Schema(LEDGER_SCHEMA.to_owned()),
-                    });
                 }
             }
         }
@@ -879,6 +900,53 @@ mod tests {
         held.ledger_schema.remove("INSERT");
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+    }
+
+    /// The scope is chosen per ledger table, not once for the pair. An account
+    /// with object grants on `__pbps_lock` alone passed readiness: the surviving
+    /// object made the whole question object-scoped, so the DML `__pbps_state`
+    /// would need once `ensure_tables` recreated it was asked about at neither
+    /// scope — and the next state read was denied by a permission `doctor` had
+    /// reported nothing about.
+    #[test]
+    fn a_half_present_ledger_asks_the_missing_table_at_schema_scope() {
+        let mut held = ledger_granted_on_the_objects_only(&["app"]);
+        held.ledger_objects.remove(pbps_db::ledger::STATE_TABLE);
+        // The creation permission is the other half of this shape and has its
+        // own test; granted here so the gaps below are only the DML ones.
+        held.ledger_schema.insert("ALTER".to_owned());
+
+        let gaps = missing(&held);
+        for permission in ["SELECT", "INSERT", "DELETE"] {
+            assert!(
+                gaps.iter()
+                    .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+                "{permission} on the table still to be created was not asked for: {gaps:?}"
+            );
+        }
+        // And the surviving table is still answered where its grant actually
+        // sits, or the same account would be told to re-grant what it holds.
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+            "{gaps:?}"
+        );
+    }
+
+    /// The other direction, and the reason the fallback is deduplicated: with
+    /// neither table present both fall back to the same schema, and an operator
+    /// needs one `GRANT` line, not the same one twice.
+    #[test]
+    fn a_missing_ledger_reports_each_schema_permission_once() {
+        let mut held = everything(&["dbo"]);
+        assert!(held.ledger_objects.is_empty(), "the premise: no ledger yet");
+        held.ledger_schema.remove("SELECT");
+
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
         assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
     }
 

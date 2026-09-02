@@ -158,6 +158,26 @@ pub struct Hooks {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(deny_unknown_fields)]
+// Both fields are individually optional in Rust because serde has to read the
+// file before it can say which one is present — but `dev::spec` requires
+// **exactly one**, and refuses `dev: {}` and a block naming both. A schema that
+// left the derive's shape alone blessed two pbps.yml files the CLI then cannot
+// run a plan with at all, which is the one thing generating the schema from
+// these types is supposed to prevent (the same reasoning as the module
+// declaration's `oneOf`).
+//
+// Each branch pins the other key to `false` rather than merely requiring its
+// own: `required` alone would accept a file naming both.
+#[schemars(extend("oneOf" = [
+    serde_json::json!({
+        "required": ["docker"],
+        "properties": {"docker": {"type": "string"}, "url_env": false},
+    }),
+    serde_json::json!({
+        "required": ["url_env"],
+        "properties": {"url_env": {"type": "string"}, "docker": false},
+    }),
+]))]
 pub struct Dev {
     /// The name of an environment variable holding a connection string to a
     /// throwaway server — never the string itself, for the reason
