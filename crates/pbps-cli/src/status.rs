@@ -220,10 +220,18 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     // would leave them puzzled at the refusal.
     if let Some(progress) = &entry.snapshot.staged {
         row.state = "staged";
+        // Through `env_arg`, like every other command this tool prints. An
+        // environment name is a YAML map key, so `US West` is a valid one, and
+        // interpolated bare it becomes two arguments — or, with a shell
+        // metacharacter, something that runs. These `detail` strings advertise
+        // commands exactly as the remedies do, and were the one place that
+        // bypassed the helper.
         row.detail = Some(format!(
             "a staged apply stopped after {} of {} statement(s); continue it with \
-             `pbps apply --staged --resume --env {name} --plan ...`",
-            progress.completed, progress.total
+             `pbps apply --staged --resume --env {} --plan ...`",
+            progress.completed,
+            progress.total,
+            crate::report::env_arg(name)
         ));
     }
 
@@ -262,15 +270,17 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
 fn record_drift(row: &mut EnvStatus, entry_id: i64, name: &str) {
     if row.state == "staged" {
         let so_far = row.detail.take().unwrap_or_default();
+        let arg = crate::report::env_arg(name);
         row.detail = Some(format!(
             "{so_far} — and it has moved since that checkpoint, which \
-             `pbps verify --env {name}` will show"
+             `pbps verify --env {arg}` will show"
         ));
         return;
     }
     row.state = "drift";
+    let arg = crate::report::env_arg(name);
     row.detail = Some(format!(
-        "the database no longer matches entry #{entry_id}; run `pbps verify --env {name}`"
+        "the database no longer matches entry #{entry_id}; run `pbps verify --env {arg}`"
     ));
 }
 
@@ -494,6 +504,36 @@ mod tests {
         r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
         let ids: Vec<&str> = findings(&[r]).iter().map(|f| f.id).collect();
         assert_eq!(ids, ["state.drift", "state.locked"]);
+    }
+
+    /// Every command this tool prints is copy-pastable or it is not printed.
+    /// The `detail` strings advertise commands exactly as the remedies do, and
+    /// were the one place that interpolated the environment name bare — so a
+    /// name a shell would split, or one carrying a metacharacter, produced a
+    /// line that does the wrong thing when pasted.
+    #[test]
+    fn a_command_inside_a_detail_quotes_the_environment_like_every_other() {
+        // Only the drift path is reachable without a connection; the staged
+        // detail is built inside `one()`. Asserting a hand-built string for it
+        // would test the test, so that one is left to inspection — the two call
+        // sites are a few lines apart and go through the same helper.
+        let mut r = row("US West", "ok");
+        record_drift(&mut r, 7, "US West");
+        let detail = r.detail.unwrap();
+        assert!(
+            detail.contains("--env \"US West\""),
+            "a name a shell would split must be quoted: {detail}"
+        );
+
+        // A name no spelling can carry becomes the placeholder rather than a
+        // command that would run something when pasted.
+        let mut r = row("prod&rm", "ok");
+        record_drift(&mut r, 7, "prod&rm");
+        let detail = r.detail.unwrap();
+        assert!(
+            detail.contains("--env <environment>"),
+            "an unquotable name must not be interpolated: {detail}"
+        );
     }
 
     /// A short sha must not panic the slice that shortens a long one.

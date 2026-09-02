@@ -1462,7 +1462,19 @@ fn resolve_with_intent(
                     // Silently: the caller compares against the pre-prompt
                     // mapping and prints one "updated" line, and two messages
                     // about one file would read as two files.
-                    write_ids(project, &r.ids)?;
+                    //
+                    // Through the envelope like the caller's own write: this
+                    // is a *second* path to the same file, reached only from
+                    // an interactive session, and wrapping the caller's alone
+                    // left this one escaping. `quiet` is the JSON flag under
+                    // another name — the caller passes it so nothing prints
+                    // above a prompt.
+                    output::or_unanswerable(
+                        "plan",
+                        quiet,
+                        "identity.unwritable",
+                        write_ids(project, &r.ids),
+                    )?;
                     return Ok(Ok(r));
                 }
                 Err(again) => blockers = again,

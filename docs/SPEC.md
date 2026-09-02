@@ -901,10 +901,15 @@ organization say no to the tool.
 
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted
-below the database, so they are asked for there; `ALTER`, `SELECT` and
-`VIEW DEFINITION` are asked for on each managed schema, and `INSERT` and
-`DELETE` on the ledger and lock **objects** themselves, falling back to their
-schema only while those tables do not exist yet. Asking for all of
+below the database, so they are asked for there; `ALTER`, `VIEW DEFINITION` and
+the probes' `SELECT` are asked for on each **managed** schema, and `INSERT`,
+`DELETE` and the ledger's own `SELECT` on the ledger and lock **objects**
+themselves, falling back to their schema only while those tables do not exist
+yet. `SELECT` appears twice because it is needed in two places for two reasons:
+the probes count rows in managed tables, and reading the recorded state is a
+read of two tables in `dbo`. The ledger's schema is not treated as a managed one
+— a project that declares nothing in `dbo` never touches a `dbo` table and must
+not be asked for `ALTER` there. Asking for all of
 them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE')`
 alone answers — reports gaps a correctly granted least-privilege account does
 not have, and the remedy an operator then reaches for is the database-wide grant

@@ -77,16 +77,27 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
 /// The schema the ledger and the lock live in.
 pub const LEDGER_SCHEMA: &str = "dbo";
 
-pub const REQUIRED: [Requirement; 9] = [
+pub const REQUIRED: [Requirement; 10] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
         Needed::Managed,
     ),
+    // `SELECT` twice, because it is needed in two places for two reasons and a
+    // single entry made the wrong demand in both directions. The probes count
+    // rows in the *managed* tables; reading the ledger is a read of two tables
+    // in `dbo`. A project that manages only `app` can legitimately hold the
+    // first on `SCHEMA::app` and the second on the two ledger objects — and one
+    // `Needed::Managed` entry reported `SELECT on SCHEMA::dbo` missing for it.
     req(
         "SELECT",
-        "the pre-flight probes, which count rows that would break, and reading the ledger",
+        "the pre-flight probes, which count rows that would break",
         Needed::Managed,
+    ),
+    req(
+        "SELECT",
+        "reading the recorded state and the deployment lock",
+        Needed::Ledger,
     ),
     req(
         "CREATE TABLE",
@@ -145,11 +156,23 @@ pub const REQUIRED: [Requirement; 9] = [
 pub struct Held {
     /// Permissions effective on the database securable.
     pub database: BTreeSet<String>,
-    /// Per schema, the schema-scoped permissions effective on it.
+    /// Per **managed** schema, the schema-scoped permissions effective on it.
     ///
     /// A schema absent from this map was **not asked about**, which is not the
     /// same as holding nothing there — see [`missing`].
+    ///
+    /// The ledger's schema is deliberately not forced in here. It used to be,
+    /// which quietly demanded `ALTER` and the probes' `SELECT` on `dbo` from a
+    /// project that manages only `app` and never touches a `dbo` table.
     pub schemas: BTreeMap<String, BTreeSet<String>>,
+
+    /// The schema-scoped permissions effective on the ledger's schema.
+    ///
+    /// Kept apart from `schemas` because it answers a different question:
+    /// it is the fallback for the ledger requirements before the ledger tables
+    /// exist, not a managed schema in its own right. When the project *does*
+    /// manage `dbo`, it appears in both.
+    pub ledger_schema: BTreeSet<String>,
 
     /// Per ledger object, the permissions effective on it.
     ///
@@ -224,6 +247,9 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         database.insert(name.trim().to_ascii_uppercase());
     }
 
+    // The ledger's schema is queried alongside the managed ones because it is
+    // the fallback for the ledger requirements before those tables exist — but
+    // its answer is kept in its own field, not folded into the managed set.
     let mut wanted: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
     wanted.insert(LEDGER_SCHEMA);
     let wanted: Vec<&str> = wanted.into_iter().collect();
@@ -319,9 +345,16 @@ pub async fn permissions(conn: &mut Conn, schemas: &[String]) -> Result<Held, Db
         }
     }
 
+    let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
+    // Managed means declared. `dbo` stays only if the project actually declares
+    // something in it.
+    let managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
+    per_schema.retain(|name, _| managed.contains(name.as_str()));
+
     Ok(Held {
         database,
         schemas: per_schema,
+        ledger_schema,
         ledger_objects,
     })
 }
@@ -378,9 +411,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 }
             }
             Needed::Ledger => {
-                if let Some(granted) = held.schemas.get(LEDGER_SCHEMA)
-                    && !granted.contains(r.name)
-                {
+                if !held.ledger_schema.contains(r.name) {
                     out.push(Gap {
                         permission: r.name,
                         why: r.why,
@@ -478,8 +509,14 @@ mod tests {
                 .map(|s| ((*s).to_owned(), schema_perms.clone()))
                 .collect(),
             // The ledger not existing yet is the default here, so `missing`
-            // falls back to the schema. `with_ledger_objects` below is the
-            // other half.
+            // falls back to the ledger *schema*, which therefore carries the
+            // ledger permissions. `ledger_granted_on_the_objects_only` below is
+            // the other half.
+            ledger_schema: REQUIRED
+                .iter()
+                .filter(|r| matches!(r.needed, Needed::Ledger))
+                .map(|r| r.name.to_owned())
+                .collect(),
             ledger_objects: BTreeMap::new(),
         }
     }
@@ -494,11 +531,7 @@ mod tests {
             .map(|r| r.name.to_owned())
             .collect();
         let mut held = everything(schemas);
-        for granted in held.schemas.values_mut() {
-            for p in &ledger {
-                granted.remove(p);
-            }
-        }
+        held.ledger_schema.clear();
         held.ledger_objects = [
             (pbps_db::ledger::STATE_TABLE.to_owned(), ledger.clone()),
             (pbps_db::ledger::LOCK_TABLE.to_owned(), ledger),
@@ -547,7 +580,7 @@ mod tests {
     #[test]
     fn holding_insert_without_delete_is_still_a_gap() {
         let mut held = everything(&["dbo"]);
-        held.schemas.get_mut("dbo").unwrap().remove("DELETE");
+        held.ledger_schema.remove("DELETE");
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].permission, "DELETE");
@@ -565,6 +598,32 @@ mod tests {
         app.remove("INSERT");
         app.remove("DELETE");
         assert!(missing(&held).is_empty());
+    }
+
+    /// The finding this split exists for. A project that manages only `app`
+    /// never touches a `dbo` table, so demanding the probes' `SELECT` — or
+    /// `ALTER`, or `VIEW DEFINITION` — on `SCHEMA::dbo` asks for access the
+    /// deployment does not use. Forcing the ledger's schema into the managed
+    /// set did exactly that.
+    #[test]
+    fn an_unmanaged_ledger_schema_is_not_asked_for_the_managed_permissions() {
+        let held = everything(&["app"]);
+        assert!(
+            !held.schemas.contains_key("dbo"),
+            "dbo is not managed here and must not be in the managed set"
+        );
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+
+        // But the ledger's own requirements are still checked there.
+        let mut held = everything(&["app"]);
+        held.ledger_schema.remove("SELECT");
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        // The *ledger* SELECT, not the probes' one: the two entries exist to be
+        // told apart, and the reason is what tells them apart in the report.
+        assert!(gaps[0].why.contains("recorded state"), "{gaps:?}");
     }
 
     /// A declared schema that does not exist yet produces no row, and a first
@@ -586,8 +645,8 @@ mod tests {
     fn a_grant_on_the_ledger_objects_alone_satisfies_the_ledger_requirements() {
         let held = ledger_granted_on_the_objects_only(&["dbo", "app"]);
         assert!(
-            !held.schemas["dbo"].contains("INSERT"),
-            "the test's premise is wrong if the schema still carries it"
+            !held.ledger_schema.contains("INSERT"),
+            "the test's premise is wrong if the ledger schema still carries it"
         );
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
@@ -617,7 +676,7 @@ mod tests {
         assert!(missing(&held).is_empty());
 
         let mut held = everything(&["dbo"]);
-        held.schemas.get_mut("dbo").unwrap().remove("INSERT");
+        held.ledger_schema.remove("INSERT");
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
@@ -677,6 +736,7 @@ mod tests {
         let held = Held {
             database: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
+            ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
         };
         assert_eq!(missing(&held).len(), REQUIRED.len());

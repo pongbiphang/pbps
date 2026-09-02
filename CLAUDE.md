@@ -338,13 +338,17 @@ Phase 3.1 additions worth knowing before touching them:
     Permissions are *asked for* (`sys.fn_my_permissions`, `HAS_PERMS_BY_NAME`),
     never tried, and named one by one with what each is for **and at the
     securable where it is needed**: the four `CREATE`s at the database (they
-    cannot be granted lower), `ALTER` / `SELECT` / `VIEW DEFINITION` per managed
-    schema, `INSERT` / `DELETE` on the ledger and lock *objects* (falling back
-    to their schema only until those tables exist). Asking at database
-    scope alone reports gaps a least-privilege account does not have, and the
-    remedy it then invites is exactly the "make it db_owner" this list exists to
-    avoid. A declared schema that does not exist yet is left unasked — that is
-    every first deployment.
+    cannot be granted lower), `ALTER` / `VIEW DEFINITION` and the probes'
+    `SELECT` per **managed** schema, and `INSERT` / `DELETE` plus the ledger's
+    own `SELECT` on the ledger and lock *objects* (falling back to their schema
+    only until those tables exist). `SELECT` is listed twice on purpose: the
+    probes read managed tables and the ledger read is two tables in `dbo`, and
+    one entry made the wrong demand in both directions. The ledger's schema is
+    **not** forced into the managed set — a project managing only `app` never
+    touches a `dbo` table. Asking at database scope alone reports gaps a
+    least-privilege account does not have, and the remedy it then invites is
+    exactly the "make it db_owner" this list exists to avoid. A securable that
+    does not exist yet is left unasked — that is every first deployment.
 39. **`explain` always exits 0 and needs no connection.** It is the reviewer's
     command, and the reviewer may have no checkout and no credentials; the gate
     is `apply --allow`. A target is optional and answers only the question no
