@@ -70,11 +70,19 @@ pub struct EnvDiagnosis {
     pub detail: Option<String>,
 }
 
-pub fn cmd_doctor(
-    project: &Project,
-    one: Option<(db::Target, Option<String>)>,
-    json: bool,
-) -> anyhow::Result<()> {
+/// One target named on the command line, resolved or not.
+///
+/// The resolution is carried rather than unwrapped by the caller because
+/// failing to resolve is itself something `doctor` diagnoses: an unset
+/// `url_env` variable is the commonest first-run problem, and it has a finding
+/// and a remedy here.
+pub struct Requested {
+    /// The `--env` name, when that is how the target was given.
+    pub name: Option<String>,
+    pub target: anyhow::Result<db::Target>,
+}
+
+pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
     let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
 
@@ -115,14 +123,28 @@ pub fn cmd_doctor(
     }
 
     let mut environments = Vec::new();
-    if let Some((target, name)) = one {
+    if let Some(Requested { name, target }) = one {
         db::require_mssql(project, "doctor")?;
-        let rt = db::runtime()?;
-        // Named by the environment when there is one, and by the *redacted*
-        // label otherwise — `db::redact` gives server/database, never the
-        // connection string CI passed in.
-        let label = name.unwrap_or_else(|| target.label.clone());
-        let d = rt.block_on(examine(&label, target.connection()));
+        let d = match target {
+            Ok(target) => {
+                // Named by the environment when there is one, and by the
+                // *redacted* label otherwise — `db::redact` gives
+                // server/database, never the connection string CI passed in.
+                let label = name.unwrap_or_else(|| target.label.clone());
+                db::runtime()?.block_on(examine(&label, target.connection()))
+            }
+            Err(e) => EnvDiagnosis {
+                environment: name.unwrap_or_else(|| "the given target".to_owned()),
+                state: "unconfigured",
+                server_version: None,
+                edition: None,
+                supports_online: None,
+                supports_create_or_alter: None,
+                missing_permissions: Vec::new(),
+                permissions_unknown: false,
+                detail: Some(format!("{e:#}")),
+            },
+        };
         findings.extend(env_findings(&d, counts.modules > 0));
         environments.push(d);
     } else if project.config.environments.is_empty() {

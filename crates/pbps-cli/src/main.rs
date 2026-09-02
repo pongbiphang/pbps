@@ -564,9 +564,19 @@ fn run() -> anyhow::Result<()> {
             // The only connected command whose target is optional: with none it
             // surveys every configured environment, which is what makes it
             // worth running before a deployment.
+            //
+            // A resolution failure is *not* propagated here. An unset `url_env`
+            // variable is the most common first-run problem there is, and
+            // `doctor` has a diagnosis for it — `unconfigured`, with the remedy
+            // — which the all-environments path already produced. Failing at
+            // `?` instead made the single-environment path, the one a person
+            // onboarding actually types, the one that answered worst.
             let one = match (&target.db, &target.env) {
                 (None, None) => None,
-                _ => Some((target.resolve(&project)?, target.env.clone())),
+                _ => Some(doctor::Requested {
+                    name: target.env.clone(),
+                    target: target.resolve(&project),
+                }),
             };
             doctor::cmd_doctor(&project, one, format == OutputFormat::Json)
         }

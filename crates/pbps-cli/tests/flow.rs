@@ -2956,3 +2956,165 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
         "{v}"
     );
 }
+
+// ---- Tenth review round ----
+
+/// A path no shell-quoting can carry across POSIX shells, PowerShell and `cmd`
+/// alike is printed on a line of its own instead of being guessed at. `cmd`
+/// does not treat `'` as quoting, so `&` in a single-quoted path splits the
+/// command there — the opposite of the "fails safe" it was claimed to be.
+#[test]
+fn an_unquotable_plan_path_is_shown_rather_than_inlined() {
+    let d = Demo::new("unquotable");
+    risky_plan(&d);
+    let dir = d.dir.join("a&b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let plan = dir.join("plan.json");
+    std::fs::copy(d.dir.join("plan.json"), &plan).unwrap();
+
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    let command = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps "))
+        .unwrap_or_else(|| panic!("no command in:\n{out}"));
+    assert!(command.contains("<plan path>"), "{command}");
+    assert!(
+        !command.contains("a&b"),
+        "the path must not be inlined at all: {command}"
+    );
+    // And it is shown, so the reviewer can still act on it.
+    assert!(out.contains("<plan path> is:"), "{out}");
+    assert!(out.contains("a&b"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert!(
+        v["data"]["plan_path"].as_str().unwrap().contains("a&b"),
+        "{v}"
+    );
+}
+
+/// A plan naming an engine this build has no dialect for is one it cannot
+/// explain, and the one-envelope contract covers that failure like the others.
+#[test]
+fn explain_json_emits_an_envelope_for_a_dialect_it_cannot_explain() {
+    let d = Demo::new("explaindialect");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "pg.json", "transactional");
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    std::fs::write(&plan, raw.replace("\"mssql\"", "\"postgres\"")).unwrap();
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "plan.unsupported-dialect");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("postgres"),
+        "the message must name the engine: {v}"
+    );
+}
+
+/// An unset `url_env` variable is the commonest first-run problem, and `doctor`
+/// has a diagnosis for it. Failing at `target.resolve` instead made the
+/// single-environment path — the one a person onboarding actually types — the
+/// one that answered worst.
+#[test]
+fn doctor_env_diagnoses_an_unset_variable_rather_than_failing_at_resolution() {
+    let d = Demo::new("doctorenvunset");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_ENV_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["doctor", "--env", "prod", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["data"]["environments"][0]["environment"], "prod");
+    assert_eq!(v["data"]["environments"][0]["state"], "unconfigured");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "environment.unconfigured"
+                && f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PBPS_DOCTOR_ENV_UNSET")),
+        "{v}"
+    );
+    // The project half of the report still ran.
+    assert_eq!(v["data"]["tables"], 1, "{v}");
+}
+
+/// A database pbps has never touched must come back `uninitialized`, not
+/// `unreachable`. This regressed once — the lock check was added ahead of the
+/// initialization check, and `lock_holder` selects from a `__pbps_lock` that a
+/// virgin database does not have — so it is pinned against a real server.
+///
+/// `tempdb` is the target: it always exists, holds none of pbps's tables, and
+/// nothing here writes to it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn explain_calls_a_never_initialized_database_uninitialized() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    // Point the same server at a database pbps has never initialized.
+    let virgin = if connection.to_lowercase().contains("database=") {
+        connection
+            .split(';')
+            .map(|p| {
+                if p.to_lowercase().starts_with("database=") {
+                    "Database=tempdb".to_owned()
+                } else {
+                    p.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    } else {
+        format!("{connection};Database=tempdb")
+    };
+
+    let d = Demo::new("explainvirgin");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "target.json", "transactional");
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &virgin,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["data"]["target"]["state"], "uninitialized",
+        "a reachable database pbps has never touched is not unreachable: {v}"
+    );
+}

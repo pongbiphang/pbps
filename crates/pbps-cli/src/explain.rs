@@ -31,7 +31,11 @@ use crate::{db, output, report};
 ///
 /// A generated placeholder, never a value, so it is exempt from [`shell_arg`] —
 /// quoting it would make it read as a literal directory called `<environment>`.
-const PLACEHOLDER: &str = "<environment>";
+const ENV_PLACEHOLDER: &str = "<environment>";
+
+/// Stands in for a plan path no shell-quoting can carry across POSIX shells,
+/// PowerShell and `cmd` alike. The real path is printed beneath the command.
+const PLAN_PLACEHOLDER: &str = "<plan path>";
 
 /// What `explain` found, for `--format json`.
 ///
@@ -61,6 +65,12 @@ pub struct Explanation {
     /// a preview, the command that produces an applyable plan instead. Which
     /// one it is is [`Explanation::applyable`].
     pub approve_with: String,
+
+    /// Set only when the plan path could not be spelled safely for every shell
+    /// this line is read in, and `approve_with` therefore carries a
+    /// `<plan path>` placeholder. The value is the path, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_path: Option<String>,
     pub probes: Vec<String>,
     /// Statements the plan will run. Counted, not listed: the SQL is
     /// `plan --sql`'s job, and duplicating it here would invite a reviewer to
@@ -120,7 +130,26 @@ pub fn cmd_explain(
     // may have been handed nothing but the file. It is also more honest where a
     // project does exist: a plan computed for one engine must be explained as
     // that engine, not as whatever the local config happens to select.
-    let dialect = dialect_of(&plan)?;
+    let dialect = match dialect_of(&plan) {
+        Ok(d) => d,
+        Err(e) => {
+            // Same envelope as an unreadable plan: this build cannot explain
+            // the file, so it did not answer. Without this a plan naming an
+            // engine this binary has no dialect for left stdout empty.
+            if json {
+                let report = output::Report::plain(
+                    "explain",
+                    vec![
+                        output::Finding::error("plan.unsupported-dialect", format!("{e:#}"))
+                            .at(path, None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
 
     let explanation = explain(&plan, dialect.as_ref(), path, target, env)?;
     let findings = findings(&plan, &explanation);
@@ -206,6 +235,13 @@ fn explain(
         })
         .collect();
 
+    // A path no shell-quoting can carry safely becomes a placeholder, and the
+    // literal value is printed on a line of its own where nothing can execute
+    // it (see `shell_arg`). Better a command that has to be completed by hand
+    // than one that redirects or runs something when it is pasted.
+    let literal = path.display().to_string();
+    let plan_arg = shell_arg(&literal).unwrap_or_else(|| PLAN_PLACEHOLDER.to_owned());
+
     // An offline plan has no approval command, because there is nothing to
     // approve: `apply` refuses a `Preview` structurally, whatever target and
     // whatever `--allow` it is given (§7.3). Printing one anyway would have the
@@ -222,10 +258,10 @@ fn explain(
             // The placeholder is generated, not user input, and must stay
             // visibly a placeholder rather than become a quoted string.
             match env {
-                Some(name) => shell_arg(name),
-                None => PLACEHOLDER.to_owned(),
+                Some(name) => shell_arg(name).unwrap_or_else(|| ENV_PLACEHOLDER.to_owned()),
+                None => ENV_PLACEHOLDER.to_owned(),
             },
-            shell_arg(&path.display().to_string())
+            plan_arg
         );
         if !present.is_empty() {
             approve.push_str(&format!(
@@ -242,10 +278,7 @@ fn explain(
         }
         approve
     } else {
-        format!(
-            "pbps plan --env {PLACEHOLDER} --out {}",
-            shell_arg(&path.display().to_string())
-        )
+        format!("pbps plan --env {ENV_PLACEHOLDER} --out {plan_arg}")
     };
 
     Ok(Explanation {
@@ -264,6 +297,7 @@ fn explain(
         module_count,
         risks,
         approve_with: approve,
+        plan_path: (plan_arg == PLAN_PLACEHOLDER).then_some(literal),
         probes: dialect
             .preflight(cs)
             .into_iter()
@@ -290,6 +324,13 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
     // commit before this branch was written.
     let checked = db::runtime()?.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
+        // Initialization first. `lock_holder` selects from `__pbps_lock`, which
+        // a never-initialized database does not have, so asking it first turned
+        // "pbps has never touched this database" into a driver error and then
+        // into `unreachable` — undoing an earlier fix in this same function.
+        if !pbps_mssql::state::is_initialized(&mut conn).await? {
+            return Err(pbps_db::LedgerError::NotInitialized);
+        }
         if let Some(lock) = pbps_mssql::state::lock_holder(&mut conn).await? {
             return Ok(Err(lock));
         }
@@ -480,59 +521,59 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         },
         e.approve_with
     ));
+    if let Some(literal) = &e.plan_path {
+        out.push_str(&format!(
+            "\n  <plan path> is:\n    {literal}\n  \
+             Quote it the way your own shell needs — it contains characters that no\n  \
+             single spelling is safe for in POSIX shells, PowerShell and cmd alike.\n"
+        ));
+    }
     out
 }
 
-/// One argument, quoted so that pasting it passes the value through unchanged.
+/// One argument, quoted so that pasting it passes the value through unchanged —
+/// or `None` when no spelling can promise that.
 ///
-/// # Why there is no single "correct escaping" to reach for
+/// # Why there is a `None`
 ///
 /// This line is read in POSIX shells, PowerShell and `cmd`, and their quoting
-/// rules disagree: POSIX single quotes are literal, PowerShell treats `$` and a
-/// backtick as live inside double quotes, and `cmd` knows neither single quotes
-/// nor `$`. No one string is exactly right in all three, so the rule below picks
-/// the form that is right where the characters in question are *dangerous*, and
-/// merely wrong — inert, a path that will not be found — where they are not.
+/// rules do not overlap enough to cover everything:
 ///
-/// Three cases:
+/// - POSIX single quotes are literal, but **`cmd` does not treat `'` as quoting
+///   at all**, so `&`, `|`, `<` and `>` stay live inside them. An earlier
+///   version of this function used single quotes for exactly those characters
+///   and claimed it failed safe in `cmd`; it does not — `cmd` would split the
+///   command at the `&` and run the remainder.
+/// - Double quotes are understood by all three for *splitting*, but POSIX
+///   shells and PowerShell still expand `$` and a backtick inside them.
 ///
-/// 1. Nothing a shell reinterprets: emitted bare, so the ordinary path does not
-///    look like it needs care.
-/// 2. Something a shell would split, but nothing it would expand (a space, most
-///    often): double quotes, which all three understand.
-/// 3. Anything a shell would *expand or redirect* — `$`, a backtick, `"`, `<`,
-///    `>`, `|`, `;`, `&`, a trailing backslash: POSIX single quotes, with `'`
-///    escaped as `'\''`. That is exactly right in the shells where those
-///    characters mean something, and in `cmd`, where single quotes are ordinary
-///    characters, it fails to find the file rather than running anything.
-///
-/// Failing safe is the whole design here. The value is the user's own `--plan`
-/// argument rather than anything hostile, so this is a correctness problem, not
-/// an injection one — but a printed command that silently redirects into a file
-/// is a bad way to learn that.
-fn shell_arg(value: &str) -> String {
+/// So there is no single string that is safe everywhere for a value containing
+/// both families. Rather than pick a form that is wrong on one platform, this
+/// returns `None` and the caller prints the path on a line of its own, where
+/// nothing can execute it. A command that cannot be pasted blindly is a much
+/// smaller problem than one that redirects or runs something when it is.
+fn shell_arg(value: &str) -> Option<String> {
     // `~` is safe away from the front: it means home-directory expansion as the
     // first character of a word and nothing at all elsewhere, and every Windows
     // short path is full of it (`C:\Users\RUNNER~1\...`).
-    //
-    // `<` and `>` are deliberately *not* here. They were, so that the
-    // `<environment>` placeholder would stay bare, and the cost was that a path
-    // containing one became a redirection. The placeholder is generated rather
-    // than user input, so it is exempted where it is built instead.
     let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=~".contains(c);
     if !value.is_empty() && !value.starts_with('~') && value.chars().all(bare) {
-        return value.to_owned();
+        return Some(value.to_owned());
     }
 
-    // Double quotes leave these live in POSIX shells or PowerShell, and a
-    // trailing backslash would escape the closing quote itself — which a
-    // Windows directory path ends with more often than not.
-    let expands =
-        value.contains(['$', '`', '"', '<', '>', '|', ';', '&', '\n']) || value.ends_with('\\');
-    if !expands {
-        return format!("\"{value}\"");
+    // Double quotes hold for a value a shell would only *split* — a space, most
+    // often. They do not neutralize expansion (`$`, a backtick), a quote of the
+    // same kind, a newline, or a trailing backslash, which would escape the
+    // closing quote itself — and a Windows directory path ends with one more
+    // often than not.
+    let expands = value.contains(['$', '`', '"', '\n']) || value.ends_with('\\');
+    // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
+    // quote character to wrap them in.
+    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%']);
+    if expands || cmd_metacharacters {
+        return None;
     }
-    format!("'{}'", value.replace('\'', "'\\''"))
+    Some(format!("\"{value}\""))
 }
 
 #[cfg(test)]
@@ -544,10 +585,13 @@ mod tests {
     /// the ordinary case looks like it needs care.
     #[test]
     fn only_a_value_a_shell_would_reinterpret_is_quoted() {
-        assert_eq!(shell_arg("plan.json"), "plan.json");
-        assert_eq!(shell_arg("/tmp/plans/plan.json"), "/tmp/plans/plan.json");
+        assert_eq!(shell_arg("plan.json").unwrap(), "plan.json");
         assert_eq!(
-            shell_arg("/tmp/release plans/plan.json"),
+            shell_arg("/tmp/plans/plan.json").unwrap(),
+            "/tmp/plans/plan.json"
+        );
+        assert_eq!(
+            shell_arg("/tmp/release plans/plan.json").unwrap(),
             "\"/tmp/release plans/plan.json\""
         );
     }
@@ -559,57 +603,47 @@ mod tests {
     #[test]
     fn a_tilde_is_special_only_at_the_front() {
         assert_eq!(
-            shell_arg("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json"),
+            shell_arg("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json").unwrap(),
             "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\plan.json"
         );
-        assert_eq!(shell_arg("~/plans/plan.json"), "\"~/plans/plan.json\"");
+        assert_eq!(
+            shell_arg("~/plans/plan.json").unwrap(),
+            "\"~/plans/plan.json\""
+        );
     }
 
-    /// The cases that matter: a printed command must not redirect, expand or
-    /// substitute anything when pasted. Double quotes do not stop `$`, a
-    /// backtick or a redirection, so those take the single-quoted form, which
-    /// is literal in every shell where they mean anything.
+    /// The cases no spelling covers. POSIX single quotes would make `$` and a
+    /// backtick literal but **`cmd` does not treat `'` as quoting at all**, so
+    /// `&`, `|`, `<` and `>` stay live inside them — an earlier version of this
+    /// function used single quotes here and claimed it failed safe in `cmd`,
+    /// which it did not. `None` means the caller prints the path on a line of
+    /// its own instead, where nothing can execute it.
     #[test]
-    fn nothing_a_shell_would_expand_or_redirect_survives_unquoted() {
+    fn a_value_no_shell_spelling_can_carry_is_refused_rather_than_guessed() {
         for value in [
-            "/tmp/a>b/plan.json",
-            "/tmp/a<b/plan.json",
-            "/tmp/a|b/plan.json",
-            "/tmp/a;b/plan.json",
             "/tmp/a&b/plan.json",
+            "/tmp/a|b/plan.json",
+            "/tmp/a<b/plan.json",
+            "/tmp/a>b/plan.json",
+            "C:\\plans\\a&b.json",
             "/tmp/$HOME/plan.json",
             "/tmp/$(id)/plan.json",
             "/tmp/`id`/plan.json",
+            "/tmp/50%/plan.json",
+            "/tmp/a^b/plan.json",
+            "C:\\release plans\\",
         ] {
-            let quoted = shell_arg(value);
             assert!(
-                quoted.starts_with('\'') && quoted.ends_with('\''),
-                "{value} must be single-quoted, got {quoted}"
+                shell_arg(value).is_none(),
+                "{value} has no safe spelling and must not be guessed at"
             );
         }
-    }
-
-    /// A trailing backslash would escape the closing double quote itself, and a
-    /// Windows directory path ends with one more often than not.
-    #[test]
-    fn a_trailing_backslash_does_not_escape_the_closing_quote() {
-        let quoted = shell_arg("C:\\release plans\\");
-        assert!(quoted.starts_with('\''), "{quoted}");
-        assert!(!quoted.ends_with("\\\""), "{quoted}");
-    }
-
-    /// The single-quoted form has to close and reopen around a quote of its
-    /// own, or it ends the string early — the one way this transformation can
-    /// produce something actively wrong rather than merely unfound.
-    #[test]
-    fn a_single_quote_is_escaped_rather_than_ending_the_string() {
-        assert_eq!(shell_arg("/tmp/o'brien/$x"), "'/tmp/o'\\''brien/$x'");
     }
 
     /// The negative case: an empty value must not vanish into the command line
     /// as though the argument had not been given.
     #[test]
     fn an_empty_value_is_not_silently_dropped() {
-        assert_eq!(shell_arg(""), "\"\"");
+        assert_eq!(shell_arg("").unwrap(), "\"\"");
     }
 }
