@@ -1402,3 +1402,119 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         ))
         .await;
 }
+
+/// A lock table the caller may not read is not an absent one.
+///
+/// SQL Server's metadata-visibility rules hide an object from a principal with
+/// no permission on it, so the `OBJECT_ID` guard this replaced answered "absent"
+/// for a table that exists and holds a live lock — turning "not authorized to
+/// look" into "no lock", which is the one direction this tool must never round
+/// in. `HAS_PERMS_BY_NAME` does not separate them either: it answers 0 for both.
+///
+/// Only a real server settles which of those three questions can tell the cases
+/// apart, which is why this test exists at all rather than a unit one.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
+    let mut db = TestDb::create("lockvisibility").await;
+    let login = format!("pbps_viz_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsVisibility!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    pbps_mssql::state::lock(&mut db.conn, "the-invisible-holder")
+        .await
+        .expect("take the lock");
+    // The state table is readable, the lock table is not. That is the shape a
+    // half-granted deployment account really has, and `doctor` exists to catch
+    // it — but only if the lock read reports rather than shrugs.
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT SELECT ON dbo.__pbps_state TO [{login}];"
+        ))
+        .await
+        .expect("grant on the state table only");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    // The premise, stated rather than assumed: the catalog really does hide the
+    // table from this principal, so the old guard really would have said absent.
+    let hidden = lp
+        .query(
+            "SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL THEN 0 ELSE 1 END \
+             AS present;",
+        )
+        .await
+        .expect("ask the catalog");
+    let present: i32 = hidden[0].try_get("present").expect("present").unwrap_or(1);
+    assert_eq!(present, 0, "the premise is wrong if the table is visible");
+
+    let answer = pbps_mssql::state::lock_holder(&mut lp).await;
+    assert!(
+        answer.is_err(),
+        "a lock that cannot be read must not be reported as absent: {answer:?}"
+    );
+
+    // And the other half, on the same connection: a table that genuinely is not
+    // there still answers "no lock" rather than failing, which is what keeps a
+    // first run quiet.
+    db.conn
+        .execute("DROP TABLE dbo.__pbps_lock;")
+        .await
+        .expect("drop the lock table");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    assert!(
+        pbps_mssql::state::lock_holder(&mut lp)
+            .await
+            .expect("an absent lock table is not an error")
+            .is_none()
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}

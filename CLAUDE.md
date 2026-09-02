@@ -418,10 +418,16 @@ Phase 3.1 additions worth knowing before touching them:
     absent means nothing ever took a lock **by any path the tool controls** —
     but a hand-dropped state table leaves the lock behind, so both branches read
     it. What makes that safe on a first run is that `lock_holder` and `unlock`
-    now ask whether the **lock** table exists (`state::lock_exists`, not
-    `is_initialized`): absent answers "no lock", which is a different thing from
-    unreadable, which stays an error. `unlock` had the same confusion and could
-    not release a lock that outlived its state table.
+    now attempt the statement and read the server's error number: **208**
+    (invalid object name) means absent and answers "no lock", **229**
+    (permission denied) and everything else stay errors. `unlock` had the same
+    confusion and could not release a lock that outlived its state table.
+    **Never ask `OBJECT_ID` instead**: metadata visibility hides an object from a
+    principal with no permission on it, so it answers NULL for a lock table that
+    exists and is held — turning "not authorized to look" into "no lock".
+    `HAS_PERMS_BY_NAME` does not separate them either (measured: 0 for both).
+    `DbError::server_error_number` exists so `pbps-mssql` can read the code
+    without a second crate naming `tiberius`.
 46. **The lock is asked before initialization, in all four commands.** `status`,
     `doctor` and `explain` each asked `is_initialized` first, because
     `lock_holder` used to select from a table a never-initialized database does
