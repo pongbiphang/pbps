@@ -422,6 +422,14 @@ Phase 3.1 additions worth knowing before touching them:
     `is_initialized`): absent answers "no lock", which is a different thing from
     unreadable, which stays an error. `unlock` had the same confusion and could
     not release a lock that outlived its state table.
+46. **The lock is asked before initialization, in all four commands.** `status`,
+    `doctor` and `explain` each asked `is_initialized` first, because
+    `lock_holder` used to select from a table a never-initialized database does
+    not have. Item 45 removed that reason; the ordering then only hid the
+    half-present ledger. `doctor` called it "uninitialized" and exited **0**
+    with an apply blocked, and `explain` printed the approval command for a
+    target that was changing under it. A guard whose reason has gone is not
+    harmless — it is a filter nobody re-reads.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

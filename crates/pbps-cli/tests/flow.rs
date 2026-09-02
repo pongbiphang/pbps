@@ -4419,3 +4419,100 @@ fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
         "both halves have to be counted: {summary}"
     );
 }
+
+// ---- Twenty-ninth review round ----
+
+/// The same half-present ledger, at the two commands the round-28 fix did not
+/// sweep. `dbo.__pbps_state` dropped by hand while `dbo.__pbps_lock` and its row
+/// survive: `doctor` reported only "uninitialized" and could exit 0, and
+/// `explain` labelled the target uninitialized and went on printing the
+/// approval command — with an apply in fact running.
+///
+/// Both used to ask about initialization before the lock, deliberately, because
+/// `lock_holder` selected from a table a never-initialized database does not
+/// have. Round 28 removed that reason and updated only `status`.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_and_explain_see_a_lock_that_outlived_its_state_table() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("orphanlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_ORPHAN_LOCK_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-orphaned-apply")
+            .await
+            .expect("take the lock");
+        conn.execute("DROP TABLE dbo.__pbps_state;")
+            .await
+            .expect("drop the state table");
+    });
+
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(args)
+            .env(&var, &connection)
+            .output()
+            .unwrap()
+    };
+    let doctor = run(&["doctor", "--format", "json"]);
+    let plan = write_plan(&d, "orphan.json", "transactional");
+    let explain_human = run(&["explain", "--plan", plan.to_str().unwrap(), "--env", "test"]);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = pbps_mssql::state::unlock(&mut conn).await;
+        let _ = conn.execute("DROP TABLE dbo.__pbps_lock;").await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&doctor))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&doctor)));
+    assert_eq!(v["data"]["environments"][0]["state"], "locked", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "{v}"
+    );
+    // An error, not a warning: while the lock is held an apply is refused, so a
+    // readiness check that passed would answer a different question.
+    assert_eq!(code(&doctor), FINDING, "{v}");
+
+    // `explain` always exits 0 — it is the reviewer's report, not a gate — but
+    // it must say the environment is changing rather than print an approval
+    // command as though it were idle.
+    assert_eq!(code(&explain_human), 0, "{}", stderr(&explain_human));
+    let out = stdout(&explain_human);
+    assert!(
+        out.contains("the-orphaned-apply"),
+        "the surviving lock is missing from the report:\n{out}"
+    );
+}

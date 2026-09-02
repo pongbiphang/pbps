@@ -399,26 +399,37 @@ async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnos
 
     // The ledger last, because it is the only question whose answer changes
     // between two runs a minute apart, and it is the one that decides the state.
-    d.state = match pbps_mssql::state::is_initialized(&mut conn).await {
-        Ok(false) => "uninitialized",
-        Ok(true) => match pbps_mssql::state::lock_holder(&mut conn).await {
-            // A lock this could not read is not an absent lock. Falling through
-            // to `latest` here let a denied or damaged `__pbps_lock` be reported
-            // as `ready` — `doctor` saying no deployment is active without ever
-            // having established it, which is the same mistake as an empty
-            // `missing_permissions` meaning "none missing".
-            Err(e) => {
-                d.detail = Some(format!("could not read the deployment lock: {e}"));
-                "lock-unknown"
-            }
-            Ok(Some(lock)) => {
-                d.detail = Some(format!(
-                    "held by {} since {}; an apply is running, or one died without releasing",
-                    lock.locked_by, lock.locked_at
-                ));
-                "locked"
-            }
-            Ok(None) => match pbps_mssql::state::latest(&mut conn).await {
+    //
+    // The lock is asked **first**, ahead of `is_initialized`. It used to be
+    // asked only when the state table existed, because `lock_holder` selected
+    // from `__pbps_lock` unconditionally and a never-initialized database has
+    // neither table. It now checks for its own table and answers `None`, so the
+    // ordering that guarded against that is no longer needed — and it was
+    // hiding the half-present ledger this command already reports on elsewhere:
+    // `dbo.__pbps_state` dropped by hand while a live lock survives. `doctor`
+    // called that "uninitialized" and could exit 0, with the next apply blocked
+    // by a lock nothing had mentioned.
+    let lock = pbps_mssql::state::lock_holder(&mut conn).await;
+    d.state = match lock {
+        // A lock this could not read is not an absent lock. Falling through
+        // here let a denied or damaged `__pbps_lock` be reported as `ready` —
+        // `doctor` saying no deployment is active without ever having
+        // established it, which is the same mistake as an empty
+        // `missing_permissions` meaning "none missing".
+        Err(e) => {
+            d.detail = Some(format!("could not read the deployment lock: {e}"));
+            "lock-unknown"
+        }
+        Ok(Some(lock)) => {
+            d.detail = Some(format!(
+                "held by {} since {}; an apply is running, or one died without releasing",
+                lock.locked_by, lock.locked_at
+            ));
+            "locked"
+        }
+        Ok(None) => match pbps_mssql::state::is_initialized(&mut conn).await {
+            Ok(false) => "uninitialized",
+            Ok(true) => match pbps_mssql::state::latest(&mut conn).await {
                 Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
                     let p = entry.snapshot.staged.as_ref().expect("just matched");
                     d.detail = Some(format!(
@@ -434,11 +445,11 @@ async fn examine(name: &str, connection: &str, schemas: &[String]) -> EnvDiagnos
                     "unreachable"
                 }
             },
+            Err(e) => {
+                d.detail = Some(e.to_string());
+                "unreachable"
+            }
         },
-        Err(e) => {
-            d.detail = Some(e.to_string());
-            "unreachable"
-        }
     };
     d
 }

@@ -378,15 +378,20 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
     };
     let checked = rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
-        // Initialization first. `lock_holder` selects from `__pbps_lock`, which
-        // a never-initialized database does not have, so asking it first turned
-        // "pbps has never touched this database" into a driver error and then
-        // into `unreachable` — undoing an earlier fix in this same function.
-        if !pbps_mssql::state::is_initialized(&mut conn).await? {
-            return Err(pbps_db::LedgerError::NotInitialized);
-        }
+        // The lock first. This used to ask about initialization first, because
+        // `lock_holder` selected from `__pbps_lock` unconditionally and a
+        // never-initialized database has neither table — so asking it first
+        // turned "pbps has never touched this database" into a driver error and
+        // then into `unreachable`. `lock_holder` now checks for its own table
+        // and answers `None`, which removes that reason and leaves the ordering
+        // hiding a real case: `dbo.__pbps_state` dropped by hand while a live
+        // lock survives. `explain` labelled that target "uninitialized" and went
+        // on printing the approval command, while an apply was in fact running.
         if let Some(lock) = pbps_mssql::state::lock_holder(&mut conn).await? {
             return Ok(Err(lock));
+        }
+        if !pbps_mssql::state::is_initialized(&mut conn).await? {
+            return Err(pbps_db::LedgerError::NotInitialized);
         }
         pbps_mssql::state::latest(&mut conn).await.map(Ok)
     });
