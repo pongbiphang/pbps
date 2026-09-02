@@ -88,7 +88,12 @@ pub struct Requested {
 }
 
 pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyhow::Result<()> {
-    let dialect = crate::dialect(project)?;
+    let dialect = output::or_unanswerable(
+        "doctor",
+        json,
+        "project.unsupported-dialect",
+        crate::dialect(project),
+    )?;
     let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
 
     if !project.ids_file().exists() {
@@ -129,7 +134,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
-        db::require_mssql(project, "doctor")?;
+        output::or_unanswerable(
+            "doctor",
+            json,
+            "project.unsupported-dialect",
+            db::require_mssql(project, "doctor"),
+        )?;
         let d = match target {
             Ok(target) => {
                 // Named by the environment when there is one, and by the
@@ -166,7 +176,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         // Refused before connecting rather than after: the failure is about the
         // project, not the environment, and reporting it once beats reporting it
         // per environment.
-        db::require_mssql(project, "doctor")?;
+        output::or_unanswerable(
+            "doctor",
+            json,
+            "project.unsupported-dialect",
+            db::require_mssql(project, "doctor"),
+        )?;
         let rt = db::runtime()?;
         for name in names {
             let d = match project.connection_string(&name) {

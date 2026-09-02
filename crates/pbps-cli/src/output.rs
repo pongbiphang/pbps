@@ -219,6 +219,46 @@ impl<T: Serialize> Report<T> {
     }
 }
 
+/// Runs a step that must not escape the one-envelope contract.
+///
+/// Every read-only command has setup that can fail before it has anything to
+/// report — selecting the dialect, listing the declarations, opening a runtime.
+/// A `?` on any of them leaves stdout empty in JSON mode, and a consumer then
+/// gets the converter's generic "produced no output" instead of a typed finding
+/// naming the problem.
+///
+/// This was found seven separate times on this branch, one command at a time,
+/// which is what a per-site fix looks like from the outside. Routing every such
+/// step through one function is the structural version: a new fallible step is
+/// wrapped or it is not, and that is visible at the call site.
+///
+/// The result is always [`Outcome::Unanswerable`] — the command did not get far
+/// enough to answer — and the error is returned unchanged, so the exit code and
+/// the human path are exactly what they were.
+pub fn or_unanswerable<T>(
+    command: &'static str,
+    json: bool,
+    id: &'static str,
+    step: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match step {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if json {
+                let report = Report::plain(command, vec![Finding::error(id, format!("{e:#}"))])
+                    .unanswerable();
+                // A serialization failure here would be a bug in this crate's
+                // own types; printing nothing is still better than panicking on
+                // top of the error being reported.
+                if let Ok(text) = serde_json::to_string_pretty(&report) {
+                    println!("{text}");
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Renders the findings for a person.
 ///
 /// Deliberately plain: the rich span-annotated form belongs to the loader's own
@@ -308,6 +348,24 @@ mod tests {
         assert_eq!(v["result"], "unanswerable");
         // The findings are unchanged: only the routing differs.
         assert_eq!(v["findings"][0]["id"], "environment.unreachable");
+    }
+
+    /// The error is returned unchanged, so the exit code and the human path are
+    /// exactly what they were before the envelope existed.
+    #[test]
+    fn a_wrapped_failure_is_still_the_same_failure() {
+        let err = or_unanswerable::<()>(
+            "doctor",
+            false,
+            "project.unsupported-dialect",
+            Err(anyhow::anyhow!("no postgres yet")),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "no postgres yet");
+
+        // And a step that succeeds passes straight through.
+        let ok = or_unanswerable("doctor", true, "x.y", Ok(7)).unwrap();
+        assert_eq!(ok, 7);
     }
 
     #[test]

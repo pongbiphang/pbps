@@ -105,10 +105,15 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    db::require_mssql(project, "status")?;
+    output::or_unanswerable(
+        "status",
+        json,
+        "project.unsupported-dialect",
+        db::require_mssql(project, "status"),
+    )?;
     let checked_at = crate::now();
 
-    let rt = db::runtime()?;
+    let rt = output::or_unanswerable("status", json, "runtime.unavailable", db::runtime())?;
     let mut rows = Vec::new();
     for (name, environment) in &project.config.environments {
         // Each environment is reported independently. One unreachable database

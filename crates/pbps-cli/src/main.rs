@@ -634,8 +634,17 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
-            let target = target.resolve(&project)?;
-            deploy::cmd_verify(&project, &target, format == OutputFormat::Json)
+            let json = format == OutputFormat::Json;
+            // Resolving the target reads `url_env`, and an unset variable is the
+            // commonest first-run failure. It happens before the command body,
+            // so without this it would escape the envelope the command promises.
+            let target = output::or_unanswerable(
+                "verify",
+                json,
+                "environment.unconfigured",
+                target.resolve(&project),
+            )?;
+            deploy::cmd_verify(&project, &target, json)
         }
         Command::Snapshot { target, force } => {
             let target = target.resolve(&project)?;
@@ -1120,8 +1129,13 @@ pub struct IdentityCounts {
 /// the file format").
 fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Result<()> {
     let dir = project.schema_dir();
-    let files = pbps_load::schema_files(&dir)
-        .with_context(|| format!("cannot list `{}`", dir.display()))?;
+    let json = format == OutputFormat::Json;
+    let files = output::or_unanswerable(
+        "fmt",
+        json,
+        "load.io",
+        pbps_load::schema_files(&dir).with_context(|| format!("cannot list `{}`", dir.display())),
+    )?;
 
     // Stripping a redundant `renamed_from` is fmt's job, not plan's: plan writes
     // only the ids file and never the user's YAML (SPEC §6.2). Redundancy is
@@ -1151,8 +1165,13 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for path in &files {
-        let original = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read `{}`", path.display()))?;
+        let original = output::or_unanswerable(
+            "fmt",
+            json,
+            "load.io",
+            std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read `{}`", path.display())),
+        )?;
         let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
             // A file that does not parse cannot be canonicalized, and guessing
             // at what it meant would be the tool rewriting something it did not

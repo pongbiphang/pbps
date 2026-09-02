@@ -206,11 +206,22 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
 /// mapping the environment has never seen would report every uncommitted local
 /// rename as drift in production.
 pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Result<()> {
-    db::require_mssql(project, "verify")?;
-    let dialect = crate::dialect(project)?;
+    crate::output::or_unanswerable(
+        "verify",
+        json,
+        "project.unsupported-dialect",
+        db::require_mssql(project, "verify"),
+    )?;
+    let dialect = crate::output::or_unanswerable(
+        "verify",
+        json,
+        "project.unsupported-dialect",
+        crate::dialect(project),
+    )?;
     let checked_at = crate::now();
 
-    let report = match db::runtime()?.block_on(async {
+    let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
+    let report = match rt.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;

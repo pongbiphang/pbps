@@ -3250,3 +3250,112 @@ fn a_remedy_quotes_an_environment_name_a_shell_would_split() {
         );
     }
 }
+
+// ---- The sweep: every fallible step before a JSON branch ----
+//
+// The findings above arrived one command at a time, each one an error escaping
+// through `?` before its command reached the envelope. Rather than wait for the
+// rest to be reported, `output::or_unanswerable` was introduced and every such
+// step in every read-only command routed through it. These are the sites that
+// sweep found; they are grouped because they are one bug, not four.
+
+/// `doctor`'s first act is selecting the dialect, so a project pbps.yml the
+/// tool cannot serve left stdout empty for the one command whose entire job is
+/// to say what is wrong with the project.
+#[test]
+fn doctor_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("doctordialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "doctor");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// `verify` exits 2 on drift and 1 when it could not look (decision 25), and a
+/// scheduled drift-watch tells them apart from the envelope. Refusing the
+/// dialect without one made that scheduled job read "no output" instead.
+#[test]
+fn verify_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("verifydialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["verify", "--db", "Server=x;Database=y", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// Resolving the target happens in the dispatcher, before the command body, so
+/// an unset `url_env` — the commonest first-run failure — escaped even though
+/// the body itself was careful.
+#[test]
+fn verify_json_emits_an_envelope_when_the_environment_variable_is_unset() {
+    let d = Demo::new("verifyunset");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_VERIFY_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["verify", "--env", "prod", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "environment.unconfigured");
+}
+
+/// `status` always exits 0 when it can report (decision 25), which is exactly
+/// why the case where it cannot has to be visible in the envelope rather than
+/// inferred from an empty stdout.
+#[test]
+fn status_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("statusdialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  prod:\n    url_env: PBPS_STATUS_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["status", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "status");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// Listing the declarations is the step before `fmt` has anything at all to
+/// say. A declarations path that is not a directory is a misconfigured
+/// `pbps.yml`, not a formatting finding — but it still has to arrive as one.
+#[test]
+fn fmt_json_emits_an_envelope_when_the_declarations_cannot_be_listed() {
+    let d = Demo::new("fmtunlistable");
+    // A file where the schema directory should be: the listing fails for a
+    // reason the user can act on, which is the case worth reporting. Permission
+    // bits would not do — the test suite may run as root.
+    std::fs::remove_dir_all(d.dir.join("schema")).unwrap();
+    std::fs::write(d.dir.join("schema"), "not a directory\n").unwrap();
+
+    let o = d.run(&["fmt", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "fmt");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "load.io");
+}
