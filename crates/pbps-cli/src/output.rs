@@ -118,6 +118,25 @@ impl Finding {
     }
 }
 
+/// What a command ended on — the same three-way split as the exit codes.
+///
+/// Three values, not two, because a consumer that has to re-derive "could not
+/// answer" from the findings has re-implemented the routing rule the exit codes
+/// exist to carry. `scripts/findings-to-github.py` maps this straight to the
+/// process's own exit code, and a two-valued `result` made it turn `doctor`'s
+/// exit 1 into a 2 — routing an unreachable database to the author of the
+/// schema change, which is exactly what §9.8 is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    /// Nothing to act on. Exit 0.
+    Ok,
+    /// The command answered and found something. Exit 2.
+    Findings,
+    /// The command could not answer. Exit 1.
+    Unanswerable,
+}
+
 /// What a read-only command produced.
 ///
 /// Generic over the payload so a command with one — `verify`'s drift report,
@@ -129,9 +148,11 @@ pub struct Report<T: Serialize> {
     pub tool_version: &'static str,
     pub command: &'static str,
 
-    /// `ok` or `findings`. Derived from the findings rather than set by the
-    /// caller, so it cannot come to disagree with them.
-    pub result: &'static str,
+    /// Derived from the findings rather than set by the caller, so it cannot
+    /// come to disagree with them — except for [`Outcome::Unanswerable`], which
+    /// no finding can imply and which the command marks explicitly with
+    /// [`Report::unanswerable`].
+    pub result: Outcome,
 
     pub findings: Vec<Finding>,
 
@@ -153,10 +174,24 @@ impl<T: Serialize> Report<T> {
             schema_version: SCHEMA_VERSION,
             tool_version: env!("CARGO_PKG_VERSION"),
             command,
-            result: if failed { "findings" } else { "ok" },
+            result: if failed {
+                Outcome::Findings
+            } else {
+                Outcome::Ok
+            },
             findings,
             data,
         }
+    }
+
+    /// Marks this report as one the command could not answer (exit 1).
+    ///
+    /// Deliberately explicit. No pattern in the findings distinguishes "the
+    /// database is unreachable" from "the declarations are invalid" — both are
+    /// errors — so the command that knows which it was has to say so.
+    pub fn unanswerable(mut self) -> Self {
+        self.result = Outcome::Unanswerable;
+        self
     }
 
     pub fn has_errors(&self) -> bool {
@@ -220,7 +255,7 @@ mod tests {
     #[test]
     fn a_report_with_only_warnings_is_still_ok() {
         let r = Report::plain("validate", vec![Finding::warning("x.y", "careful")]);
-        assert_eq!(r.result, "ok");
+        assert_eq!(r.result, Outcome::Ok);
         assert!(!r.has_errors());
         assert!(r.outcome().is_ok());
     }
@@ -237,7 +272,7 @@ mod tests {
                 Finding::warning("e.f", "careful"),
             ],
         );
-        assert_eq!(r.result, "findings");
+        assert_eq!(r.result, Outcome::Findings);
         assert!(r.outcome().is_err());
     }
 
@@ -258,6 +293,21 @@ mod tests {
         assert!(v["findings"][0].get("location").is_none());
         assert!(v["findings"][0].get("remedy").is_none());
         assert!(v.get("data").is_none());
+    }
+
+    /// The converter maps `result` straight to its own exit code, so the third
+    /// value has to survive into the JSON under the name it is documented by.
+    #[test]
+    fn an_unanswerable_report_says_so_in_the_json() {
+        let r = Report::plain(
+            "doctor",
+            vec![Finding::error("environment.unreachable", "no")],
+        )
+        .unanswerable();
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["result"], "unanswerable");
+        // The findings are unchanged: only the routing differs.
+        assert_eq!(v["findings"][0]["id"], "environment.unreachable");
     }
 
     #[test]

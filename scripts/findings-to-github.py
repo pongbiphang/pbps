@@ -17,6 +17,12 @@ anyone thought of (SPEC 14.1).
 The pipeline step must still fail on a finding. Swallowing the exit code to
 print annotations would produce a green build with red squiggles on it, which is
 worse than either alone.
+
+The code comes from the envelope's `result`, which carries the same three-way
+split as pbps's own exit codes — a pipe loses the producer's status, and
+re-deriving "could not answer" from the findings would put the routing rule in
+two places. Deriving it here once turned `doctor`'s exit 1 into a 2, which sends
+an unreachable database to whoever wrote the schema change.
 """
 
 import json
@@ -58,6 +64,11 @@ def main() -> int:
         )
         return 1
 
+    # ok -> 0, findings -> 2, unanswerable -> 1: the same split pbps itself uses
+    # (SPEC 9.8). An unrecognised value is treated as a finding rather than as
+    # success, because a green build is the one wrong answer that goes unnoticed.
+    EXIT = {"ok": 0, "findings": 2, "unanswerable": 1}
+
     findings = report.get("findings", [])
     for f in findings:
         level = LEVEL.get(f.get("severity", "error"), "error")
@@ -73,10 +84,13 @@ def main() -> int:
         print(f"::{level} {','.join(props)}::{escape(message)}")
 
     command = report.get("command", "pbps")
-    if report.get("result") == "findings":
+    result = report.get("result", "findings")
+    code = EXIT.get(result, 2)
+    if code == 1:
+        print(f"::error::{command}: could not complete; see the annotations above")
+    elif code != 0:
         print(f"::error::{command}: {len(findings)} finding(s)")
-        return 2
-    return 0
+    return code
 
 
 if __name__ == "__main__":

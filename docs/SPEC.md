@@ -965,9 +965,11 @@ copy blesses files the loader refuses, and does it quietly.
 
 ### 9.8 Machine-readable output and exit codes
 
-Every read-only command — `plan`, `validate`, `fmt`, `explain`, `doctor`,
-`verify`, `status` — takes `--format human|json` and, in JSON, emits one
-envelope:
+Every read-only command — `plan` (offline, including `--check`), `validate`,
+`fmt`, `explain`, `doctor`, `verify`, `status` — takes `--format human|json`
+and, in JSON, emits one envelope. `plan --db` is deliberately outside that set:
+it connects, reads the ledger and writes the deployment artifact, and what a
+reviewer reads *from* that artifact is `explain`.
 
 ```json
 {
@@ -999,6 +1001,14 @@ the severity of (14.1), so it must survive a reworded message. `schema_version`
 is the version of the envelope alone; it moves when a consumer would have to
 change, which the tool version does not.
 
+`result` is `ok`, `findings` or **`unanswerable`** — the same three-way split as
+the exit codes below, and for the same reason. A pipe loses the producer's
+status, so `scripts/findings-to-github.py` maps this field straight to its own
+exit code; re-deriving "could not answer" from the findings would put the routing
+rule in two places, and no pattern in them distinguishes an unreachable database
+from an invalid declaration. Both are errors. Only the command knows which it
+was, so the command says so.
+
 Three exit codes, and the split is the point:
 
 | Code | Meaning | Who it wakes |
@@ -1007,14 +1017,20 @@ Three exit codes, and the split is the point:
 | 2 | The command answered and found something to act on — invalid declarations, an unformatted file, a stale ids file, unresolved identity, drift, a plan that does not converge | whoever owns the change or the schema |
 | 1 | The command could not answer — an unreachable database, an unreadable file, contradictory flags | whoever runs CI |
 
+`fmt` on a file it cannot parse is the second case: the parse errors are the
+findings, but `fmt` never got to decide whether that file was canonical, so the
+result is `unanswerable`.
+
 A pipeline that cannot tell 1 from 2 sends half of every alert to the wrong
 person. `status` is the deliberate exception and always exits 0: it is a report
 rather than a gate (9.4), so its JSON carries findings at warning severity and
 the per-environment truth stays in `state`.
 
 `doctor` splits its own findings across 1 and 2, and the split is the same one:
-an unreachable or unconfigured environment is a question it *could not answer*,
-so that is 1, while everything it found by looking — invalid declarations, a
+an unreachable environment, an unconfigured one, or one whose permissions could
+not even be read is a question it *could not answer*, so that is 1 — an empty
+`missing_permissions` must never be mistaken for "none missing" when the query
+behind it failed. Everything it found by looking — invalid declarations, a
 missing permission, an environment mid-deployment — is 2. A pipeline running
 `doctor --env prod` must route a firewall or a missing credential to whoever
 runs CI, not to the author of the schema change.

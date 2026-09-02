@@ -1111,8 +1111,14 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     print_load_error(e);
                 }
             } else {
-                let report = output::Report::plain("fmt", errs.iter().map(load_finding).collect());
-                let _ = report.emit_json();
+                // Unanswerable: `fmt` did not get to decide whether the file is
+                // canonical, because it could not read it. The findings are the
+                // parse errors, but the routing is "the tool could not run".
+                let report = output::Report::plain("fmt", errs.iter().map(load_finding).collect())
+                    .unanswerable();
+                if let Ok(text) = serde_json::to_string_pretty(&report) {
+                    println!("{text}");
+                }
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;

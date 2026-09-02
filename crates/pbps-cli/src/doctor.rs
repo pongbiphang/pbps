@@ -61,6 +61,11 @@ pub struct EnvDiagnosis {
     pub supports_create_or_alter: Option<bool>,
     /// The permissions pbps needs and this account does not hold.
     pub missing_permissions: Vec<String>,
+
+    /// Set when the permission query itself failed, so an empty
+    /// `missing_permissions` means "not determined" rather than "none".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permissions_unknown: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -139,6 +144,7 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
                     supports_online: None,
                     supports_create_or_alter: None,
                     missing_permissions: Vec::new(),
+                    permissions_unknown: false,
                     detail: Some(e.to_string()),
                 },
             };
@@ -162,12 +168,37 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
         }),
     );
 
+    // Marked before it is printed, so the JSON and the exit code say the same
+    // thing: the converter in `scripts/` maps `result` straight to its own exit
+    // code, and a report that read `findings` while the process exited 1 would
+    // route an unreachable database to the author of the schema change.
+    let report = if unanswerable(&report) > 0 {
+        report.unanswerable()
+    } else {
+        report
+    };
+
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render(&report));
     }
     outcome(&report)
+}
+
+/// How many findings mean "I could not look", rather than "I looked and found".
+fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
+    report
+        .findings
+        .iter()
+        .filter(|f| {
+            f.severity == output::Severity::Error
+                && matches!(
+                    f.id,
+                    "environment.unreachable" | "environment.unconfigured" | "permission.unknown"
+                )
+        })
+        .count()
 }
 
 /// Which of the three exit codes this report ends on (SPEC §9.8).
@@ -183,14 +214,7 @@ pub fn cmd_doctor(project: &Project, env: Option<&str>, json: bool) -> anyhow::R
 /// Everything else it found — invalid declarations, a missing permission, an
 /// environment mid-deployment — it found by looking, so those stay at 2.
 fn outcome(report: &output::Report<Diagnosis>) -> anyhow::Result<()> {
-    let unanswerable = report
-        .findings
-        .iter()
-        .filter(|f| {
-            f.severity == output::Severity::Error
-                && matches!(f.id, "environment.unreachable" | "environment.unconfigured")
-        })
-        .count();
+    let unanswerable = unanswerable(report);
     if unanswerable > 0 {
         // The detail is already in the report above; this line is what `main`
         // prints after "error:", so it names the count rather than repeating one
@@ -210,6 +234,7 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
         supports_online: None,
         supports_create_or_alter: None,
         missing_permissions: Vec::new(),
+        permissions_unknown: false,
         detail: None,
     };
     let mut conn = match Conn::connect(connection).await {
@@ -246,7 +271,15 @@ async fn examine(name: &str, connection: &str) -> EnvDiagnosis {
                 .map(|(name, why)| format!("{name} — {why}"))
                 .collect();
         }
-        Err(e) => d.detail = Some(format!("could not read this account's permissions: {e}")),
+        // Not merely noted in `detail`: with the list left empty, a successful
+        // ledger read could go on to set `ready`, and `doctor` would print
+        // "Nothing to report; this project is ready" having never established
+        // whether the account can deploy at all. Silence in the one direction
+        // that matters is the worst answer this command can give.
+        Err(e) => {
+            d.permissions_unknown = true;
+            d.detail = Some(format!("could not read this account's permissions: {e}"));
+        }
     }
 
     // The ledger last, because it is the only question whose answer changes
@@ -359,6 +392,19 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             )),
         ),
         _ => {}
+    }
+    if d.permissions_unknown {
+        out.push(
+            output::Finding::error(
+                "permission.unknown",
+                format!(
+                    "{}: this account's permissions could not be read, so whether it can deploy \
+                     here is undetermined",
+                    d.environment
+                ),
+            )
+            .remedy("grant VIEW DEFINITION, or check what the login is mapped to in this database"),
+        );
     }
     for gap in &d.missing_permissions {
         out.push(output::Finding::error(

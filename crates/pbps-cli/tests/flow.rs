@@ -2531,3 +2531,62 @@ fn every_per_environment_remedy_names_its_environment() {
         }
     }
 }
+
+// ---- Fifth review round ----
+
+/// The envelope's `result` is what `scripts/findings-to-github.py` maps to its
+/// own exit code — a pipe loses the producer's status. Two values could not
+/// express "could not answer", so the converter turned `doctor`'s exit 1 into a
+/// 2 and routed an unreachable database to the author of the schema change.
+#[test]
+fn the_envelope_result_matches_the_exit_code_the_command_used() {
+    let d = Demo::new("resultcode");
+    d.table(ONE_COLUMN);
+
+    // Could not answer.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_RESULT_UNSET\n",
+    )
+    .unwrap();
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "unanswerable");
+
+    // Answered, and found something.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "findings");
+
+    // Answered, nothing to act on.
+    d.table(ONE_COLUMN);
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+}
+
+/// `fmt` on a file it cannot parse has not decided whether that file is
+/// canonical — it never got to look. The findings are the parse errors; the
+/// routing is "the tool could not run".
+#[test]
+fn fmt_on_an_unparseable_file_is_unanswerable_not_a_finding() {
+    let d = Demo::new("fmtunparseable");
+    d.table("table: dbo.t\ncolumns: [this is not a mapping\n");
+
+    let o = d.run(&["fmt", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "unanswerable");
+    assert!(
+        v["findings"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("load."),
+        "{v}"
+    );
+}
