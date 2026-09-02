@@ -430,6 +430,20 @@ Phase 3.1 additions worth knowing before touching them:
     with an apply blocked, and `explain` printed the approval command for a
     target that was changing under it. A guard whose reason has gone is not
     harmless — it is a filter nobody re-reads.
+47. **A flag is honoured or refused, never accepted and dropped.**
+    `plan --db --format json` took the flag and ignored it — prose on success,
+    empty stdout on failure, while the flag validations in the same invocation
+    answered JSON properly. It is refused now, not implemented: `plan --db`
+    produces an *artifact*, and its typed form already exists and is better than
+    an envelope — `--out plan.json`, read back with `explain --plan --format
+    json`. A second typed rendering would give a reviewer two documents to
+    disagree about.
+48. **A path is spelled with `to_str`, never `display()`, before it is put in a
+    command.** On Unix a filename is bytes; `display()` substitutes U+FFFD,
+    which `shell_arg` neither refuses nor leaves bare — so a lossy path came
+    back neatly quoted, naming a file that does not exist. A path that cannot be
+    spelled is in the same position as one that cannot be quoted: the
+    placeholder, with the literal printed where nothing can execute it.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

@@ -124,8 +124,9 @@ enum Command {
         #[arg(long)]
         dev: Option<String>,
 
-        /// human (default) or json. Only meaningful with --check, which is the
-        /// read-only file check CI runs
+        /// human (default) or json. Not accepted with --db/--env: a connected
+        /// plan's typed form is the plan file itself (--out), read back with
+        /// `pbps explain --plan`
         #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
@@ -604,6 +605,26 @@ fn run() -> anyhow::Result<()> {
                     refuse(
                         "--dev rehearses a preview and --db computes the plan for a real \
                          environment; run them separately",
+                    )?;
+                }
+                if json {
+                    // Refused rather than ignored. `--format json` was accepted
+                    // here and then dropped: `cmd_plan_db` prints human text, so
+                    // a consumer that asked for JSON got prose on success and an
+                    // *empty stdout* on every failure — while the flag
+                    // validations a few lines above, in the same invocation,
+                    // answered it properly. Silently honouring a flag in some
+                    // branches of one command is worse than not having it.
+                    //
+                    // Refused rather than implemented, because `plan --db` is
+                    // not a findings command: its output *is* an artifact. The
+                    // typed form of this plan already exists and is better than
+                    // an envelope would be — `--out plan.json`, which is the
+                    // file the deployment gate approves, read back by `explain
+                    // --plan --format json`. Adding a second typed rendering
+                    // would give a reviewer two documents to disagree about.
+                    refuse(
+                        "--format json describes findings, and `plan --db` produces a plan.\n                         Write it with --out <plan.json> and read it with                          `pbps explain --plan <plan.json> --format json`",
                     )?;
                 }
                 let target = output::or_unanswerable(

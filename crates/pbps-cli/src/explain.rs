@@ -272,8 +272,20 @@ fn explain(
     // literal value is printed on a line of its own where nothing can execute
     // it (see `shell_arg`). Better a command that has to be completed by hand
     // than one that redirects or runs something when it is pasted.
+    //
+    // `to_str`, not `display()`: on Unix a filename is bytes, and `display()`
+    // substitutes U+FFFD for the ones that are not UTF-8. That character is not
+    // in `shell_arg`'s bare set and is not one of its refusals either, so the
+    // path came back neatly double-quoted — naming a *different* file, usually
+    // one that does not exist. `explain` had read the real plan and would then
+    // advertise a command that cannot open it. A path this cannot spell is in
+    // the same position as one it cannot quote: the placeholder is the honest
+    // answer, and the literal line below still shows the reader what was read.
     let literal = path.display().to_string();
-    let plan_arg = shell_arg(&literal).unwrap_or_else(|| PLAN_PLACEHOLDER.to_owned());
+    let plan_arg = path
+        .to_str()
+        .and_then(shell_arg)
+        .unwrap_or_else(|| PLAN_PLACEHOLDER.to_owned());
 
     // An offline plan has no approval command, because there is nothing to
     // approve: `apply` refuses a `Preview` structurally, whatever target and

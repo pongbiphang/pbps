@@ -4516,3 +4516,113 @@ fn doctor_and_explain_see_a_lock_that_outlived_its_state_table() {
         "the surviving lock is missing from the report:\n{out}"
     );
 }
+
+// ---- Thirtieth review round ----
+
+/// `plan --db --format json` accepted the flag and dropped it: `cmd_plan_db`
+/// prints human text, so a consumer that asked for JSON got prose on success
+/// and an **empty stdout** on every failure — while the flag validations a few
+/// lines above, in the same invocation, answered it properly.
+///
+/// Refused rather than implemented. `plan --db` is not a findings command: its
+/// output is an artifact, and the typed form of that artifact already exists
+/// and is better than an envelope — `--out plan.json`, read back with `explain
+/// --plan --format json`. A second typed rendering would give a reviewer two
+/// documents to disagree about.
+#[test]
+fn plan_against_a_target_refuses_json_rather_than_ignoring_it() {
+    let d = Demo::new("plandbjson");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    // Deliberately unreachable: the refusal must come from the flags, before
+    // anything tries to connect, so the test says nothing about the network.
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+    // The message has to name the path that does work, or the refusal just
+    // moves the consumer's problem one step along.
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--out") && m.contains("explain")),
+        "{v}"
+    );
+}
+
+/// The negative case: without a target, `--format json` still works. The
+/// refusal is about the connected form only.
+#[test]
+fn an_offline_plan_still_speaks_json() {
+    let d = Demo::new("planofflinejson");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "ok", "{v}");
+}
+
+/// On Unix a filename is bytes, and `Path::display()` substitutes U+FFFD for
+/// the ones that are not UTF-8. That character is not in `shell_arg`'s bare set
+/// and is not one of its refusals either, so a lossy path came back neatly
+/// double-quoted — naming a *different* file, usually one that does not exist.
+/// `explain` had read the real plan and would then advertise a command that
+/// cannot open it.
+///
+/// Unix-only because no other platform can produce the input.
+#[cfg(unix)]
+#[test]
+fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let d = Demo::new("lossypath");
+    d.table(ONE_COLUMN);
+    // An *applyable* plan: `explain` prints no approval command for a preview,
+    // by design, so a preview would pass this test without exercising anything.
+    let src = write_plan(&d, "src.json", "transactional");
+    // 0xFF is not valid UTF-8 in any position.
+    let name = std::ffi::OsStr::from_bytes(b"plan-\xff-.json");
+    let lossy = d.dir.join(name);
+    std::fs::copy(&src, &lossy).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .arg("explain")
+        .arg("--plan")
+        .arg(&lossy)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+
+    // It read the real file, which is the premise: the report is about this
+    // plan, and only the *command* it advertises was wrong.
+    assert!(
+        out.contains("prod as queried (entry #1)"),
+        "the plan itself was not read:\n{out}"
+    );
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps apply"))
+        .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
+    assert!(
+        line.contains("<plan path>"),
+        "a path that cannot be spelled must not be advertised: {line}"
+    );
+    // And the literal is still shown, on a line of its own, so the reader can
+    // see what was read even though it cannot be pasted.
+    assert!(out.contains("<plan path> is:"), "{out}");
+}
