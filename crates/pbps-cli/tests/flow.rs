@@ -4709,8 +4709,15 @@ fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
 #[test]
 #[ignore = "needs docker and a SQL Server image; set PBPS_TEST_DEV_IMAGE (see scripts/live-tests.sh)"]
 fn a_dev_container_outlives_the_call_that_started_it() {
+    // Skipped, not panicked, when the variable is absent — unlike every other
+    // test in this file, which panics on a missing `PBPS_TEST_DB`. The
+    // difference is that CI sets `PBPS_TEST_DB` always, so its absence is a
+    // broken setup worth shouting about, while `PBPS_TEST_DEV_IMAGE` is opt-in
+    // and CI deliberately leaves it unset. Copying the panic here turned "this
+    // test is not enabled" into a red `live` job.
     let Ok(image) = std::env::var("PBPS_TEST_DEV_IMAGE") else {
-        panic!("PBPS_TEST_DEV_IMAGE is not set");
+        eprintln!("skipped: PBPS_TEST_DEV_IMAGE is not set (see scripts/live-tests.sh)");
+        return;
     };
 
     let d = Demo::new("devdocker");
