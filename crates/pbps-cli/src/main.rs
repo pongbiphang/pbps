@@ -445,7 +445,15 @@ fn run() -> anyhow::Result<()> {
         && target.env.is_none()
     {
         let target = target.db.as_deref().map(db::target_from_connection);
-        return explain::cmd_explain(plan, target.as_ref(), None, *format == OutputFormat::Json);
+        return explain::cmd_explain(
+            plan,
+            match target {
+                Some(t) => explain::Target::Reachable(t),
+                None => explain::Target::None,
+            },
+            None,
+            *format == OutputFormat::Json,
+        );
     }
     let project = Project::discover(&start)?;
 
@@ -462,11 +470,17 @@ fn run() -> anyhow::Result<()> {
             target,
             format,
         } => {
+            // A resolution failure is *not* propagated. The whole design of
+            // this command is that the file half of the explanation survives a
+            // database the reviewer cannot reach — `target_state` already
+            // degrades an unreachable target to a line in the report — so an
+            // unset `url_env` variable must not suppress the entire
+            // explanation, which is exactly what `?` here did.
             let env = target.env.clone();
-            let target = target.resolve(&project)?;
+            let resolved = target.resolve(&project);
             explain::cmd_explain(
                 &plan,
-                Some(&target),
+                explain::Target::from(resolved),
                 env.as_deref(),
                 format == OutputFormat::Json,
             )
@@ -995,7 +1009,26 @@ pub fn validate_findings(
 }
 
 fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
-    let dialect = dialect(project)?;
+    // `postgres` is an accepted `DialectName` with no implementation yet, so
+    // this is a reachable failure on a perfectly valid project — and it escaped
+    // before the JSON branch, leaving stdout empty.
+    let dialect = match dialect(project) {
+        Ok(d) => d,
+        Err(e) => {
+            if format == OutputFormat::Json {
+                let report = output::Report::plain(
+                    "validate",
+                    vec![
+                        output::Finding::error("project.unsupported-dialect", format!("{e:#}"))
+                            .at(project.config_file(), None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
     let (findings, data) = validate_findings(project, dialect.as_ref());
     let report = output::Report::new("validate", findings, Some(data));
 

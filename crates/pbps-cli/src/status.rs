@@ -161,7 +161,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
                     // the reader to work out which of the six it meant.
                     f = f.remedy(format!(
                         "pbps apply --env {} --plan <plan.json> --staged --resume",
-                        r.environment
+                        crate::report::env_arg(&r.environment)
                     ));
                 }
                 f

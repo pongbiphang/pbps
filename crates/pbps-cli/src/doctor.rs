@@ -422,9 +422,11 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             // a remedy without one is a command that fails the moment it is
             // pasted — and this one is aimed at a first-time user, who has the
             // least standing to work out why.
+            // Quoted: an environment name is a YAML map key, so `US West` is
+            // valid and interpolated verbatim becomes two arguments.
             .remedy(format!(
                 "pbps baseline --env {} --reason \"adopting this environment\"",
-                d.environment
+                crate::report::env_arg(&d.environment)
             )),
         ),
         "mid-deployment" => out.push(
@@ -440,7 +442,7 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             )
             .remedy(format!(
                 "pbps apply --env {} --plan <plan.json> --staged --resume",
-                d.environment
+                crate::report::env_arg(&d.environment)
             )),
         ),
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
@@ -475,7 +477,7 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
             )
             .remedy(format!(
                 "if no apply is running: pbps unlock --env {}",
-                d.environment
+                crate::report::env_arg(&d.environment)
             )),
         ),
         _ => {}

@@ -25,6 +25,7 @@ use anyhow::Context as _;
 use pbps_dialect::Dialect;
 use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
+use crate::report::shell_arg;
 use crate::{db, output, report};
 
 /// What stands in for an environment the reviewer has to supply.
@@ -91,15 +92,38 @@ pub struct RiskDetail {
 #[derive(serde::Serialize)]
 pub struct TargetState {
     pub environment: String,
-    /// `ready`, `locked`, `mid-deployment`, `uninitialized` or `unreachable`.
+    /// `ready`, `locked`, `mid-deployment`, `uninitialized`, `unreachable` or
+    /// `unconfigured`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
+/// What the reviewer asked this explanation to be about.
+///
+/// A target that could not even be resolved is carried rather than propagated,
+/// because the file half of the explanation is the whole point of the command:
+/// `target_state` already degrades an unreachable database to one line in the
+/// report, and an unset `url_env` variable must not do worse than an unplugged
+/// network cable.
+pub enum Target {
+    None,
+    Reachable(db::Target),
+    Unresolved(anyhow::Error),
+}
+
+impl From<anyhow::Result<db::Target>> for Target {
+    fn from(r: anyhow::Result<db::Target>) -> Self {
+        match r {
+            Ok(t) => Target::Reachable(t),
+            Err(e) => Target::Unresolved(e),
+        }
+    }
+}
+
 pub fn cmd_explain(
     path: &std::path::Path,
-    target: Option<&db::Target>,
+    target: Target,
     env: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -151,7 +175,7 @@ pub fn cmd_explain(
         }
     };
 
-    let explanation = explain(&plan, dialect.as_ref(), path, target, env)?;
+    let explanation = explain(&plan, dialect.as_ref(), path, &target, env)?;
     let findings = findings(&plan, &explanation);
 
     if json {
@@ -213,7 +237,7 @@ fn explain(
     plan: &SavedPlan,
     dialect: &dyn Dialect,
     path: &std::path::Path,
-    target: Option<&db::Target>,
+    target: &Target,
     env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
@@ -305,8 +329,15 @@ fn explain(
             .collect(),
         statement_count: crate::statements(cs, dialect)?.len(),
         target: match target {
-            Some(t) => Some(target_state(t)?),
-            None => None,
+            Target::None => None,
+            Target::Reachable(t) => Some(target_state(t)?),
+            // Reported, not fatal, and phrased as what it is: the environment
+            // was never reached because it was never resolved.
+            Target::Unresolved(e) => Some(TargetState {
+                environment: env.unwrap_or("the given target").to_owned(),
+                state: "unconfigured",
+                detail: Some(format!("{e:#}")),
+            }),
         },
     })
 }
@@ -529,51 +560,6 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         ));
     }
     out
-}
-
-/// One argument, quoted so that pasting it passes the value through unchanged —
-/// or `None` when no spelling can promise that.
-///
-/// # Why there is a `None`
-///
-/// This line is read in POSIX shells, PowerShell and `cmd`, and their quoting
-/// rules do not overlap enough to cover everything:
-///
-/// - POSIX single quotes are literal, but **`cmd` does not treat `'` as quoting
-///   at all**, so `&`, `|`, `<` and `>` stay live inside them. An earlier
-///   version of this function used single quotes for exactly those characters
-///   and claimed it failed safe in `cmd`; it does not — `cmd` would split the
-///   command at the `&` and run the remainder.
-/// - Double quotes are understood by all three for *splitting*, but POSIX
-///   shells and PowerShell still expand `$` and a backtick inside them.
-///
-/// So there is no single string that is safe everywhere for a value containing
-/// both families. Rather than pick a form that is wrong on one platform, this
-/// returns `None` and the caller prints the path on a line of its own, where
-/// nothing can execute it. A command that cannot be pasted blindly is a much
-/// smaller problem than one that redirects or runs something when it is.
-fn shell_arg(value: &str) -> Option<String> {
-    // `~` is safe away from the front: it means home-directory expansion as the
-    // first character of a word and nothing at all elsewhere, and every Windows
-    // short path is full of it (`C:\Users\RUNNER~1\...`).
-    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=~".contains(c);
-    if !value.is_empty() && !value.starts_with('~') && value.chars().all(bare) {
-        return Some(value.to_owned());
-    }
-
-    // Double quotes hold for a value a shell would only *split* — a space, most
-    // often. They do not neutralize expansion (`$`, a backtick), a quote of the
-    // same kind, a newline, or a trailing backslash, which would escape the
-    // closing quote itself — and a Windows directory path ends with one more
-    // often than not.
-    let expands = value.contains(['$', '`', '"', '\n']) || value.ends_with('\\');
-    // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
-    // quote character to wrap them in.
-    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%']);
-    if expands || cmd_metacharacters {
-        return None;
-    }
-    Some(format!("\"{value}\""))
 }
 
 #[cfg(test)]

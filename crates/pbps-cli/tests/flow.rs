@@ -3158,3 +3158,95 @@ fn doctor_reports_server_capabilities_or_says_it_could_not_read_them() {
         "{v}"
     );
 }
+
+// ---- Eleventh review round ----
+
+/// `postgres` is an accepted `DialectName` with no implementation yet, so this
+/// is a reachable failure on a perfectly valid project — and it escaped before
+/// the JSON branch, leaving stdout empty.
+#[test]
+fn validate_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("validatedialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("pbps.yml"),
+        "{v}"
+    );
+}
+
+/// The file half of an explanation is the whole point of the command, and
+/// `target_state` already degrades an unreachable database to one line in the
+/// report. An unset `url_env` variable must not do worse than an unplugged
+/// network cable — it did, suppressing the entire explanation.
+#[test]
+fn explain_still_explains_when_the_environment_variable_is_unset() {
+    let d = Demo::new("explainunset");
+    let plan = risky_plan(&d);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_EXPLAIN_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap(), "--env", "prod"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    // The explanation is all there.
+    assert!(out.contains("drop column pii"), "{out}");
+    assert!(out.contains("data is lost"), "{out}");
+    // And the target is reported as what it is, not silently omitted.
+    assert!(out.contains("unconfigured"), "{out}");
+    assert!(out.contains("PBPS_EXPLAIN_UNSET"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--env",
+        "prod",
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["target"]["state"], "unconfigured", "{v}");
+    assert_eq!(v["data"]["change_count"], 2, "{v}");
+}
+
+/// Environment names are YAML map keys, so `US West` is a valid one — and
+/// interpolated verbatim into a copy-pastable remedy it becomes two arguments.
+#[test]
+fn a_remedy_quotes_an_environment_name_a_shell_would_split() {
+    let d = Demo::new("remedyquote");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  \"US West\":\n    url_env: PBPS_REMEDY_QUOTE_UNSET\n",
+    )
+    .unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    for f in v["findings"].as_array().unwrap() {
+        let Some(remedy) = f["remedy"].as_str() else {
+            continue;
+        };
+        if !remedy.contains("--env ") {
+            continue;
+        }
+        assert!(
+            remedy.contains("--env \"US West\""),
+            "an environment name a shell would split must be quoted: {remedy}"
+        );
+    }
+}

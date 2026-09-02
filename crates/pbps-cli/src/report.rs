@@ -405,3 +405,59 @@ pub fn describe(c: &Change) -> String {
         Change::DropModule { kind, .. } => format!("- drop {kind}"),
     }
 }
+
+/// One argument, quoted so that pasting it passes the value through unchanged —
+/// or `None` when no spelling can promise that.
+///
+/// # Why there is a `None`
+///
+/// This line is read in POSIX shells, PowerShell and `cmd`, and their quoting
+/// rules do not overlap enough to cover everything:
+///
+/// - POSIX single quotes are literal, but **`cmd` does not treat `'` as quoting
+///   at all**, so `&`, `|`, `<` and `>` stay live inside them. An earlier
+///   version of this function used single quotes for exactly those characters
+///   and claimed it failed safe in `cmd`; it does not — `cmd` would split the
+///   command at the `&` and run the remainder.
+/// - Double quotes are understood by all three for *splitting*, but POSIX
+///   shells and PowerShell still expand `$` and a backtick inside them.
+///
+/// So there is no single string that is safe everywhere for a value containing
+/// both families. Rather than pick a form that is wrong on one platform, this
+/// returns `None` and the caller prints the path on a line of its own, where
+/// nothing can execute it. A command that cannot be pasted blindly is a much
+/// smaller problem than one that redirects or runs something when it is.
+pub fn shell_arg(value: &str) -> Option<String> {
+    // `~` is safe away from the front: it means home-directory expansion as the
+    // first character of a word and nothing at all elsewhere, and every Windows
+    // short path is full of it (`C:\Users\RUNNER~1\...`).
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:\\@+=~".contains(c);
+    if !value.is_empty() && !value.starts_with('~') && value.chars().all(bare) {
+        return Some(value.to_owned());
+    }
+
+    // Double quotes hold for a value a shell would only *split* — a space, most
+    // often. They do not neutralize expansion (`$`, a backtick), a quote of the
+    // same kind, a newline, or a trailing backslash, which would escape the
+    // closing quote itself — and a Windows directory path ends with one more
+    // often than not.
+    let expands = value.contains(['$', '`', '"', '\n']) || value.ends_with('\\');
+    // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
+    // quote character to wrap them in.
+    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%']);
+    if expands || cmd_metacharacters {
+        return None;
+    }
+    Some(format!("\"{value}\""))
+}
+
+/// A `--env` argument for a copy-pastable remedy.
+///
+/// Environment names are YAML map keys, so `US West` is a perfectly valid one —
+/// and interpolated verbatim it becomes two arguments. Where no cross-shell
+/// spelling exists the caller gets `None` and should fall back to a placeholder;
+/// a remedy that changes meaning when pasted is worse than one that has to be
+/// completed by hand.
+pub fn env_arg(name: &str) -> String {
+    shell_arg(name).unwrap_or_else(|| "<environment>".to_owned())
+}
