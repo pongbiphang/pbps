@@ -3549,3 +3549,133 @@ fn plan_json_emits_an_envelope_when_the_baseline_cannot_be_read() {
         assert_eq!(v["findings"][0]["id"], "baseline.unreadable", "{v}");
     }
 }
+
+// ---- Eighteenth review round ----
+
+/// `explain`'s file half is the whole point of the command: the reviewer may
+/// have been handed nothing but the plan. `--env` needs a project to resolve
+/// the *name*, but that is a fact about the environment, not about the
+/// explanation — and discovery failing suppressed the entire report.
+#[test]
+fn explain_still_explains_with_an_env_outside_a_project() {
+    let d = Demo::new("explainnoproject");
+    let plan = risky_plan(&d);
+    let elsewhere = d.root.join("no-project");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&elsewhere)
+        .args(["explain", "--plan", plan.to_str().unwrap(), "--env", "prod"])
+        .output()
+        .unwrap();
+    // Still exit 0: explaining a plan is not a gate, whatever the target did.
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("dbo.customer"),
+        "the plan must still be explained: {out}"
+    );
+    assert!(
+        out.contains("prod"),
+        "the environment must still be named, as unresolved: {out}"
+    );
+}
+
+/// The artifact is the deliverable, so a `--out` that cannot be written is a
+/// failure of the whole command — and it escaped before the JSON branch. A
+/// missing parent directory is the ordinary way this happens in CI.
+#[test]
+fn plan_json_emits_an_envelope_when_the_artifact_cannot_be_written() {
+    let d = Demo::new("planunwritable");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let nowhere = d.dir.join("no/such/dir/plan.json");
+    for flag in ["--out", "--sql"] {
+        let o = d.run(&["plan", flag, nowhere.to_str().unwrap(), "--format", "json"]);
+        assert_eq!(code(&o), 1, "{flag}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{flag}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "plan.unwritable", "{v}");
+    }
+}
+
+/// The three-way exit-code split is the feature (SPEC §9.8), and this is the
+/// case that most needs it to be right: the database *was* reached and a
+/// difference *was* established — the differ simply has no `Change` for it —
+/// so it is drift, not "could not look". Folding it into the connection
+/// catch-all reported `environment.unreachable` and exited 1, waking whoever
+/// owns CI instead of whoever owns the schema.
+///
+/// Only a real engine can produce this: `IDENTITY` is a property no `ALTER`
+/// can change, so it needs a table that really has one and really loses it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let sqlcmd = |query: &str| {
+        std::process::Command::new("docker")
+            .args([
+                "exec",
+                "pbps-test-mssql",
+                "/opt/mssql-tools18/bin/sqlcmd",
+                "-C",
+                "-S",
+                "localhost",
+                "-U",
+                "sa",
+                "-P",
+                "Pbps!Test12345",
+                "-Q",
+                query,
+            ])
+            .output()
+    };
+
+    let d = Demo::new("verifyidentity");
+    d.table("table: dbo.ident_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let made = sqlcmd(
+        "IF OBJECT_ID(N'dbo.ident_drift', N'U') IS NOT NULL DROP TABLE dbo.ident_drift; \
+         CREATE TABLE dbo.ident_drift (id bigint IDENTITY(1,1) NOT NULL);",
+    );
+    if made.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+    // Records the live state, which has the IDENTITY, as the baseline.
+    assert_eq!(
+        code(&d.run(&["snapshot", "--db", &connection, "--force"])),
+        0
+    );
+    // The same table without it. No ALTER can do this, which is the point.
+    let _ =
+        sqlcmd("DROP TABLE dbo.ident_drift; CREATE TABLE dbo.ident_drift (id bigint NOT NULL);");
+
+    let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let _ = sqlcmd("DROP TABLE dbo.ident_drift;");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(
+        code(&o),
+        FINDING,
+        "reached and differing is exit 2, not 1: {v}"
+    );
+    assert_eq!(v["result"], "findings", "{v}");
+    assert_eq!(v["findings"][0]["id"], "state.drift-unexpressible", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("IDENTITY")),
+        "the message must name what differs: {v}"
+    );
+}

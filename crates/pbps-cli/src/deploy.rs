@@ -265,18 +265,20 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // about; passing the declarations' strategies here would put a
             // hint nobody can act on into a report about what already happened.
             &pbps_model::Hints::default(),
-        )
-        .map_err(|errs| {
-            for e in &errs {
-                eprintln!("  {e}");
-            }
-            anyhow::anyhow!(
-                "the live database differs in {} way(s) that cannot even be expressed as changes",
-                errs.len()
-            )
-        })?;
+        );
+        // Handed back rather than turned into an error. The database was
+        // reached and a difference *was* established — the differ simply has
+        // no `Change` for it — so this is drift, not "could not look". Folding
+        // it into the catch-all below labelled it `environment.unreachable`
+        // and exited 1, which wakes whoever owns CI instead of whoever owns
+        // the schema. That split is the whole point of the three exit codes
+        // (SPEC §9.8).
+        let changes = match changes {
+            Ok(c) => c,
+            Err(errs) => return Ok(Err(errs)),
+        };
 
-        Ok(pbps_model::DriftReport {
+        Ok(Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
             environment: target.label.clone(),
             checked_at,
@@ -291,9 +293,38 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
             changes,
             unmanaged: scoped.unmanaged,
-        })
+        }))
     }) {
-        Ok(r) => r,
+        Ok(Ok(r)) => r,
+        // Reached, and differing in a way the differ has no `Change` for.
+        // `verify` answered — that is exit 2 and the schema owner's problem,
+        // not exit 1 and CI's. One finding per difference, because the differ
+        // returns one per unexpressible change and the column name in it is
+        // the remedy.
+        Ok(Err(errs)) => {
+            let findings: Vec<crate::output::Finding> = errs
+                .iter()
+                .map(|e| {
+                    crate::output::Finding::error(
+                        "state.drift-unexpressible",
+                        format!("{}: {e}", target.label),
+                    )
+                })
+                .collect();
+            if json {
+                return crate::output::Report::new("verify", findings, None::<()>).emit_json();
+            }
+            eprintln!(
+                "`{}` no longer matches its recorded state, in {} way(s) that cannot even be \
+                 expressed as changes:",
+                target.label,
+                errs.len()
+            );
+            for e in &errs {
+                eprintln!("  {e}");
+            }
+            return Err(crate::Found::new("").into());
+        }
         Err(e) => {
             // Unanswerable: `verify` was asked whether this database still
             // matches its recorded state, and it could not look. Without

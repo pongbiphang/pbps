@@ -349,14 +349,17 @@ impl Command {
         let (name, format) = match self {
             Command::Plan { format, .. } => ("plan", *format),
             Command::Doctor { format, .. } => ("doctor", *format),
-            Command::Explain { format, .. } => ("explain", *format),
             Command::Validate { format } => ("validate", *format),
             Command::Fmt { format, .. } => ("fmt", *format),
             Command::Verify { format, .. } => ("verify", *format),
             Command::Status { format, .. } => ("status", *format),
             // Everything else either speaks no envelope (the write commands,
             // `docs`, the intent commands) or returns before discovery.
-            Command::Init(_)
+            // `explain` never reaches discovery: it returns above, with an
+            // undiscoverable project reported as an unresolved *target* rather
+            // than as a failure of the whole command.
+            Command::Explain { .. }
+            | Command::Init(_)
             | Command::Schema { .. }
             | Command::Completions { .. }
             | Command::Man { .. }
@@ -482,16 +485,27 @@ fn run() -> anyhow::Result<()> {
         target,
         format,
     } = &cli.command
-        && target.env.is_none()
     {
-        let target = target.db.as_deref().map(db::target_from_connection);
+        // Every form of `explain` returns here, including `--env`. The `--env`
+        // form does need a project — the name only means something inside a
+        // `pbps.yml` — but that is a fact about the *environment*, not about
+        // the explanation, whose file half is the entire point of the command
+        // and must survive a reviewer with no checkout. Discovery failing used
+        // to suppress the whole report, the same mistake an unset `url_env`
+        // made one layer down and for the same reason.
+        let resolved = match (&target.db, &target.env) {
+            (Some(db), _) => explain::Target::Reachable(db::target_from_connection(db)),
+            (None, Some(_)) => explain::Target::from(
+                Project::discover(&start)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|project| target.resolve(&project)),
+            ),
+            (None, None) => explain::Target::None,
+        };
         return explain::cmd_explain(
             plan,
-            match target {
-                Some(t) => explain::Target::Reachable(t),
-                None => explain::Target::None,
-            },
-            None,
+            resolved,
+            target.env.as_deref(),
             *format == OutputFormat::Json,
         );
     }
@@ -515,29 +529,9 @@ fn run() -> anyhow::Result<()> {
         Command::Init(_)
         | Command::Schema { .. }
         | Command::Completions { .. }
-        | Command::Man { .. } => {
+        | Command::Man { .. }
+        | Command::Explain { .. } => {
             unreachable!("these return before project discovery")
-        }
-        // Only the --env form reaches here; the rest returned above.
-        Command::Explain {
-            plan,
-            target,
-            format,
-        } => {
-            // A resolution failure is *not* propagated. The whole design of
-            // this command is that the file half of the explanation survives a
-            // database the reviewer cannot reach — `target_state` already
-            // degrades an unreachable target to a line in the report — so an
-            // unset `url_env` variable must not suppress the entire
-            // explanation, which is exactly what `?` here did.
-            let env = target.env.clone();
-            let resolved = target.resolve(&project);
-            explain::cmd_explain(
-                &plan,
-                explain::Target::from(resolved),
-                env.as_deref(),
-                format == OutputFormat::Json,
-            )
         }
         Command::Plan {
             target,
@@ -1745,7 +1739,11 @@ fn cmd_plan(
             res.ids.clone(),
         );
         plan.git_sha = db::git_sha(project.root());
-        write_plan(path, &plan)?;
+        // The artifact is the deliverable, so failing to write it is a failure
+        // of the whole command — but it is still the *command* that could not
+        // finish, not a finding about the declarations. A read-only or missing
+        // parent directory is the ordinary way this happens in CI.
+        output::or_unanswerable("plan", json, "plan.unwritable", write_plan(path, &plan))?;
         if !json {
             println!(
                 "\nwrote {} (a preview; `apply` will refuse it)",
@@ -1755,9 +1753,22 @@ fn cmd_plan(
     }
 
     if let Some(path) = sql {
-        let script = render_sql(&cs, dialect.as_ref(), &base.description)?;
-        std::fs::write(path, script)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        // Rendering can fail for the same reason `explain` can — a typed change
+        // the emitter refuses — and writing for the same reason `--out` can.
+        // Both leave the command unable to produce what it was asked for.
+        let script = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unwritable",
+            render_sql(&cs, dialect.as_ref(), &base.description),
+        )?;
+        output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unwritable",
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display())),
+        )?;
         if !json {
             println!("wrote {}", path.display());
         }
