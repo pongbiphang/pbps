@@ -524,7 +524,11 @@ impl Change {
             Change::DropModule { .. } => {
                 r.insert(RiskClass::Destructive);
             }
-            Change::RenameTable { .. } | Change::RenameColumn { .. } => {
+            // A role rename keeps its membership — which is why it is a
+            // rename and not drop + add — but the old name is gone the same
+            // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
+            // application breaks on the spot. Same gate as the other renames.
+            Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
                 r.insert(RiskClass::Rename);
             }
             Change::AlterColumnNullability {
@@ -582,10 +586,8 @@ impl Change {
             // the plan. Changing the mode emits nothing at all.
             | Change::InsertRow { .. }
             | Change::SetDataMode { .. }
-            // Creating a role grants nothing by itself, and a rename keeps its
-            // membership — which is the whole reason it is a rename.
-            | Change::CreateRole { .. }
-            | Change::RenameRole { .. } => {}
+            // Creating a role grants nothing by itself.
+            | Change::CreateRole { .. } => {}
         }
         r
     }

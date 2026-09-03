@@ -155,11 +155,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             out.push(Statement::new(format!("DROP ROLE {};", quote(name)?)));
             Ok(out)
         }
-        Change::RenameRole { from, to, .. } => one(format!(
-            "ALTER ROLE {} WITH NAME = {};",
-            quote(from)?,
-            quote(to)?
-        )),
+        // The statement says what it does to the name (`Statement::renaming_role`),
+        // as a table rename does, so a staged checkpoint finds the role again.
+        Change::RenameRole { from, to, .. } => Ok(vec![
+            Statement::new(format!(
+                "ALTER ROLE {} WITH NAME = {};",
+                quote(from)?,
+                quote(to)?
+            ))
+            .renaming_role(from.clone(), to.clone()),
+        ]),
         Change::Grant {
             role,
             target,
@@ -1566,12 +1571,28 @@ mod tests {
         );
         // ALTER, never drop + add: the membership has to survive.
         let sql = sql_of(&Change::RenameRole {
-            uid,
+            uid: uid.clone(),
             from: "reader".into(),
             to: "app_reader".into(),
         });
         assert_eq!(sql, ["ALTER ROLE [reader] WITH NAME = [app_reader];"]);
         assert!(!sql[0].contains("DROP"), "{sql:?}");
+        // And the statement says what it did to the name, as a table rename's
+        // do, so a staged checkpoint finds the role again (DECISIONS 93).
+        let stmts = emit(
+            &Change::RenameRole {
+                uid,
+                from: "reader".into(),
+                to: "app_reader".into(),
+            },
+            Strategy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            stmts[0].role_renames,
+            [("reader".to_owned(), "app_reader".to_owned())]
+        );
+        assert!(stmts[0].renames.is_empty());
     }
 
     #[test]

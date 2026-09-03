@@ -717,3 +717,28 @@ SPEC is in sync with all of these.
     keeps reading the same WKT and calling it clean. 70's shape again:
     refused by name as a key and as a set cell, with a typed value in the
     model as the way to lift it.
+91. **A role rename faces the `rename` gate.** It keeps its membership, which
+    is why it is a rename and not drop + add — but the old name is gone the
+    same way a table's is, and a module or an application that asks
+    `IS_ROLEMEMBER('old')` breaks the moment the statement commits. Nothing
+    about keeping the members makes that safe, so `RenameRole` carries
+    `RiskClass::Rename` and a plan with one needs `--allow rename`, like
+    every other rename.
+92. **`apply` reads a dropped role's members and ownership again before
+    statement one.** The plan lists the members at `plan --db` time so a
+    reviewer sees who loses the role (ADR-0005 item 6), and the baseline
+    checksum cannot notice a member added since — membership is outside the
+    managed state on purpose. A staged apply would then commit every `DROP
+    MEMBER` the reviewer saw and fail on the one nobody did: users without
+    access, the role still there. So the preflight compares the live
+    membership with the listed one and refuses on any difference, added or
+    gone, asking for a new plan; ownership (83) is asked about again the
+    same way. The transactional apply would have rolled back, but a refusal
+    that names the member beats a failed statement that does not.
+93. **A statement that renames a role says so, as one that renames a table
+    does.** `Statement::renames` exists because a staged checkpoint has to
+    find an object under the name the catalog has *now* (ADR-0002 staged
+    mode); `ALTER ROLE ... WITH NAME` moved a name the same way and said
+    nothing, so a checkpoint after it scoped the role out under its old
+    name and a resume could not see what changed on it while paused. The
+    second instance of a shape the first one had already named.

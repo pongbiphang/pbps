@@ -1661,6 +1661,9 @@ async fn apply_staged_under_lock(
         for (from, to) in &stmt.renames {
             live_ids.rename_table(from, to);
         }
+        for (from, to) in &stmt.role_renames {
+            live_ids.rename_role(from, to);
+        }
 
         // The unmanaged policy is deliberately not enforced between two
         // committed statements. It is a hygiene gate for the start of a
@@ -1766,6 +1769,77 @@ async fn preflight(
             refused.join(", "),
             edition.name()
         );
+    }
+
+    // A dropped role's members were listed at plan time, and the baseline
+    // checksum cannot see a member added since: membership is each
+    // environment's own, outside the managed state on purpose (ADR-0005).
+    // Read again here, before statement one — a staged apply would otherwise
+    // commit every DROP MEMBER the reviewer saw and then fail on the member
+    // nobody did, leaving the reviewed users without access and the role in
+    // place. Ownership can change after planning the same way (DECISIONS 92).
+    let dropped_roles: Vec<(&str, &[String])> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
+                Some((name.as_str(), members.as_slice()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !dropped_roles.is_empty() {
+        let members_now = pbps_mssql::catalog::role_members(conn)
+            .await
+            .context("cannot read the role memberships")?;
+        let owned_now = pbps_mssql::catalog::role_owned_securables(conn)
+            .await
+            .context("cannot read what the roles own")?;
+        for (name, listed) in dropped_roles {
+            let listed: std::collections::BTreeSet<&str> =
+                listed.iter().map(String::as_str).collect();
+            let now: std::collections::BTreeSet<&str> = members_now
+                .get(name)
+                .map(|m| m.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let added: Vec<&str> = now.difference(&listed).copied().collect();
+            let gone: Vec<&str> = listed.difference(&now).copied().collect();
+            if !added.is_empty() || !gone.is_empty() {
+                let mut detail = Vec::new();
+                if !added.is_empty() {
+                    detail.push(format!(
+                        "member(s) the plan did not list: {}",
+                        added.join(", ")
+                    ));
+                }
+                if !gone.is_empty() {
+                    detail.push(format!(
+                        "listed member(s) no longer in it: {}",
+                        gone.join(", ")
+                    ));
+                }
+                bail!(
+                    "role `{name}` is not the role this plan was made against: {}.\n\
+                     Its membership changed after `plan --db`, and the plan lists who loses \
+                     the role so a reviewer can see it. Recompute it with `pbps plan --db`.",
+                    detail.join("; ")
+                );
+            }
+            if let Some(securables) = owned_now.get(name)
+                && !securables.is_empty()
+            {
+                bail!(
+                    "role `{name}` cannot be dropped: it owns {}, which it did not when this \
+                     plan was made.\n\
+                     Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, by hand, \
+                     since pbps does not decide who owns a securable), or keep the role.",
+                    securables.join(", "),
+                    securables[0]
+                );
+            }
+        }
     }
 
     // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the

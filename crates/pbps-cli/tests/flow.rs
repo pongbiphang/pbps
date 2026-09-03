@@ -5019,6 +5019,121 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
     });
 }
 
+/// A dropped role's members are listed at plan time so a reviewer sees who
+/// loses the role, and membership is each environment's own — so a member
+/// added between `plan --db` and `apply` is invisible to the checksum. The
+/// apply has to ask again before statement one (DECISIONS 92): a staged apply
+/// that found out at `DROP ROLE` would have committed every `DROP MEMBER` the
+/// reviewer saw. Only a real engine holds a membership to change under the
+/// plan.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_roledrop_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    let members = || -> i32 {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let rows = c
+                .query(&format!(
+                    "USE [{name}]; SELECT COUNT(*) FROM sys.database_role_members rm \
+                     JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
+                     WHERE r.name = 'reporting';"
+                ))
+                .await
+                .expect("count members");
+            rows[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("roledrop-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("reporting.yml"),
+        "role: reporting\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The environment gives the role a member; the plan lists it.
+    sql("CREATE USER analyst_a WITHOUT LOGIN; ALTER ROLE reporting ADD MEMBER analyst_a;");
+    std::fs::remove_file(d.dir.join("schema").join("roles").join("reporting.yml")).unwrap();
+    let o = d.run(&["drop-role", "reporting", "--reason", "SEC-9 retired"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("analyst_a"), "{}", stdout(&o));
+
+    // Another member after the plan was made. The apply is refused before
+    // anything runs, naming the member nobody reviewed, and the first member
+    // still holds the role.
+    sql("CREATE USER analyst_b WITHOUT LOGIN; ALTER ROLE reporting ADD MEMBER analyst_b;");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "revoke",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("analyst_b"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("plan --db"), "{}", stderr(&o));
+    assert_eq!(members(), 2, "nothing ran");
+
+    // A plan made against the role as it is now lists both, and applies.
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("analyst_b"), "{}", stdout(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "revoke",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(members(), 0, "the role is gone");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// The connected half of ADR-0004, end to end through the real binary: the
 /// rows go in with `bootstrap`, come back into the recorded state in the
 /// engine's spelling, a hand-edited row is drift, a re-declared table plans
@@ -5346,6 +5461,9 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
         "{}",
         stdout(&o)
     );
+    // Gated like any rename: the old name is gone, and a module or an
+    // application asking `IS_ROLEMEMBER('app_reader')` breaks on the spot.
+    assert!(stdout(&o).contains("--allow rename"), "{}", stdout(&o));
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     assert_eq!(

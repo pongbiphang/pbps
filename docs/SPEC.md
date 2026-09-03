@@ -630,7 +630,7 @@ exists when prod deploys the rename five versions later.
 
 | Class | Trigger | Risk |
 |---|---|---|
-| `rename` | A column or table is renamed | Dependent objects break (see 7.4) |
+| `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX | Data loss |
 | `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |

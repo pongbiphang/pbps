@@ -143,6 +143,12 @@ pub struct Statement {
     /// Empty for every statement that renames nothing, which is nearly all of
     /// them.
     pub renames: Vec<(TableName, TableName)>,
+
+    /// The role renames this statement performs, `(from, to)`, for the same
+    /// reason: a staged checkpoint after `ALTER ROLE ... WITH NAME` has to
+    /// find the role under its new name, or it records the environment
+    /// without it and a resume cannot see what changed on it while paused.
+    pub role_renames: Vec<(String, String)>,
 }
 
 impl Statement {
@@ -152,12 +158,19 @@ impl Statement {
             own_batch: false,
             transactional: true,
             renames: Vec::new(),
+            role_renames: Vec::new(),
         }
     }
 
     /// Records that this statement moves `from` to `to`.
     pub fn renaming(mut self, from: TableName, to: TableName) -> Self {
         self.renames.push((from, to));
+        self
+    }
+
+    /// Records that this statement renames the role `from` to `to`.
+    pub fn renaming_role(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.role_renames.push((from.into(), to.into()));
         self
     }
 

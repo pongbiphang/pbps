@@ -131,6 +131,16 @@ impl IdsFile {
         }
     }
 
+    /// Moves a role to a new name, keeping its uid — the same operation as
+    /// [`Self::rename_table`], for the same reason, and the same no-op when
+    /// nothing is called `from`.
+    pub fn rename_role(&mut self, from: &str, to: &str) {
+        let Some(uid) = self.role_uid(from).cloned() else {
+            return;
+        };
+        self.roles.insert(uid, to.to_owned());
+    }
+
     /// Checks internal consistency.
     ///
     /// The tool writes this file itself, so under normal conditions it cannot
@@ -272,6 +282,23 @@ mod tests {
             &"dbo.customer".parse().unwrap(),
             &"sales.customer".parse().unwrap(),
         );
+        assert_eq!(f, before);
+    }
+
+    /// The role half of the same replay: the uid stays, the name moves, and
+    /// a rename already absorbed changes nothing.
+    #[test]
+    fn renaming_a_role_keeps_its_uid_and_is_idempotent() {
+        let mut f = sample();
+        f.roles.insert(uid("r_q8m2kd"), "reader".to_owned());
+        f.rename_role("reader", "app_reader");
+        assert_eq!(f.roles[&uid("r_q8m2kd")], "app_reader");
+        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_q8m2kd")));
+        let before = f.clone();
+        f.rename_role("reader", "app_reader");
+        assert_eq!(f, before);
+        // A name nobody has is a no-op, not a new role.
+        f.rename_role("ghost", "phantom");
         assert_eq!(f, before);
     }
 

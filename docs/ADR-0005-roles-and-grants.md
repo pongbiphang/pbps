@@ -200,6 +200,20 @@ Decisions taken during implementation that this document did not anticipate:
     other changes had committed. `validate` applies the engine's own table,
     measured pair by pair, with a function's kind read off its `RETURNS`
     clause (DECISIONS 89).
+12. **A role rename is gated.** `RenameRole` carries the `rename` risk like a
+    table or column rename: the members stay, the old name does not, and
+    `IS_ROLEMEMBER('old')` in a module or an application breaks on the spot
+    (DECISIONS 91).
+13. **`apply` asks about a dropped role again before statement one.** The
+    members listed at plan time can be stale by apply time, and the checksum
+    cannot see it; the preflight compares the live membership with the list
+    and refuses on any difference, and asks about ownership again the same
+    way (DECISIONS 92). A staged apply that found out at `DROP ROLE` would
+    already have committed every `DROP MEMBER` the reviewer saw.
+14. **A staged checkpoint follows a role rename.** The `ALTER ROLE ... WITH
+    NAME` statement records the rename it performs, as a table rename's
+    statements do, so the checkpoint after it scopes the role under its new
+    name (DECISIONS 93).
 
 ## Placement
 
