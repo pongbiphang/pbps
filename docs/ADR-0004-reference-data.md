@@ -215,8 +215,13 @@ Decisions taken during implementation that this document did not anticipate:
    takeover. The baseline is pinned under the union of the recorded scope
    and the plan's, table by table, so a key added to an `ensure` block or
    an `ensure` -> `exact` switch is checked again before apply (DECISIONS
-   98). A row key has to be spellable in its key column's type, since a
-   table this plan creates has no engine to ask (99).
+   98). A row key has to be spellable in its key column's type (99, 103),
+   and every connected command asks the engine, before anything is written,
+   whether each declared text comes back as written — `"1.5"` in a
+   `decimal(5,2)` does not, it comes back `1.50` — and refuses the
+   declaration with the spelling to write (101); a table this plan creates
+   is asked about the same way, since the question needs the type and not
+   the table.
 6. **The pre-delete probe finds the referencing tables in the catalog at run
    time**, through `sys.foreign_keys` and dynamic SQL, rather than trusting
    the declarations to list them — a foreign key someone added by hand is

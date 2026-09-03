@@ -529,6 +529,51 @@ pub async fn read_rows(
     Ok(out)
 }
 
+/// Every declared spelling the engine would not read back as written, over
+/// every table that declares rows (DECISIONS 101). Asked of the engine, not
+/// of the table: a table this plan creates can be asked too.
+pub async fn misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+) -> Result<Vec<crate::rows::Misspelt>, crate::rows::RowsError> {
+    let mut out = Vec::new();
+    for (name, table) in &schema.tables {
+        for q in crate::rows::spelling_queries(name, table)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            for row in &conn.query(&q.sql).await.map_err(read)? {
+                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+                let Some((key, declared)) = q.literals.get(i) else {
+                    return Err(read(pbps_db::DbError::BadRow(format!(
+                        "the spelling query returned index {i} for {} literal(s)",
+                        q.literals.len()
+                    ))));
+                };
+                // A key's spelling is aliased at read time (71); only a text
+                // the type cannot read at all is wrong there.
+                let agrees = match (&q.column, &canonical) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(_), Some(c)) => c == declared,
+                };
+                if !agrees {
+                    out.push(crate::rows::Misspelt {
+                        table: name.clone(),
+                        key: key.clone(),
+                        column: q.column.clone(),
+                        declared: declared.clone(),
+                        ty: q.ty.clone(),
+                        canonical,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

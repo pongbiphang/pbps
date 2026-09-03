@@ -185,6 +185,48 @@ fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     out
 }
 
+/// Refuses a declaration whose text the engine would not read back as
+/// written, before anything is written (DECISIONS 101).
+///
+/// Asked of the engine rather than reasoned about: `"1.5"` in a
+/// `decimal(5,2)` comes back `1.50`, `"ab "` in a `char(5)` comes back `ab`,
+/// and a text the type cannot read at all comes back as a failed insert —
+/// each a plan that never converges or never applies, and each a question
+/// only the engine answers the same way it will answer at read time.
+pub(crate) async fn refuse_misspelt(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
+    let found = pbps_mssql::catalog::misspelt(conn, schema)
+        .await
+        .context("cannot ask the engine how it reads the declared rows")?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = found
+        .iter()
+        .map(|m| match (&m.column, &m.canonical) {
+            (None, _) => format!(
+                "{} row key `{}` cannot be read as {} by the engine",
+                m.table, m.key, m.ty
+            ),
+            (Some(c), None) => format!(
+                "{} row `{}`: `{c}` = {:?} cannot be read as {} by the engine",
+                m.table, m.key, m.declared, m.ty
+            ),
+            (Some(c), Some(canonical)) => format!(
+                "{} row `{}`: `{c}` is written {:?}, and the engine reads it back as {:?}; \
+                 write it that way",
+                m.table, m.key, m.declared, canonical
+            ),
+        })
+        .collect();
+    bail!(
+        "{} declared value(s) would not come back as written:\n  {}\n\
+         A declaration that disagrees with its own database on every plan is worse than \
+         none; the engine's spelling is the one to write (DECISIONS 101).",
+        lines.len(),
+        lines.join("\n  ")
+    );
+}
+
 /// Brings the objects a committed statement created into the live identities,
 /// under the uids the plan gave them, so the checkpoint taken next scopes
 /// them in. Before this, a role or a table the plan had just created stood
@@ -779,6 +821,10 @@ pub fn cmd_bootstrap(
         // never mentioned it.
         // No rows are read here: the question is whether any declared object
         // stands, and a table that does is refused before its rows matter.
+        // Before the declared rows go in: a spelling the engine reads back
+        // differently would be recorded as the engine spells it and drift
+        // from the declaration on the next plan (DECISIONS 101).
+        refuse_misspelt(&mut conn, &loaded.schema).await?;
         let existing = managed_state_full(
             &mut conn,
             &ids,
@@ -998,6 +1044,10 @@ pub fn cmd_plan_db(
         // the rename then planned none of its deletes.
         let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
         let declared_data = declared_live.data_scopes();
+        // Every declared text, as the engine reads it: a spelling it would
+        // read back differently is refused before a plan is written that
+        // could never converge (DECISIONS 101).
+        refuse_misspelt(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -1641,6 +1691,16 @@ async fn apply_staged_under_lock(
                 entry.id
             );
         }
+        // The role a `DROP ROLE` will meet is the role as the plan left it:
+        // the members whose `DROP MEMBER` has not run yet, and nothing
+        // owned. Membership and ownership are outside the checksum on
+        // purpose, so the check above cannot see a member added while the
+        // deployment was paused (DECISIONS 102).
+        check_role_drops(
+            conn,
+            &role_drop_expectations(&plan.changes, dialect, progress.completed)?,
+        )
+        .await?;
         println!(
             "Resuming at statement {} of {} (checkpoint entry #{}).",
             progress.completed + 1,
@@ -1816,6 +1876,101 @@ fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::R
 }
 
 /// The pre-flight of §7.5: dependency impact, then probes against the data.
+/// The members each dropped role is expected to still have when the plan's
+/// next statement runs: every listed member before statement one, fewer
+/// once some of its `DROP MEMBER` statements have committed, and no
+/// expectation at all once the `DROP ROLE` has. Counted off the emitter's
+/// own statements, in the emitter's order (one `DROP MEMBER` per listed
+/// member, then the `DROP ROLE`), so a resume asks about the role as the
+/// plan left it and not as the plan first saw it (DECISIONS 102).
+fn role_drop_expectations(
+    cs: &pbps_model::ChangeSet,
+    dialect: &dyn pbps_dialect::Dialect,
+    completed: usize,
+) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for p in &cs.changes {
+        let n = dialect
+            .emit(&p.change, p.strategy)
+            .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
+            .len();
+        if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
+            let done = completed.saturating_sub(at).min(n);
+            if done <= members.len() {
+                out.push((name.clone(), members[done..].to_vec()));
+            }
+        }
+        at += n;
+    }
+    Ok(out)
+}
+
+/// Refuses, before anything runs, a role drop whose role is not the one the
+/// plan was made against: a member the plan did not list, a listed member
+/// no longer there, or a securable it has come to own. A staged apply would
+/// otherwise commit every `DROP MEMBER` the reviewer saw and then fail on
+/// the one nobody did, leaving the reviewed users without access and the
+/// role in place (DECISIONS 92, 102).
+async fn check_role_drops(
+    conn: &mut Conn,
+    expected: &[(String, Vec<String>)],
+) -> anyhow::Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let members_now = pbps_mssql::catalog::role_members(conn)
+        .await
+        .context("cannot read the role memberships")?;
+    let owned_now = pbps_mssql::catalog::role_owned_securables(conn)
+        .await
+        .context("cannot read what the roles own")?;
+    for (name, listed) in expected {
+        let listed: std::collections::BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+        let now: std::collections::BTreeSet<&str> = members_now
+            .get(name.as_str())
+            .map(|m| m.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let added: Vec<&str> = now.difference(&listed).copied().collect();
+        let gone: Vec<&str> = listed.difference(&now).copied().collect();
+        if !added.is_empty() || !gone.is_empty() {
+            let mut detail = Vec::new();
+            if !added.is_empty() {
+                detail.push(format!(
+                    "member(s) the plan did not list: {}",
+                    added.join(", ")
+                ));
+            }
+            if !gone.is_empty() {
+                detail.push(format!(
+                    "listed member(s) no longer in it: {}",
+                    gone.join(", ")
+                ));
+            }
+            bail!(
+                "role `{name}` is not the role this plan was made against: {}.\n\
+                 Its membership changed after `plan --db`, and the plan lists who loses \
+                 the role so a reviewer can see it. Recompute it with `pbps plan --db`.",
+                detail.join("; ")
+            );
+        }
+        if let Some(securables) = owned_now.get(name.as_str())
+            && !securables.is_empty()
+        {
+            bail!(
+                "role `{name}` cannot be dropped: it owns {}, which it did not when this \
+                 plan was made.\n\
+                 Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, by hand, \
+                 since pbps does not decide who owns a securable), then recompute the plan \
+                 with `pbps plan --db`.",
+                securables.join(", "),
+                securables[0]
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn preflight(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
@@ -1840,76 +1995,12 @@ async fn preflight(
         );
     }
 
-    // A dropped role's members were listed at plan time, and the baseline
-    // checksum cannot see a member added since: membership is each
-    // environment's own, outside the managed state on purpose (ADR-0005).
-    // Read again here, before statement one — a staged apply would otherwise
-    // commit every DROP MEMBER the reviewer saw and then fail on the member
-    // nobody did, leaving the reviewed users without access and the role in
-    // place. Ownership can change after planning the same way (DECISIONS 92).
-    let dropped_roles: Vec<(&str, &[String])> = plan
-        .changes
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
-                Some((name.as_str(), members.as_slice()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !dropped_roles.is_empty() {
-        let members_now = pbps_mssql::catalog::role_members(conn)
-            .await
-            .context("cannot read the role memberships")?;
-        let owned_now = pbps_mssql::catalog::role_owned_securables(conn)
-            .await
-            .context("cannot read what the roles own")?;
-        for (name, listed) in dropped_roles {
-            let listed: std::collections::BTreeSet<&str> =
-                listed.iter().map(String::as_str).collect();
-            let now: std::collections::BTreeSet<&str> = members_now
-                .get(name)
-                .map(|m| m.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            let added: Vec<&str> = now.difference(&listed).copied().collect();
-            let gone: Vec<&str> = listed.difference(&now).copied().collect();
-            if !added.is_empty() || !gone.is_empty() {
-                let mut detail = Vec::new();
-                if !added.is_empty() {
-                    detail.push(format!(
-                        "member(s) the plan did not list: {}",
-                        added.join(", ")
-                    ));
-                }
-                if !gone.is_empty() {
-                    detail.push(format!(
-                        "listed member(s) no longer in it: {}",
-                        gone.join(", ")
-                    ));
-                }
-                bail!(
-                    "role `{name}` is not the role this plan was made against: {}.\n\
-                     Its membership changed after `plan --db`, and the plan lists who loses \
-                     the role so a reviewer can see it. Recompute it with `pbps plan --db`.",
-                    detail.join("; ")
-                );
-            }
-            if let Some(securables) = owned_now.get(name)
-                && !securables.is_empty()
-            {
-                bail!(
-                    "role `{name}` cannot be dropped: it owns {}, which it did not when this \
-                     plan was made.\n\
-                     Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, by hand, \
-                     since pbps does not decide who owns a securable), or keep the role.",
-                    securables.join(", "),
-                    securables[0]
-                );
-            }
-        }
-    }
+    // A dropped role's members were listed at plan time, and the ledger's
+    // checksum cannot see a membership change — membership is each
+    // environment's own and outside the managed state on purpose. Read
+    // again here, before statement one (DECISIONS 92), and again on a
+    // resume, for the members whose statements have not run yet (102).
+    check_role_drops(conn, &role_drop_expectations(&plan.changes, dialect, 0)?).await?;
 
     // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
     // module changes sort before the table changes precisely so that the drop
@@ -2206,6 +2297,50 @@ mod tests {
                 .into_iter()
                 .map(pbps_model::RowKey::from)
                 .collect()
+        );
+    }
+
+    /// Counted off the emitter's statements: every member before statement
+    /// one, fewer as the `DROP MEMBER`s commit, none once the role is gone.
+    #[test]
+    fn a_resumed_role_drop_expects_only_the_members_whose_statements_remain() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateRole {
+                    uid: uid.clone(),
+                    name: "auditors".into(),
+                }),
+                PlannedChange::new(Change::DropRole {
+                    uid,
+                    name: "reporting".into(),
+                    members: vec!["a".into(), "b".into()],
+                }),
+            ],
+        };
+        let expect =
+            |completed: usize| role_drop_expectations(&cs, &pbps_mssql::Mssql, completed).unwrap();
+        let both = vec![("reporting".to_owned(), vec!["a".to_owned(), "b".to_owned()])];
+        assert_eq!(expect(0), both, "before statement one");
+        assert_eq!(
+            expect(1),
+            both,
+            "the CREATE ROLE is done; the drop has not started"
+        );
+        assert_eq!(
+            expect(2),
+            vec![("reporting".to_owned(), vec!["b".to_owned()])],
+            "one DROP MEMBER committed"
+        );
+        assert_eq!(
+            expect(3),
+            vec![("reporting".to_owned(), vec![])],
+            "every member gone; the DROP ROLE still to run"
+        );
+        assert!(
+            expect(4).is_empty(),
+            "the role is dropped; nothing to expect"
         );
     }
 

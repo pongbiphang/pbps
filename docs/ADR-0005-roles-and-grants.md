@@ -213,7 +213,9 @@ Decisions taken during implementation that this document did not anticipate:
     cannot see it; the preflight compares the live membership with the list
     and refuses on any difference, and asks about ownership again the same
     way (DECISIONS 92). A staged apply that found out at `DROP ROLE` would
-    already have committed every `DROP MEMBER` the reviewer saw.
+    already have committed every `DROP MEMBER` the reviewer saw. A staged
+    resume asks once more, for the members whose `DROP MEMBER` has not run,
+    counted off the emitter's statements (102).
 14. **A staged checkpoint follows a role rename, and adopts a role the plan
     creates.** The `ALTER ROLE ... WITH NAME` statement records the rename
     it performs, as a table rename's statements do, so the checkpoint after

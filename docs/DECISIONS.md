@@ -806,3 +806,32 @@ SPEC is in sync with all of these.
     was recorded as clean. The emitter says what each statement creates
     (`Statement::creates`), as it says what each renames (93), and the
     executor adopts it under the plan's uid before the checkpoint is taken.
+101. **A declared text is refused before it is written unless the engine
+    reads it back as written.** `"1.5"` in a `decimal(5,2)` is stored and
+    read back as `1.50`, `"ab "` in a `char(5)` as `ab`, and every connected
+    plan then restated an update that changed nothing (the same kind on both
+    sides this time, 87's fix could not see it). Neither the model nor the
+    dialect can spell a value the engine's way without becoming the engine —
+    71 refused to invent a normalizer for keys for exactly this reason — so
+    every connected command that writes or compares rows (`plan --db`,
+    `bootstrap`, the `dev` rehearsal) first sends each declared text cell
+    through `TRY_CONVERT` into its column's type and back through the
+    read-back's own rendering, and refuses the declaration with the spelling
+    to write. A text the type cannot read at all (NULL from `TRY_CONVERT`)
+    is refused the same way, which also covers a key on a table this plan
+    creates: the alias query (71) has no table to ask yet. Keys are checked
+    only for that, since their spelling is aliased at read time.
+102. **A staged resume re-checks a role drop for the members whose
+    statements have not run.** 92 read the membership again before
+    statement one; a checkpoint taken between two `DROP MEMBER`s left the
+    same window open until `--resume`, whose drift check cannot see a
+    member (membership is outside the checksum on purpose). The expectation
+    is counted off the emitter's own statements — every listed member, minus
+    the ones whose `DROP MEMBER` committed, and none once the `DROP ROLE`
+    has — so the resume asks about the role as the plan left it.
+103. **`validate` refuses a key whose text no spelling of its type has.**
+    A number with letters, a GUID of the wrong length, a date with no
+    digit: conservative on purpose, since the engine accepts more spellings
+    than any rule here would list (`20260903` is a date), and the engine is
+    asked before anything is written (101). What this catches, it catches
+    offline; what it lets through, the connected commands do not.

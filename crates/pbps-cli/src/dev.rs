@@ -236,6 +236,11 @@ async fn rehearse_in(
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
     conn.execute(&format!("USE [{name}];")).await?;
+    // The rehearsal reads the rows back and compares; a spelling the engine
+    // reads differently would fail that comparison without saying which
+    // spelling to write. Asked first, as every connected command asks
+    // (DECISIONS 101).
+    crate::deploy::refuse_misspelt(conn, declared).await?;
 
     for (i, stmt) in build.iter().enumerate() {
         conn.execute(&stmt.sql).await.map_err(|e| {

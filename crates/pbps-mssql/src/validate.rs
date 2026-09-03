@@ -89,6 +89,66 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     errs
 }
 
+/// Why a key's text cannot possibly be read as `base`, or `None` when it
+/// might be. Conservative on purpose: this refuses only shapes no spelling
+/// of the type has — letters in a number, a GUID of the wrong length — and
+/// leaves the rest to the engine, which is asked before anything is written
+/// (DECISIONS 101, 103). A text type takes anything.
+fn key_shape(base: &str, text: &str) -> Option<&'static str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let fits = match base {
+        "decimal" | "numeric" | "money" | "smallmoney" | "float" | "real" => {
+            let n = text.strip_prefix(['-', '+']).unwrap_or(text);
+            let (mantissa, exponent) = match n.split_once(['e', 'E']) {
+                Some((m, e)) => (m, Some(e)),
+                None => (n, None),
+            };
+            let mantissa_ok = match mantissa.split_once('.') {
+                Some((i, f)) => {
+                    (i.is_empty() || digits(i))
+                        && (f.is_empty() || digits(f))
+                        && !(i.is_empty() && f.is_empty())
+                }
+                None => digits(mantissa),
+            };
+            mantissa_ok && exponent.is_none_or(|e| digits(e.strip_prefix(['-', '+']).unwrap_or(e)))
+        }
+        "date" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" | "time" => {
+            text.bytes().any(|b| b.is_ascii_digit())
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b" -:T./+Z".contains(&b))
+        }
+        "uniqueidentifier" => {
+            let inner = text
+                .strip_prefix('{')
+                .and_then(|t| t.strip_suffix('}'))
+                .unwrap_or(text);
+            let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+            let groups: Vec<&str> = inner.split('-').collect();
+            (groups.len() == 5
+                && groups
+                    .iter()
+                    .zip([8usize, 4, 4, 4, 12])
+                    .all(|(g, n)| g.len() == n && hex(g)))
+                || (groups.len() == 1 && inner.len() == 32 && hex(inner))
+        }
+        _ => true,
+    };
+    if fits {
+        return None;
+    }
+    Some(match base {
+        "decimal" | "numeric" | "money" | "smallmoney" | "float" | "real" => {
+            "a numeric key is a number, like `1.50`"
+        }
+        "uniqueidentifier" => {
+            "a `uniqueidentifier` key is a GUID, like `6F9619FF-8B86-D011-B42D-00C04FC964FF`"
+        }
+        _ => "a date or time key is written the way the engine reads it back, like `2026-09-03`",
+    })
+}
+
 /// What a grant target is, as far as the engine's permission rules care.
 ///
 /// A function is three kinds to the engine: a scalar one is executed, an
@@ -425,7 +485,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                             || text.eq_ignore_ascii_case("true")
                             || text.eq_ignore_ascii_case("false")
                     }
-                    ValueKind::Text => true,
+                    ValueKind::Text => key_shape(&base, text).is_none(),
                 };
                 if !fits {
                     errs.push(invalid(format!(
@@ -434,7 +494,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                         match kind {
                             ValueKind::Int => "an integer key is digits, with an optional sign",
                             ValueKind::Bool => "a `bit` key is `0`, `1`, `true` or `false`",
-                            ValueKind::Text => unreachable!(),
+                            ValueKind::Text => key_shape(&base, text).unwrap_or_default(),
                         }
                     )));
                 }
@@ -827,11 +887,52 @@ mod tests {
         assert!(!messages(&table(&name, &t)).contains("row key"));
         with(&mut t, "bit", &["yes"]);
         assert!(messages(&table(&name, &t)).contains("row key `yes` cannot be a `bit`"));
-        // Text takes anything; so does a decimal, which reads back as text.
+        // Text takes anything.
         with(&mut t, "varchar(10)", &["not-an-int", ""]);
         assert!(!messages(&table(&name, &t)).contains("row key"));
-        with(&mut t, "decimal(5,2)", &["1.50"]);
+        // A type that reads back as text still has shapes it cannot read;
+        // those are refused here, and the rest is the engine's to judge
+        // before anything is written (DECISIONS 101, 103).
+        with(&mut t, "decimal(5,2)", &["1.50", "-.5", "1e3", "007"]);
         assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(&mut t, "decimal(5,2)", &["1,5", "abc", "."]);
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("row key `1,5` cannot be a `decimal`"), "{msg}");
+        assert!(msg.contains("row key `abc`"), "{msg}");
+        assert!(msg.contains("row key `.`"), "{msg}");
+        with(
+            &mut t,
+            "date",
+            &["2026-09-03", "20260903", "2026-09-03T10:00:00Z"],
+        );
+        assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(&mut t, "date", &["not-a-date", "tomorrow"]);
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("row key `not-a-date` cannot be a `date`"),
+            "{msg}"
+        );
+        with(
+            &mut t,
+            "uniqueidentifier",
+            &[
+                "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+                "{6f9619ff-8b86-d011-b42d-00c04fc964ff}",
+                "6F9619FF8B86D011B42D00C04FC964FF",
+            ],
+        );
+        assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(
+            &mut t,
+            "uniqueidentifier",
+            &["not-a-guid", "6F9619FF-8B86-D011-B42D"],
+        );
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("row key `not-a-guid` cannot be a `uniqueidentifier`"),
+            "{msg}"
+        );
+        assert!(msg.contains("row key `6F9619FF-8B86-D011-B42D`"), "{msg}");
     }
 
     /// Refused for what it is, not for its kind: the text would go in, but

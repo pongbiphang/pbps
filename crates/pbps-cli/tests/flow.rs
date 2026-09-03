@@ -5019,6 +5019,89 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
     });
 }
 
+/// A declared text the engine reads back differently — `"1.5"` in a
+/// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
+/// it and drift from the declaration on every later plan. Every connected
+/// command asks the engine first and refuses with the spelling to write
+/// (DECISIONS 101); only a real engine can say what that spelling is.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_spelling_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("spelling-live");
+    let declared = |pct: &str, since: &str| {
+        format!(
+            "table: dbo.rate\ncolumns:\n  code: {{type: varchar(10), nullable: false}}\n  \
+             pct: {{type: \"decimal(5,2)\"}}\n  since: {{type: date}}\n\
+             primary_key: [code]\ndata:\n  mode: exact\n  rows:\n    std: {{pct: \"{pct}\", \
+             since: \"{since}\"}}\n"
+        )
+    };
+    d.table(&declared("1.5", "2026-9-3"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Refused before the table exists, naming both spellings, and nothing
+    // was built.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("`pct` is written \"1.5\"") && err.contains("\"1.50\""),
+        "{err}"
+    );
+    assert!(
+        err.contains("`since` is written \"2026-9-3\"") && err.contains("\"2026-09-03\""),
+        "{err}"
+    );
+
+    // Written the engine's way, it goes in and comes back as declared: the
+    // next connected plan has nothing to say.
+    d.table(&declared("1.50", "2026-09-03"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // And a connected plan against a database that has the row is refused
+    // the same way, before a plan that could never converge is written.
+    d.table(&declared("1.5", "2026-09-03"));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`pct` is written \"1.5\"") && stderr(&o).contains("\"1.50\""),
+        "{}",
+        stderr(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// A dropped role's members are listed at plan time so a reviewer sees who
 /// loses the role, and membership is each environment's own — so a member
 /// added between `plan --db` and `apply` is invisible to the checksum. The

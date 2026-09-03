@@ -299,6 +299,141 @@ pub fn query(
     }))
 }
 
+/// One declared spelling the engine reads back differently, or cannot read
+/// at all (DECISIONS 101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Misspelt {
+    pub table: TableName,
+    pub key: RowKey,
+    /// `None` for the key itself.
+    pub column: Option<String>,
+    pub declared: String,
+    /// The column's type, as the engine was asked to read the text.
+    pub ty: String,
+    /// What the engine reads back; `None` when it cannot convert the text.
+    pub canonical: Option<String>,
+}
+
+/// Every declared literal of one column, sent to the engine to be read the
+/// way the read-back reads it, beside its index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpellingQuery {
+    /// `None` for the key column.
+    pub column: Option<String>,
+    pub ty: String,
+    pub literals: Vec<(RowKey, String)>,
+    pub sql: String,
+}
+
+/// The engine's own answer to "is this text the spelling it reads back":
+/// every declared text cell and every key, converted to its column's type
+/// and rendered exactly as [`read_expr`] renders a stored value.
+///
+/// A declaration written `"1.5"` for a `decimal(5,2)` is stored as `1.50`
+/// and read back as `1.50`, and every connected plan then restates an
+/// update that changes nothing. Neither the model nor this crate can spell
+/// a value the engine's way without becoming the engine (71 refused to
+/// invent a normalizer for keys for the same reason), so the engine is
+/// asked, before anything is written, and a declaration that disagrees is
+/// refused with the spelling to write. `TRY_CONVERT` answers NULL for a
+/// text the type cannot read at all — the other thing a table this plan
+/// creates cannot be asked about through its alias query, since there is no
+/// table yet. Keys are only checked for that: their spelling is aliased at
+/// read time (71). Integer and bit cells are parsed by the loader and
+/// spelled by the model; only text-kind columns carry a spelling to ask
+/// about.
+pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQuery>, RowsError> {
+    let Some(data) = &table.data else {
+        return Ok(Vec::new());
+    };
+    let key = key_column(name, table)?;
+    let ty_of = |column: &str| -> Result<(String, String), RowsError> {
+        let spec = table
+            .columns
+            .get(column)
+            .ok_or_else(|| RowsError::Unreadable {
+                table: name.clone(),
+                why: format!("`{column}` is not among its columns"),
+            })?;
+        let ty = crate::types::normalize(&spec.ty).map_err(|e| RowsError::Unreadable {
+            table: name.clone(),
+            why: e.to_string(),
+        })?;
+        Ok((ty.base.clone(), ty.to_string()))
+    };
+    let query = |column: Option<String>,
+                 base: &str,
+                 ty: String,
+                 literals: Vec<(RowKey, String)>|
+     -> SpellingQuery {
+        let rendered = read_expr(&format!("TRY_CONVERT({ty}, v.s)"), base);
+        let values = literals
+            .iter()
+            .enumerate()
+            .map(|(i, (_, text))| format!("({i}, {})", literal(text)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        SpellingQuery {
+            column,
+            ty,
+            literals,
+            sql: format!("SELECT v.i AS i, {rendered} AS c\n  FROM (VALUES {values}) AS v(i, s);"),
+        }
+    };
+
+    let mut out = Vec::new();
+    let (base, ty) = ty_of(&key)?;
+    let keys: Vec<(RowKey, String)> = data
+        .rows
+        .keys()
+        .map(|k| (k.clone(), k.as_str().to_owned()))
+        .collect();
+    if !keys.is_empty() {
+        out.push(query(None, &base, ty, keys));
+    }
+    for (column, spec) in &table.columns {
+        if *column == key || spec.identity.is_some() {
+            continue;
+        }
+        let (base, ty) = ty_of(column)?;
+        if ValueKind::of(&base) != ValueKind::Text {
+            continue;
+        }
+        let literals: Vec<(RowKey, String)> = data
+            .rows
+            .iter()
+            .filter_map(|(k, row)| match row.get(column) {
+                Some(Value::Text(t)) => Some((k.clone(), t.clone())),
+                _ => None,
+            })
+            .collect();
+        if !literals.is_empty() {
+            out.push(query(Some(column.clone()), &base, ty, literals));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads one row of a spelling query: the literal's index and what the
+/// engine made of it.
+pub fn decode_spelling(
+    name: &TableName,
+    row: &pbps_db::Row,
+) -> Result<(usize, Option<String>), RowsError> {
+    let read = |source: DbError| RowsError::Read {
+        table: name.clone(),
+        source: Box::new(source),
+    };
+    let i: Option<i32> = row.try_get_at(0).map_err(read)?;
+    let c: Option<&str> = row.try_get_at(1).map_err(read)?;
+    let Some(i) = i.and_then(|i| usize::try_from(i).ok()) else {
+        return Err(read(DbError::BadRow(
+            "the spelling query returned a NULL index".to_owned(),
+        )));
+    };
+    Ok((i, c.map(str::to_owned)))
+}
+
 /// Reads one row of the alias query: the requested spelling and the engine's.
 pub fn decode_alias(name: &TableName, row: &pbps_db::Row) -> Result<(RowKey, RowKey), RowsError> {
     let read = |source: DbError| RowsError::Read {
@@ -587,6 +722,63 @@ mod tests {
         assert_eq!(q.columns.len(), 1, "{:?}", q.columns);
         assert_eq!(q.columns[0].column, "label");
         assert!(!q.sql.contains("[seq]"), "{}", q.sql);
+    }
+
+    /// One query per column that has a spelling to ask about — the key for
+    /// convertibility, each text-kind column for its literals — rendered
+    /// the way the read-back renders a stored value; integer and bit
+    /// columns, and columns nobody spells, get none.
+    #[test]
+    fn spelling_queries_ask_the_engine_about_every_declared_text_and_every_key() {
+        use pbps_model::{DataMode, Row, TableData};
+        let mut t = table(
+            Some(vec!["code"]),
+            &[
+                ("code", "varchar(10)", None),
+                ("pct", "decimal(5,2)", None),
+                ("rank", "int", None),
+                ("since", "date", None),
+            ],
+        );
+        let mut std = Row::default();
+        std.0.insert("pct".into(), Value::Text("1.5".into()));
+        std.0.insert("rank".into(), Value::Int(1));
+        let mut old = Row::default();
+        old.0.insert("since".into(), Value::Text("2026-9-3".into()));
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("std"), std), (RowKey::from("old"), old)]
+                .into_iter()
+                .collect(),
+        });
+        let qs = spelling_queries(&name(), &t).unwrap();
+        let columns: Vec<Option<&str>> = qs.iter().map(|q| q.column.as_deref()).collect();
+        assert_eq!(columns, [None, Some("pct"), Some("since")], "{qs:#?}");
+        assert_eq!(qs[0].ty, "varchar(10)");
+        assert_eq!(qs[0].literals.len(), 2);
+        assert_eq!(qs[1].ty, "decimal(5, 2)");
+        assert_eq!(qs[1].literals, [(RowKey::from("std"), "1.5".to_owned())]);
+        assert!(
+            qs[1]
+                .sql
+                .contains("CONVERT(nvarchar(max), TRY_CONVERT(decimal(5, 2), v.s)) AS c"),
+            "{}",
+            qs[1].sql
+        );
+        assert!(
+            qs[1].sql.contains("(VALUES (0, N'1.5')) AS v(i, s)"),
+            "{}",
+            qs[1].sql
+        );
+        // A date is rendered in the fixed style the read-back uses.
+        assert!(
+            qs[2].sql.contains("TRY_CONVERT(date, v.s), 126)"),
+            "{}",
+            qs[2].sql
+        );
+        // No block, nothing to ask.
+        t.data = None;
+        assert!(spelling_queries(&name(), &t).unwrap().is_empty());
     }
 
     #[test]
