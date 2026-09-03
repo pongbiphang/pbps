@@ -941,7 +941,7 @@ pub fn cmd_plan_db(
             &recorded_data,
             &declared_data,
         );
-        let cs = pbps_diff::diff(
+        let mut cs = pbps_diff::diff(
             pbps_diff::Side {
                 schema: &base,
                 ids: &recorded_ids,
@@ -959,6 +959,29 @@ pub fn cmd_plan_db(
             }
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
+
+        // A role this plan drops still has this environment's members, which
+        // the engine will not drop it over. They are read here and written
+        // into the plan by name, so the artifact the gate approves lists
+        // exactly who is removed (ADR-0005) — never found again at apply
+        // time, where nobody would have reviewed them.
+        if cs
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+        {
+            let members = pbps_mssql::catalog::role_members(&mut conn)
+                .await
+                .context("cannot read the role memberships")?;
+            for p in &mut cs.changes {
+                if let pbps_model::Change::DropRole {
+                    name, members: m, ..
+                } = &mut p.change
+                {
+                    *m = members.get(name).cloned().unwrap_or_default();
+                }
+            }
+        }
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered

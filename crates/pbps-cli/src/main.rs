@@ -1986,6 +1986,19 @@ fn cmd_plan(
     if !json {
         println!("Baseline: {}", base.description);
         print!("{}", report::plan(&cs));
+        // Membership is each environment's own, so an offline plan cannot
+        // list who a dropped role is taken from; saying so keeps "no members
+        // listed" from reading as "no members".
+        if cs
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+        {
+            println!(
+                "\n  A dropped role's members are removed first; `pbps plan --db` lists them for \
+                 the target, this preview cannot."
+            );
+        }
     }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an

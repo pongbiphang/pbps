@@ -452,3 +452,13 @@ SPEC is in sync with all of these.
     per object and per schema the roles are granted on, the way foreign-key
     targets outside the managed schemas already are. `CONTROL` is what is
     asked for, because `HAS_PERMS_BY_NAME` cannot ask "held with grant option".
+63. **A dropped role's members are written into the connected plan, never
+    found at apply time.** The engine refuses `DROP ROLE` while members
+    remain, and the two obvious answers were both wrong: leaving it to the
+    engine made every role drop fail in production, and removing members with
+    dynamic SQL at apply time would run statements the reviewed plan never
+    showed. `plan --db` reads `sys.database_role_members` for the roles it
+    drops and puts each member into `DropRole::members`, so the plan lists
+    who is removed and the emitter writes one `ALTER ROLE ... DROP MEMBER`
+    per name before the drop. Membership stays undeclared and uncompared;
+    this is the consequence of a drop the user asked for with a reason.

@@ -280,6 +280,30 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     Ok(assemble(&raw))
 }
 
+/// Who holds each user-defined role, by role name (ADR-0005).
+///
+/// Read only by `plan --db`, and only to list the members a `DROP ROLE` has
+/// to remove first: membership is each environment's own and is never
+/// compared, but a role cannot be dropped while it has members, and a plan
+/// that removes them has to say whom. A nested role is a member like any
+/// user and comes back the same way.
+pub async fn role_members(conn: &mut Conn) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+    const MEMBERS: &str = "\
+SELECT r.name AS role_name, m.name AS member_name
+  FROM sys.database_role_members rm
+  JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
+  JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+ WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
+ ORDER BY r.name, m.name;";
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in conn.query(MEMBERS).await? {
+        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+            .or_default()
+            .push(get::<&str>(&row, "member_name")?.to_owned());
+    }
+    Ok(out)
+}
+
 /// Reads the rows of every scoped table the schema has (ADR-0004).
 ///
 /// The scope decides *which* rows — every row of an `exact` table, the

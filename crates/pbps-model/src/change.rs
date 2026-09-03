@@ -375,9 +375,16 @@ pub enum Change {
         uid: Uid,
         name: String,
     },
+    /// Dropping a role that still has members is refused by the engine, and
+    /// membership is each environment's own — so a connected plan lists the
+    /// members it found and removes them first, by name, where the reviewer
+    /// can see who loses what. An offline plan has no environment to ask and
+    /// leaves the list empty (ADR-0005).
     DropRole {
         uid: Uid,
         name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<String>,
     },
     RenameRole {
         uid: Uid,
@@ -725,7 +732,8 @@ mod tests {
         assert!(
             Change::DropRole {
                 uid: uid("r_aaaaaa"),
-                name: "r".into()
+                name: "r".into(),
+                members: Vec::new(),
             }
             .intrinsic_risks()
             .contains(&RiskClass::Revoke)

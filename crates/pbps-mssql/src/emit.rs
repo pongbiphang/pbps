@@ -140,7 +140,21 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
         // which is the reason a role rename is intent rather than drop + add.
         Change::CreateRole { name, .. } => one(format!("CREATE ROLE {};", quote(name)?)),
-        Change::DropRole { name, .. } => one(format!("DROP ROLE {};", quote(name)?)),
+        // The members go first, each in a statement of its own, and the role
+        // last: the engine refuses to drop a role that still has members, and
+        // a plan that listed them is a plan the reviewer saw.
+        Change::DropRole { name, members, .. } => {
+            let mut out = Vec::new();
+            for member in members {
+                out.push(Statement::new(format!(
+                    "ALTER ROLE {} DROP MEMBER {};",
+                    quote(name)?,
+                    quote(member)?
+                )));
+            }
+            out.push(Statement::new(format!("DROP ROLE {};", quote(name)?)));
+            Ok(out)
+        }
         Change::RenameRole { from, to, .. } => one(format!(
             "ALTER ROLE {} WITH NAME = {};",
             quote(from)?,
@@ -1531,9 +1545,24 @@ mod tests {
         assert_eq!(
             sql_of(&Change::DropRole {
                 uid: uid.clone(),
-                name: "app_reader".into()
+                name: "app_reader".into(),
+                members: Vec::new(),
             }),
             ["DROP ROLE [app_reader];"]
+        );
+        // Members first, by name, then the role: the engine refuses the drop
+        // while any remain, and the plan says exactly who is removed.
+        assert_eq!(
+            sql_of(&Change::DropRole {
+                uid: uid.clone(),
+                name: "app_reader".into(),
+                members: vec!["app_svc".into(), "reporting".into()],
+            }),
+            [
+                "ALTER ROLE [app_reader] DROP MEMBER [app_svc];",
+                "ALTER ROLE [app_reader] DROP MEMBER [reporting];",
+                "DROP ROLE [app_reader];"
+            ]
         );
         // ALTER, never drop + add: the membership has to survive.
         let sql = sql_of(&Change::RenameRole {

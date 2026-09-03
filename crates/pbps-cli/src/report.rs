@@ -498,7 +498,14 @@ pub fn describe(c: &Change) -> String {
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
         Change::CreateRole { name, .. } => format!("+ create role {name}"),
-        Change::DropRole { name, .. } => format!("- drop role {name}"),
+        Change::DropRole { name, members, .. } if members.is_empty() => {
+            format!("- drop role {name}")
+        }
+        Change::DropRole { name, members, .. } => format!(
+            "- drop role {name}, removing {} member(s) first: {}",
+            members.len(),
+            members.join(", ")
+        ),
         Change::RenameRole { from, to, .. } => format!("~ rename role {from} -> {to}"),
         Change::Grant {
             target,

@@ -423,6 +423,9 @@ grants:
   (5.1), a rename needs intent (`pbps rename-role`, or `renamed_from:`) and is
   emitted as `ALTER ROLE ... WITH NAME`, and a drop needs `--reason` and leaves
   a tombstone.
+- A dropped role's members are removed first: `plan --db` lists them by name
+  from the target, so the plan says who loses the role there; an offline plan
+  cannot and says so. Membership is otherwise never declared or compared.
 - Two risk classes (7.2): `revoke`, gated, for anything that takes access
   away — a role drop included; `grant-widen`, labelled in every plan but never
   gated, because granting is the normal case and the merge request is where

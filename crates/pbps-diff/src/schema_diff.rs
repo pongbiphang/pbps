@@ -764,6 +764,8 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
             changes.push(Change::DropRole {
                 uid: uid.clone(),
                 name: name.clone(),
+                // Only a connected plan can know them; see `Change::DropRole`.
+                members: Vec::new(),
             });
         }
     }

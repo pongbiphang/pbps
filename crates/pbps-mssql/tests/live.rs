@@ -2286,6 +2286,40 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     let n: i32 = members[0].try_get_at(0).unwrap().unwrap();
     assert_eq!(n, 1, "the member must still hold the renamed role");
 
+    // Dropping the role while it has a member: the connected plan lists the
+    // member and removes it first, and the engine then accepts the drop.
+    let found = pbps_mssql::catalog::role_members(&mut db.conn)
+        .await
+        .expect("members");
+    assert_eq!(found.get("reader"), Some(&vec!["pbps_member".to_owned()]));
+    let drop = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::DropRole {
+                uid: renamed_ids.roles.keys().next().unwrap().clone(),
+                name: "reader".to_owned(),
+                members: found["reader"].clone(),
+            },
+        )],
+    };
+    apply(&mut db.conn, &drop).await;
+    let left = db
+        .conn
+        .query("SELECT COUNT(*) FROM sys.database_principals WHERE name = 'reader';")
+        .await
+        .expect("query");
+    let n: i32 = left[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(n, 0, "the role is gone");
+    // The negative case, against the engine: without the members listed the
+    // drop is refused, which is the failure the listing exists to avoid.
+    db.conn
+        .execute("CREATE ROLE stuck; ALTER ROLE stuck ADD MEMBER pbps_member;")
+        .await
+        .expect("a role with a member");
+    assert!(
+        db.conn.execute("DROP ROLE stuck;").await.is_err(),
+        "the engine must refuse to drop a role that has members"
+    );
+
     db.drop().await;
 }
 

@@ -148,12 +148,22 @@ Decisions taken during implementation that this document did not anticipate:
 5. **The built-in roles are refused by `validate`.** `public` and the ten
    `db_*` roles cannot be created, dropped or renamed; declaring one would plan
    a statement the engine refuses.
-6. **A role with members cannot be dropped**, and the engine says so inside the
-   transaction; removing members is an environment-local act pbps does not
-   perform. `doctor` does not yet check the permissions managing roles needs
-   (`CREATE ROLE`, `ALTER ANY ROLE`, and `CONTROL` on the objects granted);
-   an account short of them fails loudly at apply time, and the gap is
-   recorded in STATUS.
+6. **A dropped role's members are removed first, by name, in the connected
+   plan.** The engine refuses to drop a role that still has members, and
+   membership is each environment's own — so `plan --db` reads
+   `sys.database_role_members` and writes each member into the `DropRole`
+   change, which emits one `ALTER ROLE ... DROP MEMBER` per member before the
+   `DROP ROLE`. The artifact the gate approves therefore says exactly who
+   loses the role in that environment; nothing is looked up at apply time,
+   where nobody would have reviewed it. An offline plan has no environment
+   to ask, leaves the list empty, and says so. Membership is still never
+   declared or compared: this is the one consequence of a drop the user
+   already asked for, with a reason, made visible rather than left to the
+   engine to refuse.
+7. **`doctor` asks for the role permissions only of a project that declares a
+   role**: `CREATE ROLE` and `ALTER ANY ROLE` at the database, and `CONTROL`
+   on every object and schema a role is granted on, because a `GRANT` is
+   authorized on the securable and `ALTER` on the schema does not cover it.
 
 ## Placement
 
