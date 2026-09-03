@@ -40,7 +40,8 @@ inside the test container — `sa` holds `CONTROL` and short-circuits the whole
 permission list, which is how three permission bugs survived the first live
 test) run
 against a real SQL Server in Docker:
-`scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken), or set
+`scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken; the engine is
+pinned by digest there and in CI), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The
 script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
 rehearsal. They are `#[ignore]`d so the ordinary suite stays offline; CI has a

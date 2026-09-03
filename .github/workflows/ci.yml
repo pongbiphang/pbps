@@ -61,7 +61,18 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mssql:
-        image: mcr.microsoft.com/mssql/server:2025-latest
+        # Pinned by digest: SQL Server 2025 RTM, 17.0.4075.5, image built
+        # 2026-07-23. `2025-latest` is a floating tag, so the engine under test
+        # could change between two runs of the same commit — which is the one
+        # thing a suite that exists to answer "what does the engine actually do"
+        # cannot afford. Bump deliberately, and run `scripts/live-tests.sh`
+        # against the new digest before pushing the bump.
+        #
+        # This is **not** a fix for the startup crashes recorded in
+        # docs/PITFALLS.md; their cause is unproven and looks resource-shaped
+        # (errno 11 on a 2-CPU runner). What it buys is that the next one is
+        # reproducible instead of unrepeatable.
+        image: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "Pbps!Ci12345"
@@ -74,15 +85,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The service has no health check hook here; the loop stands in for one.
+      #
+      # Found by the published port, not by `ancestor=<image>`: that filter
+      # repeated the image reference, so pinning it above would have left the
+      # two spellings free to drift apart and this step looking for a container
+      # that no longer matches.
       - name: wait for SQL Server
         run: |
-          for i in $(seq 1 60); do
-            if docker exec $(docker ps -q --filter ancestor=mcr.microsoft.com/mssql/server:2025-latest)                 /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
+          id=$(docker ps -q --filter publish=14330)
+          if [ -z "$id" ]; then
+            echo "no service container publishing 14330" >&2
+            docker ps -a >&2
+            exit 1
+          fi
+          for _ in $(seq 1 60); do
+            if docker exec "$id" /opt/mssql-tools18/bin/sqlcmd \
+                 -C -S localhost -U sa -P "Pbps!Ci12345" -Q "SELECT 1" >/dev/null 2>&1; then
               exit 0
             fi
             sleep 2
           done
-          echo "SQL Server never became ready" >&2; exit 1
+          # The container has crashed at startup twice on this job, and both
+          # times the reason was only visible in its own log — which the raw
+          # job output buries under teardown noise. Print it where the failure
+          # is, so the next occurrence is diagnosable without a dig.
+          echo "SQL Server never became ready" >&2
+          echo "----- service container log -----" >&2
+          docker logs "$id" >&2 2>&1 || true
+          exit 1
       - run: cargo test -p pbps-mssql --test live -- --ignored
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
@@ -93,6 +123,36 @@ jobs:
       # fail, and the failure looks like a bug in the lock rather than in the
       # test schedule.
       - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1
+
+  # `plan --dev docker://<image>` starts a throwaway container of its own, and
+  # nothing else reaches that code: every other `--dev` test passes a connection
+  # string. It shipped broken for exactly that reason — the cleanup guard
+  # removed the container it had just returned, so the feature had never worked
+  # (docs/PITFALLS.md, "A guard built twice is a guard that fires early").
+  #
+  # Its own job rather than a step in `live`: that one already runs a SQL Server
+  # as a service container, and a second engine on the same runner is the
+  # pressure the startup crashes suggest is worth not adding.
+  dev-rehearsal:
+    runs-on: ubuntu-latest
+    env:
+      PBPS_TEST_DEV_IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: plan --dev docker://
+        run: |
+          # The name filter is asserted, not trusted: a rename would otherwise
+          # leave this job green while running nothing, which is the shape
+          # docs/PITFALLS.md calls "tests that pass for the wrong reason".
+          out=$(cargo test -p pbps-cli --test flow -- \
+                  --ignored --test-threads=1 a_dev_container_outlives 2>&1)
+          echo "$out"
+          echo "$out" | grep -qE '^test result: ok\. 1 passed' || {
+            echo "expected exactly one test to run and pass" >&2
+            exit 1
+          }
 
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.

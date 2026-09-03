@@ -189,11 +189,26 @@ the suite may run as root **and** runs on Windows.
 - The `live` job's SQL Server service container has crashed at startup twice, on
   two different commits: the failing step is `wait for SQL Server`, both cargo
   steps are **skipped**, and a re-run of the same commit passed both times. Read
-  the job's step list before blaming the diff. Pinning the floating
-  `mcr.microsoft.com/mssql/server:2025-latest` tag is the fix, and belongs in a
-  CI change of its own.
-- The `docker://` rehearsal test is opt-in through `PBPS_TEST_DEV_IMAGE` because
-  it starts a *second* SQL Server. `scripts/live-tests.sh` sets it; CI does not.
+  the job's step list before blaming the diff. **The cause is still unproven** —
+  it looks resource-shaped (`errno 11`, core dump, 2-CPU runner), not
+  image-shaped. That step now prints the container's own log on failure, which
+  the raw job output otherwise buries under teardown noise.
+- The engine is **pinned by digest** in both `ci.yml` and
+  `scripts/live-tests.sh`. That is not a fix for the crashes above; it means the
+  next one is reproducible rather than unrepeatable, and that a suite whose job
+  is to answer "what does the engine actually do" cannot have the engine change
+  under it between two runs of the same commit. Bump deliberately, and run the
+  live tests against the new digest first.
+- Find the service container by **published port**, never by
+  `--filter ancestor=<image>`. That filter repeats the image reference, so the
+  two spellings drift apart the moment one is pinned.
+- The `docker://` rehearsal runs in its own job (`dev-rehearsal`), not alongside
+  the service container: two engines on one runner is the pressure worth not
+  adding. It stays opt-in locally through `PBPS_TEST_DEV_IMAGE`.
+- **A name filter in CI must be asserted, not trusted.** `cargo test -- <name>`
+  exits 0 having run nothing if the name stops matching, so `dev-rehearsal`
+  greps for `1 passed`. Without that a rename leaves the job green and the
+  coverage gone — the same shape as the tests that pass for the wrong reason.
 - An opt-in test must **skip** when its variable is unset, not panic. Copying
   the `panic!` used for `PBPS_TEST_DB` — which CI always sets — turned "this
   test is not enabled here" into a red job.
