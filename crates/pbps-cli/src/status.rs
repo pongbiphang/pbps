@@ -551,7 +551,8 @@ mod tests {
     fn a_locked_environment_that_also_drifted_reports_both() {
         let mut r = row("prod", "drift");
         r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
-        let ids: Vec<&str> = findings(&[r]).iter().map(|f| f.id).collect();
+        let found = findings(&[r]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.drift", "state.locked"]);
     }
 

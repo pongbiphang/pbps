@@ -20,7 +20,7 @@ groups of commands:
 | `init` (`--env` / `--from` / `--url-env`) | Create a complete project, optionally adopting an existing database |
 | `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`) | Compare against a baseline and produce a change plan |
 | `plan --dev` | Rehearse the plan in a throwaway engine: does it compile, does it converge (optional) |
-| `validate`, `fmt` (`--check`) | Static checks and canonical formatting |
+| `validate` (`--since <rev>`), `fmt` (`--check`) | Static checks, the project's `policies:`, and canonical formatting |
 | `rename`, `rename-table`, `rename-role`, `drop`, `drop-table`, `drop-role` | Record the intent only a human can supply |
 | `docs` (`--format markdown\|html\|erd`) | Documentation and an ERD from the declarations |
 | `explain --plan` | What a saved plan does, why it needs approval, and the exact command that approves it |

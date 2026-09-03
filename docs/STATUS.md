@@ -20,7 +20,7 @@ Declarations may carry database roles and their grants (`role:`, ADR-0005);
 membership stays each environment's own.
 
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
-`validate`, `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
+`validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`,
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind`), `completions`, `man`. Every read-only command
@@ -96,9 +96,9 @@ of 14.1. It was placed ahead of the next dialect deliberately: broadening the
 object model improves coverage, but these improve the first hour and every
 failure after it.
 
-**In progress — Phase 4, depth on SQL Server before breadth across engines**:
-declarative reference data (ADR-0004), roles and grants (ADR-0005), the
-`policies:` block and a wider built-in analyzer catalogue.
+**Phase 4, depth on SQL Server before breadth across engines**, is complete as
+scoped: declarative reference data (ADR-0004), roles and grants (ADR-0005),
+the `policies:` block and the first built-in analyzer catalogue (ADR-0008).
 
 Reference data is **built**, both halves: the `data:` block, its `exact` and
 `ensure` modes, the round trip through `fmt`, the rules `validate` reports, the
@@ -114,9 +114,13 @@ Roles and grants (ADR-0005) are **built**: the `role:` file, `r_` uids in the
 ids file, `rename-role` / `drop-role` and the other two intent channels, the
 differ with `revoke` (gated) and `grant-widen` (labelled, never gated), the
 T-SQL, the catalog read-back, drift under the managed set, `validate`'s
-target rule and `pull`. ADR-0005 lists the decisions taken on the way. Next in
-Phase 4: the `policies:` block and the analyzer catalogue, designed in
-[ADR-0008](ADR-0008-policies.md) and not yet built.
+target rule and `pull`. ADR-0005 lists the decisions taken on the way.
+
+The `policies:` block and the first analyzer catalogue (ADR-0008) are
+**built**: rules and suppressions in `pbps.yml`, `validate` (with `--since`)
+at the declaration point, `plan` and `plan --db` at the plan point with the
+findings carried in the saved plan, and refusal of the plan at `error` before
+anything is written. ADR-0008 lists the decisions taken on the way.
 
 Depth before breadth was chosen against the obvious ordering — engine count is
 what every comparison table measures — because a second dialect doubles the

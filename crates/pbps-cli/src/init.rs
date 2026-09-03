@@ -145,6 +145,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         // number written into every generated pbps.yml is one more line to
         // explain in the first hour.
         max_data_rows: None,
+        policies: None,
     };
     let config_text = render_config(&config);
 
@@ -677,6 +678,7 @@ mod tests {
             unmanaged: Unmanaged::Ignore,
             dev: None,
             max_data_rows: None,
+            policies: None,
         };
         let text = render_config(&config);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");

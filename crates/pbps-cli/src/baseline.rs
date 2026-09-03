@@ -197,13 +197,7 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
     // The identity file must come from the same revision: using the current one as
     // the baseline would hide renames.
-    let ids_rel = relative_to(&project.ids_file())?;
-    let ids = match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}"))?,
-        // On a first run that revision has no identity file yet; empty is correct.
-        Err(_) => IdsFile::default(),
-    };
+    let ids = ids_at(project, rev)?;
 
     Ok(Baseline {
         schema,
@@ -212,6 +206,46 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         description: format!("git {rev} ({count} objects)"),
         is_empty_fallback: count == 0,
     })
+}
+
+/// The identity file as it was at `rev`.
+///
+/// Empty when that revision has none — a first run — which is the right
+/// answer rather than a failure: everything is new against it.
+pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<IdsFile> {
+    let root = &project.root;
+    let ids_rel = relative_to(&project.ids_file())?;
+    match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}")),
+        Err(_) => Ok(IdsFile::default()),
+    }
+}
+
+/// The objects whose identity differs between `before` and `now`, as a policy
+/// finding names them: a table under either of its names, a column's table,
+/// a role as `role <name>` (ADR-0008 decision 7).
+///
+/// By uid, not by file: a renamed table counts as changed under both names,
+/// and a file moved between directories does not count at all.
+pub fn changed_subjects(before: &IdsFile, now: &IdsFile) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (uid, name) in before.tables.iter().chain(&now.tables) {
+        if before.tables.get(uid) != now.tables.get(uid) {
+            out.insert(name.to_string());
+        }
+    }
+    for (uid, column) in before.columns.iter().chain(&now.columns) {
+        if before.columns.get(uid) != now.columns.get(uid) {
+            out.insert(column.table.to_string());
+        }
+    }
+    for (uid, role) in before.roles.iter().chain(&now.roles) {
+        if before.roles.get(uid) != now.roles.get(uid) {
+            out.insert(format!("role {role}"));
+        }
+    }
+    out
 }
 
 /// Rewrites a path relative to the repo root, which is what git's path arguments

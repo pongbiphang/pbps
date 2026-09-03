@@ -610,6 +610,12 @@ pub struct PlannedChange {
     /// not even have is a hint nobody reviewed.
     #[serde(default, skip_serializing_if = "Strategy::is_default")]
     pub strategy: Strategy,
+
+    /// What the analyzers said about this change (ADR-0008). Beside the risks,
+    /// never inside them: a finding carries a severity the project chose and
+    /// can be suppressed, a risk class is what the gate reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::finding::Finding>,
 }
 
 impl PlannedChange {
@@ -621,6 +627,7 @@ impl PlannedChange {
             change,
             risks,
             strategy: Strategy::default(),
+            findings: Vec::new(),
         }
     }
 

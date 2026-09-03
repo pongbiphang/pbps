@@ -237,6 +237,18 @@ pub struct Config {
     /// that a 1,200-row currency table is illegitimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_data_rows: Option<usize>,
+
+    /// The organization's own rules and their suppressions (ADR-0008). Absent
+    /// means every built-in rule at its default severity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<pbps_policy::Policies>,
+}
+
+impl Config {
+    /// The policies block, or the defaults when there is none.
+    pub fn policies(&self) -> pbps_policy::Policies {
+        self.policies.clone().unwrap_or_default()
+    }
 }
 
 fn default_schema_dir() -> PathBuf {

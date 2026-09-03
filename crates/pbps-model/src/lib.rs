@@ -25,6 +25,7 @@
 pub mod change;
 pub mod data;
 pub mod drift;
+pub mod finding;
 pub mod ids;
 pub mod intent;
 pub mod module;
@@ -42,6 +43,7 @@ pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRows, Row, RowKey, RowScope, TableData, Value,
 };
 pub use drift::{DriftBaseline, DriftReport};
+pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use module::{Hints, Module, ModuleDeps, ModuleKind, ObjectName};

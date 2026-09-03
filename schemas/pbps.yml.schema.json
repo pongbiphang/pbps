@@ -48,6 +48,17 @@
       ],
       "format": "uint",
       "minimum": 0
+    },
+    "policies": {
+      "description": "The organization's own rules and their suppressions (ADR-0008). Absent\nmeans every built-in rule at its default severity.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Policies"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -161,6 +172,116 @@
             "url_env"
           ]
         }
+      ]
+    },
+    "Policies": {
+      "description": "The whole block. Absent means every rule at its default and nothing\nsuppressed.",
+      "type": "object",
+      "properties": {
+        "rules": {
+          "description": "Rule id to its setting.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RuleSetting"
+          }
+        },
+        "suppress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppression"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RuleSetting": {
+      "description": "`error` / `warning` / `note` / `off`, or the detailed form.\n\n`off` is a YAML boolean (so are `on`, `yes` and `no`), and a project that\nwrites `naming.table: off` means the rule is off, not a type error. The\nboolean is accepted as a switch: `false` is off; `true` is refused by\n[`Policies::check`], because \"on\" says nothing about the severity.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/RuleConfig"
+        }
+      ]
+    },
+    "RuleConfig": {
+      "description": "The detailed form of one rule's setting.\n\nThe parameters of every rule are fields here, and a rule refuses the ones\nthat are not its own (see [`Policies::check`]): one flat shape keeps the\neditor schema honest without a variant per rule.",
+      "type": "object",
+      "properties": {
+        "severity": {
+          "description": "`error`, `warning`, `note` or `off`. Absent keeps the rule's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "`naming.*`: the regular expression the name must match in full.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "description": "`data.max-rows`: the row count above which a block is reported.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "offset": {
+          "description": "`change.window`: the UTC offset the windows are written in (`+08:00`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow": {
+          "description": "`change.window`: `mon-fri 09:00-17:00`, `sat 00:00-24:00`, ...",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Suppression": {
+      "description": "One suppression: a rule that does not fire, where, why, and until when.",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string"
+        },
+        "on": {
+          "description": "The object it applies to (`dbo.customer`, `role app_reader`). Absent\nmeans the whole project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why. The field an audit reads; blank is refused.",
+          "type": "string"
+        },
+        "until": {
+          "description": "`YYYY-MM-DD`. From that day on the suppression stops applying and the\nfinding comes back at its configured severity (ADR-0008 decision 4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "reason"
       ]
     }
   },

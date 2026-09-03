@@ -1,0 +1,23 @@
+[package]
+name = "pbps-policy"
+description = "PongBiphang Schema - the policies block and the built-in analyzer catalogue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+serde.workspace = true
+schemars.workspace = true
+# The naming rules take a pattern (ADR-0008 decision 5). `regex-lite` rather
+# than `regex`: the same syntax for what a naming rule needs, a fraction of
+# the dependency tree, and this binary gets audited.
+regex-lite.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -983,6 +983,24 @@ pub fn cmd_plan_db(
             }
         }
 
+        // The plan rules (ADR-0008), the connected ones included: this is the
+        // one place a change window has a moment and a target to be measured
+        // against. An `error` refuses the plan here, before anything is
+        // written; `apply` never sees a policy.
+        let policy = crate::attach_policy_findings(&mut cs, project, true);
+        for f in &policy {
+            eprintln!("{}: {} — {}", f.severity_word(), f.id, f.message);
+        }
+        if policy
+            .iter()
+            .any(|f| f.severity == crate::output::Severity::Error)
+        {
+            bail!(
+                "a policy set to `error` refuses this plan; fix the declarations, or suppress \
+                 the rule in pbps.yml with a reason"
+            );
+        }
+
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
         // honestly: whether ONLINE will be accepted at all, and whether an

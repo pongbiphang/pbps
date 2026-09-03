@@ -19,6 +19,7 @@ pbps-diff.workspace = true
 pbps-dialect.workspace = true
 pbps-mssql.workspace = true
 pbps-db.workspace = true
+pbps-policy.workspace = true
 pbps-docs.workspace = true
 tokio.workspace = true
 clap.workspace = true

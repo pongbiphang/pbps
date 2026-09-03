@@ -102,7 +102,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         "project.unsupported-dialect",
         crate::dialect(project),
     )?;
-    let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
+    let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref(), None);
     // The schemas the permission check asks about. Declarations that do not
     // load leave this empty, which is not a silence: `dbo` is always asked
     // about (the ledger lives there) and the declarations themselves are
@@ -280,7 +280,7 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
         .filter(|f| {
             f.severity == output::Severity::Error
                 && matches!(
-                    f.id,
+                    f.id.as_str(),
                     "environment.unreachable"
                         | "environment.unconfigured"
                         | "permission.unknown"

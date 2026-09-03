@@ -314,6 +314,11 @@ pub fn changes(cs: &ChangeSet) -> String {
             )
         };
         out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
+        // The analyzers' findings, under the change they are about, at the
+        // severity the project chose (ADR-0008).
+        for f in &p.findings {
+            out.push_str(&format!("      {}: {} — {}\n", f.severity, f.id, f.message));
+        }
     }
     out
 }

@@ -462,3 +462,25 @@ SPEC is in sync with all of these.
     who is removed and the emitter writes one `ALTER ROLE ... DROP MEMBER`
     per name before the drop. Membership stays undeclared and uncompared;
     this is the consequence of a drop the user asked for with a reason.
+
+## Phase 4 — policies (ADR-0008)
+
+64. **A rule's finding carries the rule's id, and the envelope's id became a
+    `String`.** Findings from the catalogue are what a project re-weights and
+    suppresses by, so the id they reach CI under is the rule's own
+    (`naming.column`), not a `policy.*` wrapper around it. The envelope's
+    `Finding::id` was a `&'static str`; every id was a literal until now, but
+    a rule id read out of a plan file is not, and a leak or a lookup table to
+    keep it static would have been a workaround for a type that no longer
+    described the data.
+65. **A block with problems is refused whole at the plan point.** `validate`
+    lists what is wrong with `policies:`; `plan` evaluates none of it until
+    that is fixed. Running the rules that parsed would report against a
+    configuration the project did not manage to write, and a plan that
+    passed under it would pass for the wrong reason.
+66. **A rule setting accepts the YAML boolean `false` as `off`.** The word
+    `off` is a boolean to the loader (so are `on`, `yes` and `no`), and
+    `naming.table: off` is what an operator will write. Refusing it as a type
+    error, or demanding quotes, would make the most common setting the one
+    that fails; `true` is refused instead, because "on" names no severity.
+    ADR-0008 "Implementation status" item 6.

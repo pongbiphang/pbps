@@ -495,6 +495,13 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
             format!("{}: {} ({} change(s))", r.class, r.why, r.changes.len()),
         ));
     }
+    // The analyzers' findings the plan carries (ADR-0008), under their own
+    // ids: a reviewer reading the envelope sees what `plan` saw.
+    for p in &plan.changes.changes {
+        for f in &p.findings {
+            out.push(crate::policy_finding(f));
+        }
+    }
     if let Some(t) = &e.target
         && t.state != "ready"
     {

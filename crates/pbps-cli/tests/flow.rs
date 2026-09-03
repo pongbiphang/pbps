@@ -4900,7 +4900,9 @@ fn an_oversized_data_block_warns_but_still_plans() {
 
     let o = d.run(&["validate", "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert_eq!(v["findings"][0]["id"], "schema.data-large", "{v}");
+    // The `data.max-rows` policy rule, with `max_data_rows` as its default
+    // parameter (ADR-0008).
+    assert_eq!(v["findings"][0]["id"], "data.max-rows", "{v}");
     assert_eq!(v["findings"][0]["severity"], "warning", "{v}");
     // A warning is not a finding the pipeline must act on.
     assert_eq!(code(&o), 0, "{}", stdout(&o));
@@ -5246,4 +5248,183 @@ fn fmt_keeps_a_pending_role_rename_and_strips_an_absorbed_one() {
     assert_eq!(code(&d.run(&["fmt"])), 0);
     let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
     assert!(!text.contains("renamed_from"), "absorbed: {text}");
+}
+
+// ---- The policies block, ADR-0008 ----
+
+/// A naming rule set to `error` fails `validate` with the rule's own id, and
+/// a suppression with a reason takes it back out — until its expiry.
+#[test]
+fn a_naming_policy_fails_validate_and_a_suppression_lifts_it_until_it_expires() {
+    let d = Demo::new("policynaming");
+    d.table("table: dbo.t\ncolumns:\n  CustomerId: {type: int}\n");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "naming.column", "{v}");
+    assert_eq!(v["findings"][0]["severity"], "error", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`CustomerId`"),
+        "{v}"
+    );
+
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n  suppress:\n    - rule: naming.column\n      on: dbo.t\n      reason: inherited\n      until: 2999-01-01\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Expired: the finding is back at its configured severity.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n  suppress:\n    - rule: naming.column\n      on: dbo.t\n      reason: inherited\n      until: 2000-01-01\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["validate"])), FINDING);
+
+    // And a block with a typo is refused by name rather than configuring
+    // nothing: `naming.colum` silently doing nothing would be worse than the
+    // rule having never been written.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.colum: error\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "policy.invalid", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("naming.colum"),
+        "{v}"
+    );
+}
+
+/// The plan point: adding and dropping in one table is the expand/contract
+/// lint, shown under the change at the project's severity — and at `error`
+/// the plan is refused before any file is written.
+#[test]
+fn the_expand_contract_lint_is_shown_in_the_plan_and_at_error_refuses_it() {
+    let d = Demo::new("policyplan");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  old: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    // Not a rename: an add plus a drop, recorded as such.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  added: {type: int}\n");
+    let o = d.run(&["drop", "dbo.t.old", "--reason", "gone"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("warning: change.expand-contract"), "{out}");
+    assert!(out.contains("- drop column old"), "{out}");
+
+    // The same plan carries the finding into the saved artifact.
+    let plan = d.dir.join("plan.json");
+    assert_eq!(code(&d.run(&["plan", "--out", plan.to_str().unwrap()])), 0);
+    let saved = std::fs::read_to_string(&plan).unwrap();
+    assert!(saved.contains("change.expand-contract"), "{saved}");
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.expand-contract"),
+        "{v}"
+    );
+
+    // Raised to error: refused, with nothing written.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.expand-contract: error\n",
+    )
+    .unwrap();
+    let refused = d.dir.join("refused.json");
+    let o = d.run(&["plan", "--out", refused.to_str().unwrap()]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("policy"), "{}", stderr(&o));
+    assert!(!refused.exists(), "a refused plan must not be written");
+    let o = d.run(&["plan", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "findings", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.expand-contract" && f["severity"] == "error"),
+        "{v}"
+    );
+
+    // Off: gone, and the plan is produced.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.expand-contract: off\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("expand-contract"), "{}", stdout(&o));
+}
+
+/// `--since` evaluates the declaration rules for the objects whose identity
+/// changed since the revision, so an estate can adopt a rule one table at a
+/// time — and a rename counts as changed under both names.
+#[test]
+fn validate_since_evaluates_only_what_changed() {
+    let d = Demo::new("policysince");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Untouched since HEAD: nothing is evaluated, though the name fails the rule.
+    assert_eq!(code(&d.run(&["validate"])), FINDING, "the rule does fail");
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // A new table is changed.
+    std::fs::write(
+        d.dir.join("schema").join("dbo.NewTable.yml"),
+        "table: dbo.NewTable\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("NewTable"), "{v}");
 }

@@ -136,6 +136,13 @@ schema_dir: schema/
 ids_file: schema.ids.json
 ```
 
+The `policies:` block selects built-in rules and their severities and records
+suppressions — a rule id, a reason and an optional expiry — with parameters
+that are data (a pattern, a number, a change window) and never code
+([ADR-0008](ADR-0008-policies.md)). Rules over the declarations run in
+`validate`; rules over the plan run in `plan`, attach to the changes they are
+about, and an `error` refuses to produce the plan. `apply` is never touched.
+
 ### 4.2 Table definitions
 
 One table per file. File names carry no meaning; the table name comes from
@@ -850,7 +857,7 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` | Record intent into the ids file |
-| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
+| `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
 | `pbps schema` / `completions` / `man` | Editor schemas, shell completions and man pages, generated from the binary's own definitions (see 9.7) |

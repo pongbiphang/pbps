@@ -191,6 +191,11 @@ enum Command {
         /// human (default) or json
         #[arg(long, default_value = "human")]
         format: OutputFormat,
+
+        /// Evaluate the policy rules only for objects changed since this git
+        /// revision, so a large estate can adopt a rule gradually
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Rewrite the declarations in canonical form
@@ -366,7 +371,7 @@ impl Command {
         let (name, format) = match self {
             Command::Plan { format, .. } => ("plan", *format),
             Command::Doctor { format, .. } => ("doctor", *format),
-            Command::Validate { format } => ("validate", *format),
+            Command::Validate { format, .. } => ("validate", *format),
             Command::Fmt { format, .. } => ("fmt", *format),
             Command::Verify { format, .. } => ("verify", *format),
             Command::Status { format, .. } => ("status", *format),
@@ -750,7 +755,7 @@ fn run() -> anyhow::Result<()> {
             };
             doctor::cmd_doctor(&project, one, format == OutputFormat::Json)
         }
-        Command::Validate { format } => cmd_validate(&project, format),
+        Command::Validate { format, since } => cmd_validate(&project, format, since.as_deref()),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
@@ -1082,6 +1087,60 @@ fn cmd_pull(
     Ok(())
 }
 
+/// What the policy rules need besides the block (ADR-0008).
+fn policy_context(project: &Project, connected: bool) -> pbps_policy::Context {
+    pbps_policy::Context {
+        now: unix_seconds(),
+        max_rows: project
+            .config
+            .max_data_rows
+            .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS),
+        connected,
+        only: None,
+    }
+}
+
+/// Runs the plan rules, attaches each finding to its change, and returns them
+/// as envelope findings for the command's own report.
+///
+/// A block with problems contributes nothing here: `validate` reports the
+/// problems, and evaluating half a block would report against rules the
+/// project did not manage to configure.
+pub fn attach_policy_findings(
+    cs: &mut pbps_model::ChangeSet,
+    project: &Project,
+    connected: bool,
+) -> Vec<output::Finding> {
+    let policies = project.config.policies();
+    if !policies.check().is_empty() {
+        return vec![
+            output::Finding::error(
+                "policy.invalid",
+                "the `policies:` block in pbps.yml has problems; `pbps validate` lists them",
+            )
+            .at(project.config_file(), None),
+        ];
+    }
+    let ctx = policy_context(project, connected);
+    let mut out = Vec::new();
+    for (at, f) in pbps_policy::plan(cs, &policies, &ctx) {
+        out.push(policy_finding(&f));
+        if let Some(p) = cs.changes.get_mut(at) {
+            p.findings.push(f);
+        }
+    }
+    out
+}
+
+/// A rule's finding as the envelope carries it: the rule id is the finding id.
+pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
+    match f.severity {
+        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), f.message.clone()),
+    }
+}
+
 /// The dialect implementation this project is configured for.
 fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     match project.config.dialect {
@@ -1193,6 +1252,7 @@ fn context() -> Context {
 pub fn validate_findings(
     project: &Project,
     dialect: &dyn Dialect,
+    since: Option<&str>,
 ) -> (Vec<output::Finding>, ValidateData) {
     // Both halves run before either is allowed to fail. A bad merge produces a
     // broken declaration *and* a scrambled identity file together, and the rule
@@ -1256,31 +1316,46 @@ pub fn validate_findings(
         }
         // Reference data (ADR-0004). Model rules, not engine rules — a row's
         // key is its identity in every dialect — so they come from the model
-        // rather than from `validate_table`.
-        let max_rows = project
-            .config
-            .max_data_rows
-            .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS);
+        // rather than from `validate_table`. The size warning is the
+        // `data.max-rows` policy rule below, with `max_data_rows` as its
+        // default parameter.
         for (name, table) in &l.schema.tables {
             for problem in pbps_model::data::check(name, table) {
                 findings.push(output::Finding::error("schema.data-invalid", problem));
             }
-            // A warning, never an error: the philosophy of ADR-0004 is enforced
-            // by the tool saying so, not by refusing a table somebody has a
-            // good reason for. Every plan from here on compares these rows one
-            // by one, which is the cost being pointed at.
-            if let Some(data) = &table.data
-                && data.rows.len() > max_rows
-            {
-                findings.push(output::Finding::warning(
-                    "schema.data-large",
-                    format!(
-                        "{name}: {} declared rows is above `max_data_rows` ({max_rows}) — this \
-                         does not look like reference data, and every plan compares it row by row",
-                        data.rows.len()
-                    ),
-                ));
-            }
+        }
+
+        // The project's own rules (ADR-0008): the declaration point. The block
+        // itself is checked first — a misspelled rule id that configured
+        // nothing would be the silent failure this mechanism exists to replace.
+        let policies = project.config.policies();
+        for problem in policies.check() {
+            findings.push(
+                output::Finding::error("policy.invalid", problem).at(project.config_file(), None),
+            );
+        }
+        let only = match since {
+            None => None,
+            Some(rev) => match (baseline::ids_at(project, rev), read_ids_opt(project)) {
+                (Ok(before), Ok(now)) => Some(baseline::changed_subjects(
+                    &before,
+                    &now.unwrap_or_default(),
+                )),
+                (Err(e), _) => {
+                    findings.push(output::Finding::error(
+                        "baseline.unreadable",
+                        format!("--since {rev}: {e:#}"),
+                    ));
+                    Some(Default::default())
+                }
+                // An unreadable identity file is already reported below.
+                (_, Err(_)) => Some(Default::default()),
+            },
+        };
+        let mut ctx = policy_context(project, false);
+        ctx.only = only;
+        for f in pbps_policy::declarations(&l.schema, &policies, &ctx) {
+            findings.push(policy_finding(&f));
         }
     }
     if let Err(e) = &ids {
@@ -1310,7 +1385,11 @@ pub fn validate_findings(
     (findings, data)
 }
 
-fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
+fn cmd_validate(
+    project: &Project,
+    format: OutputFormat,
+    since: Option<&str>,
+) -> anyhow::Result<()> {
     // `postgres` is an accepted `DialectName` with no implementation yet, so
     // this is a reachable failure on a perfectly valid project — and it escaped
     // before the JSON branch, leaving stdout empty.
@@ -1331,7 +1410,7 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let (findings, data) = validate_findings(project, dialect.as_ref());
+    let (findings, data) = validate_findings(project, dialect.as_ref(), since);
     let report = output::Report::new("validate", findings, Some(data));
 
     if format == OutputFormat::Json {
@@ -1948,7 +2027,7 @@ fn cmd_plan(
             .or_insert_with(|| deps.clone());
     }
 
-    let cs = pbps_diff::diff(
+    let mut cs = pbps_diff::diff(
         Side {
             schema: &base.schema,
             ids: &base.ids,
@@ -1982,6 +2061,14 @@ fn cmd_plan(
         }
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
+
+    // The plan rules (ADR-0008): attached to the changes they are about, so
+    // the plan file carries them to `explain`, and reported here at the
+    // severity the project chose. An `error` refuses to produce the plan —
+    // nothing below writes a file for it — and never reaches `apply`.
+    let policy = attach_policy_findings(&mut cs, project, false);
+    let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
+    findings.extend(policy);
 
     if !json {
         println!("Baseline: {}", base.description);
@@ -2017,6 +2104,18 @@ fn cmd_plan(
             "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
              Enterprise-only, and only `pbps plan --db` can read the target's edition."
         );
+    }
+
+    if refused {
+        if json {
+            let report = output::Report::new("plan", findings, None::<PlanData>);
+            return report.emit_json();
+        }
+        return Err(Found::new(
+            "a policy set to `error` refuses this plan; fix the declarations, or suppress the \
+             rule in pbps.yml with a reason",
+        )
+        .into());
     }
 
     if let Some(path) = out {

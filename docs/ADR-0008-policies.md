@@ -1,6 +1,6 @@
 # ADR-0008: The `policies:` block and the analyzer catalogue
 
-- Status: accepted (design; implementation is the next Phase 4 item)
+- Status: accepted and built (Phase 4; see "Implementation status")
 - Date: 2026-09-03
 - Related: docs/SPEC.md §9.8, §13.3, §14.1 (the two P1 rows), §14.3;
   [ADR-0003](ADR-0003-execution-strategy.md);
@@ -125,6 +125,42 @@ now are compared by uid, so a renamed table counts as changed under both its
 names and a file moved between directories does not count at all. Comparing
 file paths instead would make a directory reorganization re-lint the whole
 estate and a rename lint nothing.
+
+## Implementation status
+
+Built: the `policies:` block in `pbps.yml` (`rules`, `suppress`), the
+catalogue of Decision 6 in the `pbps-policy` crate, `validate` at the
+declaration point with `--since <rev>` by identity, `plan` and `plan --db` at
+the plan point with findings attached to each change and carried by the saved
+plan into `explain`, refusal on `error` before anything is written, and the
+editor schema regenerated from the config's own types.
+
+Decisions taken during implementation:
+
+1. **The block is checked before anything is evaluated.** A misspelled rule
+   id, a parameter a rule does not take, an invalid pattern, a suppression
+   with no reason or a bad date each produce a `policy.invalid` finding from
+   `validate`, and `plan` refuses to evaluate a block with problems rather
+   than run the half of it that parsed.
+2. **`data.max-rows` replaced the `schema.data-large` finding**, with
+   `max_data_rows` in `pbps.yml` as its default parameter. One rule, one id,
+   one place to re-weight it.
+3. **The change window is written with a UTC offset, never a zone name.** A
+   zone database is the dependency being declined; `+08:00` says what it
+   means without one. A window switched on with no `allow` list is refused
+   by `validate`, because it would refuse every plan.
+4. **Modules have no identity, so `--since` evaluates them every time.** No
+   declaration rule reads a module today, so nothing is lost; the day one
+   does, this is the sentence to revisit.
+5. **The naming rules match the whole name.** A pattern is wrapped in
+   `^(?:...)$`, so `[a-z_]+` refuses `CustomerId` rather than matching the
+   `ustomer` inside it — the failure a lint that silently partially matched
+   would never surface.
+6. **`off` is a YAML boolean, and the block reads it as one.** `naming.table:
+   off` parses as `false` (so would `on`, `yes` and `no`); the setting accepts
+   the boolean `false` as off rather than making the operator quote the word.
+   `true` is refused, because "on" says nothing about the severity — the
+   rule is switched on by naming one.
 
 ## Ruled out
 
