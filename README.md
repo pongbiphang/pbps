@@ -6,6 +6,9 @@ the schema should look like; the tool works out the rest.
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
   through [docs/ADR-0007-connection-strategy.md](docs/ADR-0007-connection-strategy.md)
+- Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)
+- Bugs shipped or nearly shipped, and their shapes: [docs/PITFALLS.md](docs/PITFALLS.md)
+- Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
 
 **Phases 0 through 3.5, and Phase 3.1, are complete** for SQL Server: tables,
 columns, keys,
