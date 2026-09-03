@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 
+use crate::data::TableData;
 use crate::module::{Module, ObjectName};
 use crate::name::TableName;
 use crate::types::ColumnType;
@@ -43,6 +44,32 @@ pub struct Schema {
 impl Schema {
     pub fn get(&self, name: &TableName) -> Option<&Table> {
         self.tables.get(name)
+    }
+
+    /// This schema with every `data:` block removed.
+    ///
+    /// For comparing a declaration against a catalog that has **not observed
+    /// rows** — which, until the connected half of ADR-0004 reads them back,
+    /// is every catalog. A catalog side always has `data: None`, and `None`
+    /// means "declares no rows", not "did not look"; comparing it to a
+    /// declaration that does declare rows would report every one of them as
+    /// missing, on every run. Stripping the declared side makes the comparison
+    /// say what it can actually answer, which is structure.
+    pub fn without_data(&self) -> Schema {
+        let mut s = self.clone();
+        for t in s.tables.values_mut() {
+            t.data = None;
+        }
+        s
+    }
+
+    /// The tables that declare reference data, for a refusal that names them.
+    pub fn tables_with_data(&self) -> Vec<&TableName> {
+        self.tables
+            .iter()
+            .filter(|(_, t)| t.data.is_some())
+            .map(|(n, _)| n)
+            .collect()
     }
 }
 
@@ -70,6 +97,18 @@ pub struct Table {
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub indexes: BTreeMap<String, Index>,
+
+    /// Declared reference data (ADR-0004).
+    ///
+    /// `None` — the overwhelmingly common case — is the opt-in switch being
+    /// off: pbps touches no row of a table that does not declare one. It lives
+    /// inside [`Table`] rather than beside the model because rows are desired
+    /// state that the database shows, so `==` must see them.
+    ///
+    /// Defaulted on read: every snapshot and plan written before `data:`
+    /// existed describes a table that declares no rows, not a broken file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<TableData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

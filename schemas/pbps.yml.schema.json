@@ -39,6 +39,15 @@
           "type": "null"
         }
       ]
+    },
+    "max_data_rows": {
+      "description": "How many rows a `data:` block may declare before `validate` says this\ndoes not look like reference data (ADR-0004).\n\nA knob rather than a constant because the line between a lookup table\nand somebody's business table is a judgement about *this* project — but\nit is a warning either way, never a refusal: pbps does not get to decide\nthat a 1,200-row currency table is illegitimate.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "minimum": 0
     }
   },
   "additionalProperties": false,
@@ -155,6 +164,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 1,
+  "x-pbps-schema-version": 2,
   "x-pbps-tool-version": "0.0.0"
 }

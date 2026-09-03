@@ -8,11 +8,12 @@ use serde_saphyr::Spanned;
 use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Intent, Module,
-    ModuleKind, ObjectName, PrimaryKey, Strategy, Table, TableName, UniqueConstraint,
+    CheckConstraint, Column, ColumnType, DataMode, ForeignKey, Identity, Index, IndexColumn,
+    Intent, Module, ModuleKind, ObjectName, PrimaryKey, Row, RowKey, Strategy, Table, TableData,
+    TableName, UniqueConstraint, Value,
 };
 
-use crate::dto::{ModuleDto, PrimaryKeyDto, TableDto};
+use crate::dto::{DataDto, ModuleDto, PrimaryKeyDto, TableDto, ValueDto};
 use crate::error::{LoadError, SourceFile, to_span};
 
 /// The result of loading one declaration file.
@@ -177,6 +178,17 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         }
     }
 
+    let data = match dto.data {
+        Some(d) => match convert_data(src, d) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                errs.extend(e);
+                None
+            }
+        },
+        None => None,
+    };
+
     match (name, errs.is_empty()) {
         (Some(name), true) => Ok(LoadedTable {
             name,
@@ -188,12 +200,94 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 foreign_keys,
                 checks,
                 indexes,
+                data,
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),
         }),
         _ => Err(errs),
     }
+}
+
+/// The `data:` block (ADR-0004).
+///
+/// Every problem is collected, like everywhere else here: a lookup table's
+/// block is the one place a user writes dozens of similar lines, and reporting
+/// the first bad one at a time would be the worst possible place to do it.
+fn convert_data(src: &SourceFile, dto: DataDto) -> Result<TableData, Vec<LoadError>> {
+    let mut errs = Vec::new();
+
+    // The `mode:` scalar is the only spanned thing in the block, so it is also
+    // where the cell diagnostics below point. They name the row and column in
+    // the message; the span gets the reader to the right block.
+    let at = to_span(&dto.mode.defined);
+
+    let mode = match dto.mode.value.as_str() {
+        "exact" => Some(DataMode::Exact),
+        "ensure" => Some(DataMode::Ensure),
+        other => {
+            errs.push(
+                LoadError::semantic(
+                    src,
+                    at,
+                    format!("unknown data mode `{other}`"),
+                    "not a mode",
+                )
+                .with_help(
+                    "`exact` means the declared rows are the whole table and an undeclared row is deleted; \
+                     `ensure` means they must exist and anything else is left alone",
+                ),
+            );
+            None
+        }
+    };
+
+    let mut rows = std::collections::BTreeMap::new();
+    for (key, cells) in dto.rows {
+        let mut row = std::collections::BTreeMap::new();
+        for (column, cell) in cells {
+            match convert_value(cell) {
+                Ok(v) => {
+                    row.insert(column, v);
+                }
+                // The message deliberately does not echo the number back.
+                // It has already been through `f64` by the time it gets here,
+                // so echoing it would print `1.5` at a user who wrote `1.50` —
+                // demonstrating the bug in the middle of explaining it.
+                Err(FloatCell) => errs.push(
+                    LoadError::semantic(
+                        src,
+                        at,
+                        format!("row `{key}`, column `{column}`: an unquoted decimal"),
+                        "quote it",
+                    )
+                    .with_help(
+                        "the exact form written is the literal that reaches the column, and reading it \
+                         as a floating-point number would not give it back — `'1.50'` stays 1.50",
+                    ),
+                ),
+            }
+        }
+        rows.insert(RowKey::from(key), Row(row));
+    }
+
+    match (mode, errs.is_empty()) {
+        (Some(mode), true) => Ok(TableData { mode, rows }),
+        _ => Err(errs),
+    }
+}
+
+/// A YAML float, which the loader refuses.
+struct FloatCell;
+
+fn convert_value(dto: ValueDto) -> Result<Value, FloatCell> {
+    Ok(match dto {
+        ValueDto::Null => Value::Null,
+        ValueDto::Bool(b) => Value::Bool(b),
+        ValueDto::Int(i) => Value::Int(i),
+        ValueDto::Float(_) => return Err(FloatCell),
+        ValueDto::Text(t) => Value::Text(t),
+    })
 }
 
 /// `dbo.region(region_id)` / `dbo.region(a, b)` into a table name and a column

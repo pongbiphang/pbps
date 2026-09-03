@@ -1153,6 +1153,34 @@ pub fn validate_findings(
         for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
             findings.push(output::Finding::error("schema.unknown-dependency", problem));
         }
+        // Reference data (ADR-0004). Model rules, not engine rules — a row's
+        // key is its identity in every dialect — so they come from the model
+        // rather than from `validate_table`.
+        let max_rows = project
+            .config
+            .max_data_rows
+            .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS);
+        for (name, table) in &l.schema.tables {
+            for problem in pbps_model::data::check(name, table) {
+                findings.push(output::Finding::error("schema.data-invalid", problem));
+            }
+            // A warning, never an error: the philosophy of ADR-0004 is enforced
+            // by the tool saying so, not by refusing a table somebody has a
+            // good reason for. Every plan from here on compares these rows one
+            // by one, which is the cost being pointed at.
+            if let Some(data) = &table.data
+                && data.rows.len() > max_rows
+            {
+                findings.push(output::Finding::warning(
+                    "schema.data-large",
+                    format!(
+                        "{name}: {} declared rows is above `max_data_rows` ({max_rows}) — this \
+                         does not look like reference data, and every plan compares it row by row",
+                        data.rows.len()
+                    ),
+                ));
+            }
+        }
     }
     if let Err(e) = &ids {
         findings.push(

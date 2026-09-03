@@ -4787,3 +4787,143 @@ fn a_dev_container_outlives_the_call_that_started_it() {
         "the rehearsal did not reach a live engine: {v}"
     );
 }
+
+// ---- Reference data, ADR-0004 ----
+
+const LOOKUP: &str = "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false}
+primary_key: [code]
+data:
+  mode: exact
+  rows:
+    new: {label: New}
+";
+
+/// The whole offline half in one run: a declaration with a `data:` block
+/// reaches plan.sql as DML, in the right place relative to the CREATE.
+#[test]
+fn declared_rows_reach_the_plan_as_dml() {
+    let d = Demo::new("dataplan");
+    d.table(LOOKUP);
+
+    let sql_path = d.dir.join("plan.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    let create = sql.find("CREATE TABLE").expect(&sql);
+    let insert = sql.find("INSERT INTO").expect(&sql);
+    assert!(
+        create < insert,
+        "rows must go in after the table exists:\n{sql}"
+    );
+    assert!(
+        sql.contains("([code], [label]) VALUES (N'new', N'New')"),
+        "{sql}"
+    );
+
+    // And the summary names the row, so a reviewer with no connection can see
+    // what is being written.
+    let out = stdout(&o);
+    assert!(out.contains("row new"), "{out}");
+}
+
+/// Removing a row from an `exact` declaration deletes it — and the plan says
+/// so behind the `data-delete` gate rather than in the SQL alone.
+#[test]
+fn removing_a_row_from_an_exact_table_is_gated() {
+    let d = Demo::new("datadelete");
+    d.table(LOOKUP);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(&LOOKUP.replace("    new: {label: New}\n", ""));
+    let o = d.run(&["plan"]);
+    let out = stdout(&o);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(out.contains("row new"), "{out}");
+    assert!(out.contains("data-delete"), "the gate must be named: {out}");
+}
+
+/// The negative case, and the promise `ensure` makes: pbps never removes what
+/// it did not declare in a table the application also writes to.
+#[test]
+fn removing_a_row_from_an_ensure_table_deletes_nothing() {
+    let d = Demo::new("dataensure");
+    let ensure = LOOKUP.replace("mode: exact", "mode: ensure");
+    d.table(&ensure);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(&ensure.replace("    new: {label: New}\n", ""));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("row new"), "{}", stdout(&o));
+
+    // The positive control, without which this test would also pass if
+    // `ensure` mode planned nothing at all: adding a row still works.
+    d.table(&ensure.replace(
+        "    new: {label: New}\n",
+        "    new: {label: New}\n    later: {label: Later}\n",
+    ));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("row later"), "{}", stdout(&o));
+}
+
+/// `validate` reports the model's own rules against the file, so the user sees
+/// the declaration rather than a constraint violation halfway through an apply.
+#[test]
+fn a_data_block_without_a_primary_key_fails_validate() {
+    let d = Demo::new("datanokey");
+    d.table(&LOOKUP.replace("primary_key: [code]\n", ""));
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}", stdout(&o));
+    let text = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(text.contains("primary key"), "{text}");
+}
+
+/// A warning, never a refusal: the tool says a thousand rows does not look like
+/// reference data, and leaves the judgement with the project.
+#[test]
+fn an_oversized_data_block_warns_but_still_plans() {
+    let d = Demo::new("datalarge");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\nmax_data_rows: 2\n").unwrap();
+    let rows: String = (0..3)
+        .map(|i| format!("    r{i}: {{label: R{i}}}\n"))
+        .collect();
+    d.table(&format!(
+        "table: dbo.t\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n  label: {{type: nvarchar(50), nullable: false}}\nprimary_key: [code]\ndata:\n  mode: exact\n  rows:\n{rows}"
+    ));
+
+    let o = d.run(&["validate", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "schema.data-large", "{v}");
+    assert_eq!(v["findings"][0]["severity"], "warning", "{v}");
+    // A warning is not a finding the pipeline must act on.
+    assert_eq!(code(&o), 0, "{}", stdout(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+}
+
+/// Until the connected half of ADR-0004 reads rows back from the catalog, a
+/// live target has not observed them — and a plan computed against it would
+/// insert every declared row on every run. Refused, before any connection is
+/// opened, which is why this test needs no server.
+#[test]
+fn a_connected_plan_refuses_reference_data_it_cannot_observe() {
+    let d = Demo::new("datadbrefuse");
+    d.table(LOOKUP);
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=localhost,1;Database=x;User Id=u;Password=p;TrustServerCertificate=true",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(err.contains("dbo.t"), "the table must be named: {err}");
+    assert!(err.contains("ADR-0004"), "{err}");
+    // Refused for the right reason, not because the bogus server was tried.
+    assert!(!err.contains("cannot connect"), "{err}");
+}

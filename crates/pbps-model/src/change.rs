@@ -14,9 +14,10 @@
 //! the model layer does not have. So risks are computed by the differ, which does
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::data::{Cell, DataMode, Row, RowKey};
 use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
 use crate::schema::{
@@ -47,6 +48,13 @@ pub enum RiskClass {
     NotNull,
     /// Adding UNIQUE / FK / CHECK: existing rows may not satisfy it.
     Constraint,
+    /// A declared reference row's values are overwritten (ADR-0004). What is
+    /// there now is not recoverable from the declarations, because what is
+    /// there now is what is being replaced.
+    DataUpdate,
+    /// A row leaves the table: an `exact` table's undeclared row, or a changed
+    /// primary-key value, which is delete plus insert.
+    DataDelete,
 }
 
 impl RiskClass {
@@ -58,6 +66,8 @@ impl RiskClass {
             RiskClass::Narrowing => "narrowing",
             RiskClass::NotNull => "not-null",
             RiskClass::Constraint => "constraint",
+            RiskClass::DataUpdate => "data-update",
+            RiskClass::DataDelete => "data-delete",
         }
     }
 
@@ -83,15 +93,23 @@ impl RiskClass {
             RiskClass::Constraint => {
                 "existing rows may not satisfy the new constraint and the statement fails"
             }
+            RiskClass::DataUpdate => {
+                "a reference row's current values are overwritten, and the plan does not record what they were"
+            }
+            RiskClass::DataDelete => {
+                "a reference row is removed: rows in other tables that point at it fail, or lose what they pointed at"
+            }
         }
     }
 
-    pub const ALL: [RiskClass; 5] = [
+    pub const ALL: [RiskClass; 7] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
         RiskClass::NotNull,
         RiskClass::Constraint,
+        RiskClass::DataUpdate,
+        RiskClass::DataDelete,
     ];
 }
 
@@ -240,6 +258,67 @@ pub enum Change {
         name: String,
     },
 
+    // Reference data (ADR-0004). No uid, and no rename intent: a row's entire
+    // content is declared, so recreating one is lossless — the generalized
+    // identity criterion of ADR-0005. The identity is the primary-key value,
+    // and a change to *that* is a delete plus an insert, gated as `data-delete`.
+    //
+    // The table's name rather than its uid, unlike the column changes above,
+    // because these run in the same plan as the renames and after them: the
+    // emitter needs the name the catalog will have when the statement runs, and
+    // for a row that is always the post-rename one.
+    InsertRow {
+        table: TableName,
+        /// The single primary-key column the key belongs in.
+        ///
+        /// Carried rather than looked up: the emitter has the change and
+        /// nothing else, and a saved plan is applied on a host that may have no
+        /// checkout at all — the same reason the plan carries its own ids.
+        key_column: String,
+        /// Whether the key column is an `IDENTITY` column, which the engine
+        /// assigns unless told otherwise. Carried for the same reason the
+        /// column name is: the emitter sees the change and nothing else, and
+        /// an explicit value into an identity column is refused unless the
+        /// statement says `SET IDENTITY_INSERT ... ON` first (ADR-0004).
+        identity_key: bool,
+        key: RowKey,
+        row: Row,
+    },
+    /// The columns that differ, never the whole row: an `UPDATE` restating a
+    /// column that did not change would overwrite a value the declaration and
+    /// the database already agree on, and would make plan.sql claim a change
+    /// that is not one.
+    UpdateRow {
+        table: TableName,
+        key_column: String,
+        key: RowKey,
+        /// Column to (before, after). The before is carried so the plan can say
+        /// what is being replaced — the reviewer at the gate has no connection
+        /// (SPEC §14.1) and cannot look it up.
+        ///
+        /// [`Cell`], not [`Value`]: an omitted column means the declared
+        /// default, and the emitter has to write `DEFAULT`, not `NULL`.
+        columns: BTreeMap<String, (Cell, Cell)>,
+    },
+    DeleteRow {
+        table: TableName,
+        key_column: String,
+        key: RowKey,
+        /// Why this row is going: `exact` means the table declared itself
+        /// complete and this row is not in it. Recorded because the two reasons
+        /// read very differently at the gate.
+        cause: DeleteCause,
+    },
+    /// `exact` <-> `ensure`. It emits no SQL by itself — the row changes it
+    /// implies are separate entries — but it is a change to the declaration
+    /// that `verify` compares against, so a plan that omitted it would leave
+    /// the recorded state disagreeing with the file.
+    SetDataMode {
+        table: TableName,
+        from: Option<DataMode>,
+        to: Option<DataMode>,
+    },
+
     // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
     // is drop + add and the audit trail is git.
     CreateModule {
@@ -279,7 +358,11 @@ impl Change {
             | Change::AddCheck { table, .. }
             | Change::DropCheck { table, .. }
             | Change::AddIndex { table, .. }
-            | Change::DropIndex { table, .. } => table,
+            | Change::DropIndex { table, .. }
+            | Change::InsertRow { table, .. }
+            | Change::UpdateRow { table, .. }
+            | Change::DeleteRow { table, .. }
+            | Change::SetDataMode { table, .. } => table,
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
@@ -315,7 +398,11 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::DropIndex { .. } => None,
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. } => None,
         }
     }
 
@@ -358,6 +445,12 @@ impl Change {
             Change::SetPrimaryKey { to: None, .. } => {
                 r.insert(RiskClass::Destructive);
             }
+            Change::UpdateRow { .. } => {
+                r.insert(RiskClass::DataUpdate);
+            }
+            Change::DeleteRow { .. } => {
+                r.insert(RiskClass::DataDelete);
+            }
             Change::CreateTable { .. }
             | Change::AddColumn { .. }
             | Change::AlterColumnType { .. }
@@ -374,7 +467,12 @@ impl Change {
             // CREATE OR ALTER rolls back with the plan's transaction and the
             // environment is unchanged.
             | Change::CreateModule { .. }
-            | Change::AlterModule { .. } => {}
+            | Change::AlterModule { .. }
+            // Inserting a declared row adds what the declaration says should be
+            // there; a failure (a duplicate key, a violated FK) rolls back with
+            // the plan. Changing the mode emits nothing at all.
+            | Change::InsertRow { .. }
+            | Change::SetDataMode { .. } => {}
         }
         r
     }
@@ -685,4 +783,16 @@ mod tests {
         let back: ChangeSet = serde_json::from_str(&serde_json::to_string(&cs).unwrap()).unwrap();
         assert_eq!(cs, back);
     }
+}
+
+/// Why a [`Change::DeleteRow`] is in the plan (ADR-0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteCause {
+    /// The table declares `mode: exact` and this row is not among the declared
+    /// ones. Only `exact` ever produces this; `ensure` never emits a DELETE.
+    Undeclared,
+    /// The row's primary-key value changed, which is delete plus insert because
+    /// rows carry no identity beyond their key.
+    KeyChanged,
 }

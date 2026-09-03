@@ -89,6 +89,17 @@
           "additionalProperties": {
             "$ref": "#/$defs/IndexDto"
           }
+        },
+        "data": {
+          "description": "Declared reference data (ADR-0004). Absent on almost every table: it is\nthe opt-in that lets the tool touch rows at all.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DataDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -271,6 +282,48 @@
         "columns"
       ]
     },
+    "DataDto": {
+      "description": "The `data:` block.\n\n`mode` is required rather than defaulted. The two modes differ by whether a\nrow the declaration does not mention is deleted, and a default would decide\nthat for the user in the file where it is least visible.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "rows": {
+          "description": "Primary-key value to the row's other columns.\n\nThe key is read as a string whatever the YAML scalar looked like, which\nis why an integer key (`1:`) works: the primary-key column's declared\ntype is what says how to render it, and it says so in one place\n(`pbps_model::RowKey`).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/ValueDto"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "rows"
+      ]
+    },
+    "ValueDto": {
+      "description": "One cell, as written: `null`, a boolean, an integer, or text. A decimal\nmust be quoted (`'1.50'`) — see `pbps_model::Value` for why.\n\nThe variants are tried in order and the order is the whole design. `Text`\nis last so that it catches only what nothing else did; `Float` sits ahead\nof it so that a bare `1.50` is *caught and refused* rather than silently\nbecoming the string `\"1.50\"` in some YAML parsers and the number 1.5 in\nothers. `convert` turns that arm into a diagnostic asking for quotes.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
     "ModuleDto": {
       "description": "One view, procedure, function or trigger (ADR-0002).\n\nThe leading key is both the kind and the name — `view: dbo.active_customer`\n— for the same reason `table:` is: the file name carries no meaning, so the\nidentity has to be inside the file.",
       "type": "object",
@@ -428,6 +481,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 1,
+  "x-pbps-schema-version": 2,
   "x-pbps-tool-version": "0.0.0"
 }
