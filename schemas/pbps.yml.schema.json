@@ -285,6 +285,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 2,
+  "x-pbps-schema-version": 3,
   "x-pbps-tool-version": "0.0.0"
 }

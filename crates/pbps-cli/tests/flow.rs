@@ -5578,6 +5578,51 @@ fn the_expand_contract_lint_is_shown_in_the_plan_and_at_error_refuses_it() {
 /// `--since` evaluates the declaration rules for the objects whose identity
 /// changed since the revision, so an estate can adopt a rule one table at a
 /// time — and a rename counts as changed under both names.
+/// `--since` reads the declarations at a revision through git, whose pathspec
+/// resolves against the current directory while `<rev>:<path>` resolves
+/// against the repository root. A project in a subdirectory listed nothing,
+/// so every table read as changed and an error-level rule failed on the
+/// legacy names `--since` exists to leave alone. Its sibling `load_from_git`
+/// already carried the `--full-tree` for this; the second instance is the
+/// shape.
+#[test]
+fn validate_since_reads_the_revision_from_the_repository_root() {
+    let d = Demo::nested("policysince-nested", "db/app");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Nothing changed since HEAD, so nothing is evaluated — though the name
+    // fails the rule, which the plain `validate` confirms.
+    assert_eq!(code(&d.run(&["validate"])), FINDING, "the rule does fail");
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // And a table that did change is still seen, from the same subdirectory.
+    std::fs::write(
+        d.dir.join("schema").join("dbo.NewTable.yml"),
+        "table: dbo.NewTable\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("NewTable"), "{v}");
+}
+
 #[test]
 fn validate_since_evaluates_only_what_changed() {
     let d = Demo::new("policysince");

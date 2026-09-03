@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Sixteen instances so far. **Absent, empty and unreadable are three different
+Seventeen instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -29,6 +29,10 @@ things, and only one of them is good news.**
   and `explain`.
 - A lock table the caller has **no permission to read**: metadata visibility
   makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock".
+- `validate --since` reading a failed `ls-tree` as "no declarations at that
+  revision", which calls every table new. From a project in a subdirectory it
+  was empty every time: the pathspec lacked the `--full-tree` its sibling
+  `load_from_git` had carried for exactly this since the baseline was written.
 
 ### 2. Failures escaping the one-envelope contract
 

@@ -283,9 +283,39 @@ pub fn changed_subjects(
 /// makes everything new — the right answer for a project's first policy run.
 pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Schema> {
     let root = &project.root;
+    // A revision that does not exist yet is the empty schema, the same answer
+    // `load_from_git` gives for the identities; anything else git refuses is
+    // an error, not "no declarations" — an unreadable tree read as an empty
+    // one would call every table new.
+    if git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_err()
+    {
+        return Ok(pbps_model::Schema::default());
+    }
     let dir_rel = relative_to(&project.schema_dir())?;
-    let listing =
-        git(root, &["ls-tree", "-r", "--name-only", rev, "--", &dir_rel]).unwrap_or_default();
+    // `--full-tree` and the empty-path rule for the same reasons as in
+    // `load_from_git`: git resolves the pathspec against the current
+    // directory, so a project in a subdirectory listed nothing here and
+    // `--since` called every table changed.
+    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", rev];
+    if !dir_rel.is_empty() {
+        args.push("--");
+        args.push(&dir_rel);
+    }
+    let listing = git(root, &args).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read `{}` at `{rev}`: {e}",
+            if dir_rel.is_empty() { "." } else { &dir_rel }
+        )
+    })?;
     let scratch = std::env::temp_dir().join(format!(
         "pbps-since-{}-{}",
         std::process::id(),
