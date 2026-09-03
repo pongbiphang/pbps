@@ -6,9 +6,10 @@
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
 use pbps_dialect::DialectError;
-use pbps_model::{GrantTarget, Module, ModuleKind, ObjectName, Role, Table, TableName};
+use pbps_model::{GrantTarget, Module, ModuleKind, ObjectName, Role, Table, TableName, Value};
 
 use crate::ident;
+use crate::rows::ValueKind;
 use crate::types::{self, DIALECT};
 
 /// SQL Server's limit on the number of key columns in one index.
@@ -209,38 +210,77 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     // A declared row value travels as a string literal and the engine
     // converts it — right for numbers, dates and text, wrong for bytes:
     // `N'0x01'` into a varbinary stores the characters, not the byte, and a
-    // key read back as `0x01` then fails to select its own row. The emitter
-    // carries no types (a plan applies with no checkout), so this is refused
-    // here, by name, rather than guessed at twice (DECISIONS 70).
+    // key read back as `0x01` then fails to select its own row. A
+    // `sql_variant` fails the other way round: the text goes in, but the
+    // variant's own base type does not come back out, so a pulled `int`
+    // variant would be written back as an `nvarchar` one. The emitter
+    // carries no types (a plan applies with no checkout), so both are
+    // refused here, by name, rather than guessed at twice (DECISIONS 70, 87).
+    // A scalar of the wrong *kind* is refused for the same reason: a bare
+    // `1` for a `varchar` column is stored and read back as text, and a
+    // declaration that disagrees with its own database on every plan is
+    // worse than none (87).
     if let Some(data) = &table.data {
-        let binary = |column: &str| {
+        let base_of = |column: &str| {
             table
                 .columns
                 .get(column)
                 .and_then(|c| types::normalize(&c.ty).ok())
-                .is_some_and(|t| {
-                    matches!(
-                        t.base.as_str(),
-                        "binary" | "varbinary" | "image" | "timestamp"
-                    )
-                })
+                .map(|t| t.base)
+        };
+        let unholdable = |base: &str| match base {
+            "binary" | "varbinary" | "image" | "timestamp" => Some((
+                "a binary column",
+                "row values are written as text, and text does not convert to the bytes it \
+                 names",
+            )),
+            "sql_variant" => Some((
+                "a `sql_variant` column",
+                "row values are written as text, and the variant's own base type does not \
+                 survive the trip",
+            )),
+            _ => None,
         };
         if let Some(pk) = &table.primary_key
             && let [key] = pk.columns.as_slice()
-            && binary(key)
+            && let Some((what, why)) = base_of(key).as_deref().and_then(unholdable)
         {
             errs.push(invalid(format!(
-                "a `data:` block cannot key its rows by `{key}`, a binary column: row values \
-                 are written as text, and text does not convert to the bytes it names"
+                "a `data:` block cannot key its rows by `{key}`, {what}: {why}"
             )));
         }
         for (key, row) in &data.rows {
-            for column in row.0.keys() {
-                if binary(column) {
+            for (column, value) in &row.0 {
+                let Some(base) = base_of(column) else {
+                    continue;
+                };
+                if let Some((what, why)) = unholdable(&base) {
                     errs.push(invalid(format!(
-                        "row `{key}` sets `{column}`, a binary column, which a `data:` block \
-                         cannot hold: row values are written as text, and text does not \
-                         convert to the bytes it names — leave the column out of the row"
+                        "row `{key}` sets `{column}`, {what}, which a `data:` block cannot \
+                         hold: {why} — leave the column out of the row"
+                    )));
+                    continue;
+                }
+                let kind = ValueKind::of(&base);
+                let agrees = matches!(
+                    (kind, value),
+                    (_, Value::Null)
+                        | (ValueKind::Bool, Value::Bool(_))
+                        | (ValueKind::Int, Value::Int(_))
+                        | (ValueKind::Text, Value::Text(_))
+                );
+                if !agrees {
+                    let spelling = match kind {
+                        ValueKind::Bool => "`true` or `false`",
+                        ValueKind::Int => "a bare integer",
+                        ValueKind::Text => "a quoted string",
+                    };
+                    errs.push(invalid(format!(
+                        "row `{key}` sets `{column}` to {value}, {}, but `{base}` reads back as \
+                         {}: the declaration would disagree with its own database on every \
+                         plan — write it as {spelling}",
+                        value.kind(),
+                        kind.name()
                     )));
                 }
             }
@@ -501,6 +541,103 @@ mod tests {
         });
         let msg = messages(&table(&name, &t));
         assert!(msg.contains("key its rows by `id`"), "{msg}");
+    }
+
+    /// Refused, not normalized: the differ has no column types to normalize
+    /// with, and a cell read back as another kind would drift on every plan.
+    #[test]
+    fn a_cell_of_the_wrong_kind_for_its_column_is_refused_with_the_spelling_that_fits() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let (name, mut t) = base_table();
+        t.columns
+            .insert("code".into(), Column::new(ty("varchar(10)")));
+        t.columns.insert("rank".into(), Column::new(ty("int")));
+        t.columns.insert("flag".into(), Column::new(ty("bit")));
+        let with = |t: &mut Table, cells: Vec<(&str, Value)>| {
+            let mut row = Row::default();
+            for (c, v) in cells {
+                row.0.insert(c.to_owned(), v);
+            }
+            t.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: [(RowKey::from("1"), row)].into_iter().collect(),
+            });
+        };
+        for (column, value, spelling) in [
+            ("code", Value::Int(1), "a quoted string"),
+            ("code", Value::Bool(true), "a quoted string"),
+            ("rank", Value::Text("1".into()), "a bare integer"),
+            ("rank", Value::Bool(true), "a bare integer"),
+            ("flag", Value::Int(1), "`true` or `false`"),
+            ("flag", Value::Text("true".into()), "`true` or `false`"),
+        ] {
+            with(&mut t, vec![(column, value)]);
+            let msg = messages(&table(&name, &t));
+            assert!(
+                msg.contains(&format!("sets `{column}` to")) && msg.contains(spelling),
+                "{column}: {msg}"
+            );
+        }
+        // The kind that reads back, and NULL in any column, pass.
+        with(
+            &mut t,
+            vec![
+                ("code", Value::Text("1".into())),
+                ("rank", Value::Int(1)),
+                ("flag", Value::Bool(true)),
+            ],
+        );
+        let msg = messages(&table(&name, &t));
+        assert!(!msg.contains("reads back"), "{msg}");
+        with(
+            &mut t,
+            vec![
+                ("code", Value::Null),
+                ("rank", Value::Null),
+                ("flag", Value::Null),
+            ],
+        );
+        let msg = messages(&table(&name, &t));
+        assert!(!msg.contains("reads back"), "{msg}");
+    }
+
+    /// Refused for what it is, not for its kind: the text would go in, but
+    /// the variant's base type would not come back out.
+    #[test]
+    fn a_sql_variant_cell_or_key_in_a_data_block_is_refused_by_name() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let (name, mut t) = base_table();
+        t.columns.insert("v".into(), Column::new(ty("sql_variant")));
+        let mut row = Row::default();
+        row.0.insert("v".into(), Value::Int(1));
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("1"), row)].into_iter().collect(),
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("`v`, a `sql_variant` column"), "{msg}");
+        assert!(!msg.contains("reads back"), "{msg}");
+
+        // Left out of the row, nothing flows and nothing is refused.
+        t.data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(RowKey::from("1"), Row::default());
+        assert!(!messages(&table(&name, &t)).contains("sql_variant"));
+
+        // A `sql_variant` key is refused whatever the rows set.
+        t.columns
+            .insert("id".into(), Column::new(ty("sql_variant")).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("key its rows by `id`, a `sql_variant` column"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -2760,6 +2760,55 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         db.conn.execute("DROP ROLE owner_role;").await.is_err(),
         "the engine must refuse to drop a role that owns a schema"
     );
+    // A schema is one class of many. The first list named the ones that
+    // came to mind and missed a role that owns another role; the check now
+    // covers every class the catalog records an owner for (DECISIONS 88),
+    // and three of them are measured here — the one that was missed, a
+    // Service Broker object, and a schema-scoped one whose owner is only
+    // recorded when it differs from the schema's.
+    db.conn
+        .execute(
+            "CREATE ROLE owned_role AUTHORIZATION owner_role; \
+             CREATE MESSAGE TYPE owned_mt AUTHORIZATION owner_role VALIDATION = NONE; \
+             CREATE XML SCHEMA COLLECTION owned_xsc AS \
+             N'<schema xmlns=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:x\">\
+             <element name=\"r\" type=\"string\"/></schema>'; \
+             ALTER AUTHORIZATION ON XML SCHEMA COLLECTION::dbo.owned_xsc TO owner_role;",
+        )
+        .await
+        .expect("a role that owns a role, a message type and an XML schema collection");
+    let owned = pbps_mssql::catalog::role_owned_securables(&mut db.conn)
+        .await
+        .expect("owned securables");
+    assert_eq!(
+        owned.get("owner_role"),
+        Some(&vec![
+            "MESSAGE TYPE::owned_mt".to_owned(),
+            "ROLE::owned_role".to_owned(),
+            "SCHEMA::owned".to_owned(),
+            "XML SCHEMA COLLECTION::dbo.owned_xsc".to_owned(),
+        ])
+    );
+    // The negative case, against the engine: with everything but the role
+    // handed back, owning a role alone still blocks the drop — and handing
+    // that back too is what lets it through, so the list was the whole
+    // reason.
+    db.conn
+        .execute(
+            "ALTER AUTHORIZATION ON SCHEMA::owned TO dbo; \
+             ALTER AUTHORIZATION ON MESSAGE TYPE::owned_mt TO dbo; \
+             ALTER AUTHORIZATION ON XML SCHEMA COLLECTION::dbo.owned_xsc TO dbo;",
+        )
+        .await
+        .expect("ownership moved back");
+    assert!(
+        db.conn.execute("DROP ROLE owner_role;").await.is_err(),
+        "the engine must refuse to drop a role that owns another role"
+    );
+    db.conn
+        .execute("ALTER AUTHORIZATION ON ROLE::owned_role TO dbo; DROP ROLE owner_role;")
+        .await
+        .expect("a role that owns nothing can be dropped");
 
     db.drop().await;
 }

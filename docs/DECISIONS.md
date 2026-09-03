@@ -671,3 +671,29 @@ SPEC is in sync with all of these.
     question and failed at `CREATE ROLE`; a pulled block that set a non-key
     IDENTITY column passed the dialect's check and was refused by the
     model's on the next `validate`. Both ask the whole question now.
+87. **A declared cell must be of the kind its column reads back as, and a
+    `sql_variant` cannot hold a declared value.** A bare `1` in a `varchar`
+    column is stored as text and read back as text; a quoted `"1"` in an
+    `int`, a `1` in a `bit`, come back as another kind — and every connected
+    plan then restates the same update, forever, against a database that
+    already agrees. Normalizing the declaration needs the column types in
+    the differ, which is dialect knowledge it does not hold, and normalizing
+    the read would hide the mismatch rather than remove it; so `validate`
+    refuses the cell by name, with the spelling that fits (70's shape). A
+    `sql_variant` cell is refused for 70's reason turned around: the text
+    goes in, but the variant's base type does not come back out, and a
+    pulled `int` variant would be written back as an `nvarchar` one — the
+    same digits, a different value to `SQL_VARIANT_PROPERTY`.
+88. **The owned-securable check names every class the catalog carries an
+    owner for.** 83 listed the classes that came to mind — schema, object,
+    type, assembly, certificate, keys — and missed a role that owns another
+    role (`sys.database_principals.owning_principal_id`), exactly the drop a
+    staged apply would commit every `DROP MEMBER` for before failing. The
+    list is now the catalog views with a `principal_id` or
+    `owning_principal_id` column, read off a live server rather than
+    recalled: roles, XML schema collections, full-text catalogs and
+    stoplists, search property lists, the Service Broker objects,
+    database-scoped credentials, event notifications, external languages
+    and libraries. The views that arrived after 2008 are probed for first,
+    so an older engine answers with the classes it has. A class enumerated
+    from memory is a filter nobody re-reads.

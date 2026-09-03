@@ -287,8 +287,144 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// compared, but a role cannot be dropped while it has members, and a plan
 /// that removes them has to say whom. A nested role is a member like any
 /// user and comes back the same way.
+/// The classes a database principal can own: the catalog view that records
+/// the owner, and the `SELECT` arm that spells each owned securable the way
+/// T-SQL names it (`SCHEMA::sales`, `ROLE::auditors`, `MESSAGE TYPE::m`).
+///
+/// The list is every catalog view with a `principal_id` or
+/// `owning_principal_id` column, read off a live server rather than recalled:
+/// the first version of it named the classes that came to mind and missed a
+/// role that owns another role, exactly the drop a staged apply would have
+/// committed every `DROP MEMBER` for before failing (DECISIONS 88). A view
+/// that arrived after SQL Server 2008 is named in the first field and probed
+/// for before the query is built, so an older engine answers with the classes
+/// it has instead of refusing the whole question.
+const OWNABLE: &[(Option<&str>, &str)] = &[
+    (
+        None,
+        "SELECT principal_id, N'SCHEMA::' + name FROM sys.schemas",
+    ),
+    (
+        None,
+        "SELECT o.principal_id, N'OBJECT::' + SCHEMA_NAME(o.schema_id) + N'.' + o.name \
+         FROM sys.objects o WHERE o.principal_id IS NOT NULL AND o.parent_object_id = 0",
+    ),
+    (
+        None,
+        "SELECT t.principal_id, N'TYPE::' + SCHEMA_NAME(t.schema_id) + N'.' + t.name \
+         FROM sys.types t WHERE t.principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT x.principal_id, N'XML SCHEMA COLLECTION::' + SCHEMA_NAME(x.schema_id) + N'.' + \
+         x.name FROM sys.xml_schema_collections x WHERE x.principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT p.owning_principal_id, \
+         CASE p.type WHEN 'A' THEN N'APPLICATION ROLE::' ELSE N'ROLE::' END + p.name \
+         FROM sys.database_principals p WHERE p.owning_principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ASSEMBLY::' + name FROM sys.assemblies",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'CERTIFICATE::' + name FROM sys.certificates",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'SYMMETRIC KEY::' + name FROM sys.symmetric_keys",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ASYMMETRIC KEY::' + name FROM sys.asymmetric_keys",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'FULLTEXT CATALOG::' + name FROM sys.fulltext_catalogs",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'FULLTEXT STOPLIST::' + name FROM sys.fulltext_stoplists",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'MESSAGE TYPE::' + name FROM sys.service_message_types",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'CONTRACT::' + name FROM sys.service_contracts",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'SERVICE::' + name FROM sys.services",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ROUTE::' + name FROM sys.routes",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'REMOTE SERVICE BINDING::' + name FROM sys.remote_service_bindings",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'EVENT NOTIFICATION::' + name FROM sys.event_notifications",
+    ),
+    (
+        Some("registered_search_property_lists"),
+        "SELECT principal_id, N'SEARCH PROPERTY LIST::' + name \
+         FROM sys.registered_search_property_lists",
+    ),
+    (
+        Some("database_scoped_credentials"),
+        "SELECT principal_id, N'DATABASE SCOPED CREDENTIAL::' + name \
+         FROM sys.database_scoped_credentials",
+    ),
+    (
+        Some("external_libraries"),
+        "SELECT principal_id, N'EXTERNAL LIBRARY::' + name FROM sys.external_libraries",
+    ),
+    (
+        Some("external_languages"),
+        "SELECT principal_id, N'EXTERNAL LANGUAGE::' + language FROM sys.external_languages",
+    ),
+];
+
+/// The ownership query over the classes whose view `present` says exists.
+fn owned_query(present: &dyn Fn(&str) -> bool) -> String {
+    // The catalog's name columns do not all share a collation (the
+    // `language` of `sys.external_languages` is binary), and a UNION refuses
+    // to pick one; the database's own is the right answer for names in it.
+    let arms = OWNABLE
+        .iter()
+        .filter(|(since, _)| since.is_none_or(present))
+        .enumerate()
+        .map(|(i, (_, arm))| {
+            format!(
+                "SELECT principal_id, securable COLLATE DATABASE_DEFAULT \
+                 FROM ({arm}) AS a{i} (principal_id, securable)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n        UNION ALL\n        ");
+    format!(
+        "\
+SELECT r.name AS role_name, x.securable
+  FROM sys.database_principals r
+  JOIN (
+        {arms}
+       ) AS x (principal_id, securable) ON x.principal_id = r.principal_id
+ WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
+ ORDER BY r.name, x.securable;"
+    )
+}
+
 /// Every securable each user-defined role **owns**, spelled the way T-SQL
-/// names it (`SCHEMA::sales`, `OBJECT::dbo.t`, `TYPE::dbo.money2`, ...).
+/// names it (`SCHEMA::sales`, `OBJECT::dbo.t`, `ROLE::auditors`, ...), over
+/// every class the catalog can assign an owner to ([`OWNABLE`]).
 ///
 /// The engine refuses to drop a role that owns anything, and ownership is
 /// each environment's own, like membership. A connected plan reads this so
@@ -298,30 +434,32 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 pub async fn role_owned_securables(
     conn: &mut Conn,
 ) -> Result<BTreeMap<String, Vec<String>>, DbError> {
-    const OWNED: &str = "\
-SELECT r.name AS role_name, x.securable
-  FROM sys.database_principals r
-  JOIN (
-        SELECT principal_id, N'SCHEMA::' + name AS securable FROM sys.schemas
-        UNION ALL
-        SELECT o.principal_id, N'OBJECT::' + SCHEMA_NAME(o.schema_id) + N'.' + o.name
-          FROM sys.objects o WHERE o.principal_id IS NOT NULL AND o.parent_object_id = 0
-        UNION ALL
-        SELECT t.principal_id, N'TYPE::' + SCHEMA_NAME(t.schema_id) + N'.' + t.name
-          FROM sys.types t WHERE t.principal_id IS NOT NULL
-        UNION ALL
-        SELECT a.principal_id, N'ASSEMBLY::' + a.name FROM sys.assemblies a
-        UNION ALL
-        SELECT c.principal_id, N'CERTIFICATE::' + c.name FROM sys.certificates c
-        UNION ALL
-        SELECT k.principal_id, N'SYMMETRIC KEY::' + k.name FROM sys.symmetric_keys k
-        UNION ALL
-        SELECT k.principal_id, N'ASYMMETRIC KEY::' + k.name FROM sys.asymmetric_keys k
-       ) AS x ON x.principal_id = r.principal_id
- WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
- ORDER BY r.name, x.securable;";
+    // The views that are not on every engine, asked about in one round trip:
+    // `OBJECT_ID` is NULL for a view this version does not have.
+    let optional: Vec<&str> = OWNABLE.iter().filter_map(|(since, _)| *since).collect();
+    let probe = format!(
+        "SELECT {};",
+        optional
+            .iter()
+            .map(|view| format!("OBJECT_ID(N'sys.{view}')"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut present = Vec::with_capacity(optional.len());
+    let probed = conn.query(&probe).await?;
+    let Some(row) = probed.first() else {
+        return Err(DbError::BadRow(
+            "the catalog probe returned no row".to_owned(),
+        ));
+    };
+    for (i, view) in optional.iter().enumerate() {
+        if row.try_get_at::<i32>(i)?.is_some() {
+            present.push(*view);
+        }
+    }
+    let query = owned_query(&|view| present.contains(&view));
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in conn.query(OWNED).await? {
+    for row in conn.query(&query).await? {
         out.entry(get::<&str>(&row, "role_name")?.to_owned())
             .or_default()
             .push(get::<&str>(&row, "securable")?.to_owned());
@@ -389,4 +527,27 @@ pub async fn read_rows(
         out.insert(name.clone(), observed);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine without a view answers with the classes it has; one with
+    /// every view is asked about every class.
+    #[test]
+    fn an_absent_catalog_view_removes_its_class_and_nothing_else() {
+        let all = owned_query(&|_| true);
+        let none = owned_query(&|_| false);
+        for (since, arm) in OWNABLE {
+            assert!(all.contains(arm), "{arm}");
+            assert_eq!(none.contains(arm), since.is_none(), "{arm}");
+        }
+        // The class that was missed once is not an optional one.
+        assert!(none.contains("owning_principal_id"));
+        assert!(!none.contains("sys.external_languages"));
+        assert!(all.contains("sys.external_languages"));
+        // A well-formed derived table: one `UNION ALL` fewer than arms.
+        assert_eq!(all.matches("UNION ALL").count() + 1, OWNABLE.len());
+    }
 }

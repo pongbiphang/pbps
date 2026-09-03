@@ -1062,7 +1062,7 @@ pub fn cmd_plan_db(
                 .context("cannot read the role memberships")?;
             // Ownership is refused, not planned around: the engine will not
             // drop an owning role, and moving ownership is a decision about
-            // who owns a schema, not a consequence of a drop. Said here,
+            // who owns a securable, not a consequence of a drop. Said here,
             // before anything runs — a staged apply would otherwise commit
             // every DROP MEMBER and then fail on the DROP ROLE.
             let owned = pbps_mssql::catalog::role_owned_securables(&mut conn)
@@ -1079,7 +1079,7 @@ pub fn cmd_plan_db(
                         bail!(
                             "role `{name}` cannot be dropped in `{}`: it owns {}.\n\
                              Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, \
-                             by hand, since pbps does not decide who owns a schema), or keep \
+                             by hand, since pbps does not decide who owns a securable), or keep \
                              the role.",
                             target.label,
                             securables.join(", "),

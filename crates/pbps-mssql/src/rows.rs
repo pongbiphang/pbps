@@ -109,7 +109,7 @@ impl ValueKind {
         }
     }
 
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             ValueKind::Bool => "boolean",
             ValueKind::Int => "integer",

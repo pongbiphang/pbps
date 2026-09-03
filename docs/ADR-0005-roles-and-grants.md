@@ -185,6 +185,15 @@ Decisions taken during implementation that this document did not anticipate:
    `DROP` takes the permissions with it; a table replaced under the same
    name, or a module changing kind, comes back bare, and every declared
    permission on it is a `GRANT` after the `CREATE` (DECISIONS 72).
+10. **A connected plan refuses to drop a role that owns anything**, of every
+    class the catalog can assign an owner to — schemas, objects, types, XML
+    schema collections, other roles, assemblies, certificates and keys, the
+    full-text and Service Broker objects, credentials, event notifications,
+    external languages and libraries — and names the `ALTER AUTHORIZATION`
+    to run by hand. The engine will not drop an owning role, and a staged
+    apply would have committed every `DROP MEMBER` before finding out; the
+    list is read off the catalog's owner columns, not recalled (DECISIONS
+    83, 88).
 
 ## Placement
 

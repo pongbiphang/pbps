@@ -98,6 +98,13 @@ An absent table gives **Msg 208** on that same statement. `HAS_PERMS_BY_NAME` �
 the natural repair — answers 0 for both cases, so only attempting the statement
 separates them. Measurement changed the fix here, it did not merely confirm it.
 
+A list of "the kinds of thing a principal can own", written from memory, had
+six entries; the catalog has nineteen views with an owner column, and the one
+that mattered — a role owning another role — was not on the list. **When the
+engine holds the list, read the list off the engine** (`sys.all_columns` for
+`principal_id` / `owning_principal_id`), and keep the probe that found it in
+the code's comment so the next reader can run it again.
+
 ## A comparison that runs what it compares
 
 The row read-back asked the engine, per cell, `CASE WHEN col = (default)`, so
