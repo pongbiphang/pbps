@@ -188,7 +188,14 @@ Decisions taken during implementation that this document did not anticipate:
    engine's text-to-binary conversion stores the characters, not the bytes.
    `validate` refuses a binary key and a row that sets a binary cell
    (DECISIONS 70); a typed value in the model is the way to lift that, and
-   it is an ADR of its own.
+   it is an ADR of its own. A key the engine spells differently from the
+   declaration (`01` for an `int` `1`) is read back under the declaration's
+   spelling: the read sends each declared key through a `VALUES` join and
+   the engine says which row it names (DECISIONS 71), so neither side ever
+   invents a second normalizer; two declared spellings of one row are
+   refused rather than reconciled (74). The pre-delete probe counts a child
+   row the plan updates unless the update sets the referencing column
+   itself (73).
 5. **A table the declarations take over is measured against what it holds.**
    The first connected plan for a table with a new `data:` block reads its
    rows, updates the ones that differ, inserts the ones missing, and — for

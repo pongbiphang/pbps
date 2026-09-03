@@ -116,6 +116,16 @@ default" into "omitted", and a row that spelled a value equal to its default
 compared unequal to itself on every plan. The catalog cannot know how a row
 was written; only the side reading it can (decision 67).
 
+## An exclusion wider than its reason
+
+The pre-delete probe left out every child row the plan *updated*, because a
+row the plan moves off the doomed parent must not be counted against the
+delete. The reason covers an update to the referencing column; the exclusion
+covered an update to any column, and a child updated elsewhere — still
+pointing at the parent — probed zero. Under `ON DELETE CASCADE` the engine
+then deleted it without a word (decision 73). Shape 4: a fix right about the
+case in front of it, one step too wide.
+
 ## A readiness check that reads only the declarations
 
 `doctor` derived the securables to ask `CONTROL` about from the declared

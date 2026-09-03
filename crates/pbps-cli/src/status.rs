@@ -301,9 +301,20 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         }
     };
     let live_schema =
-        scoped
+        match scoped
             .schema
-            .with_observed_rows(&rows, &recorded_data, &entry.snapshot.schema);
+            .with_observed_rows(&rows, &recorded_data, &entry.snapshot.schema)
+        {
+            Ok(schema) => schema,
+            // Two recorded spellings of one row: the recorded state cannot be
+            // compared against the database, which is the same answer as a read
+            // that failed, never "no drift".
+            Err(e) => {
+                row.state = "unreachable";
+                row.detail = Some(format!("the recorded rows cannot be compared: {e}"));
+                return row;
+            }
+        };
     let live = pbps_model::state_checksum(&live_schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {

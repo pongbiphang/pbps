@@ -291,7 +291,7 @@ async fn rehearse_in(
         .context("cannot read the declared rows back from the dev database")?;
     let engine = scoped
         .schema
-        .with_observed_rows(&rows, &declared_data, declared);
+        .with_observed_rows(&rows, &declared_data, declared)?;
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &engine,

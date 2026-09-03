@@ -76,7 +76,7 @@ async fn managed_state(
     let mut scoped = managed.scoped;
     scoped.schema = scoped
         .schema
-        .with_observed_rows(&managed.rows, scopes, reference);
+        .with_observed_rows(&managed.rows, scopes, reference)?;
     Ok(scoped)
 }
 
@@ -932,7 +932,7 @@ pub fn cmd_plan_db(
             &managed.rows,
             &recorded_data,
             &entry.snapshot.schema,
-        );
+        )?;
         let live = pbps_model::state_checksum(&as_recorded, &recorded_ids);
         let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
         if live != recorded {
@@ -971,7 +971,7 @@ pub fn cmd_plan_db(
             &managed.rows,
             &recorded_data,
             &loaded.schema,
-        );
+        )?;
         let mut cs = pbps_diff::diff(
             pbps_diff::Side {
                 schema: &base,

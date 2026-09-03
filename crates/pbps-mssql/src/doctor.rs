@@ -354,21 +354,22 @@ pub struct Held {
 }
 
 /// What the managed roles are granted on, as `doctor` has to ask about it
-/// (ADR-0005). `None` at the call site means the project has no role at all
-/// — none declared, none recorded, none being dropped.
+/// (ADR-0005). Empty from the project files is not yet "no role": the
+/// recorded state of the environment is consulted too, and a role it holds
+/// that the declarations no longer have is one the next plan drops.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantTargets {
     /// `schema.object`, qualified the way `HAS_PERMS_BY_NAME` takes it, as
     /// the declarations grant them.
     pub objects: Vec<String>,
     pub schemas: Vec<String>,
-    /// The managed roles by name: declared, recorded in the ids file, or
-    /// tombstoned by a `drop-role` not yet applied. Whatever these hold — in
-    /// the recorded state, and in the catalog where this login can see it —
-    /// is asked about too, because a grant that is gone from the
-    /// declarations is a `REVOKE` the plan will write, and the securable it
-    /// names is where `CONTROL` has to be held; the declarations alone
-    /// cannot see it.
+    /// The managed roles by name, as the project files know them: declared,
+    /// or recorded in the ids file. The roles in the environment's recorded
+    /// state join them. Whatever all of these hold — in the recorded state,
+    /// and in the catalog where this login can see it — is asked about too,
+    /// because a grant that is gone from the declarations is a `REVOKE` the
+    /// plan will write, and the securable it names is where `CONTROL` has to
+    /// be held; the declarations alone cannot see it.
     pub roles: Vec<String>,
 }
 
@@ -432,7 +433,7 @@ pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
     referenced: &[String],
-    granted: Option<&GrantTargets>,
+    granted: &GrantTargets,
 ) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
@@ -618,7 +619,26 @@ pub async fn permissions(
     // schema, so it is reported like a managed schema that is missing rather
     // than dropped by the join below.
     let mut absent_granted: BTreeSet<String> = BTreeSet::new();
-    if let Some(targets) = granted {
+    // The managed roles: the project's, plus every role the environment's
+    // recorded state holds — a role pbps applied is a role pbps manages,
+    // whether or not the declarations still name it (a `drop-role` removes
+    // it from the ids file before the plan that drops it runs). Tombstones
+    // are not consulted: they are permanent, and a drop applied long ago
+    // would keep the role requirements switched on forever.
+    let recorded = match crate::state::latest(conn).await {
+        Ok(Some(entry)) => entry.snapshot.schema.roles,
+        // Nothing recorded, or a ledger this account cannot read — the
+        // latter is a gap of its own, reported by the ledger rows.
+        _ => BTreeMap::new(),
+    };
+    let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
+    roles.extend(recorded.keys().cloned());
+    // Any role-shaped demand switches the role requirements on: a managed
+    // role by name, or a grant target the caller asks about.
+    let roles_declared =
+        !roles.is_empty() || !granted.objects.is_empty() || !granted.schemas.is_empty();
+    if roles_declared {
+        let targets = granted;
         let granted_perms: Vec<&str> = REQUIRED
             .iter()
             .filter(|r| matches!(r.needed, Needed::Granted))
@@ -636,29 +656,23 @@ pub async fn permissions(
         // read is a gap of its own, reported by the ledger rows.
         let mut objects: BTreeSet<String> = targets.objects.iter().cloned().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
-        if !targets.roles.is_empty()
-            && let Ok(Some(entry)) = crate::state::latest(conn).await
-        {
-            for (name, role) in &entry.snapshot.schema.roles {
-                if !targets.roles.contains(name) {
-                    continue;
-                }
-                for target in role.grants.keys() {
-                    match target {
-                        pbps_model::GrantTarget::Object(o) => {
-                            objects.insert(format!("{}.{}", o.schema, o.name));
-                        }
-                        pbps_model::GrantTarget::Schema(s) => {
-                            schemas_wanted.insert(s.clone());
-                        }
+        for role in recorded.values() {
+            for target in role.grants.keys() {
+                match target {
+                    pbps_model::GrantTarget::Object(o) => {
+                        objects.insert(format!("{}.{}", o.schema, o.name));
+                    }
+                    pbps_model::GrantTarget::Schema(s) => {
+                        schemas_wanted.insert(s.clone());
                     }
                 }
             }
         }
-        if !targets.roles.is_empty() {
+        // `IN ()` is not T-SQL: nothing to ask when no role is named.
+        if !roles.is_empty() {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut role_slots = Vec::new();
-            for r in &targets.roles {
+            for r in &roles {
                 params.push(Param::from(r.as_str()));
                 role_slots.push(format!("@P{}", params.len()));
             }
@@ -780,7 +794,7 @@ pub async fn permissions(
         ledger_schema,
         ledger_objects,
         referenced_objects,
-        roles_declared: granted.is_some(),
+        roles_declared,
         granted_objects,
         granted_schemas,
     })

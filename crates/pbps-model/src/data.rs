@@ -336,6 +336,19 @@ impl ObservedTable {
         self.rows.get_key_value(canonical)
     }
 
+    /// Two of `spelling`'s keys that name one row, with the engine's key.
+    pub fn conflict(&self, spelling: &BTreeSet<RowKey>) -> Option<(RowKey, RowKey, RowKey)> {
+        let mut seen: BTreeMap<&RowKey, &RowKey> = BTreeMap::new();
+        for key in spelling {
+            if let Some(canonical) = self.aliases.get(key)
+                && let Some(first) = seen.insert(canonical, key)
+            {
+                return Some((first.clone(), key.clone(), canonical.clone()));
+            }
+        }
+        None
+    }
+
     /// Every row, keyed as `spelling` spells it where it does and as the
     /// engine does elsewhere.
     pub fn rows_as(&self, spelling: &BTreeSet<RowKey>) -> BTreeMap<RowKey, &ObservedRow> {
@@ -358,6 +371,25 @@ impl ObservedTable {
 }
 
 pub type ObservedRows = BTreeMap<TableName, ObservedTable>;
+
+/// Two keys one side spells that the engine calls the same row — `1` and
+/// `01` for an `int` key, `a` and `A` under a case-insensitive collation.
+///
+/// Refused rather than reconciled: keeping one spelling would plan an insert
+/// of the other, which fails on the primary key at apply, and `validate`
+/// cannot see it (which spellings are equal is the engine's call). Surfaced by
+/// every connected command that projects rows.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{table}: rows `{first}` and `{second}` are the same row to the database (its key is \
+     `{canonical}`); declare it once"
+)]
+pub struct RowConflict {
+    pub table: TableName,
+    pub first: RowKey,
+    pub second: RowKey,
+    pub canonical: RowKey,
+}
 
 /// Which rows a read-back query fetches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,20 +522,33 @@ impl crate::schema::Schema {
     /// `reference` is the schema the scopes came from — the recorded snapshot
     /// for a drift check, the declarations for a rehearsal — because its rows
     /// say which cells that side spells explicitly ([`ObservedRow`]).
+    ///
+    /// Two keys the side spells that the engine calls one row is an error
+    /// ([`RowConflict`]), never a choice between them.
     pub fn with_observed_rows(
         mut self,
         rows: &ObservedRows,
         scopes: &DataScopes,
         reference: &crate::schema::Schema,
-    ) -> Self {
+    ) -> Result<Self, RowConflict> {
         for (name, table) in &mut self.tables {
             let own = reference.tables.get(name).and_then(|t| t.data.as_ref());
             table.data = match (scopes.get(name), rows.get(name)) {
-                (Some(scope), Some(observed)) => Some(scope.project(observed, own)),
+                (Some(scope), Some(observed)) => {
+                    if let Some((first, second, canonical)) = observed.conflict(&scope.keys) {
+                        return Err(RowConflict {
+                            table: name.clone(),
+                            first,
+                            second,
+                            canonical,
+                        });
+                    }
+                    Some(scope.project(observed, own))
+                }
                 _ => None,
             };
         }
-        self
+        Ok(self)
     }
 }
 
@@ -528,7 +573,7 @@ pub fn plan_base(
     rows: &ObservedRows,
     recorded: &DataScopes,
     declared: &crate::schema::Schema,
-) -> crate::schema::Schema {
+) -> Result<crate::schema::Schema, RowConflict> {
     let declared_scopes = declared.data_scopes();
     let mut base = live.clone();
     for (name, table) in &mut base.tables {
@@ -538,6 +583,16 @@ pub fn plan_base(
             .map(|s| s.mode);
         let own = declared.tables.get(name).and_then(|t| t.data.as_ref());
         let spelling = declared_scopes.get(name).map(|s| &s.keys);
+        if let (Some(spelling), Some(observed)) = (spelling, rows.get(name))
+            && let Some((first, second, canonical)) = observed.conflict(spelling)
+        {
+            return Err(RowConflict {
+                table: name.clone(),
+                first,
+                second,
+                canonical,
+            });
+        }
         table.data = match (mode, rows.get(name)) {
             (Some(mode), Some(observed)) => Some(TableData {
                 mode,
@@ -553,7 +608,7 @@ pub fn plan_base(
             _ => None,
         };
     }
-    base
+    Ok(base)
 }
 
 /// The order declared rows must be inserted in: a referenced table before the
@@ -1100,6 +1155,45 @@ mod tests {
         assert_eq!(names, ["1", "2"], "nothing to spell: the engine's");
     }
 
+    /// `1` and `01` declared side by side name one row to the engine; keeping
+    /// either would plan an insert of the other, which the primary key then
+    /// refuses at apply. Refused here instead, by both names.
+    #[test]
+    fn two_spellings_of_one_row_are_refused_not_reconciled() {
+        let mut seen = observed(&["1"]);
+        seen.aliases.insert(RowKey::from("01"), RowKey::from("1"));
+        seen.aliases.insert(RowKey::from("1"), RowKey::from("1"));
+        let both: BTreeSet<RowKey> = ["01", "1"].into_iter().map(RowKey::from).collect();
+        assert_eq!(
+            seen.conflict(&both),
+            Some((RowKey::from("01"), RowKey::from("1"), RowKey::from("1")))
+        );
+        // One side spelling `01` and the other `1` is not a conflict: each
+        // side is asked about its own keys.
+        let one: BTreeSet<RowKey> = ["01"].into_iter().map(RowKey::from).collect();
+        assert_eq!(seen.conflict(&one), None);
+
+        let mut schema = crate::schema::Schema::default();
+        schema.tables.insert(
+            name(),
+            table(Some(vec!["code"]), vec![("01", vec![]), ("1", vec![])]),
+        );
+        let scopes = schema.data_scopes();
+        let mut live = crate::schema::Schema::default();
+        live.tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let observed: ObservedRows = [(name(), seen)].into_iter().collect();
+        let err = live
+            .clone()
+            .with_observed_rows(&observed, &scopes, &schema)
+            .unwrap_err();
+        assert_eq!(err.first, RowKey::from("01"));
+        assert_eq!(err.second, RowKey::from("1"));
+        assert!(err.to_string().contains("declare it once"), "{err}");
+        let err = plan_base(&live, &observed, &BTreeMap::new(), &schema).unwrap_err();
+        assert_eq!(err.canonical, RowKey::from("1"));
+    }
+
     /// The catalog cannot tell `label: Unlabelled` from an omitted `label`
     /// when the default is `'Unlabelled'`; the side that reads the row can,
     /// and each side must see its own spelling back — or one of the two
@@ -1240,13 +1334,16 @@ mod tests {
         let none = crate::schema::Schema::default();
         let unread = schema
             .clone()
-            .with_observed_rows(&BTreeMap::new(), &scopes, &none);
+            .with_observed_rows(&BTreeMap::new(), &scopes, &none)
+            .unwrap();
         assert_eq!(unread.tables[&name()].data, None);
-        let read = schema.with_observed_rows(
-            &[(name(), ObservedTable::default())].into_iter().collect(),
-            &scopes,
-            &none,
-        );
+        let read = schema
+            .with_observed_rows(
+                &[(name(), ObservedTable::default())].into_iter().collect(),
+                &scopes,
+                &none,
+            )
+            .unwrap();
         assert_eq!(
             read.tables[&name()].data,
             Some(TableData {
@@ -1277,7 +1374,7 @@ mod tests {
         declared
             .tables
             .insert(name(), table(Some(vec!["code"]), vec![("a", vec![])]));
-        let base = plan_base(&live, &observed, &recorded, &declared);
+        let base = plan_base(&live, &observed, &recorded, &declared).unwrap();
         let data = base.tables[&name()].data.as_ref().unwrap();
         assert_eq!(
             data.mode,
@@ -1291,7 +1388,7 @@ mod tests {
         );
         // Taken over for the first time: the declared mode, since nothing was
         // recorded to differ from.
-        let base = plan_base(&live, &observed, &BTreeMap::new(), &declared);
+        let base = plan_base(&live, &observed, &BTreeMap::new(), &declared).unwrap();
         assert_eq!(
             base.tables[&name()].data.as_ref().unwrap().mode,
             DataMode::Exact
@@ -1302,7 +1399,8 @@ mod tests {
             &observed,
             &BTreeMap::new(),
             &crate::schema::Schema::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(base.tables[&name()].data, None);
     }
 }

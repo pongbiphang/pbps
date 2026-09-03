@@ -908,6 +908,28 @@ fn pull_refuses_to_overwrite_existing_declarations() {
     assert!(!err.contains("nowhere.invalid"), "{err}");
 }
 
+/// An ids file that names only roles is identity state too: a role-only
+/// project whose declaration directory is empty (a role file deleted by
+/// mistake, say) must not have its `r_` mapping replaced by an unforced pull.
+#[test]
+fn pull_refuses_to_overwrite_role_identities() {
+    let d = Demo::new("pull-refuse-roles");
+    std::fs::write(
+        d.ids_path(),
+        "{\"version\":1,\"tables\":{},\"columns\":{},\"roles\":{\"r_aaaaaa\":\"app_reader\"}}\n",
+    )
+    .unwrap();
+    let o = d.run(&[
+        "pull",
+        "--db",
+        "Server=nowhere.invalid,1433;Database=x;User Id=u;Password=p",
+    ]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("already has declarations"), "{err}");
+    assert!(!err.contains("nowhere.invalid"), "{err}");
+}
+
 #[test]
 fn pull_names_the_dialect_it_needs() {
     let d = Demo::new("pull-dialect");

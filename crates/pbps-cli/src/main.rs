@@ -926,7 +926,10 @@ fn cmd_pull(
         // still a pristine project, not user data for pull to overwrite. A
         // non-empty or malformed file remains a hard stop before connecting.
         let identities_exist = read_ids_opt(project)?.is_some_and(|ids| {
-            !ids.tables.is_empty() || !ids.columns.is_empty() || !ids.tombstones.is_empty()
+            !ids.tables.is_empty()
+                || !ids.columns.is_empty()
+                || !ids.roles.is_empty()
+                || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
             bail!(

@@ -516,8 +516,10 @@ SPEC is in sync with all of these.
     role, plans a `REVOKE` or a `DROP ROLE` whose securable the declarations
     no longer name — so `grant_targets` was `None` and `doctor` said ready to
     an apply that then failed on the `REVOKE`. The managed roles (declared, in
-    the ids file, or tombstoned by a `drop-role`) are passed by name, and
-    the connected check reads their grants from the **recorded state** first
+    the ids file, or held by the environment's recorded state — never the
+    tombstones, which are permanent and would keep the requirements on for
+    a drop applied years ago) are asked about, and the connected check
+    reads their grants from the **recorded state** first
     — that is what the next plan revokes against, and the ledger is readable
     by any account that can deploy — and from `sys.database_permissions`
     second, for grants adopted by hand. The catalog alone was tried first and
@@ -557,3 +559,22 @@ SPEC is in sync with all of these.
     silently removed a role's access. On a dropped target the base side is
     now empty, so every declared permission is a `GRANT`, ordered after the
     `CREATE`, and the `REVOKE` stays unwritten as before (58).
+73. **The pre-delete probe excludes an updated child row only for the
+    column its update sets.** The first cut excluded every row the plan
+    updated, on the reading that "the plan moves it". A plan that set some
+    other column of a row still pointing at the doomed parent then probed
+    zero, and under `ON DELETE CASCADE` the engine deleted the child
+    silently — the one outcome the probe exists to prevent. Which column a
+    foreign key references is known only to the catalog query that runs the
+    probe (`c.name`), so the exclusion is a `CASE` on it: a deleted row for
+    every column, an updated row for the columns it sets. An update that
+    sets the referencing column to the doomed parent itself is still
+    excluded, and fails loudly at the constraint instead.
+74. **Two spellings of one row on one side are refused, never reconciled.**
+    With keys read back through the engine (71), `1` and `01` declared side
+    by side both alias the row `1`; keeping either plans an insert of the
+    other, which the primary key refuses at apply. `validate` cannot see it
+    (which spellings are equal is the engine's call, and `a`/`A` depends on
+    the collation), so the projection refuses it (`RowConflict`) and every
+    connected command reports it by both names. One side spelling `01` and
+    the other `1` is not a conflict: each side is asked about its own keys.

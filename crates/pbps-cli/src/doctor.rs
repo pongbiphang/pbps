@@ -209,7 +209,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     target.connection(),
                     &managed_schemas,
                     &referenced,
-                    granted.as_ref(),
+                    &granted,
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
@@ -246,7 +246,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &conn,
                     &managed_schemas,
                     &referenced,
-                    granted.as_ref(),
+                    &granted,
                 )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
@@ -385,30 +385,26 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// What the managed roles are granted on (ADR-0005), or `None` when the
-/// project has no role — which switches the role requirements off.
+/// What the managed roles are granted on (ADR-0005), as far as the project
+/// files can say. Empty when the project declares no role and its ids file
+/// names none — which is not yet "no role": the environment's recorded state
+/// may still hold one a `drop-role` is about to remove, and the connected
+/// check adds those (see `pbps_mssql::doctor::permissions`). Tombstones are
+/// deliberately not read here: they are permanent audit records, and a drop
+/// applied years ago must not keep asking for `CREATE ROLE`.
 ///
-/// "Has" is wider than "declares": a role recorded in the ids file or
-/// tombstoned by a `drop-role` still exists in the database, and the next
-/// plan revokes what it holds there — needing `CONTROL` on securables the
-/// declarations no longer name and `ALTER ANY ROLE` for a role they no longer
-/// have. Those roles go into `roles`, and the connected check reads their
-/// live grants.
-fn grant_targets(project: &Project) -> Option<pbps_mssql::doctor::GrantTargets> {
-    let loaded = crate::load_quiet(project).ok()?;
+/// "Has" is wider than "declares": a role recorded in the ids file still
+/// exists in the database, and the next plan revokes what it holds there —
+/// needing `CONTROL` on securables the declarations no longer name and
+/// `ALTER ANY ROLE` for a role they no longer have.
+fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return pbps_mssql::doctor::GrantTargets::default();
+    };
     let ids = crate::read_ids(project).unwrap_or_default();
     let mut roles: std::collections::BTreeSet<String> =
         loaded.schema.roles.keys().cloned().collect();
     roles.extend(ids.roles.values().cloned());
-    roles.extend(
-        ids.tombstones
-            .iter()
-            .filter(|(uid, _)| uid.kind() == pbps_model::UidKind::Role)
-            .map(|(_, t)| t.was.clone()),
-    );
-    if roles.is_empty() {
-        return None;
-    }
     let mut objects = std::collections::BTreeSet::new();
     let mut schemas = std::collections::BTreeSet::new();
     for role in loaded.schema.roles.values() {
@@ -423,11 +419,11 @@ fn grant_targets(project: &Project) -> Option<pbps_mssql::doctor::GrantTargets> 
             }
         }
     }
-    Some(pbps_mssql::doctor::GrantTargets {
+    pbps_mssql::doctor::GrantTargets {
         objects: objects.into_iter().collect(),
         schemas: schemas.into_iter().collect(),
         roles: roles.into_iter().collect(),
-    })
+    }
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -436,7 +432,7 @@ async fn examine(
     connection: &str,
     schemas: &[String],
     referenced: &[String],
-    granted: Option<&pbps_mssql::doctor::GrantTargets>,
+    granted: &pbps_mssql::doctor::GrantTargets,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves

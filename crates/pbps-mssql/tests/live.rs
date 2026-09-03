@@ -1052,9 +1052,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["dbo".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
 
     // The point of the whole change: none of these are held on the *database*,
     // which is what the first version of this check asked about.
@@ -1080,9 +1085,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["dbo".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].permission, "DELETE");
@@ -1106,9 +1116,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
     // As a project that manages `app`, so the gap can only be the ledger's own
     // creation requirement and not the ordinary managed-schema `ALTER`.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.iter()
@@ -1137,9 +1152,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("grant on the ledger objects");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["dbo".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         !held.schemas["dbo"].contains("INSERT"),
         "the premise is wrong if the schema grant survived the revoke: {held:?}"
@@ -1161,9 +1181,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("drop the state table");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["dbo".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert_eq!(
         held.ledger_objects.len(),
         1,
@@ -1215,9 +1240,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke alter again");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         !gaps.iter().any(|g| g.permission == "ALTER"),
@@ -1239,9 +1269,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute("CREATE SCHEMA [app];")
         .await
         .expect("create app schema");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["App".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         held.absent_schemas.is_empty(),
         "a schema that exists under another casing must not be reported absent: {held:?}"
@@ -1256,9 +1291,14 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // nothing in the tool emits `CREATE SCHEMA`, so the first
     // `CREATE TABLE [nowhere].[...]` would have failed right after a clean
     // readiness report.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["nowhere".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         held.absent_schemas.contains("nowhere"),
         "a declared schema the database lacks must be reported: {held:?}"
@@ -1350,9 +1390,14 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         held.database.contains("CONTROL"),
         "the test's premise is wrong if this login lacks CONTROL: {held:?}"
@@ -1368,9 +1413,14 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         .await
         .expect("deny");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     // All three facts, because the old shortcut was built on the first alone.
     assert!(
         held.database.contains("CONTROL"),
@@ -1603,9 +1653,14 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         .expect("connect as the login");
     // The premise: with no foreign key out of `app`, this login is ready. If it
     // were not, the assertion below would pass for the wrong reason.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         pbps_mssql::doctor::missing(&held).is_empty(),
         "the premise is wrong if this login is short of something else: {:?}",
@@ -1617,7 +1672,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &mut lp,
         &["app".to_owned()],
         &["shared.parent".to_owned()],
-        None,
+        &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
     .expect("read permissions");
@@ -1643,7 +1698,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &mut lp,
         &["app".to_owned()],
         &["shared.parent".to_owned()],
-        None,
+        &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
     .expect("read permissions");
@@ -1956,7 +2011,9 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
         .await
         .expect("read rows");
-    let live = live.with_observed_rows(&observed, &scopes, &declared);
+    let live = live
+        .with_observed_rows(&observed, &scopes, &declared)
+        .unwrap();
 
     // What was declared is what comes back — `1.50` as the engine spells a
     // decimal(5,2), the defaulted label omitted, the NULLs omitted.
@@ -1992,7 +2049,9 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &again, &read)
         .await
         .expect("read rows");
-    let again = again.with_observed_rows(&observed, &scopes, &declared);
+    let again = again
+        .with_observed_rows(&observed, &scopes, &declared)
+        .unwrap();
 
     let status_rows = &again.tables[&TableName::new("dbo", "status")]
         .data
@@ -2113,6 +2172,43 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .unwrap();
     assert_eq!(n, 0, "a row the plan moves is not counted");
 
+    // An update that sets some other column of kind 7 leaves it pointing at
+    // `old`: still counted. The first cut excluded every updated row, and
+    // under ON DELETE CASCADE that was a silent delete.
+    db.conn
+        .execute("ALTER TABLE dbo.kind ADD note nvarchar(10) NULL;")
+        .await
+        .expect("a column the update can set");
+    let elsewhere = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                key: RowKey::from("7"),
+                columns: [(
+                    "note".to_owned(),
+                    (
+                        pbps_model::Cell::Value(Value::Null),
+                        pbps_model::Cell::Value(text("x")),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    let probe = probe_for(&elsewhere);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 1, "a row updated elsewhere still points at `old`");
+
     // A table that has lost its key is unreadable, not empty.
     db.conn
         .execute("ALTER TABLE dbo.kind DROP CONSTRAINT fk_kind_status; DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.status') AND type = 'PK'); EXEC('ALTER TABLE dbo.status DROP CONSTRAINT ' + @pk);")
@@ -2226,10 +2322,13 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     // explicit `label` included, and the two volatile cells omitted.
     let as_declared = live
         .clone()
-        .with_observed_rows(&observed, &scopes, &declared);
+        .with_observed_rows(&observed, &scopes, &declared)
+        .unwrap();
     assert_eq!(as_declared.tables[&name].data, declared.tables[&name].data);
     // As `pull` sees it, with no rows of its own: the shortest true block.
-    let pulled = live.with_observed_rows(&observed, &scopes, &Schema::default());
+    let pulled = live
+        .with_observed_rows(&observed, &scopes, &Schema::default())
+        .unwrap();
     assert_eq!(
         pulled.tables[&name].data.as_ref().unwrap().rows,
         rows(&[("1", &[]), ("2", &[])])
@@ -2340,7 +2439,8 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
     // As declared: the declaration's own spelling, and nothing to plan.
     let as_declared = live
         .clone()
-        .with_observed_rows(&observed, &scopes, &declared);
+        .with_observed_rows(&observed, &scopes, &declared)
+        .unwrap();
     assert_eq!(as_declared.tables[&name].data, declared.tables[&name].data);
     let cs = pbps_diff::diff_partial(
         pbps_diff::Side {
@@ -2379,7 +2479,8 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
         .collect();
     let pulled = live
         .clone()
-        .with_observed_rows(&observed, &unspelled, &Schema::default());
+        .with_observed_rows(&observed, &unspelled, &Schema::default())
+        .unwrap();
     let keys: Vec<String> = pulled.tables[&name]
         .data
         .as_ref()
@@ -2399,7 +2500,9 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
     let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
         .await
         .expect("read rows");
-    let as_ensured = live.with_observed_rows(&observed, &scopes, &ensured);
+    let as_ensured = live
+        .with_observed_rows(&observed, &scopes, &ensured)
+        .unwrap();
     assert_eq!(as_ensured.tables[&name].data, ensured.tables[&name].data);
 
     db.drop().await;
@@ -2656,9 +2759,14 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         .expect("connect as the login");
 
     // The control: with no role declared, this account is ready.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
-        .await
-        .expect("read permissions");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["dbo".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+    )
+    .await
+    .expect("read permissions");
     assert!(
         pbps_mssql::doctor::missing(&held).is_empty(),
         "{:?}",
@@ -2672,7 +2780,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         schemas: vec!["dbo".to_owned()],
         roles: vec![],
     };
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&targets))
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], &targets)
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -2748,7 +2856,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         roles: vec!["app_reader".to_owned()],
         ..targets.clone()
     };
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&managed))
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], &managed)
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -2776,7 +2884,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         schemas: vec!["dbo".to_owned(), "nowhere".to_owned()],
         ..targets.clone()
     };
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&nowhere))
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], &nowhere)
         .await
         .expect("read permissions");
     assert_eq!(
@@ -2797,7 +2905,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         ))
         .await
         .expect("grant the role permissions");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&managed))
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], &managed)
         .await
         .expect("read permissions");
     assert!(

@@ -165,8 +165,10 @@ Decisions taken during implementation that this document did not anticipate:
    already asked for, with a reason, made visible rather than left to the
    engine to refuse.
 7. **`doctor` asks for the role permissions only of a project that has a
-   role** — declared, recorded in the ids file, or tombstoned by a
-   `drop-role` not yet applied: `CREATE ROLE` and `ALTER ANY ROLE` at the
+   role** — declared, recorded in the ids file, or held by the
+   environment's recorded state, which is where a role a `drop-role` is
+   about to remove still shows (tombstones are permanent audit records and
+   are not read for this): `CREATE ROLE` and `ALTER ANY ROLE` at the
    database, and `CONTROL` on every object and schema a role is granted on,
    because a `GRANT` is authorized on the securable and `ALTER` on the schema
    does not cover it. The securables are the declared grants **plus whatever

@@ -66,11 +66,27 @@ struct AsStored {
     /// Tables this plan creates. They are empty, so nothing in them can violate
     /// anything, and probing them would only produce "invalid object name".
     created: BTreeSet<TableName>,
-    /// The declared rows this plan updates or deletes, by table: the key
-    /// column and the keys. A row the plan itself moves off a parent that is
-    /// going away must not be counted as still pointing at it (see
-    /// [`delete_probe`]).
-    moved: BTreeMap<TableName, (String, BTreeSet<RowKey>)>,
+    /// The declared rows this plan updates or deletes, by table. A row the
+    /// plan itself moves off a parent that is going away must not be counted
+    /// as still pointing at it (see [`delete_probe`]) — and a row the plan
+    /// merely touches elsewhere must.
+    moved: BTreeMap<TableName, Moved>,
+}
+
+/// The rows of one table a plan writes, as the pre-delete probe has to see
+/// them: which are deleted outright, and which columns each update sets.
+#[derive(Debug, Default)]
+struct Moved {
+    key_column: String,
+    /// Deleted: gone whatever they referenced.
+    deleted: BTreeSet<RowKey>,
+    /// Column set by an update -> the keys of the rows it is set in. An
+    /// update that sets the *referencing* column moves the row off the
+    /// parent; one that sets any other column leaves it pointing where it
+    /// was, and with `ON DELETE CASCADE` the engine would then delete it
+    /// silently — the first cut excluded every updated row and let exactly
+    /// that through.
+    updated: BTreeMap<String, BTreeSet<RowKey>>,
 }
 
 impl AsStored {
@@ -93,19 +109,27 @@ impl AsStored {
                     table,
                     key_column,
                     key,
-                    ..
+                    columns,
+                } => {
+                    let moved = this.moved.entry(table.clone()).or_default();
+                    moved.key_column = key_column.clone();
+                    for column in columns.keys() {
+                        moved
+                            .updated
+                            .entry(column.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
                 }
-                | Change::DeleteRow {
+                Change::DeleteRow {
                     table,
                     key_column,
                     key,
                     ..
                 } => {
-                    this.moved
-                        .entry(table.clone())
-                        .or_insert_with(|| (key_column.clone(), BTreeSet::new()))
-                        .1
-                        .insert(key.clone());
+                    let moved = this.moved.entry(table.clone()).or_default();
+                    moved.key_column = key_column.clone();
+                    moved.deleted.insert(key.clone());
                 }
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
@@ -404,25 +428,51 @@ fn delete_probe(
     // literal list the generated `NOT IN` will carry, under the name the
     // database has for the table now. Doubled quotes, because the fragment is
     // itself inside a T-SQL string literal.
+    //
+    // Which rows count as moved depends on the referencing column, which only
+    // the catalog query knows (`c.name`): a deleted row is gone for every
+    // column, an updated row only for the columns its update sets. A row
+    // updated elsewhere still points at the parent, and is counted.
     let mut exclusions = Vec::new();
-    for (child, (child_key, keys)) in &names.moved {
+    for (child, moved) in &names.moved {
         let Some(stored_child) = names.table(child) else {
             continue;
         };
-        let Some(stored_key) = names.column(&child.column(child_key)) else {
+        let Some(stored_key) = names.column(&child.column(&moved.key_column)) else {
             continue;
         };
-        let list: Vec<String> = keys.iter().map(|k| literal(k.as_str())).collect();
-        let clause = format!(
-            " AND {} NOT IN ({})",
-            quote(&stored_key.name)?,
-            list.join(", ")
-        );
+        let key_sql = quote(&stored_key.name)?;
+        let not_in = |keys: &BTreeSet<RowKey>| {
+            let list: Vec<String> = keys.iter().map(|k| literal(k.as_str())).collect();
+            literal(&format!(" AND {key_sql} NOT IN ({})", list.join(", ")))
+        };
+        let mut per_column = Vec::new();
+        for (column, keys) in &moved.updated {
+            let Some(stored_column) = names.column(&child.column(column)) else {
+                continue;
+            };
+            let mut keys = keys.clone();
+            keys.extend(moved.deleted.iter().cloned());
+            per_column.push(format!(
+                "WHEN c.name = {} THEN {}",
+                literal(&stored_column.name),
+                not_in(&keys)
+            ));
+        }
+        let otherwise = if moved.deleted.is_empty() {
+            "N''".to_owned()
+        } else {
+            not_in(&moved.deleted)
+        };
+        let clause = if per_column.is_empty() {
+            otherwise
+        } else {
+            format!("CASE {} ELSE {otherwise} END", per_column.join(" "))
+        };
         exclusions.push(format!(
-            "WHEN s.name = {} AND t.name = {} THEN {}",
+            "WHEN s.name = {} AND t.name = {} THEN {clause}",
             literal(&stored_child.schema),
             literal(&stored_child.name),
-            literal(&clause)
         ));
     }
     let exclusion = if exclusions.is_empty() {
@@ -859,10 +909,63 @@ mod tests {
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
         let sql = &p[0].sql;
-        // Inside the dynamic text, so the quotes are doubled.
+        // Inside the dynamic text, so the quotes are doubled — and only for
+        // the foreign key on the column the update sets; any other foreign
+        // key from that table still counts the row.
         assert!(
             sql.contains(
-                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN N' AND [id] NOT IN (N''7'')'"
+                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = \
+                 N'status_code' THEN N' AND [id] NOT IN (N''7'')' ELSE N'' END"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// An update that sets some other column leaves the row pointing where
+    /// it was. Excluding it anyway let `ON DELETE CASCADE` remove the row
+    /// silently: the probe said zero, the engine cascaded.
+    #[test]
+    fn a_child_row_updated_elsewhere_is_still_counted_against_the_delete() {
+        let cs = plan(vec![
+            Change::UpdateRow {
+                table: tname("dbo.kind"),
+                key_column: "id".into(),
+                key: RowKey::from("7"),
+                columns: [(
+                    "note".to_owned(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Null),
+                        pbps_model::Cell::Value(pbps_model::Value::Text("x".into())),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.kind"),
+                key_column: "id".into(),
+                key: RowKey::from("8"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+            Change::DeleteRow {
+                table: tname("dbo.status"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ]);
+        let p = probes(&cs);
+        let sql = &p
+            .iter()
+            .find(|p| p.description.contains("row `old`"))
+            .expect("the status delete carries a probe")
+            .sql;
+        // Row 8 is deleted: excluded for every column. Row 7 is excluded
+        // only where `note` is the referencing column, which it never is.
+        assert!(
+            sql.contains(
+                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = N'note' \
+                 THEN N' AND [id] NOT IN (N''7'', N''8'')' ELSE N' AND [id] NOT IN (N''8'')' END"
             ),
             "{sql}"
         );
