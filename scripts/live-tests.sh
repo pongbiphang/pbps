@@ -56,4 +56,15 @@ cargo test -p pbps-mssql --test live -- --ignored "$@"
 # `--test-threads=1`: these share one SQL Server, and the deployment lock is a
 # single row in it. Two tests taking it concurrently make each other fail, and
 # the failure reads as a bug in the lock rather than in the test schedule.
-exec cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 "$@"
+#
+# On macOS two tests are `ignore`d for a different reason — APFS cannot hold a
+# filename that is not valid UTF-8 — and `--ignored` would force them anyway.
+# They are skipped by name here only where they cannot run; on Linux they are
+# not ignored, run in the ordinary suite, and this filter never sees them. If
+# a rename stops the filter matching, the tests run and fail loudly on macOS,
+# which is the safe direction for a name filter to be wrong in.
+SKIP=()
+if [ "$(uname -s)" = Darwin ]; then
+    SKIP=(--skip not_utf8 --skip non_utf8)
+fi
+exec cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 "${SKIP[@]}" "$@"
