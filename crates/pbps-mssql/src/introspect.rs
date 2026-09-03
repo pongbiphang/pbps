@@ -138,8 +138,13 @@ pub struct RawRole {
 #[derive(Debug, Clone)]
 pub struct RawPermission {
     pub role: String,
-    /// `sys.database_permissions.class`: 1 for an object, 3 for a schema.
+    /// `sys.database_permissions.class`: 1 for an object, 3 for a schema, 0
+    /// for the database itself, and the rest for classes the model does not
+    /// hold (a type, an assembly, another principal, ...).
     pub class: u8,
+    /// The catalog's own name for the class (`DATABASE`, `OBJECT_OR_COLUMN`,
+    /// `TYPE`), for the report of one the model does not hold.
+    pub class_desc: String,
     /// The permission name as the catalog spells it (`SELECT`, `VIEW
     /// DEFINITION`).
     pub permission: String,
@@ -733,7 +738,35 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 pbps_model::GrantTarget::Object(ObjectName::new(p.schema.clone(), object.clone()))
             }
             (3, _) => pbps_model::GrantTarget::Schema(p.schema.clone()),
-            _ => continue,
+            // The database itself (`CONTROL`, `CREATE TABLE`), a type, an
+            // assembly, another principal: nothing a declaration can name,
+            // and a role that gained one out of band has changed even when
+            // every grant the model does hold still matches (DECISIONS 105).
+            (0, _) => {
+                unexpressible.push((
+                    p.role.clone(),
+                    format!(
+                        "role {}: {} on the database is not modelled; the declarations cannot \
+                         express it",
+                        p.role, p.permission
+                    ),
+                ));
+                continue;
+            }
+            _ => {
+                unexpressible.push((
+                    p.role.clone(),
+                    format!(
+                        "role {}: {} on a {} (class {}) is not modelled; the declarations \
+                         cannot express it",
+                        p.role,
+                        p.permission,
+                        p.class_desc.to_ascii_lowercase().replace('_', " "),
+                        p.class
+                    ),
+                ));
+                continue;
+            }
         };
         // Every permission the model cannot hold is left out of the role's
         // set *and* reported as unexpressible, never as a warning alone: a
@@ -928,6 +961,12 @@ mod tests {
         let grant = |object: Option<&str>, class: u8| RawPermission {
             role: "app_reader".into(),
             class,
+            class_desc: if class == 1 {
+                "OBJECT_OR_COLUMN"
+            } else {
+                "SCHEMA"
+            }
+            .into(),
             permission: "SELECT".into(),
             state: "G".into(),
             schema: "dbo".into(),
@@ -963,6 +1002,7 @@ mod tests {
         let grant = |permission: &str, state: &str| RawPermission {
             role: "app_reader".into(),
             class: 1,
+            class_desc: "OBJECT_OR_COLUMN".into(),
             permission: permission.into(),
             state: state.into(),
             schema: "dbo".into(),
@@ -997,6 +1037,50 @@ mod tests {
         assert!(what.iter().any(|w| w.contains("CONTROL")), "{what:?}");
         assert!(
             what.iter().any(|w| w.contains("column-level INSERT")),
+            "{what:?}"
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    /// A permission at the database, or on a class the model does not hold,
+    /// has no target a declaration can name — and a role that gained one has
+    /// changed even when its object grants still match (DECISIONS 105).
+    #[test]
+    fn a_permission_of_a_class_the_model_does_not_hold_is_unexpressible() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |class: u8, class_desc: &str, permission: &str| RawPermission {
+            role: "app_reader".into(),
+            class,
+            class_desc: class_desc.into(),
+            permission: permission.into(),
+            state: "G".into(),
+            schema: String::new(),
+            object: None,
+            minor_id: 0,
+        };
+        raw.permissions.push(grant(0, "DATABASE", "CREATE TABLE"));
+        raw.permissions.push(grant(0, "DATABASE", "CONTROL"));
+        raw.permissions
+            .push(grant(4, "DATABASE_PRINCIPAL", "IMPERSONATE"));
+        let p = assemble(&raw);
+        assert!(p.schema.roles["app_reader"].grants.is_empty());
+        let what: Vec<&str> = p.unexpressible.iter().map(|(_, w)| w.as_str()).collect();
+        assert_eq!(what.len(), 3, "{what:?}");
+        assert!(
+            what.iter()
+                .any(|w| w.contains("CREATE TABLE on the database")),
+            "{what:?}"
+        );
+        assert!(
+            what.iter().any(|w| w.contains("CONTROL on the database")),
+            "{what:?}"
+        );
+        assert!(
+            what.iter()
+                .any(|w| w.contains("IMPERSONATE on a database principal (class 4)")),
             "{what:?}"
         );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);

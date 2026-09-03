@@ -842,3 +842,14 @@ SPEC is in sync with all of these.
     the model. The bounds are the type's own and never change, so `validate`
     names them — a key as well as a cell — and a `bigint` holds every value
     the model can carry.
+105. **The permission read takes every class, and the ones the model does
+    not hold are unexpressible drift.** The catalog query kept classes 1 and
+    3 (an object, a schema), so a `GRANT CONTROL TO role` or `GRANT CREATE
+    TABLE TO role` (class 0, the database itself) never reached 97's
+    handling: it was filtered out before anything could report it, and a
+    managed role that had gained the whole database compared equal on the
+    grants it still held. The query filters nothing by class now; the
+    assembler names the database-level ones and, for every other class, the
+    catalog's own class name. The third instance of 95's shape — a
+    permission the model cannot hold, dropped before the comparison — found
+    one filter further up each time.

@@ -2614,13 +2614,25 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         .execute(
             "GRANT INSERT ON OBJECT::dbo.customer TO app_reader;\n\
              DENY DELETE ON OBJECT::dbo.customer TO app_reader;\n\
-             GRANT UPDATE ON OBJECT::dbo.customer TO app_reader WITH GRANT OPTION;",
+             GRANT UPDATE ON OBJECT::dbo.customer TO app_reader WITH GRANT OPTION;\n\
+             GRANT CREATE TABLE TO app_reader;",
         )
         .await
         .expect("hand edits");
     let again = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect");
+    // A database-level grant is class 0 in the catalog, which the read once
+    // filtered out before anything could report it; measured here as the
+    // engine records it (DECISIONS 105).
+    assert!(
+        again
+            .unexpressible
+            .iter()
+            .any(|(role, w)| role == "app_reader" && w.contains("CREATE TABLE on the database")),
+        "{:?}",
+        again.unexpressible
+    );
     // The DENY is not a warning: a managed role that gained one has changed,
     // and the sets that remain would compare equal (DECISIONS 97).
     assert!(

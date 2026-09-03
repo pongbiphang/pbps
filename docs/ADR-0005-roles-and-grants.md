@@ -144,8 +144,10 @@ Decisions taken during implementation that this document did not anticipate:
 4. **What the model cannot hold is reported by `pull`, never dropped — and
    is drift on a managed role.** A `DENY`, a column-level grant, a permission
    outside the closed set (`CONTROL`, `TAKE OWNERSHIP`), a grant `WITH GRANT
-   OPTION`, and a grant on an object the model does not hold (a sequence, a
-   synonym, a module that could not be read) are each left out of the role's
+   OPTION`, a database-level grant (`CREATE TABLE`, `CONTROL` on the
+   database) or one of any other class, and a grant on an object the model
+   does not hold (a sequence, a synonym, a module that could not be read) are
+   each left out of the role's
    set and reported naming the role and the target: `pull` prints them as
    warnings, `verify` carries them as unexpressible drift, and `plan --db`
    refuses to plan over them (DECISIONS 95, 97), since the sets that remain

@@ -132,11 +132,14 @@ SELECT p.name
  WHERE p.type = 'R' AND p.is_fixed_role = 0 AND p.name <> 'public'
  ORDER BY p.name;";
 
-/// Every permission held by a user-defined role on an object or a schema.
-/// Column-level rows come too (`minor_id <> 0`), so the assembler can report
-/// them rather than have them silently absent.
+/// Every permission held by a user-defined role, of every class. Column-level
+/// rows come too (`minor_id <> 0`), and so do the database-level ones
+/// (class 0: `CONTROL`, `CREATE TABLE`) and every other class the model does
+/// not hold, so the assembler can report each rather than have it silently
+/// absent — a `GRANT CONTROL TO role` that the read never saw compared equal
+/// on the grants it did see (DECISIONS 105).
 const PERMISSIONS: &str = "\
-SELECT pr.name AS role_name, dp.class, dp.permission_name, dp.state, dp.minor_id,
+SELECT pr.name AS role_name, dp.class, dp.class_desc, dp.permission_name, dp.state, dp.minor_id,
        COALESCE(os.name, ss.name) AS schema_name, o.name AS object_name
   FROM sys.database_permissions dp
   JOIN sys.database_principals pr ON pr.principal_id = dp.grantee_principal_id
@@ -144,7 +147,6 @@ SELECT pr.name AS role_name, dp.class, dp.permission_name, dp.state, dp.minor_id
   LEFT JOIN sys.schemas os ON os.schema_id = o.schema_id
   LEFT JOIN sys.schemas ss ON dp.class = 3 AND ss.schema_id = dp.major_id
  WHERE pr.type = 'R' AND pr.is_fixed_role = 0 AND pr.name <> 'public'
-   AND dp.class IN (1, 3)
  ORDER BY pr.name, dp.class, schema_name, object_name, dp.permission_name;";
 
 /// A required value that came back NULL means the query and the struct have
@@ -260,18 +262,22 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     }
 
     for row in conn.query(PERMISSIONS).await? {
-        // A permission on an object the catalog has no schema for (a dropped
-        // object's orphaned row) has nothing to be declared against.
-        let Some(schema) = opt::<&str>(&row, "schema_name")? else {
-            continue;
-        };
         let class: u8 = get(&row, "class")?;
+        // A permission on an object the catalog has no schema for (a dropped
+        // object's orphaned row) has nothing to be declared against. Any
+        // other class has no schema to begin with and is carried as is.
+        let schema = match opt::<&str>(&row, "schema_name")? {
+            Some(schema) => schema.to_owned(),
+            None if matches!(class, 1 | 3) => continue,
+            None => String::new(),
+        };
         raw.permissions.push(crate::introspect::RawPermission {
             role: get::<&str>(&row, "role_name")?.to_owned(),
             class,
+            class_desc: get::<&str>(&row, "class_desc")?.trim().to_owned(),
             permission: get::<&str>(&row, "permission_name")?.trim().to_owned(),
             state: get::<&str>(&row, "state")?.to_owned(),
-            schema: schema.to_owned(),
+            schema,
             object: opt::<&str>(&row, "object_name")?.map(str::to_owned),
             minor_id: get(&row, "minor_id")?,
         });
