@@ -89,6 +89,19 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     errs
 }
 
+/// The values an integer type holds, for the ones smaller than the model's
+/// `i64`. A `bigint` holds every `i64`; a `tinyint` is unsigned and holds
+/// none of the negatives, which is the surprise worth naming in the message
+/// (DECISIONS 104).
+fn int_range(base: &str) -> Option<(i128, i128)> {
+    match base {
+        "tinyint" => Some((0, 255)),
+        "smallint" => Some((i128::from(i16::MIN), i128::from(i16::MAX))),
+        "int" => Some((i128::from(i32::MIN), i128::from(i32::MAX))),
+        _ => None,
+    }
+}
+
 /// Why a key's text cannot possibly be read as `base`, or `None` when it
 /// might be. Conservative on purpose: this refuses only shapes no spelling
 /// of the type has — letters in a number, a GUID of the wrong length — and
@@ -478,7 +491,15 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 let fits = match kind {
                     ValueKind::Int => {
                         let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
-                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                        let shaped =
+                            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+                        // And within the type: `300` is an integer no `tinyint`
+                        // holds, and the engine refuses the insert the same way.
+                        shaped
+                            && text.parse::<i128>().is_ok_and(|n| {
+                                int_range(&base).is_none_or(|(lo, hi)| (lo..=hi).contains(&n))
+                                    && (i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&n)
+                            })
                     }
                     ValueKind::Bool => {
                         matches!(text, "0" | "1")
@@ -492,7 +513,9 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                         "row key `{key}` cannot be a `{base}`, the type of the key column \
                          `{key_column}`: the engine would refuse the insert — {}",
                         match kind {
-                            ValueKind::Int => "an integer key is digits, with an optional sign",
+                            ValueKind::Int =>
+                                "an integer key is digits, with an optional sign, \
+                                               within what the type holds",
                             ValueKind::Bool => "a `bit` key is `0`, `1`, `true` or `false`",
                             ValueKind::Text => key_shape(&base, text).unwrap_or_default(),
                         }
@@ -532,6 +555,18 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                          plan — write it as {spelling}",
                         value.kind(),
                         kind.name()
+                    )));
+                }
+                // The right kind, but not a value the type holds: the kind
+                // check cannot see it, the spelling probe asks the engine only
+                // about text, and the insert would fail at apply (DECISIONS 104).
+                if let Value::Int(n) = value
+                    && let Some((lo, hi)) = int_range(&base)
+                    && !(lo..=hi).contains(&i128::from(*n))
+                {
+                    errs.push(invalid(format!(
+                        "row `{key}` sets `{column}` to {n}, but `{base}` holds {lo} to {hi}: the \
+                         engine would refuse the insert"
                     )));
                 }
             }
@@ -850,6 +885,74 @@ mod tests {
         );
         let msg = messages(&table(&name, &t));
         assert!(!msg.contains("reads back"), "{msg}");
+    }
+
+    /// The right kind is not enough: `256` is an integer no `tinyint` holds,
+    /// and a negative one is the surprise. Keys the same.
+    #[test]
+    fn an_integer_outside_what_its_column_holds_is_refused_with_the_bounds() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let (name, mut t) = base_table();
+        t.columns.insert("tiny".into(), Column::new(ty("tinyint")));
+        t.columns
+            .insert("small".into(), Column::new(ty("smallint")));
+        t.columns.insert("wide".into(), Column::new(ty("int")));
+        t.columns.insert("big".into(), Column::new(ty("bigint")));
+        let with = |t: &mut Table, cells: Vec<(&str, i64)>| {
+            let mut row = Row::default();
+            for (c, v) in cells {
+                row.0.insert(c.to_owned(), Value::Int(v));
+            }
+            t.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: [(RowKey::from("1"), row)].into_iter().collect(),
+            });
+        };
+        with(
+            &mut t,
+            vec![
+                ("tiny", 255),
+                ("small", -32768),
+                ("wide", 2_147_483_647),
+                ("big", i64::MIN),
+            ],
+        );
+        assert!(!messages(&table(&name, &t)).contains("holds"));
+        with(
+            &mut t,
+            vec![("tiny", 256), ("small", 32768), ("wide", -2_147_483_649)],
+        );
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("sets `tiny` to 256, but `tinyint` holds 0 to 255"),
+            "{msg}"
+        );
+        assert!(msg.contains("sets `small` to 32768"), "{msg}");
+        assert!(msg.contains("sets `wide` to -2147483649"), "{msg}");
+        with(&mut t, vec![("tiny", -1)]);
+        assert!(messages(&table(&name, &t)).contains("`tinyint` holds 0 to 255"));
+
+        // A key too: shaped like an integer and still not one the type holds.
+        t.columns
+            .insert("k".into(), Column::new(ty("tinyint")).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["k".into()],
+        });
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [
+                (RowKey::from("255"), Row::default()),
+                (RowKey::from("300"), Row::default()),
+                (RowKey::from("-1"), Row::default()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("row key `300` cannot be a `tinyint`"), "{msg}");
+        assert!(msg.contains("row key `-1` cannot be a `tinyint`"), "{msg}");
+        assert!(!msg.contains("row key `255`"), "{msg}");
     }
 
     /// The key is a literal like any cell, and a table this plan creates has

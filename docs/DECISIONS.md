@@ -835,3 +835,10 @@ SPEC is in sync with all of these.
     than any rule here would list (`20260903` is a date), and the engine is
     asked before anything is written (101). What this catches, it catches
     offline; what it lets through, the connected commands do not.
+104. **An integer outside what its column holds is refused offline.** `256`
+    in a `tinyint`, `-1` in one, `32768` in a `smallint`: the right kind
+    (87), and the engine refuses the insert at apply; the spelling probe
+    (101) asks the engine only about text, since an integer is spelled by
+    the model. The bounds are the type's own and never change, so `validate`
+    names them — a key as well as a cell — and a `bigint` holds every value
+    the model can carry.
