@@ -200,7 +200,10 @@ impl Policies {
                 }
             }
             if id == rules::CHANGE_WINDOW
-                && config.severity.as_deref().is_none_or(|s| s != "off")
+                && config
+                    .severity
+                    .as_deref()
+                    .is_none_or(|s| !s.eq_ignore_ascii_case("off"))
                 && config.allow.is_empty()
             {
                 problems.push(format!(
@@ -392,6 +395,20 @@ mod tests {
         );
         assert!(p.suppressed("grant.widen", Some("role r"), "2030-01-01"));
         assert!(p.suppressed("grant.widen", None, "2030-01-01"));
+    }
+
+    /// `OFF` is accepted as a severity everywhere else; the window check
+    /// compared it case-sensitively and demanded an `allow` for a rule that
+    /// is off.
+    #[test]
+    fn a_change_window_switched_off_in_any_case_needs_no_allow_window() {
+        for word in ["off", "OFF", "Off"] {
+            let p = block(&format!(
+                r#"{{"rules": {{"change.window": {{"severity": "{word}", "offset": "+08:00"}}}}}}"#
+            ));
+            assert_eq!(p.check(), Vec::<String>::new(), "{word}");
+            assert_eq!(p.effective("change.window").severity, None);
+        }
     }
 
     #[test]

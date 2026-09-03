@@ -179,9 +179,11 @@ Decisions taken during implementation that this document did not anticipate:
    query, because the `CASE` that compares would run them once per row —
    and `NEXT VALUE FOR` is not even legal there. Such a cell is taken at the
    declaration's word: at its default where the row omits it, the stored
-   value where the row spells it; a hand edit to an omitted cell of that kind
-   is not seen, and the remedy for a column that matters is to write the
-   value. A table whose live key is not a single column is **unreadable**,
+   value where the row spells it, and the stored value again where there is
+   no declaration to consult (`pull`), since a generated key is a value the
+   block has to carry (DECISIONS 80); a hand edit to an omitted cell of that
+   kind is not seen, and the remedy for a column that matters is to write
+   the value. A table whose live key is not a single column is **unreadable**,
    and the read fails rather than answering "no rows".
    A binary column (`binary`, `varbinary`, `image`, `timestamp`) cannot hold
    a declared value at all: row values travel as string literals, and the

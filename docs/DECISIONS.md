@@ -510,7 +510,8 @@ SPEC is in sync with all of these.
     The cost is stated in the module docs: a hand edit to an omitted cell of
     that kind is not seen. The alternative — reading it explicit — restated
     `= DEFAULT` on every plan, and for `SYSUTCDATETIME()` that *rewrote the
-    timestamp on every apply*, which is worse than not looking.
+    timestamp on every apply*, which is worse than not looking. *Refined by
+    80: "reported as at its default" became "reported as unknown".*
 69. **`doctor` asks about what the managed roles hold live, not only what the
     declarations grant.** A revision that removes a role's last grant, or the
     role, plans a `REVOKE` or a `DROP ROLE` whose securable the declarations
@@ -613,3 +614,13 @@ SPEC is in sync with all of these.
     text, `2026-02-31` kept a suppression alive to the end of February and
     expired it on March 1, for a date that never comes; `2025-02-29` the
     same. The day is checked against its month, leap years included.
+80. **A cell whose default was never asked about is unknown, not at its
+    default.** 68 folded the two: a `NEWID()` key and a `GETDATE()` stamp
+    were reported at their default, and `pull --data`, which has no row of
+    its own to consult, omitted every such cell — a block that, rebuilt,
+    generated fresh keys and broke every child row's foreign key. The read
+    now reports three answers (`ObservedRow::at_default`, `unknown`, or
+    neither), and the unknown cell is omitted only where the side's own row
+    omits it; with no side at all it is kept, because a generated value is a
+    value the block has to carry. A confirmed default is still omitted for
+    `pull`: it *is* the default, and the shortest true block says so.

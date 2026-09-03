@@ -34,10 +34,14 @@
 //! FOR` are not, because that `CASE` would *run* the expression once per row
 //! — a sequence advanced by a drift check, and `NEXT VALUE FOR` is not even
 //! legal there, which made the table unreadable. Such a cell cannot be told
-//! from its default, so it is taken at the declaration's word: at its default
-//! where the side omits it, the stored value where the side spells it out.
-//! A hand edit to an omitted cell of that kind is therefore not seen; the
-//! remedy, for a column that matters, is to write the value.
+//! from its default ([`ObservedRow::unknown`]), so it is taken at the
+//! declaration's word: at its default where the side omits it, the stored
+//! value where the side spells it out — and, where there is no declaration
+//! at all (`pull`), the stored value, because a `NEWID()` key or a
+//! `GETDATE()` stamp is a value the block has to carry, not a default it
+//! can be rebuilt from. A hand edit to an omitted cell of that kind is
+//! therefore not seen; the remedy, for a column that matters, is to write
+//! the value.
 //!
 //! A NULL in a column with no default is omitted outright, because the model
 //! already treats the two spellings as one there (see
@@ -433,22 +437,30 @@ pub fn decode(
 
     let mut cells = BTreeMap::new();
     let mut at_default = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
     for slot in &query.columns {
         let text: Option<&str> = row.try_get_at(slot.value_at).map_err(|e| read(name, e))?;
-        let is_default = match slot.default_at {
+        // Three answers, not two: the engine said it is the default, the
+        // engine said it is not, or the engine was never asked (a default it
+        // would have had to run). The third is not the first: a `NEWID()`
+        // key or a `GETDATE()` stamp holds a value nobody can tell from its
+        // default, and `pull` has to write that value, not drop it.
+        let confirmed = match slot.default_at {
             Some(at) => {
                 row.try_get_at::<i32>(at)
                     .map_err(|e| read(name, e))?
                     .unwrap_or(0)
                     == 1
             }
-            None => slot.assume_default,
+            None => false,
         };
         match canonical(slot, text) {
             Ok(Some(v)) => {
                 cells.insert(slot.column.clone(), v);
-                if is_default {
+                if confirmed {
                     at_default.insert(slot.column.clone());
+                } else if slot.assume_default {
+                    unknown.insert(slot.column.clone());
                 }
             }
             Ok(None) => {}
@@ -467,6 +479,7 @@ pub fn decode(
         ObservedRow {
             cells: Row(cells),
             at_default,
+            unknown,
         },
     ))
 }

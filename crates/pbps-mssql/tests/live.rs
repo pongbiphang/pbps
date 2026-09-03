@@ -2325,14 +2325,17 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
         .with_observed_rows(&observed, &scopes, &declared)
         .unwrap();
     assert_eq!(as_declared.tables[&name].data, declared.tables[&name].data);
-    // As `pull` sees it, with no rows of its own: the shortest true block.
+    // As `pull` sees it, with no rows of its own: the label, which the
+    // engine confirmed at its default, is omitted; the sequence value and
+    // the stamp, whose defaults were never asked about, are kept — a
+    // generated value is a value the block has to carry.
     let pulled = live
         .with_observed_rows(&observed, &scopes, &Schema::default())
         .unwrap();
-    assert_eq!(
-        pulled.tables[&name].data.as_ref().unwrap().rows,
-        rows(&[("1", &[]), ("2", &[])])
-    );
+    for (key, row) in &pulled.tables[&name].data.as_ref().unwrap().rows {
+        let columns: Vec<&String> = row.columns().map(|(c, _)| c).collect();
+        assert_eq!(columns, ["seq", "stamp"], "row {key}");
+    }
     // And the differ, measured against the declared reading, has nothing to
     // say about the rows — which is the property the whole thing exists for.
     let cs = pbps_diff::diff_partial(

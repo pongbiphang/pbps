@@ -289,20 +289,34 @@ pub type DataScopes = BTreeMap<TableName, DataScope>;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservedRow {
     pub cells: Row,
+    /// The engine confirmed these cells hold the column's default.
     pub at_default: BTreeSet<String>,
+    /// The engine was never asked about these: the column's default is an
+    /// expression it would have had to run. Nobody can tell the value from
+    /// the default, so the side's own spelling decides — and a side with no
+    /// spelling keeps the value, because a `NEWID()` key is a value.
+    pub unknown: BTreeSet<String>,
 }
 
 impl ObservedRow {
     /// The row as one side spells it. A cell that side writes explicitly is
-    /// read explicit, whatever it holds; a cell at its default that the side
-    /// omits — or any such cell of a row the side does not have — is omitted.
-    /// `None` is a side with no row of its own, which is `pull`.
+    /// read explicit, whatever it holds. A cell the engine confirmed at its
+    /// default is omitted where the side omits it, and where there is no
+    /// side at all (`pull`): it *is* the default. A cell whose default could
+    /// not be asked about is omitted only where the side's own row omits it
+    /// — taken at the declaration's word — and kept everywhere else.
     pub fn as_seen_by(&self, reference: Option<&Row>) -> Row {
         self.cells
             .columns()
             .filter(|(column, _)| {
-                !self.at_default.contains(*column)
-                    || reference.is_some_and(|r| r.get(column).is_some())
+                let spelled = reference.is_some_and(|r| r.get(column).is_some());
+                if self.at_default.contains(*column) {
+                    spelled
+                } else if self.unknown.contains(*column) {
+                    reference.is_none_or(|r| r.get(column).is_some())
+                } else {
+                    true
+                }
             })
             .map(|(column, value)| (column.clone(), value.clone()))
             .collect()
@@ -1209,6 +1223,7 @@ mod tests {
             .into_iter()
             .collect(),
             at_default: ["label".to_owned()].into_iter().collect(),
+            unknown: BTreeSet::new(),
         };
         // The side omits `label`: omitted. The side writes it: explicit. No
         // side at all (`pull`): omitted. `rank` is not at its default and is
@@ -1227,6 +1242,40 @@ mod tests {
         // the hand edit that set `label` back to its default is a drift.
         let other: Row = [("label".to_owned(), text("Other"))].into_iter().collect();
         assert_eq!(seen.as_seen_by(Some(&other)), writes);
+    }
+
+    /// A default the engine was never asked about (`NEWID()`, `GETDATE()`)
+    /// leaves the cell's provenance unknown. The side's own row decides;
+    /// with no row — `pull` — the value is kept, because a generated key
+    /// is a value the block has to carry, not a default it can be rebuilt
+    /// from. The first cut dropped every such cell from a pulled block.
+    #[test]
+    fn a_cell_of_unknown_provenance_is_kept_unless_the_side_omits_it() {
+        let text = |s: &str| Value::Text(s.to_owned());
+        let seen = ObservedRow {
+            cells: [
+                ("stamp".to_owned(), text("2026-09-03T10:00:00")),
+                ("rank".to_owned(), Value::Int(1)),
+            ]
+            .into_iter()
+            .collect(),
+            at_default: BTreeSet::new(),
+            unknown: ["stamp".to_owned()].into_iter().collect(),
+        };
+        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        assert_eq!(
+            seen.as_seen_by(Some(&omits)),
+            omits,
+            "the declaration's word"
+        );
+        let writes: Row = [
+            ("stamp".to_owned(), text("2026-09-03T10:00:00")),
+            ("rank".to_owned(), Value::Int(1)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen.as_seen_by(Some(&writes)), writes);
+        assert_eq!(seen.as_seen_by(None), writes, "pull keeps the value");
     }
 
     #[test]
