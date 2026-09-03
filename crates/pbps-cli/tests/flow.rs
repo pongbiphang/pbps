@@ -4574,6 +4574,29 @@ fn an_offline_plan_still_speaks_json() {
     assert_eq!(v["result"], "ok", "{v}");
 }
 
+/// A filename holding a byte that is not valid UTF-8, or `None` when the
+/// filesystem refuses to hold one.
+///
+/// `#[cfg(unix)]` says the *API* can spell the name; it does not say the
+/// filesystem will accept it. Linux passes the bytes through, so this is real
+/// coverage there and in CI, but macOS's APFS validates them and fails the
+/// create with `EILSEQ` — which made the two tests below fail on a developer's
+/// machine for a reason that has nothing to do with what they assert. Skipping
+/// beats asserting on a platform that cannot produce the input.
+#[cfg(unix)]
+fn non_utf8_path(dir: &std::path::Path, bytes: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = dir.join(std::ffi::OsStr::from_bytes(bytes));
+    match std::fs::write(&path, b"") {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("skipped: this filesystem will not hold a non-UTF-8 filename ({e})");
+            None
+        }
+    }
+}
+
 /// On Unix a filename is bytes, and `Path::display()` substitutes U+FFFD for
 /// the ones that are not UTF-8. That character is not in `shell_arg`'s bare set
 /// and is not one of its refusals either, so a lossy path came back neatly
@@ -4585,16 +4608,15 @@ fn an_offline_plan_still_speaks_json() {
 #[cfg(unix)]
 #[test]
 fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let d = Demo::new("lossypath");
     d.table(ONE_COLUMN);
     // An *applyable* plan: `explain` prints no approval command for a preview,
     // by design, so a preview would pass this test without exercising anything.
     let src = write_plan(&d, "src.json", "transactional");
     // 0xFF is not valid UTF-8 in any position.
-    let name = std::ffi::OsStr::from_bytes(b"plan-\xff-.json");
-    let lossy = d.dir.join(name);
+    let Some(lossy) = non_utf8_path(&d.dir, b"plan-\xff-.json") else {
+        return;
+    };
     std::fs::copy(&src, &lossy).unwrap();
 
     let o = Command::new(BIN)
@@ -4642,12 +4664,11 @@ fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let d = Demo::new("lossyenvelope");
     d.table(ONE_COLUMN);
-    let name = std::ffi::OsStr::from_bytes(b"bad-\xff-.json");
-    let bad = d.dir.join(name);
+    let Some(bad) = non_utf8_path(&d.dir, b"bad-\xff-.json") else {
+        return;
+    };
     std::fs::write(&bad, "{ not json").unwrap();
 
     let o = Command::new(BIN)
