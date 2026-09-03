@@ -537,3 +537,23 @@ SPEC is in sync with all of these.
     a row that sets a binary cell, by name, and a `pull --data` of such a
     table produces a declaration that says why it is refused. Lifting this
     means a typed value in the model (`Value::Binary`), which is an ADR.
+71. **A declared key is read back under the declaration's spelling, and the
+    engine says which row it names.** `01` for an `int` key comes back as
+    `1`, and the row differ saw two keys: an insert of `01`, a delete of
+    `1`, every connected plan — and an `ensure` block never found its row.
+    Deciding on this side which spellings are equal would be a second
+    normalizer beside the engine (53); instead the read sends every key a
+    side spells (`RowScope::Every { known }`, `Keys`) through a `VALUES`
+    join, the engine answers with its own spelling of the row each one
+    names, and `ObservedTable::aliases` carries the answer. A side then reads
+    its rows back under its own keys (`rows_as`, `row`), `pull` under the
+    engine's, and the comparison the read makes is the one the emitter's
+    `WHERE [id] = N'01'` will make. Measured on a live server.
+72. **A securable this plan drops and creates again is granted from
+    nothing.** `DROP` takes an object's permissions with it, so a table
+    replaced under the same name, or a module changing kind, comes back bare;
+    the grant differ compared the base's grants to the declared ones as
+    text, found them equal, and wrote no `GRANT` — a successful apply that
+    silently removed a role's access. On a dropped target the base side is
+    now empty, so every declared permission is a `GRANT`, ordered after the
+    `CREATE`, and the `REVOKE` stays unwritten as before (58).

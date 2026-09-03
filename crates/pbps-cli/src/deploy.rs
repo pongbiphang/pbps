@@ -152,6 +152,35 @@ fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, Da
     ))
 }
 
+/// The plan's data scopes under the names the catalog has *now*.
+///
+/// `plan.data` is keyed by each table's final name. Halfway through a staged
+/// rename that moves both the schema and the name, the table stands at an
+/// intermediate name, and a scope keyed by the final one would make the
+/// checkpoint read no rows for it — so a hand-made change to those rows while
+/// the deployment is paused would go unseen by `--resume`. The scopes follow
+/// the same mapping the checkpoint's ids follow: final name -> uid -> the
+/// name `live_ids` has for it. A table the plan has not created yet keeps its
+/// final name and is simply not there to read.
+fn scopes_at(plan: &pbps_model::SavedPlan, live_ids: &IdsFile) -> DataScopes {
+    scopes_under(&plan.data, &plan.ids, live_ids)
+}
+
+/// [`scopes_at`] on its parts: `data` keyed by the names `final_ids` gives
+/// each table, re-keyed by the names `live_ids` gives the same uids.
+fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> DataScopes {
+    data.iter()
+        .map(|(final_name, scope)| {
+            let now = final_ids
+                .table_uid(final_name)
+                .and_then(|uid| live_ids.tables.get(uid))
+                .cloned()
+                .unwrap_or_else(|| final_name.clone());
+            (now, scope.clone())
+        })
+        .collect()
+}
+
 /// The modules a plan leaves the environment holding.
 ///
 /// Built from the recorded state plus the plan's own changes rather than from
@@ -926,11 +955,11 @@ pub fn cmd_plan_db(
                 continue;
             }
             match managed.rows.get(name) {
-                Some(rows) => println!(
+                Some(observed) => println!(
                     "Reference data: the declarations take over the rows of {name} ({}); it holds \
                      {} row(s) now.",
                     scope.mode,
-                    rows.len()
+                    observed.rows.len()
                 ),
                 None => println!(
                     "Reference data: {name} does not exist yet; its declared rows go in with it."
@@ -1549,7 +1578,7 @@ async fn apply_staged_under_lock(
             &live_ids,
             &modules_after(&entry.snapshot, &plan.changes),
             pbps_config::Unmanaged::Ignore,
-            &plan.data,
+            &scopes_at(plan, &live_ids),
             &Schema::default(),
         )
         .await?;
@@ -1839,4 +1868,42 @@ pub async fn run_in_transaction(
 fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> StateSnapshot {
     snapshot.git_sha = db::git_sha(root);
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{DataMode, DataScope};
+
+    /// Halfway through a rename that moves both schema and name, the table
+    /// stands at neither end; the checkpoint's scope has to stand there too.
+    #[test]
+    fn a_checkpoint_reads_rows_under_the_name_the_catalog_has_now() {
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let mut final_ids = IdsFile::default();
+        final_ids
+            .tables
+            .insert(uid.clone(), "app.customer".parse().unwrap());
+        let mut live_ids = IdsFile::default();
+        live_ids
+            .tables
+            .insert(uid, "app.old_customer".parse().unwrap());
+        let scope = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        let mut data = DataScopes::new();
+        data.insert("app.customer".parse().unwrap(), scope.clone());
+        // A table the plan creates later is not in the live mapping at all,
+        // and keeps its final name: there is nothing to read yet either way.
+        data.insert("app.later".parse().unwrap(), scope.clone());
+
+        let now = scopes_under(&data, &final_ids, &live_ids);
+        let names: Vec<String> = now.keys().map(ToString::to_string).collect();
+        assert_eq!(names, ["app.later", "app.old_customer"]);
+        assert_eq!(
+            now[&"app.old_customer".parse::<TableName>().unwrap()],
+            scope
+        );
+    }
 }

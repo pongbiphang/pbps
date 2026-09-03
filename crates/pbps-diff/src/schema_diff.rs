@@ -809,7 +809,22 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
         }
         let targets: BTreeSet<&GrantTarget> = before.keys().chain(role.grants.keys()).collect();
         for target in targets {
-            let b = before.get(target).cloned().unwrap_or_default();
+            let target_dropped = match target {
+                GrantTarget::Object(o) => dropped.contains(o),
+                GrantTarget::Schema(_) => false,
+            };
+            // A DROP takes the object's permissions with it. An object this
+            // plan drops and creates again under the same name — a table
+            // replaced by a new one, a module changing kind — therefore has
+            // *no* grants after the DROP, whatever the base held, and every
+            // declared permission on it is a GRANT to write after the CREATE.
+            // Comparing the two grant sets as text called them equal and
+            // left the role without its access until a later plan noticed.
+            let b = if target_dropped {
+                BTreeSet::new()
+            } else {
+                before.get(target).cloned().unwrap_or_default()
+            };
             let d = role.grants.get(target).cloned().unwrap_or_default();
             let added: BTreeSet<Permission> = d.difference(&b).copied().collect();
             let removed: BTreeSet<Permission> = b.difference(&d).copied().collect();
@@ -820,10 +835,6 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
                     permissions: added,
                 });
             }
-            let target_dropped = match target {
-                GrantTarget::Object(o) => dropped.contains(o),
-                GrantTarget::Schema(_) => false,
-            };
             if !removed.is_empty() && !target_dropped {
                 changes.push(Change::Revoke {
                     role: name.clone(),
@@ -2587,6 +2598,52 @@ mod tests {
             declared.1.columns.clear();
             let k = kinds(&base, &declared);
             assert!(k.iter().all(|c| !c.starts_with("revoke")), "{k:?}");
+        }
+
+        /// The drop takes the permission with it, and the CREATE that follows
+        /// makes a bare object: every declared permission on it is a GRANT
+        /// again, even though the two grant sets read the same.
+        #[test]
+        fn a_grant_on_a_table_this_plan_drops_and_recreates_is_granted_again() {
+            let grants = role(&[("dbo.customer", &[Permission::Select])]);
+            let base = side(&[("r_aaaaaa", "r", grants.clone())]);
+            // The same name under a new identity: a drop and a create.
+            let mut declared = side(&[("r_aaaaaa", "r", grants)]);
+            declared.1.tables.clear();
+            declared.1.columns.clear();
+            declared
+                .1
+                .tables
+                .insert("t_bbbbbb".parse().unwrap(), "dbo.customer".parse().unwrap());
+            declared.1.columns.insert(
+                "c_bbbbbb".parse().unwrap(),
+                "dbo.customer.id".parse().unwrap(),
+            );
+            let cs = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            let at =
+                |pred: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| pred(&p.change));
+            let drop = at(&|c| matches!(c, Change::DropTable { .. })).expect("a drop");
+            let create = at(&|c| matches!(c, Change::CreateTable { .. })).expect("a create");
+            let grant = at(&|c| matches!(c, Change::Grant { .. })).expect("the grant again");
+            assert!(
+                at(&|c| matches!(c, Change::Revoke { .. })).is_none(),
+                "{:?}",
+                kinds(&base, &declared)
+            );
+            // And the grant comes after the create, which comes after the drop.
+            assert!(drop < create && create < grant, "{drop} {create} {grant}");
         }
 
         /// The ordering: a revoke after the renames it may depend on, a grant

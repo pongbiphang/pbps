@@ -952,7 +952,14 @@ fn cmd_pull(
         }
         let read: std::collections::BTreeMap<TableName, pbps_model::RowScope> = data
             .iter()
-            .map(|t| (t.clone(), pbps_model::RowScope::Every))
+            .map(|t| {
+                (
+                    t.clone(),
+                    pbps_model::RowScope::Every {
+                        known: Default::default(),
+                    },
+                )
+            })
             .collect();
         let rows = pbps_mssql::catalog::read_rows(&mut conn, &pulled.schema, &read).await?;
         for (name, rows) in rows {
@@ -962,10 +969,27 @@ fn cmd_pull(
                     // No declaration to spell the cells: one at its default
                     // is written omitted, which is the shortest true block.
                     rows: rows
+                        .rows
                         .into_iter()
                         .map(|(k, r)| (k, r.as_seen_by(None)))
                         .collect(),
                 });
+                // What was just built has to pass `validate`, or `pull` would
+                // report success about files the next command refuses — a
+                // binary cell, say (DECISIONS 70). Refused here, before any
+                // declaration is written.
+                let problems = pbps_mssql::validate::table(&name, table);
+                if !problems.is_empty() {
+                    anyhow::bail!(
+                        "--data {name}: this table's rows cannot be declared as a `data:` \
+                         block:\n{}",
+                        problems
+                            .iter()
+                            .map(|e| format!("  - {e}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
             }
         }
         Ok::<_, anyhow::Error>(pulled)

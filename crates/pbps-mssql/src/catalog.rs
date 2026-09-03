@@ -326,21 +326,25 @@ pub async fn read_rows(
         let Some(table) = schema.tables.get(name) else {
             continue;
         };
-        let mut rows = BTreeMap::new();
+        let mut observed = pbps_model::ObservedTable::default();
         if let Some(query) = crate::rows::query(name, table, scope)? {
-            let result =
-                conn.query(&query.sql)
-                    .await
-                    .map_err(|source| crate::rows::RowsError::Read {
-                        table: name.clone(),
-                        source: Box::new(source),
-                    })?;
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            let result = conn.query(&query.sql).await.map_err(read)?;
             for row in &result {
                 let (key, cells) = crate::rows::decode(name, &query, row)?;
-                rows.insert(key, cells);
+                observed.rows.insert(key, cells);
+            }
+            if let Some(sql) = &query.aliases {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (requested, canonical) = crate::rows::decode_alias(name, row)?;
+                    observed.aliases.insert(requested, canonical);
+                }
             }
         }
-        out.insert(name.clone(), rows);
+        out.insert(name.clone(), observed);
     }
     Ok(out)
 }

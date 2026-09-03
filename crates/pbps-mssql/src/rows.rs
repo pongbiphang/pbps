@@ -139,6 +139,12 @@ pub struct RowQuery {
     pub sql: String,
     pub key: Slot,
     pub columns: Vec<Slot>,
+    /// A second query, when the read was asked to spell keys: each requested
+    /// spelling beside the engine's spelling of the row it names
+    /// ([`pbps_model::ObservedTable::aliases`]). The engine decides that
+    /// `N'01'` names the `int` row `1`, exactly as it will when the emitter's
+    /// `WHERE [id] = N'01'` runs.
+    pub aliases: Option<String>,
 }
 
 /// The single primary-key column, or why there is none.
@@ -179,6 +185,7 @@ pub fn query(
     {
         return Ok(None);
     }
+    let requested: Vec<String> = scope.known().iter().map(|k| literal(k.as_str())).collect();
 
     let mut select = vec![read_expr(&quote(&key)?, &key_spec.ty.base)];
     let key_slot = Slot {
@@ -250,11 +257,51 @@ pub fn query(
     }
     sql.push(';');
 
+    let aliases = if requested.is_empty() {
+        None
+    } else {
+        let table = qualified(name)?;
+        let key = quote(&key)?;
+        // Both sides aliased, so neither exposed name can collide with the
+        // table's own: `FROM (VALUES ...) AS k JOIN [dbo].[k]` is refused by
+        // the engine, and a table called `k` is not far-fetched.
+        Some(format!(
+            "SELECT pbps_requested.requested AS requested, {} AS canonical\n  \
+             FROM (VALUES {}) AS pbps_requested(requested)\n  \
+             JOIN {table} AS pbps_table ON pbps_table.{key} = pbps_requested.requested;",
+            read_expr(&format!("pbps_table.{key}"), &key_spec.ty.base),
+            requested
+                .iter()
+                .map(|r| format!("({r})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))
+    };
+
     Ok(Some(RowQuery {
         sql,
         key: key_slot,
         columns,
+        aliases,
     }))
+}
+
+/// Reads one row of the alias query: the requested spelling and the engine's.
+pub fn decode_alias(name: &TableName, row: &pbps_db::Row) -> Result<(RowKey, RowKey), RowsError> {
+    let read = |source: DbError| RowsError::Read {
+        table: name.clone(),
+        source: Box::new(source),
+    };
+    let requested: Option<&str> = row.try_get_at(0).map_err(read)?;
+    let canonical: Option<&str> = row.try_get_at(1).map_err(read)?;
+    match (requested, canonical) {
+        (Some(r), Some(c)) => Ok((RowKey::from(r), RowKey::from(c))),
+        // The join cannot produce a NULL on either side; one here means the
+        // query and this reader disagree.
+        _ => Err(read(DbError::BadRow(
+            "the alias query returned a NULL key".to_owned(),
+        ))),
+    }
 }
 
 /// The expression that renders one column as the text the state will hold.
@@ -458,7 +505,15 @@ mod tests {
                 ("rank", "int", None),
             ],
         );
-        let q = query(&name(), &t, &RowScope::Every).unwrap().unwrap();
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(q.key.value_at, 0);
         assert_eq!(q.key.column, "code");
         assert_eq!(q.columns.len(), 2);
@@ -487,6 +542,34 @@ mod tests {
         let keys = ["7", "o'k"].into_iter().map(RowKey::from).collect();
         let q = query(&name(), &t, &RowScope::Keys(keys)).unwrap().unwrap();
         assert!(q.sql.contains("WHERE [id] IN (N'7', N'o''k')"), "{}", q.sql);
+        // And asks the engine which row each spelling names, in the engine's
+        // own spelling of the key — the same comparison the DML will make.
+        let aliases = q.aliases.unwrap();
+        assert!(
+            aliases.contains("FROM (VALUES (N'7'), (N'o''k')) AS pbps_requested(requested)"),
+            "{aliases}"
+        );
+        assert!(
+            aliases.contains(
+                "JOIN [dbo].[status] AS pbps_table ON pbps_table.[id] = pbps_requested.requested"
+            ),
+            "{aliases}"
+        );
+        assert!(
+            aliases.contains("CONVERT(nvarchar(max), pbps_table.[id]) AS canonical"),
+            "{aliases}"
+        );
+        // A read that spells nothing (`pull`) asks nothing.
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(q.aliases, None);
     }
 
     /// `IN ()` is not T-SQL, and nothing is being asked for anyway.
@@ -504,13 +587,27 @@ mod tests {
     #[test]
     fn a_table_whose_rows_have_no_identity_is_refused_by_name() {
         let none = table(None, &[("id", "int", None)]);
-        let e = query(&name(), &none, &RowScope::Every).unwrap_err();
+        let e = query(
+            &name(),
+            &none,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("no primary key"), "{e}");
         let two = table(
             Some(vec!["a", "b"]),
             &[("a", "int", None), ("b", "int", None)],
         );
-        let e = query(&name(), &two, &RowScope::Every).unwrap_err();
+        let e = query(
+            &name(),
+            &two,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("2 columns"), "{e}");
     }
 
@@ -524,7 +621,15 @@ mod tests {
                 ("blob", "image", Some("0x")),
             ],
         );
-        let q = query(&name(), &t, &RowScope::Every).unwrap().unwrap();
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert!(q.columns.iter().all(|s| s.default_at.is_none()), "{q:?}");
         assert!(q.columns.iter().all(|s| s.has_default), "{q:?}");
         // Not asked about is taken at the declaration's word.
@@ -582,7 +687,15 @@ mod tests {
                 ("stamp", "datetime2", Some("sysutcdatetime()")),
             ],
         );
-        let q = query(&name(), &t, &RowScope::Every).unwrap().unwrap();
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert!(!q.sql.contains("NEXT VALUE"), "{}", q.sql);
         assert!(
             !q.sql.to_ascii_lowercase().contains("sysutcdatetime"),

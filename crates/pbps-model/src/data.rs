@@ -309,13 +309,63 @@ impl ObservedRow {
     }
 }
 
-pub type ObservedRows = BTreeMap<TableName, BTreeMap<RowKey, ObservedRow>>;
+/// One table's rows as the catalog read them, keyed by the **engine's**
+/// spelling of each key, with the spellings the read was asked for beside
+/// them.
+///
+/// A declaration may write a key the engine spells differently — `"01"` for
+/// an `int` key that comes back as `1`, `"a "` for a `char` that comes back
+/// trimmed — and the engine, not this crate, decides that they are the same
+/// row (§8.2). So every key a side spells is sent along with the read, the
+/// engine says which row it names, and `aliases` records the answer; a side
+/// then reads its rows back under its own spelling ([`ObservedTable::row`],
+/// [`ObservedTable::rows_as`]). Without that, an `exact` declaration of `01`
+/// planned an insert of `01` and a delete of `1` on every connected plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedTable {
+    pub rows: BTreeMap<RowKey, ObservedRow>,
+    /// Requested spelling -> the engine's, for every requested key that
+    /// named a row.
+    pub aliases: BTreeMap<RowKey, RowKey>,
+}
+
+impl ObservedTable {
+    /// The row a side names by its own spelling, with the engine's.
+    pub fn row(&self, key: &RowKey) -> Option<(&RowKey, &ObservedRow)> {
+        let canonical = self.aliases.get(key).unwrap_or(key);
+        self.rows.get_key_value(canonical)
+    }
+
+    /// Every row, keyed as `spelling` spells it where it does and as the
+    /// engine does elsewhere.
+    pub fn rows_as(&self, spelling: &BTreeSet<RowKey>) -> BTreeMap<RowKey, &ObservedRow> {
+        let mut requested: BTreeMap<&RowKey, &RowKey> = BTreeMap::new();
+        for key in spelling {
+            if let Some(canonical) = self.aliases.get(key) {
+                requested.entry(canonical).or_insert(key);
+            }
+        }
+        self.rows
+            .iter()
+            .map(|(canonical, row)| {
+                let key = requested
+                    .get(canonical)
+                    .map_or_else(|| canonical.clone(), |k| (*k).clone());
+                (key, row)
+            })
+            .collect()
+    }
+}
+
+pub type ObservedRows = BTreeMap<TableName, ObservedTable>;
 
 /// Which rows a read-back query fetches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowScope {
-    /// Every row of the table.
-    Every,
+    /// Every row of the table. `known` are the keys the reader spells, sent
+    /// along so the engine can say which row each names
+    /// ([`ObservedTable::aliases`]).
+    Every { known: BTreeSet<RowKey> },
     /// Only the rows with these keys; the rest of the table is not looked at.
     Keys(BTreeSet<RowKey>),
 }
@@ -324,11 +374,24 @@ impl RowScope {
     /// The narrower of two reads that still answers both.
     pub fn union(self, other: RowScope) -> RowScope {
         match (self, other) {
-            (RowScope::Every, _) | (_, RowScope::Every) => RowScope::Every,
+            (RowScope::Every { known: mut a }, RowScope::Every { known: b })
+            | (RowScope::Every { known: mut a }, RowScope::Keys(b))
+            | (RowScope::Keys(b), RowScope::Every { known: mut a }) => {
+                a.extend(b);
+                RowScope::Every { known: a }
+            }
             (RowScope::Keys(mut a), RowScope::Keys(b)) => {
                 a.extend(b);
                 RowScope::Keys(a)
             }
+        }
+    }
+
+    /// The keys this read spells, whichever shape it has.
+    pub fn known(&self) -> &BTreeSet<RowKey> {
+        match self {
+            RowScope::Every { known } => known,
+            RowScope::Keys(keys) => keys,
         }
     }
 }
@@ -344,7 +407,9 @@ impl DataScope {
     /// The rows the catalog has to fetch to answer this scope.
     pub fn rows_to_read(&self) -> RowScope {
         match self.mode {
-            DataMode::Exact => RowScope::Every,
+            DataMode::Exact => RowScope::Every {
+                known: self.keys.clone(),
+            },
             DataMode::Ensure => RowScope::Keys(self.keys.clone()),
         }
     }
@@ -359,23 +424,21 @@ impl DataScope {
     ///
     /// `reference` is this side's own block, whose spelling of each cell
     /// decides how a cell at its default is read (see [`ObservedRow`]).
-    pub fn project(
-        &self,
-        rows: &BTreeMap<RowKey, ObservedRow>,
-        reference: Option<&TableData>,
-    ) -> TableData {
-        let seen = |(k, r): (&RowKey, &ObservedRow)| {
-            (
-                k.clone(),
-                r.as_seen_by(reference.and_then(|d| d.rows.get(k))),
-            )
+    pub fn project(&self, observed: &ObservedTable, reference: Option<&TableData>) -> TableData {
+        let seen = |k: RowKey, r: &ObservedRow| {
+            let row = r.as_seen_by(reference.and_then(|d| d.rows.get(&k)));
+            (k, row)
         };
         let rows = match self.mode {
-            DataMode::Exact => rows.iter().map(seen).collect(),
-            DataMode::Ensure => rows
+            DataMode::Exact => observed
+                .rows_as(&self.keys)
+                .into_iter()
+                .map(|(k, r)| seen(k, r))
+                .collect(),
+            DataMode::Ensure => self
+                .keys
                 .iter()
-                .filter(|(k, _)| self.keys.contains(*k))
-                .map(seen)
+                .filter_map(|k| observed.row(k).map(|(_, r)| seen(k.clone(), r)))
                 .collect(),
         };
         TableData {
@@ -474,12 +537,17 @@ pub fn plan_base(
             .or_else(|| declared_scopes.get(name))
             .map(|s| s.mode);
         let own = declared.tables.get(name).and_then(|t| t.data.as_ref());
+        let spelling = declared_scopes.get(name).map(|s| &s.keys);
         table.data = match (mode, rows.get(name)) {
             (Some(mode), Some(observed)) => Some(TableData {
                 mode,
                 rows: observed
-                    .iter()
-                    .map(|(k, r)| (k.clone(), r.as_seen_by(own.and_then(|d| d.rows.get(k)))))
+                    .rows_as(spelling.unwrap_or(&BTreeSet::new()))
+                    .into_iter()
+                    .map(|(k, r)| {
+                        let row = r.as_seen_by(own.and_then(|d| d.rows.get(&k)));
+                        (k, row)
+                    })
                     .collect(),
             }),
             _ => None,
@@ -967,10 +1035,69 @@ mod tests {
             .collect()
     }
 
-    fn observed(keys: &[&str]) -> BTreeMap<RowKey, ObservedRow> {
-        keys.iter()
-            .map(|k| (RowKey::from(*k), ObservedRow::default()))
-            .collect()
+    fn observed(keys: &[&str]) -> ObservedTable {
+        ObservedTable {
+            rows: keys
+                .iter()
+                .map(|k| (RowKey::from(*k), ObservedRow::default()))
+                .collect(),
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    /// The engine spells an `int` key `1`; the declaration wrote `01`. The
+    /// engine said they are the same row, and each side reads it back under
+    /// its own spelling — an `exact` block, an `ensure` block, and `pull`.
+    #[test]
+    fn a_declared_key_comes_back_in_the_declared_spelling() {
+        let mut seen = observed(&["1", "2"]);
+        seen.aliases.insert(RowKey::from("01"), RowKey::from("1"));
+        let keys = |ks: &[&str]| ks.iter().map(|k| RowKey::from(*k)).collect::<BTreeSet<_>>();
+        assert_eq!(seen.row(&RowKey::from("01")).unwrap().0, &RowKey::from("1"));
+        assert_eq!(seen.row(&RowKey::from("2")).unwrap().0, &RowKey::from("2"));
+        assert!(seen.row(&RowKey::from("3")).is_none());
+
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: keys(&["01"]),
+        };
+        let names: Vec<String> = exact
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            ["01", "2"],
+            "declared spelling where declared, the engine's elsewhere"
+        );
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: keys(&["01"]),
+        };
+        let names: Vec<String> = ensure
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            ["01"],
+            "found through the alias, kept under the declared key"
+        );
+        let pull = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        let names: Vec<String> = pull
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["1", "2"], "nothing to spell: the engine's");
     }
 
     /// The catalog cannot tell `label: Unlabelled` from an omitted `label`
@@ -1014,7 +1141,12 @@ mod tests {
             mode: DataMode::Exact,
             keys: ["a"].into_iter().map(RowKey::from).collect(),
         };
-        assert_eq!(exact.rows_to_read(), RowScope::Every);
+        assert_eq!(
+            exact.rows_to_read(),
+            RowScope::Every {
+                known: ["a"].into_iter().map(RowKey::from).collect()
+            }
+        );
         let ensure = DataScope {
             mode: DataMode::Ensure,
             keys: ["a"].into_iter().map(RowKey::from).collect(),
@@ -1065,17 +1197,21 @@ mod tests {
             read[&t],
             RowScope::Keys(["a", "b"].into_iter().map(RowKey::from).collect())
         );
-        // ensure + exact, either way round: everything.
+        // ensure + exact, either way round: everything, spelling the keys
+        // of both sides.
+        let every = RowScope::Every {
+            known: ["a"].into_iter().map(RowKey::from).collect(),
+        };
         let read = read_scopes(
             &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
             &[(t.clone(), exact.clone())].into_iter().collect(),
         );
-        assert_eq!(read[&t], RowScope::Every);
+        assert_eq!(read[&t], every);
         let read = read_scopes(
             &[(t.clone(), exact)].into_iter().collect(),
             &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
         );
-        assert_eq!(read[&t], RowScope::Every);
+        assert_eq!(read[&t], every);
         // A table on one side only is still read.
         let read = read_scopes(
             &BTreeMap::new(),
@@ -1107,7 +1243,7 @@ mod tests {
             .with_observed_rows(&BTreeMap::new(), &scopes, &none);
         assert_eq!(unread.tables[&name()].data, None);
         let read = schema.with_observed_rows(
-            &[(name(), BTreeMap::new())].into_iter().collect(),
+            &[(name(), ObservedTable::default())].into_iter().collect(),
             &scopes,
             &none,
         );

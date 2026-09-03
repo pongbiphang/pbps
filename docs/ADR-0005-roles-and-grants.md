@@ -177,6 +177,10 @@ Decisions taken during implementation that this document did not anticipate:
    check that read only those said "ready" to an apply that then failed. The
    recorded state comes first because the catalog hides a securable from an
    account with no permission on it, which is the account being checked.
+8. **A target this plan drops and creates again is granted from nothing.**
+   `DROP` takes the permissions with it; a table replaced under the same
+   name, or a module changing kind, comes back bare, and every declared
+   permission on it is a `GRANT` after the `CREATE` (DECISIONS 72).
 
 ## Placement
 

@@ -2261,6 +2261,150 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     db.drop().await;
 }
 
+/// The engine spells an `int` key `1`; the declaration wrote `01`. Whether
+/// they name the same row is the engine's call (§8.2), and it has to be the
+/// same call the DML makes with `WHERE [id] = N'01'` — so the read asks it,
+/// and each side gets its rows back under its own spelling. Before this, an
+/// `exact` block of `01` planned an insert of `01` and a delete of `1` on
+/// every connected plan, and an `ensure` block could not find its row.
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently() {
+    use pbps_model::{DataMode, Row, RowKey, RowScope, TableData, Value};
+
+    let text = |s: &str| Value::Text(s.to_owned());
+    let table_with = |mode: DataMode, keys: &[&str]| {
+        let mut t = Table::default();
+        t.columns
+            .insert("id".to_owned(), Column::new(ty("int")).not_null());
+        t.columns.insert(
+            "label".to_owned(),
+            Column::new(ty("nvarchar(50)")).not_null(),
+        );
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_k".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        t.data = Some(TableData {
+            mode,
+            rows: keys
+                .iter()
+                .map(|k| {
+                    (
+                        RowKey::from(*k),
+                        [("label".to_owned(), text(&format!("row {k}")))]
+                            .into_iter()
+                            .collect::<Row>(),
+                    )
+                })
+                .collect(),
+        });
+        t
+    };
+    let name = TableName::new("dbo", "k");
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert(name.clone(), table_with(DataMode::Exact, &["01", "7"]));
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("keyspelling").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let read_under = |schema: &Schema| {
+        let scopes = schema.data_scopes();
+        let read: std::collections::BTreeMap<TableName, RowScope> = scopes
+            .iter()
+            .map(|(n, s)| (n.clone(), s.rows_to_read()))
+            .collect();
+        (scopes, read)
+    };
+    let (scopes, read) = read_under(&declared);
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("read rows");
+    // The engine's spelling, and the alias the read asked about.
+    let seen = &observed[&name];
+    let keys: Vec<String> = seen.rows.keys().map(ToString::to_string).collect();
+    assert_eq!(keys, ["1", "7"]);
+    assert_eq!(seen.aliases[&RowKey::from("01")], RowKey::from("1"));
+
+    // As declared: the declaration's own spelling, and nothing to plan.
+    let as_declared = live
+        .clone()
+        .with_observed_rows(&observed, &scopes, &declared);
+    assert_eq!(as_declared.tables[&name].data, declared.tables[&name].data);
+    let cs = pbps_diff::diff_partial(
+        pbps_diff::Side {
+            schema: &as_declared,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &Mssql,
+        &pbps_model::Hints::default(),
+    );
+    assert!(cs.errors.is_empty(), "{:?}", cs.errors);
+    let rows_changed: Vec<String> = cs
+        .changes
+        .changes
+        .iter()
+        .filter(|p| p.change.table() == Some(&name))
+        .map(|p| format!("{:?}", p.change))
+        .collect();
+    assert_eq!(rows_changed, Vec::<String>::new());
+
+    // As `pull` sees it — a scope that spells no key — the engine's spelling.
+    let unspelled: pbps_model::DataScopes = scopes
+        .iter()
+        .map(|(n, s)| {
+            (
+                n.clone(),
+                pbps_model::DataScope {
+                    mode: s.mode,
+                    keys: Default::default(),
+                },
+            )
+        })
+        .collect();
+    let pulled = live
+        .clone()
+        .with_observed_rows(&observed, &unspelled, &Schema::default());
+    let keys: Vec<String> = pulled.tables[&name]
+        .data
+        .as_ref()
+        .unwrap()
+        .rows
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(keys, ["1", "7"]);
+
+    // An `ensure` block that names `01` finds its row through the alias.
+    let mut ensured = Schema::default();
+    ensured
+        .tables
+        .insert(name.clone(), table_with(DataMode::Ensure, &["01"]));
+    let (scopes, read) = read_under(&ensured);
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("read rows");
+    let as_ensured = live.with_observed_rows(&observed, &scopes, &ensured);
+    assert_eq!(as_ensured.tables[&name].data, ensured.tables[&name].data);
+
+    db.drop().await;
+}
+
 /// Roles against the engine (ADR-0005): the plan's `CREATE ROLE` and `GRANT`
 /// are accepted, the catalog reads the role and its grants back exactly, a
 /// hand-made `GRANT` and a `DENY` are seen for what they are, and a rename
