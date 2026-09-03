@@ -210,20 +210,25 @@ pub struct DataDto {
     pub rows: BTreeMap<String, BTreeMap<String, ValueDto>>,
 }
 
-/// One cell, as written.
+/// One cell, as written: `null`, a boolean, an integer, or text. A decimal
+/// must be quoted (`'1.50'`) — see `pbps_model::Value` for why.
 ///
 /// The variants are tried in order and the order is the whole design. `Text`
 /// is last so that it catches only what nothing else did; `Float` sits ahead
 /// of it so that a bare `1.50` is *caught and refused* rather than silently
 /// becoming the string `"1.50"` in some YAML parsers and the number 1.5 in
-/// others. `convert` turns that arm into a diagnostic asking for quotes —
-/// see `pbps_model::Value` for why the exact form has to survive.
+/// others. `convert` turns that arm into a diagnostic asking for quotes.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ValueDto {
     Null,
     Bool(bool),
     Int(i64),
+    /// Exists to be refused with a good message. **Kept out of the published
+    /// schema**: an editor validating against it would otherwise accept a
+    /// bare `1.50` that every `pbps` command then rejects, and the whole point
+    /// of generating the schema from these types is that the two agree.
+    #[schemars(skip)]
     Float(f64),
     Text(String),
 }
@@ -339,4 +344,21 @@ pub struct IndexDto {
 pub enum DeclarationFile {
     Table(TableDto),
     Module(ModuleDto),
+}
+
+#[cfg(test)]
+mod tests {
+    /// The editor schema must refuse what the loader refuses. A `number` arm
+    /// here would let an editor bless `pct: 1.50` that `validate` then rejects.
+    #[test]
+    fn the_published_value_schema_has_no_floating_point_arm() {
+        let v = serde_json::to_value(schemars::schema_for!(super::ValueDto)).unwrap();
+        let text = v.to_string();
+        assert!(!text.contains("\"number\""), "{text}");
+        assert!(!text.contains("double"), "{text}");
+        // And the negative case: the arms that are valid are still there.
+        for arm in ["\"null\"", "\"boolean\"", "\"integer\"", "\"string\""] {
+            assert!(text.contains(arm), "{arm} missing from {text}");
+        }
+    }
 }

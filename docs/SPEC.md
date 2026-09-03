@@ -380,7 +380,12 @@ DML for review, and the dev rehearsal runs it and compares structure.
 constraints that check them, and they follow the foreign keys *between* the
 tables that declare them — a referenced table's rows first, and out last. That
 edge is the same one the live tests had to find at table granularity, one level
-down.
+down. Deletes run after every insert and update: no single order satisfies
+every shape (a delete-then-insert against a UNIQUE elsewhere wants the delete
+first, and fails loudly in the transaction), but deleting first can fail
+*silently* — a child row that moves to another parent in the same plan is
+still pointing at the old one when it goes, and `ON DELETE CASCADE` takes the
+child with it.
 
 ## 5. The identity file (`schema.ids.json`)
 

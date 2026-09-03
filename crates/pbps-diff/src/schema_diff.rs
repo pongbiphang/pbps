@@ -764,22 +764,29 @@ fn order_key(c: &Change) -> u8 {
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. } => 2,
-        // Rows leave *after* the foreign keys that could block the delete and
-        // *before* the column and table drops, which may take the row with
-        // them anyway.
-        Change::DeleteRow { .. } => 3,
-        Change::DropColumn { .. } => 4,
-        Change::DropTable { .. } => 5,
-        Change::CreateTable { .. } => 6,
-        Change::AddColumn { .. } => 7,
+        Change::DropColumn { .. } => 3,
+        Change::DropTable { .. } => 4,
+        Change::CreateTable { .. } => 5,
+        Change::AddColumn { .. } => 6,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 8,
-        Change::SetColumnDeprecated { .. } => 9,
+        | Change::AlterColumnDefault { .. } => 7,
+        Change::SetColumnDeprecated { .. } => 8,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
-        Change::InsertRow { .. } | Change::UpdateRow { .. } => 10,
+        Change::InsertRow { .. } | Change::UpdateRow { .. } => 9,
+        // Rows leave after every insert and update, and after the foreign keys
+        // that could block them are gone. No single order satisfies every
+        // shape — a delete-then-insert on a table with a UNIQUE elsewhere
+        // wants the delete first — but this is the order whose failure is
+        // *loud*: the engine refuses inside the transaction and the plan rolls
+        // back. Deleting first fails silently: a child row that moves its
+        // foreign key to another parent in this same plan is still pointing
+        // at the old one when the old one goes, and `ON DELETE CASCADE` takes
+        // the child with it, after which the update touches zero rows and
+        // nothing says so.
+        Change::DeleteRow { .. } => 10,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
@@ -1401,6 +1408,73 @@ mod tests {
             unreachable!()
         };
         assert_eq!(key_column, "kode", "the statement runs after the rename");
+    }
+
+    /// The third review's P1. A parent row leaves an `exact` table while a
+    /// child row moves its foreign key to another parent. Deleting first is
+    /// wrong both ways the engine can go: `NO ACTION` refuses a delete the
+    /// child still points at, and `ON DELETE CASCADE` takes the child with it —
+    /// silently, with the later update then touching zero rows and the dev
+    /// rehearsal, which compares structure only, calling that convergence.
+    #[test]
+    fn a_child_row_moves_away_before_its_former_parent_is_deleted() {
+        let parent = lookup(DataMode::Exact, &[("p1", "P1"), ("p2", "P2")]);
+        let mut child = lookup(DataMode::Exact, &[("c", "C")]);
+        child.columns.insert(
+            "parent".to_owned(),
+            Column::new(ty("varchar(20)")).not_null(),
+        );
+        child.foreign_keys.insert(
+            "fk_child_parent".to_owned(),
+            pbps_model::ForeignKey {
+                columns: vec!["parent".to_owned()],
+                references_table: "dbo.parent".parse().unwrap(),
+                references_columns: vec!["code".to_owned()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let pointing_at = |p: &str| -> Table {
+            let mut t = child.clone();
+            t.data.as_mut().unwrap().rows = [(
+                pbps_model::RowKey::from("c"),
+                [
+                    ("label".to_owned(), Value::Text("C".to_owned())),
+                    ("parent".to_owned(), Value::Text(p.to_owned())),
+                ]
+                .into_iter()
+                .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect();
+            t
+        };
+
+        let mut base = Schema::default();
+        base.tables
+            .insert("dbo.parent".parse().unwrap(), parent.clone());
+        base.tables
+            .insert("dbo.child".parse().unwrap(), pointing_at("p1"));
+        let mut declared = Schema::default();
+        declared.tables.insert(
+            "dbo.parent".parse().unwrap(),
+            lookup(DataMode::Exact, &[("p2", "P2")]),
+        );
+        declared
+            .tables
+            .insert("dbo.child".parse().unwrap(), pointing_at("p2"));
+
+        let cs = run(&base, &declared, &[]);
+        let k = kinds(&cs);
+        let update = k
+            .iter()
+            .position(|c| c == "UpdateRow")
+            .unwrap_or_else(|| panic!("{k:?}"));
+        let delete = k
+            .iter()
+            .position(|c| c == "DeleteRow")
+            .unwrap_or_else(|| panic!("{k:?}"));
+        assert!(update < delete, "{k:?}");
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently

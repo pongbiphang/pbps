@@ -307,7 +307,7 @@
       ]
     },
     "ValueDto": {
-      "description": "One cell, as written.\n\nThe variants are tried in order and the order is the whole design. `Text`\nis last so that it catches only what nothing else did; `Float` sits ahead\nof it so that a bare `1.50` is *caught and refused* rather than silently\nbecoming the string `\"1.50\"` in some YAML parsers and the number 1.5 in\nothers. `convert` turns that arm into a diagnostic asking for quotes —\nsee `pbps_model::Value` for why the exact form has to survive.",
+      "description": "One cell, as written: `null`, a boolean, an integer, or text. A decimal\nmust be quoted (`'1.50'`) — see `pbps_model::Value` for why.\n\nThe variants are tried in order and the order is the whole design. `Text`\nis last so that it catches only what nothing else did; `Float` sits ahead\nof it so that a bare `1.50` is *caught and refused* rather than silently\nbecoming the string `\"1.50\"` in some YAML parsers and the number 1.5 in\nothers. `convert` turns that arm into a diagnostic asking for quotes.",
       "anyOf": [
         {
           "type": "null"
@@ -318,10 +318,6 @@
         {
           "type": "integer",
           "format": "int64"
-        },
-        {
-          "type": "number",
-          "format": "double"
         },
         {
           "type": "string"
