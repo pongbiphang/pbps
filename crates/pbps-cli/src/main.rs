@@ -1350,7 +1350,7 @@ pub fn validate_findings(
             findings.push(output::Finding::error("schema.grant-target", problem));
         }
         for (name, role) in &l.schema.roles {
-            for e in dialect.validate_role(name, role) {
+            for e in dialect.validate_role(name, role, &l.schema) {
                 findings.push(output::Finding::error(
                     "dialect.rejected",
                     format!("role {name}: {e}"),

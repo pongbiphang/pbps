@@ -33,7 +33,8 @@
 use std::borrow::Cow;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Role, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Role, Schema, Strategy, Table,
+    TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -349,8 +350,12 @@ pub trait Dialect {
     }
 
     /// Checks whether this dialect can express the role and its grants
-    /// (ADR-0005). The same default, for the same reason.
-    fn validate_role(&self, _name: &str, _role: &Role) -> Vec<DialectError> {
+    /// (ADR-0005). The same default, for the same reason. The schema is there
+    /// so a grant can be checked against what its target *is*: which
+    /// permissions apply to a table, a procedure or a function is the engine's
+    /// rule, and a `GRANT` the engine refuses would fail an apply after the
+    /// changes before it had run.
+    fn validate_role(&self, _name: &str, _role: &Role, _schema: &Schema) -> Vec<DialectError> {
         Vec::new()
     }
 

@@ -6,7 +6,9 @@
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
 use pbps_dialect::DialectError;
-use pbps_model::{GrantTarget, Module, ModuleKind, ObjectName, Role, Table, TableName, Value};
+use pbps_model::{
+    GrantTarget, Module, ModuleKind, ObjectName, Permission, Role, Schema, Table, TableName, Value,
+};
 
 use crate::ident;
 use crate::rows::ValueKind;
@@ -23,10 +25,11 @@ fn invalid(message: impl Into<String>) -> DialectError {
 }
 
 /// Every problem with a role (ADR-0005): the names it uses have to be ones
-/// this dialect can write into `GRANT` and `CREATE ROLE`. `public` and the
+/// this dialect can write into `GRANT` and `CREATE ROLE`, and each permission
+/// has to be one the engine defines on what the target *is*. `public` and the
 /// fixed database roles are the engine's own and cannot be created, dropped or
 /// renamed; declaring one would plan a statement the engine refuses.
-pub fn role(name: &str, role: &Role) -> Vec<DialectError> {
+pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     let mut errs = Vec::new();
     if let Err(e) = ident::quote(name) {
         errs.push(e);
@@ -37,7 +40,7 @@ pub fn role(name: &str, role: &Role) -> Vec<DialectError> {
              declare a role of your own and grant to that"
         )));
     }
-    for target in role.grants.keys() {
+    for (target, permissions) in &role.grants {
         let parts: Vec<&str> = match target {
             GrantTarget::Object(o) => vec![&o.schema, &o.name],
             GrantTarget::Schema(s) => vec![s],
@@ -47,8 +50,151 @@ pub fn role(name: &str, role: &Role) -> Vec<DialectError> {
                 errs.push(e);
             }
         }
+        // `GRANT EXECUTE` on a table, `GRANT SELECT` on a procedure: the
+        // engine refuses each (Msg 4606), and in a staged apply the grants
+        // run after the other changes, so it would refuse it on a database
+        // already changed. The permission is checked against the kind of the
+        // target here, where nothing has run. An object the declarations do
+        // not have is the model's finding, not this one's.
+        let GrantTarget::Object(object) = target else {
+            continue;
+        };
+        let Some(kind) = target_kind(object, schema) else {
+            continue;
+        };
+        let Some(applicable) = kind.permissions() else {
+            errs.push(invalid(format!(
+                "grants on `{object}`, a trigger, which takes no permission at all: the engine \
+                 has none on triggers — grant on the table it fires on instead"
+            )));
+            continue;
+        };
+        for p in permissions {
+            if !applicable.contains(p) {
+                errs.push(invalid(format!(
+                    "`{}` does not apply to `{object}`, {}: the engine refuses that GRANT; {} \
+                     takes {}",
+                    p.as_str(),
+                    kind.article(),
+                    kind.article(),
+                    applicable
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
     }
     errs
+}
+
+/// What a grant target is, as far as the engine's permission rules care.
+///
+/// A function is three kinds to the engine: a scalar one is executed, an
+/// inline table-valued one is queried like a view, and a multi-statement one
+/// is queried but never written to. Which one it is stands in its own
+/// `RETURNS` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Table,
+    View,
+    Procedure,
+    ScalarFunction,
+    InlineFunction,
+    MultiStatementFunction,
+    Trigger,
+}
+
+impl TargetKind {
+    /// The permissions the engine defines on this kind, among the ones a
+    /// declaration can name. Measured on a live SQL Server 2025 for every
+    /// pair (DECISIONS 89); `None` is a trigger, on which `GRANT` names no
+    /// object at all (Msg 15151).
+    const fn permissions(self) -> Option<&'static [Permission]> {
+        use Permission::*;
+        Some(match self {
+            TargetKind::Table | TargetKind::View | TargetKind::InlineFunction => &[
+                Select,
+                Insert,
+                Update,
+                Delete,
+                References,
+                Alter,
+                ViewDefinition,
+            ],
+            TargetKind::Procedure | TargetKind::ScalarFunction => {
+                &[Execute, References, Alter, ViewDefinition]
+            }
+            TargetKind::MultiStatementFunction => &[Select, References, Alter, ViewDefinition],
+            TargetKind::Trigger => return None,
+        })
+    }
+
+    const fn article(self) -> &'static str {
+        match self {
+            TargetKind::Table => "a table",
+            TargetKind::View => "a view",
+            TargetKind::Procedure => "a procedure",
+            TargetKind::ScalarFunction => "a scalar function",
+            TargetKind::InlineFunction => "an inline table-valued function",
+            TargetKind::MultiStatementFunction => "a multi-statement table-valued function",
+            TargetKind::Trigger => "a trigger",
+        }
+    }
+}
+
+fn target_kind(object: &ObjectName, schema: &Schema) -> Option<TargetKind> {
+    if schema.tables.contains_key(object) {
+        return Some(TargetKind::Table);
+    }
+    let module = schema.modules.get(object)?;
+    Some(match module.kind {
+        ModuleKind::View => TargetKind::View,
+        ModuleKind::Procedure => TargetKind::Procedure,
+        ModuleKind::Trigger => TargetKind::Trigger,
+        ModuleKind::Function => match returns(&module.definition) {
+            Returns::Table => TargetKind::InlineFunction,
+            Returns::TableVariable => TargetKind::MultiStatementFunction,
+            Returns::Scalar => TargetKind::ScalarFunction,
+        },
+    })
+}
+
+/// What a function's `RETURNS` clause says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Returns {
+    /// `RETURNS int`, or no `RETURNS` at all — which the engine refuses on
+    /// its own, and which is a scalar function's shape as far as a grant is
+    /// concerned.
+    Scalar,
+    /// `RETURNS TABLE`: an inline table-valued function.
+    Table,
+    /// `RETURNS @t TABLE (...)`: a multi-statement table-valued function.
+    TableVariable,
+}
+
+/// Read off the code, not the raw text: the word may sit in a comment or a
+/// literal, and only the first `RETURNS` outside them is the clause.
+fn returns(definition: &str) -> Returns {
+    let code = pbps_model::module::code_only(definition);
+    let mut words = code
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',')
+        .filter(|w| !w.is_empty());
+    while let Some(w) = words.next() {
+        if !w.eq_ignore_ascii_case("returns") {
+            continue;
+        }
+        return match words.next() {
+            Some(t) if t.eq_ignore_ascii_case("table") => Returns::Table,
+            Some(v) if v.starts_with('@') => match words.next() {
+                Some(t) if t.eq_ignore_ascii_case("table") => Returns::TableVariable,
+                _ => Returns::Scalar,
+            },
+            _ => Returns::Scalar,
+        };
+    }
+    Returns::Scalar
 }
 
 /// The roles every SQL Server database has, which no declaration may claim.
@@ -215,7 +361,8 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     // variant's own base type does not come back out, so a pulled `int`
     // variant would be written back as an `nvarchar` one. The emitter
     // carries no types (a plan applies with no checkout), so both are
-    // refused here, by name, rather than guessed at twice (DECISIONS 70, 87).
+    // refused here, by name, rather than guessed at twice (DECISIONS 70, 87);
+    // a spatial value loses its SRID the same way (90).
     // A scalar of the wrong *kind* is refused for the same reason: a bare
     // `1` for a `varchar` column is stored and read back as text, and a
     // declaration that disagrees with its own database on every plan is
@@ -238,6 +385,11 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "a `sql_variant` column",
                 "row values are written as text, and the variant's own base type does not \
                  survive the trip",
+            )),
+            "geometry" | "geography" => Some((
+                "a spatial column",
+                "row values are written as text, and the SRID a spatial value carries is not in \
+                 its text — the engine would give it the default one",
             )),
             _ => None,
         };
@@ -640,6 +792,174 @@ mod tests {
         );
     }
 
+    /// Every pair measured on the engine (DECISIONS 89): the wrong permission
+    /// is refused by the kind of its target, the right one passes, and an
+    /// object the declarations lack is left to the model's own rule.
+    #[test]
+    fn a_permission_the_engine_does_not_define_on_the_target_is_refused_by_kind() {
+        use pbps_model::{Module, Permission};
+        let mut schema = Schema::default();
+        let (t_name, t) = base_table();
+        schema.tables.insert(t_name, t);
+        let module = |kind: ModuleKind, body: &str| Module {
+            kind,
+            description: None,
+            on: None,
+            definition: body.to_owned(),
+        };
+        schema.modules.insert(
+            TableName::new("dbo", "v"),
+            module(ModuleKind::View, "SELECT 1 AS one"),
+        );
+        schema.modules.insert(
+            TableName::new("dbo", "p"),
+            module(ModuleKind::Procedure, "AS SELECT 1"),
+        );
+        schema.modules.insert(
+            TableName::new("dbo", "fs"),
+            module(ModuleKind::Function, "() RETURNS int AS BEGIN RETURN 1 END"),
+        );
+        schema.modules.insert(
+            TableName::new("dbo", "fi"),
+            module(
+                ModuleKind::Function,
+                "() RETURNS TABLE AS RETURN SELECT 1 AS one",
+            ),
+        );
+        schema.modules.insert(
+            TableName::new("dbo", "fm"),
+            module(
+                ModuleKind::Function,
+                "() RETURNS @r TABLE (one int) AS BEGIN INSERT @r VALUES (1); RETURN END",
+            ),
+        );
+        schema.modules.insert(
+            TableName::new("dbo", "tr"),
+            module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
+        );
+        let grant = |target: &str, p: Permission| {
+            let mut role = Role::default();
+            role.grants
+                .insert(target.parse().unwrap(), [p].into_iter().collect());
+            super::role("r", &role, &schema)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (target, p, what) in [
+            ("dbo.customer", Permission::Execute, "a table"),
+            ("dbo.v", Permission::Execute, "a view"),
+            ("dbo.p", Permission::Select, "a procedure"),
+            ("dbo.fs", Permission::Select, "a scalar function"),
+            (
+                "dbo.fi",
+                Permission::Execute,
+                "an inline table-valued function",
+            ),
+            (
+                "dbo.fm",
+                Permission::Insert,
+                "a multi-statement table-valued function",
+            ),
+            (
+                "dbo.fm",
+                Permission::Execute,
+                "a multi-statement table-valued function",
+            ),
+        ] {
+            let msg = grant(target, p);
+            assert!(
+                msg.contains(&format!(
+                    "`{}` does not apply to `{target}`, {what}",
+                    p.as_str()
+                )),
+                "{target} {p:?}: {msg}"
+            );
+        }
+        for (target, p) in [
+            ("dbo.customer", Permission::Insert),
+            ("dbo.v", Permission::Delete),
+            ("dbo.p", Permission::Execute),
+            ("dbo.fs", Permission::Execute),
+            ("dbo.fs", Permission::References),
+            ("dbo.fi", Permission::Update),
+            ("dbo.fm", Permission::Select),
+            ("schema::dbo", Permission::Execute),
+            ("schema::dbo", Permission::Select),
+        ] {
+            let msg = grant(target, p);
+            assert!(msg.is_empty(), "{target} {p:?}: {msg}");
+        }
+        // A trigger takes nothing, whatever is asked.
+        let msg = grant("dbo.tr", Permission::Select);
+        assert!(
+            msg.contains("a trigger, which takes no permission"),
+            "{msg}"
+        );
+        // An object nobody declares is the model's finding; this check has no
+        // kind to measure against and says nothing.
+        assert!(grant("dbo.ghost", Permission::Execute).is_empty());
+    }
+
+    /// The clause is read off the code, past comments and literals, and a
+    /// function with no clause is a scalar one to a grant.
+    #[test]
+    fn a_function_is_scalar_inline_or_multi_statement_by_its_returns_clause() {
+        assert_eq!(
+            returns("(@a int) RETURNS int AS BEGIN RETURN @a END"),
+            Returns::Scalar
+        );
+        assert_eq!(
+            returns("() returns table as return select 1 as one"),
+            Returns::Table
+        );
+        assert_eq!(
+            returns("()\nRETURNS @out TABLE (id int)\nAS BEGIN RETURN END"),
+            Returns::TableVariable
+        );
+        assert_eq!(
+            returns("() -- RETURNS TABLE, says the comment\nRETURNS int AS BEGIN RETURN 1 END"),
+            Returns::Scalar
+        );
+        assert_eq!(
+            returns("() RETURNS nvarchar(10) AS BEGIN RETURN 'RETURNS TABLE' END"),
+            Returns::Scalar
+        );
+        assert_eq!(returns("() AS BEGIN RETURN 1 END"), Returns::Scalar);
+    }
+
+    /// Refused for what it is: the text of a spatial value has no SRID.
+    #[test]
+    fn a_spatial_cell_or_key_in_a_data_block_is_refused_by_name() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let (name, mut t) = base_table();
+        t.columns
+            .insert("shape".into(), Column::new(ty("geography")));
+        let mut row = Row::default();
+        row.0
+            .insert("shape".into(), Value::Text("POINT (1 2)".into()));
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("1"), row)].into_iter().collect(),
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("`shape`, a spatial column"), "{msg}");
+        t.data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(RowKey::from("1"), Row::default());
+        assert!(!messages(&table(&name, &t)).contains("spatial"));
+        t.columns
+            .insert("id".into(), Column::new(ty("geometry")).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        assert!(messages(&table(&name, &t)).contains("key its rows by `id`, a spatial column"));
+    }
+
     #[test]
     fn two_identity_columns_are_reported() {
         let (name, mut t) = base_table();
@@ -845,18 +1165,18 @@ mod tests {
             "dbo.customer".parse().unwrap(),
             [pbps_model::Permission::Select].into_iter().collect(),
         );
-        assert!(super::role("app_reader", &role).is_empty());
-        let errs = super::role("db_datareader", &role);
+        assert!(super::role("app_reader", &role, &Schema::default()).is_empty());
+        let errs = super::role("db_datareader", &role, &Schema::default());
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].to_string().contains("built-in"), "{errs:?}");
         // Case is the engine's, not the file's.
-        assert!(!super::role("PUBLIC", &role).is_empty());
+        assert!(!super::role("PUBLIC", &role, &Schema::default()).is_empty());
         // And a target that cannot be quoted is refused where the name is.
         let mut bad = Role::default();
         bad.grants.insert(
             GrantTarget::Schema("a\0b".into()),
             [pbps_model::Permission::Select].into_iter().collect(),
         );
-        assert!(!super::role("ok", &bad).is_empty());
+        assert!(!super::role("ok", &bad, &Schema::default()).is_empty());
     }
 }

@@ -189,12 +189,13 @@ Decisions taken during implementation that this document did not anticipate:
    a declared value at all: row values travel as string literals, and the
    engine's text-to-binary conversion stores the characters, not the bytes.
    A `sql_variant` column cannot either, the other way round: the text goes
-   in, but the variant's base type does not come back out. `validate`
-   refuses both as a key and as a set cell (DECISIONS 70, 87), and refuses a
+   in, but the variant's base type does not come back out; nor can a spatial
+   one, whose text has no SRID (90). `validate` refuses each as a key and as
+   a set cell (DECISIONS 70, 87, 90), and refuses a
    scalar of the wrong kind for its column — a bare `1` in a `varchar`, a
    quoted `"1"` in an `int` — because it would read back as another kind
    and drift on every plan (87). A typed value in the model is the way to
-   lift the first two, and it is an ADR of its own. A key the engine spells differently from the
+   lift those, and it is an ADR of its own. A key the engine spells differently from the
    declaration (`01` for an `int` `1`) is read back under the declaration's
    spelling: the read sends each declared key through a `VALUES` join and
    the engine says which row it names (DECISIONS 71), so neither side ever

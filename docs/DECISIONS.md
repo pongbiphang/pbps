@@ -697,3 +697,23 @@ SPEC is in sync with all of these.
     and libraries. The views that arrived after 2008 are probed for first,
     so an older engine answers with the classes it has. A class enumerated
     from memory is a filter nobody re-reads.
+89. **A grant's permissions are checked against what the target is, with the
+    engine's table.** `GRANT EXECUTE` on a table and `GRANT SELECT` on a
+    procedure both pass the name checks and are both refused by the engine
+    (Msg 4606) — in a staged apply after every earlier change has committed.
+    `validate` now applies the engine's rule, measured on a live SQL Server
+    2025 for every pair a declaration can spell: a table, a view and an
+    inline table-valued function take everything but `execute`; a procedure
+    and a scalar function take `execute`, `references`, `alter` and
+    `view-definition`; a multi-statement table-valued function takes
+    `select`, `references`, `alter` and `view-definition`; a trigger takes
+    nothing (Msg 15151: `GRANT` cannot even name it); a schema takes all. The
+    three kinds of function are told apart by the `RETURNS` clause, read off
+    the code so a comment or a literal cannot pass for it. An object the
+    declarations do not have is the model's finding and gets no kind here.
+90. **A spatial cell cannot hold a declared value.** `geometry` and
+    `geography` read back as WKT through `ToString()`, which carries no SRID;
+    written back as text the engine assigns the default one, and `verify`
+    keeps reading the same WKT and calling it clean. 70's shape again:
+    refused by name as a key and as a set cell, with a typed value in the
+    model as the way to lift it.

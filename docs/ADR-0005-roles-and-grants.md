@@ -194,6 +194,12 @@ Decisions taken during implementation that this document did not anticipate:
     apply would have committed every `DROP MEMBER` before finding out; the
     list is read off the catalog's owner columns, not recalled (DECISIONS
     83, 88).
+11. **A permission is checked against the kind of its target.** `execute` on
+    a table, `select` on a procedure, anything on a trigger: the engine
+    refuses each `GRANT`, and in a staged apply it would do so after the
+    other changes had committed. `validate` applies the engine's own table,
+    measured pair by pair, with a function's kind read off its `RETURNS`
+    clause (DECISIONS 89).
 
 ## Placement
 

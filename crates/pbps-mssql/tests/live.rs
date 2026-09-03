@@ -2738,6 +2738,27 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         "the engine must refuse to drop a role that has members"
     );
 
+    // The permission rule `validate` applies is the engine's, measured here
+    // on the pair the rule exists for (DECISIONS 89): a table is not
+    // executed, and the engine says so with Msg 4606 rather than by ignoring
+    // it — a staged apply would have committed everything before this.
+    db.conn
+        .execute("CREATE ROLE perm_probe;")
+        .await
+        .expect("a role to grant to");
+    let refused = db
+        .conn
+        .execute("GRANT EXECUTE ON dbo.customer TO perm_probe;")
+        .await;
+    assert!(
+        refused.is_err(),
+        "the engine must refuse EXECUTE on a table: {refused:?}"
+    );
+    db.conn
+        .execute("GRANT SELECT ON dbo.customer TO perm_probe; DROP ROLE perm_probe;")
+        .await
+        .expect("the permission a table does take");
+
     // Ownership is the other thing the engine refuses to drop a role over,
     // and the plan has to see it before anything runs.
     db.conn
