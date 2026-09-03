@@ -134,7 +134,19 @@ anticipate, both of them narrowings:
    default applies to a value that was sent. So the differ compares a `Cell`
    (a value, or *the default*) resolved against each side's own table, an
    UPDATE to an omitted column says `DEFAULT`, and `validate` refuses an
-   explicit `null` on a NOT NULL column whatever its default.
+   explicit `null` on a NOT NULL column whatever its default. The cell carries
+   the default *expression*, compared as text: when the default changes, a row
+   that omits the column should hold the new one, and `ALTER` does not
+   backfill. (A read-back that spells the default the engine's way will
+   therefore restate `DEFAULT` on every plan until the declaration is written
+   in the stored form — the same spelling cost check constraints already
+   have, and the same remedy.)
+   The key column is never compared: its value is the map key, and resolving
+   it through the omission rule read a default added to the key column as
+   "set every key to DEFAULT". Rows are matched to the base by column **uid**,
+   so a renamed column keeps its values; a primary key that *moves* to a
+   different column is refused, because the two key sets have nothing in
+   common.
 3. **A connected plan refuses a declaration with `data:` blocks**, before it
    connects. The catalog does not read rows back yet, so its tables all say
    `data: None` — which means "declares no rows", not "did not look" — and the

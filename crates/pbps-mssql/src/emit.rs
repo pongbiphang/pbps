@@ -453,7 +453,7 @@ fn update_row(
         // column's default, which is the one thing a literal cannot say.
         let rhs = match to {
             Cell::Value(v) => value_literal(v),
-            Cell::Default => "DEFAULT".to_owned(),
+            Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{} = {}", quote(column)?, rhs));
     }
@@ -1345,7 +1345,7 @@ mod tests {
             key: RowKey::from("a"),
             columns: [(
                 "sort".to_owned(),
-                (Cell::Value(Value::Int(3)), Cell::Default),
+                (Cell::Value(Value::Int(3)), Cell::Default("0".to_owned())),
             )]
             .into_iter()
             .collect(),

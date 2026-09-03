@@ -214,15 +214,18 @@ impl fmt::Display for Value {
 #[serde(rename_all = "snake_case")]
 pub enum Cell {
     Value(Value),
-    /// The column's declared default, whatever it evaluates to.
-    Default,
+    /// The column's declared default — the expression as declared, because
+    /// *which* default matters: when it changes, a row that omits the column
+    /// should hold the new one, and `ALTER` does not backfill. Compared as
+    /// text, like the defaults themselves are.
+    Default(String),
 }
 
 impl fmt::Display for Cell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Cell::Value(v) => v.fmt(f),
-            Cell::Default => f.write_str("default"),
+            Cell::Default(expr) => write!(f, "default ({expr})"),
         }
     }
 }
@@ -238,9 +241,9 @@ impl fmt::Display for Cell {
 pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Cell {
     match row.get(column) {
         Some(v) => Cell::Value(v.clone()),
-        None => match spec {
-            Some(c) if c.default.is_some() => Cell::Default,
-            _ => Cell::Value(Value::Null),
+        None => match spec.and_then(|c| c.default.as_ref()) {
+            Some(default) => Cell::Default(default.clone()),
+            None => Cell::Value(Value::Null),
         },
     }
 }
@@ -582,7 +585,10 @@ mod tests {
         };
         let without = Column::new(ColumnType::from_str("int").unwrap());
         let row = Row::default();
-        assert_eq!(cell(&row, "n", Some(&with_default)), Cell::Default);
+        assert_eq!(
+            cell(&row, "n", Some(&with_default)),
+            Cell::Default("0".to_owned())
+        );
         assert_eq!(cell(&row, "n", Some(&without)), Cell::Value(Value::Null));
         assert_eq!(cell(&row, "n", None), Cell::Value(Value::Null));
         // And a written value is that value, default or no default: the

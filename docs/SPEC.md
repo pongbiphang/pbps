@@ -338,7 +338,9 @@ can imply.
   [ADR-0005](ADR-0005-roles-and-grants.md)).
 - **A `data:` table needs a declared, single-column primary key.** Composite
   keys are deferred: a written form for a tuple that later has to change is
-  worse than saying so.
+  worse than saying so. Renaming the key column is an ordinary rename; moving
+  the key to a *different* column is refused while the block is present,
+  because the old and new row keys have nothing in common.
 - **An omitted column means the column's declared default, or NULL.** It does
   not mean "this row says nothing about it" — that reading would leave part of
   an `exact` table undeclared. An explicit `null` is different: it is sent, so

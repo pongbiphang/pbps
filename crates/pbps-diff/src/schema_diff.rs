@@ -27,8 +27,8 @@ use pbps_dialect::Dialect;
 use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, ColumnType, DataMode, Hints, IdsFile, ObjectName, PlannedChange,
-    Schema, Table, TableName, Uid,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, Hints, IdsFile, ObjectName,
+    PlannedChange, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +49,18 @@ pub enum DiffError {
         "{table} declares `data:` but has no single-column primary key, so its rows have no identity"
     )]
     DataWithoutKey { table: TableName },
+
+    /// A `data:` table whose primary key moved to a different column. The row
+    /// keys on each side are values of that side's key column, so the two sets
+    /// have nothing in common and matching them by text would update and
+    /// delete the wrong rows. Renaming the key column is fine — same column,
+    /// same values.
+    #[error(
+        "{table} declares `data:` and its primary key moved to another column, so the declared \
+         rows cannot be matched to the recorded ones. Remove the block, apply the key change, \
+         then declare the rows again — or rename the column instead of replacing it"
+    )]
+    DataKeyColumnChanged { table: TableName },
 }
 
 /// One side's complete input: a state plus its own identity mapping.
@@ -201,10 +213,19 @@ pub fn diff_partial(
             &mut errs,
         );
         diff_constraints(declared_name, base_table, declared_table, &mut changes);
+        // Rows are compared by column *name* on each side, and a rename in
+        // this same plan means the two sides know one column by two names.
+        // The uid is what says they are the same column.
+        let base_cols = columns_of(base.ids, base_name);
+        let base_name_of: BTreeMap<String, String> = columns_of(declared.ids, declared_name)
+            .iter()
+            .filter_map(|(uid, d)| base_cols.get(uid).map(|b| (d.name.clone(), b.name.clone())))
+            .collect();
         diff_data(
             declared_name,
             base_table,
             declared_table,
+            &base_name_of,
             &mut changes,
             &mut errs,
         );
@@ -475,6 +496,7 @@ fn diff_data(
     name: &TableName,
     base: &Table,
     declared: &Table,
+    base_name_of: &BTreeMap<String, String>,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -513,6 +535,25 @@ fn diff_data(
     // the baseline, and only the connected drift comparison can see it.
     let base_rows = base.data.as_ref().map(|d| &d.rows);
 
+    // The row keys on each side are values of *that side's* key column. They
+    // can only be matched when it is the same column — the same uid — on both
+    // sides; renamed is fine, since the values did not move. A key that moved
+    // to a different column leaves two sets of keys with nothing in common,
+    // and matching them by text would update and delete the wrong rows.
+    if base_rows.is_some() {
+        let base_key = base
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| pk.columns[0].as_str());
+        if base_name_of.get(&key_column).map(String::as_str) != base_key {
+            errs.push(DiffError::DataKeyColumnChanged {
+                table: name.clone(),
+            });
+            return;
+        }
+    }
+
     for (key, row) in &declared_data.rows {
         match base_rows.and_then(|r| r.get(key)) {
             None => changes.push(Change::InsertRow {
@@ -528,13 +569,29 @@ fn diff_data(
                 // claim a change that is not one.
                 let mut columns = BTreeMap::new();
                 for (column, spec) in &declared.columns {
-                    // Each side against *its own* table. A column that gains a
-                    // default in this same plan resolves to NULL on the base
-                    // and to the default on the declared side, which is an
-                    // UPDATE — and the right one: adding a default does not
-                    // backfill existing rows, and the declaration says the
-                    // row should hold it.
-                    let b = cell(before, column, base.columns.get(column));
+                    // The key lives in the map key, not in either row, so it
+                    // has nothing to compare — and resolving it through the
+                    // omission rule would read a default added to the key
+                    // column as "set every key to DEFAULT".
+                    if *column == key_column {
+                        continue;
+                    }
+                    // Each side against *its own* table, and the base side
+                    // under the name the base knew the column by: a renamed
+                    // column keeps its values, and looking it up by the new
+                    // name would find nothing and restate every row. A column
+                    // the base does not have at all is NULL there. A column
+                    // that gains a default in this same plan resolves to NULL
+                    // on the base and to the default on the declared side,
+                    // which is an UPDATE — and the right one: adding a default
+                    // does not backfill existing rows, and the declaration
+                    // says the row should hold it.
+                    let b = match base_name_of.get(column) {
+                        Some(base_column) => {
+                            cell(before, base_column, base.columns.get(base_column))
+                        }
+                        None => Cell::Value(Value::Null),
+                    };
                     let d = cell(row, column, Some(spec));
                     if b != d {
                         columns.insert(column.clone(), (b, d));
@@ -742,7 +799,7 @@ mod tests {
     use indexmap::IndexMap;
     use pbps_dialect::MinimalDialect;
     use pbps_model::{
-        Column, ColumnType, IdsFile, Index, IndexColumn, Intent, RiskClass, Row, Uid, Value,
+        Column, ColumnType, IdsFile, Index, IndexColumn, Intent, RiskClass, Row, Uid,
     };
 
     fn ctx() -> Context {
@@ -1105,7 +1162,7 @@ mod tests {
             columns["label"],
             (
                 pbps_model::Cell::Value(Value::Text("x".to_owned())),
-                pbps_model::Cell::Default
+                pbps_model::Cell::Default("''".to_owned())
             )
         );
     }
@@ -1152,6 +1209,198 @@ mod tests {
                 .changes
                 .is_empty()
         );
+    }
+
+    fn rename_column(from: &str, to: &str) -> Intent {
+        Intent::RenameColumn {
+            table: "dbo.s".parse().unwrap(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+
+    /// The second review's second round. The key lives in the map key, not in
+    /// either row, so a default added to the key column has nothing to compare
+    /// against — reading it through the omission rule produced
+    /// `SET [code] = DEFAULT` for every row, which for a GUID default rewrites
+    /// every identity.
+    #[test]
+    fn a_default_on_the_key_column_never_updates_the_key() {
+        let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut declared_t = base_t.clone();
+        declared_t.columns.get_mut("code").unwrap().default = Some("NEWID()".to_owned());
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+        // The negative case: the default itself is still a change.
+        assert!(
+            kinds(&cs).contains(&"AlterColumnDefault".to_owned()),
+            "{:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// An omitted column means *the* default — and when the default changes,
+    /// so does what the row should hold. `ALTER` does not backfill, so the
+    /// plan has to restate it, and two undifferentiated "default" cells would
+    /// have compared equal.
+    #[test]
+    fn a_changed_default_restates_the_rows_that_omit_the_column() {
+        let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+        base_t.columns.get_mut("label").unwrap().default = Some("'a'".to_owned());
+        base_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+            .into_iter()
+            .collect();
+        let mut declared_t = base_t.clone();
+        declared_t.columns.get_mut("label").unwrap().default = Some("'b'".to_owned());
+
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        let Some(Change::UpdateRow { columns, .. }) = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateRow { .. }))
+        else {
+            panic!("{:?}", kinds(&cs));
+        };
+        assert_eq!(
+            columns["label"],
+            (
+                pbps_model::Cell::Default("'a'".to_owned()),
+                pbps_model::Cell::Default("'b'".to_owned())
+            )
+        );
+        // And after the new default exists.
+        let k = kinds(&cs);
+        let alter = k.iter().position(|c| c == "AlterColumnDefault").unwrap();
+        let update = k.iter().position(|c| c == "UpdateRow").unwrap();
+        assert!(alter < update, "{k:?}");
+    }
+
+    /// A renamed column keeps its values. Looking the base row up by the new
+    /// name found nothing, and restated every row behind the `data-update`
+    /// gate for a change that was not one.
+    #[test]
+    fn a_renamed_column_with_unchanged_values_is_not_an_update() {
+        let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut declared_t = base_t.clone();
+        let label = declared_t.columns.shift_remove("label").unwrap();
+        declared_t.columns.insert("caption".to_owned(), label);
+        declared_t.data.as_mut().unwrap().rows = [(
+            pbps_model::RowKey::from("new"),
+            [("caption".to_owned(), Value::Text("New".to_owned()))]
+                .into_iter()
+                .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect();
+
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[rename_column("label", "caption")],
+        );
+        assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+        assert!(
+            kinds(&cs).contains(&"RenameColumn".to_owned()),
+            "{:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// The row keys on each side are values of that side's key column. When
+    /// the key moves to a *different* column the two key sets have nothing in
+    /// common, and matching them by text would update and delete the wrong
+    /// rows — so it is refused, not guessed.
+    #[test]
+    fn moving_the_primary_key_to_another_column_is_refused() {
+        let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut declared_t = base_t.clone();
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["label".to_owned()],
+        });
+        // The rows now key on `label`, and say nothing about `code`.
+        declared_t.columns.get_mut("code").unwrap().nullable = true;
+        declared_t.data.as_mut().unwrap().rows =
+            [(pbps_model::RowKey::from("New"), Row::default())]
+                .into_iter()
+                .collect();
+
+        let base = schema_of("dbo.s", base_t);
+        let declared = schema_of("dbo.s", declared_t);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let d = diff_partial(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        );
+        assert!(
+            d.errors
+                .iter()
+                .any(|e| matches!(e, DiffError::DataKeyColumnChanged { .. })),
+            "{:?}",
+            d.errors
+        );
+        assert!(row_ops(&d.changes).is_empty(), "{:?}", row_ops(&d.changes));
+    }
+
+    /// The negative case for the refusal: *renaming* the key column is the
+    /// same column by uid, the values did not move, and the row changes simply
+    /// use the new name.
+    #[test]
+    fn renaming_the_primary_key_column_keeps_the_rows_matched() {
+        let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut declared_t = base_t.clone();
+        let code = declared_t.columns.shift_remove("code").unwrap();
+        declared_t.columns.insert("kode".to_owned(), code);
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["kode".to_owned()],
+        });
+        declared_t.data.as_mut().unwrap().rows = [(
+            pbps_model::RowKey::from("new"),
+            [("label".to_owned(), Value::Text("Renamed".to_owned()))]
+                .into_iter()
+                .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect();
+
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[rename_column("code", "kode")],
+        );
+        assert_eq!(row_ops(&cs), ["update new [label]"]);
+        let Some(Change::UpdateRow { key_column, .. }) = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateRow { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(key_column, "kode", "the statement runs after the rename");
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently
