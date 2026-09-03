@@ -853,3 +853,15 @@ SPEC is in sync with all of these.
     catalog's own class name. The third instance of 95's shape — a
     permission the model cannot hold, dropped before the comparison — found
     one filter further up each time.
+106. **Two declared keys the engine reads as one row are refused before
+    anything is written.** 74 refused them through the alias query, which
+    asks the engine which existing row each spelling names — and on a table
+    the plan creates, or one that holds neither row yet, nothing joins and
+    both pass, so the plan inserts twice and fails on the second. The
+    spelling probe (101) now also groups the keys by what the engine reads
+    them as (`GROUP BY TRY_CONVERT(<type>, key)`, under the database's own
+    collation) and refuses each group of more than one with the same
+    message: `1` and `01` for an `int`, `a` and `A` under a
+    case-insensitive collation. A column collation that differs from the
+    database's is not modelled, and is the one thing this grouping cannot
+    see.

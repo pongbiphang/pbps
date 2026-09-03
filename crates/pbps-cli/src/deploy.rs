@@ -197,31 +197,37 @@ pub(crate) async fn refuse_misspelt(conn: &mut Conn, schema: &Schema) -> anyhow:
     let found = pbps_mssql::catalog::misspelt(conn, schema)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
-    if found.is_empty() {
+    if found.misspelt.is_empty() && found.conflicts.is_empty() {
         return Ok(());
     }
-    let lines: Vec<String> = found
-        .iter()
-        .map(|m| match (&m.column, &m.canonical) {
-            (None, _) => format!(
-                "{} row key `{}` cannot be read as {} by the engine",
-                m.table, m.key, m.ty
-            ),
-            (Some(c), None) => format!(
-                "{} row `{}`: `{c}` = {:?} cannot be read as {} by the engine",
-                m.table, m.key, m.declared, m.ty
-            ),
-            (Some(c), Some(canonical)) => format!(
-                "{} row `{}`: `{c}` is written {:?}, and the engine reads it back as {:?}; \
+    // Two keys the engine reads as one row would insert twice and fail on
+    // the second; the alias check (74) cannot see them on a table that holds
+    // neither yet (DECISIONS 106).
+    let mut lines: Vec<String> = found.conflicts.iter().map(ToString::to_string).collect();
+    lines.extend(
+        found
+            .misspelt
+            .iter()
+            .map(|m| match (&m.column, &m.canonical) {
+                (None, _) => format!(
+                    "{} row key `{}` cannot be read as {} by the engine",
+                    m.table, m.key, m.ty
+                ),
+                (Some(c), None) => format!(
+                    "{} row `{}`: `{c}` = {:?} cannot be read as {} by the engine",
+                    m.table, m.key, m.declared, m.ty
+                ),
+                (Some(c), Some(canonical)) => format!(
+                    "{} row `{}`: `{c}` is written {:?}, and the engine reads it back as {:?}; \
                  write it that way",
-                m.table, m.key, m.declared, canonical
-            ),
-        })
-        .collect();
+                    m.table, m.key, m.declared, canonical
+                ),
+            }),
+    );
     bail!(
         "{} declared value(s) would not come back as written:\n  {}\n\
          A declaration that disagrees with its own database on every plan is worse than \
-         none; the engine's spelling is the one to write (DECISIONS 101).",
+         none; the engine's spelling is the one to write (DECISIONS 101, 106).",
         lines.len(),
         lines.join("\n  ")
     );

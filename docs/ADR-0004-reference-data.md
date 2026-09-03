@@ -221,7 +221,9 @@ Decisions taken during implementation that this document did not anticipate:
    `decimal(5,2)` does not, it comes back `1.50` — and refuses the
    declaration with the spelling to write (101); a table this plan creates
    is asked about the same way, since the question needs the type and not
-   the table.
+   the table — and the same question groups the keys by what the engine
+   reads them as, so two spellings of one row are refused there too, where
+   the alias query has no row to find (106).
 6. **The pre-delete probe finds the referencing tables in the catalog at run
    time**, through `sys.foreign_keys` and dynamic SQL, rather than trusting
    the declarations to list them — a foreign key someone added by hand is

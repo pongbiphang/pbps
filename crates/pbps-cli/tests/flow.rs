@@ -5044,23 +5044,30 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
     let connection = format!("{server};Database={name}");
 
     let d = Demo::new("spelling-live");
-    let declared = |pct: &str, since: &str| {
+    let declared = |pct: &str, since: &str, extra_rows: &str| {
         format!(
             "table: dbo.rate\ncolumns:\n  code: {{type: varchar(10), nullable: false}}\n  \
              pct: {{type: \"decimal(5,2)\"}}\n  since: {{type: date}}\n\
              primary_key: [code]\ndata:\n  mode: exact\n  rows:\n    std: {{pct: \"{pct}\", \
-             since: \"{since}\"}}\n"
+             since: \"{since}\"}}\n{extra_rows}"
         )
     };
-    d.table(&declared("1.5", "2026-9-3"));
+    // `STD` beside `std`: one row to the engine under its case-insensitive
+    // collation, and no row to alias against on a table that does not exist
+    // yet (DECISIONS 106).
+    d.table(&declared("1.5", "2026-9-3", "    STD: {}\n"));
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
-    // Refused before the table exists, naming both spellings, and nothing
-    // was built.
+    // Refused before the table exists, naming both spellings and the two
+    // keys that are one, and nothing was built.
     let o = d.run(&["bootstrap", "--db", &connection]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     let err = stderr(&o);
+    assert!(
+        err.contains("rows `STD` and `std` are the same row to the database"),
+        "{err}"
+    );
     assert!(
         err.contains("`pct` is written \"1.5\"") && err.contains("\"1.50\""),
         "{err}"
@@ -5072,7 +5079,7 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
 
     // Written the engine's way, it goes in and comes back as declared: the
     // next connected plan has nothing to say.
-    d.table(&declared("1.50", "2026-09-03"));
+    d.table(&declared("1.50", "2026-09-03", ""));
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
     let o = d.run(&["bootstrap", "--db", &connection]);
@@ -5083,7 +5090,7 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
 
     // And a connected plan against a database that has the row is refused
     // the same way, before a plan that could never converge is written.
-    d.table(&declared("1.5", "2026-09-03"));
+    d.table(&declared("1.5", "2026-09-03", ""));
     let o = d.run(&["plan", "--db", &connection]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(

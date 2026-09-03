@@ -535,20 +535,49 @@ pub async fn read_rows(
     Ok(out)
 }
 
-/// Every declared spelling the engine would not read back as written, over
-/// every table that declares rows (DECISIONS 101). Asked of the engine, not
-/// of the table: a table this plan creates can be asked too.
+/// What the engine says about the declared spellings of every table that
+/// declares rows: the ones it would not read back as written, and the keys
+/// it reads as one row.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Spellings {
+    pub misspelt: Vec<crate::rows::Misspelt>,
+    pub conflicts: Vec<pbps_model::RowConflict>,
+}
+
+/// Every declared spelling the engine would not read back as written, and
+/// every pair of keys it reads as one, over every table that declares rows
+/// (DECISIONS 101, 106). Asked of the engine, not of the table: a table this
+/// plan creates can be asked too.
 pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
-) -> Result<Vec<crate::rows::Misspelt>, crate::rows::RowsError> {
-    let mut out = Vec::new();
+) -> Result<Spellings, crate::rows::RowsError> {
+    let mut out = Spellings::default();
     for (name, table) in &schema.tables {
         for q in crate::rows::spelling_queries(name, table)? {
             let read = |source| crate::rows::RowsError::Read {
                 table: name.clone(),
                 source: Box::new(source),
             };
+            if let Some(sql) = &q.collisions {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
+                    let (Some((first, _)), Some((second, _))) =
+                        (q.literals.get(a), q.literals.get(b))
+                    else {
+                        return Err(read(pbps_db::DbError::BadRow(format!(
+                            "the collision query returned indexes {a} and {b} for {} literal(s)",
+                            q.literals.len()
+                        ))));
+                    };
+                    out.conflicts.push(pbps_model::RowConflict {
+                        table: name.clone(),
+                        first: first.clone(),
+                        second: second.clone(),
+                        canonical: pbps_model::RowKey::from(canonical.as_str()),
+                    });
+                }
+            }
             for row in &conn.query(&q.sql).await.map_err(read)? {
                 let (i, canonical) = crate::rows::decode_spelling(name, row)?;
                 let Some((key, declared)) = q.literals.get(i) else {
@@ -565,7 +594,7 @@ pub async fn misspelt(
                     (Some(_), Some(c)) => c == declared,
                 };
                 if !agrees {
-                    out.push(crate::rows::Misspelt {
+                    out.misspelt.push(crate::rows::Misspelt {
                         table: name.clone(),
                         key: key.clone(),
                         column: q.column.clone(),

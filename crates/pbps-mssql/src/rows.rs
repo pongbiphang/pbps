@@ -323,6 +323,14 @@ pub struct SpellingQuery {
     pub ty: String,
     pub literals: Vec<(RowKey, String)>,
     pub sql: String,
+    /// For the key column only: the query that groups the keys by what the
+    /// engine reads them as and returns each group of more than one, as the
+    /// indexes of two of its members and the spelling the engine gives the
+    /// group. Two keys the engine reads as one row — `1` and `01` for an
+    /// `int`, `a` and `A` under a case-insensitive collation — would insert
+    /// twice and fail on the second, and the alias query (71) cannot see
+    /// them on a table that does not hold either yet (DECISIONS 106).
+    pub collisions: Option<String>,
 }
 
 /// The engine's own answer to "is this text the spelling it reads back":
@@ -373,11 +381,21 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             .map(|(i, (_, text))| format!("({i}, {})", literal(text)))
             .collect::<Vec<_>>()
             .join(", ");
+        let collisions = column.is_none().then(|| {
+            format!(
+                "SELECT MIN(v.i) AS first, MAX(v.i) AS second, MIN({rendered}) AS canonical\n  \
+                 FROM (VALUES {values}) AS v(i, s)\n \
+                 WHERE TRY_CONVERT({ty}, v.s) IS NOT NULL\n \
+                 GROUP BY TRY_CONVERT({ty}, v.s)\n\
+                 HAVING COUNT(*) > 1;"
+            )
+        });
         SpellingQuery {
             column,
             ty,
             literals,
             sql: format!("SELECT v.i AS i, {rendered} AS c\n  FROM (VALUES {values}) AS v(i, s);"),
+            collisions,
         }
     };
 
@@ -432,6 +450,30 @@ pub fn decode_spelling(
         )));
     };
     Ok((i, c.map(str::to_owned)))
+}
+
+/// Reads one row of a collision query: two indexes the engine reads as one
+/// key, and the spelling it gives that key.
+pub fn decode_collision(
+    name: &TableName,
+    row: &pbps_db::Row,
+) -> Result<(usize, usize, String), RowsError> {
+    let read = |source: DbError| RowsError::Read {
+        table: name.clone(),
+        source: Box::new(source),
+    };
+    let first: Option<i32> = row.try_get_at(0).map_err(read)?;
+    let second: Option<i32> = row.try_get_at(1).map_err(read)?;
+    let canonical: Option<&str> = row.try_get_at(2).map_err(read)?;
+    match (
+        first.and_then(|i| usize::try_from(i).ok()),
+        second.and_then(|i| usize::try_from(i).ok()),
+    ) {
+        (Some(a), Some(b)) => Ok((a, b, canonical.unwrap_or_default().to_owned())),
+        _ => Err(read(DbError::BadRow(
+            "the collision query returned a NULL index".to_owned(),
+        ))),
+    }
 }
 
 /// Reads one row of the alias query: the requested spelling and the engine's.
@@ -770,6 +812,14 @@ mod tests {
             "{}",
             qs[1].sql
         );
+        // Only the key asks about collisions, grouped by what the engine reads.
+        let dupes = qs[0].collisions.as_deref().unwrap();
+        assert!(
+            dupes.contains("GROUP BY TRY_CONVERT(varchar(10), v.s)")
+                && dupes.contains("HAVING COUNT(*) > 1"),
+            "{dupes}"
+        );
+        assert!(qs[1].collisions.is_none());
         // A date is rendered in the fixed style the read-back uses.
         assert!(
             qs[2].sql.contains("TRY_CONVERT(date, v.s), 126)"),
