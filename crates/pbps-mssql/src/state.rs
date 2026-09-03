@@ -202,16 +202,56 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
     }
 }
 
-/// Releases the lock. `false` means it was not held.
-pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
-    if !is_initialized(conn).await? {
-        return Ok(false);
-    }
-    Ok(conn.execute_with(DELETE_LOCK, &[]).await? > 0)
+/// SQL Server's "Invalid object name": the table this statement names is not
+/// there. **Not** the code for one that is there and may not be read — that is
+/// 229, "permission was denied", and keeping the two apart is the whole point
+/// of asking by error number.
+const INVALID_OBJECT_NAME: u32 = 208;
+
+/// Whether a failure means "that table does not exist".
+///
+/// # Why the statement is attempted rather than the catalog asked
+///
+/// The obvious guard is `OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL`, and it
+/// is wrong: SQL Server's metadata-visibility rules hide an object from a
+/// principal with no permission on it, so `OBJECT_ID` answers NULL for a table
+/// that exists and holds a live lock. That turned "not authorized to look" into
+/// "no lock", which is the one direction this tool must never round in.
+///
+/// `HAS_PERMS_BY_NAME` does not separate them either — measured against a real
+/// server, it answers **0** both for an absent table and for one hidden this
+/// way. The statement itself is the only thing that does: 208 for absent, 229
+/// for denied, and every other failure stays a failure.
+fn is_missing_table(e: &DbError) -> bool {
+    e.server_error_number() == Some(INVALID_OBJECT_NAME)
 }
 
+/// Releases the lock. `false` means it was not held.
+pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
+    // The *lock* table, not the state table. Guarding on `is_initialized` meant
+    // a database whose `__pbps_state` had been dropped by hand reported "not
+    // held" and left a live lock in place — with no command able to clear it.
+    match conn.execute_with(DELETE_LOCK, &[]).await {
+        Ok(n) => Ok(n > 0),
+        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Who holds the deployment lock, if anyone.
+///
+/// A missing lock table answers `None` rather than failing: nothing can be
+/// holding a lock that does not exist. That is deliberately *not* the same as
+/// the table being unreadable, which stays an error — callers report the two
+/// differently, and "I could not look" must never be flattened into "nothing
+/// there". See [`is_missing_table`] for why that distinction cannot be made by
+/// asking the catalog first.
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
-    let rows = conn.query(SELECT_LOCK).await?;
+    let rows = match conn.query(SELECT_LOCK).await {
+        Ok(rows) => rows,
+        Err(e) if is_missing_table(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     match rows.first() {
         Some(row) => Ok(Some(LockInfo {
             locked_by: get::<&str>(row, "locked_by")?.to_owned(),

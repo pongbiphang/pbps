@@ -91,6 +91,14 @@ fn code(o: &Output) -> i32 {
     o.status.code().unwrap_or(-1)
 }
 
+/// The command ran correctly and found something the user must act on.
+///
+/// Distinct from 1, which means the tool could not answer at all (SPEC §14.1).
+/// Asserting the exact code rather than "non-zero" is the point: a pipeline
+/// that treats an unreachable database the same as an invalid declaration wakes
+/// the wrong person, and only a test can hold the two apart.
+const FINDING: i32 = 2;
+
 const ONE_COLUMN: &str = "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n";
 
 #[test]
@@ -121,8 +129,8 @@ fn an_ambiguous_rename_is_blocked_and_the_exact_command_is_printed() {
 
     assert_eq!(
         code(&o),
-        1,
-        "an ambiguity must exit non-zero, or CI cannot block on it"
+        FINDING,
+        "an ambiguity must exit as a finding, or CI cannot block on it"
     );
     let msg = stderr(&o);
     assert!(
@@ -177,7 +185,7 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
 
     d.table(ONE_COLUMN);
     let o = d.run(&["plan"]);
-    assert_eq!(code(&o), 1, "a drop without a reason must be blocked");
+    assert_eq!(code(&o), FINDING, "a drop without a reason must be blocked");
     assert!(stderr(&o).contains("--reason"), "{}", stderr(&o));
 
     assert_eq!(
@@ -219,7 +227,7 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
     let before = std::fs::read_to_string(d.ids_path()).unwrap();
 
     let o = d.run(&["plan", "--check"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
     assert!(
         stderr(&o).contains("the identity file is out of date"),
         "{}",
@@ -259,7 +267,7 @@ fn an_invalid_declaration_is_rejected() {
     let d = Demo::new("invalid");
     d.table("table: no_schema_prefix\ncolumns:\n  a: {type: int}\n");
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
 }
 
 /// An offline plan is a preview and the file has to say so in its own terms
@@ -645,8 +653,8 @@ fn fmt_normalises_and_check_mode_never_writes() {
     let o = d.run(&["fmt", "--check"]);
     assert_eq!(
         code(&o),
-        1,
-        "a file that is not canonical should exit non-zero"
+        FINDING,
+        "a file that is not canonical should exit as a finding"
     );
     assert_eq!(
         std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
@@ -699,7 +707,7 @@ fn fmt_strips_a_renamed_from_only_after_plan_absorbs_it() {
     );
 
     // Absorbed now: fmt reports the file as non-canonical, then strips it.
-    assert_eq!(code(&d.run(&["fmt", "--check"])), 1);
+    assert_eq!(code(&d.run(&["fmt", "--check"])), FINDING);
     assert_eq!(code(&d.run(&["fmt"])), 0);
     let stripped = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
     assert!(
@@ -729,7 +737,11 @@ fn validate_rejects_one_name_mapped_to_two_uids() {
     std::fs::write(d.ids_path(), ids.to_string()).unwrap();
 
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1, "a scrambled identity file must fail validate");
+    assert_eq!(
+        code(&o),
+        FINDING,
+        "a scrambled identity file must fail validate"
+    );
     let msg = stderr(&o);
     assert!(
         msg.contains("both point at"),
@@ -852,7 +864,7 @@ fn validate_rejects_what_the_engine_would_refuse() {
         "table: dbo.t\ncolumns:\n  id: {type: jsonb}\n  code: {type: int}\nprimary_key: [code]\n",
     );
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), 1);
+    assert_eq!(code(&o), FINDING);
     let err = stderr(&o);
     assert!(err.contains("has no type `jsonb`"), "{err}");
     assert!(err.contains("must be NOT NULL"), "{err}");
@@ -1538,4 +1550,3207 @@ fn bootstrap_honours_declared_module_dependencies() {
     let first = sql.find("[dbo].[first]").expect(&sql);
     let second = sql.find("[dbo].[second]").expect(&sql);
     assert!(first < second, "dependency order was discarded:\n{sql}");
+}
+
+// ---- Phase 3.1: one machine-readable shape, and three exit codes ----
+
+/// The whole point of the JSON view is that a frontend can point at the line
+/// without re-parsing a rendered diagnostic.
+#[test]
+fn validate_json_carries_the_id_the_file_and_the_line() {
+    let d = Demo::new("vjson");
+    // A semantic error rather than a dialect one: only the loader has a span,
+    // because the dialect is span-free by design (constraint 1 in CLAUDE.md).
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint}\nindexes:\n  ix:\n    columns: [id sideways]\n");
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["command"], "validate");
+    assert_eq!(v["result"], "findings");
+    let f = &v["findings"][0];
+    assert_eq!(f["id"], "load.semantic", "{v}");
+    assert_eq!(f["severity"], "error");
+    assert!(
+        f["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("dbo.t.yml"),
+        "{v}"
+    );
+    assert_eq!(f["location"]["line"], 6, "{v}");
+}
+
+/// A successful run must still produce the envelope: a consumer that only ever
+/// sees JSON when something is wrong cannot tell "clean" from "did not run".
+#[test]
+fn validate_json_of_a_clean_project_is_ok_with_no_findings() {
+    let d = Demo::new("vjsonok");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(v["data"]["tables"], 1);
+    assert_eq!(v["data"]["dialect"], "mssql");
+}
+
+/// `fmt --check` and `fmt` answer the same question and must not need two
+/// parsers; `mode` is what separates "must be fixed" from "was fixed".
+#[test]
+fn fmt_json_names_each_file_and_which_mode_ran() {
+    let d = Demo::new("fjson");
+    d.table("table:  dbo.t\ncolumns:\n  id:  {type: BIGINT}\n");
+
+    let o = d.run(&["fmt", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["mode"], "check");
+    assert_eq!(v["findings"][0]["id"], "fmt.not-canonical");
+    assert_eq!(v["findings"][0]["remedy"], "pbps fmt");
+
+    let o = d.run(&["fmt", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["mode"], "write");
+    assert_eq!(v["result"], "ok", "a file that was fixed is not a finding");
+    assert_eq!(v["findings"][0]["id"], "fmt.rewritten");
+    assert_eq!(v["findings"][0]["severity"], "note");
+}
+
+/// The negative case the split exists for: a project that cannot be found is a
+/// tool failure, not a finding, and the two must not share an exit code — a
+/// drift-watch pipeline routes them to different people (SPEC §14.1).
+#[test]
+fn a_broken_declaration_and_a_missing_project_have_different_exit_codes() {
+    let d = Demo::new("codes");
+    d.table("table: no_schema_prefix\ncolumns:\n  a: {type: int}\n");
+    assert_eq!(code(&d.run(&["validate"])), FINDING);
+
+    let nowhere = std::env::temp_dir().join(format!("pbps-none-{}", std::process::id()));
+    std::fs::create_dir_all(&nowhere).unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&nowhere)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let _ = std::fs::remove_dir_all(&nowhere);
+}
+
+/// `--format text` was the spelling the connected commands took before `human`
+/// became the one word across all of them; a pipeline already passing it must
+/// not break to gain a synonym.
+#[test]
+fn text_is_still_accepted_as_a_name_for_human() {
+    let d = Demo::new("alias");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["validate", "--format", "text"])), 0);
+    assert_eq!(code(&d.run(&["validate", "--format", "human"])), 0);
+}
+
+// ---- Phase 3.1: the plan summary and `explain` ----
+
+/// A plan builder for the explain tests: two changes, three risk classes, one
+/// table — enough that a summary and a grouped risk list have something to say.
+fn risky_plan(d: &Demo) -> PathBuf {
+    d.table(concat!(
+        "table: dbo.customer\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "  pii: {type: nvarchar(50)}\n",
+        "  code: {type: nvarchar(20)}\n",
+        "primary_key: [id]\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(concat!(
+        "table: dbo.customer\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "  code: {type: nvarchar(10), nullable: false}\n",
+        "primary_key: [id]\n"
+    ));
+    assert_eq!(
+        code(&d.run(&["drop", "dbo.customer.pii", "--reason", "REG-1"])),
+        0
+    );
+    let path = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--out", path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    path
+}
+
+/// The first screenful has to say how big the plan is and what kind of trouble
+/// it carries; a sixty-table plan and a one-table drop must not open the same
+/// way.
+#[test]
+fn every_plan_opens_with_a_summary_of_its_size_and_risks() {
+    let d = Demo::new("summary");
+    risky_plan(&d);
+    let out = stdout(&d.run(&["plan"]));
+
+    assert!(out.contains("2 change(s) across 1 table(s)"), "{out}");
+    assert!(out.contains("destructive"), "{out}");
+    assert!(
+        out.contains("data is lost, and no plan brings it back"),
+        "the class must be explained, not just named: {out}"
+    );
+    // The summary comes before the change list, or it is not a summary.
+    let summary_at = out.find("2 change(s) across").unwrap();
+    let list_at = out.find("drop column pii").unwrap();
+    assert!(summary_at < list_at, "{out}");
+}
+
+/// A plan with nothing risky in it must say so, rather than leaving the reader
+/// to notice an absence.
+#[test]
+fn a_plan_with_no_risk_says_it_needs_no_allow() {
+    let d = Demo::new("norisk");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("needs no --allow"), "{out}");
+    assert!(!out.contains("needs approval to apply"), "{out}");
+}
+
+/// `explain` is for the reviewer at the deployment gate: no checkout, no
+/// credentials, and every question they have to answer in one place.
+#[test]
+fn explain_answers_the_reviewers_questions_without_a_connection() {
+    let d = Demo::new("explain");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+
+    // What, why, how, and the exact command that approves it.
+    assert!(out.contains("drop column pii"), "{out}");
+    assert!(out.contains("data is lost"), "{out}");
+    assert!(
+        out.contains("one transaction, all or nothing"),
+        "the execution mode must be stated: {out}"
+    );
+    // The risks are named with what each one means; the *approval command* is
+    // asserted separately, on an applyable plan — this fixture is a preview,
+    // which has nothing to approve.
+    assert!(out.contains("destructive"), "{out}");
+    assert!(out.contains("narrowing"), "{out}");
+    assert!(out.contains("not-null"), "{out}");
+    // The probes are what a reviewer most wants and cannot get from plan.sql.
+    assert!(
+        out.contains("Checks that run before the first statement"),
+        "{out}"
+    );
+    assert!(out.contains("NOT NULL would reject"), "{out}");
+    // And the one thing the file cannot answer must be named as unanswered
+    // rather than quietly omitted.
+    assert!(out.contains("Not checked: no --db or --env"), "{out}");
+}
+
+/// An offline plan is a preview, and a reviewer must not be able to read this
+/// output and believe they are approving something applyable (SPEC §7.3).
+#[test]
+fn explain_says_a_preview_is_a_preview() {
+    let d = Demo::new("explainprev");
+    let plan = risky_plan(&d);
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    assert!(out.contains("`apply` will refuse it"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["applyable"], false);
+    assert_eq!(v["findings"][0]["id"], "plan.preview");
+}
+
+/// The checksum is what makes the approval mean something: it is what `apply`
+/// recomputes, so the reviewer has to be shown the one they are approving.
+#[test]
+fn explain_json_carries_the_checksum_and_the_risk_detail() {
+    let d = Demo::new("explainjson");
+    let plan = risky_plan(&d);
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["data"]["mode"], "transactional");
+    assert_eq!(v["data"]["change_count"], 2);
+    assert_eq!(v["data"]["table_count"], 1);
+    assert_eq!(v["data"]["checksum"].as_str().unwrap().len(), 64);
+    assert_eq!(v["data"]["risks"][0]["class"], "destructive");
+    assert!(!v["data"]["risks"][0]["why"].as_str().unwrap().is_empty());
+    assert_eq!(v["data"]["probes"].as_array().unwrap().len(), 2);
+    // No target was given, so the field must be absent rather than a guess.
+    assert!(v["data"].get("target").is_none(), "{v}");
+}
+
+/// Explaining is not gating. A plan full of destructive changes is exactly what
+/// this command exists to describe, and failing on one would make the
+/// reviewer's own tool look broken in their terminal.
+#[test]
+fn explain_never_fails_on_a_risky_plan() {
+    let d = Demo::new("explainexit");
+    let plan = risky_plan(&d);
+    assert_eq!(
+        code(&d.run(&["explain", "--plan", plan.to_str().unwrap()])),
+        0
+    );
+
+    // But a plan that is not there, or not a plan, is a tool failure.
+    let o = d.run(&["explain", "--plan", "nowhere.json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    std::fs::write(d.dir.join("junk.json"), "{\"nope\": 1}").unwrap();
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        d.dir.join("junk.json").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+}
+
+// ---- Phase 3.1: `doctor` ----
+
+/// The point of the command: everything wrong with the project in one run,
+/// rather than one thing per command over two days.
+#[test]
+fn doctor_reports_the_project_and_never_writes() {
+    let d = Demo::new("doctor");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let o = d.run(&["doctor"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("pbps.yml"), "{out}");
+    assert!(out.contains("1 table(s)"), "{out}");
+    assert!(
+        out.contains("no environments are configured"),
+        "an unconfigured estate must be said out loud: {out}"
+    );
+    // Nothing this command does may create the identity file: it is the command
+    // someone runs when they are not yet sure what they are pointed at.
+    assert!(!d.ids_path().exists(), "doctor must not write");
+}
+
+/// `doctor` runs `validate` rather than a second copy of it, so a broken
+/// declaration has to reach the report with the same id `validate` gives it.
+#[test]
+fn doctor_reports_the_same_finding_validate_would() {
+    let d = Demo::new("doctorvalidate");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+
+    let doctored: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    let validated: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["validate", "--format", "json"]))).unwrap();
+
+    assert_eq!(doctored["findings"][0]["id"], "dialect.rejected");
+    assert_eq!(
+        doctored["findings"][0]["message"], validated["findings"][0]["message"],
+        "the two must not be able to disagree"
+    );
+    assert_eq!(code(&d.run(&["doctor"])), FINDING);
+}
+
+/// An environment naming a variable nobody exported is the single most common
+/// first-run failure, and it must not take the rest of the report down with it.
+#[test]
+fn doctor_names_an_unset_connection_variable_without_echoing_anything() {
+    let d = Demo::new("doctorenv");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["doctor"]);
+    // Exit 1, not 2: `doctor` could not look at this environment, so it did not
+    // answer its own question about it (SPEC 9.8, and see `doctor::outcome`).
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("PBPS_DOCTOR_UNSET"), "{out}");
+    assert!(out.contains("unconfigured"), "{out}");
+    // The project half of the report still ran.
+    assert!(out.contains("1 table(s)"), "{out}");
+}
+
+/// The negative case for the split: a checkout with no commits and no checkout
+/// at all have different remedies, and one message for both sends the user to
+/// the wrong one.
+#[test]
+fn doctor_tells_an_empty_checkout_from_no_checkout() {
+    let d = Demo::new("doctorgit");
+    d.table(ONE_COLUMN);
+
+    let out = stdout(&d.run(&["doctor"]));
+    assert!(out.contains("no commits yet"), "{out}");
+    assert!(out.contains("git add -A && git commit"), "{out}");
+    assert!(!out.contains("not inside a git checkout"), "{out}");
+
+    d.commit();
+    let out = stdout(&d.run(&["doctor"]));
+    assert!(!out.contains("no commits yet"), "{out}");
+}
+
+/// `doctor`'s permissions query has never met a real `sys.fn_my_permissions`
+/// until this runs, and a catalog query that is wrong offline is wrong
+/// silently: it returns an empty set, which `missing` reads as "this account
+/// holds nothing" and reports as one error per required permission. Only a live
+/// server can tell the two apart.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctor-live");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_DOCTOR_LIVE_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+
+    assert_eq!(env["environment"], "test", "{v}");
+    assert!(
+        env["server_version"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{v}"
+    );
+    assert!(
+        env["edition"].as_str().is_some_and(|s| !s.is_empty()),
+        "{v}"
+    );
+    // The container runs Developer edition, which does support ONLINE. The
+    // assertion is on the field being answered at all: `None` would mean the
+    // SERVERPROPERTY read failed and the report silently said nothing.
+    assert!(env["supports_online"].is_boolean(), "{v}");
+    // The account the test container gives us is `sa`, which holds CONTROL.
+    // Anything in this list means the permissions query came back empty or the
+    // names it returns are not the ones `REQUIRED` spells.
+    assert_eq!(
+        env["missing_permissions"].as_array().unwrap().len(),
+        0,
+        "the deployment account should hold everything: {v}"
+    );
+    // A database with a ledger is ready; one without has never been touched.
+    // Both are legitimate here, and neither is unreachable.
+    assert!(
+        matches!(env["state"].as_str(), Some("ready" | "uninitialized")),
+        "{v}"
+    );
+    assert!(
+        !stdout(&o).contains("Password"),
+        "no part of a connection string may reach the report"
+    );
+}
+
+// ---- Phase 3.1: the interactive prompt (SPEC 6.3) ----
+
+/// The conversation itself is unit-tested in `prompt`; what only the real binary
+/// can show is the wiring — that a terminal is what turns the prompt on, and
+/// that the answer reaches the identity file through the ordinary resolve.
+///
+/// Linux only: this drives a pseudo-terminal through util-linux `script`, whose
+/// flags differ on BSD and which does not exist on Windows. Asserting it on the
+/// one platform where the harness is stable beats asserting it nowhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_turns_the_prompt_on_and_the_answer_is_recorded() {
+    let d = Demo::new("prompt");
+    d.table("table: dbo.t\ncolumns:\n  customer_name: {type: nvarchar(50)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        // `script` is not installed. Skipping beats failing a suite over a
+        // missing test fixture, and the conversation is covered by unit tests.
+        return;
+    };
+    let text = stdout(&out);
+    assert!(
+        text.contains("customer_name was renamed to full_name"),
+        "the likely rename must be offered first: {text}"
+    );
+    assert_eq!(code(&out), 0, "{text}");
+
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("full_name"), "{ids}");
+    // And the recorded answer must be a rename, not a drop-and-add: a tombstone
+    // here would mean the prompt wrote something other than what was chosen.
+    assert!(!ids.contains("tombstones"), "{ids}");
+}
+
+/// With no terminal — every CI run — the behaviour of SPEC 6.4 is unchanged, and
+/// `--no-input` must not change it either. The flag declines a prompt; it can
+/// never answer one (SPEC 14.3).
+#[test]
+fn without_a_terminal_nothing_is_asked_and_no_input_changes_nothing() {
+    let d = Demo::new("noinput");
+    d.table("table: dbo.t\ncolumns:\n  customer_name: {type: nvarchar(50)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
+
+    for args in [&["plan"][..], &["--no-input", "plan"][..]] {
+        let o = d.run(args);
+        assert_eq!(code(&o), FINDING, "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("pbps rename dbo.t.customer_name full_name"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.ids_path()).unwrap(),
+            before,
+            "{args:?}: an unanswered question must record nothing"
+        );
+    }
+}
+
+// ---- Phase 3.1: editor schemas, completions, man pages ----
+
+/// All three answer without a project. Requiring one would mean a user could
+/// not install completions until after they had succeeded at the thing
+/// completions are meant to help them do.
+#[test]
+fn the_integration_commands_need_no_project() {
+    let nowhere = std::env::temp_dir().join(format!("pbps-noproj-{}", std::process::id()));
+    std::fs::create_dir_all(&nowhere).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&nowhere)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let o = run(&["schema"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["title"], "pbps declaration");
+
+    let o = run(&["schema", "--kind", "config"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("dialect"), "{}", stdout(&o));
+
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let o = run(&["completions", shell]);
+        assert_eq!(code(&o), 0, "{shell}: {}", stderr(&o));
+        assert!(stdout(&o).contains("pbps"), "{shell}");
+    }
+
+    let man = nowhere.join("man");
+    let o = run(&["man", "--out", man.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // One page per command: a single page documenting all of them is the page
+    // nobody reads, and `man pbps-apply` is what an operator types.
+    assert!(man.join("pbps.1").exists());
+    assert!(man.join("pbps-apply.1").exists());
+    assert!(man.join("pbps-doctor.1").exists());
+
+    let _ = std::fs::remove_dir_all(&nowhere);
+}
+
+/// The schema exists to catch a typo before `validate` does, and that only
+/// works if it refuses what the loader refuses.
+#[test]
+fn the_declaration_schema_describes_what_the_loader_accepts() {
+    let d = Demo::new("schema");
+    let o = d.run(&["schema"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let table = &v["$defs"]["TableDto"];
+    assert_eq!(table["additionalProperties"], serde_json::json!(false));
+    // `columns` has no default in the loader, so the schema must require it —
+    // an editor that accepted a table with no columns would bless a file every
+    // later command fails on.
+    let required: Vec<&str> = table["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"table"), "{table}");
+    assert!(required.contains(&"columns"), "{table}");
+    // And the one-shot annotation must be describable, or an editor flags what
+    // the format documents.
+    assert!(table["properties"].get("renamed_from").is_some(), "{table}");
+    assert!(table["properties"].get("strategy").is_some(), "{table}");
+}
+
+// ---- Review follow-ups on the Phase 3.1 PR ----
+
+/// The command's one promise: a reviewer holding nothing but plan.json, in a
+/// directory with no project, still gets the whole of the file's answer. The
+/// plan names its own dialect, so there is nothing left to discover.
+#[test]
+fn explain_works_in_a_directory_with_no_project() {
+    let d = Demo::new("explainbare");
+    let plan = risky_plan(&d);
+
+    let elsewhere = std::env::temp_dir().join(format!("pbps-reviewer-{}", std::process::id()));
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&elsewhere)
+        .args(["explain", "--plan", plan.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("drop column pii"), "{}", stdout(&o));
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+/// The approval command has to survive being pasted. `apply` requires exactly
+/// one of --db / --env, so one printed without a target fails immediately —
+/// which would make the single most important line of the report the one that
+/// does not work.
+#[test]
+fn the_approval_command_explain_prints_carries_a_target() {
+    let d = Demo::new("approvecmd");
+    d.table(ONE_COLUMN);
+    // An applyable plan, since a preview has no approval command at all.
+    let plan = write_plan(&d, "target.json", "transactional");
+
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps apply"))
+        .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
+    assert!(line.contains("--plan"), "{line}");
+    // A redacted --db label is not a connection string and must never be
+    // printed as though it were; the placeholder is the honest form.
+    assert!(line.contains("--env <environment>"), "{line}");
+}
+
+/// A project with no environments is the shape a consumer meets first, and it
+/// must not be the one that arrives as a parse error (SPEC 9.8).
+#[test]
+fn status_json_stays_json_when_there_are_no_environments() {
+    let d = Demo::new("statusempty");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&["status", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "status");
+    assert_eq!(v["data"].as_array().unwrap().len(), 0);
+    assert_eq!(v["findings"][0]["id"], "project.no-environments");
+    // Still `ok`: status is a report, not a gate, and it always exits 0.
+    assert_eq!(v["result"], "ok");
+}
+
+/// The schema's whole justification is that it accepts exactly what the loader
+/// accepts. A module file names one kind; a file with none, or with two, is
+/// refused by `convert_module`, so the schema has to refuse it too or an editor
+/// blesses a declaration `validate` cannot load.
+#[test]
+fn the_module_schema_demands_exactly_one_kind() {
+    let d = Demo::new("moduleschema");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&["schema"]))).unwrap();
+    let branches = v["$defs"]["ModuleDto"]["oneOf"].as_array().unwrap();
+
+    assert_eq!(branches.len(), 4, "{v}");
+    for kind in ["view", "procedure", "function"] {
+        let branch = branches
+            .iter()
+            .find(|b| b["required"] == serde_json::json!([kind]))
+            .unwrap_or_else(|| panic!("no branch for {kind}: {v}"));
+        // The type is pinned as well as the presence: `required` is satisfied
+        // by an explicit null, which YAML writes as often as not (`view:` with
+        // nothing after it), and the loader reads that as absent.
+        assert_eq!(branch["properties"][kind]["type"], "string", "{branch}");
+        // `on:` names the table a trigger fires on, and the loader rejects it
+        // on everything else. Left optional here, the published schema blessed
+        // a view with one — a document `pbps validate` refuses.
+        assert_eq!(branch["properties"]["on"]["type"], "null", "{branch}");
+        // And the other three kind keys, or `oneOf` stops doing the work it was
+        // chosen for: with only `on:` constrained, `trigger` + `on` + `view`
+        // was disqualified from this branch and unconstrained in the trigger
+        // one, so it matched exactly one branch and was blessed.
+        for other in ["view", "procedure", "function", "trigger"] {
+            if other == kind {
+                continue;
+            }
+            assert_eq!(branch["properties"][other]["type"], "null", "{branch}");
+        }
+    }
+    // And the trigger branch requires it, which the loader also does: a trigger
+    // that does not say which table it is on is refused.
+    let trigger = branches
+        .iter()
+        .find(|b| b["required"] == serde_json::json!(["trigger", "on"]))
+        .unwrap_or_else(|| panic!("no trigger branch requiring `on`: {v}"));
+    assert_eq!(
+        trigger["properties"]["trigger"]["type"], "string",
+        "{trigger}"
+    );
+    assert_eq!(trigger["properties"]["on"]["type"], "string", "{trigger}");
+    for other in ["view", "procedure", "function"] {
+        assert_eq!(trigger["properties"][other]["type"], "null", "{trigger}");
+    }
+}
+
+/// The hole the `on:` constraint opened, and the reason every branch has to
+/// name the other kinds: `trigger` + `on` + `view` is disqualified from the
+/// view branch by `on`, so with the trigger branch saying nothing about `view`
+/// it matched exactly one branch — which is what `oneOf` calls valid.
+/// `convert_module` refuses it, so an editor was blessing a file `pbps
+/// validate` rejects.
+#[test]
+fn the_module_schema_refuses_a_second_kind_beside_a_trigger() {
+    let d = Demo::new("modulekinds");
+    d.table(ONE_COLUMN);
+
+    for body in [
+        "trigger: dbo.tr\non: dbo.t\nview: dbo.v\ndefinition: |-\n  AFTER INSERT AS SELECT 1\n",
+        "view: dbo.v\ntrigger: dbo.tr\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    ] {
+        d.module("dbo.two.yml", body);
+        let o = d.run(&["validate"]);
+        assert_eq!(code(&o), 2, "{body}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("2 objects at once"),
+            "{body}: {}",
+            stderr(&o)
+        );
+    }
+}
+
+/// The other direction, and why the exclusions are `{"type": "null"}` rather
+/// than `false`: YAML writes `procedure:` with nothing after it, serde reads
+/// that as absent, and the loader accepts the file. `false` would have made the
+/// schema stricter than the tool — a smaller failure than blessing what the
+/// tool refuses, but the same disagreement.
+#[test]
+fn an_empty_kind_key_is_absent_to_both_the_loader_and_the_schema() {
+    let d = Demo::new("modulenullkey");
+    d.table(ONE_COLUMN);
+
+    for body in [
+        "view: dbo.v\nprocedure:\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        "view: dbo.v\non:\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        "trigger: dbo.tr\non: dbo.t\nview:\ndefinition: |-\n  AFTER INSERT AS SELECT 1\n",
+    ] {
+        d.module("dbo.one.yml", body);
+        let o = d.run(&["validate"]);
+        assert_eq!(code(&o), 0, "{body}: {}", stderr(&o));
+    }
+}
+
+// ---- Second review round ----
+
+/// One blocker is not one question. A table that lost two columns and gained
+/// two arrives as a single `AmbiguousColumns` holding all four names, so
+/// answering it once leaves the other pair ambiguous — and before the prompt
+/// looped, the answer already given was discarded as well, which made a
+/// two-column rename impossible to complete interactively.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_prompt_keeps_asking_until_every_ambiguity_is_answered() {
+    let d = Demo::new("multiprompt");
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  customer_name: {type: nvarchar(50)}\n",
+        "  customer_zip: {type: nvarchar(10)}\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  full_name: {type: nvarchar(50)}\n",
+        "  postcode: {type: nvarchar(10)}\n"
+    ));
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            // The likeliest pairing is offered first each round, so "1" twice
+            // is the ordinary answer to "yes, both of these".
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n1\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        return; // `script` is not installed; the conversation is unit-tested.
+    };
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(
+        text.contains("rename column customer_name -> full_name"),
+        "{text}"
+    );
+    assert!(
+        text.contains("rename column customer_zip -> postcode"),
+        "{text}"
+    );
+
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(
+        ids.contains("full_name") && ids.contains("postcode"),
+        "{ids}"
+    );
+    assert!(!ids.contains("tombstones"), "neither was a drop: {ids}");
+}
+
+/// Stopping part-way through must still record nothing, now that the loop
+/// carries answers between rounds. A half-answered ambiguity written to the ids
+/// file would be a decision the user never finished making.
+#[cfg(target_os = "linux")]
+#[test]
+fn stopping_part_way_through_the_loop_still_records_nothing() {
+    let d = Demo::new("multistop");
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  customer_name: {type: nvarchar(50)}\n",
+        "  customer_zip: {type: nvarchar(10)}\n"
+    ));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  full_name: {type: nvarchar(50)}\n",
+        "  postcode: {type: nvarchar(10)}\n"
+    ));
+
+    let out = Command::new("script")
+        .args([
+            "-qec",
+            &format!("{BIN} --project {} plan", d.dir.display()),
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            // Answer the first, then decline the second.
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin was piped")
+                .write_all(b"1\n\n")?;
+            child.wait_with_output()
+        });
+    let Ok(out) = out else {
+        return;
+    };
+    assert_eq!(code(&out), FINDING, "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(d.ids_path()).unwrap(),
+        before,
+        "an unfinished answer must record nothing"
+    );
+    // And the commands cover the *whole* original problem, not just the part
+    // the user had not reached. Nothing was recorded, so they are back where
+    // they started; a list omitting the question they did answer would send
+    // them to fix half of it.
+    let text = stdout(&out);
+    assert!(text.contains("pbps rename dbo.t.customer_name"), "{text}");
+    assert!(text.contains("pbps rename dbo.t.customer_zip"), "{text}");
+}
+
+// ---- Third review round ----
+
+/// An offline plan cannot be applied at all — `apply` refuses a `Preview`
+/// structurally, whatever target and whatever `--allow` (SPEC 7.3). Printing an
+/// apply command anyway had the report contradict its own first line and hand
+/// the reviewer something that cannot work.
+#[test]
+fn explain_offers_no_apply_command_for_a_preview() {
+    let d = Demo::new("previewcmd");
+    let plan = risky_plan(&d);
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+
+    assert!(!out.contains("pbps apply"), "{out}");
+    assert!(out.contains("This plan cannot be applied"), "{out}");
+    // And it says what to do instead, or the reviewer is left with a refusal
+    // and no next step.
+    assert!(out.contains("pbps plan --env"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["applyable"], false);
+    assert!(
+        !v["data"]["approve_with"]
+            .as_str()
+            .unwrap()
+            .contains("apply"),
+        "{v}"
+    );
+}
+
+/// The command is advertised as copy-pastable, so a plan under a path with a
+/// space in it has to survive the paste rather than arrive at `apply` as two
+/// arguments.
+///
+/// Only the space case is asserted end to end. Which *other* characters are
+/// quoted is pinned by `explain`'s own unit tests, on values chosen rather than
+/// inherited: an assertion that a plain path stays unquoted would depend on the
+/// shape of the ambient temp directory, and on Windows that is
+/// `C:\Users\RUNNER~1\...` — which is how the tilde rule was found in the first
+/// place, one CI cycle too late.
+#[test]
+fn the_approval_command_quotes_a_path_a_shell_would_split() {
+    let d = Demo::new("quotedpath");
+    risky_plan(&d);
+    let dir = d.dir.join("release plans");
+    std::fs::create_dir_all(&dir).unwrap();
+    let plan = dir.join("plan.json");
+    std::fs::copy(d.dir.join("plan.json"), &plan).unwrap();
+
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps "))
+        .unwrap_or_else(|| panic!("no command in:\n{out}"));
+    assert!(line.contains('"'), "the path must be quoted: {line}");
+    assert!(line.contains("release plans"), "{line}");
+}
+
+/// `doctor` asks "is this environment ready", and for an unreachable target it
+/// did not answer that question — it could not look. That is exit 1, not 2, or
+/// a pipeline routes a firewall to the author of the schema change (SPEC 9.8).
+#[test]
+fn doctor_exits_one_when_it_could_not_look_and_two_when_it_looked() {
+    let d = Demo::new("doctorexit");
+    // Could not look: the variable naming the connection string is not set.
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_EXIT_UNSET\n",
+    )
+    .unwrap();
+    let o = d.run(&["doctor"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    // The finding is still in the report; only the exit code differs.
+    assert!(stdout(&o).contains("unconfigured"), "{}", stdout(&o));
+
+    // Looked, and found something: a declaration the dialect rejects, with no
+    // environments to be unreachable.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+    assert_eq!(code(&d.run(&["doctor"])), FINDING);
+}
+
+// ---- Fourth review round ----
+
+/// `plan --check` is the command CI runs, so its findings have to reach the
+/// annotator like every other read-only command's (SPEC 9.8). Without
+/// `--format json` here, missing intent and a stale identity file were the two
+/// findings a pipeline could not consume.
+#[test]
+fn plan_check_speaks_json_like_every_other_read_only_command() {
+    let d = Demo::new("planjson");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // A stale identity file.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["findings"][0]["id"], "identity.stale");
+    assert_eq!(v["findings"][0]["remedy"], "pbps plan");
+
+    // And missing intent, which is the other thing --check exists to catch.
+    d.table("table: dbo.t\ncolumns:\n  ident: {type: bigint, nullable: false}\n");
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "identity.ambiguous-columns");
+    assert!(
+        v["findings"][0]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("pbps rename dbo.t.id ident"),
+        "the copy-pastable command must survive into JSON: {v}"
+    );
+}
+
+/// A clean plan still produces the envelope, with the shape of the change set
+/// as data — a consumer that only ever sees JSON when something is wrong cannot
+/// tell "clean" from "did not run".
+#[test]
+fn plan_json_of_a_clean_run_carries_the_change_summary() {
+    let d = Demo::new("planjsonok");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["data"]["changes"], 1);
+    assert_eq!(v["data"]["tables"], 1);
+    // The empty baseline is a warning, not silence: everything reading as newly
+    // created is the one thing most easily mistaken for a real plan.
+    assert_eq!(v["findings"][0]["id"], "baseline.empty");
+}
+
+/// `baseline`, `apply` and `unlock` each require exactly one of --db / --env, so
+/// a per-environment remedy without one is a command that fails when pasted —
+/// and these are aimed at whoever is meeting the environment for the first time.
+#[test]
+fn every_per_environment_remedy_names_its_environment() {
+    let d = Demo::new("remedyenv");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_REMEDY_UNSET\n",
+    )
+    .unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    for f in v["findings"].as_array().unwrap() {
+        let Some(remedy) = f["remedy"].as_str() else {
+            continue;
+        };
+        if !remedy.starts_with("pbps ") && !remedy.contains(": pbps ") {
+            continue;
+        }
+        // Every pbps command named in a per-environment remedy needs a target.
+        if ["baseline", "apply", "unlock"]
+            .iter()
+            .any(|c| remedy.contains(&format!("pbps {c}")))
+        {
+            assert!(remedy.contains("--env "), "{remedy}");
+        }
+    }
+}
+
+// ---- Fifth review round ----
+
+/// The envelope's `result` is what `scripts/findings-to-github.py` maps to its
+/// own exit code — a pipe loses the producer's status. Two values could not
+/// express "could not answer", so the converter turned `doctor`'s exit 1 into a
+/// 2 and routed an unreachable database to the author of the schema change.
+#[test]
+fn the_envelope_result_matches_the_exit_code_the_command_used() {
+    let d = Demo::new("resultcode");
+    d.table(ONE_COLUMN);
+
+    // Could not answer.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_RESULT_UNSET\n",
+    )
+    .unwrap();
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "unanswerable");
+
+    // Answered, and found something.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  id: {type: jsonb}\n");
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "findings");
+
+    // Answered, nothing to act on.
+    d.table(ONE_COLUMN);
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "ok");
+}
+
+/// `fmt` on a file it cannot parse has not decided whether that file is
+/// canonical — it never got to look. The findings are the parse errors; the
+/// routing is "the tool could not run".
+#[test]
+fn fmt_on_an_unparseable_file_is_unanswerable_not_a_finding() {
+    let d = Demo::new("fmtunparseable");
+    d.table("table: dbo.t\ncolumns: [this is not a mapping\n");
+
+    let o = d.run(&["fmt", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "unanswerable");
+    assert!(
+        v["findings"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("load."),
+        "{v}"
+    );
+}
+
+// ---- Sixth review round ----
+
+/// Everything in `plan` can fail before it reaches the point of serializing,
+/// and a failure that escaped early printed prose to stderr and nothing to
+/// stdout — so a consumer asking for JSON got "pbps produced no output" instead
+/// of the typed findings it was owed.
+#[test]
+fn plan_json_emits_an_envelope_even_when_the_declarations_do_not_load() {
+    let d = Demo::new("planearly");
+    d.table("table: dbo.t\ncolumns: [unclosed\n");
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    // Exit 1 in both formats: `plan`'s question is "what changes", and with
+    // declarations it cannot read it did not answer that. `validate` is the
+    // command whose question *is* validity, and there the same errors are a
+    // finding.
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "load.yaml");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("dbo.t.yml"),
+        "{v}"
+    );
+    // The human format still says the same thing, the same way it always did.
+    assert_eq!(code(&d.run(&["plan", "--check"])), 1);
+}
+
+/// Choosing an output format must not disable a check the project asked for.
+/// With `dev:` configured, JSON mode skipped `dev::rehearse` entirely, so a
+/// plan that does not converge came back `result: "ok"`.
+///
+/// Live, because a rehearsal without an engine is not a rehearsal.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_rehearsal_still_runs_when_the_output_is_json() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("rehearsejson");
+    // A check constraint the engine stores in its own spelling: the difference
+    // only exists once a real engine has written it back.
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "checks:\n",
+        "  ck_pos: \"id > 0\"\n"
+    ));
+
+    let o = d.run(&["plan", "--dev", &connection, "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"rehearsal.spelling"),
+        "the rehearsal must reach the envelope, not be skipped: {v}"
+    );
+    // stdout stays one JSON document: the rehearsal's own multi-line report
+    // would corrupt it.
+    assert!(!stdout(&o).contains("Dev rehearsal:"), "{}", stdout(&o));
+}
+
+// ---- Seventh review round ----
+
+/// `apply` refuses a plan whose version this build does not understand, and
+/// `explain` must refuse it too. A newer plan may carry semantics this binary
+/// has no idea about — explaining it would show a reviewer an incomplete
+/// account of what they are approving, and an approval command for an artifact
+/// `apply` will reject anyway.
+#[test]
+fn explain_refuses_a_plan_version_it_does_not_understand() {
+    let d = Demo::new("planversion");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "future.json", "transactional");
+
+    // The same plan, one version ahead.
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    let bumped = raw.replace("\"version\": 2", "\"version\": 3");
+    assert_ne!(raw, bumped, "the fixture must carry a version to bump");
+    std::fs::write(&plan, bumped).unwrap();
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("version 3"), "{}", stderr(&o));
+    assert!(
+        !stdout(&o).contains("pbps apply"),
+        "a plan this build cannot read must not come with an approval command: {}",
+        stdout(&o)
+    );
+}
+
+/// The one-envelope contract holds for the failures too. A missing or malformed
+/// plan left stdout empty, so the converter reported its own generic "produced
+/// no output" instead of a report naming the bad file.
+#[test]
+fn explain_json_emits_an_envelope_when_the_plan_cannot_be_read() {
+    let d = Demo::new("explainbadplan");
+    d.table(ONE_COLUMN);
+
+    for plan in ["nowhere.json", "junk.json"] {
+        if plan == "junk.json" {
+            std::fs::write(d.dir.join(plan), "{\"nope\": 1}").unwrap();
+        }
+        let path = d.dir.join(plan);
+        let o = d.run(&[
+            "explain",
+            "--plan",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&o), 1, "{plan}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{plan}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "explain");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "plan.unreadable");
+    }
+}
+
+// ---- Eighth review round ----
+
+/// `Change::table()` returns a module's own name for a module change, so
+/// counting its distinct values called a one-view plan "1 table". Modules are a
+/// different kind of object (ADR-0002) and are counted apart.
+#[test]
+fn a_plan_of_modules_is_not_reported_as_a_plan_of_tables() {
+    let d = Demo::new("modulecount");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.module("v.yml", A_VIEW);
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("1 module(s)"), "{out}");
+    assert!(!out.contains("1 table(s)"), "a view is not a table: {out}");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["plan", "--format", "json"]))).unwrap();
+    assert_eq!(v["data"]["modules"], 1, "{v}");
+    assert_eq!(v["data"]["tables"], 0, "{v}");
+}
+
+/// And a plan touching both says both, rather than folding one into the other's
+/// count.
+#[test]
+fn a_plan_touching_tables_and_modules_counts_them_separately() {
+    let d = Demo::new("bothcount");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+    d.module("v.yml", A_VIEW);
+
+    let out = stdout(&d.run(&["plan"]));
+    assert!(out.contains("1 table(s) and 1 module(s)"), "{out}");
+}
+
+/// `verify` could not answer, so it must say so through the envelope like every
+/// other read-only command — not leave stdout empty for the converter to
+/// report as its own generic failure.
+#[test]
+fn verify_json_emits_an_envelope_when_it_cannot_connect() {
+    let d = Demo::new("verifyjson");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&[
+        "verify",
+        "--db",
+        "Server=127.0.0.1,1;Database=nope;User Id=u;Password=p;TrustServerCertificate=true",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "environment.unreachable");
+    // And still no connection string anywhere in it.
+    assert!(!stdout(&o).contains("Password"), "{}", stdout(&o));
+}
+
+/// `explain --db` must not call a target ready while an apply holds the lock.
+/// During an ordinary transactional apply the newest ledger entry is a
+/// completed snapshot, so reading `latest` alone reports `ready` — and hands
+/// the reviewer an approval command for an environment that is changing
+/// underneath them.
+///
+/// Live, because only a real ledger can hold a real lock.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn explain_reports_a_locked_target_rather_than_a_ready_one() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("explainlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let plan = write_plan(&d, "target.json", "transactional");
+
+    // A ledger with an ordinary completed entry, and a lock held on top of it.
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    let held = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &connection,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&held), 0, "{}", stderr(&held));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&held)).unwrap();
+    // With no apply running the target is ready; that is the control.
+    assert_eq!(v["data"]["target"]["state"], "ready", "{v}");
+
+    // Now take the lock the way an apply does, and ask again.
+    d.git(&["init", "-q"]);
+    let locked = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "pbps-test-mssql",
+            "/opt/mssql-tools18/bin/sqlcmd",
+            "-C",
+            "-S",
+            "localhost",
+            "-U",
+            "sa",
+            "-P",
+            "Pbps!Test12345",
+            "-Q",
+            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+        ])
+        .output();
+    if locked.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container; the control above already ran.
+    }
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &connection,
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let _ = d.run(&["unlock", "--db", &connection]);
+
+    assert_eq!(v["data"]["target"]["state"], "locked", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "target.not-ready"),
+        "{v}"
+    );
+}
+
+// ---- Ninth review round ----
+
+/// The identity file escaped serialization the same way the declarations did,
+/// one line below the fix for them.
+#[test]
+fn plan_json_emits_an_envelope_when_the_identity_file_is_unreadable() {
+    let d = Demo::new("planids");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.ids_path(), "{ this is not json").unwrap();
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "identity.unreadable");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("schema.ids.json"),
+        "{v}"
+    );
+}
+
+/// `doctor` answers "can I deploy from here", and while the lock is held an
+/// apply is refused — so a readiness check that passed would be answering a
+/// different question than the one it was asked.
+///
+/// Live, because only a real ledger can hold a real lock.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_does_not_report_ready_while_the_lock_is_held() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctorlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    let taken = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "pbps-test-mssql",
+            "/opt/mssql-tools18/bin/sqlcmd",
+            "-C",
+            "-S",
+            "localhost",
+            "-U",
+            "sa",
+            "-P",
+            "Pbps!Test12345",
+            "-Q",
+            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+        ])
+        .output();
+    if taken.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+
+    let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let _ = d.run(&["unlock", "--db", &connection]);
+
+    assert_eq!(
+        v["result"], "findings",
+        "a held lock is not a clean report: {v}"
+    );
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let locked = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.locked")
+        .unwrap_or_else(|| panic!("no state.locked finding: {v}"));
+    assert_eq!(locked["severity"], "error", "{v}");
+    // It found this by looking, so it is a finding (exit 2), not unanswerable.
+    assert!(
+        locked["remedy"].as_str().unwrap().contains("pbps unlock"),
+        "{v}"
+    );
+}
+
+// ---- Tenth review round ----
+
+/// A path no shell-quoting can carry across POSIX shells, PowerShell and `cmd`
+/// alike is printed on a line of its own instead of being guessed at. `cmd`
+/// does not treat `'` as quoting, so `&` in a single-quoted path splits the
+/// command there — the opposite of the "fails safe" it was claimed to be.
+#[test]
+fn an_unquotable_plan_path_is_shown_rather_than_inlined() {
+    let d = Demo::new("unquotable");
+    risky_plan(&d);
+    let dir = d.dir.join("a&b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let plan = dir.join("plan.json");
+    std::fs::copy(d.dir.join("plan.json"), &plan).unwrap();
+
+    let out = stdout(&d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    let command = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps "))
+        .unwrap_or_else(|| panic!("no command in:\n{out}"));
+    assert!(command.contains("<plan path>"), "{command}");
+    assert!(
+        !command.contains("a&b"),
+        "the path must not be inlined at all: {command}"
+    );
+    // And it is shown, so the reviewer can still act on it.
+    assert!(out.contains("<plan path> is:"), "{out}");
+    assert!(out.contains("a&b"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert!(
+        v["data"]["plan_path"].as_str().unwrap().contains("a&b"),
+        "{v}"
+    );
+}
+
+/// A plan naming an engine this build has no dialect for is one it cannot
+/// explain, and the one-envelope contract covers that failure like the others.
+#[test]
+fn explain_json_emits_an_envelope_for_a_dialect_it_cannot_explain() {
+    let d = Demo::new("explaindialect");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "pg.json", "transactional");
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    std::fs::write(&plan, raw.replace("\"mssql\"", "\"postgres\"")).unwrap();
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "plan.unsupported-dialect");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("postgres"),
+        "the message must name the engine: {v}"
+    );
+}
+
+/// An unset `url_env` variable is the commonest first-run problem, and `doctor`
+/// has a diagnosis for it. Failing at `target.resolve` instead made the
+/// single-environment path — the one a person onboarding actually types — the
+/// one that answered worst.
+#[test]
+fn doctor_env_diagnoses_an_unset_variable_rather_than_failing_at_resolution() {
+    let d = Demo::new("doctorenvunset");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_DOCTOR_ENV_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["doctor", "--env", "prod", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["data"]["environments"][0]["environment"], "prod");
+    assert_eq!(v["data"]["environments"][0]["state"], "unconfigured");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "environment.unconfigured"
+                && f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PBPS_DOCTOR_ENV_UNSET")),
+        "{v}"
+    );
+    // The project half of the report still ran.
+    assert_eq!(v["data"]["tables"], 1, "{v}");
+}
+
+/// A database pbps has never touched must come back `uninitialized`, not
+/// `unreachable`. This regressed once — the lock check was added ahead of the
+/// initialization check, and `lock_holder` selects from a `__pbps_lock` that a
+/// virgin database does not have — so it is pinned against a real server.
+///
+/// `tempdb` is the target: it always exists, holds none of pbps's tables, and
+/// nothing here writes to it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn explain_calls_a_never_initialized_database_uninitialized() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    // Point the same server at a database pbps has never initialized.
+    let virgin = if connection.to_lowercase().contains("database=") {
+        connection
+            .split(';')
+            .map(|p| {
+                if p.to_lowercase().starts_with("database=") {
+                    "Database=tempdb".to_owned()
+                } else {
+                    p.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    } else {
+        format!("{connection};Database=tempdb")
+    };
+
+    let d = Demo::new("explainvirgin");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "target.json", "transactional");
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        &virgin,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["data"]["target"]["state"], "uninitialized",
+        "a reachable database pbps has never touched is not unreachable: {v}"
+    );
+}
+
+// ---- Self-review: the same pattern, a third time ----
+
+/// Found by sweeping this branch for the shape the review kept catching — an
+/// error read as good news. `server_version` and `edition` were `.ok()` and
+/// `if let Ok`, so a server whose version could not be read never had the
+/// 2016-SP1 `CREATE OR ALTER` gate applied, and `doctor` could still say
+/// `ready` for a server that would reject every module statement in the plan.
+///
+/// The live counterpart is the control: against a real server the capabilities
+/// *are* read, so no such finding appears and the fields are populated.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_reports_server_capabilities_or_says_it_could_not_read_them() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let d = Demo::new("doctorcaps");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+
+    // Read successfully, so both capability answers are present and the
+    // "undetermined" finding is absent. An empty `supports_create_or_alter`
+    // must never be able to pass for "fine".
+    assert!(env["supports_create_or_alter"].is_boolean(), "{v}");
+    assert!(env["supports_online"].is_boolean(), "{v}");
+    assert!(env.get("server_capabilities_unknown").is_none(), "{v}");
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "server.capabilities-unknown"),
+        "{v}"
+    );
+}
+
+// ---- Eleventh review round ----
+
+/// `postgres` is an accepted `DialectName` with no implementation yet, so this
+/// is a reachable failure on a perfectly valid project — and it escaped before
+/// the JSON branch, leaving stdout empty.
+#[test]
+fn validate_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("validatedialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("pbps.yml"),
+        "{v}"
+    );
+}
+
+/// The file half of an explanation is the whole point of the command, and
+/// `target_state` already degrades an unreachable database to one line in the
+/// report. An unset `url_env` variable must not do worse than an unplugged
+/// network cable — it did, suppressing the entire explanation.
+#[test]
+fn explain_still_explains_when_the_environment_variable_is_unset() {
+    let d = Demo::new("explainunset");
+    let plan = risky_plan(&d);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_EXPLAIN_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["explain", "--plan", plan.to_str().unwrap(), "--env", "prod"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    // The explanation is all there.
+    assert!(out.contains("drop column pii"), "{out}");
+    assert!(out.contains("data is lost"), "{out}");
+    // And the target is reported as what it is, not silently omitted.
+    assert!(out.contains("unconfigured"), "{out}");
+    assert!(out.contains("PBPS_EXPLAIN_UNSET"), "{out}");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--env",
+        "prod",
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(v["data"]["target"]["state"], "unconfigured", "{v}");
+    assert_eq!(v["data"]["change_count"], 2, "{v}");
+}
+
+/// Environment names are YAML map keys, so `US West` is a valid one — and
+/// interpolated verbatim into a copy-pastable remedy it becomes two arguments.
+#[test]
+fn a_remedy_quotes_an_environment_name_a_shell_would_split() {
+    let d = Demo::new("remedyquote");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  \"US West\":\n    url_env: PBPS_REMEDY_QUOTE_UNSET\n",
+    )
+    .unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["doctor", "--format", "json"]))).unwrap();
+    for f in v["findings"].as_array().unwrap() {
+        let Some(remedy) = f["remedy"].as_str() else {
+            continue;
+        };
+        if !remedy.contains("--env ") {
+            continue;
+        }
+        assert!(
+            remedy.contains("--env \"US West\""),
+            "an environment name a shell would split must be quoted: {remedy}"
+        );
+    }
+}
+
+// ---- The sweep: every fallible step before a JSON branch ----
+//
+// The findings above arrived one command at a time, each one an error escaping
+// through `?` before its command reached the envelope. Rather than wait for the
+// rest to be reported, `output::or_unanswerable` was introduced and every such
+// step in every read-only command routed through it. These are the sites that
+// sweep found; they are grouped because they are one bug, not four.
+
+/// `doctor`'s first act is selecting the dialect, so a project pbps.yml the
+/// tool cannot serve left stdout empty for the one command whose entire job is
+/// to say what is wrong with the project.
+#[test]
+fn doctor_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("doctordialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["doctor", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "doctor");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// `verify` exits 2 on drift and 1 when it could not look (decision 25), and a
+/// scheduled drift-watch tells them apart from the envelope. Refusing the
+/// dialect without one made that scheduled job read "no output" instead.
+#[test]
+fn verify_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("verifydialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["verify", "--db", "Server=x;Database=y", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// Resolving the target happens in the dispatcher, before the command body, so
+/// an unset `url_env` — the commonest first-run failure — escaped even though
+/// the body itself was careful.
+#[test]
+fn verify_json_emits_an_envelope_when_the_environment_variable_is_unset() {
+    let d = Demo::new("verifyunset");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  prod:\n    url_env: PBPS_VERIFY_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["verify", "--env", "prod", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "verify");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "environment.unconfigured");
+}
+
+/// `status` always exits 0 when it can report (decision 25), which is exactly
+/// why the case where it cannot has to be visible in the envelope rather than
+/// inferred from an empty stdout.
+#[test]
+fn status_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("statusdialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  prod:\n    url_env: PBPS_STATUS_UNSET\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["status", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "status");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+/// Listing the declarations is the step before `fmt` has anything at all to
+/// say. A declarations path that is not a directory is a misconfigured
+/// `pbps.yml`, not a formatting finding — but it still has to arrive as one.
+#[test]
+fn fmt_json_emits_an_envelope_when_the_declarations_cannot_be_listed() {
+    let d = Demo::new("fmtunlistable");
+    // A file where the schema directory should be: the listing fails for a
+    // reason the user can act on, which is the case worth reporting. Permission
+    // bits would not do — the test suite may run as root.
+    std::fs::remove_dir_all(d.dir.join("schema")).unwrap();
+    std::fs::write(d.dir.join("schema"), "not a directory\n").unwrap();
+
+    let o = d.run(&["fmt", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "fmt");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "load.io");
+}
+
+// ---- Twelfth review round ----
+
+/// The site the sweep above missed. `plan`'s dialect step is a bare `dialect(`
+/// call in the same module, not `crate::dialect`, so the grep that found the
+/// other seven walked past it — which is the argument for the wrapper being at
+/// the call site rather than for being better at grepping.
+#[test]
+fn plan_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
+    let d = Demo::new("plandialect");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable");
+    assert_eq!(v["findings"][0]["id"], "project.unsupported-dialect");
+}
+
+// ---- Fourteenth review round ----
+
+/// The last upstream site in the escaping-`?` pattern, and the only one no
+/// command body could have caught: project discovery runs before dispatch. Its
+/// failure is also the very first one a new user meets.
+#[test]
+fn every_json_command_emits_an_envelope_when_the_project_cannot_be_discovered() {
+    let d = Demo::new("nodiscovery");
+    // A directory that is not a project and has no project above it: `pbps.yml`
+    // is removed and the search must not escape into the repository this test
+    // suite itself lives in.
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+
+    for command in [
+        vec!["validate"],
+        vec!["plan", "--check"],
+        vec!["fmt", "--check"],
+        vec!["doctor"],
+        vec!["status"],
+    ] {
+        let mut args = command.clone();
+        args.extend(["--format", "json"]);
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{command:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{command:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], command[0], "{v}");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "project.undiscoverable", "{v}");
+    }
+}
+
+/// The negative half: a command that speaks no envelope must not grow one, and
+/// the human format must stay human. A JSON envelope on stdout where a script
+/// expects a rendered document would be a new bug, not a fix.
+#[test]
+fn a_command_without_an_envelope_does_not_gain_one_from_the_discovery_wrapper() {
+    let d = Demo::new("nodiscoveryhuman");
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+
+    for args in [vec!["validate"], vec!["docs"], vec!["unlock", "--env", "x"]] {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}");
+        assert!(
+            !stdout(&o).trim_start().starts_with('{'),
+            "{args:?} printed an envelope on stdout: {}",
+            stdout(&o)
+        );
+    }
+}
+
+/// A change the differ cannot express is a *reachable* planning failure — it
+/// needs only a declaration that adds IDENTITY to an existing column (decision
+/// 5: it cannot be done with ALTER) — and it left `plan --format json` printing
+/// prose on stderr and nothing on stdout.
+///
+/// Each unexpressible change becomes its own finding rather than one collapsed
+/// message: the differ hands back one error per change, and the column name in
+/// it is the entire remedy.
+#[test]
+fn plan_json_emits_an_envelope_when_a_change_cannot_be_expressed() {
+    let d = Demo::new("unexpressible");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The same column, now IDENTITY: a change ALTER cannot make.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+
+    let o = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "change.unexpressible", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("IDENTITY")),
+        "the message must name what cannot be done: {v}"
+    );
+}
+
+// ---- Sixteenth review round ----
+
+/// A plan that reads and deserializes perfectly can still carry a typed change
+/// the emitter refuses — a `create_table` whose table has no columns. That is a
+/// third, later failure than the two `cmd_explain` already handled, and it left
+/// the reviewer's own command printing nothing at all.
+#[test]
+fn explain_json_emits_an_envelope_when_a_plan_cannot_be_rendered() {
+    let d = Demo::new("explainunrenderable");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    assert_eq!(code(&d.run(&["plan", "--out", plan.to_str().unwrap()])), 0);
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    // Empty the created table's columns. The plan stays a structurally valid,
+    // current-version plan that deserializes cleanly — which is the point: the
+    // two earlier guards both pass, and only the emitter can refuse it.
+    let changes = v["changes"]["changes"].as_array_mut().unwrap();
+    let target = changes
+        .iter_mut()
+        .find(|c| c["op"] == "create_table")
+        .expect("the plan should create a table");
+    target["table"]["columns"] = serde_json::json!({});
+    let broken = d.dir.join("broken.json");
+    std::fs::write(&broken, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        broken.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    // Specifically the *third* guard, not one of the two that already existed:
+    // a plan.unreadable here would mean the fixture is broken in a way that
+    // never reaches the emitter, and the test would pass without testing this.
+    assert_eq!(v["findings"][0]["id"], "plan.unexplainable", "{v}");
+}
+
+// ---- Seventeenth review round ----
+
+/// A `--base` that is missing, malformed or of an unsupported version is a
+/// failure of the *input*: the command never got as far as comparing anything.
+/// It escaped before the JSON branch, so an offline `plan` in CI printed
+/// nothing at all for the commonest way of pointing it at the wrong file.
+#[test]
+fn plan_json_emits_an_envelope_when_the_baseline_cannot_be_read() {
+    let d = Demo::new("planbadbase");
+    d.table(ONE_COLUMN);
+    // The identity check runs first, so the project has to be settled or the
+    // test would pass on a `identity.stale` finding instead — a different
+    // envelope, from a different guard.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    for base in ["nowhere.json", "junk.json"] {
+        if base == "junk.json" {
+            std::fs::write(d.dir.join(base), "not a state snapshot").unwrap();
+        }
+        let path = d.dir.join(base);
+        let o = d.run(&[
+            "plan",
+            "--check",
+            "--base",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&o), 1, "{base}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{base}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "baseline.unreadable", "{v}");
+    }
+}
+
+// ---- Eighteenth review round ----
+
+/// `explain`'s file half is the whole point of the command: the reviewer may
+/// have been handed nothing but the plan. `--env` needs a project to resolve
+/// the *name*, but that is a fact about the environment, not about the
+/// explanation — and discovery failing suppressed the entire report.
+#[test]
+fn explain_still_explains_with_an_env_outside_a_project() {
+    let d = Demo::new("explainnoproject");
+    let plan = risky_plan(&d);
+    let elsewhere = d.root.join("no-project");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&elsewhere)
+        .args(["explain", "--plan", plan.to_str().unwrap(), "--env", "prod"])
+        .output()
+        .unwrap();
+    // Still exit 0: explaining a plan is not a gate, whatever the target did.
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("dbo.customer"),
+        "the plan must still be explained: {out}"
+    );
+    assert!(
+        out.contains("prod"),
+        "the environment must still be named, as unresolved: {out}"
+    );
+}
+
+/// The artifact is the deliverable, so a `--out` that cannot be written is a
+/// failure of the whole command — and it escaped before the JSON branch. A
+/// missing parent directory is the ordinary way this happens in CI.
+#[test]
+fn plan_json_emits_an_envelope_when_the_artifact_cannot_be_written() {
+    let d = Demo::new("planunwritable");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let nowhere = d.dir.join("no/such/dir/plan.json");
+    for flag in ["--out", "--sql"] {
+        let o = d.run(&["plan", flag, nowhere.to_str().unwrap(), "--format", "json"]);
+        assert_eq!(code(&o), 1, "{flag}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{flag}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "plan.unwritable", "{v}");
+    }
+}
+
+/// The three-way exit-code split is the feature (SPEC §9.8), and this is the
+/// case that most needs it to be right: the database *was* reached and a
+/// difference *was* established — the differ simply has no `Change` for it —
+/// so it is drift, not "could not look". Folding it into the connection
+/// catch-all reported `environment.unreachable` and exited 1, waking whoever
+/// owns CI instead of whoever owns the schema.
+///
+/// Only a real engine can produce this: `IDENTITY` is a property no `ALTER`
+/// can change, so it needs a table that really has one and really loses it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let sqlcmd = |query: &str| {
+        std::process::Command::new("docker")
+            .args([
+                "exec",
+                "pbps-test-mssql",
+                "/opt/mssql-tools18/bin/sqlcmd",
+                "-C",
+                "-S",
+                "localhost",
+                "-U",
+                "sa",
+                "-P",
+                "Pbps!Test12345",
+                "-Q",
+                query,
+            ])
+            .output()
+    };
+
+    let d = Demo::new("verifyidentity");
+    d.table("table: dbo.ident_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let made = sqlcmd(
+        "IF OBJECT_ID(N'dbo.ident_drift', N'U') IS NOT NULL DROP TABLE dbo.ident_drift; \
+         CREATE TABLE dbo.ident_drift (id bigint IDENTITY(1,1) NOT NULL);",
+    );
+    if made.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+    // Records the live state, which has the IDENTITY, as the baseline.
+    assert_eq!(
+        code(&d.run(&["snapshot", "--db", &connection, "--force"])),
+        0
+    );
+    // The same table without it. No ALTER can do this, which is the point.
+    let _ =
+        sqlcmd("DROP TABLE dbo.ident_drift; CREATE TABLE dbo.ident_drift (id bigint NOT NULL);");
+
+    let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let _ = sqlcmd("DROP TABLE dbo.ident_drift;");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(
+        code(&o),
+        FINDING,
+        "reached and differing is exit 2, not 1: {v}"
+    );
+    assert_eq!(v["result"], "findings", "{v}");
+    // By id, not by position: the report now also carries the ordinary drift
+    // summary, and asserting `findings[0]` would break on an unrelated change
+    // to their order.
+    let unexpressible = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift-unexpressible")
+        .unwrap_or_else(|| panic!("no unexpressible finding: {v}"));
+    assert!(
+        unexpressible["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("IDENTITY")),
+        "the message must name what differs: {v}"
+    );
+    // It reaches the *report*, which is what the `on_drift` hook receives —
+    // the whole point of carrying it there rather than on a parallel path.
+    assert_eq!(
+        v["data"]["unexpressible"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    // And the summary counts it. "0 difference(s)" beside a drift verdict
+    // reads as a bug in the tool rather than a fact about the database.
+    let summary = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift")
+        .unwrap_or_else(|| panic!("no drift summary: {v}"));
+    assert!(
+        summary["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("1 difference")),
+        "{summary}"
+    );
+}
+
+/// The last two pre-existing instances of "an absence read as good news",
+/// closed after the review stopped rather than left as a follow-up.
+///
+/// `pull`'s guard is the only thing between an unforced pull and the user's
+/// declarations, and it read three different "I do not know" answers as
+/// "there is nothing here": a failed listing, and a declarations path that
+/// exists but is not a directory.
+///
+/// Only the second is reachable from a test — a listing that fails on a real
+/// directory needs permissions this suite cannot rely on, since it may run as
+/// root. That one is fixed by inspection and carries no test; saying so is
+/// better than a test that passes down the path that already worked.
+#[test]
+fn pull_refuses_when_it_cannot_tell_whether_declarations_exist() {
+    let d = Demo::new("pullunlistable");
+    // A file where the declarations directory should be.
+    std::fs::remove_dir_all(d.dir.join("schema")).unwrap();
+    std::fs::write(d.dir.join("schema"), "not a directory\n").unwrap();
+
+    // The guard runs before anything connects, so the unreachable server in the
+    // connection string is never contacted — and must not be what fails.
+    let o = d.run(&["pull", "--db", "Server=x;Database=y"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("is not a directory"),
+        "the refusal must name the real problem, not a connection failure: {}",
+        stderr(&o)
+    );
+    // And it must not have begun overwriting anything.
+    assert!(
+        d.dir.join("schema").is_file(),
+        "pull must not have touched the declarations path"
+    );
+}
+
+// ---- Nineteenth review round ----
+//
+// Two writes escaped the envelope: `fmt` rewriting a declaration, and `plan`
+// writing the identity file. Both are fixed in `crates/pbps-cli/src/main.rs`
+// and **neither carries a test**, which is worth stating rather than papering
+// over with one that passes elsewhere.
+//
+// Making a write fail while the matching read succeeds needs either permission
+// bits or an immutable flag. This suite may run as root, which defeats the
+// first, and it runs on Windows too, which defeats the second. Every cheaper
+// fixture — a directory where the file goes, a file where the directory goes —
+// trips the *read* guard one line earlier and produces that guard's envelope,
+// so a test built on one would assert a passing behaviour that already worked.
+// That mistake has been made three times on this branch already.
+
+// ---- Twenty-first review round ----
+
+/// `db::target` refuses both flags for every other command; `explain`'s
+/// project-free path bypassed that resolver and silently preferred `--db`
+/// while still printing `--env` in the approval command. The reviewer would
+/// validate one database and paste a command that applies to another.
+#[test]
+fn explain_refuses_a_db_and_an_env_together() {
+    let d = Demo::new("explainbothtargets");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        "Server=x;Database=y",
+        "--env",
+        "prod",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("pass one of them"),
+        "the refusal must be the shared one, not a connection failure: {}",
+        stderr(&o)
+    );
+    // And nothing was explained: an approval command naming the wrong target
+    // is the specific harm here.
+    assert!(
+        !stdout(&o).contains("pbps apply"),
+        "no approval command may be printed: {}",
+        stdout(&o)
+    );
+}
+
+// ---- Twenty-second review round ----
+
+/// The refusal added one round earlier was a bare `return`, which put back the
+/// escape the rest of `explain` had just been cured of. A new refusal is still
+/// an answer, and a consumer has to be able to read it.
+#[test]
+fn explain_json_emits_an_envelope_when_the_target_flags_conflict() {
+    let d = Demo::new("explainbothjson");
+    let plan = risky_plan(&d);
+
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--db",
+        "Server=x;Database=y",
+        "--env",
+        "prod",
+        "--format",
+        "json",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "target.conflicting", "{v}");
+}
+
+/// Flag validations run before `cmd_plan` and its JSON handling, which is
+/// exactly why they escaped the envelope. A consumer told "produced no output"
+/// cannot say which flags contradicted each other.
+#[test]
+fn plan_json_emits_an_envelope_when_the_flags_contradict() {
+    let d = Demo::new("planflags");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    for args in [
+        vec!["plan", "--check", "--db", "Server=x;Database=y"],
+        vec!["plan", "--staged"],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "json"]);
+        let o = d.run(&argv);
+        assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+    }
+}
+
+// ---- Twenty-sixth review round ----
+
+/// `--check` is the read-only file check CI runs, and "read-only" has to hold
+/// for the artifact flags too. With a current identity file the command fell
+/// through to the unconditional `--out` / `--sql` writes, so a job that meant
+/// to check wrote a plan and a script — and a later reviewer had an artifact no
+/// deployment ever produced.
+///
+/// Refused rather than skipped: silently not writing leaves the previous run's
+/// file on disk, and the job then reviews a stale one instead of none.
+#[test]
+fn check_mode_refuses_the_flags_that_would_write_a_file() {
+    let d = Demo::new("checkwrites");
+    d.table(ONE_COLUMN);
+    // Planned and committed first, so the identity file is current: that is the
+    // state in which the writes used to be reached.
+    d.run(&["plan"]);
+    d.commit();
+
+    for flag in ["--out", "--sql"] {
+        let path = d
+            .dir
+            .join(format!("artifact{}", flag.trim_start_matches('-')));
+        let o = d.run(&["plan", "--check", flag, path.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{flag}: {}", stderr(&o));
+        assert!(stderr(&o).contains("--check"), "{flag}: {}", stderr(&o));
+        assert!(!path.exists(), "{flag} wrote {} anyway", path.display());
+    }
+}
+
+/// The same three refusals through `--format json`. The `--dev` half used to be
+/// a `bail!` deep inside the command, after the artifact writes, so a consumer
+/// asking for JSON got an empty stdout and the converter's generic "no output"
+/// — which names no flag and so cannot be acted on.
+#[test]
+fn check_mode_refusals_reach_the_json_envelope() {
+    let d = Demo::new("checkwritesjson");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    let artifact = d.dir.join("artifact.json");
+    for args in [
+        vec!["plan", "--check", "--dev", "docker://mssql"],
+        vec!["plan", "--check", "--out", artifact.to_str().unwrap()],
+        vec!["plan", "--check", "--sql", artifact.to_str().unwrap()],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "json"]);
+        let o = d.run(&argv);
+        assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["command"], "plan");
+        assert_eq!(v["result"], "unanswerable", "{v}");
+        assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+        assert!(!artifact.exists(), "{args:?} wrote the artifact anyway");
+    }
+}
+
+/// The negative case the refusals must not have swallowed: without `--check`,
+/// both artifact flags still produce their files.
+#[test]
+fn the_artifact_flags_still_write_without_check() {
+    let d = Demo::new("artifactswrite");
+    d.table(ONE_COLUMN);
+
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let o = d.run(&[
+        "plan",
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(plan.is_file(), "no {}", plan.display());
+    assert!(sql.is_file(), "no {}", sql.display());
+}
+
+/// The config schema's justification is the declaration schema's: it accepts
+/// exactly what the tool accepts. `dev::spec` requires exactly one backend and
+/// refuses both `dev: {}` and a block naming two, so a schema that left the
+/// derive's shape alone blessed a pbps.yml no `plan` can run.
+#[test]
+fn the_config_schema_demands_exactly_one_dev_backend() {
+    let d = Demo::new("devschema");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&d.run(&["schema", "--kind", "config"]))).unwrap();
+    let branches = v["$defs"]["Dev"]["oneOf"].as_array().unwrap();
+
+    assert_eq!(branches.len(), 2, "{v}");
+    for (key, other) in [("docker", "url_env"), ("url_env", "docker")] {
+        let branch = branches
+            .iter()
+            .find(|b| b["required"] == serde_json::json!([key]))
+            .unwrap_or_else(|| panic!("no branch for {key}: {v}"));
+        // The type is pinned as well as the presence: `required` is satisfied
+        // by an explicit null, which YAML writes as `docker:` with nothing
+        // after it, and serde reads that as absent.
+        assert_eq!(branch["properties"][key]["type"], "string", "{branch}");
+        // And the other key is constrained, not merely unrequired: `required`
+        // alone accepts a block naming both, which `dev::spec` refuses. Pinned
+        // to null rather than `false` for the reason the module branches are:
+        // `url_env:` written empty is absent to serde, so the block resolves.
+        assert_eq!(branch["properties"][other]["type"], "null", "{branch}");
+    }
+}
+
+/// The other half of that property, from the tool's side: the two shapes the
+/// schema now refuses are the two the CLI refuses. Asserted against a real
+/// `plan`, because a schema pinned only to itself would keep agreeing with a
+/// loader that had changed underneath it.
+#[test]
+fn a_dev_block_naming_neither_or_both_backends_is_refused() {
+    for (name, block) in [
+        ("devneither", "dev: {}\n"),
+        ("devboth", "dev:\n  docker: img\n  url_env: PBPS_DEV_URL\n"),
+    ] {
+        let d = Demo::new(name);
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: mssql\n{block}")).unwrap();
+        d.table(ONE_COLUMN);
+
+        let o = d.run(&["plan", "--format", "json"]);
+        assert_eq!(code(&o), 1, "{name}: {}", stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("{name}: stdout was not JSON ({e}): {}", stdout(&o)));
+        assert_eq!(v["findings"][0]["id"], "rehearsal.unavailable", "{v}");
+    }
+}
+
+// ---- Twenty-seventh review round ----
+
+/// A lock held over an empty ledger is exactly what a *first* `bootstrap` looks
+/// like while it runs: `state::lock` calls `ensure_tables`, so both tables
+/// exist before anything records a snapshot. `status` returned at
+/// "uninitialized" without reading the lock, so an apply in flight — and the
+/// stale lock an interrupted first bootstrap leaves behind — were invisible in
+/// the human view and the JSON alike.
+///
+/// Set up with the tool's own functions rather than a copy of the DDL: no flag
+/// produces this state, and a hand-written `INSERT` would pin the test to a
+/// ledger shape the tool is free to change.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_reports_a_lock_held_over_an_empty_ledger() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statuslock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_LOCK_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        // Whatever an earlier test left: this asserts about an *empty* ledger.
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-interrupted-bootstrap")
+            .await
+            .expect("take the lock");
+        // The premise, stated rather than assumed: the ledger really is empty
+        // while the lock is really held. If `lock` ever stopped creating the
+        // tables this test would be exercising nothing.
+        assert!(
+            matches!(pbps_mssql::state::latest(&mut conn).await, Ok(None)),
+            "the ledger should exist and be empty"
+        );
+        assert!(
+            pbps_mssql::state::lock_holder(&mut conn)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    let human = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = pbps_mssql::state::unlock(&mut conn).await;
+        let _ = conn
+            .execute("DROP TABLE dbo.__pbps_state; DROP TABLE dbo.__pbps_lock;")
+            .await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    // Still uninitialized — that half was never wrong.
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(
+        v["data"][0]["locked_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("the-interrupted-bootstrap")),
+        "the lock is missing from the row: {v}"
+    );
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "a consumer keying off findings alone is told nothing: {v}"
+    );
+    // And the human view, which is where an operator actually reads it.
+    assert!(
+        stdout(&human).contains("locked by the-interrupted-bootstrap"),
+        "{}",
+        stdout(&human)
+    );
+}
+
+/// The other half-present ledger: `dbo.__pbps_state` dropped by hand while
+/// `dbo.__pbps_lock` survives with a live row.
+///
+/// The round-27 fix read the lock only when the ledger was *empty*, on the
+/// reasoning that nothing can take a lock without `ensure_tables` creating the
+/// state table first. True of every path the tool controls, and beside the
+/// point: a hand-dropped state table leaves the lock behind, the next apply
+/// recreates the table and then fails to take that lock, and `status` was
+/// hiding the one line that explains the failure.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_reports_a_lock_that_outlived_its_state_table() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statuslockorphan");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_ORPHAN_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-orphaned-apply")
+            .await
+            .expect("take the lock");
+        // The state table goes, the lock stays. Stated rather than assumed:
+        // `latest` must now answer `NotInitialized`, which is the branch that
+        // used to return without looking.
+        conn.execute("DROP TABLE dbo.__pbps_state;")
+            .await
+            .expect("drop the state table");
+        assert!(
+            matches!(
+                pbps_mssql::state::latest(&mut conn).await,
+                Err(pbps_db::LedgerError::NotInitialized)
+            ),
+            "the premise: the state table is gone"
+        );
+        assert!(
+            pbps_mssql::state::lock_holder(&mut conn)
+                .await
+                .unwrap()
+                .is_some(),
+            "the premise: the lock survived"
+        );
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        // Also the negative case for `unlock`, which guarded on the *state*
+        // table and so could not release a lock that outlived it.
+        assert!(
+            pbps_mssql::state::unlock(&mut conn).await.unwrap(),
+            "unlock must release a lock whose state table is gone"
+        );
+        let _ = conn.execute("DROP TABLE dbo.__pbps_lock;").await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(
+        v["data"][0]["locked_by"]
+            .as_str()
+            .is_some_and(|s| s.contains("the-orphaned-apply")),
+        "the surviving lock is missing from the row: {v}"
+    );
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "{v}"
+    );
+}
+
+/// And the ordinary first run, which must stay quiet: a database pbps has
+/// never touched has no lock table, and reading it has to answer "no lock"
+/// rather than "I could not look". `lock_unknown` on every fresh environment
+/// would be a warning about the commonest case there is.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_says_nothing_about_a_lock_on_a_database_with_no_ledger() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("statusnoledger");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_STATUS_FRESH_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+    });
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&var, &connection)
+        .output()
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["data"][0]["state"], "uninitialized", "{v}");
+    assert!(v["data"][0]["locked_by"].is_null(), "{v}");
+    assert!(
+        v["data"][0]["lock_unknown"].is_null(),
+        "a missing lock table is not an unreadable one: {v}"
+    );
+}
+
+/// One difference the differ cannot phrase must not delete the ones it can.
+/// `pbps_diff::diff` accumulates every change it can express and only then
+/// returns `Err(errs)`, so `verify` — which reports rather than approves — was
+/// throwing that work away: the count, the human report and the `on_drift`
+/// hook's payload all lost the expressible drift beside an altered `IDENTITY`.
+///
+/// Live, because only a real engine produces an `IDENTITY` no `ALTER` can
+/// change.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let sqlcmd = |query: &str| {
+        std::process::Command::new("docker")
+            .args([
+                "exec",
+                "pbps-test-mssql",
+                "/opt/mssql-tools18/bin/sqlcmd",
+                "-C",
+                "-S",
+                "localhost",
+                "-U",
+                "sa",
+                "-P",
+                "Pbps!Test12345",
+                "-Q",
+                query,
+            ])
+            .output()
+    };
+
+    let d = Demo::new("verifyboth");
+    d.table("table: dbo.both_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let made = sqlcmd(
+        "IF OBJECT_ID(N'dbo.both_drift', N'U') IS NOT NULL DROP TABLE dbo.both_drift; \
+         CREATE TABLE dbo.both_drift (id bigint IDENTITY(1,1) NOT NULL);",
+    );
+    if made.map(|o| !o.status.success()).unwrap_or(true) {
+        return; // Not the scripted container.
+    }
+    assert_eq!(
+        code(&d.run(&["snapshot", "--db", &connection, "--force"])),
+        0
+    );
+    // Two differences at once: the IDENTITY is gone (no `Change` exists for
+    // that) and a column has been added by hand (one does).
+    let _ = sqlcmd(
+        "DROP TABLE dbo.both_drift; \
+         CREATE TABLE dbo.both_drift (id bigint NOT NULL, note nvarchar(50) NULL);",
+    );
+
+    let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let _ = sqlcmd("DROP TABLE dbo.both_drift;");
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(code(&o), FINDING, "{v}");
+    assert_eq!(
+        v["data"]["unexpressible"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    // The half that used to vanish. It is what the `on_drift` hook receives,
+    // so a missing entry here is an alert that understates the damage.
+    assert_eq!(
+        v["data"]["changes"]["changes"].as_array().map(Vec::len),
+        Some(1),
+        "the expressible drift was dropped: {v}"
+    );
+    let summary = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.drift")
+        .unwrap_or_else(|| panic!("no drift summary: {v}"));
+    assert!(
+        summary["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("2 difference")),
+        "both halves have to be counted: {summary}"
+    );
+}
+
+// ---- Twenty-ninth review round ----
+
+/// The same half-present ledger, at the two commands the round-28 fix did not
+/// sweep. `dbo.__pbps_state` dropped by hand while `dbo.__pbps_lock` and its row
+/// survive: `doctor` reported only "uninitialized" and could exit 0, and
+/// `explain` labelled the target uninitialized and went on printing the
+/// approval command — with an apply in fact running.
+///
+/// Both used to ask about initialization before the lock, deliberately, because
+/// `lock_holder` selected from a table a never-initialized database does not
+/// have. Round 28 removed that reason and updated only `status`.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_and_explain_see_a_lock_that_outlived_its_state_table() {
+    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let d = Demo::new("orphanlock");
+    d.table(ONE_COLUMN);
+    d.commit();
+    let var = format!("PBPS_ORPHAN_LOCK_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "the-orphaned-apply")
+            .await
+            .expect("take the lock");
+        conn.execute("DROP TABLE dbo.__pbps_state;")
+            .await
+            .expect("drop the state table");
+    });
+
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(args)
+            .env(&var, &connection)
+            .output()
+            .unwrap()
+    };
+    let doctor = run(&["doctor", "--format", "json"]);
+    let plan = write_plan(&d, "orphan.json", "transactional");
+    let explain_human = run(&["explain", "--plan", plan.to_str().unwrap(), "--env", "test"]);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = pbps_mssql::state::unlock(&mut conn).await;
+        let _ = conn.execute("DROP TABLE dbo.__pbps_lock;").await;
+    });
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&doctor))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&doctor)));
+    assert_eq!(v["data"]["environments"][0]["state"], "locked", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "state.locked"),
+        "{v}"
+    );
+    // An error, not a warning: while the lock is held an apply is refused, so a
+    // readiness check that passed would answer a different question.
+    assert_eq!(code(&doctor), FINDING, "{v}");
+
+    // `explain` always exits 0 — it is the reviewer's report, not a gate — but
+    // it must say the environment is changing rather than print an approval
+    // command as though it were idle.
+    assert_eq!(code(&explain_human), 0, "{}", stderr(&explain_human));
+    let out = stdout(&explain_human);
+    assert!(
+        out.contains("the-orphaned-apply"),
+        "the surviving lock is missing from the report:\n{out}"
+    );
+}
+
+// ---- Thirtieth review round ----
+
+/// `plan --db --format json` accepted the flag and dropped it: `cmd_plan_db`
+/// prints human text, so a consumer that asked for JSON got prose on success
+/// and an **empty stdout** on every failure — while the flag validations a few
+/// lines above, in the same invocation, answered it properly.
+///
+/// Refused rather than implemented. `plan --db` is not a findings command: its
+/// output is an artifact, and the typed form of that artifact already exists
+/// and is better than an envelope — `--out plan.json`, read back with `explain
+/// --plan --format json`. A second typed rendering would give a reviewer two
+/// documents to disagree about.
+#[test]
+fn plan_against_a_target_refuses_json_rather_than_ignoring_it() {
+    let d = Demo::new("plandbjson");
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+
+    // Deliberately unreachable: the refusal must come from the flags, before
+    // anything tries to connect, so the test says nothing about the network.
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "flags.conflicting", "{v}");
+    // The message has to name the path that does work, or the refusal just
+    // moves the consumer's problem one step along.
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--out") && m.contains("explain")),
+        "{v}"
+    );
+}
+
+/// The negative case: without a target, `--format json` still works. The
+/// refusal is about the connected form only.
+#[test]
+fn an_offline_plan_still_speaks_json() {
+    let d = Demo::new("planofflinejson");
+    d.table(ONE_COLUMN);
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["command"], "plan");
+    assert_eq!(v["result"], "ok", "{v}");
+}
+
+/// On Unix a filename is bytes, and `Path::display()` substitutes U+FFFD for
+/// the ones that are not UTF-8. That character is not in `shell_arg`'s bare set
+/// and is not one of its refusals either, so a lossy path came back neatly
+/// double-quoted — naming a *different* file, usually one that does not exist.
+/// `explain` had read the real plan and would then advertise a command that
+/// cannot open it.
+///
+/// Unix-only because no other platform can produce the input.
+#[cfg(unix)]
+#[test]
+fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let d = Demo::new("lossypath");
+    d.table(ONE_COLUMN);
+    // An *applyable* plan: `explain` prints no approval command for a preview,
+    // by design, so a preview would pass this test without exercising anything.
+    let src = write_plan(&d, "src.json", "transactional");
+    // 0xFF is not valid UTF-8 in any position.
+    let name = std::ffi::OsStr::from_bytes(b"plan-\xff-.json");
+    let lossy = d.dir.join(name);
+    std::fs::copy(&src, &lossy).unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .arg("explain")
+        .arg("--plan")
+        .arg(&lossy)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+
+    // It read the real file, which is the premise: the report is about this
+    // plan, and only the *command* it advertises was wrong.
+    assert!(
+        out.contains("prod as queried (entry #1)"),
+        "the plan itself was not read:\n{out}"
+    );
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("pbps apply"))
+        .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
+    assert!(
+        line.contains("<plan path>"),
+        "a path that cannot be spelled must not be advertised: {line}"
+    );
+    // And the literal is still shown, on a line of its own, so the reader can
+    // see what was read even though it cannot be pasted.
+    assert!(out.contains("<plan path> is:"), "{out}");
+}
+
+// ---- Thirty-first review round ----
+
+/// The other place round 30's lossy path went, and the worse one: serde's
+/// `Path` impl **fails** on a path that is not UTF-8, so a `PathBuf` in
+/// `Location.file` made that failure the whole envelope's. `explain --plan
+/// <non-UTF-8> --format json` on an unreadable plan printed nothing at all and
+/// exited 1 with `error: path contains invalid UTF-8 characters` — the
+/// one-envelope contract broken by the envelope itself.
+///
+/// `Location.file` is a `String` now, built with `to_str`, and the location is
+/// dropped when the path cannot be spelled. Dropping the pointer keeps the
+/// finding; a lossy pointer would name a different file.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let d = Demo::new("lossyenvelope");
+    d.table(ONE_COLUMN);
+    let name = std::ffi::OsStr::from_bytes(b"bad-\xff-.json");
+    let bad = d.dir.join(name);
+    std::fs::write(&bad, "{ not json").unwrap();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .arg("explain")
+        .arg("--plan")
+        .arg(&bad)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {:?}", stdout(&o)));
+    assert_eq!(v["command"], "explain");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert_eq!(v["findings"][0]["id"], "plan.unreadable", "{v}");
+    // No location rather than a lossy one: a consumer keying off
+    // `location.file` would open the wrong file, or none.
+    assert!(v["findings"][0]["location"].is_null(), "{v}");
+
+    // The negative case in the same shape: an ordinary path still carries its
+    // location, so the fix did not simply stop reporting them.
+    let ok = d.dir.join("also-bad.json");
+    std::fs::write(&ok, "{ not json").unwrap();
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        ok.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "plan.unreadable", "{v}");
+    assert!(
+        v["findings"][0]["location"]["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("also-bad.json")),
+        "{v}"
+    );
+}
+
+// ---- Thirty-third review round ----
+
+/// `plan --dev docker://<image>` end to end, which is the one path through
+/// `dev.rs` that had **no automated coverage at all** — every other `--dev`
+/// test passes a connection string, so `Container::start` was never run.
+///
+/// That is how it shipped removing the container it had just returned. It built
+/// the cleanup guard twice, the second binding shadowing the first, and a
+/// shadowed binding is not dropped early: it lives to the end of the function,
+/// so the first guard's `Drop` ran `docker rm -f` on the container handed to the
+/// caller. Every `plan --dev docker://...` run then failed with "cannot reach
+/// the dev database: connection refused", from the day the feature was written.
+///
+/// Opt-in through `PBPS_TEST_DEV_IMAGE` because it starts a second SQL Server:
+/// `scripts/live-tests.sh` sets it, CI's live job deliberately does not.
+#[test]
+#[ignore = "needs docker and a SQL Server image; set PBPS_TEST_DEV_IMAGE (see scripts/live-tests.sh)"]
+fn a_dev_container_outlives_the_call_that_started_it() {
+    // Skipped, not panicked, when the variable is absent — unlike every other
+    // test in this file, which panics on a missing `PBPS_TEST_DB`. The
+    // difference is that CI sets `PBPS_TEST_DB` always, so its absence is a
+    // broken setup worth shouting about, while `PBPS_TEST_DEV_IMAGE` is opt-in
+    // and CI deliberately leaves it unset. Copying the panic here turned "this
+    // test is not enabled" into a red `live` job.
+    let Ok(image) = std::env::var("PBPS_TEST_DEV_IMAGE") else {
+        eprintln!("skipped: PBPS_TEST_DEV_IMAGE is not set (see scripts/live-tests.sh)");
+        return;
+    };
+
+    let d = Demo::new("devdocker");
+    // A check constraint the engine stores in its own spelling, so a rehearsal
+    // that really talked to a server has something to report. Reaching that
+    // finding at all proves the container was still there to be talked to.
+    d.table(concat!(
+        "table: dbo.t\n",
+        "columns:\n",
+        "  id: {type: bigint, nullable: false}\n",
+        "checks:\n",
+        "  ck_pos: \"id > 0\"\n"
+    ));
+
+    let o = d.run(&[
+        "plan",
+        "--dev",
+        &format!("docker://{image}"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    // Not `rehearsal.unavailable`, which is what a removed container produces.
+    assert!(
+        ids.contains(&"rehearsal.spelling"),
+        "the rehearsal did not reach a live engine: {v}"
+    );
 }

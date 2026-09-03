@@ -27,6 +27,7 @@ use pbps_dialect::{Dialect, DialectError, Probe, Statement, TypeChangeRisk};
 use pbps_model::{Change, ChangeSet, ColumnType, Module, ObjectName, Strategy, Table, TableName};
 
 pub mod catalog;
+pub mod doctor;
 pub mod edition;
 pub mod emit;
 pub mod ident;

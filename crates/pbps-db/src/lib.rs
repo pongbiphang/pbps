@@ -57,6 +57,30 @@ pub enum DbError {
     BadRow(String),
 }
 
+impl DbError {
+    /// The server's own error number, when the failure came from the server
+    /// rather than from the connection.
+    ///
+    /// Exposed as a bare number and not interpreted here: what 208 or 229
+    /// *mean* is SQL Server's vocabulary, and this crate deliberately holds
+    /// none of it — a dialect's error codes belong in that dialect's crate.
+    /// What this crate owns is that the number is reachable at all without a
+    /// second crate naming `tiberius`.
+    pub fn server_error_number(&self) -> Option<u32> {
+        // Enumerated rather than wildcarded, as `wildcard_enum_match_arm`
+        // requires: a variant added later must be looked at here, because the
+        // answer "no number" is the one a caller reads as "not the case I am
+        // asking about" and would silently apply to it.
+        match self {
+            DbError::Driver(e) => e.code(),
+            DbError::BadConnectionString(_)
+            | DbError::Connect { .. }
+            | DbError::ConnectTimeout { .. }
+            | DbError::BadRow(_) => None,
+        }
+    }
+}
+
 /// How long to wait for the TCP connection before giving up.
 ///
 /// Long enough for a slow VPN or a container still starting, short enough that

@@ -64,6 +64,17 @@ pub struct DriftReport {
     /// presence is not drift.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmanaged: Vec<TableName>,
+
+    /// Differences the differ found but has no [`Change`](crate::Change) for —
+    /// an `IDENTITY` that was altered by hand, say.
+    ///
+    /// Carried *in* the report rather than raised as a separate outcome. They
+    /// are drift: the database was reached, the catalog was read, and the two
+    /// states are not the same. A parallel path for them meant the `on_drift`
+    /// hook never ran for this class, so a scheduled alert missed exactly the
+    /// drift nobody can fix by re-running `plan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexpressible: Vec<String>,
 }
 
 impl DriftReport {
@@ -74,7 +85,9 @@ impl DriftReport {
     /// leave `changes` empty while the two states are plainly not the same, and
     /// "no drift" is the answer that must never be given by accident.
     pub fn has_drift(&self) -> bool {
-        self.live_checksum != self.baseline.checksum || !self.changes.is_empty()
+        self.live_checksum != self.baseline.checksum
+            || !self.changes.is_empty()
+            || !self.unexpressible.is_empty()
     }
 }
 
@@ -97,7 +110,22 @@ mod tests {
             live_checksum: live_checksum.into(),
             changes: ChangeSet::default(),
             unmanaged: Vec::new(),
+            unexpressible: Vec::new(),
         }
+    }
+
+    /// A difference the differ has no `Change` for is still drift. It is the
+    /// case `has_drift`'s own doc anticipates, and until it was carried in the
+    /// report it travelled down a parallel path that skipped the `on_drift`
+    /// hook — so the alert missed exactly the drift nobody can fix by rerunning
+    /// `plan`.
+    #[test]
+    fn an_unexpressible_difference_is_drift() {
+        let mut r = report("abc");
+        assert!(!r.has_drift(), "the premise: matching checksum, no changes");
+        r.unexpressible
+            .push("the IDENTITY of dbo.t.id changed".into());
+        assert!(r.has_drift());
     }
 
     #[test]

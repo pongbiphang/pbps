@@ -36,6 +36,34 @@ pub fn blockers(list: &[Blocker]) -> String {
     out
 }
 
+/// One blocker as a typed finding: a stable id, what happened, and the commands
+/// that resolve it.
+///
+/// The remedy is the same text the human view prints — there is one description
+/// of how to resolve an ambiguity, and a second one written for JSON would drift
+/// from it the first time a command gained a flag.
+pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
+    let id = match b {
+        Blocker::AmbiguousColumns { .. } => "identity.ambiguous-columns",
+        Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
+        Blocker::DropColumnNeedsReason { .. } => "identity.drop-column-needs-reason",
+        Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
+        Blocker::UnusedIntent { .. } => "identity.unused-intent",
+    };
+    let text = one_blocker(b);
+    // The first line says what happened; the rest are the commands.
+    let (message, remedy) = match text.split_once("\n\n") {
+        Some((head, tail)) => (head.trim().to_owned(), tail.trim().to_owned()),
+        None => (text.trim().to_owned(), String::new()),
+    };
+    let f = crate::output::Finding::error(id, message);
+    if remedy.is_empty() {
+        f
+    } else {
+        f.remedy(remedy)
+    }
+}
+
 fn one_blocker(b: &Blocker) -> String {
     match b {
         Blocker::AmbiguousColumns {
@@ -103,12 +131,86 @@ fn join<T: std::fmt::Display>(v: &[T]) -> String {
         .join(", ")
 }
 
+/// The headline: how much, where, and how risky.
+///
+/// Printed above the change list so that the first thing a reader sees is the
+/// shape of the plan rather than its first line. A plan touching sixty tables
+/// scrolls past; a plan touching one and dropping a column does not, and the two
+/// must not look the same for the first screenful (SPEC §14.1).
+///
+/// Stable by construction: the counts come from the typed ChangeSet and the risk
+/// order is [`RiskClass::ALL`], so two runs over the same plan produce the same
+/// text and a diff of two summaries means the plans really differ.
+/// How many distinct tables and how many modules a change set touches.
+///
+/// `Change::table()` returns the *object* name, which for a view, procedure,
+/// function or trigger is the module's own name — so counting its distinct
+/// values called a one-view plan "1 table". `module_name()` is what separates
+/// them, and it exists precisely because they are different kinds of object
+/// (ADR-0002).
+pub fn touched(cs: &ChangeSet) -> (usize, usize) {
+    let mut tables = std::collections::BTreeSet::new();
+    let mut modules = std::collections::BTreeSet::new();
+    for p in &cs.changes {
+        match p.change.module_name() {
+            Some(m) => modules.insert(m.to_string()),
+            None => tables.insert(p.change.table().to_string()),
+        };
+    }
+    (tables.len(), modules.len())
+}
+
+/// "3 table(s)", "2 module(s)", or both — never a count of one naming the
+/// other.
+pub fn objects(tables: usize, modules: usize) -> String {
+    match (tables, modules) {
+        (0, m) => format!("{m} module(s)"),
+        (t, 0) => format!("{t} table(s)"),
+        (t, m) => format!("{t} table(s) and {m} module(s)"),
+    }
+}
+
+pub fn summary(cs: &ChangeSet) -> String {
+    if cs.is_empty() {
+        return String::new();
+    }
+    let (tables, modules) = touched(cs);
+    let mut out = format!(
+        "\n  {} change(s) across {}.\n",
+        cs.changes.len(),
+        objects(tables, modules)
+    );
+
+    let risks = cs.risks();
+    if risks.is_empty() {
+        out.push_str("  No risk class applies; this plan needs no --allow.\n");
+        return out;
+    }
+    for class in RiskClass::ALL {
+        if !risks.contains(&class) {
+            continue;
+        }
+        let n = cs
+            .changes
+            .iter()
+            .filter(|p| p.risks.contains(&class))
+            .count();
+        out.push_str(&format!(
+            "    {:<12} {n:>3} change(s) — {}\n",
+            class.as_str(),
+            class.why()
+        ));
+    }
+    out
+}
+
 pub fn plan(cs: &ChangeSet) -> String {
     if cs.is_empty() {
         return "No changes.\n".to_owned();
     }
 
-    let mut out = changes(cs);
+    let mut out = summary(cs);
+    out.push_str(&changes(cs));
     let risks = cs.risks();
     if !risks.is_empty() {
         out.push_str(&format!(
@@ -184,6 +286,17 @@ pub fn drift(r: &DriftReport) -> String {
     }
 
     out.push_str("\nDRIFT: the database no longer matches its recorded state.\n");
+    if !r.unexpressible.is_empty() {
+        // First, because these are the ones no workflow can resolve: `pull`
+        // cannot express them either, so the reader has to act by hand.
+        out.push_str(&format!(
+            "\n  {} difference(s) that cannot even be expressed as changes:\n",
+            r.unexpressible.len()
+        ));
+        for e in &r.unexpressible {
+            out.push_str(&format!("    {e}\n"));
+        }
+    }
     if !r.changes.is_empty() {
         out.push_str("\n  Differences found (recorded state -> database as it is now):\n");
         // The plan's own vocabulary, indented, minus its `--allow` advice: a
@@ -302,4 +415,102 @@ pub fn describe(c: &Change) -> String {
         Change::AlterModule { module, .. } => format!("~ restate {}", module.kind),
         Change::DropModule { kind, .. } => format!("- drop {kind}"),
     }
+}
+
+/// One argument, quoted so that pasting it passes the value through unchanged —
+/// or `None` when no spelling can promise that.
+///
+/// # Why there is a `None`
+///
+/// This line is read in POSIX shells, PowerShell and `cmd`, and their quoting
+/// rules do not overlap enough to cover everything:
+///
+/// - POSIX single quotes are literal, but **`cmd` does not treat `'` as quoting
+///   at all**, so `&`, `|`, `<` and `>` stay live inside them. An earlier
+///   version of this function used single quotes for exactly those characters
+///   and claimed it failed safe in `cmd`; it does not — `cmd` would split the
+///   command at the `&` and run the remainder.
+/// - Double quotes are understood by all three for *splitting*, but POSIX
+///   shells and PowerShell still expand `$` and a backtick inside them, and a
+///   POSIX shell still reads `\\` as an escape inside them.
+///
+/// So there is no single string that is safe everywhere for a value containing
+/// both families. Rather than pick a form that is wrong on one platform, this
+/// returns `None` and the caller prints the path on a line of its own, where
+/// nothing can execute it. A command that cannot be pasted blindly is a much
+/// smaller problem than one that redirects or runs something when it is.
+pub fn shell_arg(value: &str) -> Option<String> {
+    // `~` is safe away from the front: it means home-directory expansion as the
+    // first character of a word and nothing at all elsewhere, and every Windows
+    // short path is full of it (`C:\Users\RUNNER~1\...`).
+    //
+    // `\` is deliberately *not* in this set, even though the same Windows paths
+    // are full of it too. Bare is the one form a POSIX shell reads the
+    // backslashes in: `C:\Users\RUNNER~1\plan.json` pasted unquoted arrives as
+    // `C:UsersRUNNER~1plan.json`. It was added here to stop Windows paths being
+    // quoted, which had the direction backwards — those are exactly the values
+    // that need the quotes.
+    //
+    // `@` is the same shape as `~`, one shell further out: in PowerShell a token
+    // *beginning* `@` in argument position is splatting, so `@args` would be
+    // replaced by the current argument array rather than passed as the string
+    // it is. Away from the front it means nothing, and `deploy@prod` is a
+    // perfectly ordinary environment name — so the front is where it is
+    // refused, and quoting it below makes PowerShell read it literally.
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:@+=~".contains(c);
+    if !value.is_empty() && !value.starts_with(['~', '@', '-']) && value.chars().all(bare) {
+        return Some(value.to_owned());
+    }
+
+    // A leading `-` is refused outright rather than quoted, because quoting
+    // does not help: the shell strips the quotes and clap still receives an
+    // argument beginning `-` and reads it as a flag — measured, not assumed
+    // (`pbps explain --plan -plan.json` answers "unexpected argument '-p'").
+    //
+    // `--plan=-plan.json` *does* work, and emitting every option in that form
+    // would carry these values. Not taken: it changes the shape of every
+    // command this module advertises, and every test that reads one, to buy an
+    // environment name or plan path beginning with a hyphen. The placeholder is
+    // the established answer for a value that cannot be pasted, and this is one.
+    if value.starts_with('-') {
+        return None;
+    }
+
+    // Double quotes hold for a value a shell would only *split* — a space, most
+    // often. They do not neutralize expansion (`$`, a backtick), a quote of the
+    // same kind, a newline, or a trailing backslash, which would escape the
+    // closing quote itself — and a Windows directory path ends with one more
+    // often than not.
+    //
+    // A doubled backslash is refused for the same reason: inside POSIX double
+    // quotes it collapses to a single one, which silently rewrites the leading
+    // pair of a UNC path into a value that is still a valid path, just a
+    // different one.
+    let expands =
+        value.contains(['$', '`', '"', '\n']) || value.ends_with('\\') || value.contains("\\\\");
+    // Live in `cmd` whatever they are wrapped in, since `cmd` has no literal
+    // quote character to wrap them in.
+    //
+    // `!` is in the list for a narrower reason: it is inert in a default `cmd`,
+    // but under `setlocal enabledelayedexpansion` it expands *inside* double
+    // quotes, so a path or environment name containing `!NAME!` would silently
+    // become a different value on the one shell where this is hardest to
+    // notice. Whether delayed expansion is on is not knowable from here, so the
+    // safe reading is that it might be.
+    let cmd_metacharacters = value.contains(['&', '|', '<', '>', '^', '%', '!']);
+    if expands || cmd_metacharacters {
+        return None;
+    }
+    Some(format!("\"{value}\""))
+}
+
+/// A `--env` argument for a copy-pastable remedy.
+///
+/// Environment names are YAML map keys, so `US West` is a perfectly valid one —
+/// and interpolated verbatim it becomes two arguments. Where no cross-shell
+/// spelling exists the caller gets `None` and should fall back to a placeholder;
+/// a remedy that changes meaning when pasted is worse than one that has to be
+/// completed by hand.
+pub fn env_arg(name: &str) -> String {
+    shell_arg(name).unwrap_or_else(|| "<environment>".to_owned())
 }

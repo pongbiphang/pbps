@@ -5,23 +5,49 @@ mod db;
 mod declaration_file;
 mod deploy;
 mod dev;
+mod doctor;
+mod explain;
 mod hooks;
 mod init;
+mod integration;
+mod output;
+mod prompt;
 mod report;
 mod status;
 
-/// Drift was found. Not a failure of the tool, so it must not look like one.
+/// The command ran correctly and found something the user must act on.
 ///
-/// A scheduled drift-watch pipeline (SPEC §10) needs to tell "the database
-/// moved" from "the tool could not reach it": the first pages the schema owner,
-/// the second pages whoever runs CI. One exit code for both would send every
-/// alert to the wrong person half the time.
+/// Not a failure of the tool, so it must not look like one. A scheduled
+/// drift-watch pipeline (SPEC §10) needs to tell "the database moved" from "the
+/// tool could not reach it": the first pages the schema owner, the second pages
+/// whoever runs CI. One exit code for both would send every alert to the wrong
+/// person half the time — and the same split holds for every read-only command,
+/// which is why this is not specific to drift (SPEC §14.1).
+///
+/// Three codes in total: 0 success, [`EXIT_FINDING`] a finding, 1 anything that
+/// stopped the tool from answering.
 #[derive(Debug, thiserror::Error)]
-#[error("drift found")]
-pub struct DriftFound;
+#[error("{0}")]
+pub struct Found(String);
 
-/// The exit code for [`DriftFound`].
-const EXIT_DRIFT: i32 = 2;
+impl Found {
+    /// A finding whose detail has already been printed.
+    ///
+    /// The empty message is load-bearing: [`main`] prints nothing for it, so a
+    /// report that has already listed twelve problems is not followed by a
+    /// thirteenth line restating that there were problems.
+    pub fn reported() -> Self {
+        Found(String::new())
+    }
+
+    /// A finding whose one-line summary is the whole of the output.
+    pub fn new(message: impl Into<String>) -> Self {
+        Found(message.into())
+    }
+}
+
+/// The exit code for [`Found`].
+const EXIT_FINDING: i32 = 2;
 
 use std::path::PathBuf;
 
@@ -39,11 +65,19 @@ use pbps_model::{ColumnRef, IdsFile, Intent, TableName};
     version,
     about = "Declarative database schema version control"
 )]
-struct Cli {
+pub struct Cli {
     /// Project directory. Existing commands search upwards for pbps.yml; init
     /// creates it here. Defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
+
+    /// Never ask a question, even on a terminal.
+    ///
+    /// It declines the prompt; it can never answer one. No flag may supply
+    /// rename or drop intent (SPEC §14.3), so this only ever makes the run more
+    /// conservative — which is why it is safe to put in a shell alias.
+    #[arg(long, global = true)]
+    no_input: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -89,16 +123,85 @@ enum Command {
         /// connection string to a server pbps may create a scratch database on
         #[arg(long)]
         dev: Option<String>,
+
+        /// human (default) or json. Not accepted with --db/--env: a connected
+        /// plan's typed form is the plan file itself (--out), read back with
+        /// `pbps explain --plan`
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+
+    /// Print the JSON Schema for the declaration format or for pbps.yml
+    ///
+    /// For editors, including air-gapped ones: `pbps schema --kind declaration
+    /// --out .pbps-declaration.schema.json` needs no network and no service.
+    Schema {
+        /// declaration (default) or config
+        #[arg(long, default_value = "declaration")]
+        kind: integration::SchemaKind,
+
+        /// Where to write. Defaults to standard output
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+
+    /// Print a shell completion script
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
+
+    /// Write one man page per command into a directory
+    Man {
+        #[arg(long, short, default_value = "man")]
+        out: PathBuf,
+    },
+
+    /// Check whether this project and its environments are ready
+    Doctor {
+        /// Check only this target. Without one, every configured environment.
+        /// `--db` is what CI passes from a secret, as for every other connected
+        /// command
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+
+    /// Explain a saved plan to whoever has to approve it
+    Explain {
+        /// The plan.json written by `pbps plan --out`
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Optionally check whether that environment is mid-deployment — the one
+        /// question the plan file cannot answer
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Check that the declarations are valid, without comparing to a baseline
-    Validate,
+    Validate {
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
 
     /// Rewrite the declarations in canonical form
     Fmt {
         /// Only check; exit non-zero if any file needs rewriting, and change nothing
         #[arg(long)]
         check: bool,
+
+        /// human (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
     },
 
     /// Record a column rename
@@ -181,7 +284,7 @@ enum Command {
         target: TargetArgs,
 
         /// text (default) or json
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
 
@@ -224,7 +327,7 @@ enum Command {
     /// One screen across every configured environment
     Status {
         /// text (default) or json
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
 
@@ -233,6 +336,49 @@ enum Command {
         #[command(flatten)]
         target: TargetArgs,
     },
+}
+
+impl Command {
+    /// The command name to put in an envelope, when this invocation asked for
+    /// JSON and speaks one.
+    ///
+    /// Matched exhaustively on purpose: a new read-only command with a
+    /// `--format` flag has to be added here, and the compiler says so. A
+    /// wildcard arm is how the other escapes in this pattern stayed hidden for
+    /// eleven review rounds.
+    fn json_envelope(&self) -> Option<&'static str> {
+        let (name, format) = match self {
+            Command::Plan { format, .. } => ("plan", *format),
+            Command::Doctor { format, .. } => ("doctor", *format),
+            Command::Validate { format } => ("validate", *format),
+            Command::Fmt { format, .. } => ("fmt", *format),
+            Command::Verify { format, .. } => ("verify", *format),
+            Command::Status { format, .. } => ("status", *format),
+            // Everything else either speaks no envelope (the write commands,
+            // `docs`, the intent commands) or returns before discovery.
+            // `explain` never reaches discovery: it returns above, with an
+            // undiscoverable project reported as an unresolved *target* rather
+            // than as a failure of the whole command.
+            Command::Explain { .. }
+            | Command::Init(_)
+            | Command::Schema { .. }
+            | Command::Completions { .. }
+            | Command::Man { .. }
+            | Command::Rename { .. }
+            | Command::RenameTable { .. }
+            | Command::Drop { .. }
+            | Command::DropTable { .. }
+            | Command::Docs { .. }
+            | Command::Pull { .. }
+            | Command::Apply { .. }
+            | Command::Snapshot { .. }
+            | Command::Baseline { .. }
+            | Command::Bootstrap { .. }
+            | Command::State { .. }
+            | Command::Unlock { .. } => return None,
+        };
+        (format == OutputFormat::Json).then_some(name)
+    }
 }
 
 #[derive(Subcommand)]
@@ -248,10 +394,15 @@ enum StateCommand {
     },
 }
 
-/// How a machine-readable command should speak.
+/// How a read-only command should speak.
+///
+/// `text` is kept as an alias for `human`: it is what the connected commands
+/// took before this became the one spelling across all of them (SPEC §14.1),
+/// and a pipeline that already passes it should not break to gain a synonym.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum OutputFormat {
-    Text,
+    #[value(name = "human", alias = "text")]
+    Human,
     Json,
 }
 
@@ -280,10 +431,15 @@ impl TargetArgs {
 
 fn main() {
     if let Err(e) = run() {
-        // Drift has already printed its own report; repeating "error: drift
-        // found" underneath it would add nothing but noise.
-        if e.downcast_ref::<DriftFound>().is_some() {
-            std::process::exit(EXIT_DRIFT);
+        if let Some(found) = e.downcast_ref::<Found>() {
+            // A report that already listed what it found prints nothing more;
+            // repeating "error: drift found" underneath it would add noise, not
+            // information.
+            let message = found.to_string();
+            if !message.is_empty() {
+                eprintln!("{message}");
+            }
+            std::process::exit(EXIT_FINDING);
         }
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -303,10 +459,102 @@ fn run() -> anyhow::Result<()> {
     if let Command::Init(args) = &cli.command {
         return init::cmd_init(&start, args);
     }
-    let project = Project::discover(&start)?;
+    // Like `init`, these three answer without a project. Requiring one would
+    // mean a user could not get completions installed until after they had
+    // succeeded at the thing completions are meant to help them do.
+    //
+    // Written as three `if let`s rather than one match with a catch-all: the
+    // catch-all is what `wildcard_enum_match_arm` exists to refuse, and here it
+    // would be right to refuse it — a new command that needs no project would
+    // otherwise fall silently into "discover a project first".
+    if let Command::Schema { kind, out } = &cli.command {
+        return integration::cmd_schema(*kind, out.as_deref());
+    }
+    if let Command::Completions { shell } = &cli.command {
+        return integration::cmd_completions(*shell);
+    }
+    if let Command::Man { out } = &cli.command {
+        return integration::cmd_man(out);
+    }
+    // `explain` needs a project only to look an --env name up in pbps.yml. The
+    // reviewer this command exists for may have been handed nothing but
+    // plan.json, in a directory with no project at all — and the plan carries
+    // its own dialect, so there is nothing else to discover. Requiring a
+    // checkout here would break the command's one promise.
+    if let Command::Explain {
+        plan,
+        target,
+        format,
+    } = &cli.command
+    {
+        // Every form of `explain` returns here, including `--env`. The `--env`
+        // form does need a project — the name only means something inside a
+        // `pbps.yml` — but that is a fact about the *environment*, not about
+        // the explanation, whose file half is the entire point of the command
+        // and must survive a reviewer with no checkout. Discovery failing used
+        // to suppress the whole report, the same mistake an unset `url_env`
+        // made one layer down and for the same reason.
+        let resolved = match (&target.db, &target.env) {
+            // Refused, not silently preferred, exactly as `db::target` refuses
+            // it for every other command. Taking `--db` and ignoring `--env`
+            // would check one target and print an approval command naming the
+            // other — the reviewer validates one database and pastes a command
+            // that applies to a different one. That is the single worst thing
+            // this command can produce.
+            (Some(_), Some(_)) => {
+                // Through the envelope like every other refusal this command
+                // can make. Added as a bare `return` one round earlier, which
+                // reintroduced the escape the rest of `explain` had just been
+                // cured of — a new refusal is still an answer the consumer has
+                // to be able to read.
+                return output::or_unanswerable(
+                    "explain",
+                    *format == OutputFormat::Json,
+                    "target.conflicting",
+                    Err(anyhow::anyhow!(
+                        "--db and --env name the same thing; pass one of them"
+                    )),
+                );
+            }
+            (Some(db), None) => explain::Target::Reachable(db::target_from_connection(db)),
+            (None, Some(_)) => explain::Target::from(
+                Project::discover(&start)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|project| target.resolve(&project)),
+            ),
+            (None, None) => explain::Target::None,
+        };
+        return explain::cmd_explain(
+            plan,
+            resolved,
+            target.env.as_deref(),
+            *format == OutputFormat::Json,
+        );
+    }
+    // Discovery is the one failure no command body can catch: it happens before
+    // dispatch, so `validate --format json` in a directory with no readable
+    // `pbps.yml` printed nothing at all and the converter reported its own
+    // generic "produced no output". It is also the first failure a new user
+    // meets. Which command was asked for, and whether it wanted JSON, is known
+    // here — which is all the envelope needs.
+    let project = match cli.command.json_envelope() {
+        Some(command) => output::or_unanswerable(
+            command,
+            true,
+            "project.undiscoverable",
+            Project::discover(&start).map_err(anyhow::Error::from),
+        )?,
+        None => Project::discover(&start)?,
+    };
 
     match cli.command {
-        Command::Init(_) => unreachable!("init returns before project discovery"),
+        Command::Init(_)
+        | Command::Schema { .. }
+        | Command::Completions { .. }
+        | Command::Man { .. }
+        | Command::Explain { .. } => {
+            unreachable!("these return before project discovery")
+        }
         Command::Plan {
             target,
             since,
@@ -316,18 +564,37 @@ fn run() -> anyhow::Result<()> {
             sql,
             staged,
             dev,
+            format,
         } => {
+            // Every refusal below goes through the envelope, not `bail!`. These
+            // are flag validations, so they run *before* `cmd_plan` and its
+            // JSON handling — which is exactly why they escaped it. A consumer
+            // told "produced no output" cannot say which flags contradicted.
+            let json = format == OutputFormat::Json;
+            //
+            // `Infallible` rather than `()`: `bail!` diverged, and replacing it
+            // with a call that merely *usually* returns `Err` would let a later
+            // edit fall through a refusal into the work it refuses. With this
+            // signature the compiler knows `refuse(..)?` cannot continue.
+            let refuse = |message: &str| -> anyhow::Result<std::convert::Infallible> {
+                output::or_unanswerable(
+                    "plan",
+                    json,
+                    "flags.conflicting",
+                    Err(anyhow::anyhow!("{message}")),
+                )
+            };
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
             // the deployment wants the plan for that environment.
             if target.db.is_some() || target.env.is_some() {
                 if check {
-                    bail!(
-                        "--check is the CI file check; it never connects, so it cannot take --db"
-                    );
+                    refuse(
+                        "--check is the CI file check; it never connects, so it cannot take --db",
+                    )?;
                 }
                 if base.is_some() {
-                    bail!("--base and --db name two different baselines; pass one of them");
+                    refuse("--base and --db name two different baselines; pass one of them")?;
                 }
                 if dev.is_some() {
                     // A rehearsal answers "would this compile and converge",
@@ -335,12 +602,37 @@ fn run() -> anyhow::Result<()> {
                     // artifact the deployment gate approves, and mixing the two
                     // would invite a dev-verified plan to be read as a
                     // target-verified one (SPEC §9.3).
-                    bail!(
+                    refuse(
                         "--dev rehearses a preview and --db computes the plan for a real \
-                         environment; run them separately"
-                    );
+                         environment; run them separately",
+                    )?;
                 }
-                let target = target.resolve(&project)?;
+                if json {
+                    // Refused rather than ignored. `--format json` was accepted
+                    // here and then dropped: `cmd_plan_db` prints human text, so
+                    // a consumer that asked for JSON got prose on success and an
+                    // *empty stdout* on every failure — while the flag
+                    // validations a few lines above, in the same invocation,
+                    // answered it properly. Silently honouring a flag in some
+                    // branches of one command is worse than not having it.
+                    //
+                    // Refused rather than implemented, because `plan --db` is
+                    // not a findings command: its output *is* an artifact. The
+                    // typed form of this plan already exists and is better than
+                    // an envelope would be — `--out plan.json`, which is the
+                    // file the deployment gate approves, read back by `explain
+                    // --plan --format json`. Adding a second typed rendering
+                    // would give a reviewer two documents to disagree about.
+                    refuse(
+                        "--format json describes findings, and `plan --db` produces a plan.\n                         Write it with --out <plan.json> and read it with                          `pbps explain --plan <plan.json> --format json`",
+                    )?;
+                }
+                let target = output::or_unanswerable(
+                    "plan",
+                    json,
+                    "environment.unconfigured",
+                    target.resolve(&project),
+                )?;
                 return deploy::cmd_plan_db(
                     &project,
                     &target,
@@ -352,9 +644,34 @@ fn run() -> anyhow::Result<()> {
             if staged {
                 // Staged execution is a property of a plan that is going to be
                 // applied, and an offline plan never is (SPEC §7.3).
-                bail!(
-                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env"
-                );
+                refuse(
+                    "--staged describes how a plan is applied, so it needs the target: pass --db or --env",
+                )?;
+            }
+            // `--check` changes nothing and connects to nothing, so it
+            // contradicts every flag that produces an artifact or opens a
+            // connection. All three are refused here, together, for one reason:
+            // the `--dev` half used to be a `bail!` deep inside `cmd_plan`
+            // (after the writes), which left `--format json` with empty stdout,
+            // and the `--out` / `--sql` half was not refused at all — a
+            // supposedly read-only check wrote the files whenever the identity
+            // file happened to be current.
+            //
+            // Refused rather than skipped: silently not writing a file CI asked
+            // for leaves the previous run's plan.sql on disk, and the job then
+            // reviews an artifact no run produced.
+            if check {
+                if dev.is_some() {
+                    refuse(
+                        "--check is the CI file check; it connects to nothing, so it cannot take --dev",
+                    )?;
+                }
+                if out.is_some() {
+                    refuse("--check changes no files, so it cannot take --out")?;
+                }
+                if sql.is_some() {
+                    refuse("--check changes no files, so it cannot take --sql")?;
+                }
             }
             let source = match base {
                 Some(p) => baseline::Source::File(p),
@@ -364,10 +681,18 @@ fn run() -> anyhow::Result<()> {
             cmd_plan(
                 &project,
                 &source,
-                check,
-                out.as_deref(),
-                sql.as_deref(),
-                dev.as_deref(),
+                PlanOptions {
+                    check,
+                    out: out.as_deref(),
+                    sql: sql.as_deref(),
+                    dev: dev.as_deref(),
+                    // `--check` is the CI file check and changes nothing, so it
+                    // must not be able to ask a question either: a prompt there
+                    // would hang a pipeline on a run that was supposed to be
+                    // read-only.
+                    may_prompt: !cli.no_input && !check,
+                    format,
+                },
             )
         }
         Command::Apply {
@@ -387,8 +712,28 @@ fn run() -> anyhow::Result<()> {
                 resume,
             )
         }
-        Command::Validate => cmd_validate(&project),
-        Command::Fmt { check } => cmd_fmt(&project, check),
+        Command::Doctor { target, format } => {
+            // The only connected command whose target is optional: with none it
+            // surveys every configured environment, which is what makes it
+            // worth running before a deployment.
+            //
+            // A resolution failure is *not* propagated here. An unset `url_env`
+            // variable is the most common first-run problem there is, and
+            // `doctor` has a diagnosis for it — `unconfigured`, with the remedy
+            // — which the all-environments path already produced. Failing at
+            // `?` instead made the single-environment path, the one a person
+            // onboarding actually types, the one that answered worst.
+            let one = match (&target.db, &target.env) {
+                (None, None) => None,
+                _ => Some(doctor::Requested {
+                    name: target.env.clone(),
+                    target: target.resolve(&project),
+                }),
+            };
+            doctor::cmd_doctor(&project, one, format == OutputFormat::Json)
+        }
+        Command::Validate { format } => cmd_validate(&project, format),
+        Command::Fmt { check, format } => cmd_fmt(&project, check, format),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
             cmd_intent(
@@ -427,8 +772,17 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
-            let target = target.resolve(&project)?;
-            deploy::cmd_verify(&project, &target, format == OutputFormat::Json)
+            let json = format == OutputFormat::Json;
+            // Resolving the target reads `url_env`, and an unset variable is the
+            // commonest first-run failure. It happens before the command body,
+            // so without this it would escape the envelope the command promises.
+            let target = output::or_unanswerable(
+                "verify",
+                json,
+                "environment.unconfigured",
+                target.resolve(&project),
+            )?;
+            deploy::cmd_verify(&project, &target, json)
         }
         Command::Snapshot { target, force } => {
             let target = target.resolve(&project)?;
@@ -500,9 +854,27 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
 
     let dir = project.schema_dir();
     if !force {
+        // A listing that *failed* is not an empty directory. This guard is the
+        // only thing standing between an unforced `pull` and the user's
+        // declarations, so reading "I could not look" as "there is nothing
+        // there" is the one mistake it must not make — the consequence is
+        // overwriting files nobody ever saw.
         let existing = if dir.is_dir() {
-            pbps_load::schema_files(&dir).unwrap_or_default()
+            pbps_load::schema_files(&dir)
+                .with_context(|| format!("cannot list `{}`", dir.display()))?
+        } else if dir.exists() {
+            // Present and not a directory: the project is misconfigured, and
+            // "there are no declarations here" is not the right reading of it.
+            // Taken as one, an unforced pull would go on to create the
+            // directory beside it or fail halfway through writing.
+            bail!(
+                "`{}` exists and is not a directory; pbps cannot tell what declarations this \
+                 project has",
+                dir.display()
+            );
         } else {
+            // Genuinely absent, which is the ordinary adoption case: a project
+            // that has never had declarations is exactly what `pull` is for.
             Vec::new()
         };
         // `init` deliberately creates a versioned empty identity file. That is
@@ -579,7 +951,13 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     // already means "replace my declarations with this database"; this is the
     // rest of that sentence.
     let mut removed = Vec::new();
-    for path in pbps_load::schema_files(&dir).unwrap_or_default() {
+    // Same reading as the guard above, for the same reason in the other
+    // direction: a failed listing that came back empty would silently skip the
+    // cleanup and leave exactly the two-files-one-name state this block exists
+    // to prevent.
+    let present = pbps_load::schema_files(&dir)
+        .with_context(|| format!("cannot list `{}`", dir.display()))?;
+    for path in present {
         if written.contains(&path) {
             continue;
         }
@@ -626,18 +1004,51 @@ fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     }
 }
 
-/// Loads the declarations, printing every error in one pass.
-fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
+/// Loads the declarations, returning every error in one pass.
+///
+/// Silent, because `validate` has to decide how to render these — as miette
+/// diagnostics or as JSON findings — and a helper that had already printed them
+/// would leave it choosing between saying nothing and saying it twice.
+pub(crate) fn load_quiet(
+    project: &Project,
+) -> Result<pbps_load::Loaded, Vec<pbps_load::LoadError>> {
     let dir = project.schema_dir();
     if !dir.is_dir() {
-        bail!("no declarations directory at `{}`", dir.display());
+        return Err(vec![pbps_load::LoadError::Io {
+            path: dir.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no declarations directory"),
+        }]);
     }
-    pbps_load::load_schema_dir(&dir).map_err(|errs| {
+    pbps_load::load_schema_dir(&dir)
+}
+
+/// Loads the declarations, printing every error in one pass.
+fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
+    load_quiet(project).map_err(|errs| {
         for e in &errs {
-            eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+            print_load_error(e);
         }
         anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
     })
+}
+
+/// Renders one load error the way a person should see it.
+///
+/// The loader's own diagnostics already carry the source excerpt and the caret,
+/// so they are rendered rather than reduced to their message — the JSON view
+/// takes the reduced form instead, because a caret is not something a consumer
+/// can act on.
+fn print_load_error(e: &pbps_load::LoadError) {
+    eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+}
+
+/// One load error as a typed finding.
+fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
+    let f = output::Finding::error(e.id(), e.to_string());
+    match e.path() {
+        Some(p) => f.at(p, e.line()),
+        None => f,
+    }
 }
 
 /// Reads the identity file, or `None` when the project has none yet.
@@ -685,34 +1096,49 @@ fn context() -> Context {
     }
 }
 
-fn cmd_validate(project: &Project) -> anyhow::Result<()> {
-    // Identity consistency is validate's job too (SPEC §5.3): two branches each
-    // adding a same-named column merge cleanly at the line level — two uids, two
-    // lines — so no git conflict flags it, and only a check can.
-    //
+/// Everything `validate` checks, as findings.
+///
+/// Extracted so `doctor` can run the same checks rather than a second, drifting
+/// copy of them (SPEC §14.1). A readiness command that disagreed with `validate`
+/// about whether the declarations are valid would be worse than one that never
+/// looked.
+pub fn validate_findings(
+    project: &Project,
+    dialect: &dyn Dialect,
+) -> (Vec<output::Finding>, ValidateData) {
     // Both halves run before either is allowed to fail. A bad merge produces a
     // broken declaration *and* a scrambled identity file together, and the rule
     // everywhere else in this tool is to report every problem in one pass rather
     // than fix-one-run-again.
-    let loaded = load(project);
+    let loaded = load_quiet(project);
+    // Identity consistency is validate's job too (SPEC §5.3): two branches each
+    // adding a same-named column merge cleanly at the line level — two uids, two
+    // lines — so no git conflict flags it, and only a check can.
     let ids = read_ids_opt(project);
-    let dialect = dialect(project)?;
+
+    let mut findings = Vec::new();
+    if let Err(errs) = &loaded {
+        findings.extend(errs.iter().map(load_finding));
+    }
 
     // Three layers, all reported in the same pass: the loader checks shape, the
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the identity file checks below stand alone.
-    let mut dialect_problems = 0usize;
     if let Ok(l) = &loaded {
         for (name, table) in &l.schema.tables {
             for e in dialect.validate_table(name, table) {
-                eprintln!("  {name}: {e}");
-                dialect_problems += 1;
+                findings.push(output::Finding::error(
+                    "dialect.rejected",
+                    format!("{name}: {e}"),
+                ));
             }
         }
         for (name, module) in &l.schema.modules {
             for e in dialect.validate_module(name, module) {
-                eprintln!("  {name}: {e}");
-                dialect_problems += 1;
+                findings.push(output::Finding::error(
+                    "dialect.rejected",
+                    format!("{name}: {e}"),
+                ));
             }
         }
         // Two problems only the whole schema can see: a module named after a
@@ -720,55 +1146,144 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
         // surface as an engine error at apply time, on a database that is
         // already half-changed.
         for problem in pbps_model::module::check_names(&l.schema) {
-            eprintln!("  {problem}");
-            dialect_problems += 1;
+            findings.push(output::Finding::error("schema.name-collision", problem));
         }
         // And a third: a `depends_on:` naming a module nobody declared. It is
         // silently a no-op in the ordering, so nothing else would ever say so.
         for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
-            eprintln!("  {problem}");
-            dialect_problems += 1;
-        }
-        if dialect_problems == 0 {
-            println!(
-                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
-                dialect.name(),
-                l.schema.tables.len(),
-                l.schema
-                    .tables
-                    .values()
-                    .map(|t| t.columns.len())
-                    .sum::<usize>(),
-                l.schema.modules.len()
-            );
+            findings.push(output::Finding::error("schema.unknown-dependency", problem));
         }
     }
-    // `load` produces the specific reason (a missing directory, N problem(s));
-    // without this the run ends on the generic bail below and never says what
-    // was wrong.
-    if let Err(e) = &loaded {
-        eprintln!("  {e:#}");
-    }
-    match &ids {
-        Ok(Some(i)) => println!(
-            "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
-            i.tables.len(),
-            i.columns.len(),
-            i.tombstones.len()
-        ),
-        Ok(None) => println!(
-            "No identity file yet at `{}`; run `pbps plan` to create it.",
-            project.ids_file().display()
-        ),
-        Err(e) => eprintln!("  {e:#}"),
+    if let Err(e) = &ids {
+        findings.push(
+            output::Finding::error("identity.inconsistent", format!("{e:#}"))
+                .at(project.ids_file(), None),
+        );
     }
 
-    match (loaded.is_err() || dialect_problems > 0, ids.is_err()) {
-        (false, false) => Ok(()),
-        (true, false) => bail!("the declarations did not validate"),
-        (false, true) => bail!("the identity file did not validate"),
-        (true, true) => bail!("neither the declarations nor the identity file validated"),
+    let data = ValidateData {
+        dialect: dialect.name(),
+        tables: loaded.as_ref().map(|l| l.schema.tables.len()).unwrap_or(0),
+        columns: loaded
+            .as_ref()
+            .map(|l| l.schema.tables.values().map(|t| t.columns.len()).sum())
+            .unwrap_or(0),
+        modules: loaded.as_ref().map(|l| l.schema.modules.len()).unwrap_or(0),
+        identity: match &ids {
+            Ok(Some(i)) => Some(IdentityCounts {
+                tables: i.tables.len(),
+                columns: i.columns.len(),
+                tombstones: i.tombstones.len(),
+            }),
+            _ => None,
+        },
+    };
+    (findings, data)
+}
+
+fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
+    // `postgres` is an accepted `DialectName` with no implementation yet, so
+    // this is a reachable failure on a perfectly valid project — and it escaped
+    // before the JSON branch, leaving stdout empty.
+    let dialect = match dialect(project) {
+        Ok(d) => d,
+        Err(e) => {
+            if format == OutputFormat::Json {
+                let report = output::Report::plain(
+                    "validate",
+                    vec![
+                        output::Finding::error("project.unsupported-dialect", format!("{e:#}"))
+                            .at(project.config_file(), None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
+    let (findings, data) = validate_findings(project, dialect.as_ref());
+    let report = output::Report::new("validate", findings, Some(data));
+
+    if format == OutputFormat::Json {
+        return report.emit_json();
     }
+
+    // The human view keeps the loader's own diagnostics, which quote the source
+    // and point a caret at the value. Reducing them to the finding's one-line
+    // message here would throw away the part that makes them worth having.
+    let load_errors: Vec<&output::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("load."))
+        .collect();
+    if !load_errors.is_empty() {
+        // Re-loading to render is cheap and keeps one collection point for the
+        // checks; the alternative is `validate_findings` returning the raw
+        // errors as well and every other caller ignoring them.
+        if let Err(errs) = load_quiet(project) {
+            for e in &errs {
+                print_load_error(e);
+            }
+        }
+    }
+    let unlocated: Vec<output::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| !f.id.starts_with("load."))
+        .cloned()
+        .collect();
+    eprint!("{}", output::human(&unlocated));
+
+    if let Some(d) = &report.data {
+        if load_errors.is_empty() && unlocated.is_empty() {
+            println!(
+                "Declarations are valid for {}: {} table(s), {} column(s), {} module(s).",
+                d.dialect, d.tables, d.columns, d.modules
+            );
+        }
+        match &d.identity {
+            Some(i) => println!(
+                "Identity file is consistent: {} table uid(s), {} column uid(s), {} tombstone(s).",
+                i.tables, i.columns, i.tombstones
+            ),
+            None if !report
+                .findings
+                .iter()
+                .any(|f| f.id == "identity.inconsistent") =>
+            {
+                println!(
+                    "No identity file yet at `{}`; run `pbps plan` to create it.",
+                    project.ids_file().display()
+                )
+            }
+            None => {}
+        }
+    }
+
+    report.outcome()
+}
+
+/// What `validate` counted, for `--format json`.
+///
+/// Present even when the run failed: a consumer showing "3 of 40 tables are
+/// broken" needs the 40, and a payload that vanished on failure would make the
+/// only interesting case the one with no context.
+#[derive(serde::Serialize)]
+pub struct ValidateData {
+    pub dialect: &'static str,
+    pub tables: usize,
+    pub columns: usize,
+    pub modules: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityCounts>,
+}
+
+#[derive(serde::Serialize)]
+pub struct IdentityCounts {
+    pub tables: usize,
+    pub columns: usize,
+    pub tombstones: usize,
 }
 
 /// Canonicalizes every declaration file.
@@ -776,10 +1291,15 @@ fn cmd_validate(project: &Project) -> anyhow::Result<()> {
 /// This rewrites each file in full, so ordinary YAML comments are lost —
 /// explanatory prose belongs in a `description` field (SPEC §4.2, "the tool owns
 /// the file format").
-fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
+fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Result<()> {
     let dir = project.schema_dir();
-    let files = pbps_load::schema_files(&dir)
-        .with_context(|| format!("cannot list `{}`", dir.display()))?;
+    let json = format == OutputFormat::Json;
+    let files = output::or_unanswerable(
+        "fmt",
+        json,
+        "load.io",
+        pbps_load::schema_files(&dir).with_context(|| format!("cannot list `{}`", dir.display())),
+    )?;
 
     // Stripping a redundant `renamed_from` is fmt's job, not plan's: plan writes
     // only the ids file and never the user's YAML (SPEC §6.2). Redundancy is
@@ -791,22 +1311,49 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
     // user reaches for fmt; treating it as "nothing absorbed" keeps every
     // annotation, which is the safe direction. `validate` and `plan` still refuse
     // to run on it, so the corruption is not swallowed.
+    let mut findings: Vec<output::Finding> = Vec::new();
     let ids = match read_ids(project) {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("warning: {e:#}");
-            eprintln!("warning: every `renamed_from` will be kept; run `pbps validate` to fix it");
+            findings.push(
+                output::Finding::warning(
+                    "identity.unreadable",
+                    format!("{e:#}; every `renamed_from` will be kept until it is fixed"),
+                )
+                .at(project.ids_file(), None)
+                .remedy("pbps validate"),
+            );
             IdsFile::default()
         }
     };
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for path in &files {
-        let original = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read `{}`", path.display()))?;
+        let original = output::or_unanswerable(
+            "fmt",
+            json,
+            "load.io",
+            std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read `{}`", path.display())),
+        )?;
         let loaded = pbps_load::load_file_str(path, &original).map_err(|errs| {
-            for e in &errs {
-                eprintln!("{:?}", miette::Report::msg(format!("{e}")));
+            // A file that does not parse cannot be canonicalized, and guessing
+            // at what it meant would be the tool rewriting something it did not
+            // understand. This is a tool failure rather than a finding: `fmt`
+            // did not get to answer its own question.
+            if format == OutputFormat::Human {
+                for e in &errs {
+                    print_load_error(e);
+                }
+            } else {
+                // Unanswerable: `fmt` did not get to decide whether the file is
+                // canonical, because it could not read it. The findings are the
+                // parse errors, but the routing is "the tool could not run".
+                let report = output::Report::plain("fmt", errs.iter().map(load_finding).collect())
+                    .unanswerable();
+                if let Ok(text) = serde_json::to_string_pretty(&report) {
+                    println!("{text}");
+                }
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
@@ -835,37 +1382,91 @@ fn cmd_fmt(project: &Project, check: bool) -> anyhow::Result<()> {
         }
         changed.push((path.clone(), absorbed));
         if !check {
-            std::fs::write(path, &rendered)
-                .with_context(|| format!("cannot write `{}`", path.display()))?;
+            // The rewrite is what `fmt` is for, so failing it is the command
+            // not finishing — and the path is the whole of the remedy, which a
+            // consumer only gets if the envelope names it. Same wrapper as the
+            // listing and the read above; this write was simply missed when
+            // those two were done.
+            output::or_unanswerable(
+                "fmt",
+                json,
+                "load.io",
+                std::fs::write(path, &rendered)
+                    .with_context(|| format!("cannot write `{}`", path.display())),
+            )?;
         }
     }
 
+    // In check mode an unformatted file is the finding; in write mode it has
+    // just been fixed, so it is a note. The same list either way — a consumer
+    // asking "what did fmt touch" gets one answer whichever mode ran.
+    for (p, _) in &changed {
+        findings.push(if check {
+            output::Finding::error("fmt.not-canonical", "not in canonical form")
+                .at(p, None)
+                .remedy("pbps fmt")
+        } else {
+            output::Finding::note("fmt.rewritten", "rewritten in canonical form").at(p, None)
+        });
+    }
+    // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
+    // cannot tell "this rename happened" from "this rename never applied": a
+    // `renamed_from` naming a column that never existed also looks absorbed,
+    // because the ids file records no history to distinguish them. Naming what
+    // went is the only thing that lets the user catch the typo.
+    if !check {
+        for (p, absorbed) in &changed {
+            for i in absorbed {
+                findings.push(
+                    output::Finding::note(
+                        "fmt.annotation-dropped",
+                        format!("dropped a redundant annotation: {}", report::intent(i)),
+                    )
+                    .at(p, None),
+                );
+            }
+        }
+    }
+
+    let report = output::Report::new(
+        "fmt",
+        findings,
+        Some(FmtData {
+            checked: files.len(),
+            changed: changed.len(),
+            mode: if check { "check" } else { "write" },
+        }),
+    );
+    if format == OutputFormat::Json {
+        return report.emit_json();
+    }
+
+    eprint!("{}", output::human(&report.findings));
     if changed.is_empty() {
         println!("All {} file(s) are already in canonical form.", files.len());
-        return Ok(());
+        return report.outcome();
     }
-
     if check {
-        for (p, _) in &changed {
-            eprintln!("  needs rewriting: {}", p.display());
-        }
-        bail!(
+        return Err(Found::new(format!(
             "{} file(s) are not in canonical form; run `pbps fmt`",
             changed.len()
-        );
+        ))
+        .into());
     }
-    for (p, absorbed) in &changed {
+    for (p, _absorbed) in &changed {
         println!("rewrote {}", p.display());
-        // Deleting a line the user wrote must never be silent. `intent_is_absorbed`
-        // cannot tell "this rename happened" from "this rename never applied": a
-        // `renamed_from` naming a column that never existed also looks absorbed,
-        // because the ids file records no history to distinguish them. Naming what
-        // went is the only thing that lets the user catch the typo.
-        for i in absorbed {
-            println!("  dropped a redundant annotation: {}", report::intent(i));
-        }
     }
-    Ok(())
+    report.outcome()
+}
+
+/// What `fmt` looked at, for `--format json`.
+#[derive(serde::Serialize)]
+struct FmtData {
+    checked: usize,
+    changed: usize,
+    /// `check` or `write`. The findings mean different things in each, and a
+    /// consumer must not have to infer which ran from their severity.
+    mode: &'static str,
 }
 
 /// Records one intent: re-resolves identity with it, then writes the identity
@@ -890,42 +1491,265 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
         }
         Err(blockers) => {
             eprintln!("{}", report::blockers(&blockers));
-            bail!("identity could not be resolved")
+            Err(Found::new("identity could not be resolved").into())
         }
     }
+}
+
+/// Resolves identity, asking the user when there is one and a question to ask.
+///
+/// The prompt of SPEC §6.3 is a convenience wrapper over §6.1: what it produces
+/// is exactly the intents `pbps rename` and `pbps drop` produce, resolved by the
+/// same call. So a declined or impossible prompt has nothing to undo — it falls
+/// through to §6.4's copy-pastable commands, which is also the behaviour with no
+/// terminal at all.
+///
+/// # Why this loops
+///
+/// One blocker is not one question. A table that lost two columns and gained two
+/// reaches here as a single `AmbiguousColumns` holding all four names, and
+/// answering it names one pair — the other pair is still ambiguous. Asking once
+/// per blocker would therefore make a two-column rename impossible to complete
+/// interactively *and* throw away the answer already given, which is the worst
+/// of both. So each round of answers is folded in and identity re-resolved, and
+/// whatever is still ambiguous is asked again.
+fn resolve_with_intent(
+    project: &Project,
+    loaded: &pbps_load::Loaded,
+    ids: &IdsFile,
+    may_prompt: bool,
+    quiet: bool,
+) -> anyhow::Result<Result<pbps_diff::Resolution, Vec<pbps_diff::Blocker>>> {
+    let mut intents = loaded.intents.clone();
+    let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
+        Ok(r) => return Ok(Ok(r)),
+        Err(b) => b,
+    };
+    let mut blockers = original.clone();
+
+    if may_prompt && prompt::interactive() {
+        // The copy-pastable commands are *not* printed above the prompt. They
+        // are the no-TTY answer (§6.4), and offering to do the thing while
+        // telling the user to go and type it is one instruction too many.
+        while let Some(answers) = prompt::ask(&blockers) {
+            let before = intents.len();
+            intents.extend(answers);
+            if intents.len() == before {
+                // A round that asked and learned nothing. Nothing here produces
+                // that today, but looping forever on a blocker with no choices
+                // would be a hang rather than a bug report.
+                break;
+            }
+            // Re-resolved from scratch rather than patched: the answers are
+            // ordinary intents, and running them through the same call is what
+            // makes the prompt a wrapper rather than a second implementation of
+            // identity resolution.
+            match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
+                Ok(r) => {
+                    // Written now, so the answers survive whatever the rest of
+                    // this plan does. They are the user's decisions, and losing
+                    // them to a later failure would mean asking again.
+                    // Silently: the caller compares against the pre-prompt
+                    // mapping and prints one "updated" line, and two messages
+                    // about one file would read as two files.
+                    //
+                    // Through the envelope like the caller's own write: this
+                    // is a *second* path to the same file, reached only from
+                    // an interactive session, and wrapping the caller's alone
+                    // left this one escaping. `quiet` is the JSON flag under
+                    // another name — the caller passes it so nothing prints
+                    // above a prompt.
+                    output::or_unanswerable(
+                        "plan",
+                        quiet,
+                        "identity.unwritable",
+                        write_ids(project, &r.ids),
+                    )?;
+                    return Ok(Ok(r));
+                }
+                Err(again) => blockers = again,
+            }
+        }
+        // Declined, or answered with something that is not an option. Falling
+        // through to the no-TTY output rather than exiting quietly: the user
+        // still needs the commands, and they may well have stopped because they
+        // wanted to think about it somewhere other than a prompt.
+        //
+        // The commands printed are for the *original* blockers, not whatever is
+        // left after a partial round. Nothing was recorded, so the user is back
+        // where they started — and a list covering only the questions they had
+        // not reached yet would silently omit the ones they had.
+        eprintln!("\nNothing was recorded.");
+        blockers = original;
+    }
+    // Silent when the caller is going to render these itself — as JSON, where a
+    // prose report on stderr beside a JSON document on stdout would be two
+    // descriptions of one failure.
+    if !quiet {
+        eprintln!("{}", report::blockers(&blockers));
+    }
+    Ok(Err(blockers))
+}
+
+/// What `plan` produced, for `--format json`.
+///
+/// The changes are counted rather than listed: the typed change set is what
+/// `--out` writes, and `explain` is what renders it. Two spellings of the same
+/// list, one of them abbreviated, is how a consumer comes to read the wrong one.
+#[derive(serde::Serialize)]
+struct PlanData {
+    baseline: String,
+    changes: usize,
+    tables: usize,
+    /// Counted apart from tables: a module change's `Change::table()` is the
+    /// module's own name, so folding them together called a one-view plan
+    /// "1 table" (ADR-0002).
+    modules: usize,
+    risks: Vec<&'static str>,
+}
+
+/// What an offline `plan` was asked to do.
+///
+/// Grouped rather than passed one by one: the list grew past the point where a
+/// call site reads as anything but a row of booleans, and `cmd_plan(.., true,
+/// false, ..)` is how the wrong flag gets wired to the wrong behaviour.
+struct PlanOptions<'a> {
+    check: bool,
+    out: Option<&'a std::path::Path>,
+    sql: Option<&'a std::path::Path>,
+    dev: Option<&'a str>,
+    /// False when there is no terminal, when `--no-input` was given, and always
+    /// under `--check` — the read-only CI check must not be able to ask a
+    /// question, or a pipeline hangs on one nobody can see.
+    may_prompt: bool,
+    format: OutputFormat,
 }
 
 fn cmd_plan(
     project: &Project,
     source: &baseline::Source,
-    check: bool,
-    out: Option<&std::path::Path>,
-    sql: Option<&std::path::Path>,
-    dev: Option<&str>,
+    opts: PlanOptions<'_>,
 ) -> anyhow::Result<()> {
-    let loaded = load(project)?;
-    let ids = read_ids(project)?;
-    let dialect = dialect(project)?;
+    let PlanOptions {
+        check,
+        out,
+        sql,
+        dev,
+        may_prompt,
+        format,
+    } = opts;
+    // Decided first. Everything below can fail, and a failure that escaped
+    // before this was decided printed prose to stderr and nothing to stdout —
+    // so a consumer asking for JSON got "pbps produced no output" instead of the
+    // typed `load.*` findings it was owed.
+    let json = format == OutputFormat::Json;
 
-    let res = match pbps_diff::resolve(&loaded.schema, &ids, &loaded.intents, &context()) {
+    let loaded = match load_quiet(project) {
+        Ok(l) => l,
+        Err(errs) => {
+            // Unanswerable rather than a finding: `plan`'s question is "what
+            // changes", and with declarations it cannot read it did not answer
+            // that. The parse errors are still the findings — the user needs
+            // them either way — and the exit code is 1 in both formats, as it
+            // was before this branch existed. `validate` is the command whose
+            // question *is* "are these valid", and there they are a finding.
+            if json {
+                let report = output::Report::plain("plan", errs.iter().map(load_finding).collect())
+                    .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for e in &errs {
+                    print_load_error(e);
+                }
+            }
+            bail!("the declarations have {} problem(s)", errs.len());
+        }
+    };
+    // The identity file is read here for the same reason the declarations were
+    // above: `?` on it escaped before serialization, so a malformed or
+    // inconsistent ids file left stdout empty. Wrapping only `load` fixed half
+    // of one problem.
+    let ids = match read_ids(project) {
+        Ok(i) => i,
+        Err(e) => {
+            if json {
+                let report = output::Report::plain(
+                    "plan",
+                    vec![
+                        output::Finding::error("identity.unreadable", format!("{e:#}"))
+                            .at(project.ids_file(), None),
+                    ],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
+    let dialect = output::or_unanswerable(
+        "plan",
+        json,
+        "project.unsupported-dialect",
+        dialect(project),
+    )?;
+
+    let mut findings: Vec<output::Finding> = Vec::new();
+
+    let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
         Ok(r) => r,
         Err(blockers) => {
-            eprintln!("{}", report::blockers(&blockers));
-            bail!(
-                "some changes could not be decided automatically; express the intent with the commands above and retry"
-            );
+            // A finding, not a tool failure: pbps did its job and is asking a
+            // question only a human can answer (SPEC §6.1). CI must be able to
+            // tell that apart from "the tool broke".
+            if json {
+                let report = output::Report::new(
+                    "plan",
+                    blockers.iter().map(report::blocker_finding).collect(),
+                    None::<PlanData>,
+                );
+                return report.emit_json();
+            }
+            return Err(Found::new(
+                "some changes could not be decided automatically; express the intent with the commands above and retry",
+            )
+            .into());
         }
     };
 
     if res.ids != ids {
         if check {
-            bail!(
+            let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_file().display()
             );
+            if json {
+                let report = output::Report::new(
+                    "plan",
+                    vec![
+                        output::Finding::error("identity.stale", message)
+                            .at(project.ids_file(), None)
+                            .remedy("pbps plan"),
+                    ],
+                    None::<PlanData>,
+                );
+                return report.emit_json();
+            }
+            return Err(Found::new(message).into());
         }
-        write_ids(project, &res.ids)?;
-        println!("updated {}", project.ids_file().display());
+        // The identity file is the artifact `plan` exists to maintain — it is
+        // what the MR reviews and what every later comparison matches by uid
+        // — so failing to write it is as much a failure of the command as
+        // failing to write `--out`. Those two were wrapped a commit earlier;
+        // this one, the more important of the three, was not.
+        output::or_unanswerable(
+            "plan",
+            json,
+            "identity.unwritable",
+            write_ids(project, &res.ids),
+        )?;
+        if !json {
+            println!("updated {}", project.ids_file().display());
+        }
     }
 
     // plan never rewrites the user's YAML (SPEC §6.2), so without this line
@@ -937,15 +1761,37 @@ fn cmd_plan(
         .iter()
         .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids))
     {
-        println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+        findings.push(
+            output::Finding::note(
+                "fmt.redundant-annotation",
+                "the `renamed_from` annotation(s) just absorbed into the identity file are now redundant",
+            )
+            .remedy("pbps fmt"),
+        );
+        if !json {
+            println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+        }
     }
 
-    let base = baseline::load(project, source)?;
+    // A `--base` that is missing, malformed or of an unsupported version is a
+    // failure of the *input*, not of the plan: the command never got as far as
+    // comparing anything, so it is unanswerable rather than a finding.
+    let base = output::or_unanswerable(
+        "plan",
+        json,
+        "baseline.unreadable",
+        baseline::load(project, source),
+    )?;
     if base.is_empty_fallback {
-        eprintln!(
-            "warning: the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
+        let message = format!(
+            "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
             base.description
         );
+        if json {
+            findings.push(output::Finding::warning("baseline.empty", message));
+        } else {
+            eprintln!("warning: {message}");
+        }
     }
 
     // Drop ordering is computed over the *baseline's* modules, so it needs the
@@ -977,20 +1823,45 @@ fn cmd_plan(
         &hints,
     )
     .map_err(|errs| {
-        for e in &errs {
-            eprintln!("  {e}");
+        // Structured, not wrapped through `or_unanswerable`: the differ hands
+        // back one error per change it cannot express, and collapsing them into
+        // a single message would throw away the column name that is the whole
+        // remedy. Each becomes its own finding, carrying the id a future
+        // `policies:` block can re-weight.
+        if json {
+            let report = output::Report::plain(
+                "plan",
+                errs.iter()
+                    .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
+                    .collect(),
+            )
+            .unanswerable();
+            let _ = report.emit_json();
+        } else {
+            for e in &errs {
+                eprintln!("  {e}");
+            }
         }
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
 
-    println!("Baseline: {}", base.description);
-    print!("{}", report::plan(&cs));
+    if !json {
+        println!("Baseline: {}", base.description);
+        print!("{}", report::plan(&cs));
+    }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
     // offline plan has no edition to ask. Saying so is the honest form of a
     // preview — the alternative is a plan.sql that reads as verified and turns
     // out to be Enterprise-only at the deployment gate.
-    if cs.changes.iter().any(|c| c.strategy.online) {
+    if cs.changes.iter().any(|c| c.strategy.online) && json {
+        findings.push(output::Finding::note(
+            "strategy.online-unverified",
+            "`strategy: online` is emitted unverified: online index operations are Enterprise-only, \
+             and only `pbps plan --db` can read the target's edition",
+        ));
+    }
+    if cs.changes.iter().any(|c| c.strategy.online) && !json {
         println!(
             "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
              Enterprise-only, and only `pbps plan --db` can read the target's edition."
@@ -1013,56 +1884,142 @@ fn cmd_plan(
             cs.clone(),
             res.ids.clone(),
         );
-        plan.git_sha = db::git_sha();
-        write_plan(path, &plan)?;
-        println!(
-            "\nwrote {} (a preview; `apply` will refuse it)",
-            path.display()
-        );
+        plan.git_sha = db::git_sha(project.root());
+        // The artifact is the deliverable, so failing to write it is a failure
+        // of the whole command — but it is still the *command* that could not
+        // finish, not a finding about the declarations. A read-only or missing
+        // parent directory is the ordinary way this happens in CI.
+        output::or_unanswerable("plan", json, "plan.unwritable", write_plan(path, &plan))?;
+        if !json {
+            println!(
+                "\nwrote {} (a preview; `apply` will refuse it)",
+                path.display()
+            );
+        }
     }
 
     if let Some(path) = sql {
-        let script = render_sql(&cs, dialect.as_ref(), &base.description)?;
-        std::fs::write(path, script)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        println!("wrote {}", path.display());
+        // Rendering can fail for the same reason `explain` can — a typed change
+        // the emitter refuses — and writing for the same reason `--out` can.
+        // Both leave the command unable to produce what it was asked for.
+        let script = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unwritable",
+            render_sql(&cs, dialect.as_ref(), &base.description),
+        )?;
+        output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unwritable",
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display())),
+        )?;
+        if !json {
+            println!("wrote {}", path.display());
+        }
     }
 
     // The dev database is optional and is asked last: everything above is what
     // a plan produces with no engine in the room, and it must be identical
     // whether or not one is available (SPEC §9.3).
-    if check && dev.is_some() {
-        bail!("--check is the CI file check; it changes nothing and connects to nothing");
-    }
-    // The refusal above is for the flag; the `dev:` block in pbps.yml has to be
-    // skipped rather than refused, or a project that configures one could never
-    // run `plan --check` at all. Either way --check must not start a container
-    // or open a connection: it is the read-only file check CI runs.
+    // `--check --dev` is refused at the flag site, through the envelope. The
+    // `dev:` block in pbps.yml is a different question and has to be *skipped*
+    // rather than refused, or a project that configures one could never run
+    // `plan --check` at all. Either way --check must not start a container or
+    // open a connection: it is the read-only file check CI runs.
+    // A rehearsal that could not be *set up* — no docker, a dev database that
+    // does not answer — is unanswerable, distinct from one that ran and found
+    // the plan does not converge (a finding, below). Confusing the two would
+    // tell CI the plan is wrong when the rehearsal never happened.
     let dev_spec = if check {
         None
     } else {
-        dev::spec(project, dev)?
+        output::or_unanswerable(
+            "plan",
+            json,
+            "rehearsal.unavailable",
+            dev::spec(project, dev),
+        )?
     };
     if let Some(spec) = dev_spec {
-        let rehearsal = dev::rehearse(
-            project,
-            &spec,
-            &base.schema,
-            &base.ids,
-            &base.hints,
-            &loaded.schema,
-            &res.ids,
-            &statements(&cs, dialect.as_ref())?,
-            dialect.as_ref(),
-            &loaded.hints,
+        // Rendered first, and wrapped in its own right. As an argument it was
+        // evaluated *before* the wrapper was entered, so an emitter refusal
+        // here escaped exactly the envelope the call around it was added to
+        // guarantee. A `?` inside an argument list is invisible at a glance,
+        // which is why this is a separate statement now.
+        let statements = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unrenderable",
+            statements(&cs, dialect.as_ref()),
         )?;
-        print!("{}", report::rehearsal(&rehearsal));
-        if !rehearsal.converged() {
-            bail!(
-                "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n\
-                 differences above are what would be left behind"
-            );
+        let rehearsal = output::or_unanswerable(
+            "plan",
+            json,
+            "rehearsal.unavailable",
+            dev::rehearse(
+                project,
+                &spec,
+                &base.schema,
+                &base.ids,
+                &base.hints,
+                &loaded.schema,
+                &res.ids,
+                &statements,
+                dialect.as_ref(),
+                &loaded.hints,
+            ),
+        )?;
+        // Run in both formats. Skipping it in JSON mode made an output-format
+        // choice silently disable a validation the project had asked for — a
+        // plan that does not converge would have come back `result: "ok"`.
+        if json {
+            for d in &rehearsal.structural {
+                findings.push(output::Finding::error(
+                    "rehearsal.does-not-converge",
+                    format!("after applying the plan, the database still differs: {d}"),
+                ));
+            }
+            for d in &rehearsal.spelling {
+                findings.push(
+                    output::Finding::warning(
+                        "rehearsal.spelling",
+                        format!(
+                            "the engine stores this differently, costing one rebuilt constraint \
+                             per apply until the declaration is written in its stored form: {d}"
+                        ),
+                    )
+                    .remedy("rewrite the declaration in the form shown"),
+                );
+            }
+        } else {
+            print!("{}", report::rehearsal(&rehearsal));
+            if !rehearsal.converged() {
+                return Err(Found::new(
+                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                     differences above are what would be left behind",
+                )
+                .into());
+            }
         }
+    }
+
+    if json {
+        let (tables, modules) = report::touched(&cs);
+        let report = output::Report::new(
+            "plan",
+            findings,
+            Some(PlanData {
+                baseline: base.description.clone(),
+                changes: cs.changes.len(),
+                tables,
+                modules,
+                risks: cs.risks().iter().map(|r| r.as_str()).collect(),
+            }),
+        );
+        // A non-converging rehearsal is an error finding, so `outcome` exits 2
+        // here exactly as `Found` does in the human path.
+        return report.emit_json();
     }
     Ok(())
 }

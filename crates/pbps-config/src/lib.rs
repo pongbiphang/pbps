@@ -40,7 +40,9 @@ pub enum ConfigError {
 /// A project is bound to exactly one dialect. "Supports multiple databases" means
 /// the tool can drive different databases, not that one set of declarations
 /// deploys to both (SPEC §1.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DialectName {
     Mssql,
@@ -67,7 +69,17 @@ impl std::fmt::Display for DialectName {
 ///
 /// `Ignore` is the default because it is the precondition for gradual adoption:
 /// pbps has to be able to share a database with tooling that was there first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Unmanaged {
     #[default]
@@ -86,7 +98,9 @@ pub enum Unmanaged {
 /// with a second, undocumented field: an inline `url:` would be a credential in
 /// version control, and the one thing worse than not having the feature is
 /// having it and being surprised by it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Environment {
     /// The name of the environment variable holding the ADO.NET connection
@@ -114,7 +128,9 @@ impl Environment {
 /// There are no Slack or Teams integrations here on purpose. An exec hook
 /// outlives any chat API, holds no credentials of its own, and lets a team
 /// deliver drift alerts through whatever they already run.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
     /// Run after a successful `apply`, with the plan JSON on stdin.
@@ -138,8 +154,38 @@ pub struct Hooks {
 ///
 /// A dev-verified plan is still a **preview**. Applyable plans come only from
 /// `plan --db` against the target, and this does not move that line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
+// Both fields are individually optional in Rust because serde has to read the
+// file before it can say which one is present — but `dev::spec` requires
+// **exactly one**, and refuses `dev: {}` and a block naming both. A schema that
+// left the derive's shape alone blessed two pbps.yml files the CLI then cannot
+// run a plan with at all, which is the one thing generating the schema from
+// these types is supposed to prevent (the same reasoning as the module
+// declaration's `oneOf`).
+//
+// Each branch constrains the other key rather than merely requiring its own:
+// `required` alone would accept a file naming both.
+//
+// Pinned to null rather than to `false`, because that is `dev::spec`'s own
+// rule. It reads the two fields after serde, and YAML writes `url_env:` with
+// nothing after it — which serde reports as absent, so a block with a real
+// `docker:` beside an empty `url_env:` resolves perfectly well. `false` would
+// refuse that line: stricter than the tool rather than looser, but still a
+// disagreement, and the same one that had to be fixed in the module schema's
+// branches.
+#[schemars(extend("oneOf" = [
+    serde_json::json!({
+        "required": ["docker"],
+        "properties": {"docker": {"type": "string"}, "url_env": {"type": "null"}},
+    }),
+    serde_json::json!({
+        "required": ["url_env"],
+        "properties": {"url_env": {"type": "string"}, "docker": {"type": "null"}},
+    }),
+]))]
 pub struct Dev {
     /// The name of an environment variable holding a connection string to a
     /// throwaway server — never the string itself, for the reason
@@ -153,7 +199,9 @@ pub struct Dev {
     pub docker: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub dialect: DialectName,
@@ -242,6 +290,21 @@ impl Project {
 
     pub fn ids_file(&self) -> PathBuf {
         self.root.join(&self.config.ids_file)
+    }
+
+    /// The directory holding `pbps.yml`. Every path in the config is relative
+    /// to it, and so is anything asked of git about this project.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Path to this project's `pbps.yml`.
+    ///
+    /// Discovery searches upwards, so a user two directories down cannot
+    /// otherwise tell which file the command is obeying — which is exactly the
+    /// question `pbps doctor` exists to answer.
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join(CONFIG_FILE)
     }
 
     /// Looks up a named environment, listing what does exist when it does not.

@@ -6,8 +6,12 @@ the schema should look like; the tool works out the rest.
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
   through [docs/ADR-0007-connection-strategy.md](docs/ADR-0007-connection-strategy.md)
+- Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)
+- Bugs shipped or nearly shipped, and their shapes: [docs/PITFALLS.md](docs/PITFALLS.md)
+- Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
 
-**Phases 0 through 3.5 are complete**, for SQL Server: tables, columns, keys,
+**Phases 0 through 3.5, and Phase 3.1, are complete** for SQL Server: tables,
+columns, keys,
 constraints and indexes, plus views, procedures, functions and triggers. Two
 groups of commands:
 
@@ -19,6 +23,10 @@ groups of commands:
 | `validate`, `fmt` (`--check`) | Static checks and canonical formatting |
 | `rename`, `rename-table`, `drop`, `drop-table` | Record the intent only a human can supply |
 | `docs` (`--format markdown\|html\|erd`) | Documentation and an ERD from the declarations |
+| `explain --plan` | What a saved plan does, why it needs approval, and the exact command that approves it |
+| `doctor` (`--env`) | Whether this project and its environments are ready to deploy from |
+| `schema` (`--kind declaration\|config`) | JSON Schema for editors, generated from the loader's own types |
+| `completions <shell>`, `man` | Shell completions and man pages |
 
 | Needs a database | Purpose |
 |---|---|
@@ -30,9 +38,19 @@ groups of commands:
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |
 
-Phase 3.1 is in progress: `init` is complete; `doctor`, plan summaries,
-`explain`, typed read-only output, editor schemas, completions and the
-interactive rename prompt are next (see [SPEC §14](docs/SPEC.md)). After it,
+Every read-only command takes `--format human|json` and emits the same typed
+findings. Three exit codes, and the split matters: **0** clean, **2** the command
+answered and found something to act on, **1** the command could not answer. A
+pipeline that cannot tell 1 from 2 wakes the wrong person half the time.
+`scripts/findings-to-github.py` turns the JSON into CI annotations — outside the
+binary on purpose, so a vendor format that moves breaks a script rather than a
+release.
+
+Phase 3.1, the usability foundation, is complete: `init`, `doctor`, plan
+summaries and `explain`, one typed JSON output across the read-only commands,
+editor schemas, shell completions, man pages, and the interactive rename prompt
+— the third intent channel, and the last part of "intent is recorded by a human,
+in git" that was missing (see [SPEC §14](docs/SPEC.md)). Next,
 Phase 4 deepens what one engine can express — reference data, roles and grants,
 declarative policies — and PostgreSQL follows in Phase 5. Depth precedes the
 second dialect on purpose: a team evaluating pbps for SQL Server is not blocked

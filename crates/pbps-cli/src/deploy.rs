@@ -152,6 +152,18 @@ fn managed_modules(
     set
 }
 
+/// The `unmanaged: error` policy, refused.
+///
+/// A distinct type because `verify` has to tell it apart from every other way
+/// its work can fail. The database was reached, the catalog was read, and the
+/// command found something the project's own policy calls a problem — that is
+/// an answer (exit 2, the schema owner's), not a failure to answer (exit 1,
+/// CI's). Folded into the catch-all it came back as `environment.unreachable`
+/// about a database that had just been read successfully.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UnmanagedPolicy(String);
+
 /// Applies the `unmanaged:` policy of SPEC §8.2 to what fell outside the scope.
 fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
@@ -173,12 +185,15 @@ fn report_unmanaged(
             names.len(),
             names.join(", ")
         ),
-        pbps_config::Unmanaged::Error => bail!(
-            "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
-             Declare them (`pbps pull` reverse-generates them) or relax the setting.",
-            names.len(),
-            names.join(", ")
-        ),
+        pbps_config::Unmanaged::Error => {
+            return Err(UnmanagedPolicy(format!(
+                "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
+                 Declare them (`pbps pull` reverse-generates them) or relax the setting.",
+                names.len(),
+                names.join(", ")
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -206,11 +221,22 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
 /// mapping the environment has never seen would report every uncommitted local
 /// rename as drift in production.
 pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Result<()> {
-    db::require_mssql(project, "verify")?;
-    let dialect = crate::dialect(project)?;
+    crate::output::or_unanswerable(
+        "verify",
+        json,
+        "project.unsupported-dialect",
+        db::require_mssql(project, "verify"),
+    )?;
+    let dialect = crate::output::or_unanswerable(
+        "verify",
+        json,
+        "project.unsupported-dialect",
+        crate::dialect(project),
+    )?;
     let checked_at = crate::now();
 
-    let report = db::runtime()?.block_on(async {
+    let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
+    let report = match rt.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
@@ -240,7 +266,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // needs to catch, would be exactly what it missed.
         let observed = pbps_diff::observed_ids(&scoped.schema, &recorded_ids);
 
-        let changes = pbps_diff::diff(
+        // `diff_partial`, not `diff`: a drift report wants both halves. The
+        // `Result` form returns only the errors, and taking that branch meant
+        // one table's altered `IDENTITY` silently deleted every expressible
+        // difference the same comparison had found — an undercount in the
+        // report, in the finding count, and in the hook's payload.
+        let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &baseline.snapshot.schema,
                 ids: &recorded_ids,
@@ -254,16 +285,16 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // about; passing the declarations' strategies here would put a
             // hint nobody can act on into a report about what already happened.
             &pbps_model::Hints::default(),
-        )
-        .map_err(|errs| {
-            for e in &errs {
-                eprintln!("  {e}");
-            }
-            anyhow::anyhow!(
-                "the live database differs in {} way(s) that cannot even be expressed as changes",
-                errs.len()
-            )
-        })?;
+        );
+        // Carried *in* the report, not raised as a separate outcome. The
+        // database was reached and a difference was established — the differ
+        // simply has no `Change` for it — so this is drift, and everything
+        // downstream (findings, the envelope, the `on_drift` hook, exit 2)
+        // must treat it as such. An earlier fix made it exit 2 but returned
+        // early, which skipped the hook: right verdict, and the alert that
+        // exists to carry that verdict never fired.
+        let changes = diffed.changes;
+        let unexpressible: Vec<String> = diffed.errors.iter().map(ToString::to_string).collect();
 
         Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
@@ -280,15 +311,100 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
             changes,
             unmanaged: scoped.unmanaged,
+            unexpressible,
         })
-    })?;
+    }) {
+        Ok(r) => r,
+        // The project's own policy, refused on a database that was read
+        // successfully. `verify` answered — exit 2 and the schema owner's, not
+        // exit 1 and CI's.
+        Err(e) if e.downcast_ref::<UnmanagedPolicy>().is_some() => {
+            let findings = vec![
+                crate::output::Finding::error(
+                    "state.unmanaged-refused",
+                    format!("{}: {e}", target.label),
+                )
+                .remedy("pbps pull, or relax `unmanaged:` in pbps.yml"),
+            ];
+            if json {
+                return crate::output::Report::new("verify", findings, None::<()>).emit_json();
+            }
+            eprintln!("{e}");
+            return Err(crate::Found::reported().into());
+        }
+        Err(e) => {
+            // Unanswerable: `verify` was asked whether this database still
+            // matches its recorded state, and it could not look. Without
+            // this the JSON path returned before its own branch, leaving
+            // stdout empty — so a consumer got the converter's generic
+            // "produced no output" instead of a report naming the target
+            // (SPEC §9.8).
+            if json {
+                let report = crate::output::Report::plain(
+                    "verify",
+                    vec![crate::output::Finding::error(
+                        "environment.unreachable",
+                        format!("{}: {e:#}", target.label),
+                    )],
+                )
+                .unanswerable();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Err(e);
+        }
+    };
 
-    // The hook always receives JSON, whatever the human asked for on stdout:
-    // a script's payload should not change shape because someone added a flag
-    // for their own eyes.
+    // The hook always receives the bare report, whatever the human asked for on
+    // stdout: a script's payload should not change shape because someone added
+    // a flag for their own eyes, and it must not gain an envelope because
+    // stdout did.
     let payload = format!("{}\n", serde_json::to_string_pretty(&report)?);
+
+    let mut findings = Vec::new();
+    if report.has_drift() {
+        findings.push(
+            crate::output::Finding::error(
+                "state.drift",
+                format!(
+                    // Both counted: a difference the differ cannot phrase is
+                    // still a difference, and "0 difference(s)" beside a
+                    // drift verdict reads as a bug in the tool rather than a
+                    // fact about the database.
+                    "`{}` no longer matches its recorded state ({} difference(s))",
+                    target.label,
+                    report.changes.changes.len() + report.unexpressible.len()
+                ),
+            )
+            .remedy("pbps pull | pbps plan --db … && pbps apply | pbps baseline --reason \"…\""),
+        );
+    }
+    // One finding per difference, because the differ returns one per
+    // unexpressible change and the column name in it is the remedy.
+    for e in &report.unexpressible {
+        findings.push(crate::output::Finding::error(
+            "state.drift-unexpressible",
+            format!("{}: {e}", target.label),
+        ));
+    }
+    for table in &report.unmanaged {
+        findings.push(crate::output::Finding::note(
+            "state.unmanaged",
+            format!("{table} is in the database and outside the managed set; it was not compared"),
+        ));
+    }
+
     if json {
-        print!("{payload}");
+        // The envelope, not the bare report: a consumer reading `verify` beside
+        // `validate` should not need a second parser for one of them (SPEC
+        // §14.1). The report itself is unchanged, one level down in `data`.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::output::Report::new(
+                "verify",
+                findings,
+                Some(&report)
+            ))?
+        );
     } else {
         print!("{}", crate::report::drift(&report));
     }
@@ -301,7 +417,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     }
     // A distinct exit code so a scheduled pipeline can tell "the database moved"
     // from "the tool could not run" — the two need different people woken up.
-    Err(crate::DriftFound.into())
+    Err(crate::Found::reported().into())
 }
 
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
@@ -347,12 +463,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             Err(e) => return Err(e.into()),
         }
 
-        let snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Apply,
-            scoped.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Apply, scoped.schema, ids.clone(), &operator),
+        );
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
@@ -378,12 +492,10 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
 
-        let mut snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Baseline,
-            scoped.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let mut snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Baseline, scoped.schema, ids.clone(), &operator),
+        );
         snapshot.reason = Some(reason.to_owned());
 
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
@@ -535,12 +647,10 @@ pub fn cmd_bootstrap(
         // and only that form compares equal on the next drift check (SPEC §8.2).
         let built =
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        let snapshot = with_provenance(StateSnapshot::new(
-            StateKind::Bootstrap,
-            built.schema,
-            ids.clone(),
-            &operator,
-        ));
+        let snapshot = with_provenance(
+            project.root(),
+            StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
+        );
         let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
@@ -803,7 +913,7 @@ pub fn cmd_plan_db(
         cs,
         resolved.ids,
     );
-    plan.git_sha = db::git_sha();
+    plan.git_sha = db::git_sha(project.root());
     if staged {
         plan = plan.staged();
         println!(
@@ -1066,7 +1176,7 @@ async fn apply_under_lock(
         plan.ids.clone(),
         operator,
     );
-    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
@@ -1268,7 +1378,7 @@ async fn apply_staged_under_lock(
             live_ids.clone(),
             operator,
         );
-        checkpoint.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+        checkpoint.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         checkpoint.plan_checksum = Some(plan_checksum.to_owned());
         checkpoint.staged = Some(pbps_model::StagedProgress {
             completed: i + 1,
@@ -1295,7 +1405,7 @@ async fn apply_staged_under_lock(
         plan.ids.clone(),
         operator,
     );
-    snapshot.git_sha = plan.git_sha.clone().or_else(db::git_sha);
+    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
@@ -1401,10 +1511,10 @@ async fn preflight(
     }
 
     let mut failures = Vec::new();
-    let mut ran = 0usize;
+    let mut passed = 0usize;
+    let mut unchecked = 0usize;
     let probes = dialect.preflight(&plan.changes);
     for probe in &probes {
-        ran += 1;
         // A probe can still legitimately fail to run — a check whose expression
         // names a column this plan renames, say, since expression text is never
         // rewritten by substitution. That is not a violation and it is not
@@ -1413,6 +1523,7 @@ async fn preflight(
         let rows = match conn.query(&probe.sql).await {
             Ok(rows) => rows,
             Err(e) => {
+                unchecked += 1;
                 eprintln!(
                     "warning: could not check {} ({e}); the engine will enforce it during the apply",
                     probe.description
@@ -1420,10 +1531,27 @@ async fn preflight(
                 continue;
             }
         };
-        let count = rows
+        // A query that answered but whose count cannot be read is in exactly
+        // the same position as one that failed: nobody looked. Defaulting to
+        // zero read that silence as "no rows violate this" — the one answer a
+        // gate must never give by accident — and, worse, the probe was then
+        // counted among those that *passed*.
+        let count = match rows
             .first()
             .and_then(|r| r.try_get_at::<i32>(0).ok().flatten())
-            .unwrap_or(0);
+        {
+            Some(c) => c,
+            None => {
+                unchecked += 1;
+                eprintln!(
+                    "warning: {} returned no readable count; the engine will enforce it during \
+                     the apply",
+                    probe.description
+                );
+                continue;
+            }
+        };
+        passed += 1;
         if count > 0 {
             failures.push(format!("{count} {}", probe.description));
         }
@@ -1434,8 +1562,17 @@ async fn preflight(
             failures.join("\n  ")
         );
     }
-    if ran > 0 {
-        println!("Pre-flight: {ran} probe(s) passed against the live data.");
+    if passed > 0 {
+        println!("Pre-flight: {passed} probe(s) passed against the live data.");
+    }
+    if unchecked > 0 {
+        // Said on stdout as well as in the warnings above: an operator reading
+        // "3 probes passed" while a fourth went unchecked has been told
+        // something true and something misleading in the same breath.
+        println!(
+            "Pre-flight: {unchecked} probe(s) could not be checked here; the engine enforces \
+             them inside the transaction."
+        );
     }
 
     // "No probe" is not "no risk". Saying so keeps the operator's attention
@@ -1510,7 +1647,7 @@ pub async fn run_in_transaction(
 }
 
 /// Stamps a snapshot with where it came from.
-fn with_provenance(mut snapshot: StateSnapshot) -> StateSnapshot {
-    snapshot.git_sha = db::git_sha();
+fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> StateSnapshot {
+    snapshot.git_sha = db::git_sha(root);
     snapshot
 }

@@ -22,10 +22,13 @@ pbps-db.workspace = true
 pbps-docs.workspace = true
 tokio.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
@@ -35,3 +38,9 @@ workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 pbps-load.workspace = true
+# For the live tests only: the ledger state a CLI flag cannot produce — a lock
+# taken while the ledger is still empty — is set up with the same functions the
+# tool uses, rather than by a copy of the DDL in the test.
+pbps-db.workspace = true
+pbps-mssql.workspace = true
+tokio.workspace = true

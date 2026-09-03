@@ -422,11 +422,34 @@ commands from 6.1.
 ```
 $ pbps plan
 
-  dbo.customer
-    ? customer_name disappeared and full_name is new
-      > this is a rename: customer_name -> full_name
-        no, drop customer_name and add full_name
+  dbo.customer: customer_name disappeared, full_name is new
+    1) customer_name was renamed to full_name
+    2) customer_name was dropped (you will be asked why)
+  Which is it? [1-2, or blank to stop]
 ```
+
+The answers are ordinary intents and go through the same `resolve` call the
+commands do, so this channel produces no artifact of its own: one entry in the
+identity file, in git, reviewed in the merge request.
+
+Four properties hold it to that:
+
+- **A terminal means both streams.** stdin alone is not enough (output
+  redirected to a file means nobody sees the question); stderr alone is not
+  enough (a captured stdin means nobody can answer it). `--no-input` declines
+  the prompt everywhere, and `plan --check` never prompts at all — it is the
+  read-only CI check, and a question there hangs a pipeline.
+- **Similarity orders; it never decides.** The candidates are ranked by
+  normalized edit distance, case-insensitively, with the names themselves as the
+  tiebreak so the numbering is the same on every machine. Every pairing is still
+  offered — ordering is not filtering — and so is every drop.
+- **Nothing is charitably interpreted.** A blank line, a closed stdin, a word, a
+  number out of range: each ends the prompt and records nothing, and stopping
+  part-way abandons the answers already given. A partial answer written to the
+  identity file would be a decision the user never made.
+- **A drop still needs a reason**, asked as a second question and never
+  defaulted. An empty one ends the prompt rather than writing a tombstone that
+  explains nothing.
 
 ### 6.4 Behaviour without a TTY
 
@@ -686,11 +709,21 @@ back is structure: a column that was dropped returns empty (14.3).
 |---|---|
 | `pbps plan` | Resolve identity ambiguities, update the identity file, and compare against a baseline to produce a change plan |
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
-| `pbps plan --check` | CI mode: fail only when intent is missing, and never prompt |
+| `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
+| `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
+| `pbps schema` / `completions` / `man` | Editor schemas, shell completions and man pages, generated from the binary's own definitions (see 9.7) |
+
+Two of these will use a connection when one is offered but never require it:
+`explain --db` adds whether the target is mid-deployment, and `doctor` checks
+each configured environment as well as the project.
+
+| Command | Purpose |
+|---|---|
+| `pbps doctor` | Whether this project — and each environment it can reach — is ready to deploy from (see 9.5) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still do the whole job locally**.
@@ -830,6 +863,227 @@ Deliberately not built: a hosted service (it would contradict the product's
 premise), a resident daemon (pbps is a CLI; a daemon changes the security and
 operations profile entirely), and built-in chat integrations (an exec hook
 outlives any API).
+
+### 9.5 Readiness (`doctor`)
+
+**`pbps doctor [--db … | --env <name>]`** answers "can I deploy from here", in
+one run. It is the only connected command whose target is optional: with none it
+surveys every configured environment, which is what makes it worth running
+before a deployment rather than during one.
+Before it existed, connection, engine edition, permissions, paths and ledger
+readiness each failed later, at a different command — a user adopting their first
+database learned about them in the order the commands happened to need them,
+often across five runs and two days.
+
+It checks the project (which `pbps.yml` is in force, where the declarations and
+the identity file are, whether this is a git checkout and whether it has any
+commits) and then each environment: reachability, server version, edition and
+therefore whether `strategy: online` can be honoured here, the database-scoped
+permissions the account is missing *and what each is for*, and whether the
+environment is uninitialized, locked or mid-deployment on a staged checkpoint.
+
+Two rules hold it in place:
+
+- **It reimplements nothing.** The declaration checks are `validate`'s own, run
+  through the same function. A readiness command that disagreed with `validate`
+  about whether the declarations are valid would be worse than one that never
+  looked.
+- **It writes nothing.** This is the command someone runs when they are not yet
+  sure what they are pointed at, which is quite possibly production — so the
+  permissions are *asked for* (`sys.fn_my_permissions`, `HAS_PERMS_BY_NAME`)
+  rather than tried, and the ledger is read rather than created. It cannot leave
+  a project or a database changed.
+
+Permissions are named individually rather than as "make it `db_owner`". An
+organization that grants the deployment account exactly what it needs should be
+able to see the list; "make it an owner" is the advice that makes that
+organization say no to the tool.
+
+**Each is asked for at the securable where it is actually needed**, and the
+report names that securable. The four `CREATE` permissions cannot be granted
+below the database, so they are asked for there; `ALTER`, `VIEW DEFINITION` and
+the probes' `SELECT` are asked for on each **managed** schema, and `INSERT`,
+`DELETE` and the ledger's own `SELECT` on the ledger and lock **objects**
+themselves, falling back to their schema only while those tables do not exist
+yet — plus `ALTER` on that schema while the ledger has still to be created,
+because `CREATE TABLE` at the database does not by itself authorize creating a
+table in a given schema. `SELECT` appears twice because it is needed in two
+places for two reasons:
+the probes count rows in managed tables, and reading the recorded state is a
+read of two tables in `dbo`. The ledger's schema is not treated as a managed one
+— a project that declares nothing in `dbo` never touches a `dbo` table and must
+not be asked for `ALTER` there. Asking for all of
+them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE')`
+alone answers — reports gaps a correctly granted least-privilege account does
+not have, and the remedy an operator then reaches for is the database-wide grant
+this list exists to avoid. A declared schema that does not exist yet is left
+unasked rather than reported: that is every first deployment, and the
+create-time `ALTER` on the ledger's schema is required only while the ledger
+tables are still missing — per table, since `ensure_tables` recreates whichever
+one is gone.
+
+**One permission is deliberately absent, and the gap is recorded rather than
+covered.** A rename that moves a table between schemas is emitted as
+`ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on the
+transferred table. `doctor` never sees a plan, so demanding it would mean
+requiring `CONTROL` — close to ownership — on every managed schema of every
+project, always, to cover a statement most deployments never emit. That is the
+"make it db_owner" pressure this list exists to refuse. The claim is narrowed
+instead: `ALTER` covers *most* table changes, not every one. Catching the real
+case belongs in the plan-aware pre-flight, which does see the statements.
+
+**A declared schema the database does not have is a readiness error**, not a
+permission one and not a silence. Nothing in pbps emits `CREATE SCHEMA`, so a
+project declaring `app.customer` against a database with no `app` fails on its
+first statement; `doctor` names the schema and gives the `CREATE SCHEMA` as the
+remedy. This is distinct from leaving that schema *unasked* for permissions,
+which remains right — there is no securable to ask about.
+
+### 9.6 Explaining a plan
+
+**`pbps explain --plan plan.json`** is the deployment gate's own view of a saved
+plan, and it is not for the author of the change — the author has the
+declarations, the diff and the merge request. It is for whoever holds `plan.json`
+and has to decide whether to type `--allow destructive`: a DBA, a release
+manager, an auditor, who may have no checkout, no credentials and no intention of
+reading T-SQL. Until this command existed, the first human-facing artifact they
+met was effectively `plan.sql`.
+
+It answers, from the file alone:
+
+| Question | From |
+|---|---|
+| Is this applyable at all? | `origin` — a preview says so in its own terms (7.3) |
+| What does it change? | the typed ChangeSet, grouped by table |
+| Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
+| How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
+| What is checked first? | the derived pre-flight probes (7.5), by description |
+| What exactly do I type? | the `apply` command, with the target, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
+| What am I approving? | the plan checksum `apply` will recompute |
+
+A target is **optional**: `--db` / `--env` adds the one question no file can
+answer — whether that environment is mid-deployment on a staged checkpoint. It
+stays optional because a command needing credentials is a command the reviewer
+cannot run, which puts them back to being briefed by the person asking for the
+approval. Without `--env` it needs no *project* either: the dialect comes from
+the plan file, so a reviewer handed nothing but `plan.json`, in a directory with
+no `pbps.yml`, still gets the whole answer. Reading the dialect from the plan is
+also the more honest choice where a project does exist — a plan computed for one
+engine must be explained as that engine, not as whatever the local config
+selects.
+
+`explain` always exits 0. A plan full of destructive changes is what it exists to
+describe well; the gate is `apply --allow`, and having two commands fail on the
+same condition would make the reviewer's own tool look like the failure.
+
+Every `plan` also opens with the same summary — how many changes across how many
+tables, then each risk class with its explanation — so the first screenful says
+what shape the plan is rather than what its first line happens to be.
+
+### 9.7 Editor, shell and manual integration
+
+Three commands, all of which answer **without a project**: requiring one would
+mean a user could not install completions until after succeeding at the thing
+completions exist to help them do.
+
+- **`pbps schema [--kind declaration|config]`** prints a JSON Schema, generated
+  from `pbps-load`'s DTOs and `pbps-config`'s `Config` — the very types the
+  loader reads. There is no second description of the format to keep in step,
+  which is the failure mode every hand-written editor schema eventually has. In
+  particular `deny_unknown_fields` reaches the editor as
+  `additionalProperties: false`, so the schema refuses exactly what the loader
+  refuses; a schema that accepted more would be worse than shipping none.
+  Written to a file, it is the whole of the air-gapped path: no network, no
+  service. Each schema carries `x-pbps-schema-version` and the tool version, so
+  a copy found on disk can say whether it is the one this binary produces.
+- **`pbps completions <shell>`** and **`pbps man --out <dir>`** are generated
+  from the `clap` command tree the binary already holds. Man pages are one per
+  command, named `pbps-<command>`: a single page documenting twenty subcommands
+  is the page nobody reads, and `man pbps-apply` is what an operator types.
+
+Copies of both schemas live in `schemas/`, for editors that resolve a `$schema`
+URL and for anyone browsing the repository. A test regenerates them and fails if
+they differ, so the checked-in copy cannot drift from the binary either — a stale
+copy blesses files the loader refuses, and does it quietly.
+
+### 9.8 Machine-readable output and exit codes
+
+Every read-only command — `plan` (offline, including `--check`), `validate`,
+`fmt`, `explain`, `doctor`, `verify`, `status` — takes `--format human|json`
+and, in JSON, emits one envelope. `plan --db` is deliberately outside that set:
+it connects, reads the ledger and writes the deployment artifact, and what a
+reviewer reads *from* that artifact is `explain`.
+
+```json
+{
+  "schema_version": 1,
+  "tool_version": "0.1.0",
+  "command": "validate",
+  "result": "findings",
+  "findings": [
+    {
+      "id": "load.semantic",
+      "severity": "error",
+      "message": "invalid index column: `sideways` is not asc or desc",
+      "location": { "file": "schema/dbo.t.yml", "line": 6 },
+      "remedy": "pbps fmt"
+    }
+  ],
+  "data": { "dialect": "mssql", "tables": 12, "columns": 94, "modules": 3 }
+}
+```
+
+**One shape, not one per command.** A consumer — a CI annotator, the optional UI
+of [ADR-0006](ADR-0006-optional-ui.md), a team's own dashboard — renders what
+every command found without growing a parser per command. What a command
+uniquely produces rides in `data` (`verify`'s drift report, `status`'s
+environment rows) rather than replacing the envelope.
+
+`id` is stable and is the identifier a later `policies:` block raises or lowers
+the severity of (14.1), so it must survive a reworded message. `schema_version`
+is the version of the envelope alone; it moves when a consumer would have to
+change, which the tool version does not.
+
+`result` is `ok`, `findings` or **`unanswerable`** — the same three-way split as
+the exit codes below, and for the same reason. A pipe loses the producer's
+status, so `scripts/findings-to-github.py` maps this field straight to its own
+exit code; re-deriving "could not answer" from the findings would put the routing
+rule in two places, and no pattern in them distinguishes an unreachable database
+from an invalid declaration. Both are errors. Only the command knows which it
+was, so the command says so.
+
+Three exit codes, and the split is the point:
+
+| Code | Meaning | Who it wakes |
+|---|---|---|
+| 0 | The command answered and found nothing | nobody |
+| 2 | The command answered and found something to act on — invalid declarations, an unformatted file, a stale ids file, unresolved identity, drift, a plan that does not converge | whoever owns the change or the schema |
+| 1 | The command could not answer — an unreachable database, an unreadable file, contradictory flags | whoever runs CI |
+
+`fmt` on a file it cannot parse is the second case: the parse errors are the
+findings, but `fmt` never got to decide whether that file was canonical, so the
+result is `unanswerable`.
+
+A pipeline that cannot tell 1 from 2 sends half of every alert to the wrong
+person. `status` is the deliberate exception and always exits 0: it is a report
+rather than a gate (9.4), so its JSON carries findings at warning severity and
+the per-environment truth stays in `state`.
+
+`doctor` splits its own findings across 1 and 2, and the split is the same one:
+an unreachable environment, an unconfigured one, or one whose permissions could
+not even be read is a question it *could not answer*, so that is 1 — an empty
+`missing_permissions` must never be mistaken for "none missing" when the query
+behind it failed. Everything it found by looking — invalid declarations, a
+missing permission, an environment mid-deployment — is 2. A pipeline running
+`doctor --env prod` must route a firewall or a missing credential to whoever
+runs CI, not to the author of the schema change.
+
+**The vendor formats are converted outside the binary.** GitHub's
+`::error file=,line=::` and GitLab's code-quality JSON change on someone else's
+schedule, and each one compiled in has to be kept working by this project
+forever, including for users who run neither. `scripts/findings-to-github.py`
+reads the envelope from stdin and preserves the exit code; a team whose CI is
+the third system copies and edits it (14.3).
 
 ---
 
@@ -1284,19 +1538,28 @@ pbps init --from prod
   -> "run pbps doctor --env prod"
 
 pbps doctor --env prod
-  -> readiness report
+  -> readiness report (9.5)
   -> "run pbps plan --db ..."
 
 pbps plan --db ... --out plan.json --sql plan.sql
   -> a five-line summary and the exact approval command
 
 pbps explain --plan plan.json
-  -> the reviewer's explanation, no credentials required
+  -> the reviewer's explanation, no credentials required (9.6)
 ```
 
-Implementation status: the `init` link of this journey is built, including
-`--from`, staged round-trip validation, an every-file preview and installing
-`pbps.yml` last. The remaining Phase 3.1 links are in progress.
+Implementation status: **every P0 row of 14.1 is built.** `init` (with `--from`,
+staged round-trip validation, an every-file preview and installing `pbps.yml`
+last); `doctor` (9.5); the plan summary and `explain` (9.6); `schema`,
+`completions` and `man` (9.7); the typed findings envelope and the three exit
+codes (9.8), covering `validate`, `fmt`, `plan`, `explain`, `doctor`, `verify`
+and `status`; and the interactive prompt of 6.3, which was the last part of
+"intent is recorded by a human, in git" still missing.
+
+What remains in 14.1 is P1 and P2, and belongs to the later phases: the
+`policies:` block, operational estimates, `state show / diff / export`, the
+documented pipelines, the wider analyzer catalogue, the optional UI and a
+versioned CI component.
 
 Acceptance criteria for that slice:
 

@@ -52,6 +52,15 @@ pub struct Semantic {
 
     #[help]
     pub help: Option<String>,
+
+    /// Where the label lands, 1-based.
+    ///
+    /// Derived at construction rather than on demand: the machine-readable
+    /// output (SPEC §14.1) needs a line number, and by the time it asks, the
+    /// only copy of the source text is inside miette's `NamedSource`, which
+    /// exists to be rendered rather than measured.
+    pub line: usize,
+    pub column: usize,
 }
 
 impl LoadError {
@@ -61,12 +70,15 @@ impl LoadError {
         message: impl Into<String>,
         label: impl Into<String>,
     ) -> Self {
+        let (line, column) = line_and_column(&src.text, span.offset());
         LoadError::Semantic(Box::new(Semantic {
             message: message.into(),
             src: src.named_source(),
             span,
             label: label.into(),
             help: None,
+            line,
+            column,
         }))
     }
 
@@ -76,6 +88,56 @@ impl LoadError {
         }
         self
     }
+
+    /// The file the problem is in.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            LoadError::Io { path, .. } | LoadError::Yaml { path, .. } => Some(path),
+            LoadError::Semantic(s) => Some(Path::new(s.src.name())),
+        }
+    }
+
+    /// The 1-based line, when one is known.
+    ///
+    /// A YAML structural error has one too, but only inside the parser's own
+    /// pre-rendered message; re-parsing that text to recover a number the
+    /// diagnostic already prints would be a second, more fragile copy of it.
+    pub fn line(&self) -> Option<usize> {
+        match self {
+            LoadError::Semantic(s) => Some(s.line),
+            LoadError::Io { .. } | LoadError::Yaml { .. } => None,
+        }
+    }
+
+    /// A stable identifier for the kind of problem, for `--format json`.
+    pub fn id(&self) -> &'static str {
+        match self {
+            LoadError::Io { .. } => "load.io",
+            LoadError::Yaml { .. } => "load.yaml",
+            LoadError::Semantic(_) => "load.semantic",
+        }
+    }
+}
+
+/// The 1-based line and column of a byte offset.
+///
+/// Both counted in characters for the column, because that is what an editor
+/// shows; the offset itself is a byte offset (see [`to_span`]).
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    // `get` rather than a slice: an offset that is not on a character boundary
+    // would panic, and a diagnostic must never be the thing that crashes the
+    // run it was trying to explain.
+    let Some(before) = text.get(..offset) else {
+        return (1, 1);
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit_once('\n')
+        .map_or(before, |(_, last)| last)
+        .chars()
+        .count()
+        + 1;
+    (line, column)
 }
 
 /// The name and content of one source file, for diagnostics to quote.
@@ -109,4 +171,40 @@ pub fn to_span(loc: &serde_saphyr::Location) -> SourceSpan {
     let offset = s.byte_offset().unwrap_or_else(|| s.offset()) as usize;
     let len = s.byte_len().unwrap_or_else(|| s.len()) as usize;
     (offset, len).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_offset_maps_to_the_line_an_editor_shows() {
+        let text = "a: 1\nbb: 2\nccc: 3\n";
+        assert_eq!(line_and_column(text, 0), (1, 1));
+        assert_eq!(line_and_column(text, 5), (2, 1));
+        assert_eq!(line_and_column(text, 7), (2, 3));
+        assert_eq!(line_and_column(text, 11), (3, 1));
+    }
+
+    /// The column is in characters while the offset is in bytes (see
+    /// [`to_span`]); counting bytes here would put the caret past the end of a
+    /// line containing any non-ASCII text, which a `description:` very often
+    /// does.
+    #[test]
+    fn a_multibyte_line_does_not_shift_the_column() {
+        let text = "description: 中文\nname: t\n";
+        let offset = text.find("name").unwrap();
+        assert_eq!(line_and_column(text, offset), (2, 1));
+        // Three characters into the second line, not three bytes into it.
+        assert_eq!(line_and_column(text, offset + 3), (2, 4));
+    }
+
+    /// Offsets reach this from a parser, and a parser that is wrong about one
+    /// must not take the process down with it.
+    #[test]
+    fn an_out_of_range_or_split_offset_is_not_a_panic() {
+        let text = "中文";
+        assert_eq!(line_and_column(text, 1), (1, 1));
+        assert_eq!(line_and_column(text, 9_999), (1, 1));
+    }
 }

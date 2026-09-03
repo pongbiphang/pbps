@@ -984,3 +984,679 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     // Rows, not groups: two rows share id 1.
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
+
+/// The permission check against a real least-privilege login.
+///
+/// This is the shape the check exists for and the shape no unit test can
+/// verify: `sa` holds `CONTROL`, which used to short-circuit the whole list —
+/// that is how three permission bugs survived the first live test, and the
+/// shortcut has since been removed for a fourth reason (see
+/// `a_deny_beats_control_and_the_readiness_check_sees_it`). It is also the only way
+/// to find out whether `HAS_PERMS_BY_NAME` really answers the question — that
+/// a grant on a *schema* satisfies a requirement the earlier version asked for
+/// on the database, and reported as missing.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
+    let mut db = TestDb::create("doctorperm").await;
+    let login = format!("pbps_lp_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    // Exactly what a careful DBA would grant, and nothing more: the schema-scoped
+    // permissions on the schema, the four CREATEs at the database (SQL Server
+    // will not grant them lower), and no database-wide ALTER or SELECT at all.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+        .await
+        .expect("read permissions");
+
+    // The point of the whole change: none of these are held on the *database*,
+    // which is what the first version of this check asked about.
+    assert!(
+        !held.database.contains("ALTER"),
+        "the test's own premise is wrong if this login has database-wide ALTER: {held:?}"
+    );
+    assert!(!held.database.contains("CONTROL"), "{held:?}");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.is_empty(),
+        "a correctly granted least-privilege login was reported as missing: {gaps:?}"
+    );
+
+    // The negative case, and the dangerous one: it can take the deployment lock
+    // but not release it. `apply` would commit the schema change and only then
+    // fail, leaving a stale lock for the next pipeline.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE DELETE ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].permission, "DELETE");
+    assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+
+    // And the narrowest shape of all: the ledger tables exist, and INSERT and
+    // DELETE are granted on *those two objects* rather than on the schema. Only
+    // an object-scope question can see that grant; a schema-scope one reports
+    // it missing, which is the same over-demand at one level further down.
+    // Before the ledger exists, creating it needs ALTER on its schema on top of
+    // the database-level CREATE TABLE. This is the case a `doctor` that said
+    // "ready" would strand at the first `ensure_tables`, so it is checked
+    // against a real server rather than reasoned about.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE ALTER ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke alter");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    // As a project that manages `app`, so the gap can only be the ledger's own
+    // creation requirement and not the ordinary managed-schema `ALTER`.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+        "an account that cannot create the ledger must not pass readiness: {gaps:?}"
+    );
+    db.conn
+        .execute(&format!(
+            "USE [{}]; GRANT ALTER ON SCHEMA::dbo TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("restore alter");
+
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             REVOKE INSERT, DELETE ON SCHEMA::dbo FROM [{login}]; \
+             GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_state TO [{login}]; \
+             GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_lock TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant on the ledger objects");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        !held.schemas["dbo"].contains("INSERT"),
+        "the premise is wrong if the schema grant survived the revoke: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.is_empty(),
+        "a grant on the ledger objects alone was reported as missing: {gaps:?}"
+    );
+
+    // Half a ledger: one table dropped by hand, the other still carrying its
+    // object grants. The scope has to be chosen per table — object where the
+    // table is, schema where it is not — because the grant that will cover the
+    // one `ensure_tables` is about to recreate can only be the schema's. Asking
+    // once for the pair let this account pass readiness and then be denied on
+    // the state read, so it is checked against a real server.
+    db.conn
+        .execute(&format!("USE [{0}]; DROP TABLE dbo.__pbps_state;", db.name))
+        .await
+        .expect("drop the state table");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert_eq!(
+        held.ledger_objects.len(),
+        1,
+        "the premise: exactly one ledger table survives: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    // INSERT and DELETE only: this login still holds `SELECT ON SCHEMA::dbo`
+    // from the top of the test, so the ledger read is genuinely satisfied and
+    // reporting it would be the over-demand, not the fix. The unit test covers
+    // all three by clearing the schema grants outright.
+    for permission in ["INSERT", "DELETE"] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+            "{permission} for the table still to be created was not asked for: {gaps:?}"
+        );
+    }
+    // The surviving table is still answered where its grant actually sits, or
+    // the account would be told to re-grant what it already holds.
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+        "{gaps:?}"
+    );
+
+    // Restored for the checks below: recreating the table also drops the object
+    // grants that were on the old one.
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("recreate the ledger");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT INSERT, DELETE ON OBJECT::dbo.__pbps_state TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("re-grant on the recreated state table");
+
+    // And once the ledger exists, the creation permission is spent: writing rows
+    // needs INSERT and DELETE, not ALTER. Asked as a project that manages `app`
+    // rather than `dbo` — with `dbo` managed, ALTER there is required for the
+    // ordinary reason and this would say nothing.
+    db.conn
+        .execute(&format!(
+            "USE [{}]; REVOKE ALTER ON SCHEMA::dbo FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke alter again");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        !gaps.iter().any(|g| g.permission == "ALTER"),
+        "ALTER on the ledger schema must not be demanded once it exists: {gaps:?}"
+    );
+
+    // A declared schema spelled differently from the catalog. On a
+    // case-insensitive database `App` and `app` are the same schema, and the
+    // server says so — but the answer used to come back under the *catalog's*
+    // spelling, so the caller looked up the name it asked with and missed.
+    // `doctor` then called an existing schema absent and advised creating it.
+    // Its own batch: `CREATE SCHEMA` must be the first statement in one, so it
+    // cannot share a batch with the `USE`.
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    db.conn
+        .execute("CREATE SCHEMA [app];")
+        .await
+        .expect("create app schema");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.absent_schemas.is_empty(),
+        "a schema that exists under another casing must not be reported absent: {held:?}"
+    );
+    assert!(
+        held.schemas.contains_key("App"),
+        "the answer must come back under the requested spelling: {held:?}"
+    );
+
+    // A declared schema the database does not have. Only a real `sys.schemas`
+    // can answer this, and it is the case `doctor` used to pass in silence:
+    // nothing in the tool emits `CREATE SCHEMA`, so the first
+    // `CREATE TABLE [nowhere].[...]` would have failed right after a clean
+    // readiness report.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.absent_schemas.contains("nowhere"),
+        "a declared schema the database lacks must be reported: {held:?}"
+    );
+    assert!(
+        !held.absent_schemas.contains("dbo"),
+        "the ledger's schema is not a declaration problem: {held:?}"
+    );
+
+    drop(lp);
+    let name = db.name.clone();
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    let _ = name;
+}
+
+/// `DENY` at a narrower securable beats an inherited `CONTROL`, and the
+/// readiness check has to see it.
+///
+/// `missing` used to return early on `CONTROL` at the database. The reasoning
+/// was that `CONTROL` implies everything below it — true of grants, and beside
+/// the point, because the inputs are `HAS_PERMS_BY_NAME` answers that already
+/// account for inheritance. So the shortcut bought nothing for an owner and
+/// discarded the only answer that matters here.
+///
+/// Only a real server can settle it: whether `fn_my_permissions` still lists
+/// `CONTROL` under a `DENY`, whether the scoped question answers 0, and whether
+/// the DDL actually fails are three separate facts, and the shortcut was built
+/// on the first one alone.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
+    let mut db = TestDb::create("doctordeny").await;
+    let login = format!("pbps_ctl_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsControl!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master;              IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];              CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    db.conn
+        .execute("CREATE SCHEMA [app];")
+        .await
+        .expect("create app schema");
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; GRANT CONTROL TO [{login}];"
+        ))
+        .await
+        .expect("grant control");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    // The premise: an owner is clean, and is clean *without* the shortcut —
+    // its scoped answers come back full on their own.
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        held.database.contains("CONTROL"),
+        "the test's premise is wrong if this login lacks CONTROL: {held:?}"
+    );
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "an owner must not be reported as missing anything: {:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    db.conn
+        .execute(&format!("DENY ALTER ON SCHEMA::app TO [{login}];"))
+        .await
+        .expect("deny");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    // All three facts, because the old shortcut was built on the first alone.
+    assert!(
+        held.database.contains("CONTROL"),
+        "CONTROL is still listed under a DENY, which is the trap: {held:?}"
+    );
+    assert!(
+        !held.schemas["app"].contains("ALTER"),
+        "the scoped question has to see the DENY: {held:?}"
+    );
+    let denied = lp.execute("CREATE TABLE app.denied_probe (id int);").await;
+    assert!(
+        denied.is_err(),
+        "the premise is wrong if the DDL succeeds under the DENY"
+    );
+
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::app"),
+        "an account that cannot alter its managed schema must not pass readiness: {gaps:?}"
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
+/// A lock table the caller may not read is not an absent one.
+///
+/// SQL Server's metadata-visibility rules hide an object from a principal with
+/// no permission on it, so the `OBJECT_ID` guard this replaced answered "absent"
+/// for a table that exists and holds a live lock — turning "not authorized to
+/// look" into "no lock", which is the one direction this tool must never round
+/// in. `HAS_PERMS_BY_NAME` does not separate them either: it answers 0 for both.
+///
+/// Only a real server settles which of those three questions can tell the cases
+/// apart, which is why this test exists at all rather than a unit one.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
+    let mut db = TestDb::create("lockvisibility").await;
+    let login = format!("pbps_viz_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsVisibility!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    pbps_mssql::state::lock(&mut db.conn, "the-invisible-holder")
+        .await
+        .expect("take the lock");
+    // The state table is readable, the lock table is not. That is the shape a
+    // half-granted deployment account really has, and `doctor` exists to catch
+    // it — but only if the lock read reports rather than shrugs.
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT SELECT ON dbo.__pbps_state TO [{login}];"
+        ))
+        .await
+        .expect("grant on the state table only");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    // The premise, stated rather than assumed: the catalog really does hide the
+    // table from this principal, so the old guard really would have said absent.
+    let hidden = lp
+        .query(
+            "SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL THEN 0 ELSE 1 END \
+             AS present;",
+        )
+        .await
+        .expect("ask the catalog");
+    let present: i32 = hidden[0].try_get("present").expect("present").unwrap_or(1);
+    assert_eq!(present, 0, "the premise is wrong if the table is visible");
+
+    let answer = pbps_mssql::state::lock_holder(&mut lp).await;
+    assert!(
+        answer.is_err(),
+        "a lock that cannot be read must not be reported as absent: {answer:?}"
+    );
+
+    // And the other half, on the same connection: a table that genuinely is not
+    // there still answers "no lock" rather than failing, which is what keeps a
+    // first run quiet.
+    db.conn
+        .execute("DROP TABLE dbo.__pbps_lock;")
+        .await
+        .expect("drop the lock table");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    assert!(
+        pbps_mssql::state::lock_holder(&mut lp)
+            .await
+            .expect("an absent lock table is not an error")
+            .is_none()
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
+/// A foreign key into a schema the project does not manage.
+///
+/// `validate` accepts one whose target is undeclared — the target is somebody
+/// else's table — but the emitter still writes `REFERENCES [shared].[parent]`,
+/// which SQL Server authorizes on *that* table, and the pre-flight probe for
+/// the change reads it. Neither is covered by any question about the managed
+/// schemas, so a login could pass `doctor` and fail during `apply`.
+///
+/// Live because the whole question is what a real server authorizes: only it
+/// can say that `ALTER` on `app` does not carry `REFERENCES` on `shared.parent`.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target() {
+    let mut db = TestDb::create("fkacross").await;
+    let login = format!("pbps_fk_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsForeignKey!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    // `CREATE SCHEMA` must be the first statement in its batch, so one each.
+    db.conn.execute("CREATE SCHEMA [app];").await.expect("app");
+    db.conn
+        .execute("CREATE SCHEMA [shared];")
+        .await
+        .expect("shared");
+    db.conn
+        .execute(
+            "CREATE TABLE shared.parent (id bigint NOT NULL CONSTRAINT pk_parent PRIMARY KEY);",
+        )
+        .await
+        .expect("the unmanaged parent table");
+    // Everything a project managing `app` needs, and nothing at all on
+    // `shared` — the shape a DBA produces when told "grant them their schema".
+    db.conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::app TO [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+        ))
+        .await
+        .expect("grant");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    // The premise: with no foreign key out of `app`, this login is ready. If it
+    // were not, the assertion below would pass for the wrong reason.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+        .await
+        .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "the premise is wrong if this login is short of something else: {:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    // And with one, the target it points at is asked about.
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &["shared.parent".to_owned()],
+    )
+    .await
+    .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    for permission in ["REFERENCES", "SELECT"] {
+        assert!(
+            gaps.iter()
+                .any(|g| g.permission == permission && g.securable() == "OBJECT::shared.parent"),
+            "{permission} on the referenced table was not reported: {gaps:?}"
+        );
+    }
+
+    // Granted on the object alone — the narrowest thing a DBA can do — and the
+    // report goes quiet. A schema-scoped question could not see this grant.
+    db.conn
+        .execute(&format!(
+            "GRANT REFERENCES, SELECT ON OBJECT::shared.parent TO [{login}];"
+        ))
+        .await
+        .expect("grant on the object");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = pbps_mssql::doctor::permissions(
+        &mut lp,
+        &["app".to_owned()],
+        &["shared.parent".to_owned()],
+    )
+    .await
+    .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "an object-scoped grant on the target must satisfy it: {:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
