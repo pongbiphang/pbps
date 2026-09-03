@@ -337,14 +337,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // stdout empty — so a consumer got the converter's generic
             // "produced no output" instead of a report naming the target
             // (SPEC §9.8).
-            crate::output::unanswerable(
-                "verify",
-                json,
-                vec![crate::output::Finding::error(
-                    "environment.unreachable",
-                    format!("{}: {e:#}", target.label),
-                )],
-            );
+            if json {
+                crate::output::unanswerable(
+                    "verify",
+                    vec![crate::output::Finding::error(
+                        "environment.unreachable",
+                        format!("{}: {e:#}", target.label),
+                    )],
+                );
+            }
             return Err(e);
         }
     };

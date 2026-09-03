@@ -284,11 +284,28 @@ pub fn or_unanswerable_at<T>(
 /// The loader and the differ hand back one error per problem, and collapsing
 /// them into a single message throws away the column name that is the whole
 /// remedy. These callers keep their own human branch — a parse error is
-/// rendered by miette, not by [`human`] — so this returns the findings' fate
-/// rather than a value, and the caller ends on its own error.
-pub fn unanswerable(command: &'static str, json: bool, findings: Vec<Finding>) {
-    if json {
-        emit_unanswerable(command, findings);
+/// rendered by miette, not by [`human`] — so this prints and returns nothing,
+/// and the caller ends on its own error.
+///
+/// No `json` parameter, unlike [`or_unanswerable`]: there the flag is
+/// unavoidable, because that function is on the success path too and has to
+/// return the value either way. Here it would buy nothing and cost the caller a
+/// second `if` on the same condition — every one of these callers has a human
+/// branch, so they would write `unanswerable(.., json, ..)` and then
+/// `if !json { .. }` next to it. One `if json { .. } else { .. }` is the shape
+/// that was already there before this helper existed, and it also stops the
+/// findings being built on the path that discards them.
+///
+/// Never `?`, and never a panic: a serialization failure here would be a bug in
+/// this crate's own types, and returning it would replace the error actually
+/// being reported with a different one. Of the call sites this and
+/// [`or_unanswerable_at`] replaced, four used `?` and would have done exactly
+/// that; two used `if let Ok`, one used `let _ = emit_json()`. Three spellings
+/// of one decision is how the decision gets made differently by accident.
+pub fn unanswerable(command: &'static str, findings: Vec<Finding>) {
+    let report = Report::plain(command, findings).unanswerable();
+    if let Ok(text) = serde_json::to_string_pretty(&report) {
+        println!("{text}");
     }
 }
 
@@ -302,25 +319,10 @@ fn or_unanswerable_with<T>(
         Ok(v) => Ok(v),
         Err(e) => {
             if json {
-                emit_unanswerable(command, findings(&e));
+                unanswerable(command, findings(&e));
             }
             Err(e)
         }
-    }
-}
-
-/// Prints the envelope for an outcome the command could not answer.
-///
-/// Never `?`, and never a panic: a serialization failure here would be a bug in
-/// this crate's own types, and returning it would replace the error actually
-/// being reported with a different one. Four of the call sites this replaced
-/// used `?` and would have done exactly that; two used `if let Ok`, one used
-/// `let _ = emit_json()`. Three spellings of one decision is how the decision
-/// gets made differently by accident.
-fn emit_unanswerable(command: &'static str, findings: Vec<Finding>) {
-    let report = Report::plain(command, findings).unanswerable();
-    if let Ok(text) = serde_json::to_string_pretty(&report) {
-        println!("{text}");
     }
 }
 

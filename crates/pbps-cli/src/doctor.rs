@@ -741,17 +741,8 @@ mod tests {
 
     fn absent(schema: &str) -> EnvDiagnosis {
         EnvDiagnosis {
-            environment: "prod".to_owned(),
-            state: "ready",
-            server_version: None,
-            edition: None,
-            supports_online: None,
-            supports_create_or_alter: None,
-            missing_permissions: Vec::new(),
-            permissions_unknown: false,
             absent_schemas: vec![schema.to_owned()],
-            server_capabilities_unknown: None,
-            detail: None,
+            ..EnvDiagnosis::unknown("prod".to_owned(), "ready")
         }
     }
 

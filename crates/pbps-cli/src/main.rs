@@ -890,9 +890,13 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         }
     }
 
+    // Annotated because `db::connect` widens the block's error to `anyhow`:
+    // it carries the "cannot connect to the database" context every other
+    // plain-propagating command gets, and `introspect`'s own `DbError` cannot
+    // hold that.
     let pulled = db::runtime()?.block_on(async {
-        let mut conn = pbps_db::Conn::connect(target.connection()).await?;
-        pbps_mssql::catalog::introspect(&mut conn).await
+        let mut conn = db::connect(target).await?;
+        Ok::<_, anyhow::Error>(pbps_mssql::catalog::introspect(&mut conn).await?)
     })?;
 
     for w in &pulled.warnings {
@@ -1359,18 +1363,15 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             // at what it meant would be the tool rewriting something it did not
             // understand. This is a tool failure rather than a finding: `fmt`
             // did not get to answer its own question.
-            // Unanswerable: `fmt` did not get to decide whether the file is
-            // canonical, because it could not read it. The findings are the
-            // parse errors, but the routing is "the tool could not run".
-            output::unanswerable(
-                "fmt",
-                format == OutputFormat::Json,
-                errs.iter().map(load_finding).collect(),
-            );
             if format == OutputFormat::Human {
                 for e in &errs {
                     print_load_error(e);
                 }
+            } else {
+                // Unanswerable: `fmt` did not get to decide whether the file is
+                // canonical, because it could not read it. The findings are the
+                // parse errors, but the routing is "the tool could not run".
+                output::unanswerable("fmt", errs.iter().map(load_finding).collect());
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
         })?;
@@ -1670,8 +1671,9 @@ fn cmd_plan(
             // them either way — and the exit code is 1 in both formats, as it
             // was before this branch existed. `validate` is the command whose
             // question *is* "are these valid", and there they are a finding.
-            output::unanswerable("plan", json, errs.iter().map(load_finding).collect());
-            if !json {
+            if json {
+                output::unanswerable("plan", errs.iter().map(load_finding).collect());
+            } else {
                 for e in &errs {
                     print_load_error(e);
                 }
@@ -1832,14 +1834,14 @@ fn cmd_plan(
         // a single message would throw away the column name that is the whole
         // remedy. Each becomes its own finding, carrying the id a future
         // `policies:` block can re-weight.
-        output::unanswerable(
-            "plan",
-            json,
-            errs.iter()
-                .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
-                .collect(),
-        );
-        if !json {
+        if json {
+            output::unanswerable(
+                "plan",
+                errs.iter()
+                    .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
+                    .collect(),
+            );
+        } else {
             for e in &errs {
                 eprintln!("  {e}");
             }
