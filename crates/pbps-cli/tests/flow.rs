@@ -4574,6 +4574,37 @@ fn an_offline_plan_still_speaks_json() {
     assert_eq!(v["result"], "ok", "{v}");
 }
 
+/// A file whose name holds a byte that is not valid UTF-8.
+///
+/// `#[cfg(unix)]` says the *API* can spell the name; it does not say the
+/// filesystem will store one. Linux passes the bytes through, so the two tests
+/// below are real coverage there and in CI; macOS's APFS validates them and
+/// fails the create with `EILSEQ`. Those tests are therefore **`ignore`d on
+/// macOS**, where the harness counts and prints them as such, rather than
+/// skipped at runtime: a runtime skip that returns `Ok` is a test the harness
+/// reports as passing with its assertions never run, and an `eprintln!` from
+/// a passing test is captured, so nobody would ever see it.
+///
+/// Everywhere else the create must succeed. Any error — `ENOSPC`, `EMFILE`, a
+/// filesystem nobody expected — fails the test, because a filesystem that
+/// cannot produce the input is exactly the thing the `ignore` above is for,
+/// and anything else is a broken test environment that must not read as
+/// coverage.
+#[cfg(unix)]
+fn non_utf8_path(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = dir.join(std::ffi::OsStr::from_bytes(bytes));
+    std::fs::write(&path, b"").unwrap_or_else(|e| {
+        panic!(
+            "cannot create a non-UTF-8 filename at {} ({e}); if this filesystem cannot hold \
+             one, the test belongs behind a cfg `ignore`, not a runtime skip",
+            dir.display()
+        )
+    });
+    path
+}
+
 /// On Unix a filename is bytes, and `Path::display()` substitutes U+FFFD for
 /// the ones that are not UTF-8. That character is not in `shell_arg`'s bare set
 /// and is not one of its refusals either, so a lossy path came back neatly
@@ -4583,18 +4614,19 @@ fn an_offline_plan_still_speaks_json() {
 ///
 /// Unix-only because no other platform can produce the input.
 #[cfg(unix)]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses a filename that is not valid UTF-8 (EILSEQ); the input cannot exist here"
+)]
 #[test]
 fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let d = Demo::new("lossypath");
     d.table(ONE_COLUMN);
     // An *applyable* plan: `explain` prints no approval command for a preview,
     // by design, so a preview would pass this test without exercising anything.
     let src = write_plan(&d, "src.json", "transactional");
     // 0xFF is not valid UTF-8 in any position.
-    let name = std::ffi::OsStr::from_bytes(b"plan-\xff-.json");
-    let lossy = d.dir.join(name);
+    let lossy = non_utf8_path(&d.dir, b"plan-\xff-.json");
     std::fs::copy(&src, &lossy).unwrap();
 
     let o = Command::new(BIN)
@@ -4640,14 +4672,15 @@ fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
 /// dropped when the path cannot be spelled. Dropping the pointer keeps the
 /// finding; a lossy pointer would name a different file.
 #[cfg(unix)]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses a filename that is not valid UTF-8 (EILSEQ); the input cannot exist here"
+)]
 #[test]
 fn an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope() {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let d = Demo::new("lossyenvelope");
     d.table(ONE_COLUMN);
-    let name = std::ffi::OsStr::from_bytes(b"bad-\xff-.json");
-    let bad = d.dir.join(name);
+    let bad = non_utf8_path(&d.dir, b"bad-\xff-.json");
     std::fs::write(&bad, "{ not json").unwrap();
 
     let o = Command::new(BIN)
