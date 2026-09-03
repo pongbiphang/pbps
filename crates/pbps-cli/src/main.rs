@@ -1213,23 +1213,13 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
     // `postgres` is an accepted `DialectName` with no implementation yet, so
     // this is a reachable failure on a perfectly valid project — and it escaped
     // before the JSON branch, leaving stdout empty.
-    let dialect = match dialect(project) {
-        Ok(d) => d,
-        Err(e) => {
-            if format == OutputFormat::Json {
-                let report = output::Report::plain(
-                    "validate",
-                    vec![
-                        output::Finding::error("project.unsupported-dialect", format!("{e:#}"))
-                            .at(project.config_file(), None),
-                    ],
-                )
-                .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
-            return Err(e);
-        }
-    };
+    let dialect = output::or_unanswerable_at(
+        "validate",
+        format == OutputFormat::Json,
+        "project.unsupported-dialect",
+        project.config_file(),
+        dialect(project),
+    )?;
     let (findings, data) = validate_findings(project, dialect.as_ref());
     let report = output::Report::new("validate", findings, Some(data));
 
@@ -1369,18 +1359,17 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             // at what it meant would be the tool rewriting something it did not
             // understand. This is a tool failure rather than a finding: `fmt`
             // did not get to answer its own question.
+            // Unanswerable: `fmt` did not get to decide whether the file is
+            // canonical, because it could not read it. The findings are the
+            // parse errors, but the routing is "the tool could not run".
+            output::unanswerable(
+                "fmt",
+                format == OutputFormat::Json,
+                errs.iter().map(load_finding).collect(),
+            );
             if format == OutputFormat::Human {
                 for e in &errs {
                     print_load_error(e);
-                }
-            } else {
-                // Unanswerable: `fmt` did not get to decide whether the file is
-                // canonical, because it could not read it. The findings are the
-                // parse errors, but the routing is "the tool could not run".
-                let report = output::Report::plain("fmt", errs.iter().map(load_finding).collect())
-                    .unanswerable();
-                if let Ok(text) = serde_json::to_string_pretty(&report) {
-                    println!("{text}");
                 }
             }
             anyhow::anyhow!("`{}` does not parse", path.display())
@@ -1681,11 +1670,8 @@ fn cmd_plan(
             // them either way — and the exit code is 1 in both formats, as it
             // was before this branch existed. `validate` is the command whose
             // question *is* "are these valid", and there they are a finding.
-            if json {
-                let report = output::Report::plain("plan", errs.iter().map(load_finding).collect())
-                    .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
+            output::unanswerable("plan", json, errs.iter().map(load_finding).collect());
+            if !json {
                 for e in &errs {
                     print_load_error(e);
                 }
@@ -1697,23 +1683,13 @@ fn cmd_plan(
     // above: `?` on it escaped before serialization, so a malformed or
     // inconsistent ids file left stdout empty. Wrapping only `load` fixed half
     // of one problem.
-    let ids = match read_ids(project) {
-        Ok(i) => i,
-        Err(e) => {
-            if json {
-                let report = output::Report::plain(
-                    "plan",
-                    vec![
-                        output::Finding::error("identity.unreadable", format!("{e:#}"))
-                            .at(project.ids_file(), None),
-                    ],
-                )
-                .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
-            return Err(e);
-        }
-    };
+    let ids = output::or_unanswerable_at(
+        "plan",
+        json,
+        "identity.unreadable",
+        project.ids_file(),
+        read_ids(project),
+    )?;
     let dialect = output::or_unanswerable(
         "plan",
         json,
@@ -1856,16 +1832,14 @@ fn cmd_plan(
         // a single message would throw away the column name that is the whole
         // remedy. Each becomes its own finding, carrying the id a future
         // `policies:` block can re-weight.
-        if json {
-            let report = output::Report::plain(
-                "plan",
-                errs.iter()
-                    .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
-                    .collect(),
-            )
-            .unanswerable();
-            let _ = report.emit_json();
-        } else {
+        output::unanswerable(
+            "plan",
+            json,
+            errs.iter()
+                .map(|e| output::Finding::error("change.unexpressible", e.to_string()))
+                .collect(),
+        );
+        if !json {
             for e in &errs {
                 eprintln!("  {e}");
             }

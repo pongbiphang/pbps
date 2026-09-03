@@ -5,7 +5,7 @@
 //! runtime per command, and "what does this database look like right now" — so
 //! they are solved once here rather than five times in five command bodies.
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 
 use pbps_config::{DialectName, Project};
 
@@ -83,6 +83,21 @@ pub fn redact(connection: &str) -> String {
         (Some(s), None) => s.to_owned(),
         _ => "the database given on the command line".to_owned(),
     }
+}
+
+/// Opens a connection to `target`.
+///
+/// The context line is the reason this is a function. It was written out at
+/// eight call sites, which is eight chances for the ninth to say something
+/// slightly different — and this message is the first thing an operator sees
+/// when a deployment cannot start, so it is worth saying the same way every
+/// time. The driver's own message names an address and a cause; the label is
+/// deliberately not added here, because the callers that want it in a *finding*
+/// (`verify`, `doctor`) compose it themselves with the redacted form.
+pub async fn connect(target: &Target) -> anyhow::Result<pbps_db::Conn> {
+    pbps_db::Conn::connect(target.connection())
+        .await
+        .context("cannot connect to the database")
 }
 
 /// One runtime per command. The tool is a CLI, not a server; only the driver

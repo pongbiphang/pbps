@@ -256,21 +256,71 @@ pub fn or_unanswerable<T>(
     id: &'static str,
     step: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    or_unanswerable_with(command, json, step, |e| {
+        vec![Finding::error(id, format!("{e:#}"))]
+    })
+}
+
+/// [`or_unanswerable`] for a step whose failure belongs to a file.
+///
+/// The located form existed at four call sites before it existed here, written
+/// out by hand each time because the helper above had nowhere to put the path.
+/// A finding that names the unreadable plan or the malformed ids file is worth
+/// a parameter: it is what tells a consumer which of several files to open.
+pub fn or_unanswerable_at<T>(
+    command: &'static str,
+    json: bool,
+    id: &'static str,
+    file: impl AsRef<Path>,
+    step: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    or_unanswerable_with(command, json, step, |e| {
+        vec![Finding::error(id, format!("{e:#}")).at(&file, None)]
+    })
+}
+
+/// [`or_unanswerable`] for a step that fails with many findings at once.
+///
+/// The loader and the differ hand back one error per problem, and collapsing
+/// them into a single message throws away the column name that is the whole
+/// remedy. These callers keep their own human branch — a parse error is
+/// rendered by miette, not by [`human`] — so this returns the findings' fate
+/// rather than a value, and the caller ends on its own error.
+pub fn unanswerable(command: &'static str, json: bool, findings: Vec<Finding>) {
+    if json {
+        emit_unanswerable(command, findings);
+    }
+}
+
+fn or_unanswerable_with<T>(
+    command: &'static str,
+    json: bool,
+    step: anyhow::Result<T>,
+    findings: impl FnOnce(&anyhow::Error) -> Vec<Finding>,
+) -> anyhow::Result<T> {
     match step {
         Ok(v) => Ok(v),
         Err(e) => {
             if json {
-                let report = Report::plain(command, vec![Finding::error(id, format!("{e:#}"))])
-                    .unanswerable();
-                // A serialization failure here would be a bug in this crate's
-                // own types; printing nothing is still better than panicking on
-                // top of the error being reported.
-                if let Ok(text) = serde_json::to_string_pretty(&report) {
-                    println!("{text}");
-                }
+                emit_unanswerable(command, findings(&e));
             }
             Err(e)
         }
+    }
+}
+
+/// Prints the envelope for an outcome the command could not answer.
+///
+/// Never `?`, and never a panic: a serialization failure here would be a bug in
+/// this crate's own types, and returning it would replace the error actually
+/// being reported with a different one. Four of the call sites this replaced
+/// used `?` and would have done exactly that; two used `if let Ok`, one used
+/// `let _ = emit_json()`. Three spellings of one decision is how the decision
+/// gets made differently by accident.
+fn emit_unanswerable(command: &'static str, findings: Vec<Finding>) {
+    let report = Report::plain(command, findings).unanswerable();
+    if let Ok(text) = serde_json::to_string_pretty(&report) {
+        println!("{text}");
     }
 }
 

@@ -237,9 +237,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
     let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
     let report = match rt.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
 
         let Some(baseline) = pbps_mssql::state::latest(&mut conn).await? else {
             bail!(
@@ -339,17 +337,14 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // stdout empty — so a consumer got the converter's generic
             // "produced no output" instead of a report naming the target
             // (SPEC §9.8).
-            if json {
-                let report = crate::output::Report::plain(
-                    "verify",
-                    vec![crate::output::Finding::error(
-                        "environment.unreachable",
-                        format!("{}: {e:#}", target.label),
-                    )],
-                )
-                .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
+            crate::output::unanswerable(
+                "verify",
+                json,
+                vec![crate::output::Finding::error(
+                    "environment.unreachable",
+                    format!("{}: {e:#}", target.label),
+                )],
+            );
             return Err(e);
         }
     };
@@ -428,9 +423,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
         let scoped =
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
@@ -485,9 +478,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
         let scoped =
             managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
         report_missing(&scoped);
@@ -580,9 +571,7 @@ pub fn cmd_bootstrap(
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
 
         // Bootstrap means "into an empty database". Running it over an existing
         // managed set would fail halfway through on the first CREATE of a table
@@ -665,9 +654,7 @@ pub fn cmd_bootstrap(
 pub fn cmd_prune(project: &Project, target: &Target, keep: u32) -> anyhow::Result<()> {
     db::require_mssql(project, "state prune")?;
     db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
         let removed = pbps_mssql::state::prune(&mut conn, keep).await?;
         // The effective figure, not the one asked for: `--keep 0` still keeps
         // the newest entry, and reporting "0 remain" would describe an
@@ -690,9 +677,7 @@ pub fn cmd_prune(project: &Project, target: &Target, keep: u32) -> anyhow::Resul
 pub fn cmd_unlock(project: &Project, target: &Target) -> anyhow::Result<()> {
     db::require_mssql(project, "unlock")?;
     db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
         let holder = pbps_mssql::state::lock_holder(&mut conn).await?;
         match pbps_mssql::state::unlock(&mut conn).await? {
             true => {
@@ -775,9 +760,7 @@ pub fn cmd_plan_db(
     }
 
     let (cs, baseline_checksum, baseline_description) = db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
 
         let Some(entry) = pbps_mssql::state::latest(&mut conn).await? else {
             bail!(
@@ -1075,43 +1058,28 @@ pub fn cmd_apply(
         reject_non_transactional(&statements)?;
     }
     let targets = pbps_mssql::impact::RenameTarget::from_changes(&plan.changes);
+    let deployment = Deployment {
+        project,
+        target,
+        plan: &plan,
+        plan_checksum: &plan_checksum,
+        statements: &statements,
+        rename_targets: &targets,
+        dialect: dialect.as_ref(),
+        operator: &operator,
+    };
 
     let recorded = db::runtime()?.block_on(async {
-        let mut conn = Conn::connect(target.connection())
-            .await
-            .context("cannot connect to the database")?;
+        let mut conn = db::connect(target).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
         // have been answered about a database that is already moving.
         pbps_mssql::state::lock(&mut conn, &operator).await?;
         let result = if staged {
-            apply_staged_under_lock(
-                &mut conn,
-                project,
-                target,
-                &plan,
-                &plan_checksum,
-                &statements,
-                &targets,
-                dialect.as_ref(),
-                &operator,
-                resume,
-            )
-            .await
+            apply_staged_under_lock(&mut conn, &deployment, resume).await
         } else {
-            apply_under_lock(
-                &mut conn,
-                project,
-                target,
-                &plan,
-                &plan_checksum,
-                &statements,
-                &targets,
-                dialect.as_ref(),
-                &operator,
-            )
-            .await
+            apply_under_lock(&mut conn, &deployment).await
         };
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
@@ -1133,19 +1101,45 @@ pub fn cmd_apply(
     Ok(())
 }
 
+/// Everything one `apply` carries from its command body into the locked section.
+///
+/// Bundled rather than passed positionally because two of these are `&str` —
+/// the plan's checksum and the operator's name — and they were adjacent
+/// arguments to both functions below. Transposing them compiles, and what it
+/// produces is a ledger entry whose `plan_checksum` is a username: the pin that
+/// `apply --plan` exists to enforce, silently recording the wrong thing.
+///
+/// A struct does not make that *unrepresentable* — both fields are still
+/// `&str`, and `plan_checksum: &operator` would still compile. What it does is
+/// put the field name beside the value at the one call site, so the mistake has
+/// to be written down rather than counted to. Nine positional arguments is a
+/// place where it can be made by counting, which is what the two
+/// `#[allow(clippy::too_many_arguments)]` this replaces were saying.
+struct Deployment<'a> {
+    project: &'a Project,
+    target: &'a Target,
+    plan: &'a pbps_model::SavedPlan,
+    plan_checksum: &'a str,
+    statements: &'a [pbps_dialect::Statement],
+    rename_targets: &'a [pbps_mssql::impact::RenameTarget],
+    dialect: &'a dyn pbps_dialect::Dialect,
+    operator: &'a str,
+}
+
 /// Everything between taking the lock and releasing it. Returns the ledger id.
-#[allow(clippy::too_many_arguments)]
-async fn apply_under_lock(
-    conn: &mut Conn,
-    project: &Project,
-    target: &Target,
-    plan: &pbps_model::SavedPlan,
-    plan_checksum: &str,
-    statements: &[pbps_dialect::Statement],
-    rename_targets: &[pbps_mssql::impact::RenameTarget],
-    dialect: &dyn pbps_dialect::Dialect,
-    operator: &str,
-) -> anyhow::Result<i64> {
+async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result<i64> {
+    // Destructured straight back into the names the body below already uses:
+    // every field is a shared reference, so this copies nothing.
+    let Deployment {
+        project,
+        target,
+        plan,
+        plan_checksum,
+        statements,
+        rename_targets,
+        dialect,
+        operator,
+    } = *d;
     let Some(entry) = pbps_mssql::state::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
@@ -1225,19 +1219,21 @@ async fn apply_under_lock(
 /// hand, so the drift discipline applies to a half-finished plan as much as to
 /// a finished one: the live state has to still equal the checkpoint, or the
 /// remaining statements are being run against something nobody planned for.
-#[allow(clippy::too_many_arguments)]
 async fn apply_staged_under_lock(
     conn: &mut Conn,
-    project: &Project,
-    target: &Target,
-    plan: &pbps_model::SavedPlan,
-    plan_checksum: &str,
-    statements: &[pbps_dialect::Statement],
-    rename_targets: &[pbps_mssql::impact::RenameTarget],
-    dialect: &dyn pbps_dialect::Dialect,
-    operator: &str,
+    d: &Deployment<'_>,
     resume: bool,
 ) -> anyhow::Result<i64> {
+    let Deployment {
+        project,
+        target,
+        plan,
+        plan_checksum,
+        statements,
+        rename_targets,
+        dialect,
+        operator,
+    } = *d;
     let Some(entry) = pbps_mssql::state::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",

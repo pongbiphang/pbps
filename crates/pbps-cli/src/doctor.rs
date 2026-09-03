@@ -83,6 +83,47 @@ pub struct EnvDiagnosis {
     pub detail: Option<String>,
 }
 
+impl EnvDiagnosis {
+    /// A diagnosis of an environment nothing has been read from yet.
+    ///
+    /// Every field is the value that means **not determined**, which is what
+    /// makes this safe to share between the three callers: the type already
+    /// distinguishes "not determined" from "none" everywhere it matters
+    /// (`permissions_unknown` beside an empty `missing_permissions`,
+    /// `server_capabilities_unknown` beside an absent `supports_*`), so
+    /// starting from here cannot make an unread answer look like a good one.
+    /// Written out three times before, which is three places to forget a new
+    /// field in — and forgetting one here means shipping a default, not a
+    /// compile error.
+    fn unknown(environment: String, state: &'static str) -> Self {
+        Self {
+            environment,
+            state,
+            server_version: None,
+            edition: None,
+            supports_online: None,
+            supports_create_or_alter: None,
+            missing_permissions: Vec::new(),
+            permissions_unknown: false,
+            absent_schemas: Vec::new(),
+            server_capabilities_unknown: None,
+            detail: None,
+        }
+    }
+
+    /// The environment whose connection string could not be resolved at all.
+    ///
+    /// Distinct from `unreachable`: nothing was attempted, because there was
+    /// nothing to attempt it against. An unset `url_env` variable is the
+    /// commonest first-run problem there is, and it has its own remedy.
+    fn unconfigured(environment: String, detail: String) -> Self {
+        Self {
+            detail: Some(detail),
+            ..Self::unknown(environment, "unconfigured")
+        }
+    }
+}
+
 /// One target named on the command line, resolved or not.
 ///
 /// The resolution is carried rather than unwrapped by the caller because
@@ -169,19 +210,10 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &referenced,
                 ))
             }
-            Err(e) => EnvDiagnosis {
-                environment: name.unwrap_or_else(|| "the given target".to_owned()),
-                state: "unconfigured",
-                server_version: None,
-                edition: None,
-                supports_online: None,
-                supports_create_or_alter: None,
-                missing_permissions: Vec::new(),
-                permissions_unknown: false,
-                absent_schemas: Vec::new(),
-                server_capabilities_unknown: None,
-                detail: Some(format!("{e:#}")),
-            },
+            Err(e) => EnvDiagnosis::unconfigured(
+                name.unwrap_or_else(|| "the given target".to_owned()),
+                format!("{e:#}"),
+            ),
         };
         findings.extend(env_findings(&d, counts.modules > 0));
         environments.push(d);
@@ -212,19 +244,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
                 // command worth running before a deployment.
-                Err(e) => EnvDiagnosis {
-                    environment: name.clone(),
-                    state: "unconfigured",
-                    server_version: None,
-                    edition: None,
-                    supports_online: None,
-                    supports_create_or_alter: None,
-                    missing_permissions: Vec::new(),
-                    permissions_unknown: false,
-                    absent_schemas: Vec::new(),
-                    server_capabilities_unknown: None,
-                    detail: Some(e.to_string()),
-                },
+                Err(e) => EnvDiagnosis::unconfigured(name.clone(), e.to_string()),
             };
             findings.extend(env_findings(&d, counts.modules > 0));
             environments.push(d);
@@ -364,19 +384,10 @@ async fn examine(
     schemas: &[String],
     referenced: &[String],
 ) -> EnvDiagnosis {
-    let mut d = EnvDiagnosis {
-        environment: name.to_owned(),
-        state: "unreachable",
-        server_version: None,
-        edition: None,
-        supports_online: None,
-        supports_create_or_alter: None,
-        missing_permissions: Vec::new(),
-        permissions_unknown: false,
-        absent_schemas: Vec::new(),
-        server_capabilities_unknown: None,
-        detail: None,
-    };
+    // `unreachable` until a connection says otherwise: every early return below
+    // is a database that could not be read, and the state each of them leaves
+    // behind has to say so rather than inherit an optimistic default.
+    let mut d = EnvDiagnosis::unknown(name.to_owned(), "unreachable");
     let mut conn = match Conn::connect(connection).await {
         Ok(c) => c,
         Err(e) => {
