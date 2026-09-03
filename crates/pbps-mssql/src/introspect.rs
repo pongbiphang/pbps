@@ -126,6 +126,34 @@ pub struct RawModule {
     pub default_set_options: bool,
 }
 
+/// One user-defined database role, as `sys.database_principals` reports it
+/// (ADR-0005).
+#[derive(Debug, Clone)]
+pub struct RawRole {
+    pub name: String,
+}
+
+/// One permission row of `sys.database_permissions` granted to a role, on an
+/// object or a schema.
+#[derive(Debug, Clone)]
+pub struct RawPermission {
+    pub role: String,
+    /// `sys.database_permissions.class`: 1 for an object, 3 for a schema.
+    pub class: u8,
+    /// The permission name as the catalog spells it (`SELECT`, `VIEW
+    /// DEFINITION`).
+    pub permission: String,
+    /// `G` granted, `W` granted with grant option, `D` denied, `R` revoked.
+    pub state: String,
+    /// The schema the object is in, or the schema itself for class 3.
+    pub schema: String,
+    /// The object's name; `None` for a schema-level permission.
+    pub object: Option<String>,
+    /// `sys.database_permissions.minor_id`: non-zero for a column-level
+    /// permission, which the model does not hold.
+    pub minor_id: i32,
+}
+
 /// Maps `sys.objects.type` codes onto the model's kinds.
 ///
 /// Returns `None` for anything that is not a module, so an unknown code is
@@ -152,6 +180,8 @@ pub struct RawCatalog {
     pub checks: Vec<RawCheck>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
+    pub roles: Vec<RawRole>,
+    pub permissions: Vec<RawPermission>,
 }
 
 /// The result of a pull: the schema, plus everything that could not be said.
@@ -673,6 +703,72 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     }
     unmanaged_modules.sort();
     unmanaged_modules.dedup();
+
+    // Roles (ADR-0005). Every user-defined role is read; the managed-set cut
+    // happens later, by the ids file. What the model cannot hold — a DENY, a
+    // column-level grant, a permission outside the closed set, a grant with
+    // GRANT OPTION — is reported, never dropped: each is a difference the
+    // next plan would otherwise revoke or fail to see.
+    for r in &raw.roles {
+        schema
+            .roles
+            .insert(r.name.clone(), pbps_model::Role::default());
+    }
+    for p in &raw.permissions {
+        let Some(role) = schema.roles.get_mut(&p.role) else {
+            continue;
+        };
+        let target = match (p.class, &p.object) {
+            (1, Some(object)) => {
+                pbps_model::GrantTarget::Object(ObjectName::new(p.schema.clone(), object.clone()))
+            }
+            (3, _) => pbps_model::GrantTarget::Schema(p.schema.clone()),
+            _ => continue,
+        };
+        if p.minor_id != 0 {
+            warnings.push(format!(
+                "role {}: a column-level {} on {target} is not modelled; it was left out of the \
+                 declarations",
+                p.role, p.permission
+            ));
+            continue;
+        }
+        match p.state.trim() {
+            "G" | "W" => {}
+            "D" => {
+                warnings.push(format!(
+                    "role {}: DENY {} on {target} is not modelled (ADR-0005); it was left out of \
+                     the declarations",
+                    p.role, p.permission
+                ));
+                continue;
+            }
+            other => {
+                warnings.push(format!(
+                    "role {}: permission state `{other}` on {target} is not modelled; it was \
+                     left out of the declarations",
+                    p.role
+                ));
+                continue;
+            }
+        }
+        let Ok(permission) = p.permission.parse::<pbps_model::Permission>() else {
+            warnings.push(format!(
+                "role {}: {} on {target} is outside the permissions pbps manages; it was left \
+                 out of the declarations",
+                p.role, p.permission
+            ));
+            continue;
+        };
+        if p.state.trim() == "W" {
+            warnings.push(format!(
+                "role {}: {} on {target} was granted WITH GRANT OPTION, which is not modelled; \
+                 it is declared as a plain grant",
+                p.role, p.permission
+            ));
+        }
+        role.grants.entry(target).or_default().insert(permission);
+    }
 
     Pulled {
         schema,

@@ -5045,3 +5045,205 @@ data:
             .await;
     });
 }
+
+// ---- Roles and grants, ADR-0005 ----
+
+const A_TABLE_AND_A_ROLE: [(&str, &str); 2] = [
+    (
+        "dbo.customer.yml",
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_customer, columns: [id]}\n",
+    ),
+    (
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [select]\n",
+    ),
+];
+
+impl Demo {
+    fn files(&self, files: &[(&str, &str)]) {
+        for (name, body) in files {
+            std::fs::write(self.dir.join("schema").join(name), body).unwrap();
+        }
+    }
+}
+
+/// A declared role reaches the plan as `CREATE ROLE` then `GRANT`, after the
+/// object it grants on; the widening is labelled and nothing is gated.
+#[test]
+fn a_declared_role_is_created_then_granted_and_the_widening_is_not_gated() {
+    let d = Demo::new("rolecreate");
+    d.files(&A_TABLE_AND_A_ROLE);
+
+    let sql_path = d.dir.join("plan.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    let create_table = sql.find("CREATE TABLE").expect(&sql);
+    let create_role = sql.find("CREATE ROLE [app_reader];").expect(&sql);
+    let grant = sql
+        .find("GRANT SELECT ON OBJECT::[dbo].[customer] TO [app_reader];")
+        .expect(&sql);
+    assert!(create_table < grant && create_role < grant, "{sql}");
+
+    let out = stdout(&o);
+    assert!(out.contains("grant-widen"), "labelled: {out}");
+    assert!(!out.contains("--allow"), "but not gated: {out}");
+    // And the role has identity: an `r_` uid in the file.
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("\"r_"), "{ids}");
+    assert!(ids.contains("app_reader"), "{ids}");
+}
+
+/// Taking a permission away is the availability risk ADR-0005 gates.
+#[test]
+fn removing_a_permission_is_a_revoke_behind_the_gate() {
+    let d = Demo::new("rolerevoke");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [view-definition]\n",
+    )]);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("revoke select"), "{out}");
+    assert!(out.contains("grant view-definition"), "{out}");
+    assert!(out.contains("--allow revoke"), "{out}");
+    assert!(!out.contains("--allow revoke,grant-widen"), "{out}");
+}
+
+/// A role rename is a question only its author can answer, and the answer is
+/// recorded the way a table rename is — never as drop + add, which would lose
+/// the role's members.
+#[test]
+fn renaming_a_role_needs_intent_and_rename_role_records_it() {
+    let d = Demo::new("rolerename");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let uid_before = {
+        let ids: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+        ids["roles"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, v)| *v == "app_reader")
+            .map(|(k, _)| k.clone())
+            .unwrap()
+    };
+    d.commit();
+
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
+    d.files(&[(
+        "reader.role.yml",
+        "role: reader\ngrants:\n  dbo.customer: [select]\n",
+    )]);
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("pbps rename-role app_reader reader"),
+        "{}",
+        stderr(&o)
+    );
+
+    let o = d.run(&["rename-role", "app_reader", "reader"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("rename role app_reader -> reader"),
+        "{}",
+        stdout(&o)
+    );
+    let ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    assert_eq!(
+        ids["roles"][&uid_before], "reader",
+        "the uid survives: {ids}"
+    );
+
+    // The other answer: a drop, which needs a reason and leaves a tombstone.
+    // Committed first, so the baseline knows the role by its new name.
+    d.commit();
+    std::fs::remove_file(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), FINDING);
+    assert!(stderr(&o).contains("drop-role reader"), "{}", stderr(&o));
+    let o = d.run(&["drop-role", "reader", "--reason", "SEC-9 retired"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("drop role reader"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("--allow revoke"), "{}", stdout(&o));
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("SEC-9 retired"), "{ids}");
+}
+
+/// The foreign-key-target rule applied to permissions: a grant on an object
+/// nobody declares is refused by `validate`, and a schema-level grant is not.
+#[test]
+fn a_grant_on_an_undeclared_object_fails_validate() {
+    let d = Demo::new("rolevalidate");
+    d.files(&A_TABLE_AND_A_ROLE);
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.ghost: [select]\n  schema::app: [execute]\n",
+    )]);
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["schema.grant-target"], "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dbo.ghost"),
+        "{v}"
+    );
+
+    // And a built-in role is the engine's, not the project's.
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: db_datareader\ngrants:\n  dbo.customer: [select]\n",
+    )]);
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING);
+    assert!(
+        format!("{}{}", stdout(&o), stderr(&o)).contains("built-in"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
+/// `fmt` canonicalizes a role file, keeps a pending rename, and drops it once
+/// the identity file has absorbed it — the same life cycle a table's has.
+#[test]
+fn fmt_keeps_a_pending_role_rename_and_strips_an_absorbed_one() {
+    let d = Demo::new("rolefmt");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
+    d.files(&[(
+        "reader.role.yml",
+        "role: reader\nrenamed_from: app_reader\ngrants:\n  dbo.customer: [view-definition, select]\n",
+    )]);
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    assert!(text.contains("renamed_from: app_reader"), "pending: {text}");
+    assert!(text.contains("[select, view-definition]"), "sorted: {text}");
+
+    assert_eq!(code(&d.run(&["plan"])), 0, "the annotation is the intent");
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    assert!(!text.contains("renamed_from"), "absorbed: {text}");
+}

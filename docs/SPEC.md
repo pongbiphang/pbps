@@ -393,6 +393,44 @@ first, and fails loudly in the transaction), but deleting first can fail
 still pointing at the old one when it goes, and `ON DELETE CASCADE` takes the
 child with it.
 
+### 4.7 Roles and grants
+
+One database role per file ([ADR-0005](ADR-0005-roles-and-grants.md)); the
+leading key `role:` is the name, unqualified, because a role is a principal and
+not an object in a schema.
+
+```yaml
+# schema/app_reader.role.yml
+role: app_reader
+grants:
+  dbo.customer:     [select]
+  dbo.order_status: [select, view-definition]
+  schema::app:      [execute]
+```
+
+- **What is managed is the role and its grants; membership is not.** Who holds
+  a role is each environment's own reality, never declared, compared or
+  touched. Logins and users are server-level and out of scope.
+- **Grants are data**: a target — `schema.object`, or `schema::name` for a
+  whole schema — to a set of `select`, `insert`, `update`, `delete`,
+  `references`, `execute`, `alter`, `view-definition`. `DENY` is excluded;
+  column-level grants and permissions outside that set are reported by `pull`
+  and left alone.
+- **A grant's target must be declared** — the foreign-key-target rule applied
+  to permissions — or be a `schema::` target. `validate` refuses the rest.
+- **Roles carry identity.** Drop + add would destroy membership, which the
+  declarations cannot restore, so a role has an `r_` uid in the ids file
+  (5.1), a rename needs intent (`pbps rename-role`, or `renamed_from:`) and is
+  emitted as `ALTER ROLE ... WITH NAME`, and a drop needs `--reason` and leaves
+  a tombstone.
+- Two risk classes (7.2): `revoke`, gated, for anything that takes access
+  away — a role drop included; `grant-widen`, labelled in every plan but never
+  gated, because granting is the normal case and the merge request is where
+  the YAML diff is reviewed.
+- Drift compares the managed set only: a declared role's grants on managed
+  objects and schemas. A role the ids file does not name is left alone, and so
+  is a grant on an object nobody declares.
+
 ## 5. The identity file (`schema.ids.json`)
 
 ### 5.1 Format
@@ -587,6 +625,8 @@ exists when prod deploys the rename five versions later.
 | `constraint` | Adding UNIQUE / FK / CHECK | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
+| `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
+| `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 
 The criterion is **whether this kind of change can fail at all**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is
@@ -806,7 +846,7 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
-| `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |

@@ -30,6 +30,7 @@ pub mod intent;
 pub mod module;
 pub mod name;
 pub mod plan;
+pub mod role;
 pub mod schema;
 pub mod state;
 pub mod strategy;
@@ -46,6 +47,7 @@ pub use intent::Intent;
 pub use module::{Hints, Module, ModuleDeps, ModuleKind, ObjectName};
 pub use name::{ColumnRef, NameError, TableName};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
+pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
     CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
     ReferentialAction, Schema, Table, UniqueConstraint,

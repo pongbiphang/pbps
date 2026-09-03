@@ -61,6 +61,8 @@ pub struct Explanation {
     /// for a module change, so folding them together called a one-view plan
     /// "1 table" (ADR-0002 — they are different kinds of object).
     pub module_count: usize,
+    /// Roles touched (ADR-0005).
+    pub role_count: usize,
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
@@ -251,6 +253,7 @@ fn explain(
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
     let (table_count, module_count) = report::touched(cs);
+    let role_count = report::touched_roles(cs);
 
     let present = cs.risks();
     let risks: Vec<RiskDetail> = RiskClass::ALL
@@ -263,7 +266,7 @@ fn explain(
                 .changes
                 .iter()
                 .filter(|p| p.risks.contains(&class))
-                .map(|p| format!("{}  {}", p.change.table(), report::describe(&p.change)))
+                .map(|p| format!("{}  {}", p.change.subject(), report::describe(&p.change)))
                 .collect(),
         })
         .collect();
@@ -308,10 +311,13 @@ fn explain(
             },
             plan_arg
         );
-        if !present.is_empty() {
+        // The gated classes only: `grant-widen` is listed above for the
+        // reviewer and never asked for by `apply` (ADR-0005).
+        let gated = cs.gated_risks();
+        if !gated.is_empty() {
             approve.push_str(&format!(
                 " --allow {}",
-                present
+                gated
                     .iter()
                     .map(|r| r.as_str())
                     .collect::<Vec<_>>()
@@ -340,6 +346,7 @@ fn explain(
         change_count: cs.changes.len(),
         table_count,
         module_count,
+        role_count,
         risks,
         approve_with: approve,
         plan_path: (plan_arg == PLAN_PLACEHOLDER).then_some(literal),
@@ -549,7 +556,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     out.push_str(&format!(
         "\nWhat it changes\n  {} change(s) across {}, {} statement(s).\n",
         e.change_count,
-        report::objects(e.table_count, e.module_count),
+        report::objects(e.table_count, e.module_count, e.role_count),
         e.statement_count
     ));
     out.push_str(&report::changes(&plan.changes));

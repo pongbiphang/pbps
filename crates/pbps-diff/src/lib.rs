@@ -447,4 +447,116 @@ mod tests {
             "the missing drop reason and the column ambiguity should both be reported: {errs:?}"
         );
     }
+
+    // ---- roles (ADR-0005) ----
+
+    fn with_roles(spec: &[(&str, &[&str])], roles: &[&str]) -> Schema {
+        let mut s = schema(spec);
+        for r in roles {
+            s.roles
+                .insert((*r).to_string(), pbps_model::Role::default());
+        }
+        s
+    }
+
+    #[test]
+    fn a_new_role_is_minted_an_r_uid_and_an_unchanged_one_is_left_alone() {
+        let s = with_roles(&[("dbo.customer", &["id"])], &["app_reader"]);
+        let r = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap();
+        assert_eq!(r.created_roles.len(), 1);
+        assert_eq!(r.created_roles[0].1, "app_reader");
+        assert_eq!(r.created_roles[0].0.kind(), pbps_model::UidKind::Role);
+        r.ids.validate().unwrap();
+
+        let again = resolve(&s, &r.ids, &[], &ctx()).unwrap();
+        assert_eq!(again.ids, r.ids, "nothing changed, so nothing is rewritten");
+        assert!(again.created_roles.is_empty());
+    }
+
+    /// The whole reason roles carry identity: a role that lost its name and
+    /// one that gained a name in the same revision is not decidable, because
+    /// drop + add would destroy membership pbps cannot restore.
+    #[test]
+    fn a_role_rename_without_intent_is_ambiguous_and_with_intent_keeps_the_uid() {
+        let s = with_roles(&[("dbo.customer", &["id"])], &["reader"]);
+        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let before = ids.role_uid("reader").unwrap().clone();
+
+        let s = with_roles(&[("dbo.customer", &["id"])], &["app_reader"]);
+        let errs = resolve(&s, &ids, &[], &ctx()).unwrap_err();
+        assert!(
+            matches!(&errs[0], Blocker::AmbiguousRoles { disappeared, appeared }
+                if disappeared == &["reader".to_string()] && appeared == &["app_reader".to_string()]),
+            "{errs:?}"
+        );
+
+        let r = resolve(
+            &s,
+            &ids,
+            &[Intent::RenameRole {
+                from: "reader".into(),
+                to: "app_reader".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(r.renamed_roles.len(), 1);
+        assert_eq!(r.ids.role_uid("app_reader"), Some(&before));
+        assert_eq!(r.ids.role_uid("reader"), None);
+        // Absorbed: the same annotation left in the file is not a typo.
+        assert!(intent_is_absorbed(
+            &Intent::RenameRole {
+                from: "reader".into(),
+                to: "app_reader".into()
+            },
+            &r.ids
+        ));
+    }
+
+    #[test]
+    fn a_role_drop_needs_a_reason_and_leaves_a_tombstone() {
+        let s = with_roles(&[("dbo.customer", &["id"])], &["legacy"]);
+        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let uid = ids.role_uid("legacy").unwrap().clone();
+
+        let s = schema(&[("dbo.customer", &["id"])]);
+        let errs = resolve(&s, &ids, &[], &ctx()).unwrap_err();
+        assert!(
+            matches!(&errs[0], Blocker::DropRoleNeedsReason { role } if role == "legacy"),
+            "{errs:?}"
+        );
+
+        let r = resolve(
+            &s,
+            &ids,
+            &[Intent::DropRole {
+                role: "legacy".into(),
+                reason: "SEC-7: retired".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(r.dropped_roles, vec![(uid.clone(), "legacy".to_string())]);
+        assert_eq!(r.ids.tombstones[&uid].was, "legacy");
+        assert_eq!(r.ids.tombstones[&uid].reason, "SEC-7: retired");
+        r.ids.validate().unwrap();
+        // And a stale annotation for it is absorbed, not a blocker.
+        assert!(intent_is_absorbed(
+            &Intent::DropRole {
+                role: "legacy".into(),
+                reason: "x".into()
+            },
+            &r.ids
+        ));
+    }
+
+    /// A role and a table may share a word: their namespaces are separate.
+    #[test]
+    fn a_role_named_like_a_table_is_not_the_table() {
+        let s = with_roles(&[("dbo.customer", &["id"])], &["customer"]);
+        let r = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap();
+        assert_eq!(r.created_tables.len(), 1);
+        assert_eq!(r.created_roles.len(), 1);
+        r.ids.validate().unwrap();
+    }
 }

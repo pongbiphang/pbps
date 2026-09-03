@@ -201,7 +201,10 @@ fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    if scoped.unmanaged.is_empty() && scoped.unmanaged_modules.is_empty() {
+    if scoped.unmanaged.is_empty()
+        && scoped.unmanaged_modules.is_empty()
+        && scoped.unmanaged_roles.is_empty()
+    {
         return Ok(());
     }
     let names: Vec<String> = scoped
@@ -209,6 +212,7 @@ fn report_unmanaged(
         .iter()
         .chain(&scoped.unmanaged_modules)
         .map(ToString::to_string)
+        .chain(scoped.unmanaged_roles.iter().map(|r| format!("role {r}")))
         .collect();
     match policy {
         pbps_config::Unmanaged::Ignore => {}
@@ -234,15 +238,21 @@ fn report_unmanaged(
 /// wherever it turns up: it is either a hand-dropped table or an identity file
 /// that describes a different database.
 fn report_missing(scoped: &pbps_diff::Scoped) {
-    if scoped.missing.is_empty() {
-        return;
+    if !scoped.missing.is_empty() {
+        let names: Vec<String> = scoped.missing.iter().map(ToString::to_string).collect();
+        eprintln!(
+            "warning: the identity file names {} table(s) this database does not have: {}",
+            names.len(),
+            names.join(", ")
+        );
     }
-    let names: Vec<String> = scoped.missing.iter().map(ToString::to_string).collect();
-    eprintln!(
-        "warning: the identity file names {} table(s) this database does not have: {}",
-        names.len(),
-        names.join(", ")
-    );
+    if !scoped.missing_roles.is_empty() {
+        eprintln!(
+            "warning: the identity file names {} role(s) this database does not have: {}",
+            scoped.missing_roles.len(),
+            scoped.missing_roles.join(", ")
+        );
+    }
 }
 
 /// `pbps verify` — the drift check (SPEC §8.2).
@@ -1134,7 +1144,7 @@ pub fn cmd_apply(
             names.join(", "),
             plan_path.display(),
             plan.changes
-                .risks()
+                .gated_risks()
                 .iter()
                 .map(|r| r.as_str())
                 .collect::<Vec<_>>()

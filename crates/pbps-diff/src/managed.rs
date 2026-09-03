@@ -42,6 +42,13 @@ pub struct Scoped {
     /// Modules the database has that nobody manages. Left alone, exactly like
     /// an unmanaged table.
     pub unmanaged_modules: Vec<ObjectName>,
+
+    /// Roles the database has that the identity file does not name (ADR-0005).
+    /// Left alone: their grants are neither compared nor touched.
+    pub unmanaged_roles: Vec<String>,
+
+    /// Roles the identity file names that the database does not have.
+    pub missing_roles: Vec<String>,
 }
 
 /// Cuts a live schema down to the managed set.
@@ -69,9 +76,9 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectNa
     }
 
     let missing = managed
-        .into_iter()
-        .filter(|n| !schema.tables.contains_key(*n))
-        .cloned()
+        .iter()
+        .filter(|n| !schema.tables.contains_key(**n))
+        .map(|n| (*n).clone())
         .collect();
 
     let mut unmanaged_modules = Vec::new();
@@ -83,11 +90,40 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectNa
         }
     }
 
+    // Roles by the ids file, like tables. Inside a managed role, only the
+    // grants on objects pbps manages are kept: a grant on somebody else's
+    // table is that table's business, and comparing it would have the next
+    // plan revoke a permission the declarations were never allowed to name.
+    // Schema-level grants stay — they are declarable.
+    let managed_roles: BTreeSet<&String> = ids.roles.values().collect();
+    let mut unmanaged_roles = Vec::new();
+    for (name, role) in &schema.roles {
+        if !managed_roles.contains(name) {
+            unmanaged_roles.push(name.clone());
+            continue;
+        }
+        let mut kept = role.clone();
+        kept.grants.retain(|target, _| match target {
+            pbps_model::GrantTarget::Object(o) => {
+                managed.contains(o) || managed_modules.contains(o)
+            }
+            pbps_model::GrantTarget::Schema(_) => true,
+        });
+        scoped.roles.insert(name.clone(), kept);
+    }
+    let missing_roles = managed_roles
+        .into_iter()
+        .filter(|n| !schema.roles.contains_key(*n))
+        .cloned()
+        .collect();
+
     Scoped {
         schema: scoped,
         unmanaged,
         missing,
         unmanaged_modules,
+        unmanaged_roles,
+        missing_roles,
     }
 }
 
@@ -124,10 +160,13 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
     // Every recorded uid is off-limits for derivation: reusing one would make
     // the differ match a brand-new column to an unrelated recorded one and
     // report a rename that never happened.
+    let roles_by_name: BTreeMap<&String, &Uid> =
+        recorded.roles.iter().map(|(u, n)| (n, u)).collect();
     let mut taken: BTreeSet<Uid> = recorded
         .tables
         .keys()
         .chain(recorded.columns.keys())
+        .chain(recorded.roles.keys())
         .chain(recorded.tombstones.keys())
         .cloned()
         .collect();
@@ -148,6 +187,13 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
             };
             observed.columns.insert(uid, cref);
         }
+    }
+    for name in live.roles.keys() {
+        let uid = match roles_by_name.get(name) {
+            Some(u) => (*u).clone(),
+            None => free_uid(UidKind::Role, name, &mut taken),
+        };
+        observed.roles.insert(uid, name.clone());
     }
     observed
 }
@@ -417,6 +463,71 @@ mod tests {
         assert_eq!(
             scoped.unmanaged_modules,
             vec!["dbo.v_theirs".parse::<TableName>().unwrap()]
+        );
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    /// A role outside the ids file is somebody else's, and inside a managed
+    /// role only the grants on managed objects are compared: a grant on a
+    /// table nobody declares is not one the declarations may name, so the
+    /// next plan must not propose revoking it.
+    #[test]
+    fn roles_are_scoped_by_the_ids_file_and_their_grants_by_the_managed_set() {
+        let mut live = schema(&["dbo.customer", "dbo.other"]);
+        let mut reader = pbps_model::Role::default();
+        for target in ["dbo.customer", "dbo.other", "schema::app"] {
+            reader.grants.insert(
+                target.parse().unwrap(),
+                [pbps_model::Permission::Select].into_iter().collect(),
+            );
+        }
+        live.roles.insert("app_reader".into(), reader);
+        live.roles
+            .insert("someone_elses".into(), pbps_model::Role::default());
+
+        let mut recorded = ids(&[("t_aaaaaa", "dbo.customer")]);
+        recorded
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
+        recorded
+            .roles
+            .insert("r_bbbbbb".parse().unwrap(), "gone".into());
+
+        let scoped = scope(&live, &recorded, &BTreeSet::new());
+        assert_eq!(scoped.unmanaged_roles, vec!["someone_elses".to_string()]);
+        assert_eq!(scoped.missing_roles, vec!["gone".to_string()]);
+        let kept: Vec<String> = scoped.schema.roles["app_reader"]
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(kept, ["dbo.customer", "schema::app"]);
+        assert!(!scoped.schema.roles.contains_key("someone_elses"));
+    }
+
+    #[test]
+    fn an_observed_role_keeps_its_recorded_uid_and_a_new_one_is_derived() {
+        let mut live = schema(&["dbo.customer"]);
+        live.roles
+            .insert("app_reader".into(), pbps_model::Role::default());
+        live.roles
+            .insert("hand_made".into(), pbps_model::Role::default());
+        let mut recorded = ids(&[("t_aaaaaa", "dbo.customer")]);
+        recorded
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
+        let observed = observed_ids(&live, &recorded);
+        assert_eq!(
+            observed.role_uid("app_reader"),
+            Some(&"r_aaaaaa".parse().unwrap())
+        );
+        let derived = observed.role_uid("hand_made").unwrap();
+        assert_eq!(derived.kind(), UidKind::Role);
+        assert_eq!(
+            observed_ids(&live, &recorded).role_uid("hand_made"),
+            Some(derived),
+            "the same database observed twice gets the same identity"
         );
     }
 }

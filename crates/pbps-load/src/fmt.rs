@@ -250,6 +250,34 @@ pub fn render_module(
     s
 }
 
+/// Renders one role as canonical YAML (ADR-0005).
+///
+/// A pending `RenameRole` intent for this role is written back as
+/// `renamed_from:`, exactly as a table's is: the annotation survives `fmt`
+/// until the identity file has absorbed it.
+pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "role: {}", scalar(name));
+    if let Some(d) = &role.description {
+        let _ = writeln!(s, "description: {}", scalar(d));
+    }
+    for i in pending {
+        if let Intent::RenameRole { from, to } = i
+            && to == name
+        {
+            let _ = writeln!(s, "renamed_from: {}", scalar(from));
+        }
+    }
+    if !role.grants.is_empty() {
+        s.push_str("\ngrants:\n");
+        for (target, permissions) in &role.grants {
+            let names: Vec<String> = permissions.iter().map(|p| p.as_str().to_owned()).collect();
+            let _ = writeln!(s, "  {}: {}", scalar(&target.to_string()), seq(&names));
+        }
+    }
+    s
+}
+
 fn action(a: pbps_model::ReferentialAction) -> &'static str {
     use pbps_model::ReferentialAction as R;
     match a {

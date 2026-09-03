@@ -33,7 +33,7 @@
 use std::borrow::Cow;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Role, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -345,6 +345,12 @@ pub trait Dialect {
     /// that does not implement modules: `validate` says what it checked, and
     /// this one checked nothing.
     fn validate_module(&self, _name: &ObjectName, _module: &Module) -> Vec<DialectError> {
+        Vec::new()
+    }
+
+    /// Checks whether this dialect can express the role and its grants
+    /// (ADR-0005). The same default, for the same reason.
+    fn validate_role(&self, _name: &str, _role: &Role) -> Vec<DialectError> {
         Vec::new()
     }
 

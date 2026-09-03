@@ -51,6 +51,30 @@ fn escape_reserved_stem(encoded: String) -> String {
     format!("%{:02X}{rest}", first.as_bytes()[0])
 }
 
+/// The file a role is written to: `<name>.role.yml`, with the same encoding
+/// as an object name's components and the same hashed fallback.
+///
+/// A role has no schema, so the `.role` suffix is what keeps it apart from a
+/// table called the same thing — `app_reader.yml` would otherwise be read as
+/// a table file whose name has no schema, which the loader refuses.
+pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let readable = format!("{}.role.yml", escape_reserved_stem(component(name)));
+    let file = if readable.len() <= 240 {
+        readable
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(b"role");
+        format!("~pbps-{:x}.role.yml", hasher.finalize())
+    };
+    let path = dir.join(&file);
+    if path.parent() != Some(dir) {
+        bail!("refusing to write `{file}` outside `{}`", dir.display());
+    }
+    Ok(path)
+}
+
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     let kind_suffix = kind.map(|k| format!(".{}", k.as_str())).unwrap_or_default();
     let readable = format!(

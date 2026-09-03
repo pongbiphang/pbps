@@ -2127,3 +2127,162 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
 
     db.drop().await;
 }
+
+/// Roles against the engine (ADR-0005): the plan's `CREATE ROLE` and `GRANT`
+/// are accepted, the catalog reads the role and its grants back exactly, a
+/// hand-made `GRANT` and a `DENY` are seen for what they are, and a rename
+/// goes through `ALTER ROLE ... WITH NAME` with the membership — the one thing
+/// the declarations cannot restore — still attached afterwards.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    let mut customer = Table::default();
+    customer
+        .columns
+        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+    customer.primary_key = Some(PrimaryKey {
+        name: Some("pk_customer".to_owned()),
+        columns: vec!["id".to_owned()],
+    });
+    let mut reader = Role::default();
+    reader.grants.insert(
+        GrantTarget::Object(TableName::new("dbo", "customer")),
+        [Permission::Select, Permission::ViewDefinition]
+            .into_iter()
+            .collect(),
+    );
+    reader.grants.insert(
+        GrantTarget::Schema("dbo".to_owned()),
+        [Permission::Execute].into_iter().collect(),
+    );
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert(TableName::new("dbo", "customer"), customer);
+    declared
+        .roles
+        .insert("app_reader".to_owned(), reader.clone());
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    assert_eq!(ids.roles.len(), 1);
+
+    let mut db = TestDb::create("roles").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert_eq!(pulled.warnings, Vec::<String>::new());
+    assert_eq!(pulled.schema.roles.get("app_reader"), Some(&reader));
+    // Scoped by the ids file, the live state is the declaration.
+    let scoped = pbps_diff::scope(&pulled.schema, &ids, &Default::default());
+    assert_eq!(scoped.schema.roles, declared.roles);
+    assert!(
+        scoped.unmanaged_roles.is_empty(),
+        "{:?}",
+        scoped.unmanaged_roles
+    );
+
+    // Hand edits: a grant nobody declared, and a DENY, which is not modelled
+    // and must be reported rather than folded into anything.
+    db.conn
+        .execute(
+            "GRANT INSERT ON OBJECT::dbo.customer TO app_reader;\n\
+             DENY DELETE ON OBJECT::dbo.customer TO app_reader;",
+        )
+        .await
+        .expect("hand edits");
+    let again = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    assert!(
+        again.warnings.iter().any(|w| w.contains("DENY DELETE")),
+        "{:?}",
+        again.warnings
+    );
+    let live = pbps_diff::scope(&again.schema, &ids, &Default::default()).schema;
+    let drift = pbps_diff::diff_partial(
+        pbps_diff::Side {
+            schema: &scoped.schema,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &live,
+            ids: &pbps_diff::observed_ids(&live, &ids),
+        },
+        &Mssql,
+        &pbps_model::Hints::default(),
+    );
+    assert!(drift.errors.is_empty(), "{:?}", drift.errors);
+    let described: Vec<String> = drift
+        .changes
+        .changes
+        .iter()
+        .map(|p| format!("{:?}", p.change))
+        .collect();
+    assert_eq!(described.len(), 1, "{described:?}");
+    assert!(
+        described[0].starts_with("Grant") && described[0].contains("Insert"),
+        "{described:?}"
+    );
+
+    // Membership is the environment's own. A user without a login is enough
+    // to hold it, and it has to survive the rename.
+    db.conn
+        .execute(
+            "CREATE USER pbps_member WITHOUT LOGIN;\n\
+             ALTER ROLE app_reader ADD MEMBER pbps_member;",
+        )
+        .await
+        .expect("a member");
+    let mut renamed = declared.clone();
+    let role = renamed.roles.remove("app_reader").unwrap();
+    renamed.roles.insert("reader".to_owned(), role);
+    let renamed_ids = mint_ids(
+        &renamed,
+        &ids,
+        &[Intent::RenameRole {
+            from: "app_reader".to_owned(),
+            to: "reader".to_owned(),
+        }],
+    );
+    assert_eq!(renamed_ids.roles, {
+        let mut r = ids.roles.clone();
+        for v in r.values_mut() {
+            *v = "reader".to_owned();
+        }
+        r
+    });
+    let cs = plan(&scoped.schema, &ids, &renamed, &renamed_ids);
+    let statements: Vec<String> = cs
+        .changes
+        .iter()
+        .flat_map(|p| Mssql.emit(&p.change, p.strategy).expect("emit"))
+        .map(|s| s.sql)
+        .collect();
+    assert_eq!(
+        statements,
+        ["ALTER ROLE [app_reader] WITH NAME = [reader];"],
+        "a rename is one ALTER, never a drop"
+    );
+    apply(&mut db.conn, &cs).await;
+    let members = db
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM sys.database_role_members rm \
+             JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
+             JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id \
+             WHERE r.name = 'reader' AND m.name = 'pbps_member';",
+        )
+        .await
+        .expect("members");
+    let n: i32 = members[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(n, 1, "the member must still hold the renamed role");
+
+    db.drop().await;
+}

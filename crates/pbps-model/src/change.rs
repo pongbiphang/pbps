@@ -20,6 +20,7 @@ use std::fmt;
 use crate::data::{Cell, DataMode, Row, RowKey};
 use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
+use crate::role::{GrantTarget, Permission};
 use crate::schema::{
     CheckConstraint, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
 };
@@ -55,6 +56,15 @@ pub enum RiskClass {
     /// A row leaves the table: an `exact` table's undeclared row, or a changed
     /// primary-key value, which is delete plus insert.
     DataDelete,
+    /// Access is taken away (ADR-0005): a `REVOKE`, or a role drop, whose whole
+    /// effect is one. An availability risk — a running application loses
+    /// access mid-flight.
+    Revoke,
+    /// Access widens (ADR-0005). A security risk, labelled in every plan so
+    /// both review layers see it — but **not gated**: granting is the normal
+    /// case, the merge request reviews the YAML diff and the gate approves the
+    /// pinned plan, and a flag for it would add friction without safety.
+    GrantWiden,
 }
 
 impl RiskClass {
@@ -68,7 +78,19 @@ impl RiskClass {
             RiskClass::Constraint => "constraint",
             RiskClass::DataUpdate => "data-update",
             RiskClass::DataDelete => "data-delete",
+            RiskClass::Revoke => "revoke",
+            RiskClass::GrantWiden => "grant-widen",
         }
+    }
+
+    /// Whether `apply` refuses the plan until `--allow` names this class.
+    ///
+    /// Every class is *labelled*; only the gated ones stop an apply. The one
+    /// exception exists because the alternative is worse: a `--allow
+    /// grant-widen` typed on every deployment that adds a permission would be
+    /// typed out of habit, and a gate that is always opened protects nothing.
+    pub const fn is_gated(self) -> bool {
+        !matches!(self, RiskClass::GrantWiden)
     }
 
     /// What can go wrong, in the operator's words.
@@ -99,10 +121,16 @@ impl RiskClass {
             RiskClass::DataDelete => {
                 "a reference row is removed: rows in other tables that point at it fail, or lose what they pointed at"
             }
+            RiskClass::Revoke => {
+                "access is taken away: an application still relying on it fails from the moment the plan commits"
+            }
+            RiskClass::GrantWiden => {
+                "access widens: a role can do more than before, which the merge request should have reviewed"
+            }
         }
     }
 
-    pub const ALL: [RiskClass; 7] = [
+    pub const ALL: [RiskClass; 9] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -110,6 +138,8 @@ impl RiskClass {
         RiskClass::Constraint,
         RiskClass::DataUpdate,
         RiskClass::DataDelete,
+        RiskClass::Revoke,
+        RiskClass::GrantWiden,
     ];
 }
 
@@ -336,16 +366,70 @@ pub enum Change {
         name: ObjectName,
         kind: ModuleKind,
     },
+
+    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
+    // ... WITH NAME`, never drop + add, because membership lives only in the
+    // environment. Grants are split out of the create, as foreign keys are
+    // out of `CreateTable`: they sort after the objects they name exist.
+    CreateRole {
+        uid: Uid,
+        name: String,
+    },
+    DropRole {
+        uid: Uid,
+        name: String,
+    },
+    RenameRole {
+        uid: Uid,
+        from: String,
+        to: String,
+    },
+    /// Permissions added on one target. Only the ones that are new: restating
+    /// what the role already holds would make the plan claim a widening that
+    /// is not one.
+    Grant {
+        role: String,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// Permissions removed from one target — the ones the declaration no
+    /// longer lists.
+    Revoke {
+        role: String,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
 }
 
 impl Change {
-    /// The object this change acts on, for grouping in output and for ordering.
+    /// What this change acts on, for grouping in output and for ordering:
+    /// `dbo.customer`, or `role app_reader`.
+    // The wildcard stands in for "every change with a table", and `table()`
+    // is the exhaustive match that decides which those are; a variant added
+    // later is handled there, not here.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn subject(&self) -> String {
+        match self {
+            Change::CreateRole { name, .. }
+            | Change::DropRole { name, .. }
+            | Change::Grant { role: name, .. }
+            | Change::Revoke { role: name, .. } => format!("role {name}"),
+            Change::RenameRole { from, .. } => format!("role {from}"),
+            // Every other change acts on an object with a name.
+            other => other.table().map(ToString::to_string).unwrap_or_default(),
+        }
+    }
+
+    /// The object this change acts on, or `None` for a change that is not to
+    /// an object in the tables-and-modules namespace at all.
     ///
     /// For a module change it is the module's own qualified name: tables and
     /// modules share one namespace, so one type covers both and a plan groups
-    /// by "the thing being changed" either way.
-    pub fn table(&self) -> &TableName {
-        match self {
+    /// by "the thing being changed" either way. A role change has no such
+    /// name — a role is a principal, not an object — and the callers that
+    /// want a label use [`Change::subject`].
+    pub fn table(&self) -> Option<&TableName> {
+        Some(match self {
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
             Change::RenameTable { from, .. } => from,
             Change::AddColumn { table, .. }
@@ -371,7 +455,12 @@ impl Change {
             Change::CreateModule { name, .. }
             | Change::AlterModule { name, .. }
             | Change::DropModule { name, .. } => name,
-        }
+            Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => return None,
+        })
     }
 
     /// The module this change acts on, if it is a module change at all.
@@ -402,7 +491,12 @@ impl Change {
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. } => None,
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
         }
     }
 
@@ -451,6 +545,14 @@ impl Change {
             Change::DeleteRow { .. } => {
                 r.insert(RiskClass::DataDelete);
             }
+            // A role drop's whole effect is revocation, on top of the reason
+            // its tombstone already demanded (ADR-0005).
+            Change::DropRole { .. } | Change::Revoke { .. } => {
+                r.insert(RiskClass::Revoke);
+            }
+            Change::Grant { .. } => {
+                r.insert(RiskClass::GrantWiden);
+            }
             Change::CreateTable { .. }
             | Change::AddColumn { .. }
             | Change::AlterColumnType { .. }
@@ -472,7 +574,11 @@ impl Change {
             // there; a failure (a duplicate key, a violated FK) rolls back with
             // the plan. Changing the mode emits nothing at all.
             | Change::InsertRow { .. }
-            | Change::SetDataMode { .. } => {}
+            | Change::SetDataMode { .. }
+            // Creating a role grants nothing by itself, and a rename keeps its
+            // membership — which is the whole reason it is a rename.
+            | Change::CreateRole { .. }
+            | Change::RenameRole { .. } => {}
         }
         r
     }
@@ -545,9 +651,25 @@ impl ChangeSet {
             .collect()
     }
 
+    /// The risk classes `--allow` has to name: every gated one this plan
+    /// involves. The advice a plan prints is built from this, never from
+    /// [`ChangeSet::risks`] — advising `--allow grant-widen` for a flag the
+    /// gate never asks for would teach reviewers to type flags by rote.
+    pub fn gated_risks(&self) -> BTreeSet<RiskClass> {
+        self.risks().into_iter().filter(|r| r.is_gated()).collect()
+    }
+
     /// Risks not covered by `allowed`. Non-empty means apply must abort.
+    ///
+    /// Only the gated classes count: a labelled-but-ungated class
+    /// (`grant-widen`) is in [`ChangeSet::risks`] for the reviewer and absent
+    /// here for the gate, by design (ADR-0005).
     pub fn unapproved_risks(&self, allowed: &BTreeSet<RiskClass>) -> BTreeSet<RiskClass> {
-        self.risks().difference(allowed).copied().collect()
+        self.risks()
+            .difference(allowed)
+            .copied()
+            .filter(|r| r.is_gated())
+            .collect()
     }
 }
 
@@ -564,6 +686,58 @@ mod tests {
             assert!(r.why().len() > 20, "{r} needs a real explanation");
             assert_eq!(r.as_str().parse::<RiskClass>().unwrap(), r);
         }
+    }
+
+    /// ADR-0005: a widening is labelled for the reviewer and never stops an
+    /// apply; a revoke is both labelled and gated. The plan's risk list has to
+    /// show both, and the gate has to see exactly one.
+    #[test]
+    fn a_grant_is_labelled_but_not_gated_and_a_revoke_is_both() {
+        let target: GrantTarget = "dbo.customer".parse().unwrap();
+        let perms: BTreeSet<Permission> = [Permission::Select].into_iter().collect();
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::Grant {
+                    role: "r".into(),
+                    target: target.clone(),
+                    permissions: perms.clone(),
+                }),
+                PlannedChange::new(Change::Revoke {
+                    role: "r".into(),
+                    target,
+                    permissions: perms,
+                }),
+            ],
+        };
+        assert!(cs.risks().contains(&RiskClass::GrantWiden));
+        assert!(cs.risks().contains(&RiskClass::Revoke));
+        let unapproved = cs.unapproved_risks(&BTreeSet::new());
+        assert_eq!(
+            unapproved,
+            [RiskClass::Revoke].into_iter().collect(),
+            "only the gated class stops the apply"
+        );
+        assert!(
+            cs.unapproved_risks(&[RiskClass::Revoke].into_iter().collect())
+                .is_empty()
+        );
+        // And a role drop is a revocation on top of its tombstone.
+        assert!(
+            Change::DropRole {
+                uid: uid("r_aaaaaa"),
+                name: "r".into()
+            }
+            .intrinsic_risks()
+            .contains(&RiskClass::Revoke)
+        );
+        assert!(
+            Change::CreateRole {
+                uid: uid("r_aaaaaa"),
+                name: "r".into()
+            }
+            .intrinsic_risks()
+            .is_empty()
+        );
     }
     use crate::schema::Column;
 
@@ -718,8 +892,17 @@ mod tests {
 
     #[test]
     fn every_change_reports_its_table() {
-        assert_eq!(drop_column().table().to_string(), "dbo.customer");
-        assert_eq!(add_column().table().to_string(), "dbo.customer");
+        assert_eq!(drop_column().table().unwrap().to_string(), "dbo.customer");
+        assert_eq!(add_column().table().unwrap().to_string(), "dbo.customer");
+        assert_eq!(drop_column().subject(), "dbo.customer");
+        // A role is a principal, not an object: no table, but a subject.
+        let grant = Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: BTreeSet::new(),
+        };
+        assert_eq!(grant.table(), None);
+        assert_eq!(grant.subject(), "role app_reader");
     }
 
     // ---- modules (ADR-0002) ----
@@ -764,7 +947,7 @@ mod tests {
             name: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
         };
-        assert_eq!(c.table().to_string(), "dbo.active_customer");
+        assert_eq!(c.table().unwrap().to_string(), "dbo.active_customer");
         assert_eq!(
             c.module_name().map(ToString::to_string).as_deref(),
             Some("dbo.active_customer")

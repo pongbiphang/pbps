@@ -44,6 +44,13 @@ pub enum Blocker {
     DropColumnNeedsReason { column: ColumnRef },
     /// A table vanished from the declarations with no reason for dropping it.
     DropTableNeedsReason { table: TableName },
+    /// Roles both disappeared and appeared (ADR-0005).
+    AmbiguousRoles {
+        disappeared: Vec<String>,
+        appeared: Vec<String>,
+    },
+    /// A role vanished from the declarations with no reason for dropping it.
+    DropRoleNeedsReason { role: String },
     /// An intent was given that matches nothing in either the declarations or the
     /// identity file — almost always a typo.
     ///
@@ -74,6 +81,10 @@ pub struct Resolution {
     pub added_columns: Vec<(Uid, ColumnRef)>,
     pub dropped_columns: Vec<(Uid, ColumnRef)>,
     pub renamed_columns: Vec<(Uid, ColumnRef, ColumnRef)>,
+    pub created_roles: Vec<(Uid, String)>,
+    pub dropped_roles: Vec<(Uid, String)>,
+    /// `(uid, old name, new name)`
+    pub renamed_roles: Vec<(Uid, String, String)>,
 }
 
 pub fn resolve(
@@ -91,6 +102,7 @@ pub fn resolve(
 
     resolve_tables(declared, intents, ctx, &mut r, &mut blockers, &mut used);
     resolve_columns(declared, intents, ctx, &mut r, &mut blockers, &mut used);
+    resolve_roles(declared, intents, ctx, &mut r, &mut blockers, &mut used);
 
     for (i, intent) in intents.iter().enumerate() {
         if !used.contains(&i) && !intent_is_absorbed(intent, &r.ids) {
@@ -125,6 +137,7 @@ pub fn resolve(
 pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile) -> bool {
     let has_column = |c: &ColumnRef| ids.column_uid(c).is_some();
     let has_table = |t: &TableName| ids.table_uid(t).is_some();
+    let has_role = |r: &str| ids.role_uid(r).is_some();
 
     match intent {
         Intent::RenameTable { from, to } => has_table(to) && !has_table(from),
@@ -133,6 +146,90 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile) -> bool {
         }
         Intent::DropTable { table, .. } => !has_table(table),
         Intent::DropColumn { column, .. } => !has_column(column),
+        Intent::RenameRole { from, to } => has_role(to) && !has_role(from),
+        Intent::DropRole { role, .. } => !has_role(role),
+    }
+}
+
+/// Roles, by the same rules as tables (ADR-0005): a name on both sides is the
+/// same role, a rename needs intent, and a drop needs a reason. Membership is
+/// what drop + add would destroy, which is why a role is on this side of the
+/// line at all.
+fn resolve_roles(
+    declared: &Schema,
+    intents: &[Intent],
+    ctx: &Context,
+    r: &mut Resolution,
+    blockers: &mut Vec<Blocker>,
+    used: &mut BTreeSet<usize>,
+) {
+    let declared_names: BTreeSet<&String> = declared.roles.keys().collect();
+    let known: BTreeMap<String, Uid> = r
+        .ids
+        .roles
+        .iter()
+        .map(|(u, n)| (n.clone(), u.clone()))
+        .collect();
+
+    let mut appeared: BTreeSet<String> = declared_names
+        .iter()
+        .filter(|n| !known.contains_key(**n))
+        .map(|n| (*n).clone())
+        .collect();
+    let mut disappeared: BTreeSet<String> = known
+        .keys()
+        .filter(|n| !declared_names.contains(n))
+        .cloned()
+        .collect();
+
+    for (i, intent) in intents.iter().enumerate() {
+        if let Intent::RenameRole { from, to } = intent
+            && disappeared.remove(from)
+            && appeared.remove(to)
+        {
+            let uid = known[from].clone();
+            r.ids.roles.insert(uid.clone(), to.clone());
+            r.renamed_roles.push((uid, from.clone(), to.clone()));
+            used.insert(i);
+        }
+    }
+
+    for (i, intent) in intents.iter().enumerate() {
+        if let Intent::DropRole { role, reason } = intent
+            && disappeared.remove(role)
+        {
+            let uid = known[role].clone();
+            r.ids.roles.remove(&uid);
+            r.ids.tombstones.insert(
+                uid.clone(),
+                Tombstone {
+                    was: role.clone(),
+                    dropped_at: ctx.today.clone(),
+                    reason: reason.clone(),
+                    operator: ctx.operator.clone(),
+                },
+            );
+            r.dropped_roles.push((uid, role.clone()));
+            used.insert(i);
+        }
+    }
+
+    if !appeared.is_empty() && !disappeared.is_empty() {
+        blockers.push(Blocker::AmbiguousRoles {
+            disappeared: disappeared.into_iter().collect(),
+            appeared: appeared.into_iter().collect(),
+        });
+        return;
+    }
+
+    for role in disappeared {
+        blockers.push(Blocker::DropRoleNeedsReason { role });
+    }
+
+    for name in appeared {
+        let uid = fresh_uid(&r.ids, UidKind::Role);
+        r.ids.roles.insert(uid.clone(), name.clone());
+        r.created_roles.push((uid, name));
     }
 }
 
@@ -347,10 +444,7 @@ fn drop_table_in_ids(ids: &mut IdsFile, uid: &Uid, table: &TableName, reason: &s
 fn fresh_uid(ids: &IdsFile, kind: UidKind) -> Uid {
     loop {
         let u = Uid::generate(kind);
-        if !ids.tables.contains_key(&u)
-            && !ids.columns.contains_key(&u)
-            && !ids.tombstones.contains_key(&u)
-        {
+        if !ids.contains_uid(&u) {
             return u;
         }
     }
@@ -365,4 +459,7 @@ fn sort_resolution(r: &mut Resolution) {
     r.added_columns.sort();
     r.dropped_columns.sort();
     r.renamed_columns.sort();
+    r.created_roles.sort();
+    r.dropped_roles.sort();
+    r.renamed_roles.sort();
 }

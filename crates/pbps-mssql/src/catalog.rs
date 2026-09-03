@@ -123,6 +123,30 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
 
+/// User-defined database roles (ADR-0005). `is_fixed_role = 0` drops
+/// `db_owner` and friends; `public` is type `R` and not fixed, so it is
+/// excluded by name.
+const ROLES: &str = "\
+SELECT p.name
+  FROM sys.database_principals p
+ WHERE p.type = 'R' AND p.is_fixed_role = 0 AND p.name <> 'public'
+ ORDER BY p.name;";
+
+/// Every permission held by a user-defined role on an object or a schema.
+/// Column-level rows come too (`minor_id <> 0`), so the assembler can report
+/// them rather than have them silently absent.
+const PERMISSIONS: &str = "\
+SELECT pr.name AS role_name, dp.class, dp.permission_name, dp.state, dp.minor_id,
+       COALESCE(os.name, ss.name) AS schema_name, o.name AS object_name
+  FROM sys.database_permissions dp
+  JOIN sys.database_principals pr ON pr.principal_id = dp.grantee_principal_id
+  LEFT JOIN sys.objects o ON dp.class = 1 AND o.object_id = dp.major_id
+  LEFT JOIN sys.schemas os ON os.schema_id = o.schema_id
+  LEFT JOIN sys.schemas ss ON dp.class = 3 AND ss.schema_id = dp.major_id
+ WHERE pr.type = 'R' AND pr.is_fixed_role = 0 AND pr.name <> 'public'
+   AND dp.class IN (1, 3)
+ ORDER BY pr.name, dp.class, schema_name, object_name, dp.permission_name;";
+
 /// A required value that came back NULL means the query and the struct have
 /// drifted apart; that is a bug here, not bad data, and it must be named.
 pub(crate) fn get<'a, T: FromColumn<'a>>(row: &'a Row, col: &str) -> Result<T, DbError> {
@@ -226,6 +250,30 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             kind,
             definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
             parent,
+        });
+    }
+
+    for row in conn.query(ROLES).await? {
+        raw.roles.push(crate::introspect::RawRole {
+            name: get::<&str>(&row, "name")?.to_owned(),
+        });
+    }
+
+    for row in conn.query(PERMISSIONS).await? {
+        // A permission on an object the catalog has no schema for (a dropped
+        // object's orphaned row) has nothing to be declared against.
+        let Some(schema) = opt::<&str>(&row, "schema_name")? else {
+            continue;
+        };
+        let class: u8 = get(&row, "class")?;
+        raw.permissions.push(crate::introspect::RawPermission {
+            role: get::<&str>(&row, "role_name")?.to_owned(),
+            class,
+            permission: get::<&str>(&row, "permission_name")?.trim().to_owned(),
+            state: get::<&str>(&row, "state")?.to_owned(),
+            schema: schema.to_owned(),
+            object: opt::<&str>(&row, "object_name")?.map(str::to_owned),
+            minor_id: get(&row, "minor_id")?,
         });
     }
 

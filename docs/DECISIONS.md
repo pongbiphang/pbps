@@ -390,3 +390,42 @@ SPEC is in sync with all of these.
     runs the update *before* the delete precisely so the engine accepts it;
     an over-exclusion is refused by the engine inside the transaction, which
     is the loud direction to be wrong in.
+
+## Phase 4 — roles and grants (ADR-0005)
+
+56. **A role change has no table; `Change::table()` became an `Option` and
+    `subject()` is the label.** Every earlier change acted on an object in the
+    tables-and-modules namespace, and `table()` returning a name unconditionally
+    encoded that. A role is a principal. Returning a synthetic
+    `TableName::new("role", name)` would have compiled and grouped plans
+    correctly, and would have put a fake object name into strategy lookups and
+    the edition check. The `Option` makes every caller say which it wanted.
+57. **`grant-widen` is a risk class that is never gated.** `RiskClass::is_gated`
+    exists so a class can be labelled for both review layers without being a
+    flag: `unapproved_risks`, the `--allow` advice under a plan, `apply`'s
+    refusal and `explain`'s approval command all use `gated_risks()`. A flag
+    typed on every deployment that adds a permission is a flag typed by rote,
+    which protects nothing and teaches the wrong habit.
+58. **Grants are compared under the target's post-plan name, and never revoked
+    on an object the plan drops.** The base side's grants are brought forward
+    through the plan's table renames by uid before the per-target comparison,
+    because `sp_rename` carries the permissions with the object; without that a
+    renamed table produced a `REVOKE` on a name that no longer exists at the
+    point the revokes run. A `REVOKE` on a table or module this plan drops is
+    skipped for the mirror reason: the drop removes the permission, and the
+    statement would fail after it.
+59. **Inside a managed role, only grants on managed objects are compared.** The
+    declarations may not name an undeclared object (the `validate` rule), so a
+    grant on one could never be declared — and comparing it would have every
+    plan revoke it. `scope()` drops such grants from the live side; schema
+    grants stay, and a role outside the ids file is unmanaged like a table. The
+    cost is that a hand-made grant on somebody else's table is invisible to
+    `verify`, which is the same line the managed set already draws for the
+    table itself.
+60. **The catalog reports what the model cannot hold; it never folds it.** A
+    `DENY` is not "no grant", a column-level `SELECT` is not a table-level one,
+    and `WITH GRANT OPTION` is not a plain grant. Each becomes a `pull` warning
+    naming the role and the target, and a plain grant is recorded only for the
+    last of them (with the warning), because the declaration can express that
+    much and the difference is one the next drift check will not be able to see
+    — which is said, rather than hidden.

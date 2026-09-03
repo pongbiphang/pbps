@@ -6,7 +6,7 @@
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
 use pbps_dialect::DialectError;
-use pbps_model::{Module, ModuleKind, ObjectName, Table, TableName};
+use pbps_model::{GrantTarget, Module, ModuleKind, ObjectName, Role, Table, TableName};
 
 use crate::ident;
 use crate::types::{self, DIALECT};
@@ -20,6 +20,49 @@ fn invalid(message: impl Into<String>) -> DialectError {
         message: message.into(),
     }
 }
+
+/// Every problem with a role (ADR-0005): the names it uses have to be ones
+/// this dialect can write into `GRANT` and `CREATE ROLE`. `public` and the
+/// fixed database roles are the engine's own and cannot be created, dropped or
+/// renamed; declaring one would plan a statement the engine refuses.
+pub fn role(name: &str, role: &Role) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if let Err(e) = ident::quote(name) {
+        errs.push(e);
+    }
+    if FIXED_ROLES.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+        errs.push(invalid(format!(
+            "`{name}` is a built-in database role, which cannot be created, dropped or renamed; \
+             declare a role of your own and grant to that"
+        )));
+    }
+    for target in role.grants.keys() {
+        let parts: Vec<&str> = match target {
+            GrantTarget::Object(o) => vec![&o.schema, &o.name],
+            GrantTarget::Schema(s) => vec![s],
+        };
+        for part in parts {
+            if let Err(e) = ident::quote(part) {
+                errs.push(e);
+            }
+        }
+    }
+    errs
+}
+
+/// The roles every SQL Server database has, which no declaration may claim.
+pub const FIXED_ROLES: [&str; 10] = [
+    "public",
+    "db_owner",
+    "db_accessadmin",
+    "db_securityadmin",
+    "db_ddladmin",
+    "db_backupoperator",
+    "db_datareader",
+    "db_datawriter",
+    "db_denydatareader",
+    "db_denydatawriter",
+];
 
 /// Every problem with a module, not just the first (ADR-0002).
 ///
@@ -578,5 +621,29 @@ mod tests {
     fn an_empty_definition_is_refused() {
         let e = module_errors("dbo.v", &a_module(ModuleKind::View, "  \n "));
         assert!(e.contains("empty definition"), "{e}");
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    #[test]
+    fn a_built_in_role_cannot_be_declared_and_an_ordinary_one_can() {
+        let mut role = Role::default();
+        role.grants.insert(
+            "dbo.customer".parse().unwrap(),
+            [pbps_model::Permission::Select].into_iter().collect(),
+        );
+        assert!(super::role("app_reader", &role).is_empty());
+        let errs = super::role("db_datareader", &role);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].to_string().contains("built-in"), "{errs:?}");
+        // Case is the engine's, not the file's.
+        assert!(!super::role("PUBLIC", &role).is_empty());
+        // And a target that cannot be quoted is refused where the name is.
+        let mut bad = Role::default();
+        bad.grants.insert(
+            GrantTarget::Schema("a\0b".into()),
+            [pbps_model::Permission::Select].into_iter().collect(),
+        );
+        assert!(!super::role("ok", &bad).is_empty());
     }
 }

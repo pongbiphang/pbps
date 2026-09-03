@@ -178,6 +178,12 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
                 schema.modules.insert(m.name, m.module);
                 count += 1;
             }
+            // A role's identity is in the ids file at that revision, which the
+            // caller reads separately; the baseline needs only the state.
+            Ok(pbps_load::LoadedFile::Role(r)) => {
+                schema.roles.insert(r.name, r.role);
+                count += 1;
+            }
             Err(errs) => {
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.

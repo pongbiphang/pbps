@@ -231,6 +231,17 @@ enum Command {
         reason: String,
     },
 
+    /// Record a database role rename (ADR-0005)
+    RenameRole { from: String, to: String },
+
+    /// Record a database role drop
+    DropRole {
+        role: String,
+        /// Why it is being dropped; required for audit
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Render documentation and an ERD from the declarations
     Docs {
         /// markdown, html or erd
@@ -373,6 +384,8 @@ impl Command {
             | Command::RenameTable { .. }
             | Command::Drop { .. }
             | Command::DropTable { .. }
+            | Command::RenameRole { .. }
+            | Command::DropRole { .. }
             | Command::Docs { .. }
             | Command::Pull { .. }
             | Command::Apply { .. }
@@ -771,6 +784,10 @@ fn run() -> anyhow::Result<()> {
                 reason,
             },
         ),
+        Command::RenameRole { from, to } => cmd_intent(&project, Intent::RenameRole { from, to }),
+        Command::DropRole { role, reason } => {
+            cmd_intent(&project, Intent::DropRole { role, reason })
+        }
         Command::Pull {
             target,
             force,
@@ -1005,6 +1022,14 @@ fn cmd_pull(
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
+    // Roles (ADR-0005), one file each, with the grants the catalog holds on
+    // objects pbps can express.
+    for (name, role) in &pulled.schema.roles {
+        let path = declaration_file::role_path(&dir, name)?;
+        std::fs::write(&path, pbps_load::render_role(name, role, &[]))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
 
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
@@ -1210,6 +1235,19 @@ pub fn validate_findings(
         // already half-changed.
         for problem in pbps_model::module::check_names(&l.schema) {
             findings.push(output::Finding::error("schema.name-collision", problem));
+        }
+        // Roles (ADR-0005): a grant on an object nobody declares is the
+        // foreign-key-target rule applied to permissions.
+        for problem in pbps_model::role::check(&l.schema) {
+            findings.push(output::Finding::error("schema.grant-target", problem));
+        }
+        for (name, role) in &l.schema.roles {
+            for e in dialect.validate_role(name, role) {
+                findings.push(output::Finding::error(
+                    "dialect.rejected",
+                    format!("role {name}: {e}"),
+                ));
+            }
         }
         // And a third: a `depends_on:` naming a module nobody declared. It is
         // silently a no-op in the ordering, so nothing else would ever say so.
@@ -1467,6 +1505,14 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     absorbed,
                 )
             }
+            pbps_load::LoadedFile::Role(r) => {
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = r
+                    .intents
+                    .iter()
+                    .cloned()
+                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                (pbps_load::render_role(&r.name, &r.role, &pending), absorbed)
+            }
         };
         if rendered == original {
             continue;
@@ -1696,6 +1742,7 @@ struct PlanData {
     /// module's own name, so folding them together called a one-view plan
     /// "1 table" (ADR-0002).
     modules: usize,
+    roles: usize,
     risks: Vec<&'static str>,
 }
 
@@ -2105,6 +2152,7 @@ fn cmd_plan(
                 changes: cs.changes.len(),
                 tables,
                 modules,
+                roles: report::touched_roles(&cs),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
             }),
         );

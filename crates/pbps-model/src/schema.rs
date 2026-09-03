@@ -39,6 +39,17 @@ pub struct Schema {
     /// existed is a project with no modules, not a broken file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub modules: BTreeMap<ObjectName, Module>,
+
+    /// Database roles and what they are granted (ADR-0005).
+    ///
+    /// By name, like modules — but unlike modules they carry identity in the
+    /// ids file, because dropping and recreating a role destroys its
+    /// membership, which pbps does not manage and cannot restore.
+    ///
+    /// Defaulted on read: a snapshot written before roles existed describes an
+    /// environment with no managed roles, not a broken file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, crate::role::Role>,
 }
 
 impl Schema {

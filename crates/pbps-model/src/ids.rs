@@ -50,6 +50,11 @@ pub struct IdsFile {
     #[serde(default)]
     pub columns: BTreeMap<Uid, ColumnRef>,
 
+    /// Database roles (ADR-0005), `r_`-prefixed. A compatible evolution under
+    /// the same version: a file without the section has no managed roles.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<Uid, String>,
+
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
 }
@@ -60,6 +65,7 @@ impl Default for IdsFile {
             version: CURRENT_VERSION,
             tables: BTreeMap::new(),
             columns: BTreeMap::new(),
+            roles: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         }
     }
@@ -89,6 +95,18 @@ impl IdsFile {
 
     pub fn column_uid(&self, r: &ColumnRef) -> Option<&Uid> {
         self.columns.iter().find(|(_, n)| *n == r).map(|(u, _)| u)
+    }
+
+    pub fn role_uid(&self, name: &str) -> Option<&Uid> {
+        self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
+    /// Whether any live entry or tombstone already holds this uid.
+    pub fn contains_uid(&self, uid: &Uid) -> bool {
+        self.tables.contains_key(uid)
+            || self.columns.contains_key(uid)
+            || self.roles.contains_key(uid)
+            || self.tombstones.contains_key(uid)
     }
 
     /// Moves a table, and the columns under it, to a new name.
@@ -137,15 +155,24 @@ impl IdsFile {
                 return Err(IdsError::KindMismatch { uid: uid.clone() });
             }
         }
+        for uid in self.roles.keys() {
+            if uid.kind() != UidKind::Role {
+                return Err(IdsError::KindMismatch { uid: uid.clone() });
+            }
+        }
 
         for uid in self.tombstones.keys() {
-            if self.tables.contains_key(uid) || self.columns.contains_key(uid) {
+            if self.tables.contains_key(uid)
+                || self.columns.contains_key(uid)
+                || self.roles.contains_key(uid)
+            {
                 return Err(IdsError::LiveAndTombstoned { uid: uid.clone() });
             }
         }
 
         check_unique(self.tables.iter().map(|(u, n)| (u, n.to_string())))?;
         check_unique(self.columns.iter().map(|(u, n)| (u, n.to_string())))?;
+        check_unique(self.roles.iter().map(|(u, n)| (u, n.clone())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -344,6 +371,38 @@ mod tests {
         assert!(matches!(
             f.validate().unwrap_err(),
             IdsError::KindMismatch { .. }
+        ));
+        let mut f = sample();
+        f.roles.insert(uid("c_bbbbbb"), "app_reader".into());
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::KindMismatch { .. }
+        ));
+    }
+
+    /// Roles are a compatible evolution of the file: absent means none, two
+    /// entries may not share a name, and a tombstoned role is not live.
+    #[test]
+    fn roles_join_the_file_under_the_same_rules_as_tables() {
+        let mut f = sample();
+        f.roles.insert(uid("r_aaaaaa"), "app_reader".into());
+        f.validate().unwrap();
+        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_aaaaaa")));
+        assert_eq!(f.role_uid("nobody"), None);
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"roles\""), "{json}");
+        let back: IdsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+        // Absent in an older file: no roles, not a broken file.
+        let old: IdsFile =
+            serde_json::from_str(&serde_json::to_string(&sample()).unwrap()).unwrap();
+        assert!(old.roles.is_empty());
+        assert!(!serde_json::to_string(&sample()).unwrap().contains("roles"));
+
+        f.roles.insert(uid("r_bbbbbb"), "app_reader".into());
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::DuplicateName { .. }
         ));
     }
 

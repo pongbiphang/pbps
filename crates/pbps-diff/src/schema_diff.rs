@@ -21,14 +21,14 @@
 //! preview) or from querying the database itself (Phase 3's authoritative plan).
 //! This layer does not care which; it does the comparison and nothing else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
 use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, Hints, IdsFile, ObjectName,
-    PlannedChange, Schema, Table, TableName, Uid, Value,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
+    ObjectName, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -237,6 +237,7 @@ pub fn diff_partial(
     }
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
+    diff_roles(base, declared, &mut changes);
 
     // The ordering and risk pass below runs whether or not there are errors:
     // it is pure computation over the changes already built, and a caller that
@@ -253,7 +254,7 @@ pub fn diff_partial(
         // artifact the deployment gate reviews, and a hint resolved later
         // against a YAML file the deployment host may not have is a hint
         // nobody read (ADR-0003).
-        if let Some(strategy) = hints.strategies.get(p.change.table()) {
+        if let Some(strategy) = p.change.table().and_then(|t| hints.strategies.get(t)) {
             p.strategy = *strategy;
         }
     }
@@ -280,7 +281,7 @@ pub fn diff_partial(
         (
             order_key(&p.change),
             dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank),
-            p.change.table().to_string(),
+            p.change.subject(),
             format!("{:?}", p.change),
         )
     });
@@ -699,6 +700,125 @@ fn dependency_rank(
             data_rank.get(table).map_or(0, |r| *r as isize)
         }
         Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
+        // Roles depend on nothing among themselves; a grant's target is
+        // ordered by the class of the change, not by rank.
+        Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. } => 0,
+    }
+}
+
+/// Roles are matched by **uid** (ADR-0005), and their grants by target after
+/// the base side's object names have been brought forward through this plan's
+/// table renames — a grant follows its object through `sp_rename`, so a
+/// renamed table must not come out as a revoke on the old name plus a grant
+/// on the new one.
+///
+/// A revoke on an object this same plan drops is not emitted: the drop takes
+/// the permission with it, and a `REVOKE` that ran after it would fail on an
+/// object that is gone (and one ordered before it would be noise).
+fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
+    let dropped: BTreeSet<ObjectName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::DropTable { name, .. } | Change::DropModule { name, .. } = c {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Base table name -> the name it has after this plan, by uid.
+    let renamed: BTreeMap<&TableName, &TableName> = base
+        .ids
+        .tables
+        .iter()
+        .filter_map(|(uid, name)| declared.ids.tables.get(uid).map(|to| (name, to)))
+        .filter(|(from, to)| from != to)
+        .collect();
+    let forward = |target: &GrantTarget| -> GrantTarget {
+        match target {
+            GrantTarget::Object(o) => match renamed.get(o) {
+                Some(to) => GrantTarget::Object((*to).clone()),
+                None => target.clone(),
+            },
+            GrantTarget::Schema(_) => target.clone(),
+        }
+    };
+
+    for (uid, name) in &base.ids.roles {
+        if !declared.ids.roles.contains_key(uid) {
+            changes.push(Change::DropRole {
+                uid: uid.clone(),
+                name: name.clone(),
+            });
+        }
+    }
+
+    for (uid, name) in &declared.ids.roles {
+        let Some(role) = declared.schema.roles.get(name) else {
+            continue;
+        };
+        let Some(base_name) = base.ids.roles.get(uid) else {
+            changes.push(Change::CreateRole {
+                uid: uid.clone(),
+                name: name.clone(),
+            });
+            for (target, permissions) in &role.grants {
+                if !permissions.is_empty() {
+                    changes.push(Change::Grant {
+                        role: name.clone(),
+                        target: target.clone(),
+                        permissions: permissions.clone(),
+                    });
+                }
+            }
+            continue;
+        };
+        if base_name != name {
+            changes.push(Change::RenameRole {
+                uid: uid.clone(),
+                from: base_name.clone(),
+                to: name.clone(),
+            });
+        }
+        // The base grants, keyed by the name the target has after this plan.
+        let mut before: BTreeMap<GrantTarget, BTreeSet<Permission>> = BTreeMap::new();
+        if let Some(b) = base.schema.roles.get(base_name) {
+            for (target, permissions) in &b.grants {
+                before
+                    .entry(forward(target))
+                    .or_default()
+                    .extend(permissions.iter().copied());
+            }
+        }
+        let targets: BTreeSet<&GrantTarget> = before.keys().chain(role.grants.keys()).collect();
+        for target in targets {
+            let b = before.get(target).cloned().unwrap_or_default();
+            let d = role.grants.get(target).cloned().unwrap_or_default();
+            let added: BTreeSet<Permission> = d.difference(&b).copied().collect();
+            let removed: BTreeSet<Permission> = b.difference(&d).copied().collect();
+            if !added.is_empty() {
+                changes.push(Change::Grant {
+                    role: name.clone(),
+                    target: target.clone(),
+                    permissions: added,
+                });
+            }
+            let target_dropped = match target {
+                GrantTarget::Object(o) => dropped.contains(o),
+                GrantTarget::Schema(_) => false,
+            };
+            if !removed.is_empty() && !target_dropped {
+                changes.push(Change::Revoke {
+                    role: name.clone(),
+                    target: target.clone(),
+                    permissions: removed,
+                });
+            }
+        }
     }
 }
 
@@ -770,7 +890,14 @@ fn order_key(c: &Change) -> u8 {
         // module that is going has to go before the table changes; and a view
         // can only be created once the columns it selects exist.
         Change::DropModule { .. } => 0,
-        Change::RenameTable { .. } | Change::RenameColumn { .. } => 1,
+        // A role drop needs nothing else gone first, and a plan that also
+        // recreates the name wants the old one out of the way early.
+        Change::DropRole { .. } => 0,
+        Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => 1,
+        // After the renames, so a revoke names the role and the object as
+        // they now are; before the drops, though a revoke on an object this
+        // plan drops is never emitted (see `diff_roles`).
+        Change::Revoke { .. } => 2,
         Change::DropIndex { .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
@@ -804,9 +931,13 @@ fn order_key(c: &Change) -> u8 {
         | Change::AddCheck { .. }
         | Change::AddIndex { .. } => 11,
         Change::CreateModule { .. } | Change::AlterModule { .. } => 12,
+        // A grant names an object, so it comes after every object exists —
+        // and after the role does.
+        Change::CreateRole { .. } => 13,
+        Change::Grant { .. } => 14,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
-        Change::SetDataMode { .. } => 13,
+        Change::SetDataMode { .. } => 15,
     }
 }
 #[cfg(test)]
@@ -2130,14 +2261,14 @@ mod tests {
         let created: Vec<String> = module_diff(&Schema::default(), &declared)
             .changes
             .iter()
-            .map(|p| p.change.table().to_string())
+            .map(|p| p.change.subject())
             .collect();
         assert_eq!(created, ["dbo.base", "dbo.middle", "dbo.top"]);
 
         let dropped: Vec<String> = module_diff(&declared, &Schema::default())
             .changes
             .iter()
-            .map(|p| p.change.table().to_string())
+            .map(|p| p.change.subject())
             .collect();
         assert_eq!(dropped, ["dbo.top", "dbo.middle", "dbo.base"]);
     }
@@ -2178,5 +2309,317 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kinds(&cs), ["DropModule", "AddColumn", "CreateModule"]);
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    mod roles {
+        use super::*;
+        use pbps_model::{GrantTarget, Permission, Role};
+
+        fn role(grants: &[(&str, &[Permission])]) -> Role {
+            let mut r = Role::default();
+            for (target, perms) in grants {
+                r.grants.insert(
+                    target.parse::<GrantTarget>().unwrap(),
+                    perms.iter().copied().collect(),
+                );
+            }
+            r
+        }
+
+        /// One table `dbo.customer` (uid t_aaaaaa) on both sides, plus the
+        /// roles given, with `r_` uids minted from the name list.
+        fn side(roles: &[(&str, &str, Role)]) -> (Schema, IdsFile) {
+            let mut s = Schema::default();
+            let mut t = Table::default();
+            t.columns
+                .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+            s.tables.insert("dbo.customer".parse().unwrap(), t);
+            let mut ids = IdsFile::default();
+            ids.tables
+                .insert("t_aaaaaa".parse().unwrap(), "dbo.customer".parse().unwrap());
+            ids.columns.insert(
+                "c_aaaaaa".parse().unwrap(),
+                "dbo.customer.id".parse().unwrap(),
+            );
+            for (uid, name, role) in roles {
+                ids.roles.insert(uid.parse().unwrap(), (*name).to_owned());
+                s.roles.insert((*name).to_owned(), role.clone());
+            }
+            (s, ids)
+        }
+
+        fn kinds(base: &(Schema, IdsFile), declared: &(Schema, IdsFile)) -> Vec<String> {
+            diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap()
+            .changes
+            .iter()
+            .map(|p| crate::schema_diff::tests::roles::describe(&p.change))
+            .collect()
+        }
+
+        fn describe(c: &Change) -> String {
+            match c {
+                Change::CreateRole { name, .. } => format!("create {name}"),
+                Change::DropRole { name, .. } => format!("drop {name}"),
+                Change::RenameRole { from, to, .. } => format!("rename {from}->{to}"),
+                Change::Grant {
+                    role,
+                    target,
+                    permissions,
+                } => format!(
+                    "grant {role} {target} {}",
+                    permissions
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ),
+                Change::Revoke {
+                    role,
+                    target,
+                    permissions,
+                } => format!(
+                    "revoke {role} {target} {}",
+                    permissions
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            }
+        }
+
+        #[test]
+        fn a_new_role_is_created_and_then_granted_and_nothing_is_gated() {
+            let base = side(&[]);
+            let declared = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[("dbo.customer", &[Permission::Select, Permission::Insert])]),
+            )]);
+            let k = kinds(&base, &declared);
+            assert_eq!(
+                k,
+                [
+                    "create app_reader",
+                    "grant app_reader dbo.customer select+insert"
+                ]
+            );
+            let cs = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(cs.risks().contains(&RiskClass::GrantWiden));
+            assert!(cs.unapproved_risks(&Default::default()).is_empty());
+        }
+
+        /// Only the difference: restating what the role already holds would
+        /// claim a widening that is not one, and dropping a permission is a
+        /// revoke behind the gate.
+        #[test]
+        fn grants_are_compared_per_target_and_only_the_difference_is_emitted() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[
+                    ("dbo.customer", &[Permission::Select, Permission::Insert]),
+                    ("schema::app", &[Permission::Execute]),
+                ]),
+            )]);
+            let declared = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[
+                    ("dbo.customer", &[Permission::Select, Permission::Update]),
+                    ("schema::app", &[Permission::Execute]),
+                ]),
+            )]);
+            let k = kinds(&base, &declared);
+            assert_eq!(
+                k,
+                [
+                    "revoke app_reader dbo.customer insert",
+                    "grant app_reader dbo.customer update"
+                ]
+            );
+            let cs = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                cs.unapproved_risks(&Default::default()),
+                [RiskClass::Revoke].into_iter().collect()
+            );
+            // The negative case: identical grants are no change at all.
+            assert!(kinds(&base, &base).is_empty());
+        }
+
+        #[test]
+        fn a_role_matched_by_uid_under_a_new_name_is_renamed_in_place() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "reader",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let declared = side(&[(
+                "r_aaaaaa",
+                "app_reader",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            assert_eq!(kinds(&base, &declared), ["rename reader->app_reader"]);
+        }
+
+        #[test]
+        fn a_role_gone_from_the_ids_is_dropped_behind_the_revoke_gate() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "legacy",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let declared = side(&[]);
+            assert_eq!(kinds(&base, &declared), ["drop legacy"]);
+            let cs = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(cs.risks().contains(&RiskClass::Revoke));
+        }
+
+        /// A grant follows its object through `sp_rename`, so a renamed table
+        /// must not come out as a revoke on the old name and a grant on the
+        /// new one.
+        #[test]
+        fn a_grant_on_a_renamed_table_is_not_revoked_and_regranted() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "r",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let mut declared = side(&[(
+                "r_aaaaaa",
+                "r",
+                role(&[("dbo.client", &[Permission::Select])]),
+            )]);
+            let t = declared
+                .0
+                .tables
+                .remove(&"dbo.customer".parse().unwrap())
+                .unwrap();
+            declared.0.tables.insert("dbo.client".parse().unwrap(), t);
+            declared.1.rename_table(
+                &"dbo.customer".parse().unwrap(),
+                &"dbo.client".parse().unwrap(),
+            );
+            let k = kinds(&base, &declared);
+            assert!(
+                k.iter()
+                    .all(|c| !c.starts_with("grant") && !c.starts_with("revoke")),
+                "{k:?}"
+            );
+        }
+
+        /// The drop takes the permission with it; a `REVOKE` after it would
+        /// fail on an object that is gone.
+        #[test]
+        fn a_grant_on_a_table_this_plan_drops_is_not_revoked() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "r",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            )]);
+            let mut declared = side(&[("r_aaaaaa", "r", role(&[]))]);
+            declared.0.tables.clear();
+            declared.1.tables.clear();
+            declared.1.columns.clear();
+            let k = kinds(&base, &declared);
+            assert!(k.iter().all(|c| !c.starts_with("revoke")), "{k:?}");
+        }
+
+        /// The ordering: a revoke after the renames it may depend on, a grant
+        /// after every object exists and after the role does.
+        #[test]
+        fn role_changes_sort_where_their_statements_can_run() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "old",
+                role(&[("dbo.customer", &[Permission::Insert])]),
+            )]);
+            let mut declared = side(&[
+                (
+                    "r_aaaaaa",
+                    "renamed",
+                    role(&[("dbo.customer", &[Permission::Select])]),
+                ),
+                (
+                    "r_bbbbbb",
+                    "fresh",
+                    role(&[("dbo.customer", &[Permission::Select])]),
+                ),
+            ]);
+            let mut t = Table::default();
+            t.columns
+                .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+            declared.0.tables.insert("dbo.extra".parse().unwrap(), t);
+            declared
+                .1
+                .tables
+                .insert("t_bbbbbb".parse().unwrap(), "dbo.extra".parse().unwrap());
+            let k = kinds(&base, &declared);
+            let at = |s: &str| {
+                k.iter()
+                    .position(|c| c.starts_with(s))
+                    .unwrap_or_else(|| panic!("{s} in {k:?}"))
+            };
+            assert!(at("rename") < at("revoke"), "{k:?}");
+            assert!(at("revoke") < at("create fresh"), "{k:?}");
+            assert!(at("create fresh") < at("grant fresh"), "{k:?}");
+            // CreateTable is a discriminant string here; it must precede grants.
+            let create_table = k
+                .iter()
+                .position(|c| c.starts_with("Discriminant"))
+                .unwrap();
+            assert!(create_table < at("grant"), "{k:?}");
+        }
     }
 }

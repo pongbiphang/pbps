@@ -1,13 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pbps declaration",
-  "description": "One pbps declaration file: a table, or one view, procedure, function or\ntrigger. The leading key is both the kind and the name.",
+  "description": "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name.",
   "anyOf": [
     {
       "$ref": "#/$defs/TableDto"
     },
     {
       "$ref": "#/$defs/ModuleDto"
+    },
+    {
+      "$ref": "#/$defs/RoleDto"
     }
   ],
   "$defs": {
@@ -478,6 +481,45 @@
             "on"
           ]
         }
+      ]
+    },
+    "RoleDto": {
+      "description": "One database role and its grants (ADR-0005).\n\n`role: app_reader` names it — unqualified, because a role is a principal\nand not an object in a schema. Grants are a map of target to permission\nlist: `dbo.customer: [select]`, or `schema::dbo: [select]` for a whole\nschema.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`TableDto::renamed_from`]: the role keeps its\nmembership through the rename, which is why it is intent and not\ndrop + add.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "grants": {
+          "description": "Target to permissions. Order carries no meaning; `fmt` sorts both.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role"
       ]
     }
   },

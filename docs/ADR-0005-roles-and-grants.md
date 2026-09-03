@@ -1,7 +1,6 @@
 # ADR-0005: Roles and grants — and the generalized identity criterion
 
-- Status: decided (design; implementation targeted at Phase 4, ids-file
-  extension pinned now)
+- Status: accepted and built (Phase 4; see "Implementation status")
 - Date: 2026-08-31
 - Related: docs/SPEC.md §5, §8.1, §8.2, §13.4, §13.7, §12;
   [ADR-0002](ADR-0002-module-model.md);
@@ -112,6 +111,49 @@ access-control direction gets its mechanism.
 - **Server-level objects** (logins, server roles) are out of scope.
 - **PostgreSQL variance** (default privileges, schema and sequence grants) is
   Phase 5 touchstone material, alongside function overloading from ADR-0002.
+
+## Implementation status
+
+Built: the `role:` file and its `fmt` round trip, `Role` and its grants in the
+model and in `Schema` equality, the `roles` section of the ids file with `r_`
+uids, the three intent channels (`rename-role` / `drop-role`, `renamed_from:`,
+the prompt), the differ, the `revoke` and `grant-widen` classes, the T-SQL, the
+catalog read-back (`sys.database_principals`, `sys.database_permissions`), the
+drift comparison under the managed set, `validate`'s target rule, `pull`, and
+the docs section. Live tests cover the round trip, a hand-made `GRANT` seen as
+drift, a `DENY` reported rather than folded, and a rename keeping its member.
+
+Decisions taken during implementation that this document did not anticipate:
+
+1. **`grant-widen` is labelled but never gated, mechanically.** `RiskClass`
+   gained `is_gated()`; the plan's risk list carries the class so every
+   review layer sees it, and `unapproved_risks`, the `--allow` advice and
+   `explain`'s approval command all use the gated subset. Advising a flag the
+   gate never asks for would teach reviewers to type it by rote.
+2. **A grant follows its object through a rename.** The differ brings the base
+   side's grant targets forward through the plan's table renames by uid before
+   comparing, so renaming a table does not come out as a revoke on the old
+   name plus a grant on the new one — which is also what `sp_rename` does. A
+   revoke on an object the same plan drops is not emitted: the drop takes the
+   permission with it.
+3. **Inside a managed role, only grants on managed objects are compared.** A
+   grant on somebody else's table is that table's business; comparing it
+   would have the next plan revoke a permission the declarations were never
+   allowed to name. Schema-level grants are always compared, since they are
+   declarable. A role the ids file does not name is unmanaged, like a table.
+4. **What the model cannot hold is reported by `pull`, never dropped.** A
+   `DENY`, a column-level grant, a permission outside the closed set
+   (`CONTROL`, `TAKE OWNERSHIP`), and `WITH GRANT OPTION` each produce a
+   warning naming the role and the target.
+5. **The built-in roles are refused by `validate`.** `public` and the ten
+   `db_*` roles cannot be created, dropped or renamed; declaring one would plan
+   a statement the engine refuses.
+6. **A role with members cannot be dropped**, and the engine says so inside the
+   transaction; removing members is an environment-local act pbps does not
+   perform. `doctor` does not yet check the permissions managing roles needs
+   (`CREATE ROLE`, `ALTER ANY ROLE`, and `CONTROL` on the objects granted);
+   an account short of them fails loudly at apply time, and the gap is
+   recorded in STATUS.
 
 ## Placement
 

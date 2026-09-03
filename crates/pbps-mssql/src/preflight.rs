@@ -135,7 +135,15 @@ impl AsStored {
                 // writes to — but that table is already translated through
                 // `table()` below like every other name in a probe.
                 | Change::InsertRow { .. }
-                | Change::SetDataMode { .. } => {}
+                | Change::SetDataMode { .. }
+                // A role is a principal, not an object: nothing here names a
+                // table or a column, and nothing here moves a name a probe
+                // could ask about.
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. } => {}
             }
         }
         this
@@ -333,7 +341,14 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         // rolls the plan back.
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
-        | Change::SetDataMode { .. } => Ok(Vec::new()),
+        | Change::SetDataMode { .. }
+        // A permission change fails on nothing in the data; the engine refuses
+        // an impossible grant inside the transaction.
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. } => Ok(Vec::new()),
 
         Change::DeleteRow {
             table,

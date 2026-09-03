@@ -16,12 +16,13 @@
 //! [`Statement::own_batch`] — the block declares a variable, and two of them in
 //! one batch would collide on the name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
-    ReferentialAction, Row, RowKey, Strategy, Table, TableName, UniqueConstraint, Value,
+    Cell, Change, Column, ForeignKey, GrantTarget, Index, Module, ModuleKind, ObjectName,
+    Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
+    UniqueConstraint, Value,
 };
 
 use crate::ident::{literal, quote};
@@ -135,6 +136,36 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
         Change::SetDataMode { .. } => Ok(Vec::new()),
+
+        // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
+        // which is the reason a role rename is intent rather than drop + add.
+        Change::CreateRole { name, .. } => one(format!("CREATE ROLE {};", quote(name)?)),
+        Change::DropRole { name, .. } => one(format!("DROP ROLE {};", quote(name)?)),
+        Change::RenameRole { from, to, .. } => one(format!(
+            "ALTER ROLE {} WITH NAME = {};",
+            quote(from)?,
+            quote(to)?
+        )),
+        Change::Grant {
+            role,
+            target,
+            permissions,
+        } => one(format!(
+            "GRANT {} ON {} TO {};",
+            permission_list(permissions),
+            securable(target)?,
+            quote(role)?
+        )),
+        Change::Revoke {
+            role,
+            target,
+            permissions,
+        } => one(format!(
+            "REVOKE {} ON {} FROM {};",
+            permission_list(permissions),
+            securable(target)?,
+            quote(role)?
+        )),
 
         Change::RenameTable { from, to, .. } => rename_table(from, to),
 
@@ -497,6 +528,39 @@ fn update_row(
 
 fn one(sql: String) -> Sql {
     Ok(vec![Statement::new(sql)])
+}
+
+/// A grant target as T-SQL spells a securable: `OBJECT::[s].[o]` or
+/// `SCHEMA::[s]`. The class is written out even for an object, where the
+/// engine would accept the bare name, so a reader never has to guess which
+/// kind of thing a permission landed on.
+fn securable(target: &GrantTarget) -> Result<String, DialectError> {
+    Ok(match target {
+        GrantTarget::Object(o) => format!("OBJECT::{}", qualified(o)?),
+        GrantTarget::Schema(s) => format!("SCHEMA::{}", quote(s)?),
+    })
+}
+
+/// The permission names as the engine spells them, in the model's order.
+fn permission_list(permissions: &BTreeSet<Permission>) -> String {
+    permissions
+        .iter()
+        .map(|p| permission_sql(*p))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn permission_sql(p: Permission) -> &'static str {
+    match p {
+        Permission::Select => "SELECT",
+        Permission::Insert => "INSERT",
+        Permission::Update => "UPDATE",
+        Permission::Delete => "DELETE",
+        Permission::References => "REFERENCES",
+        Permission::Execute => "EXECUTE",
+        Permission::Alter => "ALTER",
+        Permission::ViewDefinition => "VIEW DEFINITION",
+    }
 }
 
 fn null_clause(nullable: bool) -> &'static str {
@@ -1446,6 +1510,58 @@ mod tests {
             sql,
             ["DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"]
         );
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    fn perms(list: &[Permission]) -> BTreeSet<Permission> {
+        list.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_role_is_created_dropped_and_renamed_in_place() {
+        let uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
+        assert_eq!(
+            sql_of(&Change::CreateRole {
+                uid: uid.clone(),
+                name: "app_reader".into()
+            }),
+            ["CREATE ROLE [app_reader];"]
+        );
+        assert_eq!(
+            sql_of(&Change::DropRole {
+                uid: uid.clone(),
+                name: "app_reader".into()
+            }),
+            ["DROP ROLE [app_reader];"]
+        );
+        // ALTER, never drop + add: the membership has to survive.
+        let sql = sql_of(&Change::RenameRole {
+            uid,
+            from: "reader".into(),
+            to: "app_reader".into(),
+        });
+        assert_eq!(sql, ["ALTER ROLE [reader] WITH NAME = [app_reader];"]);
+        assert!(!sql[0].contains("DROP"), "{sql:?}");
+    }
+
+    #[test]
+    fn grants_name_the_securable_class_and_spell_permissions_the_engines_way() {
+        let sql = sql_of(&Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: perms(&[Permission::ViewDefinition, Permission::Select]),
+        });
+        assert_eq!(
+            sql,
+            ["GRANT SELECT, VIEW DEFINITION ON OBJECT::[dbo].[customer] TO [app_reader];"]
+        );
+        let sql = sql_of(&Change::Revoke {
+            role: "app_reader".into(),
+            target: "schema::app".parse().unwrap(),
+            permissions: perms(&[Permission::Execute]),
+        });
+        assert_eq!(sql, ["REVOKE EXECUTE ON SCHEMA::[app] FROM [app_reader];"]);
     }
 
     /// The same rule identifiers follow: a value can never end its own literal.

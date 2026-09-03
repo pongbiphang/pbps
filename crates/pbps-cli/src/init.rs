@@ -422,6 +422,11 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
             )
             .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }
+        for (name, role) in &prepared.schema.roles {
+            let path = declaration_file::role_path(&schema_dir, name)?;
+            std::fs::write(&path, pbps_load::render_role(name, role, &[]))
+                .with_context(|| format!("cannot stage `{}`", path.display()))?;
+        }
         std::fs::write(stage.join(pbps_config::CONFIG_FILE), &prepared.config_text)
             .context("cannot stage pbps.yml")?;
         std::fs::write(
