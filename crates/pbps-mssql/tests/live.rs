@@ -2621,10 +2621,15 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     let again = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect");
+    // The DENY is not a warning: a managed role that gained one has changed,
+    // and the sets that remain would compare equal (DECISIONS 97).
     assert!(
-        again.warnings.iter().any(|w| w.contains("DENY DELETE")),
+        again
+            .unexpressible
+            .iter()
+            .any(|(role, w)| role == "app_reader" && w.contains("DENY DELETE")),
         "{:?}",
-        again.warnings
+        again.unexpressible
     );
     // WITH GRANT OPTION is wider than any grant a declaration can spell: it
     // is not folded into the set (that read a widened role as clean) and it

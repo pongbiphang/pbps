@@ -1009,6 +1009,12 @@ fn cmd_pull(
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
     }
+    // A role's permission the model cannot hold: for `pull` a warning like
+    // the others, since nothing is being compared yet; for `verify` the same
+    // fact is drift (DECISIONS 97).
+    for (_, w) in &pulled.unexpressible {
+        eprintln!("warning: {w}");
+    }
     // The same line `validate` draws, at the moment the block is written
     // rather than on the next run: a table this size is somebody's business
     // table, and every plan from here on compares it row by row.
@@ -1125,10 +1131,10 @@ fn cmd_pull(
         dir.display(),
         project.ids_file().display()
     );
-    if !pulled.warnings.is_empty() {
+    let left_out = pulled.warnings.len() + pulled.unexpressible.len();
+    if left_out > 0 {
         println!(
-            "{} thing(s) could not be expressed and were left out; see the warnings above.",
-            pulled.warnings.len()
+            "{left_out} thing(s) could not be expressed and were left out; see the warnings above."
         );
     }
     println!("Next: commit these files, then `pbps plan` should report no changes.");

@@ -763,3 +763,19 @@ SPEC is in sync with all of these.
     place and the plan never converging. Representing the bit in the model
     is a format change with an emitter half (`WITH GRANT OPTION` on the way
     out) and belongs to an ADR, not a review fix.
+96. **A clock field in a window is two digits, checked before it is read.**
+    Rust's integer parse takes a sign, so `+01:-30` was thirty minutes
+    east and `+9:00` a valid hour, and the window was measured at a time
+    nobody wrote. The offset's and the time's fields are two ASCII digits
+    each, and anything else is refused by name — the shape `parse_date`
+    already had (78).
+97. **Every permission the model cannot hold on a managed role is
+    unexpressible drift, not a warning.** 95 made the grant option so and
+    left a DENY, a column-level grant, a permission outside the closed set
+    and a grant on an unmodelled object as warnings on stderr — and a
+    managed role that gained a column-level `SELECT` on a sensitive column
+    out of band compared equal on the sets that remained. All of them now
+    travel the same way: left out of the set, carried beside the comparison,
+    reported by `verify` as drift and refused by `plan --db`. `pull` still
+    prints them as warnings, since nothing is being compared yet. The
+    second instance of 95's shape, swept the same day.

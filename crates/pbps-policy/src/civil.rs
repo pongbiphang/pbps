@@ -76,20 +76,34 @@ pub fn parse_offset(s: &str) -> Result<i32, String> {
         _ => return Err(bad()),
     };
     let (h, m) = rest.split_once(':').ok_or_else(bad)?;
-    let h: i32 = h.parse().map_err(|_| bad())?;
-    let m: i32 = m.parse().map_err(|_| bad())?;
+    // Two digits each, and digits only: `i32::parse` takes a sign, so
+    // `+01:-30` read as thirty minutes east and the window was measured at
+    // a time nobody wrote (DECISIONS 96).
+    let h = two_digits(h).ok_or_else(bad)?;
+    let m = two_digits(m).ok_or_else(bad)?;
     if h > 14 || m > 59 {
         return Err(bad());
     }
     Ok(sign * (h * 60 + m))
 }
 
+/// Exactly two ASCII digits, as a number. The shape every clock field in a
+/// window has, checked before the number is read so a sign cannot hide in it.
+fn two_digits(s: &str) -> Option<i32> {
+    let b = s.as_bytes();
+    if b.len() != 2 || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(i32::from(b[0] - b'0') * 10 + i32::from(b[1] - b'0'))
+}
+
 /// `HH:MM` as minutes since midnight; `24:00` is allowed as an end.
 pub fn parse_hhmm(s: &str) -> Result<u32, String> {
     let bad = || format!("`{s}` is not a time like `09:00`");
     let (h, m) = s.trim().split_once(':').ok_or_else(bad)?;
-    let h: u32 = h.parse().map_err(|_| bad())?;
-    let m: u32 = m.parse().map_err(|_| bad())?;
+    // The same two-digit shape: `u32::parse` takes a leading `+` too.
+    let h = two_digits(h).ok_or_else(bad)? as u32;
+    let m = two_digits(m).ok_or_else(bad)? as u32;
     if h > 24 || m > 59 || (h == 24 && m != 0) {
         return Err(bad());
     }
@@ -196,6 +210,16 @@ mod tests {
         assert_eq!(parse_offset("Z").unwrap(), 0);
         assert!(parse_offset("8").is_err());
         assert!(parse_offset("+15:00").is_err());
+        // A sign inside a component is not a smaller offset; the integer
+        // parser would have taken it.
+        assert!(parse_offset("+01:-30").is_err());
+        assert!(parse_offset("--01:00").is_err());
+        assert!(parse_offset("+1:00").is_err());
+        assert!(parse_offset("+08:0").is_err());
+        assert!(parse_offset("+0800").is_err());
+        assert!(parse_hhmm("+9:00").is_err());
+        assert!(parse_hhmm("09:+5").is_err());
+        assert!(parse_hhmm("9:00").is_err());
         assert_eq!(parse_hhmm("09:30").unwrap(), 570);
         assert_eq!(parse_hhmm("24:00").unwrap(), 1440);
         assert!(parse_hhmm("24:01").is_err());

@@ -192,13 +192,14 @@ pub struct Pulled {
     /// the caller must show these, because each one is a difference that would
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
-    /// Grants the model cannot hold and a drift check must not call clean:
-    /// `(role, what)`. A grant `WITH GRANT OPTION` is wider than the plain
-    /// grant a declaration can spell, so it is left out of the role's set —
-    /// folded in, `verify` compared it equal to the plain grant and said
-    /// "no drift" about a role that could now delegate — and reported here
-    /// for the caller to put beside the other unexpressible differences
-    /// (DECISIONS 95).
+    /// Permissions the model cannot hold and a drift check must not call
+    /// clean: `(role, what)`. A grant `WITH GRANT OPTION`, a DENY, a
+    /// column-level grant, a permission outside the closed set, a grant on
+    /// an object the model does not hold: each is left out of the role's set
+    /// — folded in or merely warned about, `verify` compared the sets that
+    /// remained equal and said "no drift" about a role that had changed —
+    /// and reported here for the caller to put beside the other
+    /// unexpressible differences (DECISIONS 95, 97).
     pub unexpressible: Vec<(String, String)>,
     /// Modules the database has that pbps cannot manage: a CLR object, one
     /// created `WITH ENCRYPTION`, or one whose stored text does not have the
@@ -734,54 +735,72 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             (3, _) => pbps_model::GrantTarget::Schema(p.schema.clone()),
             _ => continue,
         };
-        // A grant on an object the model does not hold — a sequence, a
-        // synonym, a module that could not be read — is reported and left
-        // out, like a DENY. Written into the role it would make `validate`
-        // refuse the project `pull` just wrote, since a grant target has to
-        // be a declared table or module.
+        // Every permission the model cannot hold is left out of the role's
+        // set *and* reported as unexpressible, never as a warning alone: a
+        // managed role that gained a column-level grant, a DENY, a CONTROL
+        // or a grant on a sequence out of band is wider or narrower than
+        // the recorded one, and a comparison of the sets that remain would
+        // call it clean (DECISIONS 95, 97). Written into the role, a grant
+        // on an object the model does not hold would also make `validate`
+        // refuse the project `pull` just wrote.
         if let pbps_model::GrantTarget::Object(object) = &target
             && !schema.tables.contains_key(object)
             && !schema.modules.contains_key(object)
         {
-            warnings.push(format!(
-                "role {}: {} on {target} is on an object pbps does not model, or could not \
-                 read; it was left out of the declarations",
-                p.role, p.permission
+            unexpressible.push((
+                p.role.clone(),
+                format!(
+                    "role {}: {} on {target} is on an object pbps does not model, or could not \
+                     read; the declarations cannot express it",
+                    p.role, p.permission
+                ),
             ));
             continue;
         }
         if p.minor_id != 0 {
-            warnings.push(format!(
-                "role {}: a column-level {} on {target} is not modelled; it was left out of the \
-                 declarations",
-                p.role, p.permission
+            unexpressible.push((
+                p.role.clone(),
+                format!(
+                    "role {}: a column-level {} on {target} is not modelled; the declarations \
+                     cannot express it",
+                    p.role, p.permission
+                ),
             ));
             continue;
         }
         match p.state.trim() {
             "G" | "W" => {}
             "D" => {
-                warnings.push(format!(
-                    "role {}: DENY {} on {target} is not modelled (ADR-0005); it was left out of \
-                     the declarations",
-                    p.role, p.permission
+                unexpressible.push((
+                    p.role.clone(),
+                    format!(
+                        "role {}: DENY {} on {target} is not modelled (ADR-0005); the \
+                         declarations cannot express it",
+                        p.role, p.permission
+                    ),
                 ));
                 continue;
             }
             other => {
-                warnings.push(format!(
-                    "role {}: permission state `{other}` on {target} is not modelled; it was \
-                     left out of the declarations",
-                    p.role
+                unexpressible.push((
+                    p.role.clone(),
+                    format!(
+                        "role {}: permission state `{other}` on {target} is not modelled; the \
+                         declarations cannot express it",
+                        p.role
+                    ),
                 ));
                 continue;
             }
         }
         let Ok(permission) = p.permission.parse::<pbps_model::Permission>() else {
-            warnings.push(format!(
-                "role {}: {} on {target} is outside the permissions pbps manages; it was left \
-                 out of the declarations",
-                p.role, p.permission
+            unexpressible.push((
+                p.role.clone(),
+                format!(
+                    "role {}: {} on {target} is outside the permissions pbps manages; the \
+                     declarations cannot express it",
+                    p.role, p.permission
+                ),
             ));
             continue;
         };
@@ -922,11 +941,14 @@ mod tests {
         let role = &p.schema.roles["app_reader"];
         let targets: Vec<String> = role.grants.keys().map(ToString::to_string).collect();
         assert_eq!(targets, ["dbo.customer", "schema::dbo"]);
-        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
+        assert_eq!(p.unexpressible[0].0, "app_reader");
         assert!(
-            p.warnings[0].contains("dbo.order_seq") && p.warnings[0].contains("does not model"),
+            p.unexpressible[0].1.contains("dbo.order_seq")
+                && p.unexpressible[0].1.contains("does not model"),
             "{:?}",
-            p.warnings
+            p.unexpressible
         );
     }
 
@@ -949,23 +971,33 @@ mod tests {
         };
         raw.permissions.push(grant("SELECT", "G"));
         raw.permissions.push(grant("UPDATE", "W"));
+        raw.permissions.push(grant("DELETE", "D"));
+        raw.permissions.push(grant("CONTROL", "G"));
+        let mut column = grant("INSERT", "G");
+        column.minor_id = 2;
+        raw.permissions.push(column);
         let p = assemble(&raw);
         let target: pbps_model::GrantTarget = "dbo.customer".parse().unwrap();
         let grants = &p.schema.roles["app_reader"].grants[&target];
-        assert!(grants.contains(&pbps_model::Permission::Select));
-        assert!(
-            !grants.contains(&pbps_model::Permission::Update),
-            "{grants:?}"
+        assert_eq!(
+            grants.iter().copied().collect::<Vec<_>>(),
+            [pbps_model::Permission::Select],
+            "only the plain grant on the whole object is the declaration's"
         );
-        assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
-        assert_eq!(p.unexpressible[0].0, "app_reader");
+        let what: Vec<&str> = p.unexpressible.iter().map(|(_, w)| w.as_str()).collect();
+        assert_eq!(what.len(), 4, "{what:?}");
+        assert!(p.unexpressible.iter().all(|(r, _)| r == "app_reader"));
         assert!(
-            p.unexpressible[0].1.contains("WITH GRANT OPTION")
-                && p.unexpressible[0]
-                    .1
-                    .contains("REVOKE GRANT OPTION FOR UPDATE"),
-            "{:?}",
-            p.unexpressible
+            what.iter()
+                .any(|w| w.contains("WITH GRANT OPTION")
+                    && w.contains("REVOKE GRANT OPTION FOR UPDATE")),
+            "{what:?}"
+        );
+        assert!(what.iter().any(|w| w.contains("DENY DELETE")), "{what:?}");
+        assert!(what.iter().any(|w| w.contains("CONTROL")), "{what:?}");
+        assert!(
+            what.iter().any(|w| w.contains("column-level INSERT")),
+            "{what:?}"
         );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
