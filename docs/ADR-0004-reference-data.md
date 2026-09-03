@@ -162,18 +162,27 @@ Decisions taken during implementation that this document did not anticipate:
    `apply` records the database read back, and needs no checkout to know which
    rows to read.
 4. **Values come back in the engine's spelling, and a cell that holds its
-   default comes back omitted.** Every cell is rendered by the server
-   (`CONVERT` with a fixed style; `bit` and the integer types are the only
-   ones read back typed), so both sides of a drift check see one spelling and
-   a declaration that wants to match writes it that way — `pull --data` shows
-   it. Per cell, the engine is asked whether the value equals the column's
-   default expression; when it does, the cell is omitted, which is how the
-   omitted spelling round-trips. A default the engine cannot evaluate to the
-   stored value (`SYSUTCDATETIME()`, `NEWID()`) never matches, so that cell is
-   read back explicit and a row that omits it is restated as `= DEFAULT` on
-   every connected plan, visibly; the remedy is to write the value. A table
-   whose live key is not a single column is **unreadable**, and the read
-   fails rather than answering "no rows".
+   default is read in the spelling of whoever reads it.** Every cell is
+   rendered by the server (`CONVERT` with a fixed style; `bit` and the
+   integer types are the only ones read back typed), so both sides of a drift
+   check see one spelling and a declaration that wants to match writes it
+   that way — `pull --data` shows it. The catalog cannot tell `label:
+   Unlabelled` from an omitted `label` when the default is `'Unlabelled'`, so
+   the read reports *both*: the value, and whether it equals the default
+   (`ObservedRow`). The side that looks at the row then chooses — a cell it
+   writes explicitly stays explicit, a cell it omits and that is at its
+   default is omitted — so each spelling round-trips and neither is restated
+   on every connected plan. (The first cut folded the choice into the read,
+   "equal to the default means omitted", and an explicit value equal to its
+   default was restated forever.) Only a **literal** default is compared:
+   `SYSUTCDATETIME()`, `NEWID()` or `NEXT VALUE FOR` are never put in the
+   query, because the `CASE` that compares would run them once per row —
+   and `NEXT VALUE FOR` is not even legal there. Such a cell is taken at the
+   declaration's word: at its default where the row omits it, the stored
+   value where the row spells it; a hand edit to an omitted cell of that kind
+   is not seen, and the remedy for a column that matters is to write the
+   value. A table whose live key is not a single column is **unreadable**,
+   and the read fails rather than answering "no rows".
 5. **A table the declarations take over is measured against what it holds.**
    The first connected plan for a table with a new `data:` block reads its
    rows, updates the ones that differ, inserts the ones missing, and — for

@@ -354,7 +354,8 @@ SPEC is in sync with all of these.
     in it, leaving every later `verify` blind to the rows just written — the
     same shape the state version was bumped for when modules arrived.
 53. **Values are read back in the engine's spelling, and a cell equal to its
-    default is read back as omitted.** Every cell is rendered by the server
+    default is read back as omitted.** *The second half is superseded by 67:
+    the read now reports both readings and the side chooses.* Every cell is rendered by the server
     with a fixed `CONVERT` style; only `bit` and the integer types come back
     typed, because those are the shapes a declaration writes unquoted. Per
     cell the engine is asked whether the value equals the column's default
@@ -443,7 +444,8 @@ SPEC is in sync with all of these.
     differ cannot express "give this key a name" for a declaration that has
     none — which is the declaration saying it does not care.
 62. **`doctor` asks for the role permissions only of a project that declares a
-    role.** `CREATE ROLE`, `ALTER ANY ROLE` and `CONTROL` on every granted
+    role.** *Widened by 68: "declares" became "has", and the securables
+    include what the roles hold live.* `CREATE ROLE`, `ALTER ANY ROLE` and `CONTROL` on every granted
     securable are security-shaped, and the list refuses over-demand everywhere
     else — but an account short of them fails on the first `GRANT` of a
     project that does declare roles, after `doctor` said ready. So `REQUIRED`
@@ -484,3 +486,41 @@ SPEC is in sync with all of these.
     error, or demanding quotes, would make the most common setting the one
     that fails; `true` is refused instead, because "on" names no severity.
     ADR-0008 "Implementation status" item 6.
+67. **A cell at its default is read in the spelling of whoever reads it.**
+    The catalog holds `'Unlabelled'`, not whether the row was written as
+    `label: Unlabelled` or by omitting `label`; folding "equals the default"
+    into "omitted" at the read (53) made the explicit spelling compare
+    unequal to itself and be restated on every connected plan. The read now
+    returns the value *and* the flag (`ObservedRow`), and the projection
+    into a side's view — the recorded snapshot for a drift check, the
+    declarations for the plan base and the rehearsal, nothing for `pull` —
+    keeps a cell explicit where that side spells it and omits it where that
+    side omits it. Both spellings round-trip; a hand edit that sets an
+    explicit cell to its default is still seen, because the reference spells
+    it and the read keeps the value.
+68. **Only a literal default is compared by the read; every other default is
+    taken at the declaration's word.** The `CASE` that asked "equals the
+    default" ran the default expression once per row: `NEWID()` was
+    harmless, a sequence was advanced by a drift check, and `NEXT VALUE FOR`
+    is not legal in a `CASE` at all, so the table was unreadable. A default
+    is compared only when it is a number, a string, `NULL` or a hex constant
+    under any parentheses (`rows::is_constant`, conservative on purpose); a
+    cell whose default is anything else is reported as at its default, so it
+    is omitted where the row omits it and explicit where the row spells it.
+    The cost is stated in the module docs: a hand edit to an omitted cell of
+    that kind is not seen. The alternative — reading it explicit — restated
+    `= DEFAULT` on every plan, and for `SYSUTCDATETIME()` that *rewrote the
+    timestamp on every apply*, which is worse than not looking.
+69. **`doctor` asks about what the managed roles hold live, not only what the
+    declarations grant.** A revision that removes a role's last grant, or the
+    role, plans a `REVOKE` or a `DROP ROLE` whose securable the declarations
+    no longer name — so `grant_targets` was `None` and `doctor` said ready to
+    an apply that then failed on the `REVOKE`. The managed roles (declared, in
+    the ids file, or tombstoned by a `drop-role`) are passed by name, and
+    the connected check reads their grants from the **recorded state** first
+    — that is what the next plan revokes against, and the ledger is readable
+    by any account that can deploy — and from `sys.database_permissions`
+    second, for grants adopted by hand. The catalog alone was tried first and
+    measured useless: metadata visibility hides a securable from an account
+    with no permission on it, which is exactly the account `doctor` is
+    checking, so the live query saw nothing precisely where the gap was.

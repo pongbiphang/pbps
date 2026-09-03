@@ -383,8 +383,10 @@ by one.
 of an `exact` table, the declared keys of an `ensure` one — supplied by the
 command, because a database holds rows and not a notion of which are declared.
 The rows come back in the engine's own spelling, and a cell that holds its
-column's default comes back omitted, so the declaration's spelling round-trips
-(ADR-0004, "Implementation status"). `apply` records them into `state_json`
+column's default is read as the declaration spells it — omitted where the
+declaration omits it, explicit where it writes it — so either spelling
+round-trips; a default the engine would have to run is never evaluated by the
+read (ADR-0004, "Implementation status"). `apply` records them into `state_json`
 after the plan, `verify` compares them, and a table whose rows the declarations
 cover for the first time is planned against what it holds rather than against
 nothing. `pull --data <table>` writes the block from an existing table.

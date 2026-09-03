@@ -300,7 +300,10 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
             return row;
         }
     };
-    let live_schema = scoped.schema.with_observed_rows(&rows, &recorded_data);
+    let live_schema =
+        scoped
+            .schema
+            .with_observed_rows(&rows, &recorded_data, &entry.snapshot.schema);
     let live = pbps_model::state_checksum(&live_schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {

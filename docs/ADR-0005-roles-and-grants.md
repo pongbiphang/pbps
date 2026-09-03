@@ -143,8 +143,12 @@ Decisions taken during implementation that this document did not anticipate:
    declarable. A role the ids file does not name is unmanaged, like a table.
 4. **What the model cannot hold is reported by `pull`, never dropped.** A
    `DENY`, a column-level grant, a permission outside the closed set
-   (`CONTROL`, `TAKE OWNERSHIP`), and `WITH GRANT OPTION` each produce a
-   warning naming the role and the target.
+   (`CONTROL`, `TAKE OWNERSHIP`), `WITH GRANT OPTION`, and a grant on an
+   object the model does not hold (a sequence, a synonym, a module that could
+   not be read) each produce a warning naming the role and the target. The
+   last one is left out of the role rather than written, because a grant
+   target has to be a declared table or module and `validate` would refuse
+   the project `pull` had just written.
 5. **The built-in roles are refused by `validate`.** `public` and the ten
    `db_*` roles cannot be created, dropped or renamed; declaring one would plan
    a statement the engine refuses.
@@ -160,10 +164,19 @@ Decisions taken during implementation that this document did not anticipate:
    declared or compared: this is the one consequence of a drop the user
    already asked for, with a reason, made visible rather than left to the
    engine to refuse.
-7. **`doctor` asks for the role permissions only of a project that declares a
-   role**: `CREATE ROLE` and `ALTER ANY ROLE` at the database, and `CONTROL`
-   on every object and schema a role is granted on, because a `GRANT` is
-   authorized on the securable and `ALTER` on the schema does not cover it.
+7. **`doctor` asks for the role permissions only of a project that has a
+   role** — declared, recorded in the ids file, or tombstoned by a
+   `drop-role` not yet applied: `CREATE ROLE` and `ALTER ANY ROLE` at the
+   database, and `CONTROL` on every object and schema a role is granted on,
+   because a `GRANT` is authorized on the securable and `ALTER` on the schema
+   does not cover it. The securables are the declared grants **plus whatever
+   those roles hold** in the recorded state, and in the catalog where the
+   login can see it: a grant gone from the declarations is a `REVOKE` the
+   plan will write, and a role being dropped is a `REVOKE` of each of its
+   grants — neither is visible from the declarations alone, and a readiness
+   check that read only those said "ready" to an apply that then failed. The
+   recorded state comes first because the catalog hides a securable from an
+   account with no permission on it, which is the account being checked.
 
 ## Placement
 

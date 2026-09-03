@@ -89,8 +89,14 @@ impl FromStr for GrantTarget {
         // Case-insensitive on the prefix only: `SCHEMA::dbo` is how T-SQL
         // itself writes it, and refusing it would be a style rule pretending
         // to be a parse error.
-        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("schema::") {
-            let name = s[8..].trim();
+        // `get`, not a byte slice: a multibyte character across offset 8
+        // (`aaaaaaaé.x`) is a name error, not a panic.
+        if let Some(rest) = s
+            .get(..8)
+            .filter(|p| p.eq_ignore_ascii_case("schema::"))
+            .and(s.get(8..))
+        {
+            let name = rest.trim();
             if name.is_empty() {
                 return Err(NameError::EmptySegment(s.to_owned()));
             }
@@ -248,6 +254,15 @@ mod tests {
         // not a schema.
         assert!("customer".parse::<GrantTarget>().is_err());
         assert!("schema::".parse::<GrantTarget>().is_err());
+        // A multibyte character across byte 8 is not a panic: this text
+        // comes straight from a hand-written role file, and byte-slicing the
+        // prefix used to crash on it. The first is an ordinary object name;
+        // the second is neither.
+        assert_eq!(
+            "aaaaaaaé.x".parse::<GrantTarget>().unwrap(),
+            GrantTarget::Object(TableName::new("aaaaaaaé", "x"))
+        );
+        assert!("schemä::dbo".parse::<GrantTarget>().is_err());
     }
 
     #[test]

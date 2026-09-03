@@ -274,7 +274,42 @@ pub type DataScopes = BTreeMap<TableName, DataScope>;
 ///
 /// A table that was in scope but absent from the database has no entry — it
 /// is reported as missing by the managed-set check, not read as empty.
-pub type ObservedRows = BTreeMap<TableName, BTreeMap<RowKey, Row>>;
+/// One row as the catalog read it (the connected half of ADR-0004).
+///
+/// Every cell the read fetched is in `cells`, explicit. `at_default` names
+/// the cells that hold the column's default — or whose default the engine was
+/// not asked to evaluate, so the stored value cannot be told from it. The
+/// catalog does not know which spelling a row was *written* with: a cell that
+/// holds `'Unlabelled'` may have been declared as `label: Unlabelled` or by
+/// leaving `label` out. So the observation carries both readings, and the
+/// side that looks at it chooses ([`ObservedRow::as_seen_by`]) — which is
+/// what lets an explicit value that equals the default, and an omitted one,
+/// both compare equal to what they wrote, rather than one of them being
+/// restated on every connected plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedRow {
+    pub cells: Row,
+    pub at_default: BTreeSet<String>,
+}
+
+impl ObservedRow {
+    /// The row as one side spells it. A cell that side writes explicitly is
+    /// read explicit, whatever it holds; a cell at its default that the side
+    /// omits — or any such cell of a row the side does not have — is omitted.
+    /// `None` is a side with no row of its own, which is `pull`.
+    pub fn as_seen_by(&self, reference: Option<&Row>) -> Row {
+        self.cells
+            .columns()
+            .filter(|(column, _)| {
+                !self.at_default.contains(*column)
+                    || reference.is_some_and(|r| r.get(column).is_some())
+            })
+            .map(|(column, value)| (column.clone(), value.clone()))
+            .collect()
+    }
+}
+
+pub type ObservedRows = BTreeMap<TableName, BTreeMap<RowKey, ObservedRow>>;
 
 /// Which rows a read-back query fetches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,13 +356,26 @@ impl DataScope {
     /// happened to fetch every row (because another scope on the same table
     /// needed them) must not turn the undeclared ones into recorded state, or
     /// the next `verify` would call the application's own inserts drift.
-    pub fn project(&self, rows: &BTreeMap<RowKey, Row>) -> TableData {
+    ///
+    /// `reference` is this side's own block, whose spelling of each cell
+    /// decides how a cell at its default is read (see [`ObservedRow`]).
+    pub fn project(
+        &self,
+        rows: &BTreeMap<RowKey, ObservedRow>,
+        reference: Option<&TableData>,
+    ) -> TableData {
+        let seen = |(k, r): (&RowKey, &ObservedRow)| {
+            (
+                k.clone(),
+                r.as_seen_by(reference.and_then(|d| d.rows.get(k))),
+            )
+        };
         let rows = match self.mode {
-            DataMode::Exact => rows.clone(),
+            DataMode::Exact => rows.iter().map(seen).collect(),
             DataMode::Ensure => rows
                 .iter()
                 .filter(|(k, _)| self.keys.contains(*k))
-                .map(|(k, r)| (k.clone(), r.clone()))
+                .map(seen)
                 .collect(),
         };
         TableData {
@@ -375,10 +423,20 @@ impl crate::schema::Schema {
     /// A table in scope with no observed rows is left with `data: None`: the
     /// read did not reach it (it is missing from the database, and reported as
     /// such elsewhere), and "absent" must not be recorded as "empty".
-    pub fn with_observed_rows(mut self, rows: &ObservedRows, scopes: &DataScopes) -> Self {
+    ///
+    /// `reference` is the schema the scopes came from — the recorded snapshot
+    /// for a drift check, the declarations for a rehearsal — because its rows
+    /// say which cells that side spells explicitly ([`ObservedRow`]).
+    pub fn with_observed_rows(
+        mut self,
+        rows: &ObservedRows,
+        scopes: &DataScopes,
+        reference: &crate::schema::Schema,
+    ) -> Self {
         for (name, table) in &mut self.tables {
+            let own = reference.tables.get(name).and_then(|t| t.data.as_ref());
             table.data = match (scopes.get(name), rows.get(name)) {
-                (Some(scope), Some(observed)) => Some(scope.project(observed)),
+                (Some(scope), Some(observed)) => Some(scope.project(observed, own)),
                 _ => None,
             };
         }
@@ -396,22 +454,33 @@ impl crate::schema::Schema {
 /// read fetched, unfiltered: the differ must see every row the declaration
 /// will be measured against — including, for an `exact` declaration, the rows
 /// that are about to be deleted because nobody declared them.
+///
+/// Each cell is read as the **declarations** spell it ([`ObservedRow`]): the
+/// base is what the declared rows are measured against, so a cell they write
+/// explicitly is compared as a value and a cell they omit is compared as the
+/// default. The recorded state's spelling is not consulted here; it belongs to
+/// the drift check, which reads the same rows under its own reference.
 pub fn plan_base(
     live: &crate::schema::Schema,
     rows: &ObservedRows,
     recorded: &DataScopes,
-    declared: &DataScopes,
+    declared: &crate::schema::Schema,
 ) -> crate::schema::Schema {
+    let declared_scopes = declared.data_scopes();
     let mut base = live.clone();
     for (name, table) in &mut base.tables {
         let mode = recorded
             .get(name)
-            .or_else(|| declared.get(name))
+            .or_else(|| declared_scopes.get(name))
             .map(|s| s.mode);
+        let own = declared.tables.get(name).and_then(|t| t.data.as_ref());
         table.data = match (mode, rows.get(name)) {
             (Some(mode), Some(observed)) => Some(TableData {
                 mode,
-                rows: observed.clone(),
+                rows: observed
+                    .iter()
+                    .map(|(k, r)| (k.clone(), r.as_seen_by(own.and_then(|d| d.rows.get(k)))))
+                    .collect(),
             }),
             _ => None,
         };
@@ -898,6 +967,47 @@ mod tests {
             .collect()
     }
 
+    fn observed(keys: &[&str]) -> BTreeMap<RowKey, ObservedRow> {
+        keys.iter()
+            .map(|k| (RowKey::from(*k), ObservedRow::default()))
+            .collect()
+    }
+
+    /// The catalog cannot tell `label: Unlabelled` from an omitted `label`
+    /// when the default is `'Unlabelled'`; the side that reads the row can,
+    /// and each side must see its own spelling back — or one of the two
+    /// would be restated on every connected plan.
+    #[test]
+    fn a_cell_at_its_default_is_explicit_only_where_the_side_spells_it() {
+        let text = |s: &str| Value::Text(s.to_owned());
+        let seen = ObservedRow {
+            cells: [
+                ("label".to_owned(), text("Unlabelled")),
+                ("rank".to_owned(), Value::Int(1)),
+            ]
+            .into_iter()
+            .collect(),
+            at_default: ["label".to_owned()].into_iter().collect(),
+        };
+        // The side omits `label`: omitted. The side writes it: explicit. No
+        // side at all (`pull`): omitted. `rank` is not at its default and is
+        // explicit every time.
+        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        assert_eq!(seen.as_seen_by(Some(&omits)), omits);
+        let writes: Row = [
+            ("label".to_owned(), text("Unlabelled")),
+            ("rank".to_owned(), Value::Int(1)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen.as_seen_by(Some(&writes)), writes);
+        assert_eq!(seen.as_seen_by(None), omits);
+        // A side that writes a *different* value still sees what is stored:
+        // the hand edit that set `label` back to its default is a drift.
+        let other: Row = [("label".to_owned(), text("Other"))].into_iter().collect();
+        assert_eq!(seen.as_seen_by(Some(&other)), writes);
+    }
+
     #[test]
     fn an_exact_scope_reads_every_row_and_an_ensure_scope_only_its_keys() {
         let exact = DataScope {
@@ -924,15 +1034,15 @@ mod tests {
             mode: DataMode::Ensure,
             keys: ["a"].into_iter().map(RowKey::from).collect(),
         };
-        let observed = rows(&["a", "b"]);
-        assert_eq!(ensure.project(&observed).rows, rows(&["a"]));
+        let observed = observed(&["a", "b"]);
+        assert_eq!(ensure.project(&observed, None).rows, rows(&["a"]));
         // The negative case: `exact` keeps the undeclared row, which is
         // exactly the row the differ has to delete.
         let exact = DataScope {
             mode: DataMode::Exact,
             keys: ["a"].into_iter().map(RowKey::from).collect(),
         };
-        assert_eq!(exact.project(&observed).rows, rows(&["a", "b"]));
+        assert_eq!(exact.project(&observed, None).rows, rows(&["a", "b"]));
     }
 
     #[test]
@@ -991,10 +1101,16 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let unread = schema.clone().with_observed_rows(&BTreeMap::new(), &scopes);
+        let none = crate::schema::Schema::default();
+        let unread = schema
+            .clone()
+            .with_observed_rows(&BTreeMap::new(), &scopes, &none);
         assert_eq!(unread.tables[&name()].data, None);
-        let read =
-            schema.with_observed_rows(&[(name(), BTreeMap::new())].into_iter().collect(), &scopes);
+        let read = schema.with_observed_rows(
+            &[(name(), BTreeMap::new())].into_iter().collect(),
+            &scopes,
+            &none,
+        );
         assert_eq!(
             read.tables[&name()].data,
             Some(TableData {
@@ -1011,7 +1127,7 @@ mod tests {
         let mut live = crate::schema::Schema::default();
         live.tables
             .insert(name(), table(Some(vec!["code"]), vec![]));
-        let observed: ObservedRows = [(name(), rows(&["a", "b"]))].into_iter().collect();
+        let observed: ObservedRows = [(name(), observed(&["a", "b"]))].into_iter().collect();
         let recorded: DataScopes = [(
             name(),
             DataScope {
@@ -1021,15 +1137,10 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let declared: DataScopes = [(
-            name(),
-            DataScope {
-                mode: DataMode::Exact,
-                keys: ["a"].into_iter().map(RowKey::from).collect(),
-            },
-        )]
-        .into_iter()
-        .collect();
+        let mut declared = crate::schema::Schema::default();
+        declared
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![("a", vec![])]));
         let base = plan_base(&live, &observed, &recorded, &declared);
         let data = base.tables[&name()].data.as_ref().unwrap();
         assert_eq!(
@@ -1050,7 +1161,12 @@ mod tests {
             DataMode::Exact
         );
         // Neither side covers it: untouched.
-        let base = plan_base(&live, &observed, &BTreeMap::new(), &BTreeMap::new());
+        let base = plan_base(
+            &live,
+            &observed,
+            &BTreeMap::new(),
+            &crate::schema::Schema::default(),
+        );
         assert_eq!(base.tables[&name()].data, None);
     }
 }

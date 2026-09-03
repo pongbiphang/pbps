@@ -98,6 +98,36 @@ An absent table gives **Msg 208** on that same statement. `HAS_PERMS_BY_NAME` �
 the natural repair — answers 0 for both cases, so only attempting the statement
 separates them. Measurement changed the fix here, it did not merely confirm it.
 
+## A comparison that runs what it compares
+
+The row read-back asked the engine, per cell, `CASE WHEN col = (default)`, so
+the omitted spelling of a declared row would round-trip. Written for
+`'Unlabelled'`, it was also run for `NEWID()`, for `SYSUTCDATETIME()`, and for
+`NEXT VALUE FOR dbo.seq` — one evaluation per row of every drift check. The
+first is harmless, the second is wasted, the third **advances the sequence**,
+and the engine refuses `NEXT VALUE FOR` inside a `CASE` at all, so the table
+became unreadable and `plan --db` failed. Only a literal is compared now
+(decision 68). The shape: an expression the *declaration* wrote is being
+handed to the engine in a context the declaration never meant, and "the
+database is the normalizer" does not extend to running things.
+
+The same read had a second fault with the same root: it folded "equals the
+default" into "omitted", and a row that spelled a value equal to its default
+compared unequal to itself on every plan. The catalog cannot know how a row
+was written; only the side reading it can (decision 67).
+
+## A readiness check that reads only the declarations
+
+`doctor` derived the securables to ask `CONTROL` about from the declared
+grants, so a revision that *removed* a role's last grant — or the role — had
+nothing to ask about, and the account was called ready for a plan whose
+`REVOKE` then failed. Shape 1 again, in a new coat: an absence in the
+declarations read as "nothing needed", when the thing needed lives in the
+database. The managed roles' grants are asked about too (decision 69) — from
+the recorded state, because the first fix read them from the catalog, and the
+catalog hides a securable from an account with no permission on it: the live
+suite showed the query returning nothing for exactly the login being checked.
+
 ## `shell_arg` has been wrong about shells five times
 
 **The test written to pin the second fix asserted the bug.**

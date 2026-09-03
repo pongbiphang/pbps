@@ -959,7 +959,12 @@ fn cmd_pull(
             if let Some(table) = pulled.schema.tables.get_mut(&name) {
                 table.data = Some(pbps_model::TableData {
                     mode: pbps_model::DataMode::Exact,
-                    rows,
+                    // No declaration to spell the cells: one at its default
+                    // is written omitted, which is the shortest true block.
+                    rows: rows
+                        .into_iter()
+                        .map(|(k, r)| (k, r.as_seen_by(None)))
+                        .collect(),
                 });
             }
         }

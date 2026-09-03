@@ -335,8 +335,9 @@ pub struct Held {
     /// question for `plan --db`, which sees the change; `doctor` sees no plan.
     pub referenced_objects: BTreeMap<String, BTreeSet<String>>,
 
-    /// Whether the declarations have any role at all. `false` switches the
-    /// role requirements off rather than reporting them as gaps.
+    /// Whether the project has any role at all — declared, recorded, or being
+    /// dropped. `false` switches the role requirements off rather than
+    /// reporting them as gaps.
     pub roles_declared: bool,
 
     /// Per object a declared role is granted on, the permissions effective on
@@ -350,13 +351,23 @@ pub struct Held {
     pub granted_schemas: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// What the declared roles are granted on, as `doctor` has to ask about it
-/// (ADR-0005). `None` at the call site means the project declares no role.
+/// What the managed roles are granted on, as `doctor` has to ask about it
+/// (ADR-0005). `None` at the call site means the project has no role at all
+/// — none declared, none recorded, none being dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantTargets {
-    /// `schema.object`, qualified the way `HAS_PERMS_BY_NAME` takes it.
+    /// `schema.object`, qualified the way `HAS_PERMS_BY_NAME` takes it, as
+    /// the declarations grant them.
     pub objects: Vec<String>,
     pub schemas: Vec<String>,
+    /// The managed roles by name: declared, recorded in the ids file, or
+    /// tombstoned by a `drop-role` not yet applied. Whatever these hold — in
+    /// the recorded state, and in the catalog where this login can see it —
+    /// is asked about too, because a grant that is gone from the
+    /// declarations is a `REVOKE` the plan will write, and the securable it
+    /// names is where `CONTROL` has to be held; the declarations alone
+    /// cannot see it.
+    pub roles: Vec<String>,
 }
 
 /// A permission that is needed and not held, and the securable it is missing on.
@@ -606,7 +617,73 @@ pub async fn permissions(
             .filter(|r| matches!(r.needed, Needed::Granted))
             .map(|r| r.name)
             .collect();
-        if !targets.objects.is_empty() {
+        // The declared targets, plus everything the managed roles hold: a
+        // grant the declarations dropped is a REVOKE on that securable, and a
+        // role being dropped is a REVOKE of each of its grants. Two sources,
+        // because neither is complete alone. The **recorded state** is what
+        // the next plan revokes against, and the ledger is readable by any
+        // account that can deploy at all; the **catalog** also shows grants
+        // adopted by hand, but only on securables this login already has
+        // some permission on (metadata visibility), which is precisely not
+        // the ones a readiness check is for. A ledger this account cannot
+        // read is a gap of its own, reported by the ledger rows.
+        let mut objects: BTreeSet<String> = targets.objects.iter().cloned().collect();
+        let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
+        if !targets.roles.is_empty()
+            && let Ok(Some(entry)) = crate::state::latest(conn).await
+        {
+            for (name, role) in &entry.snapshot.schema.roles {
+                if !targets.roles.contains(name) {
+                    continue;
+                }
+                for target in role.grants.keys() {
+                    match target {
+                        pbps_model::GrantTarget::Object(o) => {
+                            objects.insert(format!("{}.{}", o.schema, o.name));
+                        }
+                        pbps_model::GrantTarget::Schema(s) => {
+                            schemas_wanted.insert(s.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !targets.roles.is_empty() {
+            let mut params: Vec<Param<'_>> = Vec::new();
+            let mut role_slots = Vec::new();
+            for r in &targets.roles {
+                params.push(Param::from(r.as_str()));
+                role_slots.push(format!("@P{}", params.len()));
+            }
+            let sql = format!(
+                "SELECT CAST(dp.class AS int) AS class, s.name AS [schema], o.name AS [object] \
+                 FROM sys.database_permissions AS dp \
+                 JOIN sys.database_principals AS r \
+                   ON r.principal_id = dp.grantee_principal_id AND r.type = 'R' \
+                 LEFT JOIN sys.objects AS o ON dp.class = 1 AND o.object_id = dp.major_id \
+                 LEFT JOIN sys.schemas AS s \
+                   ON s.schema_id = CASE dp.class WHEN 1 THEN o.schema_id WHEN 3 THEN dp.major_id END \
+                 WHERE dp.class IN (1, 3) AND r.name IN ({});",
+                role_slots.join(", ")
+            );
+            for row in &conn.query_with(&sql, &params).await? {
+                let class: i32 = row.try_get("class")?.unwrap_or(0);
+                let schema: Option<&str> = row.try_get("schema")?;
+                let object: Option<&str> = row.try_get("object")?;
+                match (class, schema, object) {
+                    (1, Some(schema), Some(object)) => {
+                        objects.insert(format!("{schema}.{object}"));
+                    }
+                    (3, Some(schema), _) => {
+                        schemas_wanted.insert(schema.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let objects: Vec<String> = objects.into_iter().collect();
+        let schemas_wanted: Vec<String> = schemas_wanted.into_iter().collect();
+        if !objects.is_empty() {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut perm_slots = Vec::new();
             for p in &granted_perms {
@@ -614,7 +691,7 @@ pub async fn permissions(
                 perm_slots.push(format!("(@P{})", params.len()));
             }
             let mut object_slots = Vec::new();
-            for t in &targets.objects {
+            for t in &objects {
                 params.push(Param::from(t.as_str()));
                 object_slots.push(format!("(@P{})", params.len()));
             }
@@ -635,7 +712,7 @@ pub async fn permissions(
                 }
             }
         }
-        if !targets.schemas.is_empty() {
+        if !schemas_wanted.is_empty() {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut perm_slots = Vec::new();
             for p in &granted_perms {
@@ -643,7 +720,7 @@ pub async fn permissions(
                 perm_slots.push(format!("(@P{})", params.len()));
             }
             let mut schema_slots = Vec::new();
-            for s in &targets.schemas {
+            for s in &schemas_wanted {
                 params.push(Param::from(s.as_str()));
                 schema_slots.push(format!("(@P{})", params.len()));
             }

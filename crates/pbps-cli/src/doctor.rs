@@ -385,11 +385,28 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// What the declared roles are granted on (ADR-0005), or `None` when the
-/// project declares no role — which switches the role requirements off.
+/// What the managed roles are granted on (ADR-0005), or `None` when the
+/// project has no role — which switches the role requirements off.
+///
+/// "Has" is wider than "declares": a role recorded in the ids file or
+/// tombstoned by a `drop-role` still exists in the database, and the next
+/// plan revokes what it holds there — needing `CONTROL` on securables the
+/// declarations no longer name and `ALTER ANY ROLE` for a role they no longer
+/// have. Those roles go into `roles`, and the connected check reads their
+/// live grants.
 fn grant_targets(project: &Project) -> Option<pbps_mssql::doctor::GrantTargets> {
     let loaded = crate::load_quiet(project).ok()?;
-    if loaded.schema.roles.is_empty() {
+    let ids = crate::read_ids(project).unwrap_or_default();
+    let mut roles: std::collections::BTreeSet<String> =
+        loaded.schema.roles.keys().cloned().collect();
+    roles.extend(ids.roles.values().cloned());
+    roles.extend(
+        ids.tombstones
+            .iter()
+            .filter(|(uid, _)| uid.kind() == pbps_model::UidKind::Role)
+            .map(|(_, t)| t.was.clone()),
+    );
+    if roles.is_empty() {
         return None;
     }
     let mut objects = std::collections::BTreeSet::new();
@@ -409,6 +426,7 @@ fn grant_targets(project: &Project) -> Option<pbps_mssql::doctor::GrantTargets> 
     Some(pbps_mssql::doctor::GrantTargets {
         objects: objects.into_iter().collect(),
         schemas: schemas.into_iter().collect(),
+        roles: roles.into_iter().collect(),
     })
 }
 

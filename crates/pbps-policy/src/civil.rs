@@ -107,16 +107,26 @@ pub fn parse_weekday(s: &str) -> Result<u32, String> {
 }
 
 /// `YYYY-MM-DD`, checked for shape and range only.
+///
+/// The shape is exact — four, two and two digits — because an expiry is
+/// compared to today's date **as text** (`Civil::date`), and `2026-9-4`
+/// sorts after `2026-10-01`, which would keep a suppression alive for a
+/// month past its date without anyone being told.
 pub fn parse_date(s: &str) -> Result<(i64, u32, u32), String> {
     let bad = || format!("`{s}` is not a date like `2026-12-31`");
-    let parts: Vec<&str> = s.trim().split('-').collect();
+    let s = s.trim();
+    let parts: Vec<&str> = s.split('-').collect();
     let [y, m, d] = parts.as_slice() else {
         return Err(bad());
     };
+    let digits = |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(y, 4) || !digits(m, 2) || !digits(d, 2) {
+        return Err(bad());
+    }
     let y: i64 = y.parse().map_err(|_| bad())?;
     let m: u32 = m.parse().map_err(|_| bad())?;
     let d: u32 = d.parse().map_err(|_| bad())?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y.to_string().len() != 4 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return Err(bad());
     }
     Ok((y, m, d))
@@ -169,5 +179,9 @@ mod tests {
         assert_eq!(parse_date("2026-12-31").unwrap(), (2026, 12, 31));
         assert!(parse_date("31/12/2026").is_err());
         assert!(parse_date("2026-13-01").is_err());
+        // Unpadded is refused: as text, `2026-9-4` outlives `2026-10-01`.
+        assert!(parse_date("2026-9-4").is_err());
+        assert!(parse_date("2026-09-4").is_err());
+        assert!(parse_date("+2026-09-04").is_err());
     }
 }

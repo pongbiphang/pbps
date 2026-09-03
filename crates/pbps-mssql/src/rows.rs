@@ -17,23 +17,32 @@
 //! two shapes a declaration can write unquoted and they have to compare equal
 //! to what was written.
 //!
-//! # A cell that holds the default is read back as omitted
+//! # A cell that holds the default is read back both ways
 //!
 //! A declared row says "the default" by leaving the column out ([`Row`]). The
 //! catalog holds a value, not the fact that it came from the default — so the
 //! read-back asks the engine, per cell, whether the value *equals* the column's
-//! default expression, and omits the cell when it does. That makes the omitted
-//! spelling round-trip, and it is what lets a declaration that omits `label`
-//! compare equal to a table where every label is `'Unlabelled'`.
+//! default, and reports that beside the value ([`ObservedRow::at_default`]).
+//! Which reading a side uses is that side's choice, made where its own rows
+//! are known ([`ObservedRow::as_seen_by`]): a declaration that omits `label`
+//! compares equal to a table where every label is `'Unlabelled'`, and one that
+//! writes `label: Unlabelled` compares equal to the same table — neither is
+//! restated on every connected plan.
 //!
-//! Two consequences are deliberate. A default the engine cannot evaluate to the
-//! stored value (`SYSUTCDATETIME()`, `NEWID()`) never matches, so such a cell
-//! is read back explicit and a row that omits it is restated as `= DEFAULT` on
-//! every connected plan — visibly, and the remedy is to write the value. And a
-//! NULL in a column with no default is omitted too, because the model already
-//! treats the two spellings as one there (see [`pbps_model::data::cell`]);
-//! writing it explicitly would make the same table compare unequal to itself
-//! across two reads.
+//! **Only a literal default is compared.** `'Unlabelled'`, `0`, `NULL` are
+//! asked about with a `CASE`; `SYSUTCDATETIME()`, `NEWID()` or `NEXT VALUE
+//! FOR` are not, because that `CASE` would *run* the expression once per row
+//! — a sequence advanced by a drift check, and `NEXT VALUE FOR` is not even
+//! legal there, which made the table unreadable. Such a cell cannot be told
+//! from its default, so it is taken at the declaration's word: at its default
+//! where the side omits it, the stored value where the side spells it out.
+//! A hand edit to an omitted cell of that kind is therefore not seen; the
+//! remedy, for a column that matters, is to write the value.
+//!
+//! A NULL in a column with no default is omitted outright, because the model
+//! already treats the two spellings as one there (see
+//! [`pbps_model::data::cell`]); writing it explicitly would make the same
+//! table compare unequal to itself across two reads.
 //!
 //! # What cannot be read
 //!
@@ -42,11 +51,11 @@
 //! "empty" and "unreadable" are three different answers, and only one of them
 //! is good news.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::DbError;
 use pbps_dialect::DialectError;
-use pbps_model::{Row, RowKey, RowScope, Table, TableName, Value};
+use pbps_model::{ObservedRow, Row, RowKey, RowScope, Table, TableName, Value};
 
 use crate::emit::qualified;
 use crate::ident::{literal, quote};
@@ -112,12 +121,16 @@ pub struct Slot {
     pub kind: ValueKind,
     /// Position of the value in the result row.
     pub value_at: usize,
-    /// Position of the "equals the default" flag, for a column that has a
-    /// default the engine can compare.
+    /// Position of the "equals the default" flag, for a column whose default
+    /// is a literal the engine can compare without running anything.
     pub default_at: Option<usize>,
     /// Whether the column has a default at all — which decides what a NULL
     /// means (see the module docs).
     pub has_default: bool,
+    /// The column has a default that is *not* asked about — an expression the
+    /// engine would have to run, or a type without `=` — so the cell is taken
+    /// as at its default (module docs).
+    pub assume_default: bool,
 }
 
 /// The query that reads one table's rows, and how to read its result.
@@ -174,6 +187,7 @@ pub fn query(
         value_at: 0,
         default_at: None,
         has_default: key_spec.default.is_some(),
+        assume_default: false,
     };
 
     let mut columns = Vec::new();
@@ -184,8 +198,12 @@ pub fn query(
         let quoted = quote(column)?;
         let value_at = select.len();
         select.push(read_expr(&quoted, &spec.ty.base));
+        let asked = spec
+            .default
+            .as_deref()
+            .is_some_and(|d| comparable(&spec.ty.base) && is_constant(d));
         let default_at = match &spec.default {
-            Some(default) if comparable(&spec.ty.base) => {
+            Some(default) if asked => {
                 select.push(format!(
                     // Both halves, because `=` is UNKNOWN for a NULL on either
                     // side and `DEFAULT NULL` is a real declaration.
@@ -202,6 +220,7 @@ pub fn query(
             value_at,
             default_at,
             has_default: spec.default.is_some(),
+            assume_default: spec.default.is_some() && !asked,
         });
     }
 
@@ -257,8 +276,56 @@ fn read_expr(quoted: &str, base: &str) -> String {
     }
 }
 
-/// Whether `=` is defined on the type. Where it is not, the default flag is
-/// left out and the cell is always read explicit.
+/// Whether a default expression is a literal — a number, a string, `NULL`, a
+/// hex constant, under any number of parentheses (the catalog wraps them) —
+/// which the engine can compare a stored value against without running
+/// anything. Everything else is a function call or an expression, and the
+/// module docs say why those are never put in the query. Conservative on
+/// purpose: a literal read as "not a literal" only costs the comparison.
+pub fn is_constant(default: &str) -> bool {
+    let mut s = default.trim();
+    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.is_empty() {
+        return false;
+    }
+    if s.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let quoted = s
+        .strip_prefix(['N', 'n'])
+        .filter(|rest| rest.starts_with('\''))
+        .unwrap_or(s);
+    if let Some(inner) = quoted
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        // `'It''s'` is one literal; `'a' + 'b'` is not.
+        return !inner.replace("''", "").contains('\'');
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let number = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (number, None),
+    };
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((int, frac)) => {
+            (int.is_empty() || digits(int))
+                && (frac.is_empty() || digits(frac))
+                && !(int.is_empty() && frac.is_empty())
+        }
+        None => digits(mantissa),
+    };
+    mantissa_ok && exponent.is_none_or(|e| digits(e.strip_prefix(['-', '+']).unwrap_or(e)))
+}
+
+/// Whether `=` is defined on the type. Where it is not, the default is not
+/// asked about and the cell is taken as at its default (module docs).
 fn comparable(base: &str) -> bool {
     !matches!(
         base,
@@ -283,14 +350,7 @@ pub fn value_of(kind: ValueKind, text: &str) -> Option<Value> {
 ///
 /// The rules are in the module docs; they are what make two reads of the same
 /// table produce the same [`Row`], which `StateSnapshot::matches` relies on.
-pub fn canonical(
-    slot: &Slot,
-    text: Option<&str>,
-    is_default: bool,
-) -> Result<Option<Value>, &'static str> {
-    if is_default {
-        return Ok(None);
-    }
+pub fn canonical(slot: &Slot, text: Option<&str>) -> Result<Option<Value>, &'static str> {
     match text {
         None if !slot.has_default => Ok(None),
         None => Ok(Some(Value::Null)),
@@ -303,7 +363,7 @@ pub fn decode(
     name: &TableName,
     query: &RowQuery,
     row: &pbps_db::Row,
-) -> Result<(RowKey, Row), RowsError> {
+) -> Result<(RowKey, ObservedRow), RowsError> {
     let read = |table: &TableName, source: DbError| RowsError::Read {
         table: table.clone(),
         source: Box::new(source),
@@ -321,6 +381,7 @@ pub fn decode(
     };
 
     let mut cells = BTreeMap::new();
+    let mut at_default = BTreeSet::new();
     for slot in &query.columns {
         let text: Option<&str> = row.try_get_at(slot.value_at).map_err(|e| read(name, e))?;
         let is_default = match slot.default_at {
@@ -330,11 +391,14 @@ pub fn decode(
                     .unwrap_or(0)
                     == 1
             }
-            None => false,
+            None => slot.assume_default,
         };
-        match canonical(slot, text, is_default) {
+        match canonical(slot, text) {
             Ok(Some(v)) => {
                 cells.insert(slot.column.clone(), v);
+                if is_default {
+                    at_default.insert(slot.column.clone());
+                }
             }
             Ok(None) => {}
             Err(kind) => {
@@ -347,7 +411,13 @@ pub fn decode(
             }
         }
     }
-    Ok((RowKey::from(key_text), Row(cells)))
+    Ok((
+        RowKey::from(key_text),
+        ObservedRow {
+            cells: Row(cells),
+            at_default,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -453,6 +523,74 @@ mod tests {
         let q = query(&name(), &t, &RowScope::Every).unwrap().unwrap();
         assert!(q.columns.iter().all(|s| s.default_at.is_none()), "{q:?}");
         assert!(q.columns.iter().all(|s| s.has_default), "{q:?}");
+        // Not asked about is taken at the declaration's word.
+        assert!(q.columns.iter().all(|s| s.assume_default), "{q:?}");
+    }
+
+    /// A default the engine would have to *run* is never put in the query: a
+    /// `CASE` over `NEXT VALUE FOR` is refused by the engine, and one over
+    /// `NEWID()` runs it once per row. Only a literal is compared.
+    #[test]
+    fn a_default_the_engine_would_have_to_run_is_never_evaluated() {
+        for literal in [
+            "0",
+            "((0))",
+            "(-1)",
+            "1.5",
+            ".5",
+            "1e3",
+            "-2.5E-3",
+            "'x'",
+            "N'x'",
+            "'It''s'",
+            "NULL",
+            "(null)",
+            "0x",
+            "0xDEADbeef",
+            "N''",
+        ] {
+            assert!(is_constant(literal), "{literal}");
+        }
+        for expression in [
+            "getdate()",
+            "(SYSUTCDATETIME())",
+            "NEXT VALUE FOR dbo.seq",
+            "(newid())",
+            "'a' + 'b'",
+            "(1)+(2)",
+            "abs(-1)",
+            "",
+            "()",
+            "0x1G",
+            "1.2.3",
+            "--1",
+            "'unterminated",
+        ] {
+            assert!(!is_constant(expression), "{expression}");
+        }
+
+        let t = table(
+            Some(vec!["id"]),
+            &[
+                ("id", "int", None),
+                ("label", "nvarchar(50)", Some("'Unlabelled'")),
+                ("seq", "int", Some("NEXT VALUE FOR dbo.seq")),
+                ("stamp", "datetime2", Some("sysutcdatetime()")),
+            ],
+        );
+        let q = query(&name(), &t, &RowScope::Every).unwrap().unwrap();
+        assert!(!q.sql.contains("NEXT VALUE"), "{}", q.sql);
+        assert!(
+            !q.sql.to_ascii_lowercase().contains("sysutcdatetime"),
+            "{}",
+            q.sql
+        );
+        let by_name = |c: &str| q.columns.iter().find(|s| s.column == c).unwrap().clone();
+        assert_eq!(by_name("label").default_at, Some(2));
+        assert!(!by_name("label").assume_default);
+        assert_eq!(by_name("seq").default_at, None);
+        assert!(by_name("seq").assume_default);
+        assert!(by_name("stamp").assume_default);
     }
 
     #[test]
@@ -487,38 +625,43 @@ mod tests {
         assert_eq!(ValueKind::of("decimal"), ValueKind::Text);
     }
 
-    /// The canonical form is what lets two reads of one table be `==`: a cell
-    /// holding its default is omitted, a NULL is omitted only where the model
-    /// already reads omission as NULL, and everything else is explicit.
+    /// The canonical form is what lets two reads of one table be `==`: a NULL
+    /// is omitted only where the model already reads omission as NULL, and
+    /// everything else is explicit — whether or not it equals the default,
+    /// which is reported beside it rather than folded in.
     #[test]
-    fn a_cell_equal_to_its_default_is_read_back_as_omitted() {
+    fn a_null_is_omitted_only_where_the_model_reads_omission_as_null() {
         let with_default = Slot {
             column: "label".into(),
             kind: ValueKind::Text,
             value_at: 1,
             default_at: Some(2),
             has_default: true,
+            assume_default: false,
         };
-        assert_eq!(canonical(&with_default, Some("Unlabelled"), true), Ok(None));
         assert_eq!(
-            canonical(&with_default, Some("New"), false),
+            canonical(&with_default, Some("Unlabelled")),
+            Ok(Some(Value::Text("Unlabelled".into())))
+        );
+        assert_eq!(
+            canonical(&with_default, Some("New")),
             Ok(Some(Value::Text("New".into())))
         );
         // A NULL where a default exists is *not* the default: it was sent, and
         // an omitted cell would say the opposite.
-        assert_eq!(canonical(&with_default, None, false), Ok(Some(Value::Null)));
+        assert_eq!(canonical(&with_default, None), Ok(Some(Value::Null)));
 
         let without = Slot {
             has_default: false,
             default_at: None,
             ..with_default
         };
-        assert_eq!(canonical(&without, None, false), Ok(None));
+        assert_eq!(canonical(&without, None), Ok(None));
         // And a value the mapping cannot hold names the kind it expected.
         let int = Slot {
             kind: ValueKind::Int,
             ..without
         };
-        assert_eq!(canonical(&int, Some("x"), false), Err("integer"));
+        assert_eq!(canonical(&int, Some("x")), Err("integer"));
     }
 }

@@ -725,6 +725,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             (3, _) => pbps_model::GrantTarget::Schema(p.schema.clone()),
             _ => continue,
         };
+        // A grant on an object the model does not hold — a sequence, a
+        // synonym, a module that could not be read — is reported and left
+        // out, like a DENY. Written into the role it would make `validate`
+        // refuse the project `pull` just wrote, since a grant target has to
+        // be a declared table or module.
+        if let pbps_model::GrantTarget::Object(object) = &target
+            && !schema.tables.contains_key(object)
+            && !schema.modules.contains_key(object)
+        {
+            warnings.push(format!(
+                "role {}: {} on {target} is on an object pbps does not model, or could not \
+                 read; it was left out of the declarations",
+                p.role, p.permission
+            ));
+            continue;
+        }
         if p.minor_id != 0 {
             warnings.push(format!(
                 "role {}: a column-level {} on {target} is not modelled; it was left out of the \
@@ -858,6 +874,39 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A grant on something the model does not hold — a sequence, a synonym,
+    /// a module that could not be read — is reported and left out. Written
+    /// into the role, `validate` would refuse the project `pull` just wrote.
+    #[test]
+    fn a_grant_on_an_unmodelled_object_is_reported_and_left_out() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |object: Option<&str>, class: u8| RawPermission {
+            role: "app_reader".into(),
+            class,
+            permission: "SELECT".into(),
+            state: "G".into(),
+            schema: "dbo".into(),
+            object: object.map(str::to_owned),
+            minor_id: 0,
+        };
+        raw.permissions.push(grant(Some("customer"), 1));
+        raw.permissions.push(grant(Some("order_seq"), 1));
+        raw.permissions.push(grant(None, 3));
+        let p = assemble(&raw);
+        let role = &p.schema.roles["app_reader"];
+        let targets: Vec<String> = role.grants.keys().map(ToString::to_string).collect();
+        assert_eq!(targets, ["dbo.customer", "schema::dbo"]);
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(
+            p.warnings[0].contains("dbo.order_seq") && p.warnings[0].contains("does not model"),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]

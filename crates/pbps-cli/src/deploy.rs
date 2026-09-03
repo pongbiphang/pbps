@@ -54,12 +54,19 @@ pub struct Managed {
 /// The scoped state alone, with the rows of every table in `scopes` read back
 /// and placed under it — which is all any caller but `bootstrap` and
 /// `plan --db` needs.
+///
+/// `reference` is the schema whose rows say how a cell at its default is
+/// read ([`pbps_model::ObservedRow`]): the recorded snapshot for a drift
+/// check, the declarations for a state recorded from them. A command that has
+/// no rows of its own — `apply` records what it just wrote from the plan's
+/// scope alone — passes an empty schema and gets the shortest true spelling.
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
     modules: &BTreeSet<ObjectName>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
+    reference: &Schema,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let read: BTreeMap<TableName, RowScope> = scopes
         .iter()
@@ -67,7 +74,9 @@ async fn managed_state(
         .collect();
     let managed = managed_state_full(conn, ids, modules, unmanaged, &read).await?;
     let mut scoped = managed.scoped;
-    scoped.schema = scoped.schema.with_observed_rows(&managed.rows, scopes);
+    scoped.schema = scoped
+        .schema
+        .with_observed_rows(&managed.rows, scopes, reference);
     Ok(scoped)
 }
 
@@ -134,9 +143,13 @@ async fn managed_state_full(
 /// record, or the next `verify` would not be watching it. The ids file is
 /// already required by both, so requiring the declarations to parse as well
 /// changes nothing about when they can run.
-fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, DataScopes)> {
+fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, DataScopes, Schema)> {
     let schema = crate::load(project)?.schema;
-    Ok((managed_modules(None, Some(&schema)), schema.data_scopes()))
+    Ok((
+        managed_modules(None, Some(&schema)),
+        schema.data_scopes(),
+        schema,
+    ))
 }
 
 /// The modules a plan leaves the environment holding.
@@ -300,6 +313,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &recorded_modules,
             project.config.unmanaged,
             &baseline.snapshot.schema.data_scopes(),
+            &baseline.snapshot.schema,
         )
         .await?;
 
@@ -466,7 +480,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
-    let (declared_modules, declared_data) = declared_scope(project)?;
+    let (declared_modules, declared_data, declared_schema) = declared_scope(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
@@ -477,6 +491,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             &declared_modules,
             project.config.unmanaged,
             &declared_data,
+            &declared_schema,
         )
         .await?;
         report_missing(&scoped);
@@ -527,7 +542,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
-    let (declared_modules, declared_data) = declared_scope(project)?;
+    let (declared_modules, declared_data, declared_schema) = declared_scope(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
@@ -538,6 +553,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
             &declared_modules,
             project.config.unmanaged,
             &declared_data,
+            &declared_schema,
         )
         .await?;
         report_missing(&scoped);
@@ -708,6 +724,7 @@ pub fn cmd_bootstrap(
             &declared_modules,
             project.config.unmanaged,
             &loaded.schema.data_scopes(),
+            &loaded.schema,
         )
         .await?;
         let snapshot = with_provenance(
@@ -882,10 +899,11 @@ pub fn cmd_plan_db(
         // difference is drift, which has its own command and its own three
         // remedies. The rows are compared under the recorded scope, exactly as
         // `verify` compares them.
-        let as_recorded = scoped
-            .schema
-            .clone()
-            .with_observed_rows(&managed.rows, &recorded_data);
+        let as_recorded = scoped.schema.clone().with_observed_rows(
+            &managed.rows,
+            &recorded_data,
+            &entry.snapshot.schema,
+        );
         let live = pbps_model::state_checksum(&as_recorded, &recorded_ids);
         let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
         if live != recorded {
@@ -923,7 +941,7 @@ pub fn cmd_plan_db(
             &scoped.schema,
             &managed.rows,
             &recorded_data,
-            &declared_data,
+            &loaded.schema,
         );
         let mut cs = pbps_diff::diff(
             pbps_diff::Side {
@@ -1287,6 +1305,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &recorded_modules,
         project.config.unmanaged,
         &entry.snapshot.schema.data_scopes(),
+        &entry.snapshot.schema,
     )
     .await?;
 
@@ -1321,6 +1340,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &modules_after(&entry.snapshot, &plan.changes),
         project.config.unmanaged,
         &plan.data,
+        &Schema::default(),
     )
     .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
@@ -1410,6 +1430,7 @@ async fn apply_staged_under_lock(
             &after_modules,
             project.config.unmanaged,
             &entry.snapshot.schema.data_scopes(),
+            &entry.snapshot.schema,
         )
         .await?;
         let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
@@ -1465,6 +1486,7 @@ async fn apply_staged_under_lock(
             &recorded_modules,
             project.config.unmanaged,
             &entry.snapshot.schema.data_scopes(),
+            &entry.snapshot.schema,
         )
         .await?;
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
@@ -1528,6 +1550,7 @@ async fn apply_staged_under_lock(
             &modules_after(&entry.snapshot, &plan.changes),
             pbps_config::Unmanaged::Ignore,
             &plan.data,
+            &Schema::default(),
         )
         .await?;
         // Scoped and identified by `live_ids`, not by the plan's mapping: a
@@ -1562,6 +1585,7 @@ async fn apply_staged_under_lock(
         &modules_after(&entry.snapshot, &plan.changes),
         project.config.unmanaged,
         &plan.data,
+        &Schema::default(),
     )
     .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(

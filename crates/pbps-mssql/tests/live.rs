@@ -1956,7 +1956,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
         .await
         .expect("read rows");
-    let live = live.with_observed_rows(&observed, &scopes);
+    let live = live.with_observed_rows(&observed, &scopes, &declared);
 
     // What was declared is what comes back — `1.50` as the engine spells a
     // decimal(5,2), the defaulted label omitted, the NULLs omitted.
@@ -1992,7 +1992,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &again, &read)
         .await
         .expect("read rows");
-    let again = again.with_observed_rows(&observed, &scopes);
+    let again = again.with_observed_rows(&observed, &scopes, &declared);
 
     let status_rows = &again.tables[&TableName::new("dbo", "status")]
         .data
@@ -2126,6 +2126,137 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .await
         .expect_err("rows without a key cannot be read");
     assert!(err.to_string().contains("dbo.status"), "{err}");
+
+    db.drop().await;
+}
+
+/// The catalog cannot tell `label: Unlabelled` from an omitted `label`, so
+/// each side reads the cell in its own spelling — and a default the engine
+/// would have to run (`NEXT VALUE FOR`, `SYSUTCDATETIME()`) is never put in
+/// the read: the first is not even legal in a `CASE`, and both would run once
+/// per row of a drift check. Measured here rather than reasoned about.
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run() {
+    use pbps_model::{DataMode, Row, RowKey, RowScope, TableData, Value};
+
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut t = Table::default();
+    t.columns
+        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+    let mut label = Column::new(ty("nvarchar(50)")).not_null();
+    label.default = Some("'Unlabelled'".to_owned());
+    t.columns.insert("label".to_owned(), label);
+    let mut seq = Column::new(ty("int")).not_null();
+    // In the engine's spelling, as every default has to be (§8.2): the
+    // catalog stores `NEXT VALUE FOR [dbo].[seq]` whatever was written.
+    seq.default = Some("NEXT VALUE FOR [dbo].[seq]".to_owned());
+    t.columns.insert("seq".to_owned(), seq);
+    let mut stamp = Column::new(ty("datetime2")).not_null();
+    stamp.default = Some("sysutcdatetime()".to_owned());
+    t.columns.insert("stamp".to_owned(), stamp);
+    t.primary_key = Some(PrimaryKey {
+        name: Some("pk_t".to_owned()),
+        columns: vec!["id".to_owned()],
+    });
+    let rows = |cells: &[(&str, &[(&str, Value)])]| -> std::collections::BTreeMap<RowKey, Row> {
+        cells
+            .iter()
+            .map(|(k, cs)| {
+                (
+                    RowKey::from(*k),
+                    cs.iter()
+                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .collect::<Row>(),
+                )
+            })
+            .collect()
+    };
+    t.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[
+            // Written explicitly, and equal to the default.
+            ("1", &[("label", text("Unlabelled"))]),
+            // Omitted: the default, whatever it is.
+            ("2", &[]),
+        ]),
+    });
+    let name = TableName::new("dbo", "t");
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("voldefault").await;
+    db.conn
+        .execute("CREATE SEQUENCE dbo.seq START WITH 100 INCREMENT BY 1;")
+        .await
+        .expect("sequence");
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let scopes = declared.data_scopes();
+    let read: std::collections::BTreeMap<TableName, RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("a table with a NEXT VALUE FOR default reads back");
+
+    // The sequence was consumed by the two inserts and by nothing else: a
+    // read that evaluated the default would have advanced it further.
+    let next: i32 = db
+        .conn
+        .query("SELECT CAST(current_value AS int) AS v FROM sys.sequences WHERE name = 'seq';")
+        .await
+        .expect("sequence state")[0]
+        .try_get("v")
+        .expect("v")
+        .expect("v");
+    assert_eq!(next, 101, "two inserts, no evaluation in the read");
+
+    // As the declarations see it: what was declared is what comes back,
+    // explicit `label` included, and the two volatile cells omitted.
+    let as_declared = live
+        .clone()
+        .with_observed_rows(&observed, &scopes, &declared);
+    assert_eq!(as_declared.tables[&name].data, declared.tables[&name].data);
+    // As `pull` sees it, with no rows of its own: the shortest true block.
+    let pulled = live.with_observed_rows(&observed, &scopes, &Schema::default());
+    assert_eq!(
+        pulled.tables[&name].data.as_ref().unwrap().rows,
+        rows(&[("1", &[]), ("2", &[])])
+    );
+    // And the differ, measured against the declared reading, has nothing to
+    // say about the rows — which is the property the whole thing exists for.
+    let cs = pbps_diff::diff_partial(
+        pbps_diff::Side {
+            schema: &as_declared,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &Mssql,
+        &pbps_model::Hints::default(),
+    );
+    assert!(cs.errors.is_empty(), "{:?}", cs.errors);
+    let rows_changed: Vec<String> = cs
+        .changes
+        .changes
+        .iter()
+        .filter(|p| p.change.table() == Some(&name))
+        .map(|p| format!("{:?}", p.change))
+        .collect();
+    assert_eq!(rows_changed, Vec::<String>::new());
 
     db.drop().await;
 }
@@ -2395,6 +2526,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let targets = pbps_mssql::doctor::GrantTargets {
         objects: vec!["dbo.customer".to_owned()],
         schemas: vec!["dbo".to_owned()],
+        roles: vec![],
     };
     let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&targets))
         .await
@@ -2416,6 +2548,84 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         "{gaps:?}"
     );
 
+    // A managed role that holds a grant the declarations no longer name: the
+    // next plan revokes it, so the securable it is on is asked about too —
+    // in another schema, so the schema-scoped CONTROL below does not cover
+    // it by accident.
+    // `CREATE SCHEMA` has to be a batch of its own.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; EXEC('CREATE SCHEMA legacy');",
+            db.name
+        ))
+        .await
+        .expect("a schema outside the declarations");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE TABLE legacy.archive (id int NOT NULL PRIMARY KEY); \
+             CREATE ROLE app_reader; \
+             GRANT SELECT ON legacy.archive TO app_reader; \
+             GRANT SELECT ON SCHEMA::legacy TO app_reader;",
+            db.name
+        ))
+        .await
+        .expect("a role with a grant outside the declarations");
+    // The login cannot see `app_reader`'s grants in the catalog — metadata
+    // visibility hides a securable from an account with no permission on it,
+    // which is exactly the account being checked — so the recorded state is
+    // where the check has to read them from.
+    let mut recorded = Schema::default();
+    let mut app_reader = pbps_model::Role::default();
+    app_reader.grants.insert(
+        pbps_model::GrantTarget::Object(TableName::new("legacy", "archive")),
+        [pbps_model::Permission::Select].into_iter().collect(),
+    );
+    app_reader.grants.insert(
+        pbps_model::GrantTarget::Schema("legacy".to_owned()),
+        [pbps_model::Permission::Select].into_iter().collect(),
+    );
+    recorded.roles.insert("app_reader".to_owned(), app_reader);
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("ledger");
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            recorded,
+            IdsFile::default(),
+            "live-test",
+        ),
+    )
+    .await
+    .expect("record the state with the role");
+    let managed = pbps_mssql::doctor::GrantTargets {
+        roles: vec!["app_reader".to_owned()],
+        ..targets.clone()
+    };
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&managed))
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    let mut where_missing: Vec<String> = gaps
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    where_missing.sort();
+    assert_eq!(
+        where_missing,
+        [
+            "ALTER ANY ROLE on the database",
+            "CONTROL on OBJECT::dbo.customer",
+            "CONTROL on OBJECT::legacy.archive",
+            "CONTROL on SCHEMA::dbo",
+            "CONTROL on SCHEMA::legacy",
+            "CREATE ROLE on the database",
+        ],
+        "{gaps:?}"
+    );
+
     // Granted exactly what the gaps name, the account is ready — and CONTROL
     // on the schema covers the object inside it, which is the inheritance
     // `HAS_PERMS_BY_NAME` has to account for.
@@ -2423,12 +2633,13 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         .execute(&format!(
             "USE [{0}]; \
              GRANT CREATE ROLE, ALTER ANY ROLE TO [{login}]; \
-             GRANT CONTROL ON SCHEMA::dbo TO [{login}];",
+             GRANT CONTROL ON SCHEMA::dbo TO [{login}]; \
+             GRANT CONTROL ON SCHEMA::legacy TO [{login}];",
             db.name
         ))
         .await
         .expect("grant the role permissions");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&targets))
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&managed))
         .await
         .expect("read permissions");
     assert!(

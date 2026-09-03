@@ -289,7 +289,9 @@ async fn rehearse_in(
     let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, &read)
         .await
         .context("cannot read the declared rows back from the dev database")?;
-    let engine = scoped.schema.with_observed_rows(&rows, &declared_data);
+    let engine = scoped
+        .schema
+        .with_observed_rows(&rows, &declared_data, declared);
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &engine,

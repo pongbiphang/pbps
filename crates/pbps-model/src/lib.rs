@@ -40,7 +40,8 @@ pub mod uid;
 
 pub use change::{Change, ChangeSet, PlannedChange, RiskClass};
 pub use data::{
-    Cell, DataMode, DataScope, DataScopes, ObservedRows, Row, RowKey, RowScope, TableData, Value,
+    Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, Row, RowKey, RowScope,
+    TableData, Value,
 };
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
