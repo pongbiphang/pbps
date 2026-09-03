@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use pbps_dialect::{DialectError, Statement};
 use pbps_model::{
-    Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
+    Cell, Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
     ReferentialAction, Row, RowKey, Strategy, Table, TableName, UniqueConstraint, Value,
 };
 
@@ -445,11 +445,17 @@ fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
-    columns: &BTreeMap<String, (Value, Value)>,
+    columns: &BTreeMap<String, (Cell, Cell)>,
 ) -> Sql {
     let mut sets = Vec::with_capacity(columns.len());
     for (column, (_, to)) in columns {
-        sets.push(format!("{} = {}", quote(column)?, value_literal(to)));
+        // `DEFAULT` is the keyword: it asks the engine to evaluate the
+        // column's default, which is the one thing a literal cannot say.
+        let rhs = match to {
+            Cell::Value(v) => value_literal(v),
+            Cell::Default => "DEFAULT".to_owned(),
+        };
+        sets.push(format!("{} = {}", quote(column)?, rhs));
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -1314,8 +1320,8 @@ mod tests {
             columns: [(
                 "label".to_owned(),
                 (
-                    Value::Text("New".to_owned()),
-                    Value::Text("Opened".to_owned()),
+                    Cell::Value(Value::Text("New".to_owned())),
+                    Cell::Value(Value::Text("Opened".to_owned())),
                 ),
             )]
             .into_iter()
@@ -1325,6 +1331,30 @@ mod tests {
             sql,
             ["UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';"]
         );
+    }
+
+    /// An omitted column means the declared default, and only the keyword can
+    /// ask the engine for it. Writing NULL instead fails a NOT NULL column that
+    /// `validate` had passed, and stores NULL in a nullable one where the
+    /// declaration said "the default".
+    #[test]
+    fn an_update_to_the_default_says_default_not_null() {
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [(
+                "sort".to_owned(),
+                (Cell::Value(Value::Int(3)), Cell::Default),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert_eq!(
+            sql,
+            ["UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"]
+        );
+        assert!(!sql[0].contains("NULL"), "{sql:?}");
     }
 
     /// `UPDATE t SET WHERE ...` is not T-SQL. The differ never produces an

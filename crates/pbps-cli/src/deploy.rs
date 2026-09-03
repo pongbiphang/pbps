@@ -727,6 +727,33 @@ pub fn cmd_plan_db(
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "plan --db")?;
     let loaded = crate::load(project)?;
+    // Before the connection, on purpose: this is a fact about the declarations
+    // and the tool, not about the target, and a refusal that first dialled the
+    // server would blame the wrong thing when the server was also down.
+    //
+    // The base of a connected plan is the catalog, and the catalog does not
+    // read rows back yet (ADR-0004, "Implementation status"). Its tables all
+    // say `data: None`, which means "declares no rows", so the differ would
+    // insert every declared row on every run — the second apply fails on the
+    // primary key. Refusing is the honest answer until the read-back exists;
+    // planning the structure and quietly leaving the rows out would be a
+    // partial apply nobody asked for.
+    let with_data = loaded.schema.tables_with_data();
+    if !with_data.is_empty() {
+        bail!(
+            "{} table(s) declare reference data ({}), which `plan --db` cannot plan yet: the \
+             target's rows are not read back, so every declared row would be inserted on every \
+             run.\n\
+             `pbps plan` (offline) shows the DML for review; applying it against a target is the \
+             connected half of ADR-0004 and is not built.",
+            with_data.len(),
+            with_data
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
     let created_at = crate::now();

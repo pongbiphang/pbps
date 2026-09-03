@@ -197,6 +197,54 @@ impl fmt::Display for Value {
     }
 }
 
+/// What a row says about one column, once the omission rule has been applied.
+///
+/// A [`Row`] cannot answer this on its own: an omitted column means the
+/// column's declared default, and the column's declaration lives in the
+/// table, which the row does not reach (constraint 2). So the differ resolves
+/// each side's row against **that side's** table, and compares these.
+///
+/// `Default` is kept apart from any [`Value`] on purpose. The default is an
+/// expression (`SYSUTCDATETIME()`, `0`, `''`) that only the engine can
+/// evaluate, so "the default" and "NULL" are different declarations even when
+/// they happen to evaluate the same — and an `UPDATE` has to say `DEFAULT`,
+/// not `NULL`, or a `NOT NULL` column with a default fails on a row that
+/// `validate` had passed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cell {
+    Value(Value),
+    /// The column's declared default, whatever it evaluates to.
+    Default,
+}
+
+impl fmt::Display for Cell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Cell::Value(v) => v.fmt(f),
+            Cell::Default => f.write_str("default"),
+        }
+    }
+}
+
+/// Resolves one column of a row against the column's declaration.
+///
+/// `spec` is `None` when this side's table does not have the column at all —
+/// the base side of a row whose table gains the column in the same plan. The
+/// engine will have put NULL there (or the default, for a NOT NULL add), and
+/// NULL is the answer that makes the differ restate whatever the declaration
+/// wants: an `UPDATE ... = DEFAULT` after the `ADD` is idempotent, and a
+/// declared NULL matches without one.
+pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Cell {
+    match row.get(column) {
+        Some(v) => Cell::Value(v.clone()),
+        None => match spec {
+            Some(c) if c.default.is_some() => Cell::Default,
+            _ => Cell::Value(Value::Null),
+        },
+    }
+}
+
 /// The order declared rows must be inserted in: a referenced table before the
 /// table that references it.
 ///
@@ -340,23 +388,31 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
             }
         }
 
-        // An omitted column means "the declared default, or NULL" (see [`Row`]).
-        // Where neither exists the row cannot be inserted at all, and the engine
-        // would be the one to say so, mid-apply.
+        // The two spellings of "nothing here" are not the same statement, and
+        // the engine treats them differently (see [`Row`]). An omitted column
+        // is left out of the INSERT, so the default fills it; an explicit
+        // `null` is *sent*, and a default never applies to a value that was
+        // sent. So a `NOT NULL` column refuses an explicit null whatever its
+        // default, and refuses omission only when nothing would fill it.
         for (column, spec) in &table.columns {
-            if Some(column.as_str()) == key_column.as_deref() {
+            if Some(column.as_str()) == key_column.as_deref() || spec.nullable {
                 continue;
             }
-            let omitted = !row.0.contains_key(column);
-            let explicit_null = row.0.get(column).is_some_and(Value::is_null);
-            if (omitted || explicit_null)
-                && !spec.nullable
-                && spec.default.is_none()
-                && spec.identity.is_none()
-            {
-                problems.push(format!(
-                    "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
-                ));
+            match row.0.get(column) {
+                Some(Value::Null) => problems.push(format!(
+                    "{name}: row `{key}` sets `{column}` to null, but it is NOT NULL{}",
+                    if spec.default.is_some() {
+                        " — leave it out to get the default"
+                    } else {
+                        ""
+                    }
+                )),
+                None if spec.default.is_none() && spec.identity.is_none() => {
+                    problems.push(format!(
+                        "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
+                    ));
+                }
+                _ => {}
             }
         }
     }
@@ -488,14 +544,54 @@ mod tests {
         let p = check(&name(), &t);
         assert!(p.iter().any(|m| m.contains("`label` unset")), "{p:?}");
 
-        // ...and explicitly null, which is the same statement and would
-        // otherwise slip past a check that only looked for absence.
+        // ...and explicitly null, which is a *different* statement (it is
+        // sent, so no default can fill it) and would otherwise slip past a
+        // check that only looked for absence.
         let t = table(
             Some(vec!["code"]),
             vec![("new", vec![("label", Value::Null)])],
         );
         let p = check(&name(), &t);
-        assert!(p.iter().any(|m| m.contains("`label` unset")), "{p:?}");
+        assert!(p.iter().any(|m| m.contains("`label` to null")), "{p:?}");
+    }
+
+    /// The second review's P2: an explicit `null` is *sent*, and a default
+    /// never applies to a value that was sent — so this row fails at apply
+    /// time on a `NOT NULL` column even though the column has a default.
+    #[test]
+    fn an_explicit_null_on_a_not_null_column_is_refused_even_with_a_default() {
+        let mut t = table(
+            Some(vec!["code"]),
+            vec![("new", vec![("label", Value::Null)])],
+        );
+        t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        let p = check(&name(), &t);
+        assert!(p.iter().any(|m| m.contains("to null")), "{p:?}");
+        assert!(
+            p.iter().any(|m| m.contains("leave it out")),
+            "the remedy must be named: {p:?}"
+        );
+    }
+
+    #[test]
+    fn an_omitted_column_resolves_to_its_default_and_otherwise_to_null() {
+        let with_default = {
+            let mut c = Column::new(ColumnType::from_str("int").unwrap());
+            c.default = Some("0".to_owned());
+            c
+        };
+        let without = Column::new(ColumnType::from_str("int").unwrap());
+        let row = Row::default();
+        assert_eq!(cell(&row, "n", Some(&with_default)), Cell::Default);
+        assert_eq!(cell(&row, "n", Some(&without)), Cell::Value(Value::Null));
+        assert_eq!(cell(&row, "n", None), Cell::Value(Value::Null));
+        // And a written value is that value, default or no default: the
+        // default fills only what was left out.
+        let written: Row = [("n".to_owned(), Value::Int(7))].into_iter().collect();
+        assert_eq!(
+            cell(&written, "n", Some(&with_default)),
+            Cell::Value(Value::Int(7))
+        );
     }
 
     #[test]

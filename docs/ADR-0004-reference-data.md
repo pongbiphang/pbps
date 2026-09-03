@@ -128,14 +128,29 @@ anticipate, both of them narrowings:
 2. **An omitted column means the column's default, or NULL** — not "unspecified".
    The alternative would leave part of an `exact` table undeclared, which is
    exactly what `exact` claims not to be, and would undermine this document's
-   own argument that a row can be recreated losslessly.
+   own argument that a row can be recreated losslessly. The two spellings are
+   different statements to the engine: an omitted column is left out of the
+   INSERT and the default fills it; an explicit `null` is *sent*, and no
+   default applies to a value that was sent. So the differ compares a `Cell`
+   (a value, or *the default*) resolved against each side's own table, an
+   UPDATE to an omitted column says `DEFAULT`, and `validate` refuses an
+   explicit `null` on a NOT NULL column whatever its default.
+3. **A connected plan refuses a declaration with `data:` blocks**, before it
+   connects. The catalog does not read rows back yet, so its tables all say
+   `data: None` — which means "declares no rows", not "did not look" — and the
+   differ would insert every declared row on every run; the second apply fails
+   on the primary key. The dev rehearsal compares structure only for the same
+   reason, after having *run* the DML. Both are temporary and both say so;
+   planning the structure and quietly leaving the rows out would be a partial
+   apply nobody asked for.
 
 Not built yet, and deliberately together because they share one question — what
 the database actually holds:
 
 - the pre-delete probe counting the foreign-key references to the row;
 - reading `exact` tables' rows back into `state_json`, and the row half of the
-  drift comparison;
+  drift comparison — which is also what lifts the `plan --db` refusal above,
+  and has to evaluate a `Cell::Default` against what the engine stored;
 - `pull --data <table>`;
 - `SET IDENTITY_INSERT` around an insert into an IDENTITY key column, which
   needs the emitter to know the column is one.

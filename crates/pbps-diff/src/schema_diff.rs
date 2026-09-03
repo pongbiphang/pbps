@@ -25,9 +25,10 @@ use std::collections::BTreeMap;
 
 use pbps_dialect::Dialect;
 use pbps_model::change::DeleteCause;
+use pbps_model::data::cell;
 use pbps_model::{
     Change, ChangeSet, ColumnRef, ColumnType, DataMode, Hints, IdsFile, ObjectName, PlannedChange,
-    Row, Schema, Table, TableName, Uid, Value,
+    Schema, Table, TableName, Uid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -526,8 +527,15 @@ fn diff_data(
                 // and the database already agree on, and would make plan.sql
                 // claim a change that is not one.
                 let mut columns = BTreeMap::new();
-                for column in declared.columns.keys() {
-                    let (b, d) = (cell(before, column), cell(row, column));
+                for (column, spec) in &declared.columns {
+                    // Each side against *its own* table. A column that gains a
+                    // default in this same plan resolves to NULL on the base
+                    // and to the default on the declared side, which is an
+                    // UPDATE — and the right one: adding a default does not
+                    // backfill existing rows, and the declaration says the
+                    // row should hold it.
+                    let b = cell(before, column, base.columns.get(column));
+                    let d = cell(row, column, Some(spec));
                     if b != d {
                         columns.insert(column.clone(), (b, d));
                     }
@@ -560,17 +568,6 @@ fn diff_data(
             }
         }
     }
-}
-
-/// What a row says about one column.
-///
-/// An omitted column is not "no answer": it means the column's declared
-/// default, or NULL where there is none (see `pbps_model::Row`). Resolving both
-/// sides the same way here is what stops a row that spelled its NULL out
-/// comparing unequal to one that left it out — two spellings of one row, which
-/// would otherwise produce an UPDATE that changes nothing on every plan.
-fn cell(row: &Row, column: &str) -> Value {
-    row.get(column).cloned().unwrap_or(Value::Null)
 }
 
 /// Position in the dependency order, by table name.
@@ -744,7 +741,9 @@ mod tests {
     use crate::identity::Context;
     use indexmap::IndexMap;
     use pbps_dialect::MinimalDialect;
-    use pbps_model::{Column, ColumnType, IdsFile, Index, IndexColumn, Intent, RiskClass, Uid};
+    use pbps_model::{
+        Column, ColumnType, IdsFile, Index, IndexColumn, Intent, RiskClass, Row, Uid, Value,
+    };
 
     fn ctx() -> Context {
         Context {
@@ -1079,6 +1078,80 @@ mod tests {
             })
             .collect();
         assert_eq!(deletes, ["dbo.sub", "dbo.status"]);
+    }
+
+    /// The second review's first P1. An existing row that stops writing a
+    /// column with a default is asking for the default, and the UPDATE has to
+    /// say so: `= NULL` fails a NOT NULL column and stores NULL in a nullable
+    /// one.
+    #[test]
+    fn dropping_a_written_value_in_favour_of_the_default_updates_to_default() {
+        let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+        base_t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        let mut declared_t = base_t.clone();
+        declared_t.data.as_mut().unwrap().rows =
+            [(pbps_model::RowKey::from("new"), Row::default())]
+                .into_iter()
+                .collect();
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        let Change::UpdateRow { columns, .. } = &cs.changes[0].change else {
+            panic!("{:?}", kinds(&cs));
+        };
+        assert_eq!(
+            columns["label"],
+            (
+                pbps_model::Cell::Value(Value::Text("x".to_owned())),
+                pbps_model::Cell::Default
+            )
+        );
+    }
+
+    /// Each side resolves against its own table: a column that *gains* a
+    /// default in this plan holds NULL in every existing row (adding a default
+    /// does not backfill), and the declaration says the row should hold the
+    /// default — so that is an UPDATE, and the right one.
+    #[test]
+    fn a_column_gaining_a_default_updates_omitted_rows_to_it() {
+        let base_t = {
+            let mut t = lookup(DataMode::Exact, &[("new", "x")]);
+            t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+                .into_iter()
+                .collect();
+            t
+        };
+        let mut declared_t = base_t.clone();
+        declared_t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        assert_eq!(row_ops(&cs), ["update new [label]"]);
+        // And it runs after the default exists.
+        let k = kinds(&cs);
+        let alter = k.iter().position(|c| c == "AlterColumnDefault").unwrap();
+        let update = k.iter().position(|c| c == "UpdateRow").unwrap();
+        assert!(alter < update, "{k:?}");
+    }
+
+    /// The negative case: two omissions on a column with a default are the
+    /// same statement, and must not produce an UPDATE on every plan.
+    #[test]
+    fn two_omissions_of_a_defaulted_column_are_equal() {
+        let mut t = lookup(DataMode::Exact, &[("new", "x")]);
+        t.columns.get_mut("label").unwrap().default = Some("''".to_owned());
+        t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+            .into_iter()
+            .collect();
+        assert!(
+            run(&schema_of("dbo.s", t.clone()), &schema_of("dbo.s", t), &[])
+                .changes
+                .is_empty()
+        );
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently

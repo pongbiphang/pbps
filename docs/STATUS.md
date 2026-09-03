@@ -98,10 +98,12 @@ Reference data's **offline half is built**: the `data:` block, its `exact` and
 `ensure` modes, the round trip through `fmt`, the rules `validate` reports, the
 typed row changes with the `data-update` and `data-delete` risk classes, the
 DML, and the ordering — rows after the table and before the constraints, and
-between two tables in the direction their foreign key points. The connected
-half (the pre-delete probe, the row read-back into `state_json` and the drift
-comparison, `pull --data`, `SET IDENTITY_INSERT`) is next; ADR-0004 lists it
-under "Implementation status". The ordering was chosen against the
+between two tables in the direction their foreign key points. Until the connected
+half exists, `plan --db` refuses a declaration with `data:` blocks rather than
+insert every row on every run. That half (the row read-back into `state_json`
+and the drift comparison, which lifts the refusal; the pre-delete probe;
+`pull --data`; `SET IDENTITY_INSERT`) is next; ADR-0004 lists it under
+"Implementation status". The ordering was chosen against the
 obvious one — engine count is what every comparison table measures — because a
 second dialect doubles the surface every later feature is built twice for, and
 does it while the first engine still cannot express an organization's own rules.

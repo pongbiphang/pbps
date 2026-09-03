@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::data::{DataMode, Row, RowKey, Value};
+use crate::data::{Cell, DataMode, Row, RowKey};
 use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
 use crate::schema::{
@@ -289,7 +289,10 @@ pub enum Change {
         /// Column to (before, after). The before is carried so the plan can say
         /// what is being replaced — the reviewer at the gate has no connection
         /// (SPEC §14.1) and cannot look it up.
-        columns: BTreeMap<String, (Value, Value)>,
+        ///
+        /// [`Cell`], not [`Value`]: an omitted column means the declared
+        /// default, and the emitter has to write `DEFAULT`, not `NULL`.
+        columns: BTreeMap<String, (Cell, Cell)>,
     },
     DeleteRow {
         table: TableName,

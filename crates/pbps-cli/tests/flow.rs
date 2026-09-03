@@ -4894,3 +4894,24 @@ fn an_oversized_data_block_warns_but_still_plans() {
     assert_eq!(code(&o), 0, "{}", stdout(&o));
     assert_eq!(code(&d.run(&["plan"])), 0);
 }
+
+/// Until the connected half of ADR-0004 reads rows back from the catalog, a
+/// live target has not observed them — and a plan computed against it would
+/// insert every declared row on every run. Refused, before any connection is
+/// opened, which is why this test needs no server.
+#[test]
+fn a_connected_plan_refuses_reference_data_it_cannot_observe() {
+    let d = Demo::new("datadbrefuse");
+    d.table(LOOKUP);
+    let o = d.run(&[
+        "plan",
+        "--db",
+        "Server=localhost,1;Database=x;User Id=u;Password=p;TrustServerCertificate=true",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(err.contains("dbo.t"), "the table must be named: {err}");
+    assert!(err.contains("ADR-0004"), "{err}");
+    // Refused for the right reason, not because the bogus server was tried.
+    assert!(!err.contains("cannot connect"), "{err}");
+}

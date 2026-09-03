@@ -341,8 +341,10 @@ can imply.
   worse than saying so.
 - **An omitted column means the column's declared default, or NULL.** It does
   not mean "this row says nothing about it" — that reading would leave part of
-  an `exact` table undeclared. `validate` refuses a row that omits a `NOT NULL`
-  column with no default.
+  an `exact` table undeclared. An explicit `null` is different: it is sent, so
+  no default fills it. `validate` refuses a row that omits a `NOT NULL` column
+  with no default, and one that sets a `NOT NULL` column to `null` whatever
+  its default.
 - **A non-integer number must be quoted.** The exact decimal form written is
   the literal that reaches the column, and reading `1.10` through a binary
   float does not promise to give it back. Quoted, it is text, and the engine
@@ -365,6 +367,12 @@ like reference data". A warning, never a refusal: the line between a lookup
 table and somebody's business table is a judgement about the project, and the
 cost being pointed at is that every plan from here on compares those rows one
 by one.
+
+**Against a target.** Until the catalog reads rows back (the connected half of
+ADR-0004), `plan --db` refuses a declaration with `data:` blocks, before it
+connects: a catalog that has not observed rows declares none, and planning
+against it would insert every declared row on every run. `pbps plan` shows the
+DML for review, and the dev rehearsal runs it and compares structure.
 
 **Ordering.** Rows go in after the table and its columns exist and before the
 constraints that check them, and they follow the foreign keys *between* the

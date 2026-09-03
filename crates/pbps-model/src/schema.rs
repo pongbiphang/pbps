@@ -45,6 +45,32 @@ impl Schema {
     pub fn get(&self, name: &TableName) -> Option<&Table> {
         self.tables.get(name)
     }
+
+    /// This schema with every `data:` block removed.
+    ///
+    /// For comparing a declaration against a catalog that has **not observed
+    /// rows** — which, until the connected half of ADR-0004 reads them back,
+    /// is every catalog. A catalog side always has `data: None`, and `None`
+    /// means "declares no rows", not "did not look"; comparing it to a
+    /// declaration that does declare rows would report every one of them as
+    /// missing, on every run. Stripping the declared side makes the comparison
+    /// say what it can actually answer, which is structure.
+    pub fn without_data(&self) -> Schema {
+        let mut s = self.clone();
+        for t in s.tables.values_mut() {
+            t.data = None;
+        }
+        s
+    }
+
+    /// The tables that declare reference data, for a refusal that names them.
+    pub fn tables_with_data(&self) -> Vec<&TableName> {
+        self.tables
+            .iter()
+            .filter(|(_, t)| t.data.is_some())
+            .map(|(n, _)| n)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

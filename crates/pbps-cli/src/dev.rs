@@ -276,13 +276,21 @@ async fn rehearse_in(
     // What is left after applying the plan is what has not converged. The
     // comparison is the ordinary one, so the rehearsal cannot disagree with the
     // differ about what a difference is.
+    //
+    // Rows are compared without: the DML *ran* — a bad literal or a violated
+    // key fails the rehearsal above like any other statement — but
+    // introspection does not read rows back yet (ADR-0004, "Implementation
+    // status"), so the engine side declares none, and comparing it to a
+    // declaration that does would report every row as missing after inserting
+    // it. Structure is what this comparison can answer today.
+    let declared_structure = declared.without_data();
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &scoped.schema,
             ids: &observed,
         },
         pbps_diff::Side {
-            schema: declared,
+            schema: &declared_structure,
             ids: declared_ids,
         },
         dialect,
