@@ -429,3 +429,26 @@ SPEC is in sync with all of these.
     last of them (with the warning), because the declaration can express that
     much and the difference is one the next drift check will not be able to see
     — which is said, rather than hidden.
+
+## Phase 4 — follow-ups
+
+61. **An unnamed declared primary key matches any stored name.** A declaration
+    that writes `primary_key: [id]` leaves the name to the engine, and the
+    engine invents one that the recorded state then carries. Comparing names
+    there restated `SetPrimaryKey` — a `constraint` risk — on every connected
+    plan until somebody copied `PK__t__357D4CF8...` into the file, which is a
+    demand nobody outside `pull` would meet. So an unnamed declaration compares
+    columns only; a *named* declaration is compared in full, because renaming
+    a constraint is a change the plan has to carry. The cost is that the
+    differ cannot express "give this key a name" for a declaration that has
+    none — which is the declaration saying it does not care.
+62. **`doctor` asks for the role permissions only of a project that declares a
+    role.** `CREATE ROLE`, `ALTER ANY ROLE` and `CONTROL` on every granted
+    securable are security-shaped, and the list refuses over-demand everywhere
+    else — but an account short of them fails on the first `GRANT` of a
+    project that does declare roles, after `doctor` said ready. So `REQUIRED`
+    gained its first entries that depend on the declarations: `Needed::RoleAdmin`
+    is switched off by `Held::roles_declared`, and `Needed::Granted` is asked
+    per object and per schema the roles are granted on, the way foreign-key
+    targets outside the managed schemas already are. `CONTROL` is what is
+    asked for, because `HAS_PERMS_BY_NAME` cannot ask "held with grant option".

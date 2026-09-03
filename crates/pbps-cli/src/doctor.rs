@@ -109,6 +109,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
     let referenced = referenced_tables(project, &managed_schemas);
+    let granted = grant_targets(project);
 
     if !project.ids_file().exists() {
         findings.push(
@@ -167,6 +168,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     target.connection(),
                     &managed_schemas,
                     &referenced,
+                    granted.as_ref(),
                 ))
             }
             Err(e) => EnvDiagnosis {
@@ -207,7 +209,13 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
-                Ok(conn) => rt.block_on(examine(&name, &conn, &managed_schemas, &referenced)),
+                Ok(conn) => rt.block_on(examine(
+                    &name,
+                    &conn,
+                    &managed_schemas,
+                    &referenced,
+                    granted.as_ref(),
+                )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
@@ -357,12 +365,40 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// What the declared roles are granted on (ADR-0005), or `None` when the
+/// project declares no role — which switches the role requirements off.
+fn grant_targets(project: &Project) -> Option<pbps_mssql::doctor::GrantTargets> {
+    let loaded = crate::load_quiet(project).ok()?;
+    if loaded.schema.roles.is_empty() {
+        return None;
+    }
+    let mut objects = std::collections::BTreeSet::new();
+    let mut schemas = std::collections::BTreeSet::new();
+    for role in loaded.schema.roles.values() {
+        for target in role.grants.keys() {
+            match target {
+                pbps_model::GrantTarget::Object(o) => {
+                    objects.insert(format!("{}.{}", o.schema, o.name));
+                }
+                pbps_model::GrantTarget::Schema(s) => {
+                    schemas.insert(s.clone());
+                }
+            }
+        }
+    }
+    Some(pbps_mssql::doctor::GrantTargets {
+        objects: objects.into_iter().collect(),
+        schemas: schemas.into_iter().collect(),
+    })
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
     connection: &str,
     schemas: &[String],
     referenced: &[String],
+    granted: Option<&pbps_mssql::doctor::GrantTargets>,
 ) -> EnvDiagnosis {
     let mut d = EnvDiagnosis {
         environment: name.to_owned(),
@@ -416,7 +452,7 @@ async fn examine(
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced).await {
+    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted).await {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()

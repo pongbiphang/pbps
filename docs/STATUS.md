@@ -89,27 +89,6 @@ so it is *less* recourse than the stale crate, not more. Dialect plugins are
 declined separately: no stable Rust ABI, and a plugin API would freeze
 `ChangeSet` while the model still moves.
 
-### `doctor` does not yet check the permissions roles need
-
-Managing roles needs `CREATE ROLE`, `ALTER ANY ROLE` and `CONTROL` (or the
-permission `WITH GRANT OPTION`) on every object a role is granted on. `doctor`'s
-list is a constant and knows nothing about what the project declares, so it
-does not ask for these; an account short of them fails loudly at apply time,
-inside the transaction. Making the list conditional on the declarations is the
-fix, and it is not done.
-
-### An unnamed primary key is restated on every connected plan
-
-A declaration that writes `primary_key: [code]` leaves the name to the engine,
-and the engine invents one (`PK__t__357D4CF8...`). After `bootstrap` or the
-first `apply`, the recorded state carries that name and the declaration
-carries none, so the differ emits `SetPrimaryKey` — a `constraint` risk — on
-every `plan --db` until the key is named. Found while writing the
-reference-data live test, which names its key to get past it. Whether the
-differ should read `None` as "any name" (the way `pull` keeps the stored name
-so the next diff does not want to rename it) is undecided; until it is, name
-the key.
-
 ## Roadmap
 
 **Phase 3.1 is complete** — the usability foundation of SPEC 14, and every P0 row
@@ -136,7 +115,8 @@ ids file, `rename-role` / `drop-role` and the other two intent channels, the
 differ with `revoke` (gated) and `grant-widen` (labelled, never gated), the
 T-SQL, the catalog read-back, drift under the managed set, `validate`'s
 target rule and `pull`. ADR-0005 lists the decisions taken on the way. Next in
-Phase 4: the `policies:` block, which gets an ADR first.
+Phase 4: the `policies:` block and the analyzer catalogue, designed in
+[ADR-0008](ADR-0008-policies.md) and not yet built.
 
 Depth before breadth was chosen against the obvious ordering — engine count is
 what every comparison table measures — because a second dialect doubles the

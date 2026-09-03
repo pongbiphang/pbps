@@ -417,7 +417,18 @@ fn columns_of(ids: &IdsFile, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
 /// place — the database itself does drop + add, and pretending otherwise would
 /// only give the emitter one more path that can fail.
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
-    if base.primary_key != declared.primary_key {
+    // A declaration that leaves the key unnamed (`primary_key: [id]`) leaves
+    // the name to the engine, and the engine invents one (`PK__t__357D...`)
+    // that the recorded state then carries. Comparing names there would
+    // restate the key on every connected plan until somebody copied the
+    // invented name into the file. So an unnamed declaration matches any
+    // stored name and only the columns are compared; a *named* declaration is
+    // compared in full, because renaming a constraint is a real change.
+    let pk_differs = match (&base.primary_key, &declared.primary_key) {
+        (Some(b), Some(d)) if d.name.is_none() => b.columns != d.columns,
+        (b, d) => b != d,
+    };
+    if pk_differs {
         changes.push(Change::SetPrimaryKey {
             table: name.clone(),
             from: base.primary_key.clone(),
@@ -2621,5 +2632,65 @@ mod tests {
                 .unwrap();
             assert!(create_table < at("grant"), "{k:?}");
         }
+    }
+
+    /// A declaration that leaves the primary key unnamed matches whatever
+    /// name the engine invented; only a named declaration, or different
+    /// columns, is a change.
+    #[test]
+    fn an_unnamed_declared_primary_key_matches_any_stored_name() {
+        let mut base_t = Table::default();
+        base_t
+            .columns
+            .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+        base_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("PK__t__357D4CF8312E0151".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let mut declared_t = base_t.clone();
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_owned()],
+        });
+        let mut changes = Vec::new();
+        diff_constraints(
+            &"dbo.t".parse().unwrap(),
+            &base_t,
+            &declared_t,
+            &mut changes,
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+
+        // The negative cases: other columns, or a name of its own.
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["other".to_owned()],
+        });
+        let mut changes = Vec::new();
+        diff_constraints(
+            &"dbo.t".parse().unwrap(),
+            &base_t,
+            &declared_t,
+            &mut changes,
+        );
+        assert!(
+            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
+            "{changes:?}"
+        );
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let mut changes = Vec::new();
+        diff_constraints(
+            &"dbo.t".parse().unwrap(),
+            &base_t,
+            &declared_t,
+            &mut changes,
+        );
+        assert!(
+            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
+            "a named key is compared in full: {changes:?}"
+        );
     }
 }

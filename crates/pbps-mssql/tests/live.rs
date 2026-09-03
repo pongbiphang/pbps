@@ -1052,7 +1052,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
         .await
         .expect("read permissions");
 
@@ -1080,7 +1080,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1106,7 +1106,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
     // As a project that manages `app`, so the gap can only be the ledger's own
     // creation requirement and not the ordinary managed-schema `ALTER`.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1137,7 +1137,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("grant on the ledger objects");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert!(
@@ -1161,7 +1161,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("drop the state table");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert_eq!(
@@ -1215,7 +1215,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .await
         .expect("revoke alter again");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
         .await
         .expect("read permissions");
     let gaps = pbps_mssql::doctor::missing(&held);
@@ -1239,7 +1239,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute("CREATE SCHEMA [app];")
         .await
         .expect("create app schema");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["App".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert!(
@@ -1256,7 +1256,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     // nothing in the tool emits `CREATE SCHEMA`, so the first
     // `CREATE TABLE [nowhere].[...]` would have failed right after a clean
     // readiness report.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["nowhere".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert!(
@@ -1350,7 +1350,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let mut lp = Conn::connect(&as_login)
         .await
         .expect("connect as the login");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert!(
@@ -1368,7 +1368,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         .await
         .expect("deny");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
         .await
         .expect("read permissions");
     // All three facts, because the old shortcut was built on the first alone.
@@ -1603,7 +1603,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         .expect("connect as the login");
     // The premise: with no foreign key out of `app`, this login is ready. If it
     // were not, the assertion below would pass for the wrong reason.
-    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[])
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["app".to_owned()], &[], None)
         .await
         .expect("read permissions");
     assert!(
@@ -1617,6 +1617,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &mut lp,
         &["app".to_owned()],
         &["shared.parent".to_owned()],
+        None,
     )
     .await
     .expect("read permissions");
@@ -1642,6 +1643,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &mut lp,
         &["app".to_owned()],
         &["shared.parent".to_owned()],
+        None,
     )
     .await
     .expect("read permissions");
@@ -2285,4 +2287,126 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     assert_eq!(n, 1, "the member must still hold the renamed role");
 
     db.drop().await;
+}
+
+/// `doctor` and roles (ADR-0005): a least-privilege login that can deploy
+/// tables is not ready to deploy a role — and the gaps are reported where the
+/// grants have to go, at the database for the role itself and on the securable
+/// for the `GRANT`. Only a real `HAS_PERMS_BY_NAME` can say whether `CONTROL`
+/// at object scope is answered the way this code expects.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_granted() {
+    let mut db = TestDb::create("doctorrole").await;
+    let login = format!("pbps_lr_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             CREATE TABLE dbo.customer (id int NOT NULL PRIMARY KEY); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
+             ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant");
+
+    let base = conn_str();
+    let as_login = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{as_login};User Id={login};Password={password};Database={}",
+        db.name
+    );
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+
+    // The control: with no role declared, this account is ready.
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], None)
+        .await
+        .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "{:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    // With a role granted on the table and on the schema: three gaps, each
+    // where the grant has to go.
+    let targets = pbps_mssql::doctor::GrantTargets {
+        objects: vec!["dbo.customer".to_owned()],
+        schemas: vec!["dbo".to_owned()],
+    };
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&targets))
+        .await
+        .expect("read permissions");
+    let gaps = pbps_mssql::doctor::missing(&held);
+    let mut where_missing: Vec<String> = gaps
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    where_missing.sort();
+    assert_eq!(
+        where_missing,
+        [
+            "ALTER ANY ROLE on the database",
+            "CONTROL on OBJECT::dbo.customer",
+            "CONTROL on SCHEMA::dbo",
+            "CREATE ROLE on the database",
+        ],
+        "{gaps:?}"
+    );
+
+    // Granted exactly what the gaps name, the account is ready — and CONTROL
+    // on the schema covers the object inside it, which is the inheritance
+    // `HAS_PERMS_BY_NAME` has to account for.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             GRANT CREATE ROLE, ALTER ANY ROLE TO [{login}]; \
+             GRANT CONTROL ON SCHEMA::dbo TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the role permissions");
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&targets))
+        .await
+        .expect("read permissions");
+    assert!(
+        pbps_mssql::doctor::missing(&held).is_empty(),
+        "{:?}",
+        pbps_mssql::doctor::missing(&held)
+    );
+
+    drop(lp);
+    db.drop().await;
+    let mut master = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = master
+        .execute(&format!("USE master; DROP LOGIN [{login}];"))
+        .await;
 }

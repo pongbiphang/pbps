@@ -89,6 +89,28 @@ pub enum Needed {
     /// and demanding anything on the whole of someone else's schema is the
     /// over-demand this enum exists to avoid.
     Referenced,
+
+    /// Needed at the database, and only when the declarations have roles
+    /// (ADR-0005): creating, renaming and dropping a database role.
+    ///
+    /// The first entry in this list that depends on what the project
+    /// declares. Demanding it of every project would ask an estate that
+    /// declares no role to hold `ALTER ANY ROLE`, which is a security-shaped
+    /// permission nobody hands out for nothing; asking only when a role file
+    /// exists costs one read of the declarations `doctor` already does.
+    RoleAdmin,
+
+    /// Needed on every object or schema a declared role is granted on.
+    ///
+    /// `GRANT` is authorized on the securable itself — `CONTROL` on it, or
+    /// ownership, or that very permission held `WITH GRANT OPTION` — and
+    /// `ALTER` on the schema, which the managed entries already demand,
+    /// implies none of those. So an account holding everything above passes
+    /// readiness and fails on the first `GRANT`. Asked at object scope for an
+    /// object target and at schema scope for a `schema::` one; `CONTROL` is
+    /// what is asked for, because `HAS_PERMS_BY_NAME` cannot ask "held with
+    /// grant option".
+    Granted,
 }
 
 /// A permission pbps needs, what needs it, and where it has to be held.
@@ -114,7 +136,7 @@ pub const LEDGER_SCHEMA: &str = "dbo";
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 14] = [
+pub const REQUIRED: [Requirement; 17] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -219,9 +241,31 @@ pub const REQUIRED: [Requirement; 14] = [
         "creating or restating a declared function",
         Needed::Database,
     ),
+    // Roles (ADR-0005), demanded only of a project that declares one.
+    req(
+        "CREATE ROLE",
+        "creating a declared database role",
+        Needed::RoleAdmin,
+    ),
+    req(
+        "ALTER ANY ROLE",
+        "renaming or dropping a declared database role",
+        Needed::RoleAdmin,
+    ),
+    req(
+        "CONTROL",
+        "granting a declared role a permission here, which the engine authorizes on the \
+         securable itself",
+        Needed::Granted,
+    ),
 ];
 
-// # A permission deliberately absent: `CONTROL`
+// # A permission deliberately absent: `CONTROL` on the managed schemas
+//
+// (It *is* demanded, per securable, on what a declared role is granted on —
+// `Needed::Granted` — because a `GRANT` is authorized there and nothing else
+// in this list covers it. That is a narrow ask on named objects a project
+// chose to grant on, not the broad one refused below.)
 //
 // A rename that moves a table between schemas is emitted as
 // `ALTER SCHEMA ... TRANSFER`, which the engine authorizes with `CONTROL` on
@@ -290,6 +334,29 @@ pub struct Held {
     /// by something else's deployment. That the table is missing at all is a
     /// question for `plan --db`, which sees the change; `doctor` sees no plan.
     pub referenced_objects: BTreeMap<String, BTreeSet<String>>,
+
+    /// Whether the declarations have any role at all. `false` switches the
+    /// role requirements off rather than reporting them as gaps.
+    pub roles_declared: bool,
+
+    /// Per object a declared role is granted on, the permissions effective on
+    /// it — asked about every named object, absent or invisible included, for
+    /// the same reason `referenced_objects` is.
+    pub granted_objects: BTreeMap<String, BTreeSet<String>>,
+
+    /// Per schema a declared role is granted on (`schema::x`), the
+    /// schema-scoped permissions effective on it. A schema the database does
+    /// not have is absent, like a managed schema that does not exist yet.
+    pub granted_schemas: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// What the declared roles are granted on, as `doctor` has to ask about it
+/// (ADR-0005). `None` at the call site means the project declares no role.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantTargets {
+    /// `schema.object`, qualified the way `HAS_PERMS_BY_NAME` takes it.
+    pub objects: Vec<String>,
+    pub schemas: Vec<String>,
 }
 
 /// A permission that is needed and not held, and the securable it is missing on.
@@ -352,6 +419,7 @@ pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
     referenced: &[String],
+    granted: Option<&GrantTargets>,
 ) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
@@ -526,6 +594,80 @@ pub async fn permissions(
         }
     }
 
+    // What the declared roles are granted on (ADR-0005). Objects the way the
+    // foreign-key targets are asked — every named one, so absent and
+    // invisible both land as a gap — and schemas through `sys.schemas`, so a
+    // schema that does not exist yet is unasked rather than reported.
+    let mut granted_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut granted_schemas: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if let Some(targets) = granted {
+        let granted_perms: Vec<&str> = REQUIRED
+            .iter()
+            .filter(|r| matches!(r.needed, Needed::Granted))
+            .map(|r| r.name)
+            .collect();
+        if !targets.objects.is_empty() {
+            let mut params: Vec<Param<'_>> = Vec::new();
+            let mut perm_slots = Vec::new();
+            for p in &granted_perms {
+                params.push(Param::from(*p));
+                perm_slots.push(format!("(@P{})", params.len()));
+            }
+            let mut object_slots = Vec::new();
+            for t in &targets.objects {
+                params.push(Param::from(t.as_str()));
+                object_slots.push(format!("(@P{})", params.len()));
+            }
+            let sql = format!(
+                "SELECT o.n AS [object], p.n AS permission, \
+                 HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
+                 FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n);",
+                object_slots.join(", "),
+                perm_slots.join(", ")
+            );
+            for row in &conn.query_with(&sql, &params).await? {
+                let object: &str = get(row, "object")?;
+                let permission: &str = get(row, "permission")?;
+                let held: i32 = row.try_get("held")?.unwrap_or(0);
+                let entry = granted_objects.entry(object.to_owned()).or_default();
+                if held != 0 {
+                    entry.insert(permission.trim().to_ascii_uppercase());
+                }
+            }
+        }
+        if !targets.schemas.is_empty() {
+            let mut params: Vec<Param<'_>> = Vec::new();
+            let mut perm_slots = Vec::new();
+            for p in &granted_perms {
+                params.push(Param::from(*p));
+                perm_slots.push(format!("(@P{})", params.len()));
+            }
+            let mut schema_slots = Vec::new();
+            for s in &targets.schemas {
+                params.push(Param::from(s.as_str()));
+                schema_slots.push(format!("(@P{})", params.len()));
+            }
+            let sql = format!(
+                "SELECT w.n AS [schema], p.n AS permission, \
+                 HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', p.n) AS held \
+                 FROM (VALUES {}) AS w(n) \
+                 JOIN sys.schemas AS s ON s.name = w.n \
+                 CROSS JOIN (VALUES {}) AS p(n);",
+                schema_slots.join(", "),
+                perm_slots.join(", ")
+            );
+            for row in &conn.query_with(&sql, &params).await? {
+                let schema: &str = get(row, "schema")?;
+                let permission: &str = get(row, "permission")?;
+                let held: i32 = row.try_get("held")?.unwrap_or(0);
+                let entry = granted_schemas.entry(schema.to_owned()).or_default();
+                if held != 0 {
+                    entry.insert(permission.trim().to_ascii_uppercase());
+                }
+            }
+        }
+    }
+
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
@@ -547,6 +689,9 @@ pub async fn permissions(
         ledger_schema,
         ledger_objects,
         referenced_objects,
+        roles_declared: granted.is_some(),
+        granted_objects,
+        granted_schemas,
     })
 }
 
@@ -640,6 +785,38 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                             permission: r.name,
                             why: r.why,
                             securable: Securable::Object(object.clone()),
+                        });
+                    }
+                }
+            }
+            // Only when a role is declared: the permission is security-shaped,
+            // and asking an estate with no role to hold it is the over-demand
+            // this list refuses everywhere else.
+            Needed::RoleAdmin => {
+                if held.roles_declared && !held.database.contains(r.name) {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Database,
+                    });
+                }
+            }
+            Needed::Granted => {
+                for (object, granted) in &held.granted_objects {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Object(object.clone()),
+                        });
+                    }
+                }
+                for (schema, granted) in &held.granted_schemas {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Schema(schema.clone()),
                         });
                     }
                 }
@@ -773,7 +950,51 @@ mod tests {
                 .collect(),
             ledger_objects: BTreeMap::new(),
             referenced_objects: BTreeMap::new(),
+            roles_declared: false,
+            granted_objects: BTreeMap::new(),
+            granted_schemas: BTreeMap::new(),
         }
+    }
+
+    /// The role permissions are asked for only of a project that declares a
+    /// role (ADR-0005): `ALTER ANY ROLE` is security-shaped, and demanding it
+    /// of every estate would be the over-demand this list refuses elsewhere.
+    #[test]
+    fn role_permissions_are_demanded_only_when_a_role_is_declared() {
+        let mut held = everything(&["app"]);
+        assert!(missing(&held).is_empty());
+        held.roles_declared = true;
+        let gaps = missing(&held);
+        let names: Vec<&str> = gaps.iter().map(|g| g.permission).collect();
+        assert_eq!(names, ["CREATE ROLE", "ALTER ANY ROLE"], "{gaps:?}");
+        assert!(gaps.iter().all(|g| g.securable == Securable::Database));
+        held.database.insert("CREATE ROLE".into());
+        held.database.insert("ALTER ANY ROLE".into());
+        assert!(missing(&held).is_empty());
+    }
+
+    /// A `GRANT` is authorized on the securable itself, which `ALTER` on the
+    /// schema does not cover: the gap is reported at the object or the schema
+    /// the role is granted on, never on the database.
+    #[test]
+    fn a_grant_target_without_control_is_a_gap_on_that_securable() {
+        let mut held = everything(&["app"]);
+        held.roles_declared = true;
+        held.database.insert("CREATE ROLE".into());
+        held.database.insert("ALTER ANY ROLE".into());
+        held.granted_objects
+            .insert("app.customer".into(), BTreeSet::new());
+        held.granted_schemas
+            .insert("app".into(), ["CONTROL".to_owned()].into_iter().collect());
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "CONTROL");
+        assert_eq!(gaps[0].securable, Securable::Object("app.customer".into()));
+        held.granted_objects.insert(
+            "app.customer".into(),
+            ["CONTROL".to_owned()].into_iter().collect(),
+        );
+        assert!(missing(&held).is_empty());
     }
 
     /// The same holdings, but with the ledger tables present and carrying
@@ -958,8 +1179,11 @@ mod tests {
         assert!(alter.why.contains("most"), "{}", alter.why);
         assert!(!alter.why.contains("every"), "{}", alter.why);
         assert!(
-            !REQUIRED.iter().any(|r| r.name == "CONTROL"),
-            "CONTROL is not demanded; see the note above `Held`"
+            !REQUIRED
+                .iter()
+                .any(|r| r.name == "CONTROL" && !matches!(r.needed, Needed::Granted)),
+            "CONTROL is demanded only on the securables a declared role is granted on; see the \
+             note above `Held`"
         );
     }
 
@@ -1074,6 +1298,9 @@ mod tests {
     fn only_the_three_module_kinds_that_need_a_create_have_one() {
         let creates: Vec<&str> = REQUIRED
             .iter()
+            // `CREATE ROLE` is a role requirement, switched on by the
+            // declarations (ADR-0005), not a module kind.
+            .filter(|r| matches!(r.needed, Needed::Database))
             .map(|r| r.name)
             .filter(|n| n.starts_with("CREATE "))
             .collect();
@@ -1152,10 +1379,21 @@ mod tests {
             ledger_schema: BTreeSet::new(),
             ledger_objects: BTreeMap::new(),
             referenced_objects: BTreeMap::new(),
+            roles_declared: false,
+            granted_objects: BTreeMap::new(),
+            granted_schemas: BTreeMap::new(),
         };
+        // Not the ones that depend on what the project declares: no foreign
+        // key out of the managed schemas, and no role, means none of those
+        // are asked about at all.
         let applicable = REQUIRED
             .iter()
-            .filter(|r| !matches!(r.needed, Needed::Referenced))
+            .filter(|r| {
+                !matches!(
+                    r.needed,
+                    Needed::Referenced | Needed::RoleAdmin | Needed::Granted
+                )
+            })
             .count();
         assert_eq!(missing(&held).len(), applicable);
     }
