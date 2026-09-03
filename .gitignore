@@ -9,3 +9,7 @@ target/
 # Tool output
 /plan.json
 /plan.sql
+
+# Bytecode from running scripts/*.py locally
+__pycache__/
+*.pyc
