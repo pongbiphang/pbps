@@ -67,4 +67,6 @@ SKIP=()
 if [ "$(uname -s)" = Darwin ]; then
     SKIP=(--skip not_utf8 --skip non_utf8)
 fi
-exec cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 "${SKIP[@]}" "$@"
+# `${SKIP[@]+"${SKIP[@]}"}`, not `"${SKIP[@]}"`: under `set -u` an empty array
+# is an unbound variable in bash before 4.4, and macOS ships 3.2.
+exec cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 ${SKIP[@]+"${SKIP[@]}"} "$@"
