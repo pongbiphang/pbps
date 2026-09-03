@@ -1018,19 +1018,27 @@ fn cmd_pull(
     // The same line `validate` draws, at the moment the block is written
     // rather than on the next run: a table this size is somebody's business
     // table, and every plan from here on compares it row by row.
-    let max_rows = project
-        .config
-        .max_data_rows
-        .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS);
-    for (name, table) in &pulled.schema.tables {
-        if let Some(d) = &table.data
-            && d.rows.len() > max_rows
-        {
-            eprintln!(
-                "warning: {name}: {} rows is above `max_data_rows` ({max_rows}) — this does not \
-                 look like reference data",
-                d.rows.len()
-            );
+    //
+    // Read off the `data.max-rows` rule, not off `max_data_rows`: that field
+    // is only the rule's default parameter (ADR-0008), so a project that
+    // raises the threshold or turns the rule off would otherwise be warned
+    // here about files `validate` accepts, and one that lowers it would be
+    // handed files the next `validate` rejects (DECISIONS 111). A problem in
+    // the block itself is `validate`'s to report; the rule is read as the
+    // project wrote it either way.
+    if let Some(max_rows) =
+        data_row_limit(&project.config.policies(), &policy_context(project, true))
+    {
+        for (name, table) in &pulled.schema.tables {
+            if let Some(d) = &table.data
+                && d.rows.len() > max_rows
+            {
+                eprintln!(
+                    "warning: {name}: {} rows is above `data.max-rows` ({max_rows}) — this does \
+                     not look like reference data",
+                    d.rows.len()
+                );
+            }
         }
     }
 
@@ -1139,6 +1147,19 @@ fn cmd_pull(
     }
     println!("Next: commit these files, then `pbps plan` should report no changes.");
     Ok(())
+}
+
+/// The row count above which a `data:` block is worth a word, or `None` when
+/// the project has turned the rule off.
+///
+/// One reading of `data.max-rows` for `pull` and for `validate` alike:
+/// `max_data_rows` is only the rule's default parameter, so asking the field
+/// instead of the rule made `pull` warn about files `validate` accepts, and
+/// (with a lowered threshold) hand over files the next `validate` rejects.
+fn data_row_limit(policies: &pbps_policy::Policies, ctx: &pbps_policy::Context) -> Option<usize> {
+    let rule = policies.effective(pbps_policy::rules::DATA_MAX_ROWS);
+    rule.severity?;
+    Some(rule.config.rows.unwrap_or(ctx.max_rows))
 }
 
 /// What the policy rules need besides the block (ADR-0008).
@@ -2415,6 +2436,63 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `pull` draws its size line from the rule, not from the field that is
+    /// only the rule's default: raising the threshold, lowering it and
+    /// turning the rule off each has to reach `pull`, or it warns about files
+    /// `validate` accepts and stays quiet about files it rejects.
+    #[test]
+    fn the_pull_size_warning_follows_the_data_max_rows_rule() {
+        let ctx = pbps_policy::Context {
+            now: 0,
+            max_rows: 500,
+            connected: true,
+            only: None,
+        };
+        let policies = |json: &str| -> pbps_policy::Policies {
+            let p: pbps_policy::Policies = serde_json::from_str(json).unwrap();
+            assert!(p.check().is_empty(), "{json}");
+            p
+        };
+
+        // No block: the project's own default, which is what `ctx` carries.
+        assert_eq!(
+            data_row_limit(&pbps_policy::Policies::default(), &ctx),
+            Some(500)
+        );
+        // The rule's parameter wins over that default, up and down alike.
+        assert_eq!(
+            data_row_limit(
+                &policies(r#"{"rules": {"data.max-rows": {"rows": 5000}}}"#),
+                &ctx
+            ),
+            Some(5000)
+        );
+        assert_eq!(
+            data_row_limit(
+                &policies(r#"{"rules": {"data.max-rows": {"rows": 10}}}"#),
+                &ctx
+            ),
+            Some(10)
+        );
+        // Off is off: no threshold, so no line.
+        assert_eq!(
+            data_row_limit(&policies(r#"{"rules": {"data.max-rows": false}}"#), &ctx),
+            None
+        );
+        assert_eq!(
+            data_row_limit(&policies(r#"{"rules": {"data.max-rows": "off"}}"#), &ctx),
+            None
+        );
+        // A severity the project chose is still on, and keeps the default.
+        assert_eq!(
+            data_row_limit(
+                &policies(r#"{"rules": {"data.max-rows": {"severity": "error"}}}"#),
+                &ctx
+            ),
+            Some(500)
+        );
+    }
     use super::*;
 
     #[test]

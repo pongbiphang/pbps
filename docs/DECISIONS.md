@@ -883,3 +883,27 @@ SPEC is in sync with all of these.
     the last plan, was skipped by the differ, built nothing, and recorded
     the empty state as the whole one. Every declared table and role needs
     its uid, and the ones without are named.
+110. **A permission the declarations cannot express stops every command that
+    records a state, not only `plan --db`.** 95 carried a managed role's
+    `WITH GRANT OPTION`, and 97 and 105 the column-level, `DENY` and
+    database-level grants, beside the comparison rather than inside it, and
+    `plan --db` refused to plan over them. `snapshot` and `baseline` still
+    wrote the schema down without them, so a privilege change could be
+    recorded as a clean state that the very next `verify` reported as drift.
+    All three now stop at one guard. `snapshot --force` is not an escape: it
+    answers "record a state that differs from the recorded one", and this is
+    "record a state pbps cannot express at all", which has no right answer to
+    force.
+    `apply` stops at the same guard, before statement one rather than at its
+    closing snapshot: the baseline checksum cannot see such a permission
+    either, so one that appeared between plan and apply arrives as a clean
+    baseline and would be written down by the entry that closes the
+    deployment — and a refusal after the statements committed would be the
+    worse failure of the two.
+111. **`pull` draws its row-count line from the `data.max-rows` rule, not
+    from `max_data_rows`.** That field is only the rule's default parameter
+    (ADR-0008). Read directly, a project that raised the threshold or turned
+    the rule off was warned by `pull` about files `validate` accepts, and one
+    that lowered it was handed files the next `validate` rejects — the two
+    commands disagreeing about the same declaration, which is the failure
+    ADR-0008 exists to remove.

@@ -491,6 +491,32 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
     }
 }
 
+/// Refuses a command that would record or plan over a live permission the
+/// declarations cannot hold.
+///
+/// A managed role's grant `WITH GRANT OPTION`, a column-level grant, a `DENY`:
+/// `managed_state` leaves each out of `scoped.schema` and names it here
+/// instead (DECISIONS 95, 97, 105). A state recorded from that schema is one
+/// `verify` reports as drift the moment it is written, and a plan built on it
+/// restates the plain `GRANT` on every run while the engine keeps the option
+/// — so `snapshot`, `baseline` and `plan --db` all stop here rather than
+/// write down a state that can never be clean (DECISIONS 110).
+///
+/// `snapshot --force` is not an escape. It answers "record a state that
+/// differs from the recorded one", which is a different question from
+/// "record a state pbps cannot express at all"; the second has no right
+/// answer to force.
+fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> anyhow::Result<()> {
+    if scoped.unexpressible.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` holds what the declarations cannot express:\n  {}\n\
+         Resolve it by hand, then {then}.",
+        scoped.unexpressible.join("\n  ")
+    );
+}
+
 /// `pbps verify` — the drift check (SPEC §8.2).
 ///
 /// The comparison is scoped and identified by the **recorded** state's identity
@@ -723,6 +749,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         )
         .await?;
         report_missing(&scoped);
+        refuse_unexpressible(&scoped, &target.label, "snapshot again")?;
 
         // Comparing against the recorded state is the whole guard. A snapshot
         // that overwrites a state it differs from is exactly "somebody SSHed in
@@ -785,6 +812,7 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
         )
         .await?;
         report_missing(&scoped);
+        refuse_unexpressible(&scoped, &target.label, "baseline again")?;
 
         let mut snapshot = with_provenance(
             project.root(),
@@ -1142,17 +1170,7 @@ pub fn cmd_plan_db(
             &pbps_model::data::read_scopes(&recorded_data, &declared_data),
         )
         .await?;
-        // A managed role's grant WITH GRANT OPTION is not something to plan
-        // over either: left out of the live set, the differ would restate the
-        // plain GRANT on every plan and the engine would keep the option.
-        if !managed.scoped.unexpressible.is_empty() {
-            bail!(
-                "`{}` holds what the declarations cannot express:\n  {}\n\
-                 Resolve it by hand, then plan again.",
-                target.label,
-                managed.scoped.unexpressible.join("\n  ")
-            );
-        }
+        refuse_unexpressible(&managed.scoped, &target.label, "plan again")?;
         // A declared name standing on an object introspection cannot express is
         // not something to plan around. It is absent from the scoped schema, so
         // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`
@@ -1665,6 +1683,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         );
     }
 
+    // And the same guard the recording commands use (110): a permission the
+    // declarations cannot hold is invisible to the checksum above, so it
+    // reaches here as a clean baseline, and the closing snapshot would write
+    // the environment down without it. Refused before statement one, where a
+    // refusal still costs nothing.
+    refuse_unexpressible(&scoped, &target.label, "apply again")?;
+
     preflight(conn, dialect, plan, rename_targets).await?;
 
     println!("Applying {} statement(s)...", statements.len());
@@ -1791,6 +1816,11 @@ async fn apply_staged_under_lock(
                 entry.id
             );
         }
+        // Nor can it see a permission the declarations cannot hold, for the
+        // same reason: it is beside the comparison, not in it (110). A
+        // resume that ran on would close the deployment with a snapshot
+        // written without it.
+        refuse_unexpressible(&scoped, &target.label, "resume again")?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
@@ -1854,6 +1884,7 @@ async fn apply_staged_under_lock(
                 plan.baseline.checksum
             );
         }
+        refuse_unexpressible(&scoped, &target.label, "apply again")?;
         // Only on a fresh start. The probes name objects as the catalog had
         // them before the first statement, and after a partial run some of
         // those names have already moved — a probe answered about the wrong
@@ -2304,6 +2335,30 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
 mod tests {
     use super::*;
     use pbps_model::{DataMode, DataScope};
+
+    /// A permission the declarations cannot hold stops every command that
+    /// would write the state down, not just the one that plans over it: a
+    /// state recorded without it is one `verify` calls drift on sight.
+    #[test]
+    fn a_state_that_cannot_be_expressed_is_not_recorded_by_any_command() {
+        // The real constructor, so the empty case is the one a clean
+        // database actually produces.
+        let empty = || pbps_diff::scope(&Schema::default(), &IdsFile::default(), &BTreeSet::new());
+        for then in ["plan again", "snapshot again", "baseline again"] {
+            refuse_unexpressible(&empty(), "prod", then).expect("nothing to refuse");
+        }
+
+        let mut held = empty();
+        held.unexpressible
+            .push("role app_reader holds SELECT ON dbo.t(secret)".to_owned());
+        for then in ["plan again", "snapshot again", "baseline again"] {
+            let e = refuse_unexpressible(&held, "prod", then).expect_err(then);
+            let msg = format!("{e:#}");
+            assert!(msg.contains("app_reader"), "{msg}");
+            // The remedy names the command the operator actually ran.
+            assert!(msg.contains(then), "{msg}");
+        }
+    }
 
     /// A renamed table's declaration is found under the name the database
     /// still has; an unrenamed one, and one the plan creates, stay put.
