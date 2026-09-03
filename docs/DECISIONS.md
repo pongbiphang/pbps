@@ -907,3 +907,28 @@ SPEC is in sync with all of these.
     that lowered it was handed files the next `validate` rejects — the two
     commands disagreeing about the same declaration, which is the failure
     ADR-0008 exists to remove.
+112. **The pre-delete probe counts the rows a plan puts *onto* the parent, not
+    only the ones already there.** 71 built the probe out of `COUNT(*) ...
+    WHERE fkcol = @key` and excluded the rows this plan moves away. The
+    mirror image was missing: inserts and updates both run before the deletes
+    (`order_key`), so a child this plan *adds* to the parent — an insert, or
+    an update moving a stored row onto it — is invisible to a count taken
+    before statement one. `ON DELETE CASCADE` then takes the new row straight
+    back out, or `SET NULL` unpicks its reference, the apply succeeds and
+    records the result, and the next plan proposes the same row again: the
+    declarations and the database never converge, and nothing says so.
+    Counted now, with the engine deciding whether the arriving value and the
+    deleted key are one key — the same question `updated` already asks it, so
+    `OLD` arriving on `old` counts under a case-insensitive collation. An
+    updated row is guarded against being counted twice: only one not already
+    sitting on the key is arriving. A column an insert omits is not counted:
+    its value is the column's own default, which lives in the catalog and not
+    in the plan.
+
+    The other probes were swept for the same blindness and need nothing. The
+    orderings put every one of them either before the row changes
+    (`AlterColumnNullability`, `AlterColumnType`) or after them
+    (`AddUnique`, `SetPrimaryKey`, `AddForeignKey`) with a *loud* failure —
+    the engine refuses inside the transaction and the plan rolls back. The
+    delete is the one whose failure is silent, which is why it is the one
+    that has to look forward.

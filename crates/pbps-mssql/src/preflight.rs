@@ -92,6 +92,33 @@ struct Moved {
     /// CASCADE` the engine would then delete it silently. Whether two
     /// spellings are one key is the engine's call, so the probe asks it.
     updated: BTreeMap<String, BTreeMap<RowKey, Option<String>>>,
+    /// The mirror of [`Moved::updated`]: column -> the rows this plan puts
+    /// *onto* a parent, with the value each is set to.
+    ///
+    /// `COUNT(*) ... WHERE fkcol = @key` sees only what is stored, and a row
+    /// arriving on the parent is either not in the table yet (an insert) or
+    /// stored somewhere else (an update). Both run before the deletes
+    /// (`order_key`), so the probe passes, the insert or update commits, and
+    /// then `ON DELETE CASCADE` takes the row straight back out — or `SET
+    /// NULL` unpicks its reference — with the apply succeeding and recording
+    /// the result, so the next plan proposes the same row again. Counted
+    /// here instead, with the engine deciding whether the value and the
+    /// deleted key are one key, exactly as it decides for `updated`.
+    ///
+    /// A column an insert omits is not here: its value is the column's own
+    /// default, which lives in the catalog and not in the plan.
+    arriving: BTreeMap<String, BTreeMap<RowKey, Arrival>>,
+}
+
+/// Where a row arriving on a parent key comes from.
+///
+/// The two need different counting: an insert has no stored row, while an
+/// update has one that the base `COUNT(*)` may already have counted — a row
+/// re-spelled onto the key it is already on must not be reported twice.
+#[derive(Debug)]
+enum Arrival {
+    Inserted(String),
+    Updated(String),
 }
 
 impl AsStored {
@@ -125,11 +152,43 @@ impl AsStored {
                             Cell::Value(Value::Bool(b)) => Some(b.to_string()),
                             Cell::Value(Value::Null) | Cell::Default(_) => None,
                         };
+                        if let Some(value) = value.clone() {
+                            moved
+                                .arriving
+                                .entry(column.clone())
+                                .or_default()
+                                .insert(key.clone(), Arrival::Updated(value));
+                        }
                         moved
                             .updated
                             .entry(column.clone())
                             .or_default()
                             .insert(key.clone(), value);
+                    }
+                }
+                Change::InsertRow {
+                    table,
+                    key_column,
+                    key,
+                    row,
+                    ..
+                } => {
+                    let moved = this.moved.entry(table.clone()).or_default();
+                    moved.key_column = key_column.clone();
+                    for (column, value) in &row.0 {
+                        let text = match value {
+                            Value::Text(t) => t.clone(),
+                            Value::Int(i) => i.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            // A NULL foreign key references nothing, so no
+                            // delete can cascade into this row.
+                            Value::Null => continue,
+                        };
+                        moved
+                            .arriving
+                            .entry(column.clone())
+                            .or_default()
+                            .insert(key.clone(), Arrival::Inserted(text));
                     }
                 }
                 Change::DeleteRow {
@@ -166,10 +225,7 @@ impl AsStored {
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
-                // A row change moves no name. It does *use* one — the table it
-                // writes to — but that table is already translated through
-                // `table()` below like every other name in a probe.
-                | Change::InsertRow { .. }
+                // Setting the mode emits nothing and names nothing.
                 | Change::SetDataMode { .. }
                 // A role is a principal, not an object: nothing here names a
                 // table or a column, and nothing here moves a name a probe
@@ -445,6 +501,7 @@ fn delete_probe(
     // column, an updated row only for the columns its update sets. A row
     // updated elsewhere still points at the parent, and is counted.
     let mut exclusions = Vec::new();
+    let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
         let Some(stored_child) = names.table(child) else {
             continue;
@@ -495,6 +552,59 @@ fn delete_probe(
                 literal(&stored_column.name)
             ));
         }
+        // And, per column, the rows this plan puts *onto* the parent, which
+        // the count above cannot see (see [`Moved::arriving`]). Terms added
+        // to the count rather than clauses narrowing it, so each is a whole
+        // parenthesised expression. `rc.name` is the referenced column, which
+        // only the catalog query knows; everything else is settled here.
+        let child_sql = qualified(&stored_child)?;
+        let mut arrivals_per_column = Vec::new();
+        for (column, rows) in &moved.arriving {
+            let Some(stored_column) = names.column(&child.column(column)) else {
+                continue;
+            };
+            let column_sql = quote(&stored_column.name)?;
+            let mut pieces = Vec::new();
+            for (child_key, arrival) in rows {
+                let value = match arrival {
+                    Arrival::Inserted(v) => {
+                        // Nothing stored to double-count: the row is either
+                        // arriving on the deleted key or it is not.
+                        pieces.push(literal(&format!(
+                            " + (CASE WHEN EXISTS (SELECT 1 FROM {parent} WHERE "
+                        )));
+                        v
+                    }
+                    Arrival::Updated(v) => {
+                        // The row exists, so it may already be inside the
+                        // count: only one that is *not* on the key now is
+                        // arriving. A NULL foreign key is not on it either,
+                        // and `NULL <> @key` is unknown, so it is named.
+                        pieces.push(literal(&format!(
+                            " + (SELECT COUNT(*) FROM {child_sql} WHERE {key_sql} = {} AND \
+                             ({column_sql} IS NULL OR {column_sql} <> @key) AND EXISTS (SELECT 1 \
+                             FROM {parent} WHERE ",
+                            literal(child_key.as_str())
+                        )));
+                        v
+                    }
+                };
+                pieces.push("QUOTENAME(rc.name)".to_owned());
+                pieces.push(literal(&format!(" = {} AND ", literal(value))));
+                pieces.push("QUOTENAME(rc.name)".to_owned());
+                pieces.push(literal(match arrival {
+                    Arrival::Inserted(_) => " = @key) THEN 1 ELSE 0 END)",
+                    Arrival::Updated(_) => " = @key))",
+                }));
+            }
+            if !pieces.is_empty() {
+                arrivals_per_column.push(format!(
+                    "WHEN c.name = {} THEN {}",
+                    literal(&stored_column.name),
+                    pieces.join(" + ")
+                ));
+            }
+        }
         let otherwise = deleted.clone().unwrap_or_else(|| "N''".to_owned());
         let clause = if per_column.is_empty() {
             otherwise
@@ -506,11 +616,24 @@ fn delete_probe(
             literal(&stored_child.schema),
             literal(&stored_child.name),
         ));
+        if !arrivals_per_column.is_empty() {
+            arrivals.push(format!(
+                "WHEN s.name = {} AND t.name = {} THEN CASE {} ELSE N'' END",
+                literal(&stored_child.schema),
+                literal(&stored_child.name),
+                arrivals_per_column.join(" ")
+            ));
+        }
     }
     let exclusion = if exclusions.is_empty() {
         "N''".to_owned()
     } else {
         format!("CASE {} ELSE N'' END", exclusions.join(" "))
+    };
+    let arrival = if arrivals.is_empty() {
+        "N''".to_owned()
+    } else {
+        format!("CASE {} ELSE N'' END", arrivals.join(" "))
     };
 
     Ok(Probe::new(
@@ -522,7 +645,7 @@ fn delete_probe(
             "DECLARE @n int = 0, @sql nvarchar(max);\n\
              SELECT @sql = STRING_AGG(CONVERT(nvarchar(max),\n\
                  N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
-                 + N' WHERE ' + QUOTENAME(c.name) + N' = @key' + {exclusion} + N');'), N' ')\n\
+                 + N' WHERE ' + QUOTENAME(c.name) + N' = @key' + {exclusion} + N')' + {arrival} + N';'), N' ')\n\
                FROM sys.foreign_keys fk\n\
                JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n\
                JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\

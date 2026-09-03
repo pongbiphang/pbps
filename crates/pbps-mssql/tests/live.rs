@@ -2246,6 +2246,111 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .unwrap();
     assert_eq!(n, 1, "a row updated elsewhere still points at `old`");
 
+    // Rows this plan puts *onto* `old`. The count is of what is stored, and
+    // inserts and updates both run before the deletes, so neither is visible
+    // to a probe that only looks at the table: with ON DELETE CASCADE the
+    // engine would take the new row straight back out, the apply would
+    // succeed, and the next plan would propose it all over again.
+    let insert_onto = |code: &str| pbps_model::ChangeSet {
+        changes: vec![
+            moved.changes[0].clone(),
+            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                identity_key: true,
+                key: RowKey::from("9"),
+                row: [("status_code".to_owned(), text(code))]
+                    .into_iter()
+                    .collect::<Row>(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    for (cs, want, why) in [
+        (
+            insert_onto("old"),
+            1,
+            "an inserted child pointing at `old` is counted, though it is not there yet",
+        ),
+        // The engine decides which spellings are one key here too.
+        (
+            insert_onto("OLD"),
+            1,
+            "`OLD` is `old` to the engine: the insert lands on the row being deleted",
+        ),
+        (
+            insert_onto("new"),
+            0,
+            "an insert onto another parent blocks nothing",
+        ),
+    ] {
+        let probe = probe_for(&cs);
+        let n: i32 = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, want, "{why}");
+    }
+
+    // The same shape through an update: a stored row pointing elsewhere that
+    // this plan moves *onto* `old`. Found by sweeping the insert case, not
+    // reported.
+    db.conn
+        .execute(
+            "SET IDENTITY_INSERT dbo.kind ON;\n\
+             INSERT INTO dbo.kind (id, status_code) VALUES (42, 'new');\n\
+             SET IDENTITY_INSERT dbo.kind OFF;",
+        )
+        .await
+        .expect("a child pointing somewhere else");
+    let update_onto = |code: &str| pbps_model::ChangeSet {
+        changes: vec![
+            moved.changes[0].clone(),
+            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                key: RowKey::from("42"),
+                columns: [(
+                    "status_code".to_owned(),
+                    (
+                        pbps_model::Cell::Value(text("new")),
+                        pbps_model::Cell::Value(text(code)),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    for (cs, want, why) in [
+        (
+            update_onto("old"),
+            1,
+            "a row moved onto `old` is counted, though it is stored elsewhere",
+        ),
+        (
+            update_onto("rogue"),
+            0,
+            "a row moved onto another parent blocks nothing",
+        ),
+    ] {
+        let probe = probe_for(&cs);
+        let n: i32 = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, want, "{why}");
+    }
+
     // A table that has lost its key is unreadable, not empty.
     db.conn
         .execute("ALTER TABLE dbo.kind DROP CONSTRAINT fk_kind_status; DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.status') AND type = 'PK'); EXEC('ALTER TABLE dbo.status DROP CONSTRAINT ' + @pk);")
