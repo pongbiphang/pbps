@@ -11,7 +11,15 @@ NAME=pbps-test-mssql
 # that out.
 PORT=${PBPS_TEST_PORT:-14330}
 PASSWORD='Pbps!Test12345'
-IMAGE=mcr.microsoft.com/mssql/server:2025-latest
+# Pinned by digest, and the same one CI uses: SQL Server 2025 RTM, 17.0.4075.5,
+# image built 2026-07-23. A floating tag would let the engine under test change
+# between two runs of the same commit, which is the one thing a suite that
+# exists to answer "what does the engine actually do" cannot afford.
+#
+# An existing `pbps-test-mssql` is reused as-is, so a container started from an
+# earlier image keeps running; `docker rm -f pbps-test-mssql` to move it onto
+# this digest.
+IMAGE=mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -31,13 +39,12 @@ done
 export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
 
 # The `--dev docker://` path starts a *second*, throwaway server of its own, so
-# it is opt-in rather than always-on: naming an image here is what enables it.
-# Set locally and deliberately left out of CI's live job, which already runs one
-# SQL Server as a service container — a second on the same runner is a memory
-# and flakiness cost that belongs in a CI decision of its own, not at the tail of
-# a feature branch.
+# it stays opt-in: naming an image here is what enables it. CI covers it in a
+# job of its own (`dev-rehearsal`) rather than alongside the service container,
+# for the same reason it is opt-in here — two engines on one machine is a cost
+# worth paying deliberately.
 #
-# It is worth having at all because that path had no automated coverage
+# It is worth covering at all because that path had no automated coverage
 # whatsoever, which is how `Container::start` shipped removing the container it
 # had just returned: `plan --dev docker://...` failed with "connection refused"
 # for every user, and no test ran it.
