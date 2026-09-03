@@ -131,49 +131,25 @@ pub fn cmd_explain(
     // when JSON was asked for: everything below can fail, and a failure that
     // escaped early left stdout empty — so a consumer got the converter's
     // generic "produced no output" instead of a report naming the bad plan.
-    let plan = match read_plan(path) {
-        Ok(p) => p,
-        Err(e) => {
-            if json {
-                // Unanswerable, not a finding: `explain` was asked what this
-                // plan does and could not read it, so it did not answer.
-                let report = output::Report::plain(
-                    "explain",
-                    vec![
-                        output::Finding::error("plan.unreadable", format!("{e:#}")).at(path, None),
-                    ],
-                )
-                .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
-            return Err(e);
-        }
-    };
+    // Unanswerable, not a finding: `explain` was asked what this plan does and
+    // could not read it, so it did not answer.
+    let plan =
+        output::or_unanswerable_at("explain", json, "plan.unreadable", path, read_plan(path))?;
     // The dialect comes from the *plan*, not from a pbps.yml. That is what lets
     // this command run in a directory that has no project at all — the reviewer
     // may have been handed nothing but the file. It is also more honest where a
     // project does exist: a plan computed for one engine must be explained as
     // that engine, not as whatever the local config happens to select.
-    let dialect = match dialect_of(&plan) {
-        Ok(d) => d,
-        Err(e) => {
-            // Same envelope as an unreadable plan: this build cannot explain
-            // the file, so it did not answer. Without this a plan naming an
-            // engine this binary has no dialect for left stdout empty.
-            if json {
-                let report = output::Report::plain(
-                    "explain",
-                    vec![
-                        output::Finding::error("plan.unsupported-dialect", format!("{e:#}"))
-                            .at(path, None),
-                    ],
-                )
-                .unanswerable();
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
-            return Err(e);
-        }
-    };
+    // Same envelope as an unreadable plan: this build cannot explain the file,
+    // so it did not answer. Without this a plan naming an engine this binary has
+    // no dialect for left stdout empty.
+    let dialect = output::or_unanswerable_at(
+        "explain",
+        json,
+        "plan.unsupported-dialect",
+        path,
+        dialect_of(&plan),
+    )?;
 
     // The third failure the envelope has to survive, and the least obvious: a
     // plan that reads and deserializes fine can still carry a typed change the
