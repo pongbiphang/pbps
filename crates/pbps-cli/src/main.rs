@@ -254,6 +254,11 @@ enum Command {
         /// Overwrite existing declarations and identity file
         #[arg(long)]
         force: bool,
+
+        /// Also declare this table's rows as reference data (`data: exact`);
+        /// repeatable
+        #[arg(long = "data", value_name = "TABLE")]
+        data: Vec<String>,
     },
 
     /// Run a saved plan against the environment it was computed for
@@ -766,9 +771,13 @@ fn run() -> anyhow::Result<()> {
                 reason,
             },
         ),
-        Command::Pull { target, force } => {
+        Command::Pull {
+            target,
+            force,
+            data,
+        } => {
             let target = target.resolve(&project)?;
-            cmd_pull(&project, &target, force)
+            cmd_pull(&project, &target, force, &data)
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
@@ -849,8 +858,22 @@ fn cmd_docs(
 /// database has and the model can express becomes YAML, everything it cannot
 /// express is printed as a warning, and a fresh identity file is minted so the
 /// next `plan` starts from "no changes".
-fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Result<()> {
+fn cmd_pull(
+    project: &Project,
+    target: &db::Target,
+    force: bool,
+    data: &[String],
+) -> anyhow::Result<()> {
     db::require_mssql(project, "pull")?;
+    // Parsed before anything connects: a misspelt table name is a fact about
+    // the command line, and it should not cost a round trip to find out.
+    let data: Vec<TableName> = data
+        .iter()
+        .map(|raw| {
+            raw.parse::<TableName>()
+                .map_err(|e| anyhow::anyhow!("--data {raw}: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let dir = project.schema_dir();
     if !force {
@@ -892,11 +915,51 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
 
     let pulled = db::runtime()?.block_on(async {
         let mut conn = pbps_db::Conn::connect(target.connection()).await?;
-        pbps_mssql::catalog::introspect(&mut conn).await
+        let mut pulled = pbps_mssql::catalog::introspect(&mut conn).await?;
+        // `--data`: the table's rows become a `data: exact` block (ADR-0004),
+        // in the engine's own spelling — which is the spelling a declaration
+        // has to use to compare equal against this database from now on.
+        for name in &data {
+            if !pulled.schema.tables.contains_key(name) {
+                anyhow::bail!("--data {name}: this database has no such table");
+            }
+        }
+        let read: std::collections::BTreeMap<TableName, pbps_model::RowScope> = data
+            .iter()
+            .map(|t| (t.clone(), pbps_model::RowScope::Every))
+            .collect();
+        let rows = pbps_mssql::catalog::read_rows(&mut conn, &pulled.schema, &read).await?;
+        for (name, rows) in rows {
+            if let Some(table) = pulled.schema.tables.get_mut(&name) {
+                table.data = Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    rows,
+                });
+            }
+        }
+        Ok::<_, anyhow::Error>(pulled)
     })?;
 
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
+    }
+    // The same line `validate` draws, at the moment the block is written
+    // rather than on the next run: a table this size is somebody's business
+    // table, and every plan from here on compares it row by row.
+    let max_rows = project
+        .config
+        .max_data_rows
+        .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS);
+    for (name, table) in &pulled.schema.tables {
+        if let Some(d) = &table.data
+            && d.rows.len() > max_rows
+        {
+            eprintln!(
+                "warning: {name}: {} rows is above `max_data_rows` ({max_rows}) — this does not \
+                 look like reference data",
+                d.rows.len()
+            );
+        }
     }
 
     // What pbps cannot manage it still names (ADR-0002): an encrypted module or

@@ -28,10 +28,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Probe};
-use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, TableName, TypeArg};
+use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg};
 
 use crate::emit::qualified;
-use crate::ident::quote;
+use crate::ident::{literal, quote};
 use crate::types;
 
 /// Every probe a plan implies.
@@ -66,6 +66,11 @@ struct AsStored {
     /// Tables this plan creates. They are empty, so nothing in them can violate
     /// anything, and probing them would only produce "invalid object name".
     created: BTreeSet<TableName>,
+    /// The declared rows this plan updates or deletes, by table: the key
+    /// column and the keys. A row the plan itself moves off a parent that is
+    /// going away must not be counted as still pointing at it (see
+    /// [`delete_probe`]).
+    moved: BTreeMap<TableName, (String, BTreeSet<RowKey>)>,
 }
 
 impl AsStored {
@@ -83,6 +88,24 @@ impl AsStored {
                 }
                 Change::CreateTable { name, .. } => {
                     this.created.insert(name.clone());
+                }
+                Change::UpdateRow {
+                    table,
+                    key_column,
+                    key,
+                    ..
+                }
+                | Change::DeleteRow {
+                    table,
+                    key_column,
+                    key,
+                    ..
+                } => {
+                    this.moved
+                        .entry(table.clone())
+                        .or_insert_with(|| (key_column.clone(), BTreeSet::new()))
+                        .1
+                        .insert(key.clone());
                 }
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
@@ -112,8 +135,6 @@ impl AsStored {
                 // writes to — but that table is already translated through
                 // `table()` below like every other name in a probe.
                 | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
                 | Change::SetDataMode { .. } => {}
             }
         }
@@ -310,18 +331,115 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         // Inserting and updating a declared row need no probe: the row's whole
         // content is in the plan, and anything the engine refuses about it
         // rolls the plan back.
-        //
-        // A *delete* does have a hazard worth counting — the rows in other
-        // tables that point at the one going away — and it is deliberately not
-        // here yet: the probe belongs with the connected half of ADR-0004,
-        // beside the drift read-back that gives it something to compare. Until
-        // then a delete is gated as `data-delete` and the foreign key itself
-        // refuses it loudly, which is the same protection, later.
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
         | Change::SetDataMode { .. } => Ok(Vec::new()),
+
+        Change::DeleteRow {
+            table,
+            key_column,
+            key,
+            ..
+        } => match names.column(&table.column(key_column)) {
+            Some(stored) => Ok(vec![delete_probe(table, key, &stored, names)?]),
+            None => Ok(Vec::new()),
+        },
     }
+}
+
+/// The rows in other tables that still point at a row about to be deleted
+/// (ADR-0004).
+///
+/// # Why the referencing tables are found at run time
+///
+/// A probe is built from the plan and nothing else, and the plan does not know
+/// which tables reference this one — nor should it trust the declarations to
+/// say: a foreign key someone added by hand is exactly the one that will refuse
+/// the delete. So the statement asks `sys.foreign_keys` for every column that
+/// references the key column, builds one `COUNT(*)` per referencing table, and
+/// runs the result through `sp_executesql`. Nothing user-written reaches the
+/// dynamic text: the table and column names come from the catalog and go
+/// through `QUOTENAME`, and the key is bound as a parameter.
+///
+/// # Why `ON DELETE CASCADE` counts too
+///
+/// The engine would not refuse such a delete — it would take the child rows
+/// with it, silently. A reference row's delete cascading into an application
+/// table is the disaster the `data-delete` gate exists for, so those rows are
+/// counted and the apply stops the same way.
+///
+/// # Rows the plan itself moves
+///
+/// A child row that this plan updates or deletes is left out of the count. The
+/// ordinary shape is a child moved to a new parent in the same revision, and
+/// the plan runs that update *before* the delete precisely so the engine
+/// accepts it — a probe that ran before the first statement would otherwise
+/// refuse every such plan. The exclusion is by key, not by which column the
+/// update touches, so it can over-exclude a row whose update leaves it still
+/// pointing at the doomed parent; that row is then refused by the engine inside
+/// the transaction, where the rollback is total. Under-counting fails loudly,
+/// which is the direction to be wrong in.
+fn delete_probe(
+    table: &TableName,
+    key: &RowKey,
+    stored: &ColumnRef,
+    names: &AsStored,
+) -> Result<Probe, DialectError> {
+    // Per referencing table, the keys this plan moves in it — spelled as the
+    // literal list the generated `NOT IN` will carry, under the name the
+    // database has for the table now. Doubled quotes, because the fragment is
+    // itself inside a T-SQL string literal.
+    let mut exclusions = Vec::new();
+    for (child, (child_key, keys)) in &names.moved {
+        let Some(stored_child) = names.table(child) else {
+            continue;
+        };
+        let Some(stored_key) = names.column(&child.column(child_key)) else {
+            continue;
+        };
+        let list: Vec<String> = keys.iter().map(|k| literal(k.as_str())).collect();
+        let clause = format!(
+            " AND {} NOT IN ({})",
+            quote(&stored_key.name)?,
+            list.join(", ")
+        );
+        exclusions.push(format!(
+            "WHEN s.name = {} AND t.name = {} THEN {}",
+            literal(&stored_child.schema),
+            literal(&stored_child.name),
+            literal(&clause)
+        ));
+    }
+    let exclusion = if exclusions.is_empty() {
+        "N''".to_owned()
+    } else {
+        format!("CASE {} ELSE N'' END", exclusions.join(" "))
+    };
+
+    Ok(Probe::new(
+        format!(
+            "rows in other tables that still reference {table} row `{key}`, which its delete \
+             would orphan or cascade into"
+        ),
+        format!(
+            "DECLARE @n int = 0, @sql nvarchar(max);\n\
+             SELECT @sql = STRING_AGG(CONVERT(nvarchar(max),\n\
+                 N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
+                 + N' WHERE ' + QUOTENAME(c.name) + N' = @key' + {exclusion} + N');'), N' ')\n\
+               FROM sys.foreign_keys fk\n\
+               JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n\
+               JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
+               JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
+               JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n\
+               JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id\n\
+              WHERE fk.referenced_object_id = OBJECT_ID({}) AND rc.name = {};\n\
+             IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {}, @n = @n OUTPUT;\n\
+             SELECT @n AS n;",
+            literal(&qualified(&stored.table)?),
+            literal(&stored.name),
+            literal(key.as_str())
+        ),
+    ))
 }
 
 /// The table and columns as the database currently names them, or `None` when
@@ -662,6 +780,128 @@ mod tests {
         ] {
             assert!(sql_of(&change).is_empty(), "{change:?}");
         }
+    }
+
+    /// The connected half of ADR-0004: a row delete counts what still points
+    /// at the row, finds the referencing tables in the catalog at run time, and
+    /// leaves out the rows this plan itself moves — under the names the
+    /// database has for them now.
+    #[test]
+    fn deleting_a_row_counts_the_rows_that_still_reference_it() {
+        let cs = plan(vec![Change::DeleteRow {
+            table: tname("dbo.status"),
+            key_column: "code".into(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+        }]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1, "{p:?}");
+        let sql = &p[0].sql;
+        assert!(sql.contains("OBJECT_ID(N'[dbo].[status]')"), "{sql}");
+        assert!(sql.contains("rc.name = N'code'"), "{sql}");
+        assert!(sql.contains("@key = N'old'"), "{sql}");
+        assert!(sql.contains("sys.foreign_keys"), "{sql}");
+        assert!(sql.contains("QUOTENAME"), "{sql}");
+        // The deleted row itself is excluded from a self-referencing count: a
+        // row pointing at itself is gone with the delete, not orphaned by it.
+        assert!(
+            sql.contains(
+                "WHEN s.name = N'dbo' AND t.name = N'status' THEN N' AND [code] NOT IN (N''old'')'"
+            ),
+            "{sql}"
+        );
+        assert!(p[0].description.contains("dbo.status"), "{:?}", p[0]);
+        assert!(p[0].description.contains("`old`"), "{:?}", p[0]);
+    }
+
+    /// The live test's own shape: the child moves to a new parent in the same
+    /// plan, before the delete. Counting it would refuse the one plan the
+    /// ordering was designed to make acceptable.
+    #[test]
+    fn a_child_row_the_plan_moves_is_not_counted_against_the_delete() {
+        let cs = plan(vec![
+            Change::UpdateRow {
+                table: tname("dbo.kind"),
+                key_column: "id".into(),
+                key: RowKey::from("7"),
+                columns: [(
+                    "status_code".to_owned(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Text("old".into())),
+                        pbps_model::Cell::Value(pbps_model::Value::Text("new".into())),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.status"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1, "{p:?}");
+        let sql = &p[0].sql;
+        // Inside the dynamic text, so the quotes are doubled.
+        assert!(
+            sql.contains(
+                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN N' AND [id] NOT IN (N''7'')'"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// The delete names the row's table as the plan does, after any rename in
+    /// the same plan; the catalog still has the old name when the probe runs.
+    #[test]
+    fn a_row_delete_is_probed_under_the_table_name_the_database_still_has() {
+        let cs = plan(vec![
+            Change::RenameTable {
+                uid: uid("t_aaaaaa"),
+                from: tname("dbo.state"),
+                to: tname("dbo.status"),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.status"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].sql.contains("OBJECT_ID(N'[dbo].[state]')"),
+            "{}",
+            p[0].sql
+        );
+        assert!(p[0].description.contains("dbo.status"), "{:?}", p[0]);
+    }
+
+    /// A table this plan creates has no rows for anything to reference; the
+    /// same rule as every other probe.
+    #[test]
+    fn a_row_delete_in_a_table_created_by_this_plan_is_not_probed() {
+        let mut table = pbps_model::Table::default();
+        table
+            .columns
+            .insert("code".into(), pbps_model::Column::new(ty("varchar(20)")));
+        let cs = plan(vec![
+            Change::CreateTable {
+                uid: uid("t_aaaaaa"),
+                name: tname("dbo.status"),
+                table: Box::new(table),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.status"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ]);
+        assert!(probes(&cs).is_empty());
     }
 
     /// Every probe must be a counting query returning one column called `n`;

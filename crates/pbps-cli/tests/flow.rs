@@ -1221,7 +1221,7 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
     let plan = format!(
         r#"{{
-  "version": 2,
+  "version": 3,
   "origin": "database",
   "mode": "{mode}",
   "dialect": "mssql",
@@ -2754,13 +2754,13 @@ fn explain_refuses_a_plan_version_it_does_not_understand() {
 
     // The same plan, one version ahead.
     let raw = std::fs::read_to_string(&plan).unwrap();
-    let bumped = raw.replace("\"version\": 2", "\"version\": 3");
+    let bumped = raw.replace("\"version\": 3", "\"version\": 4");
     assert_ne!(raw, bumped, "the fixture must carry a version to bump");
     std::fs::write(&plan, bumped).unwrap();
 
     let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("version 3"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("version 4"), "{}", stderr(&o));
     assert!(
         !stdout(&o).contains("pbps apply"),
         "a plan this build cannot read must not come with an approval command: {}",
@@ -4907,23 +4907,141 @@ fn an_oversized_data_block_warns_but_still_plans() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 }
 
-/// Until the connected half of ADR-0004 reads rows back from the catalog, a
-/// live target has not observed them — and a plan computed against it would
-/// insert every declared row on every run. Refused, before any connection is
-/// opened, which is why this test needs no server.
+/// The connected half of ADR-0004, end to end through the real binary: the
+/// rows go in with `bootstrap`, come back into the recorded state in the
+/// engine's spelling, a hand-edited row is drift, a re-declared table plans
+/// against what the target holds, and `pull --data` writes the block back.
 #[test]
-fn a_connected_plan_refuses_reference_data_it_cannot_observe() {
-    let d = Demo::new("datadbrefuse");
-    d.table(LOOKUP);
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn reference_data_round_trips_through_a_real_target() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    // A database of its own, so the shared server's `master` never holds the
+    // lookup table, and two runs cannot meet in it.
+    let name = format!("pbps_cli_refdata_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let declared = "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false, default: \"'Unlabelled'\"}
+  rank: {type: int}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    new: {label: New, rank: 1}
+    old: {}
+";
+    let d = Demo::new("refdata-live");
+    d.table(declared);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Bootstrap builds the table and inserts the rows; the state it records
+    // has to hold them, read back.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "no drift right after bootstrap: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // A hand edit to a declared row is drift, named by its key.
+    sql("UPDATE dbo.t SET label = N'Ancient' WHERE code = 'old';");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("row old"), "{}", stdout(&o));
+    // ...and a rogue row in an `exact` table is drift too.
+    sql("INSERT INTO dbo.t (code, label) VALUES ('rogue', N'Rogue');");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert!(stdout(&o).contains("row rogue"), "{}", stdout(&o));
+
+    // A connected plan is computed against what the target holds: the edit is
+    // put back, the rogue row goes behind the gate, and the second apply of
+    // the same declaration is empty rather than a primary-key violation.
+    assert_eq!(
+        code(&d.run(&[
+            "baseline",
+            "--db",
+            &connection,
+            "--reason",
+            "adopt the hand edits"
+        ])),
+        0
+    );
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("row old"),
+        "the edited label is restated: {out}"
+    );
+    assert!(out.contains("row rogue"), "{out}");
+    assert!(out.contains("data-delete"), "{out}");
     let o = d.run(&[
-        "plan",
+        "apply",
         "--db",
-        "Server=localhost,1;Database=x;User Id=u;Password=p;TrustServerCertificate=true",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "data-update,data-delete",
     ]);
-    assert_eq!(code(&o), 1, "{}", stdout(&o));
-    let err = stderr(&o);
-    assert!(err.contains("dbo.t"), "the table must be named: {err}");
-    assert!(err.contains("ADR-0004"), "{err}");
-    // Refused for the right reason, not because the bogus server was tried.
-    assert!(!err.contains("cannot connect"), "{err}");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("No changes"),
+        "the same declaration must plan nothing the second time: {}",
+        stdout(&o)
+    );
+
+    // The block comes back out in the engine's spelling: the default-valued
+    // label is omitted, the explicit one is kept.
+    let fresh = Demo::new("refdata-pull");
+    let o = fresh.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let file = std::fs::read_to_string(fresh.dir.join("schema").join("dbo.t.yml")).unwrap();
+    assert!(file.contains("mode: exact"), "{file}");
+    assert!(file.contains("new: {label: New, rank: 1}"), "{file}");
+    assert!(file.contains("old: {}"), "{file}");
+    assert!(!file.contains("rogue"), "{file}");
+    // And a table this database does not have is refused by name.
+    let o = fresh.run(&["pull", "--db", &connection, "--data", "dbo.nope", "--force"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("dbo.nope"), "{}", stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
 }

@@ -12,9 +12,9 @@ CLAUDE.md's "Development environment"; counts change too often to record here.
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
 
-Declarations may carry reference data (`data:`, ADR-0004): the offline half is
-built, and `max_data_rows` in `pbps.yml` sets when `validate` says a block has
-stopped looking like reference data.
+Declarations may carry reference data (`data:`, ADR-0004), planned offline and
+against a target alike; `max_data_rows` in `pbps.yml` sets when `validate` says
+a block has stopped looking like reference data.
 
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
@@ -22,8 +22,8 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 (`--env`), `schema` (`--kind`), `completions`, `man`. Every read-only command
 takes `--format human|json`; `--no-input` is global.
 
-Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
-`plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
+Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
+(`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
 `status` (`--format json`).
@@ -42,7 +42,9 @@ name its statement declared, the module round-trip through
 readiness check against a **real least-privilege login** created and granted
 inside the test container — `sa` holds `CONTROL` and short-circuits the whole
 permission list, which is how three permission bugs survived the first live
-test) run
+test — and the reference-data path: the DML, the row read-back, drift on rows,
+the pre-delete probe's dynamic SQL, and the binary end to end through
+`bootstrap`, `verify`, `plan --db`, `apply` and `pull --data`) run
 against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken; the engine is
 pinned by digest there and in CI), or set
@@ -94,20 +96,21 @@ failure after it.
 declarative reference data (ADR-0004), roles and grants (ADR-0005), the
 `policies:` block and a wider built-in analyzer catalogue.
 
-Reference data's **offline half is built**: the `data:` block, its `exact` and
+Reference data is **built**, both halves: the `data:` block, its `exact` and
 `ensure` modes, the round trip through `fmt`, the rules `validate` reports, the
 typed row changes with the `data-update` and `data-delete` risk classes, the
-DML, and the ordering — rows after the table and before the constraints, and
-between two tables in the direction their foreign key points. Until the connected
-half exists, `plan --db` refuses a declaration with `data:` blocks rather than
-insert every row on every run. That half (the row read-back into `state_json`
-and the drift comparison, which lifts the refusal; the pre-delete probe;
-`pull --data`) is next; ADR-0004 lists it under "Implementation status". The
-DML itself, including an `IDENTITY` key, is covered by a live test. The ordering was chosen against the
-obvious one — engine count is what every comparison table measures — because a
-second dialect doubles the surface every later feature is built twice for, and
-does it while the first engine still cannot express an organization's own rules.
-The reasoning is in SPEC 12 and open question 9.
+DML and its ordering; and against a target, the row read-back into `state_json`
+under the recorded or declared scope, the row half of the drift comparison, a
+saved plan that carries which rows the recorded state must cover, the
+pre-delete probe counting the rows that still reference the row, and
+`pull --data`. ADR-0004 lists the decisions taken on the way under
+"Implementation status". Next in Phase 4: roles and grants (ADR-0005).
+
+Depth before breadth was chosen against the obvious ordering — engine count is
+what every comparison table measures — because a second dialect doubles the
+surface every later feature is built twice for, and does it while the first
+engine still cannot express an organization's own rules. The reasoning is in
+SPEC 12 and open question 9.
 
 **Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
 abstraction; two collisions are already known to be waiting — PostgreSQL

@@ -327,3 +327,66 @@ SPEC is in sync with all of these.
     PowerShell splats in argument position. Every one was found by someone
     testing rather than by reasoning, which is the argument for the placeholder
     being the default answer rather than the last resort.
+
+## Phase 4 — reference data against a target (ADR-0004)
+
+51. **The catalog reads rows under a scope the command supplies, never on its
+    own.** A database holds rows, not a notion of which of them are declared,
+    and a catalog that returned every row of every table would make the drift
+    check compare business data. `verify`, `status` and `apply`'s drift check
+    read under the **recorded** state's scope, because their question is
+    whether the environment moved since it was recorded; `snapshot`,
+    `baseline` and `bootstrap` read under the declarations'; `plan --db`
+    reads the union of the two once (`read_scopes`) and projects each view out
+    of it, so a `data:` block added, removed or switched between `exact` and
+    `ensure` is seen by both the drift check and the differ. The projection
+    filters an `ensure` table to its keys even when the read fetched more: a
+    read that fetched every row for another scope's sake must not record the
+    application's own inserts as state.
+52. **The saved plan carries the declarations' data scope (`data`), and the
+    plan version is 3.** `apply` records the database read back and needs a
+    scope to read rows; deriving it from the plan's row changes would miss an
+    `ensure` table whose declared rows were all already present, and
+    deriving it from `SetDataMode` would need the differ to emit one for a
+    table it is comparing against observed rows under the same mode. So the
+    scope travels with the plan, exactly as `ids` does. The version is bumped
+    because an older `apply` would run the DML and record a state with no rows
+    in it, leaving every later `verify` blind to the rows just written — the
+    same shape the state version was bumped for when modules arrived.
+53. **Values are read back in the engine's spelling, and a cell equal to its
+    default is read back as omitted.** Every cell is rendered by the server
+    with a fixed `CONVERT` style; only `bit` and the integer types come back
+    typed, because those are the shapes a declaration writes unquoted. Per
+    cell the engine is asked whether the value equals the column's default
+    expression, and a match is omitted — that is what lets the omitted
+    spelling round-trip, and it is the same "the database is the normalizer"
+    rule that expressions already follow. The cost is the same one check
+    constraints have: a declaration that spells a value or a default
+    differently from the engine is restated on every connected plan, and the
+    remedy is `pull --data`, which shows the engine's spelling. A default the
+    engine cannot evaluate to the stored value (`SYSUTCDATETIME()`, `NEWID()`)
+    is read back explicit for the same reason, visibly rather than guessed. A
+    NULL in a column with no default is omitted too, because `cell()` already
+    reads the two spellings as one there; two reads of one table have to
+    produce one `Row`, or `StateSnapshot::matches` would disagree with itself.
+54. **A table whose live key is not a single column is unreadable, and the
+    whole read fails.** Skipping it would record `data: None` — "declares no
+    rows" — and the next drift check would be blind to the rows it exists to
+    watch. "Absent", "empty" and "unreadable" are three answers, and only the
+    read failing keeps them apart. `status` reports the failure as
+    `unreachable` with the reason rather than as "ok".
+55. **The pre-delete probe asks `sys.foreign_keys` at run time, counts
+    cascades, and leaves out the rows the plan itself moves.** A probe is
+    built from the plan and nothing else, and the plan does not know which
+    tables reference this one — nor should it trust the declarations to say,
+    since a foreign key someone added by hand is exactly the one that will
+    refuse the delete. So the probe is dynamic SQL: the referencing tables and
+    columns come from the catalog through `QUOTENAME`, the key is bound as a
+    parameter, and the count runs through `sp_executesql`. `ON DELETE CASCADE`
+    children are counted although the engine would not refuse them: a
+    reference row's delete cascading into an application table is the case
+    the `data-delete` gate is for. A child row this plan updates or deletes is
+    excluded by key, whatever column the update touches, because the plan
+    runs the update *before* the delete precisely so the engine accepts it;
+    an over-exclusion is refused by the engine inside the transaction, which
+    is the loud direction to be wrong in.

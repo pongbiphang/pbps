@@ -1,6 +1,6 @@
 # ADR-0004: Declarative reference data — the `data:` block
 
-- Status: accepted (Phase 4; the offline half is built — see "Implementation status")
+- Status: accepted (Phase 4; built — see "Implementation status")
 - Date: 2026-08-31
 - Related: docs/SPEC.md §1.3, §7.5, §8.2, §12;
   [ADR-0002](ADR-0002-module-model.md);
@@ -110,14 +110,15 @@ same onboarding story as structure.
 
 ## Implementation status
 
-Built, offline: the block in the model and in `Schema` equality, the loader and
-`fmt` round trip, the model-level rules `validate` reports, the typed
-`InsertRow` / `UpdateRow` / `DeleteRow` / `SetDataMode` changes, the
-`data-update` and `data-delete` risk classes, the T-SQL DML, and the ordering —
-including the foreign-key order *between* two tables that both declare rows.
+Built: the block in the model and in `Schema` equality, the loader and `fmt`
+round trip, the model-level rules `validate` reports, the typed `InsertRow` /
+`UpdateRow` / `DeleteRow` / `SetDataMode` changes, the `data-update` and
+`data-delete` risk classes, the T-SQL DML, the ordering — including the
+foreign-key order *between* two tables that both declare rows — and the
+connected half: the row read-back into `state_json`, the row half of the drift
+comparison, the pre-delete probe and `pull --data`.
 
-Two decisions were taken during implementation that this document did not
-anticipate, both of them narrowings:
+Decisions taken during implementation that this document did not anticipate:
 
 1. **A bare non-integer number is refused**, with a diagnostic asking for
    quotes. There is no floating-point arm in the model's `Value` at all: `f64`
@@ -147,34 +148,61 @@ anticipate, both of them narrowings:
    so a renamed column keeps its values; a primary key that *moves* to a
    different column is refused, because the two key sets have nothing in
    common.
-3. **A connected plan refuses a declaration with `data:` blocks**, before it
-   connects. The catalog does not read rows back yet, so its tables all say
-   `data: None` — which means "declares no rows", not "did not look" — and the
-   differ would insert every declared row on every run; the second apply fails
-   on the primary key. The dev rehearsal compares structure only for the same
-   reason, after having *run* the DML. Both are temporary and both say so;
-   planning the structure and quietly leaving the rows out would be a partial
-   apply nobody asked for.
+3. **The catalog reads rows back under a scope the caller supplies.** A
+   database holds rows, not a notion of which of them are declared, so every
+   connected command says which tables' rows it wants and how: every row of an
+   `exact` table, the declared keys of an `ensure` one. `verify`, `status` and
+   `apply`'s drift check use the **recorded** state's scope — the question is
+   whether the environment moved since pbps last recorded it; `snapshot`,
+   `baseline` and `bootstrap` use the declarations'; `plan --db` reads the
+   **union** of the two once and projects each view out of it, so a block that
+   was added, removed or switched between modes since the last state is seen
+   by both the drift check and the differ. The saved plan carries the
+   declarations' scope (`data`), for the same reason it carries its `ids`:
+   `apply` records the database read back, and needs no checkout to know which
+   rows to read.
+4. **Values come back in the engine's spelling, and a cell that holds its
+   default comes back omitted.** Every cell is rendered by the server
+   (`CONVERT` with a fixed style; `bit` and the integer types are the only
+   ones read back typed), so both sides of a drift check see one spelling and
+   a declaration that wants to match writes it that way — `pull --data` shows
+   it. Per cell, the engine is asked whether the value equals the column's
+   default expression; when it does, the cell is omitted, which is how the
+   omitted spelling round-trips. A default the engine cannot evaluate to the
+   stored value (`SYSUTCDATETIME()`, `NEWID()`) never matches, so that cell is
+   read back explicit and a row that omits it is restated as `= DEFAULT` on
+   every connected plan, visibly; the remedy is to write the value. A table
+   whose live key is not a single column is **unreadable**, and the read
+   fails rather than answering "no rows".
+5. **A table the declarations take over is measured against what it holds.**
+   The first connected plan for a table with a new `data:` block reads its
+   rows, updates the ones that differ, inserts the ones missing, and — for
+   `exact` — deletes the ones nobody declared, behind the gate. `plan --db`
+   says so on stdout, because the plan shows the consequences and not the
+   takeover.
+6. **The pre-delete probe finds the referencing tables in the catalog at run
+   time**, through `sys.foreign_keys` and dynamic SQL, rather than trusting
+   the declarations to list them — a foreign key someone added by hand is
+   exactly the one that will refuse the delete. `ON DELETE CASCADE` children
+   are counted too: the engine would not refuse that delete, it would take
+   the child rows with it, which is the disaster the `data-delete` gate is
+   for. Rows the same plan updates or deletes are left out of the count, so a
+   child moved to a new parent in the same revision does not refuse the plan
+   that the ordering was designed to make acceptable; an over-exclusion fails
+   loudly in the transaction instead.
 
-Not built yet, and deliberately together because they share one question — what
-the database actually holds:
+The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
+the read-back, the drift on rows, the `ensure` read staying inside its keys,
+the probe's dynamic SQL and a keyless table refusing to be read
+(`declared_rows_read_back_as_declared_and_hand_edits_are_seen`), and the
+binary end to end — bootstrap, verify, a hand edit, a connected plan, apply,
+`pull --data` (`reference_data_round_trips_through_a_real_target`).
 
-- the pre-delete probe counting the foreign-key references to the row;
-- reading `exact` tables' rows back into `state_json`, and the row half of the
-  drift comparison — which is also what lifts the `plan --db` refusal above,
-  and has to evaluate a `Cell::Default` against what the engine stored;
-- `pull --data <table>`.
-
-An `IDENTITY` key is built: the insert carries whether its key column is one,
-and the emitter wraps it in `SET IDENTITY_INSERT ... ON` / `OFF` as a single
-statement, so the switch — a session setting at most one table may hold — is
-off again before the next table's insert. Only the key may pin an identity
-value; `validate` refuses a row that writes any other IDENTITY column. Proven
-against the engine by the live test `reference_data_reaches_the_engine_in_an_order_it_accepts`,
-which also covers `= DEFAULT` and the delete-after-the-child-moved order.
-
-Until then a delete is gated as `data-delete` and the foreign key itself refuses
-it loudly, which is the same protection, later.
+An `IDENTITY` key is pinned by wrapping the insert in `SET IDENTITY_INSERT ...
+ON` / `OFF` as a single statement, so the switch — a session setting at most one
+table may hold — is off again before the next table's insert. Only the key may
+pin an identity value; `validate` refuses a row that writes any other IDENTITY
+column.
 
 ## Placement
 

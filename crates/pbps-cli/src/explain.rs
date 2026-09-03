@@ -530,6 +530,21 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     // is what `apply` recomputes, and a plan edited after this review no longer
     // matches it.
     out.push_str(&format!("  checksum    {}\n", e.checksum));
+    if !plan.data.is_empty() {
+        // The rows this plan leaves under management. Listed because it is
+        // what the state recorded after the apply will cover — and a table
+        // that appears here for the first time is one whose rows the
+        // declarations are taking over.
+        out.push_str(&format!(
+            "  rows        {} table(s) under reference-data management afterwards: {}\n",
+            plan.data.len(),
+            plan.data
+                .iter()
+                .map(|(t, s)| format!("{t} ({})", s.mode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     out.push_str(&format!(
         "\nWhat it changes\n  {} change(s) across {}, {} statement(s).\n",

@@ -277,20 +277,26 @@ async fn rehearse_in(
     // comparison is the ordinary one, so the rehearsal cannot disagree with the
     // differ about what a difference is.
     //
-    // Rows are compared without: the DML *ran* — a bad literal or a violated
-    // key fails the rehearsal above like any other statement — but
-    // introspection does not read rows back yet (ADR-0004, "Implementation
-    // status"), so the engine side declares none, and comparing it to a
-    // declaration that does would report every row as missing after inserting
-    // it. Structure is what this comparison can answer today.
-    let declared_structure = declared.without_data();
+    // Rows included, read back under the declared scope (ADR-0004): the DML
+    // ran, and whether what it wrote is what was declared — in the engine's
+    // own spelling — is exactly what a rehearsal can answer that no offline
+    // comparison can.
+    let declared_data = declared.data_scopes();
+    let read = declared_data
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, &read)
+        .await
+        .context("cannot read the declared rows back from the dev database")?;
+    let engine = scoped.schema.with_observed_rows(&rows, &declared_data);
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
-            schema: &scoped.schema,
+            schema: &engine,
             ids: &observed,
         },
         pbps_diff::Side {
-            schema: &declared_structure,
+            schema: declared,
             ids: declared_ids,
         },
         dialect,
@@ -303,7 +309,7 @@ async fn rehearse_in(
         )
     })?;
 
-    let (structural, spelling) = classify(&remaining, &scoped.schema);
+    let (structural, spelling) = classify(&remaining, &engine);
     Ok(Rehearsal {
         built: build.len(),
         applied: plan.len(),
@@ -377,6 +383,29 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
             )),
             // The other half of a check's drop+add pair: not a second finding.
             Change::DropCheck { .. } => {}
+            // A row whose every differing cell is "the default" on both sides
+            // is the default's own spelling showing through — `N'x'` declared,
+            // `'x'` stored — which is the check-constraint case one level
+            // down. Any cell with a real value on either side is a row the
+            // plan did not write as declared, and stays structural.
+            Change::UpdateRow {
+                table,
+                key,
+                columns,
+                ..
+            } if columns.values().all(|(from, to)| {
+                matches!(
+                    (from, to),
+                    (pbps_model::Cell::Default(_), pbps_model::Cell::Default(_))
+                )
+            }) =>
+            {
+                for (column, (from, to)) in columns {
+                    spelling.push(format!(
+                        "row {key} of {table}, column {column}: declared {to}, the engine stores {from}"
+                    ));
+                }
+            }
             // Deprecation is a fact about the declarations, and the emitter
             // writes nothing for it on purpose. The engine has nowhere to keep
             // it, so it comes back on every rehearsal of every declaration that

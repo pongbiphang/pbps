@@ -24,6 +24,8 @@
 //! would be theatre. `apply` rejects a preview outright and says to run
 //! `plan --db`.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 
 use crate::change::ChangeSet;
@@ -37,7 +39,12 @@ use crate::schema::Schema;
 /// unknown fields, and run a staged plan inside a transaction with the reviewed
 /// online strategy silently dropped. `apply` compares this exactly, so an older
 /// deployment host refuses the artifact instead.
-pub const CURRENT_VERSION: u32 = 2;
+///
+/// Bumped to 3 when `data` arrived (the connected half of ADR-0004). It says
+/// which tables' rows the state recorded after the apply has to cover; an older
+/// `apply` would run the plan's DML, record a state with no rows in it, and
+/// leave every later `verify` blind to the rows it had just written.
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -153,6 +160,16 @@ pub struct SavedPlan {
     /// half of it behind would be an artifact that has to be applied from a
     /// checkout — which is exactly what an air-gapped host does not have.
     pub ids: IdsFile,
+
+    /// The tables whose rows are under management **after** this plan, with
+    /// their mode and declared keys (ADR-0004).
+    ///
+    /// Carried for the same reason `ids` is: the state `apply` records is the
+    /// database read back, and reading rows back needs a scope — which of a
+    /// table's rows are declared is not a fact the database holds. It is the
+    /// declarations' scope at plan time, so `apply` needs no checkout.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub data: crate::data::DataScopes,
 }
 
 impl SavedPlan {
@@ -174,6 +191,7 @@ impl SavedPlan {
             baseline,
             changes,
             ids,
+            data: BTreeMap::new(),
         }
     }
 
@@ -367,7 +385,7 @@ mod tests {
     #[test]
     fn the_format_version_is_written() {
         let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":2"#), "{json}");
+        assert!(json.contains(r#""version":3"#), "{json}");
         assert!(json.contains(r#""origin":"database""#), "{json}");
     }
 

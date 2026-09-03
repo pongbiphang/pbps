@@ -17,9 +17,14 @@
 
 use anyhow::{Context as _, bail};
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use pbps_config::Project;
 use pbps_db::Conn;
-use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot};
+use pbps_model::{
+    DataScopes, IdsFile, ObjectName, ObservedRows, RowScope, Schema, StateKind, StateSnapshot,
+    TableName,
+};
 
 use crate::db::{self, Target};
 
@@ -39,33 +44,52 @@ pub struct Managed {
     /// caller that most needs it is asking about a name that has *never* been
     /// recorded: a newly declared module that collides with an encrypted one
     /// already standing there.
-    pub unreadable: Vec<(pbps_model::ObjectName, String)>,
+    pub unreadable: Vec<(ObjectName, String)>,
+    /// The rows read back under the read scope the caller asked for. Not yet
+    /// placed in the schema: `plan --db` projects two different views out of
+    /// one read (see [`pbps_model::data::read_scopes`]).
+    pub rows: ObservedRows,
 }
 
-/// The scoped state alone, which is all any caller but `bootstrap` needs.
+/// The scoped state alone, with the rows of every table in `scopes` read back
+/// and placed under it — which is all any caller but `bootstrap` and
+/// `plan --db` needs.
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
-    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    modules: &BTreeSet<ObjectName>,
     unmanaged: pbps_config::Unmanaged,
+    scopes: &DataScopes,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    Ok(managed_state_full(conn, ids, modules, unmanaged)
-        .await?
-        .scoped)
+    let read: BTreeMap<TableName, RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let managed = managed_state_full(conn, ids, modules, unmanaged, &read).await?;
+    let mut scoped = managed.scoped;
+    scoped.schema = scoped.schema.with_observed_rows(&managed.rows, scopes);
+    Ok(scoped)
 }
 
-/// Introspects, cuts the result down to the managed set, and reports whatever
-/// the read itself could not express.
+/// Introspects, cuts the result down to the managed set, reads the rows of
+/// every table in `read`, and reports whatever the read itself could not
+/// express.
 ///
 /// Every connected command starts here. The warnings are printed rather than
 /// returned because ignoring them is never right: a drift check that silently
 /// skipped a computed column would report "no drift" about a database it only
 /// half read.
+///
+/// The rows come from the catalog under a scope the caller supplies, because
+/// which of a table's rows are declared is not something the database knows
+/// (ADR-0004). A row read that fails is an error, not an empty answer: a
+/// state recorded without the rows would say the table declares none.
 async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
-    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    modules: &BTreeSet<ObjectName>,
     unmanaged: pbps_config::Unmanaged,
+    read: &BTreeMap<TableName, RowScope>,
 ) -> anyhow::Result<Managed> {
     let pulled = pbps_mssql::catalog::introspect(conn)
         .await
@@ -92,19 +116,27 @@ async fn managed_state_full(
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     report_unmanaged(&scoped, unmanaged)?;
-    Ok(Managed { scoped, unreadable })
+    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, read)
+        .await
+        .context("cannot read the declared rows back")?;
+    Ok(Managed {
+        scoped,
+        unreadable,
+        rows,
+    })
 }
 
-/// The modules the declarations name, for the commands that record a state.
+/// The modules the declarations name and the rows they declare, for the
+/// commands that record a state.
 ///
 /// `snapshot` and `baseline` write down what the environment is; a module the
-/// declarations manage has to be in that record, or the next `verify` would not
-/// be watching it. The ids file is already required by both, so requiring the
-/// declarations to parse as well changes nothing about when they can run.
-fn declared_modules(
-    project: &Project,
-) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ObjectName>> {
-    Ok(managed_modules(None, Some(&crate::load(project)?.schema)))
+/// declarations manage, or a table whose rows they declare, has to be in that
+/// record, or the next `verify` would not be watching it. The ids file is
+/// already required by both, so requiring the declarations to parse as well
+/// changes nothing about when they can run.
+fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, DataScopes)> {
+    let schema = crate::load(project)?.schema;
+    Ok((managed_modules(None, Some(&schema)), schema.data_scopes()))
 }
 
 /// The modules a plan leaves the environment holding.
@@ -115,8 +147,8 @@ fn declared_modules(
 fn modules_after(
     recorded: &pbps_model::StateSnapshot,
     changes: &pbps_model::ChangeSet,
-) -> std::collections::BTreeSet<pbps_model::ObjectName> {
-    let mut set: std::collections::BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
+) -> BTreeSet<ObjectName> {
+    let mut set: BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
     for p in &changes.changes {
         // Every module change names its module and nothing else does, so the
         // accessor is the whole classification; only the direction is left.
@@ -141,8 +173,8 @@ fn modules_after(
 fn managed_modules(
     recorded: Option<&pbps_model::StateSnapshot>,
     declared: Option<&pbps_model::Schema>,
-) -> std::collections::BTreeSet<pbps_model::ObjectName> {
-    let mut set = std::collections::BTreeSet::new();
+) -> BTreeSet<ObjectName> {
+    let mut set = BTreeSet::new();
     if let Some(s) = recorded {
         set.extend(s.schema.modules.keys().cloned());
     }
@@ -251,11 +283,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
         let recorded_ids = baseline.snapshot.ids.clone();
         let recorded_modules = managed_modules(Some(&baseline.snapshot), None);
+        // The rows, like the modules, under the *recorded* scope: the question
+        // is whether this environment moved since pbps last recorded it, and a
+        // table whose rows were never recorded has nothing to have moved from.
         let scoped = managed_state(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
             project.config.unmanaged,
+            &baseline.snapshot.schema.data_scopes(),
         )
         .await?;
 
@@ -424,15 +460,21 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
-    let declared_modules = declared_modules(project)?;
+    let (declared_modules, declared_data) = declared_scope(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+        let scoped = managed_state(
+            &mut conn,
+            &ids,
+            &declared_modules,
+            project.config.unmanaged,
+            &declared_data,
+        )
+        .await?;
         report_missing(&scoped);
 
         // Comparing against the recorded state is the whole guard. A snapshot
@@ -481,15 +523,21 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
-    let declared_modules = declared_modules(project)?;
+    let (declared_modules, declared_data) = declared_scope(project)?;
     let operator = crate::operator();
 
     db::runtime()?.block_on(async {
         let mut conn = Conn::connect(target.connection())
             .await
             .context("cannot connect to the database")?;
-        let scoped =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+        let scoped = managed_state(
+            &mut conn,
+            &ids,
+            &declared_modules,
+            project.config.unmanaged,
+            &declared_data,
+        )
+        .await?;
         report_missing(&scoped);
 
         let mut snapshot = with_provenance(
@@ -588,9 +636,16 @@ pub fn cmd_bootstrap(
         // managed set would fail halfway through on the first CREATE of a table
         // that is already there, leaving a partly built schema and a ledger that
         // never mentioned it.
-        let existing =
-            managed_state_full(&mut conn, &ids, &declared_modules, project.config.unmanaged)
-                .await?;
+        // No rows are read here: the question is whether any declared object
+        // stands, and a table that does is refused before its rows matter.
+        let existing = managed_state_full(
+            &mut conn,
+            &ids,
+            &declared_modules,
+            project.config.unmanaged,
+            &BTreeMap::new(),
+        )
+        .await?;
         // Modules count as much as tables here. `CREATE OR ALTER` would not fail
         // on a view that is already there — it would quietly replace it, with no
         // plan, no risk classification and no approval, which is the opposite of
@@ -645,8 +700,16 @@ pub fn cmd_bootstrap(
         // The state recorded is what the engine actually built, read back — not
         // what was declared. Expressions come back in the engine's stored form,
         // and only that form compares equal on the next drift check (SPEC §8.2).
-        let built =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+        // The rows too, under the declared scope: bootstrap inserted them, and
+        // the engine's spelling of each value is what the record has to hold.
+        let built = managed_state(
+            &mut conn,
+            &ids,
+            &declared_modules,
+            project.config.unmanaged,
+            &loaded.schema.data_scopes(),
+        )
+        .await?;
         let snapshot = with_provenance(
             project.root(),
             StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
@@ -727,33 +790,6 @@ pub fn cmd_plan_db(
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "plan --db")?;
     let loaded = crate::load(project)?;
-    // Before the connection, on purpose: this is a fact about the declarations
-    // and the tool, not about the target, and a refusal that first dialled the
-    // server would blame the wrong thing when the server was also down.
-    //
-    // The base of a connected plan is the catalog, and the catalog does not
-    // read rows back yet (ADR-0004, "Implementation status"). Its tables all
-    // say `data: None`, which means "declares no rows", so the differ would
-    // insert every declared row on every run — the second apply fails on the
-    // primary key. Refusing is the honest answer until the read-back exists;
-    // planning the structure and quietly leaving the rows out would be a
-    // partial apply nobody asked for.
-    let with_data = loaded.schema.tables_with_data();
-    if !with_data.is_empty() {
-        bail!(
-            "{} table(s) declare reference data ({}), which `plan --db` cannot plan yet: the \
-             target's rows are not read back, so every declared row would be inserted on every \
-             run.\n\
-             `pbps plan` (offline) shows the DML for review; applying it against a target is the \
-             connected half of ADR-0004 and is not built.",
-            with_data.len(),
-            with_data
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
     let created_at = crate::now();
@@ -801,11 +837,20 @@ pub fn cmd_plan_db(
         // the first time and that already exists in the database is outside it,
         // and telling its author "this object is not declared" while planning
         // the `CREATE OR ALTER` for it would be both wrong and unactionable.
+        //
+        // The rows are read once, widely enough for both scopes that meet here
+        // (ADR-0004): the recorded one, which the drift check below compares
+        // against, and the declared one, which the differ measures the
+        // declarations against — every row an `exact` declaration is about to
+        // delete included.
+        let recorded_data = entry.snapshot.schema.data_scopes();
+        let declared_data = loaded.schema.data_scopes();
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
             pbps_config::Unmanaged::Ignore,
+            &pbps_model::data::read_scopes(&recorded_data, &declared_data),
         )
         .await?;
         // A declared name standing on an object introspection cannot express is
@@ -841,8 +886,13 @@ pub fn cmd_plan_db(
         // queried state had better be the recorded one. When it is not, the
         // plan would be pinned to a checksum that describes neither — and the
         // difference is drift, which has its own command and its own three
-        // remedies.
-        let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+        // remedies. The rows are compared under the recorded scope, exactly as
+        // `verify` compares them.
+        let as_recorded = scoped
+            .schema
+            .clone()
+            .with_observed_rows(&managed.rows, &recorded_data);
+        let live = pbps_model::state_checksum(&as_recorded, &recorded_ids);
         let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
         if live != recorded {
             bail!(
@@ -854,9 +904,36 @@ pub fn cmd_plan_db(
             );
         }
 
+        // A table whose rows the declarations cover for the first time is
+        // measured against what it holds, not against nothing: the rows are
+        // adopted, the ones that differ are updated, and — for `exact` — the
+        // ones nobody declared are deleted behind the gate. Said out loud,
+        // because the plan shows the consequences and not the takeover.
+        for (name, scope) in &declared_data {
+            if recorded_data.contains_key(name) {
+                continue;
+            }
+            match managed.rows.get(name) {
+                Some(rows) => println!(
+                    "Reference data: the declarations take over the rows of {name} ({}); it holds \
+                     {} row(s) now.",
+                    scope.mode,
+                    rows.len()
+                ),
+                None => println!(
+                    "Reference data: {name} does not exist yet; its declared rows go in with it."
+                ),
+            }
+        }
+        let base = pbps_model::data::plan_base(
+            &scoped.schema,
+            &managed.rows,
+            &recorded_data,
+            &declared_data,
+        );
         let cs = pbps_diff::diff(
             pbps_diff::Side {
-                schema: &scoped.schema,
+                schema: &base,
                 ids: &recorded_ids,
             },
             pbps_diff::Side {
@@ -941,6 +1018,9 @@ pub fn cmd_plan_db(
         resolved.ids,
     );
     plan.git_sha = db::git_sha(project.root());
+    // The rows the state recorded after the apply has to cover: the
+    // declarations' scope, carried so that `apply` needs no checkout.
+    plan.data = loaded.schema.data_scopes();
     if staged {
         plan = plan.staged();
         println!(
@@ -1160,6 +1240,7 @@ async fn apply_under_lock(
         &recorded_ids,
         &recorded_modules,
         project.config.unmanaged,
+        &entry.snapshot.schema.data_scopes(),
     )
     .await?;
 
@@ -1186,12 +1267,14 @@ async fn apply_under_lock(
 
     // What gets recorded is the database read back, not the plan applied to the
     // old state. Expressions come back in the engine's stored form, and only
-    // that form compares equal on the next drift check (SPEC §8.2).
+    // that form compares equal on the next drift check (SPEC §8.2). The rows
+    // under the plan's own scope, for the same reason it carries its ids.
     let after = managed_state(
         conn,
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes),
         project.config.unmanaged,
+        &plan.data,
     )
     .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
@@ -1278,6 +1361,7 @@ async fn apply_staged_under_lock(
             at_checkpoint,
             &after_modules,
             project.config.unmanaged,
+            &entry.snapshot.schema.data_scopes(),
         )
         .await?;
         let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
@@ -1332,6 +1416,7 @@ async fn apply_staged_under_lock(
             &recorded_ids,
             &recorded_modules,
             project.config.unmanaged,
+            &entry.snapshot.schema.data_scopes(),
         )
         .await?;
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
@@ -1386,11 +1471,15 @@ async fn apply_staged_under_lock(
         // committed statements. It is a hygiene gate for the start of a
         // command, where it already ran, and failing it here would abort
         // *after* the DDL committed and leave no checkpoint to resume from.
+        // The rows under the plan's scope even mid-way: a declared row the
+        // remaining statements have not inserted yet is simply not there, and
+        // the checkpoint says so.
         let after = managed_state(
             conn,
             &live_ids,
             &modules_after(&entry.snapshot, &plan.changes),
             pbps_config::Unmanaged::Ignore,
+            &plan.data,
         )
         .await?;
         // Scoped and identified by `live_ids`, not by the plan's mapping: a
@@ -1424,6 +1513,7 @@ async fn apply_staged_under_lock(
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes),
         project.config.unmanaged,
+        &plan.data,
     )
     .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(

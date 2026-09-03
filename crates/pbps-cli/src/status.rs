@@ -285,7 +285,23 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     let recorded_modules: std::collections::BTreeSet<_> =
         entry.snapshot.schema.modules.keys().cloned().collect();
     let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
-    let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+    // The rows too, under the recorded scope, as `verify` reads them. A read
+    // that fails is reported as the failure it is, never as "no drift".
+    let recorded_data = entry.snapshot.schema.data_scopes();
+    let read = recorded_data
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let rows = match pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            row.state = "unreachable";
+            row.detail = Some(format!("the declared rows could not be read back: {e}"));
+            return row;
+        }
+    };
+    let live_schema = scoped.schema.with_observed_rows(&rows, &recorded_data);
+    let live = pbps_model::state_checksum(&live_schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {
         record_drift(&mut row, entry.id, name);

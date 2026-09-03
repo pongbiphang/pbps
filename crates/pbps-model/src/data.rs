@@ -248,6 +248,177 @@ pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Ce
     }
 }
 
+/// Which of a table's rows a read-back is asked for (the connected half of
+/// ADR-0004).
+///
+/// The catalog cannot decide this on its own: a database has rows, not a
+/// notion of which of them are declared. The scope comes from a declaration or
+/// from a recorded state, and it is what turns "the table holds these rows"
+/// into a [`TableData`] the differ can compare.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DataScope {
+    pub mode: DataMode,
+    /// The declared keys. For an `exact` table they are informational — every
+    /// row is read, because an undeclared one is exactly what has to be seen.
+    /// For an `ensure` table they are the whole scope: nothing else in the
+    /// table is looked at, which is the promise the mode makes to a table the
+    /// application also writes to.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub keys: BTreeSet<RowKey>,
+}
+
+/// The scopes of every table that declares rows, by table.
+pub type DataScopes = BTreeMap<TableName, DataScope>;
+
+/// What was read back: every row the read scope asked for, by table.
+///
+/// A table that was in scope but absent from the database has no entry — it
+/// is reported as missing by the managed-set check, not read as empty.
+pub type ObservedRows = BTreeMap<TableName, BTreeMap<RowKey, Row>>;
+
+/// Which rows a read-back query fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowScope {
+    /// Every row of the table.
+    Every,
+    /// Only the rows with these keys; the rest of the table is not looked at.
+    Keys(BTreeSet<RowKey>),
+}
+
+impl RowScope {
+    /// The narrower of two reads that still answers both.
+    pub fn union(self, other: RowScope) -> RowScope {
+        match (self, other) {
+            (RowScope::Every, _) | (_, RowScope::Every) => RowScope::Every,
+            (RowScope::Keys(mut a), RowScope::Keys(b)) => {
+                a.extend(b);
+                RowScope::Keys(a)
+            }
+        }
+    }
+}
+
+impl DataScope {
+    pub fn of(data: &TableData) -> DataScope {
+        DataScope {
+            mode: data.mode,
+            keys: data.rows.keys().cloned().collect(),
+        }
+    }
+
+    /// The rows the catalog has to fetch to answer this scope.
+    pub fn rows_to_read(&self) -> RowScope {
+        match self.mode {
+            DataMode::Exact => RowScope::Every,
+            DataMode::Ensure => RowScope::Keys(self.keys.clone()),
+        }
+    }
+
+    /// The block this scope describes, from rows read under it or under a
+    /// wider read.
+    ///
+    /// The filter is what makes `ensure` mean what it says: a read that
+    /// happened to fetch every row (because another scope on the same table
+    /// needed them) must not turn the undeclared ones into recorded state, or
+    /// the next `verify` would call the application's own inserts drift.
+    pub fn project(&self, rows: &BTreeMap<RowKey, Row>) -> TableData {
+        let rows = match self.mode {
+            DataMode::Exact => rows.clone(),
+            DataMode::Ensure => rows
+                .iter()
+                .filter(|(k, _)| self.keys.contains(*k))
+                .map(|(k, r)| (k.clone(), r.clone()))
+                .collect(),
+        };
+        TableData {
+            mode: self.mode,
+            rows,
+        }
+    }
+}
+
+/// The read a connected plan needs: every table under either scope, fetched
+/// widely enough to answer both.
+///
+/// Two scopes meet at plan time — what the environment's recorded state
+/// covers, and what the declarations now cover — and they can disagree on a
+/// table: a block added, removed, or switched between `exact` and `ensure`.
+/// The drift check needs the recorded view, and the differ needs to see every
+/// row the declaration will compare against, so the read is the union and each
+/// caller projects its own view out of it.
+pub fn read_scopes(recorded: &DataScopes, declared: &DataScopes) -> BTreeMap<TableName, RowScope> {
+    let mut out: BTreeMap<TableName, RowScope> = BTreeMap::new();
+    for (name, scope) in recorded.iter().chain(declared) {
+        let read = scope.rows_to_read();
+        let merged = match out.remove(name) {
+            Some(existing) => existing.union(read),
+            None => read,
+        };
+        out.insert(name.clone(), merged);
+    }
+    out
+}
+
+impl crate::schema::Schema {
+    /// The scope of every table that declares rows.
+    pub fn data_scopes(&self) -> DataScopes {
+        self.tables
+            .iter()
+            .filter_map(|(n, t)| t.data.as_ref().map(|d| (n.clone(), DataScope::of(d))))
+            .collect()
+    }
+
+    /// This schema — one read from a catalog, which declares no rows of its
+    /// own — with the rows read back placed under `scopes`. Every table
+    /// outside the scopes is left with `data: None`.
+    ///
+    /// A table in scope with no observed rows is left with `data: None`: the
+    /// read did not reach it (it is missing from the database, and reported as
+    /// such elsewhere), and "absent" must not be recorded as "empty".
+    pub fn with_observed_rows(mut self, rows: &ObservedRows, scopes: &DataScopes) -> Self {
+        for (name, table) in &mut self.tables {
+            table.data = match (scopes.get(name), rows.get(name)) {
+                (Some(scope), Some(observed)) => Some(scope.project(observed)),
+                _ => None,
+            };
+        }
+        self
+    }
+}
+
+/// The base a connected plan is computed against: the live schema, with the
+/// rows read back for every table either side covers.
+///
+/// The **mode** is the recorded one where there is one, so that a switch
+/// between `exact` and `ensure` shows at the gate as `SetDataMode`; a table the
+/// declarations take over for the first time carries the declared mode, since
+/// nothing was recorded to differ from. The **rows** are everything the union
+/// read fetched, unfiltered: the differ must see every row the declaration
+/// will be measured against — including, for an `exact` declaration, the rows
+/// that are about to be deleted because nobody declared them.
+pub fn plan_base(
+    live: &crate::schema::Schema,
+    rows: &ObservedRows,
+    recorded: &DataScopes,
+    declared: &DataScopes,
+) -> crate::schema::Schema {
+    let mut base = live.clone();
+    for (name, table) in &mut base.tables {
+        let mode = recorded
+            .get(name)
+            .or_else(|| declared.get(name))
+            .map(|s| s.mode);
+        table.data = match (mode, rows.get(name)) {
+            (Some(mode), Some(observed)) => Some(TableData {
+                mode,
+                rows: observed.clone(),
+            }),
+            _ => None,
+        };
+    }
+    base
+}
+
 /// The order declared rows must be inserted in: a referenced table before the
 /// table that references it.
 ///
@@ -717,5 +888,169 @@ mod tests {
             rows: BTreeMap::new(),
         };
         assert_ne!(exact, ensure);
+    }
+
+    // ---- The connected half: scopes and read-back ----
+
+    fn rows(keys: &[&str]) -> BTreeMap<RowKey, Row> {
+        keys.iter()
+            .map(|k| (RowKey::from(*k), Row::default()))
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_scope_reads_every_row_and_an_ensure_scope_only_its_keys() {
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(exact.rows_to_read(), RowScope::Every);
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(
+            ensure.rows_to_read(),
+            RowScope::Keys(["a"].into_iter().map(RowKey::from).collect())
+        );
+    }
+
+    /// The promise `ensure` makes: a read that fetched more than the declared
+    /// keys (because another scope on the table needed them) must not record
+    /// the application's own rows, or the next `verify` calls them drift.
+    #[test]
+    fn projecting_an_ensure_scope_drops_the_rows_it_did_not_declare() {
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        let observed = rows(&["a", "b"]);
+        assert_eq!(ensure.project(&observed).rows, rows(&["a"]));
+        // The negative case: `exact` keeps the undeclared row, which is
+        // exactly the row the differ has to delete.
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(exact.project(&observed).rows, rows(&["a", "b"]));
+    }
+
+    #[test]
+    fn the_union_read_is_wide_enough_for_both_scopes() {
+        let t = name();
+        let ensure = |keys: &[&str]| DataScope {
+            mode: DataMode::Ensure,
+            keys: keys.iter().map(|k| RowKey::from(*k)).collect(),
+        };
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        // ensure + ensure: the keys of both.
+        let read = read_scopes(
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+            &[(t.clone(), ensure(&["b"]))].into_iter().collect(),
+        );
+        assert_eq!(
+            read[&t],
+            RowScope::Keys(["a", "b"].into_iter().map(RowKey::from).collect())
+        );
+        // ensure + exact, either way round: everything.
+        let read = read_scopes(
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+            &[(t.clone(), exact.clone())].into_iter().collect(),
+        );
+        assert_eq!(read[&t], RowScope::Every);
+        let read = read_scopes(
+            &[(t.clone(), exact)].into_iter().collect(),
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+        );
+        assert_eq!(read[&t], RowScope::Every);
+        // A table on one side only is still read.
+        let read = read_scopes(
+            &BTreeMap::new(),
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+        );
+        assert!(read.contains_key(&t));
+    }
+
+    /// Absent, empty and unread are three different things: a scoped table the
+    /// read did not reach stays `None`, never becomes "declares no rows".
+    #[test]
+    fn a_scoped_table_with_no_observed_rows_is_not_recorded_as_empty() {
+        let mut schema = crate::schema::Schema::default();
+        schema
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let scopes: DataScopes = [(
+            name(),
+            DataScope {
+                mode: DataMode::Exact,
+                keys: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let unread = schema.clone().with_observed_rows(&BTreeMap::new(), &scopes);
+        assert_eq!(unread.tables[&name()].data, None);
+        let read =
+            schema.with_observed_rows(&[(name(), BTreeMap::new())].into_iter().collect(), &scopes);
+        assert_eq!(
+            read.tables[&name()].data,
+            Some(TableData {
+                mode: DataMode::Exact,
+                rows: BTreeMap::new()
+            })
+        );
+    }
+
+    /// The base a connected plan sees: the recorded mode where there is one,
+    /// so a mode switch reaches the gate, and every row the read fetched.
+    #[test]
+    fn the_plan_base_keeps_the_recorded_mode_and_every_observed_row() {
+        let mut live = crate::schema::Schema::default();
+        live.tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let observed: ObservedRows = [(name(), rows(&["a", "b"]))].into_iter().collect();
+        let recorded: DataScopes = [(
+            name(),
+            DataScope {
+                mode: DataMode::Ensure,
+                keys: ["a"].into_iter().map(RowKey::from).collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let declared: DataScopes = [(
+            name(),
+            DataScope {
+                mode: DataMode::Exact,
+                keys: ["a"].into_iter().map(RowKey::from).collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let base = plan_base(&live, &observed, &recorded, &declared);
+        let data = base.tables[&name()].data.as_ref().unwrap();
+        assert_eq!(
+            data.mode,
+            DataMode::Ensure,
+            "the recorded mode, so the switch shows"
+        );
+        assert_eq!(
+            data.rows,
+            rows(&["a", "b"]),
+            "unfiltered: `b` is what exact will delete"
+        );
+        // Taken over for the first time: the declared mode, since nothing was
+        // recorded to differ from.
+        let base = plan_base(&live, &observed, &BTreeMap::new(), &declared);
+        assert_eq!(
+            base.tables[&name()].data.as_ref().unwrap().mode,
+            DataMode::Exact
+        );
+        // Neither side covers it: untouched.
+        let base = plan_base(&live, &observed, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(base.tables[&name()].data, None);
     }
 }

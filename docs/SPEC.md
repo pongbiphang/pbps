@@ -372,11 +372,15 @@ table and somebody's business table is a judgement about the project, and the
 cost being pointed at is that every plan from here on compares those rows one
 by one.
 
-**Against a target.** Until the catalog reads rows back (the connected half of
-ADR-0004), `plan --db` refuses a declaration with `data:` blocks, before it
-connects: a catalog that has not observed rows declares none, and planning
-against it would insert every declared row on every run. `pbps plan` shows the
-DML for review, and the dev rehearsal runs it and compares structure.
+**Against a target.** The catalog reads rows back under a *scope* — every row
+of an `exact` table, the declared keys of an `ensure` one — supplied by the
+command, because a database holds rows and not a notion of which are declared.
+The rows come back in the engine's own spelling, and a cell that holds its
+column's default comes back omitted, so the declaration's spelling round-trips
+(ADR-0004, "Implementation status"). `apply` records them into `state_json`
+after the plan, `verify` compares them, and a table whose rows the declarations
+cover for the first time is planned against what it holds rather than against
+nothing. `pull --data <table>` writes the block from an existing table.
 
 **Ordering.** Rows go in after the table and its columns exist and before the
 constraints that check them, and they follow the foreign keys *between* the
@@ -753,6 +757,10 @@ gradual adoption. Teams that want whole-database control tune it with
 `unmanaged: ignore | warn | error` in `pbps.yml`, and scope can also be drawn at
 the schema level (manage `dbo` only).
 
+Declared rows (ADR-0004) are part of the managed set: `exact` tables compare
+every row, `ensure` tables compare the declared keys only, and a table without a
+`data:` block has no rows compared at all.
+
 **Expressions (check / default / index WHERE) are never parsed; the database
 itself is the normalizer.** Immediately after a successful apply, the tool reads
 the definition back and stores the dialect's stored form (MSSQL's
@@ -836,7 +844,7 @@ full state.
 
 | Command | Purpose |
 |---|---|
-| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
+| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step). `--data <table>` also declares that table's rows as `exact` reference data |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
 | `pbps apply --plan plan.json --allow ...` | Apply a plan. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |

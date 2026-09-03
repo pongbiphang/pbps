@@ -4,7 +4,10 @@
 //! the plain `Raw*` structs and hands them to the pure assembler. The queries
 //! are static — nothing user-controlled is ever interpolated into them.
 
+use std::collections::BTreeMap;
+
 use pbps_db::{Conn, DbError, FromColumn, Row};
+use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
@@ -227,4 +230,45 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     }
 
     Ok(assemble(&raw))
+}
+
+/// Reads the rows of every scoped table the schema has (ADR-0004).
+///
+/// The scope decides *which* rows — every row of an `exact` table, the
+/// declared keys of an `ensure` one — and it is supplied by the caller, because
+/// a database holds rows, not a notion of which of them are declared. A scoped
+/// table the schema does not have gets no entry: it is missing, which the
+/// managed-set check reports, and "missing" must not come back as "empty".
+///
+/// A table whose rows cannot be read (no single-column key, or a value the
+/// model cannot hold) fails the whole read rather than being skipped: a state
+/// recorded without it would say the table declares no rows, and the next
+/// drift check would be blind to the rows it exists to watch.
+pub async fn read_rows(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &BTreeMap<TableName, RowScope>,
+) -> Result<ObservedRows, crate::rows::RowsError> {
+    let mut out = ObservedRows::new();
+    for (name, scope) in scopes {
+        let Some(table) = schema.tables.get(name) else {
+            continue;
+        };
+        let mut rows = BTreeMap::new();
+        if let Some(query) = crate::rows::query(name, table, scope)? {
+            let result =
+                conn.query(&query.sql)
+                    .await
+                    .map_err(|source| crate::rows::RowsError::Read {
+                        table: name.clone(),
+                        source: Box::new(source),
+                    })?;
+            for row in &result {
+                let (key, cells) = crate::rows::decode(name, &query, row)?;
+                rows.insert(key, cells);
+            }
+        }
+        out.insert(name.clone(), rows);
+    }
+    Ok(out)
 }

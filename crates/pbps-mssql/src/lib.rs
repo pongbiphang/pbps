@@ -34,6 +34,7 @@ pub mod ident;
 pub mod impact;
 pub mod introspect;
 pub mod preflight;
+pub mod rows;
 pub mod state;
 pub mod types;
 pub mod validate;

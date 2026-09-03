@@ -1833,3 +1833,297 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
 
     db.drop().await;
 }
+
+/// The connected half of ADR-0004 against the engine: the rows a plan wrote
+/// come back in the canonical form the declaration used, a hand edit and a
+/// rogue row are seen, an `ensure` read stays inside its keys, and the
+/// pre-delete probe counts what the catalog says still points at the row —
+/// through dynamic SQL only a real server can validate.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
+    use pbps_model::{DataMode, Row, RowKey, RowScope, TableData, Value};
+
+    fn rows(rows: &[(&str, &[(&str, Value)])]) -> std::collections::BTreeMap<RowKey, Row> {
+        rows.iter()
+            .map(|(k, cells)| {
+                (
+                    RowKey::from(*k),
+                    cells
+                        .iter()
+                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .collect::<Row>(),
+                )
+            })
+            .collect()
+    }
+    let text = |s: &str| Value::Text(s.to_owned());
+
+    // `status`: a varchar key, a NOT NULL label with a default, an int that
+    // may be NULL, and a `decimal` the declaration has to spell as the engine
+    // does.
+    let mut status = Table::default();
+    status
+        .columns
+        .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+    let mut label = Column::new(ty("nvarchar(50)")).not_null();
+    label.default = Some("'Unlabelled'".to_owned());
+    status.columns.insert("label".to_owned(), label);
+    status
+        .columns
+        .insert("rank".to_owned(), Column::new(ty("int")));
+    status
+        .columns
+        .insert("pct".to_owned(), Column::new(ty("decimal(5,2)")));
+    // Named, so the whole table compares equal below: the engine invents a
+    // name for an unnamed key and the read-back reports it.
+    status.primary_key = Some(PrimaryKey {
+        name: Some("pk_status".to_owned()),
+        columns: vec!["code".to_owned()],
+    });
+    status.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[
+            (
+                "new",
+                &[
+                    ("label", text("New")),
+                    ("rank", Value::Int(1)),
+                    ("pct", text("1.50")),
+                ],
+            ),
+            // Everything defaulted or NULL: the canonical read-back is `{}`.
+            ("old", &[]),
+        ]),
+    });
+
+    // `kind`: an IDENTITY key, a foreign key to `status`, under `ensure`.
+    let mut kind = Table::default();
+    let mut id = Column::new(ty("int")).not_null();
+    id.identity = Some(Identity {
+        seed: 1,
+        increment: 1,
+    });
+    kind.columns.insert("id".to_owned(), id);
+    kind.columns.insert(
+        "status_code".to_owned(),
+        Column::new(ty("varchar(20)")).not_null(),
+    );
+    kind.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".to_owned()],
+    });
+    kind.foreign_keys.insert(
+        "fk_kind_status".to_owned(),
+        ForeignKey {
+            columns: vec!["status_code".to_owned()],
+            references_table: TableName::new("dbo", "status"),
+            references_columns: vec!["code".to_owned()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    kind.data = Some(TableData {
+        mode: DataMode::Ensure,
+        rows: rows(&[("7", &[("status_code", text("old"))])]),
+    });
+
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert(TableName::new("dbo", "status"), status);
+    declared.tables.insert(TableName::new("dbo", "kind"), kind);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("readback").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let scopes = declared.data_scopes();
+    let read: std::collections::BTreeMap<TableName, RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("read rows");
+    let live = live.with_observed_rows(&observed, &scopes);
+
+    // What was declared is what comes back — `1.50` as the engine spells a
+    // decimal(5,2), the defaulted label omitted, the NULLs omitted.
+    assert_eq!(
+        live.tables[&TableName::new("dbo", "status")].data,
+        declared.tables[&TableName::new("dbo", "status")].data
+    );
+    assert_eq!(
+        live.tables[&TableName::new("dbo", "kind")].data,
+        declared.tables[&TableName::new("dbo", "kind")].data
+    );
+    // The whole thing: the rows make no difference to the schema equality
+    // that the drift check is built on.
+    assert_eq!(
+        live.tables[&TableName::new("dbo", "status")],
+        normalized(&declared).tables[&TableName::new("dbo", "status")]
+    );
+
+    // Hand edits: a changed label, a NULL where the default was, a rogue row
+    // in the `exact` table, and an application row in the `ensure` table.
+    db.conn
+        .execute(
+            "UPDATE dbo.status SET label = N'Ancient', rank = 9 WHERE code = 'old';\n\
+             INSERT INTO dbo.status (code) VALUES ('rogue');\n\
+             INSERT INTO dbo.kind (status_code) VALUES ('new');",
+        )
+        .await
+        .expect("hand edits");
+    let again = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &again, &read)
+        .await
+        .expect("read rows");
+    let again = again.with_observed_rows(&observed, &scopes);
+
+    let status_rows = &again.tables[&TableName::new("dbo", "status")]
+        .data
+        .as_ref()
+        .unwrap()
+        .rows;
+    assert_eq!(
+        status_rows[&RowKey::from("old")],
+        [
+            ("label".to_owned(), text("Ancient")),
+            ("rank".to_owned(), Value::Int(9))
+        ]
+        .into_iter()
+        .collect::<Row>()
+    );
+    assert!(status_rows.contains_key(&RowKey::from("rogue")));
+    // `ensure` reads its keys and nothing else: the application's own row is
+    // invisible, exactly as the mode promises.
+    let kind_rows = &again.tables[&TableName::new("dbo", "kind")]
+        .data
+        .as_ref()
+        .unwrap()
+        .rows;
+    assert_eq!(kind_rows.len(), 1, "{kind_rows:?}");
+
+    // As drift: the differ phrases the hand edits as changes from the recorded
+    // state to the live one.
+    let drift = pbps_diff::diff_partial(
+        pbps_diff::Side {
+            schema: &live,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &again,
+            ids: &pbps_diff::observed_ids(&again, &ids),
+        },
+        &Mssql,
+        &pbps_model::Hints::default(),
+    );
+    assert!(drift.errors.is_empty(), "{:?}", drift.errors);
+    let described: Vec<String> = drift
+        .changes
+        .changes
+        .iter()
+        .map(|p| format!("{:?}", p.change))
+        .collect();
+    assert!(
+        described
+            .iter()
+            .any(|d| d.starts_with("UpdateRow") && d.contains("old")),
+        "{described:?}"
+    );
+    assert!(
+        described
+            .iter()
+            .any(|d| d.starts_with("InsertRow") && d.contains("rogue")),
+        "{described:?}"
+    );
+    assert_eq!(drift.changes.changes.len(), 2, "{described:?}");
+
+    // The pre-delete probe, against the catalog: kind 7 points at `old`, so
+    // deleting `old` is refused with a count of one — and a plan that moves
+    // kind 7 first is not.
+    let probe_for = |cs: &pbps_model::ChangeSet| {
+        Mssql
+            .preflight(cs)
+            .into_iter()
+            .find(|p| p.description.contains("row `old`"))
+            .expect("the delete carries a probe")
+    };
+    let delete = pbps_model::PlannedChange::new(pbps_model::Change::DeleteRow {
+        table: TableName::new("dbo", "status"),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+    });
+    let alone = pbps_model::ChangeSet {
+        changes: vec![delete.clone()],
+    };
+    let probe = probe_for(&alone);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 1, "kind 7 still points at `old`");
+
+    let moved = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                key: RowKey::from("7"),
+                columns: [(
+                    "status_code".to_owned(),
+                    (
+                        pbps_model::Cell::Value(text("old")),
+                        pbps_model::Cell::Value(text("new")),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            delete,
+        ],
+    };
+    let probe = probe_for(&moved);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "a row the plan moves is not counted");
+
+    // A table that has lost its key is unreadable, not empty.
+    db.conn
+        .execute("ALTER TABLE dbo.kind DROP CONSTRAINT fk_kind_status; DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.status') AND type = 'PK'); EXEC('ALTER TABLE dbo.status DROP CONSTRAINT ' + @pk);")
+        .await
+        .expect("drop the key");
+    let keyless = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let err = pbps_mssql::catalog::read_rows(&mut db.conn, &keyless, &read)
+        .await
+        .expect_err("rows without a key cannot be read");
+    assert!(err.to_string().contains("dbo.status"), "{err}");
+
+    db.drop().await;
+}

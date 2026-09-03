@@ -30,7 +30,7 @@ groups of commands:
 
 | Needs a database | Purpose |
 |---|---|
-| `pull` | Reverse-generate declarations from an existing database |
+| `pull` (`--data <table>`) | Reverse-generate declarations from an existing database; `--data` also declares a table's rows as reference data |
 | `plan --db` / `--env` (`--staged`) | The applyable plan for one environment |
 | `apply --plan --allow` | Run an approved plan, in one transaction |
 | `apply --staged` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
