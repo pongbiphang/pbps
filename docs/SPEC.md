@@ -409,7 +409,7 @@ leading key `role:` is the name, unqualified, because a role is a principal and
 not an object in a schema.
 
 ```yaml
-# schema/app_reader.role.yml
+# schema/roles/app_reader.yml
 role: app_reader
 grants:
   dbo.customer:     [select]

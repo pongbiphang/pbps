@@ -578,3 +578,20 @@ SPEC is in sync with all of these.
     the collation), so the projection refuses it (`RowConflict`) and every
     connected command reports it by both names. One side spelling `01` and
     the other `1` is not a conflict: each side is asked about its own keys.
+75. **A connected plan is pinned under the recorded scopes plus the tables it
+    covers for the first time.** The baseline checksum was the drift check's
+    view — rows under the *recorded* scopes — so a table gaining its first
+    `data:` block had its rows measured by the differ and pinned by nothing:
+    a row inserted there between plan and apply passed `apply`'s check and,
+    under `exact`, outlived the approved deletes. The drift check keeps its
+    view (it compares against the recorded snapshot and must); the baseline
+    and `apply` read the union (`pinned_scopes`: the recorded scope where
+    there is one, the plan's where there is none) under the same reference,
+    so the two checksums are computed over the same rows.
+76. **Role files live in `roles/`, not under a `.role.yml` suffix.** A table
+    `app_reader.role` is a legal name and its file is `app_reader.role.yml`
+    — the role `app_reader`'s file exactly — so `pull` wrote the role over
+    the table without a word. No table file is ever written under `roles/`,
+    so the two can no longer name one path; the loader finds every `.yml`
+    under the schema directory and tells a role by its content, so a
+    hand-written role file anywhere still loads.

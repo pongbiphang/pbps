@@ -96,14 +96,26 @@ pub fn parse_hhmm(s: &str) -> Result<u32, String> {
     Ok(h * 60 + m)
 }
 
-/// `mon`, `tue`, ... as Monday-based indexes.
+/// `mon` / `monday`, `tue` / `tuesday`, ... as Monday-based indexes.
+///
+/// Exact, not a prefix: `money` and `mondayx` are typos in a change window,
+/// and a window that read them as Monday would admit or refuse a plan on the
+/// wrong day instead of reporting the policy as malformed.
 pub fn parse_weekday(s: &str) -> Result<u32, String> {
-    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    const DAYS: [(&str, &str); 7] = [
+        ("mon", "monday"),
+        ("tue", "tuesday"),
+        ("wed", "wednesday"),
+        ("thu", "thursday"),
+        ("fri", "friday"),
+        ("sat", "saturday"),
+        ("sun", "sunday"),
+    ];
     let key = s.trim().to_ascii_lowercase();
     DAYS.iter()
-        .position(|d| key.starts_with(d))
+        .position(|(short, long)| key == *short || key == *long)
         .map(|p| p as u32)
-        .ok_or_else(|| format!("`{s}` is not a weekday like `mon`"))
+        .ok_or_else(|| format!("`{s}` is not a weekday like `mon` or `monday`"))
 }
 
 /// `YYYY-MM-DD`, checked for shape and range only.
@@ -177,6 +189,10 @@ mod tests {
         assert_eq!(parse_weekday("Mon").unwrap(), 0);
         assert_eq!(parse_weekday("sunday").unwrap(), 6);
         assert!(parse_weekday("someday").is_err());
+        // A typo that begins with a day is still a typo.
+        assert!(parse_weekday("money").is_err());
+        assert!(parse_weekday("mondayx").is_err());
+        assert!(parse_weekday("mo").is_err());
         assert_eq!(parse_date("2026-12-31").unwrap(), (2026, 12, 31));
         assert!(parse_date("31/12/2026").is_err());
         assert!(parse_date("2026-13-01").is_err());

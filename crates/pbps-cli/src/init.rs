@@ -425,6 +425,10 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         }
         for (name, role) in &prepared.schema.roles {
             let path = declaration_file::role_path(&schema_dir, name)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot stage `{}`", parent.display()))?;
+            }
             std::fs::write(&path, pbps_load::render_role(name, role, &[]))
                 .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }

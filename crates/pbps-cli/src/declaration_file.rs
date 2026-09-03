@@ -51,14 +51,18 @@ fn escape_reserved_stem(encoded: String) -> String {
     format!("%{:02X}{rest}", first.as_bytes()[0])
 }
 
-/// The file a role is written to: `<name>.role.yml`, with the same encoding
+/// The file a role is written to: `roles/<name>.yml`, with the same encoding
 /// as an object name's components and the same hashed fallback.
 ///
-/// A role has no schema, so the `.role` suffix is what keeps it apart from a
-/// table called the same thing — `app_reader.yml` would otherwise be read as
-/// a table file whose name has no schema, which the loader refuses.
+/// A directory of its own, not a suffix. `<name>.role.yml` was the first
+/// cut, and a table `app_reader.role` produces exactly `app_reader.role.yml`,
+/// so `pull` wrote the role over the table without a word. No table file is
+/// ever written under `roles/` (a table's file is `<schema>.<name>.yml` at
+/// the top), so the two can no longer name one path. The loader reads
+/// every `.yml` under the schema directory and tells a role by its content,
+/// so a hand-written role file elsewhere still loads.
 pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let readable = format!("{}.role.yml", escape_reserved_stem(component(name)));
+    let readable = format!("{}.yml", escape_reserved_stem(component(name)));
     let file = if readable.len() <= 240 {
         readable
     } else {
@@ -66,11 +70,12 @@ pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
         hasher.update(name.as_bytes());
         hasher.update([0]);
         hasher.update(b"role");
-        format!("~pbps-{:x}.role.yml", hasher.finalize())
+        format!("~pbps-{:x}.yml", hasher.finalize())
     };
-    let path = dir.join(&file);
-    if path.parent() != Some(dir) {
-        bail!("refusing to write `{file}` outside `{}`", dir.display());
+    let roles = dir.join("roles");
+    let path = roles.join(&file);
+    if path.parent() != Some(roles.as_path()) {
+        bail!("refusing to write `{file}` outside `{}`", roles.display());
     }
     Ok(path)
 }
@@ -124,6 +129,21 @@ pub fn path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `app_reader.role` is a legal table name whose file used to be the
+    /// role `app_reader`'s file; `pull` then wrote one over the other.
+    #[test]
+    fn a_role_file_cannot_share_a_path_with_any_table_file() {
+        let dir = Path::new("schema");
+        let role = role_path(dir, "app_reader").unwrap();
+        assert_eq!(role, dir.join("roles").join("app_reader.yml"));
+        let table = path(dir, &"app_reader.role".parse().unwrap(), None).unwrap();
+        assert_ne!(role, table);
+        assert_eq!(table, dir.join("app_reader.role.yml"));
+        // A role named after a table's file still lands beside the roles.
+        let role = role_path(dir, "dbo.customer").unwrap();
+        assert!(role.starts_with(dir.join("roles")), "{}", role.display());
+    }
 
     #[test]
     fn ordinary_names_stay_readable() {

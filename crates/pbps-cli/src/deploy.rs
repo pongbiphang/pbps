@@ -152,6 +152,23 @@ fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, Da
     ))
 }
 
+/// The scopes a plan's baseline is pinned under: the recorded ones, plus the
+/// plan's own for every table the recorded state does not cover yet.
+///
+/// A table gaining its first `data:` block has rows the differ measured
+/// against and the recorded state knows nothing of. The baseline checksum
+/// and `apply`'s check both read this union — the recorded scope where there
+/// is one (the drift check's view), the plan's where there is none — so a row
+/// that appears in such a table between plan and apply is a mismatch, not a
+/// row the approved deletes silently missed.
+fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
+    let mut out = recorded.clone();
+    for (name, scope) in planned {
+        out.entry(name.clone()).or_insert_with(|| scope.clone());
+    }
+    out
+}
+
 /// The plan's data scopes under the names the catalog has *now*.
 ///
 /// `plan.data` is keyed by each table's final name. Halfway through a staged
@@ -1054,9 +1071,22 @@ pub fn cmd_plan_db(
             eprintln!("warning: {w}");
         }
 
+        // What the plan is pinned to is wider than what the drift check
+        // compared: the rows of a table the declarations cover for the first
+        // time were read (the differ measured against them) but are not in
+        // the recorded scope, and a baseline that left them out would let a
+        // row inserted between plan and apply slip past `apply`'s check —
+        // and, for `exact`, survive the approved deletes. `apply` reads the
+        // same union (`pinned_scopes`) under the same reference.
+        let pinned = scoped.schema.with_observed_rows(
+            &managed.rows,
+            &pinned_scopes(&recorded_data, &declared_data),
+            &entry.snapshot.schema,
+        )?;
+        let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         Ok((
             cs,
-            live,
+            baseline,
             format!("{} as queried (entry #{})", target.label, entry.id),
         ))
     })?;
@@ -1333,7 +1363,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &recorded_ids,
         &recorded_modules,
         project.config.unmanaged,
-        &entry.snapshot.schema.data_scopes(),
+        &pinned_scopes(&entry.snapshot.schema.data_scopes(), &plan.data),
         &entry.snapshot.schema,
     )
     .await?;
@@ -1514,7 +1544,7 @@ async fn apply_staged_under_lock(
             &recorded_ids,
             &recorded_modules,
             project.config.unmanaged,
-            &entry.snapshot.schema.data_scopes(),
+            &pinned_scopes(&entry.snapshot.schema.data_scopes(), &plan.data),
             &entry.snapshot.schema,
         )
         .await?;
@@ -1874,6 +1904,37 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
 mod tests {
     use super::*;
     use pbps_model::{DataMode, DataScope};
+
+    /// The recorded scope wins where there is one; a table only the plan
+    /// covers is pinned under the plan's.
+    #[test]
+    fn a_baseline_is_pinned_under_the_recorded_scopes_plus_the_newly_covered() {
+        let t: TableName = "dbo.t".parse().unwrap();
+        let u: TableName = "dbo.u".parse().unwrap();
+        let recorded: DataScopes = [(
+            t.clone(),
+            DataScope {
+                mode: DataMode::Ensure,
+                keys: ["a"].into_iter().map(pbps_model::RowKey::from).collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        let planned: DataScopes = [(t.clone(), exact.clone()), (u.clone(), exact.clone())]
+            .into_iter()
+            .collect();
+        let pinned = pinned_scopes(&recorded, &planned);
+        assert_eq!(
+            pinned[&t], recorded[&t],
+            "the recorded scope, not the plan's"
+        );
+        assert_eq!(pinned[&u], exact, "newly covered: the plan's");
+        assert_eq!(pinned.len(), 2);
+    }
 
     /// Halfway through a rename that moves both schema and name, the table
     /// stands at neither end; the checkpoint's scope has to stand there too.

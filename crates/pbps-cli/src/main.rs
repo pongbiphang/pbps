@@ -1067,6 +1067,10 @@ fn cmd_pull(
     // objects pbps can express.
     for (name, role) in &pulled.schema.roles {
         let path = declaration_file::role_path(&dir, name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create `{}`", parent.display()))?;
+        }
         std::fs::write(&path, pbps_load::render_role(name, role, &[]))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);

@@ -5045,6 +5045,82 @@ data:
         stdout(&o)
     );
 
+    // A table gaining its first `data:` block: its rows are pinned by the
+    // plan too, so a row that appears between plan and apply is refused —
+    // under `exact`, that row would otherwise outlive the approved deletes.
+    let u_path = d.dir.join("schema/dbo.u.yml");
+    std::fs::write(
+        &u_path,
+        "table: dbo.u\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_u, columns: [code]}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan2 = d.dir.join("plan2.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan2.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan2.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    std::fs::write(
+        &u_path,
+        "table: dbo.u\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_u, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    a: {}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan3 = d.dir.join("plan3.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan3.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    sql("INSERT INTO dbo.u (code) VALUES ('rogue');");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan3.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        code(&o),
+        0,
+        "a row that appeared after the plan: {}",
+        stdout(&o)
+    );
+    assert!(
+        stderr(&o).contains("no longer the database this plan was computed against"),
+        "{}",
+        stderr(&o)
+    );
+    // Put back the way the plan saw it, the same plan applies.
+    sql("DELETE FROM dbo.u WHERE code = 'rogue';");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan3.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
     // The block comes back out in the engine's spelling: the default-valued
     // label is omitted, the explicit one is kept.
     let fresh = Demo::new("refdata-pull");
