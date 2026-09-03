@@ -625,7 +625,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
-        "version": 3,
+        "version": 4,
         "kind": "baseline",
         "schema": { "tables": { "dbo.t": { "columns": {
             "id": { "type": "bigint", "nullable": false }

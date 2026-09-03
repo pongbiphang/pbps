@@ -28,7 +28,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{DialectError, Probe};
-use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg};
+use pbps_model::{
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Value,
+};
 
 use crate::emit::qualified;
 use crate::ident::{literal, quote};
@@ -80,13 +82,16 @@ struct Moved {
     key_column: String,
     /// Deleted: gone whatever they referenced.
     deleted: BTreeSet<RowKey>,
-    /// Column set by an update -> the keys of the rows it is set in. An
-    /// update that sets the *referencing* column moves the row off the
-    /// parent; one that sets any other column leaves it pointing where it
-    /// was, and with `ON DELETE CASCADE` the engine would then delete it
-    /// silently — the first cut excluded every updated row and let exactly
-    /// that through.
-    updated: BTreeMap<String, BTreeSet<RowKey>>,
+    /// Column set by an update -> the keys of the rows it is set in, with
+    /// the value each is set to (`None` for `DEFAULT` or NULL, which no
+    /// probe can compare). An update that sets the *referencing* column to
+    /// a value that is not the deleted key moves the row off the parent; one
+    /// that sets any other column, or sets it to the same key under another
+    /// spelling (`01` for `1`, `OLD` for `old` under a case-insensitive
+    /// collation), leaves it pointing where it was, and with `ON DELETE
+    /// CASCADE` the engine would then delete it silently. Whether two
+    /// spellings are one key is the engine's call, so the probe asks it.
+    updated: BTreeMap<String, BTreeMap<RowKey, Option<String>>>,
 }
 
 impl AsStored {
@@ -113,12 +118,18 @@ impl AsStored {
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
-                    for column in columns.keys() {
+                    for (column, (_, after)) in columns {
+                        let value = match after {
+                            Cell::Value(Value::Text(t)) => Some(t.clone()),
+                            Cell::Value(Value::Int(i)) => Some(i.to_string()),
+                            Cell::Value(Value::Bool(b)) => Some(b.to_string()),
+                            Cell::Value(Value::Null) | Cell::Default(_) => None,
+                        };
                         moved
                             .updated
                             .entry(column.clone())
                             .or_default()
-                            .insert(key.clone());
+                            .insert(key.clone(), value);
                     }
                 }
                 Change::DeleteRow {
@@ -442,28 +453,49 @@ fn delete_probe(
             continue;
         };
         let key_sql = quote(&stored_key.name)?;
-        let not_in = |keys: &BTreeSet<RowKey>| {
-            let list: Vec<String> = keys.iter().map(|k| literal(k.as_str())).collect();
+        let parent = qualified(&stored.table)?;
+        // Deleted rows are gone whatever they pointed at.
+        let deleted = (!moved.deleted.is_empty()).then(|| {
+            let list: Vec<String> = moved.deleted.iter().map(|k| literal(k.as_str())).collect();
             literal(&format!(" AND {key_sql} NOT IN ({})", list.join(", ")))
-        };
+        });
         let mut per_column = Vec::new();
-        for (column, keys) in &moved.updated {
+        for (column, rows) in &moved.updated {
             let Some(stored_column) = names.column(&child.column(column)) else {
                 continue;
             };
-            let mut keys = keys.clone();
-            keys.extend(moved.deleted.iter().cloned());
+            // The fragment is assembled at run time from literal pieces and
+            // `QUOTENAME(rc.name)`, the referenced column the catalog query
+            // has in hand: an updated row is left out only when the value it
+            // is set to is *not* the deleted key — as the engine compares
+            // them, through the parent table, so `01` and `1` are one key.
+            // A row set to DEFAULT or NULL cannot be compared and is
+            // counted, which is the direction to be wrong in.
+            let mut pieces: Vec<String> = deleted.iter().cloned().collect();
+            for (child_key, after) in rows {
+                let Some(after) = after else {
+                    continue;
+                };
+                pieces.push(literal(&format!(
+                    " AND NOT ({key_sql} = {} AND NOT EXISTS (SELECT 1 FROM {parent} WHERE ",
+                    literal(child_key.as_str())
+                )));
+                pieces.push("QUOTENAME(rc.name)".to_owned());
+                pieces.push(literal(&format!(" = {} AND ", literal(after))));
+                pieces.push("QUOTENAME(rc.name)".to_owned());
+                pieces.push(literal(" = @key))"));
+            }
+            let then = if pieces.is_empty() {
+                "N''".to_owned()
+            } else {
+                pieces.join(" + ")
+            };
             per_column.push(format!(
-                "WHEN c.name = {} THEN {}",
-                literal(&stored_column.name),
-                not_in(&keys)
+                "WHEN c.name = {} THEN {then}",
+                literal(&stored_column.name)
             ));
         }
-        let otherwise = if moved.deleted.is_empty() {
-            "N''".to_owned()
-        } else {
-            not_in(&moved.deleted)
-        };
+        let otherwise = deleted.clone().unwrap_or_else(|| "N''".to_owned());
         let clause = if per_column.is_empty() {
             otherwise
         } else {
@@ -913,12 +945,19 @@ mod tests {
         // the foreign key on the column the update sets; any other foreign
         // key from that table still counts the row.
         assert!(
+            sql.contains("WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = N'status_code' THEN"),
+            "{sql}"
+        );
+        // The row is left out only if the engine says `new` is not the
+        // deleted key, looked up through the parent table.
+        assert!(
             sql.contains(
-                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = \
-                 N'status_code' THEN N' AND [id] NOT IN (N''7'')' ELSE N'' END"
+                "N' AND NOT ([id] = N''7'' AND NOT EXISTS (SELECT 1 FROM [dbo].[status] WHERE ' + \
+                 QUOTENAME(rc.name) + N' = N''new'' AND ' + QUOTENAME(rc.name) + N' = @key))'"
             ),
             "{sql}"
         );
+        assert!(sql.contains("ELSE N'' END"), "{sql}");
     }
 
     /// An update that sets some other column leaves the row pointing where
@@ -963,10 +1002,11 @@ mod tests {
         // Row 8 is deleted: excluded for every column. Row 7 is excluded
         // only where `note` is the referencing column, which it never is.
         assert!(
-            sql.contains(
-                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = N'note' \
-                 THEN N' AND [id] NOT IN (N''7'', N''8'')' ELSE N' AND [id] NOT IN (N''8'')' END"
-            ),
+            sql.contains("CASE WHEN c.name = N'note' THEN N' AND [id] NOT IN (N''8'')' + N' AND NOT ([id] = N''7''"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ELSE N' AND [id] NOT IN (N''8'')' END"),
             "{sql}"
         );
     }

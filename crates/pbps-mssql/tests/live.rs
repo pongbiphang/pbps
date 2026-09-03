@@ -2172,6 +2172,43 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .unwrap();
     assert_eq!(n, 0, "a row the plan moves is not counted");
 
+    // An update that sets the referencing column to the *same* key under
+    // another spelling — `OLD` for `old`, one key to a case-insensitive
+    // collation — moves nothing, and the engine, not this crate, is the one
+    // that knows. Counted.
+    let same_key = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                key: RowKey::from("7"),
+                columns: [(
+                    "status_code".to_owned(),
+                    (
+                        pbps_model::Cell::Value(text("old")),
+                        pbps_model::Cell::Value(text("OLD")),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    let probe = probe_for(&same_key);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "`OLD` is `old` to the engine: the row still points at it"
+    );
+
     // An update that sets some other column of kind 7 leaves it pointing at
     // `old`: still counted. The first cut excluded every updated row, and
     // under ON DELETE CASCADE that was a silent delete.

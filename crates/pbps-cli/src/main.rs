@@ -981,7 +981,15 @@ fn cmd_pull(
                 // report success about files the next command refuses — a
                 // binary cell, say (DECISIONS 70). Refused here, before any
                 // declaration is written.
-                let problems = pbps_mssql::validate::table(&name, table);
+                // Both halves of `validate`: the model's rules for a block
+                // (a non-key IDENTITY column the rows must not set, say)
+                // and the dialect's.
+                let mut problems: Vec<String> = pbps_model::data::check(&name, table);
+                problems.extend(
+                    pbps_mssql::validate::table(&name, table)
+                        .iter()
+                        .map(ToString::to_string),
+                );
                 if !problems.is_empty() {
                     anyhow::bail!(
                         "--data {name}: this table's rows cannot be declared as a `data:` \

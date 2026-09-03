@@ -22,9 +22,13 @@ use crate::schema::Schema;
 /// side by the checkpoint's — two different sets of objects — and refuse the
 /// resume with a checksum mismatch it cannot explain.
 ///
+/// Bumped to 4 when `Schema` grew `roles` (ADR-0005), for the reason 2 was:
+/// an older client would drop the field, compare every table and no role,
+/// and report no drift about grants it never looked at.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

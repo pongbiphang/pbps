@@ -745,8 +745,11 @@ pub fn cmd_bootstrap(
             .filter(|(n, _)| declared_modules.contains(n))
             .map(|(_, why)| why.as_str())
             .collect();
+        // And roles (ADR-0005): `CREATE ROLE` fails on one that is already
+        // there, after everything before it in the batch has run.
         if !existing.scoped.schema.tables.is_empty()
             || !existing.scoped.schema.modules.is_empty()
+            || !existing.scoped.schema.roles.is_empty()
             || !unreadable_declared.is_empty()
         {
             let names: Vec<String> = existing
@@ -762,6 +765,14 @@ pub fn cmd_bootstrap(
                         .modules
                         .keys()
                         .map(ToString::to_string),
+                )
+                .chain(
+                    existing
+                        .scoped
+                        .schema
+                        .roles
+                        .keys()
+                        .map(|r| format!("role {r}")),
                 )
                 .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
                 .collect();

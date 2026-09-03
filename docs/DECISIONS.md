@@ -648,3 +648,26 @@ SPEC is in sync with all of these.
     plan is refused by name with the `ALTER AUTHORIZATION` to run by hand:
     moving ownership is a decision about who owns a schema, not a
     consequence of a drop pbps gets to make.
+84. **The state snapshot is version 4, because the schema gained roles.**
+    Adding `roles` to `Schema` under version 3 let an older binary read a
+    newer snapshot with serde dropping the field: its `verify` compared
+    every table and no role, and said "no drift" about grants it never
+    looked at. A reader refuses a version it does not know, so the bump is
+    what turns a partial reading into a refusal. The ids file stays at
+    version 1 (its `roles` section is a compatible evolution by design), and
+    an older binary meets the role *files* first, which it refuses to load.
+85. **The pre-delete probe lets the engine say whether an update moves a
+    row off the deleted key.** 73 excluded an updated row for the column its
+    update sets; an update that set the referencing column to the same key
+    under another spelling (`01` for `1`, `OLD` for `old` under a
+    case-insensitive collation) was excluded too, and cascaded. The
+    exclusion now asks the parent table, at run time, whether the value the
+    row is set to *is* the deleted key — the comparison the engine makes —
+    and a row set to `DEFAULT` or NULL, which no probe can compare, is
+    counted. Measured on a live server with `OLD` against `old`.
+86. **`bootstrap`'s empty-target guard counts roles, and `pull --data` runs
+    the model's data rules.** Two guards that stopped one object short: a
+    declared role already standing in the target passed the "is it empty"
+    question and failed at `CREATE ROLE`; a pulled block that set a non-key
+    IDENTITY column passed the dialect's check and was refused by the
+    model's on the next `validate`. Both ask the whole question now.
