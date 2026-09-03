@@ -1574,6 +1574,46 @@ fn bootstrap_honours_declared_module_dependencies() {
     assert!(first < second, "dependency order was discarded:\n{sql}");
 }
 
+/// Bootstrap builds what the identity file knows; a declared role (or
+/// table) it does not know would be skipped silently, and the empty state
+/// recorded as the whole one. Refused by name, with `pbps plan` as the
+/// remedy (DECISIONS 109).
+#[test]
+fn bootstrap_refuses_a_declared_object_the_identity_file_does_not_know() {
+    let d = Demo::new("bootids");
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("reporting.yml"),
+        "role: reporting\ngrants:\n  schema::dbo: [select]\n",
+    )
+    .unwrap();
+    // A role-only project, never planned: the identity file is empty.
+    let sql_path = d.dir.join("boot.sql");
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("role reporting") && stderr(&o).contains("pbps plan"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!sql_path.exists(), "nothing was written");
+
+    // Planned, it builds; a table added after that plan is refused the same
+    // way, by name.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        std::fs::read_to_string(&sql_path)
+            .unwrap()
+            .contains("CREATE ROLE [reporting]")
+    );
+    d.table(ONE_COLUMN);
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("dbo.t"), "{}", stderr(&o));
+}
+
 // ---- Phase 3.1: one machine-readable shape, and three exit codes ----
 
 /// The whole point of the JSON view is that a frontend can point at the line

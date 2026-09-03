@@ -233,6 +233,61 @@ pub(crate) async fn refuse_misspelt(conn: &mut Conn, schema: &Schema) -> anyhow:
     );
 }
 
+/// The key-column type changes in `cs` on tables whose declared keys were
+/// matched to their rows under a different spelling (`01` for a stored `1`
+/// under `int`), one line each. The alias mapping holds under the type the
+/// column has now; changed to `varchar`, the stored `1` is not `01`, the
+/// plan emits no row change, and an `ensure` block inserts a duplicate on
+/// the next run (DECISIONS 108).
+fn key_type_changes_over_aliases(
+    cs: &pbps_model::ChangeSet,
+    declared_live: &Schema,
+    rows: &pbps_model::ObservedRows,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in &cs.changes {
+        let pbps_model::Change::AlterColumnType {
+            column, from, to, ..
+        } = &p.change
+        else {
+            continue;
+        };
+        let Some(table) = declared_live.tables.get(&column.table) else {
+            continue;
+        };
+        let is_key = table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.columns.as_slice() == [column.name.clone()]);
+        if !is_key {
+            continue;
+        }
+        let aliased: Vec<String> = rows
+            .get(&column.table)
+            .map(|t| {
+                t.aliases
+                    .iter()
+                    .filter(|(requested, canonical)| requested != canonical)
+                    .map(|(requested, canonical)| {
+                        format!("`{requested}` (stored as `{canonical}`)")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !aliased.is_empty() {
+            out.push(format!(
+                "{}: this plan changes the type of its key column `{}` ({from} -> {to}), and \
+                 these declared keys are spelled differently from the way the engine spells \
+                 them: {}",
+                column.table,
+                column.name,
+                aliased.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 /// Brings the objects a committed statement created into the live identities,
 /// under the uids the plan gave them, so the checkpoint taken next scopes
 /// them in. Before this, a role or a table the plan had just created stood
@@ -764,10 +819,35 @@ pub fn cmd_bootstrap(
     let dialect = crate::dialect(project)?;
     let declared_modules = managed_modules(None, Some(&loaded.schema));
 
-    if ids.tables.is_empty() && !loaded.schema.tables.is_empty() {
+    // Every declared object needs its identity, not just "some": a role the
+    // ids file does not know is skipped by the differ, and a bootstrap that
+    // skipped it built less than the declarations say and recorded that as
+    // the whole state. `pbps plan` mints what is missing (DECISIONS 109).
+    let unidentified: Vec<String> = loaded
+        .schema
+        .tables
+        .keys()
+        .filter(|t| ids.table_uid(t).is_none())
+        .map(ToString::to_string)
+        .chain(
+            loaded
+                .schema
+                .roles
+                .keys()
+                .filter(|r| ids.role_uid(r).is_none())
+                .map(|r| format!("role {r}")),
+        )
+        .collect();
+    if !unidentified.is_empty() {
         bail!(
-            "the identity file names no tables, so there is nothing to build from.\n\
-             Run `pbps plan` first to mint identities for the declarations."
+            "the identity file does not know {}: {}.\n\
+             Run `pbps plan` first to mint identities for the declarations.",
+            if unidentified.len() == 1 {
+                "a declared object"
+            } else {
+                "these declared objects"
+            },
+            unidentified.join(", ")
         );
     }
 
@@ -1170,6 +1250,20 @@ pub fn cmd_plan_db(
             }
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
+
+        // The keys were matched to the rows under the type the key column has
+        // now (71); a plan that changes that type would carry the mapping
+        // into a type that does not make it (DECISIONS 108).
+        let over_aliases = key_type_changes_over_aliases(&cs, &declared_live, &managed.rows);
+        if !over_aliases.is_empty() {
+            bail!(
+                "{}\n\
+                 The declared keys were matched to the rows under the type the key column has \
+                 now, and the new type may not read them the same way. Write each key as the \
+                 engine spells it, apply that, then change the type.",
+                over_aliases.join("\n")
+            );
+        }
 
         // A role this plan drops still has this environment's members, which
         // the engine will not drop it over. They are read here and written
@@ -2304,6 +2398,71 @@ mod tests {
                 .map(pbps_model::RowKey::from)
                 .collect()
         );
+    }
+
+    /// The mapping from `01` to the stored `1` holds under `int`; a plan
+    /// that makes the column `varchar` is refused while it stands, and a
+    /// plan on a table whose keys are spelled the engine's way is not.
+    #[test]
+    fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
+        use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, PlannedChange};
+        use std::str::FromStr;
+        let table: TableName = "dbo.t".parse().unwrap();
+        let mut declared = Schema::default();
+        let mut t = pbps_model::Table::default();
+        t.columns.insert(
+            "id".into(),
+            pbps_model::Column::new(ColumnType::from_str("varchar(10)").unwrap()).not_null(),
+        );
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        declared.tables.insert(table.clone(), t);
+        let change = |name: &str| {
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: ColumnRef::new(table.clone(), name),
+                from: ColumnType::from_str("int").unwrap(),
+                to: ColumnType::from_str("varchar(10)").unwrap(),
+                from_nullable: false,
+                to_nullable: false,
+            })
+        };
+        let cs = ChangeSet {
+            changes: vec![change("id")],
+        };
+        let mut rows = pbps_model::ObservedRows::new();
+        let mut observed = pbps_model::ObservedTable::default();
+        observed.aliases.insert(
+            pbps_model::RowKey::from("01"),
+            pbps_model::RowKey::from("1"),
+        );
+        observed
+            .aliases
+            .insert(pbps_model::RowKey::from("2"), pbps_model::RowKey::from("2"));
+        rows.insert(table.clone(), observed);
+
+        let found = key_type_changes_over_aliases(&cs, &declared, &rows);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("`01` (stored as `1`)"), "{}", found[0]);
+        assert!(
+            !found[0].contains("`2`"),
+            "a key spelled the engine's way: {}",
+            found[0]
+        );
+
+        // Not the key column: nothing to say. Keys all spelled the engine's
+        // way: nothing to say either.
+        let other = ChangeSet {
+            changes: vec![change("label")],
+        };
+        assert!(key_type_changes_over_aliases(&other, &declared, &rows).is_empty());
+        rows.get_mut(&table)
+            .unwrap()
+            .aliases
+            .remove(&pbps_model::RowKey::from("01"));
+        assert!(key_type_changes_over_aliases(&cs, &declared, &rows).is_empty());
     }
 
     /// Counted off the emitter's statements: every member before statement

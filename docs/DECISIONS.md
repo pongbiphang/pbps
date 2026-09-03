@@ -865,3 +865,21 @@ SPEC is in sync with all of these.
     case-insensitive collation. A column collation that differs from the
     database's is not modelled, and is the one thing this grouping cannot
     see.
+107. **A suppression's `until` is compared as it was validated.**
+    `parse_date` trims, the lexical comparison did not, and `" 2026-12-31"`
+    sorted before today: a future suppression expired at once, and a
+    trailing space kept one alive on its own day. One text for both.
+108. **A plan that changes the type of a key column is refused while a
+    declared key is spelled differently from the stored one.** The alias
+    mapping (71) holds under the type the column has now — `01` is the
+    stored `1` under `int` — and a plan that makes the column `varchar`
+    would carry that mapping into a type that does not make it: the base
+    row is rekeyed to `01`, no row change is emitted, and the next `ensure`
+    plan inserts a second row. Refused by name, with the remedy in order:
+    write the keys as the engine spells them, apply, then change the type.
+109. **`bootstrap` refuses a declared object the identity file does not
+    know.** The guard asked whether the ids file named *any* table; a
+    role-only project that had never run `pbps plan`, or a role added after
+    the last plan, was skipped by the differ, built nothing, and recorded
+    the empty state as the whole one. Every declared table and role needs
+    its uid, and the ones without are named.

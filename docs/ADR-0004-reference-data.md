@@ -223,7 +223,10 @@ Decisions taken during implementation that this document did not anticipate:
    is asked about the same way, since the question needs the type and not
    the table — and the same question groups the keys by what the engine
    reads them as, so two spellings of one row are refused there too, where
-   the alias query has no row to find (106).
+   the alias query has no row to find (106). A plan that changes the key column's type
+   while a declared key is spelled differently from the stored one is
+   refused, since the mapping between the two holds under the old type
+   only (108).
 6. **The pre-delete probe finds the referencing tables in the catalog at run
    time**, through `sys.foreign_keys` and dynamic SQL, rather than trusting
    the declarations to list them — a foreign key someone added by hand is

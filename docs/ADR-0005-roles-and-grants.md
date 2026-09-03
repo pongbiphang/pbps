@@ -233,6 +233,10 @@ Decisions taken during implementation that this document did not anticipate:
     beside the comparison: `verify` names it (with the `REVOKE GRANT OPTION
     FOR` to run by hand where that is the remedy), and `plan --db` refuses
     rather than plan over a role it cannot describe (DECISIONS 95, 97).
+16. **`bootstrap` refuses a declared role the identity file does not
+    know.** A role-only project that never ran `pbps plan` bootstrapped
+    nothing and recorded the empty state as the whole one; every declared
+    role, like every table, needs its uid first (DECISIONS 109).
 
 ## Placement
 

@@ -295,7 +295,9 @@ impl Policies {
         self.suppress.iter().any(|s| {
             s.rule == id
                 && s.on.as_deref().is_none_or(|on| Some(on) == subject)
-                && s.until.as_deref().is_none_or(|until| today < until)
+                // Compared as it was validated: `parse_date` trims, and a
+                // leading space would sort a future date before today.
+                && s.until.as_deref().is_none_or(|until| today < until.trim())
         })
     }
 }
@@ -416,6 +418,16 @@ mod tests {
         );
         assert!(p.suppressed("grant.widen", Some("role r"), "2030-01-01"));
         assert!(p.suppressed("grant.widen", None, "2030-01-01"));
+        // Whitespace around the date passes validation, which trims; the
+        // comparison has to see the same text, or a leading space makes a
+        // future suppression expire today and a trailing one outlive its day.
+        let padded = block(
+            r#"{"suppress": [
+                {"rule": "naming.column", "reason": "x", "until": " 2026-12-31 "}]}"#,
+        );
+        assert!(padded.check().is_empty());
+        assert!(padded.suppressed("naming.column", None, "2026-09-03"));
+        assert!(!padded.suppressed("naming.column", None, "2026-12-31"));
     }
 
     /// A rule switched on without what it runs on is refused, in either
