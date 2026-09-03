@@ -141,6 +141,10 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         hooks: Hooks::default(),
         unmanaged: Unmanaged::Ignore,
         dev: None,
+        // Left to the default: a new project has no reference data yet, and a
+        // number written into every generated pbps.yml is one more line to
+        // explain in the first hour.
+        max_data_rows: None,
     };
     let config_text = render_config(&config);
 
@@ -667,6 +671,7 @@ mod tests {
             hooks: Hooks::default(),
             unmanaged: Unmanaged::Ignore,
             dev: None,
+            max_data_rows: None,
         };
         let text = render_config(&config);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");

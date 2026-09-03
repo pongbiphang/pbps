@@ -99,7 +99,13 @@ impl RenameTarget {
                 | Change::AddIndex { .. }
                 | Change::DropIndex { .. }
                 | Change::CreateModule { .. }
-                | Change::AlterModule { .. } => None,
+                | Change::AlterModule { .. }
+                // Row changes move no name: a row's identity is its key, and a
+                // changed key is a delete plus an insert, not a rename.
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. } => None,
             })
             .collect()
     }

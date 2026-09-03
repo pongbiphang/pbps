@@ -38,7 +38,9 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+// 2: the `data:` block (ADR-0004). An editor notices — it completes a block
+//    that did not exist — which is exactly the criterion above.
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {

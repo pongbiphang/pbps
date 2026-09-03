@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 
+use crate::data::TableData;
 use crate::module::{Module, ObjectName};
 use crate::name::TableName;
 use crate::types::ColumnType;
@@ -70,6 +71,18 @@ pub struct Table {
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub indexes: BTreeMap<String, Index>,
+
+    /// Declared reference data (ADR-0004).
+    ///
+    /// `None` — the overwhelmingly common case — is the opt-in switch being
+    /// off: pbps touches no row of a table that does not declare one. It lives
+    /// inside [`Table`] rather than beside the model because rows are desired
+    /// state that the database shows, so `==` must see them.
+    ///
+    /// Defaulted on read: every snapshot and plan written before `data:`
+    /// existed describes a table that declares no rows, not a broken file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<TableData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

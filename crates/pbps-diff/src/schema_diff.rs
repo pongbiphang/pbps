@@ -24,9 +24,10 @@
 use std::collections::BTreeMap;
 
 use pbps_dialect::Dialect;
+use pbps_model::change::DeleteCause;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, ColumnType, Hints, IdsFile, ObjectName, PlannedChange, Schema,
-    Table, TableName, Uid,
+    Change, ChangeSet, ColumnRef, ColumnType, DataMode, Hints, IdsFile, ObjectName, PlannedChange,
+    Row, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -38,6 +39,15 @@ pub enum DiffError {
         "the IDENTITY property of {column} changed, but IDENTITY cannot be modified with ALTER"
     )]
     IdentityChangeUnsupported { column: ColumnRef },
+
+    /// A `data:` block on a table whose primary key cannot key its rows
+    /// (ADR-0004). `validate` says the same thing against the file and the
+    /// line; this is here so that a differ reached another way never quietly
+    /// produces a plan with the rows left out of it.
+    #[error(
+        "{table} declares `data:` but has no single-column primary key, so its rows have no identity"
+    )]
+    DataWithoutKey { table: TableName },
 }
 
 /// One side's complete input: a state plus its own identity mapping.
@@ -130,6 +140,26 @@ pub fn diff_partial(
                     constraint: Box::new(fk),
                 });
             }
+            // Rows are split out of the CREATE for the same reason the
+            // foreign keys above are: they are separate statements in a
+            // separate ordering class, and a `CreateTable` carrying rows would
+            // give the emitter a second place to produce DML.
+            match (&table.data, table.primary_key.as_ref()) {
+                (Some(data), Some(pk)) if pk.columns.len() == 1 => {
+                    for (key, row) in &data.rows {
+                        changes.push(Change::InsertRow {
+                            table: name.clone(),
+                            key_column: pk.columns[0].clone(),
+                            key: key.clone(),
+                            row: row.clone(),
+                        });
+                    }
+                }
+                (Some(_), _) => errs.push(DiffError::DataWithoutKey {
+                    table: name.clone(),
+                }),
+                (None, _) => {}
+            }
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -170,6 +200,13 @@ pub fn diff_partial(
             &mut errs,
         );
         diff_constraints(declared_name, base_table, declared_table, &mut changes);
+        diff_data(
+            declared_name,
+            base_table,
+            declared_table,
+            &mut changes,
+            &mut errs,
+        );
     }
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
@@ -208,10 +245,14 @@ pub fn diff_partial(
     // change's rendering. Debug output alone would sort by uid, which is random
     // at mint time — the plan would be correct but differently ordered per
     // project, and a reviewer diffing two plan.sql files would see noise.
+    // Rows follow the foreign keys among the tables that declare them. The
+    // declared side is the right one to read: a row being inserted is going
+    // into the schema as it will be, not as it was.
+    let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
     planned.sort_by_key(|p| {
         (
             order_key(&p.change),
-            module_rank(&p.change, &create_rank, &drop_rank),
+            dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank),
             p.change.table().to_string(),
             format!("{:?}", p.change),
         )
@@ -417,6 +458,130 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     }
 }
 
+/// Declared reference data (ADR-0004).
+///
+/// The comparison is by primary-key value, because that is all the identity a
+/// row has — no uid, no tombstone and no rename intent, since a row's entire
+/// content is declared and recreating one is therefore lossless (the
+/// generalized criterion of ADR-0005).
+///
+/// The asymmetry between the two modes is the whole point of having two:
+/// `exact` claims the declaration is the table, so a row the declaration does
+/// not mention is deleted; `ensure` claims only that the declared rows are
+/// there, so an undeclared row is invisible — SPEC §8.2's managed set, at row
+/// granularity.
+fn diff_data(
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+) {
+    if base.data.as_ref().map(|d| d.mode) != declared.data.as_ref().map(|d| d.mode) {
+        changes.push(Change::SetDataMode {
+            table: name.clone(),
+            from: base.data.as_ref().map(|d| d.mode),
+            to: declared.data.as_ref().map(|d| d.mode),
+        });
+    }
+
+    // Every row change names the column its key goes in, so without one there
+    // is nothing to emit and nothing to compare.
+    let key_column = match &declared.primary_key {
+        Some(pk) if pk.columns.len() == 1 => pk.columns[0].clone(),
+        _ if declared.data.is_some() => {
+            errs.push(DiffError::DataWithoutKey {
+                table: name.clone(),
+            });
+            return;
+        }
+        _ => return,
+    };
+
+    let Some(declared_data) = &declared.data else {
+        // The block was removed. Nothing is deleted and nothing is inserted:
+        // removing the opt-in means pbps stops managing these rows, and reading
+        // it as "delete them all" would make deleting a *declaration* destroy
+        // data — the one thing this tool must never do quietly.
+        return;
+    };
+
+    // No block on the base side means the table was not managed for rows
+    // before, so every declared row is compared against nothing and inserted.
+    // `exact` still deletes nothing here: what is in the table is unknown to
+    // the baseline, and only the connected drift comparison can see it.
+    let base_rows = base.data.as_ref().map(|d| &d.rows);
+
+    for (key, row) in &declared_data.rows {
+        match base_rows.and_then(|r| r.get(key)) {
+            None => changes.push(Change::InsertRow {
+                table: name.clone(),
+                key_column: key_column.clone(),
+                key: key.clone(),
+                row: row.clone(),
+            }),
+            Some(before) => {
+                // Only the columns that differ. An UPDATE restating a column
+                // that did not change would overwrite a value the declaration
+                // and the database already agree on, and would make plan.sql
+                // claim a change that is not one.
+                let mut columns = BTreeMap::new();
+                for column in declared.columns.keys() {
+                    let (b, d) = (cell(before, column), cell(row, column));
+                    if b != d {
+                        columns.insert(column.clone(), (b, d));
+                    }
+                }
+                if !columns.is_empty() {
+                    changes.push(Change::UpdateRow {
+                        table: name.clone(),
+                        key_column: key_column.clone(),
+                        key: key.clone(),
+                        columns,
+                    });
+                }
+            }
+        }
+    }
+
+    // `exact` only. `ensure` never emits a DELETE — that is the promise the
+    // mode makes to a table the application also writes to.
+    if declared_data.mode == DataMode::Exact
+        && let Some(base_rows) = base_rows
+    {
+        for key in base_rows.keys() {
+            if !declared_data.rows.contains_key(key) {
+                changes.push(Change::DeleteRow {
+                    table: name.clone(),
+                    key_column: key_column.clone(),
+                    key: key.clone(),
+                    cause: DeleteCause::Undeclared,
+                });
+            }
+        }
+    }
+}
+
+/// What a row says about one column.
+///
+/// An omitted column is not "no answer": it means the column's declared
+/// default, or NULL where there is none (see `pbps_model::Row`). Resolving both
+/// sides the same way here is what stops a row that spelled its NULL out
+/// comparing unequal to one that left it out — two spellings of one row, which
+/// would otherwise produce an UPDATE that changes nothing on every plan.
+fn cell(row: &Row, column: &str) -> Value {
+    row.get(column).cloned().unwrap_or(Value::Null)
+}
+
+/// Position in the dependency order, by table name.
+fn rank_of_tables(order: &[TableName]) -> BTreeMap<TableName, usize> {
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect()
+}
+
 /// Position in the dependency order, by name.
 fn rank_of(order: &[ObjectName]) -> BTreeMap<ObjectName, usize> {
     order
@@ -428,13 +593,15 @@ fn rank_of(order: &[ObjectName]) -> BTreeMap<ObjectName, usize> {
 
 /// Where a change sorts *within* its ordering class.
 ///
-/// Only module changes have anything to say here; everything else is zero and
-/// keeps the tiebreakers that were already there. Drops run in reverse creation
-/// order, so a dependent goes before the thing it depends on.
-fn module_rank(
+/// Modules and reference rows both have a dependency order among themselves;
+/// everything else is zero and keeps the tiebreakers that were already there.
+/// In both families the removing direction is the reverse of the creating one,
+/// so a dependent goes before the thing it depends on.
+fn dependency_rank(
     change: &Change,
     create_rank: &BTreeMap<ObjectName, usize>,
     drop_rank: &BTreeMap<ObjectName, usize>,
+    data_rank: &BTreeMap<TableName, usize>,
 ) -> isize {
     match change {
         Change::CreateModule { name, .. } | Change::AlterModule { name, .. } => {
@@ -459,7 +626,14 @@ fn module_rank(
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
-        | Change::DropIndex { .. } => 0,
+        | Change::DropIndex { .. }
+        | Change::SetDataMode { .. } => 0,
+        // Rows follow the foreign keys between their tables: a referenced
+        // table's rows go in first, and out last.
+        Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
+            data_rank.get(table).map_or(0, |r| *r as isize)
+        }
+        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
     }
 }
 
@@ -536,20 +710,31 @@ fn order_key(c: &Change) -> u8 {
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. } => 2,
-        Change::DropColumn { .. } => 3,
-        Change::DropTable { .. } => 4,
-        Change::CreateTable { .. } => 5,
-        Change::AddColumn { .. } => 6,
+        // Rows leave *after* the foreign keys that could block the delete and
+        // *before* the column and table drops, which may take the row with
+        // them anyway.
+        Change::DeleteRow { .. } => 3,
+        Change::DropColumn { .. } => 4,
+        Change::DropTable { .. } => 5,
+        Change::CreateTable { .. } => 6,
+        Change::AddColumn { .. } => 7,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 7,
-        Change::SetColumnDeprecated { .. } => 8,
+        | Change::AlterColumnDefault { .. } => 8,
+        Change::SetColumnDeprecated { .. } => 9,
+        // Rows arrive once every column they name exists and has its final
+        // type, and before the constraints below: ADR-0004's "create table ->
+        // insert rows -> add the foreign key that references them".
+        Change::InsertRow { .. } | Change::UpdateRow { .. } => 10,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
-        | Change::AddIndex { .. } => 9,
-        Change::CreateModule { .. } | Change::AlterModule { .. } => 10,
+        | Change::AddIndex { .. } => 11,
+        Change::CreateModule { .. } | Change::AlterModule { .. } => 12,
+        // Emits nothing; it exists so the recorded state matches the file. Last
+        // keeps it out of the way of everything that does emit.
+        Change::SetDataMode { .. } => 13,
     }
 }
 #[cfg(test)]
@@ -666,6 +851,265 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kinds(&honest), vec!["CreateTable"]);
+    }
+
+    // ---- Reference data (ADR-0004) ----
+
+    fn lookup(mode: DataMode, rows: &[(&str, &str)]) -> Table {
+        let mut t = table(&[
+            ("code", Column::new(ty("varchar(20)")).not_null()),
+            ("label", Column::new(ty("nvarchar(50)"))),
+        ]);
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        t.data = Some(pbps_model::TableData {
+            mode,
+            rows: rows
+                .iter()
+                .map(|(k, label)| {
+                    (
+                        pbps_model::RowKey::from(*k),
+                        [("label".to_owned(), Value::Text((*label).to_owned()))]
+                            .into_iter()
+                            .collect::<Row>(),
+                    )
+                })
+                .collect(),
+        });
+        t
+    }
+
+    fn row_ops(cs: &ChangeSet) -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::InsertRow { key, .. } => Some(format!("insert {key}")),
+                Change::UpdateRow { key, columns, .. } => Some(format!(
+                    "update {key} [{}]",
+                    columns.keys().cloned().collect::<Vec<_>>().join(",")
+                )),
+                Change::DeleteRow { key, cause, .. } => Some(format!("delete {key} {cause:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_row_that_is_not_there_is_inserted() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        assert_eq!(row_ops(&run(&base, &declared, &[])), ["insert new"]);
+    }
+
+    #[test]
+    fn only_the_columns_that_differ_reach_the_update() {
+        let base = schema_of(
+            "dbo.s",
+            lookup(DataMode::Exact, &[("new", "New"), ("shipped", "Shipped")]),
+        );
+        let declared = schema_of(
+            "dbo.s",
+            lookup(
+                DataMode::Exact,
+                &[("new", "Opened"), ("shipped", "Shipped")],
+            ),
+        );
+        // `shipped` is untouched, and `new` restates only `label`: an UPDATE
+        // that also set the columns which agree would overwrite values nobody
+        // asked to change.
+        assert_eq!(row_ops(&run(&base, &declared, &[])), ["update new [label]"]);
+    }
+
+    #[test]
+    fn exact_deletes_a_row_the_declaration_dropped() {
+        let base = schema_of(
+            "dbo.s",
+            lookup(DataMode::Exact, &[("new", "New"), ("old", "Old")]),
+        );
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        assert_eq!(
+            row_ops(&run(&base, &declared, &[])),
+            ["delete old Undeclared"]
+        );
+    }
+
+    /// The promise `ensure` makes, and the reason the mode exists at all: the
+    /// application writes to this table too, and pbps must not remove what it
+    /// put there.
+    #[test]
+    fn ensure_never_deletes() {
+        let base = schema_of(
+            "dbo.s",
+            lookup(DataMode::Ensure, &[("new", "New"), ("old", "Old")]),
+        );
+        let declared = schema_of("dbo.s", lookup(DataMode::Ensure, &[("new", "New")]));
+        assert!(row_ops(&run(&base, &declared, &[])).is_empty());
+    }
+
+    /// Removing the *declaration* must never delete the rows. Reading a removed
+    /// block as "delete them all" would make deleting a file destroy data.
+    #[test]
+    fn removing_the_block_deletes_nothing() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        let mut without = lookup(DataMode::Exact, &[]);
+        without.data = None;
+        let declared = schema_of("dbo.s", without);
+        let cs = run(&base, &declared, &[]);
+        assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+        // It is still reported, so the recorded state stops claiming a mode the
+        // file no longer declares.
+        assert!(
+            cs.changes
+                .iter()
+                .any(|p| matches!(&p.change, Change::SetDataMode { to: None, .. }))
+        );
+    }
+
+    #[test]
+    fn identical_rows_produce_no_change() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        assert!(run(&base, &declared, &[]).changes.is_empty());
+    }
+
+    /// An omitted column and an explicit `null` are two spellings of one row.
+    /// Comparing them unequal would put an UPDATE that changes nothing into
+    /// every plan, for ever.
+    #[test]
+    fn an_omitted_column_equals_an_explicit_null() {
+        let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+        base_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+            .into_iter()
+            .collect();
+        let mut declared_t = lookup(DataMode::Exact, &[("new", "x")]);
+        declared_t.data.as_mut().unwrap().rows = [(
+            pbps_model::RowKey::from("new"),
+            [("label".to_owned(), Value::Null)]
+                .into_iter()
+                .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            run(
+                &schema_of("dbo.s", base_t),
+                &schema_of("dbo.s", declared_t),
+                &[]
+            )
+            .changes
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_new_table_gets_its_rows_after_the_create() {
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+        let cs = run(&Schema::default(), &declared, &[]);
+        let k = kinds(&cs);
+        let create = k.iter().position(|c| c == "CreateTable").unwrap();
+        let insert = k.iter().position(|c| c == "InsertRow").unwrap();
+        assert!(create < insert, "{k:?}");
+    }
+
+    /// The bug this ordering exists to prevent, one level down from the foreign
+    /// key between two new tables that a live test had to find: `sub` points at
+    /// `status`, so `status`'s rows have to be in before `sub`'s go in — and out
+    /// after `sub`'s come out.
+    #[test]
+    fn rows_follow_the_foreign_keys_between_their_tables() {
+        let status = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut sub = lookup(DataMode::Exact, &[("a", "A")]);
+        sub.columns.insert(
+            "parent".to_owned(),
+            Column::new(ty("varchar(20)")).not_null(),
+        );
+        sub.foreign_keys.insert(
+            "fk_sub_status".to_owned(),
+            pbps_model::ForeignKey {
+                columns: vec!["parent".to_owned()],
+                references_table: "dbo.status".parse().unwrap(),
+                references_columns: vec!["code".to_owned()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+
+        let mut empty_status = status.clone();
+        empty_status.data.as_mut().unwrap().rows.clear();
+        let mut empty_sub = sub.clone();
+        empty_sub.data.as_mut().unwrap().rows.clear();
+
+        let mut base = Schema::default();
+        base.tables
+            .insert("dbo.status".parse().unwrap(), empty_status);
+        base.tables.insert("dbo.sub".parse().unwrap(), empty_sub);
+        let mut declared = Schema::default();
+        declared
+            .tables
+            .insert("dbo.status".parse().unwrap(), status.clone());
+        declared
+            .tables
+            .insert("dbo.sub".parse().unwrap(), sub.clone());
+
+        let cs = run(&base, &declared, &[]);
+        let inserts: Vec<&TableName> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::InsertRow { table, .. } => Some(table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inserts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["dbo.status", "dbo.sub"],
+            "the referenced table's rows must go in first"
+        );
+
+        // And the mirror image: taking them out runs the other way round.
+        let cs = run(&declared, &base, &[]);
+        let deletes: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::DeleteRow { table, .. } => Some(table.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deletes, ["dbo.sub", "dbo.status"]);
+    }
+
+    /// A `data:` block whose rows have no identity is refused, not silently
+    /// dropped from the plan.
+    #[test]
+    fn a_data_block_without_a_single_column_key_is_an_error() {
+        let mut t = lookup(DataMode::Exact, &[("new", "New")]);
+        t.primary_key = None;
+        let declared = schema_of("dbo.s", t.clone());
+        let base_ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let d = diff_partial(
+            Side {
+                schema: &Schema::default(),
+                ids: &IdsFile::default(),
+            },
+            Side {
+                schema: &declared,
+                ids: &base_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        );
+        assert!(
+            d.errors
+                .iter()
+                .any(|e| matches!(e, DiffError::DataWithoutKey { .. })),
+            "{:?}",
+            d.errors
+        );
     }
 
     fn kinds(cs: &ChangeSet) -> Vec<String> {

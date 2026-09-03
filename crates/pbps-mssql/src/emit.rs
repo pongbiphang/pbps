@@ -16,10 +16,12 @@
 //! [`Statement::own_batch`] — the block declares a variable, and two of them in
 //! one batch would collide on the name.
 
+use std::collections::BTreeMap;
+
 use pbps_dialect::{DialectError, Statement};
 use pbps_model::{
     Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
-    ReferentialAction, Strategy, Table, TableName, UniqueConstraint,
+    ReferentialAction, Row, RowKey, Strategy, Table, TableName, UniqueConstraint, Value,
 };
 
 use crate::ident::{literal, quote};
@@ -99,6 +101,39 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::CreateTable { name, table, .. } => create_table(name, table),
 
         Change::DropTable { name, .. } => one(format!("DROP TABLE {};", qualified(name)?)),
+
+        // Reference data (ADR-0004). The only DML this tool emits, and it
+        // reaches here only for a table that declared a `data:` block.
+        Change::InsertRow {
+            table,
+            key_column,
+            key,
+            row,
+        } => insert_row(table, key_column, key, row),
+
+        Change::UpdateRow {
+            table,
+            key_column,
+            key,
+            columns,
+        } => update_row(table, key_column, key, columns),
+
+        Change::DeleteRow {
+            table,
+            key_column,
+            key,
+            ..
+        } => one(format!(
+            "DELETE FROM {} WHERE {} = {};",
+            qualified(table)?,
+            quote(key_column)?,
+            row_key(key)
+        )),
+
+        // The mode is a property of the declaration, not of the database: it
+        // decides what future plans do about undeclared rows. The row changes
+        // it implies are separate entries in this same plan.
+        Change::SetDataMode { .. } => Ok(Vec::new()),
 
         Change::RenameTable { from, to, .. } => rename_table(from, to),
 
@@ -348,6 +383,90 @@ pub fn module_definition(name: &ObjectName, module: &Module) -> Result<String, D
         // the name is the user's.
         ModuleKind::Procedure | ModuleKind::Function => format!("{head}\n{body}"),
     })
+}
+
+/// One cell as a T-SQL literal.
+///
+/// The literal is rendered from what was *written*, never from the column's
+/// type — the emitter is handed a change and nothing else, which is the same
+/// reason a saved plan can be applied on a host with no checkout. The engine's
+/// implicit conversion is what places the value in the column: `N'1.50'` into a
+/// `decimal(5,2)` and `1` into a `varchar` both do the right thing, and a
+/// value that genuinely cannot convert is rejected by the server inside the
+/// plan's transaction, which rolls the whole plan back.
+///
+/// Text goes out as an `N` literal so that a label outside the code page
+/// survives; it converts down to `varchar` without complaint.
+fn value_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_owned(),
+        // Never `0`/`1`: SQL Server has no boolean, and which of `bit`,
+        // `varchar` or `int` the column is decides what the right spelling is.
+        // The engine converts `'true'` into a `bit` correctly, and a `1` into a
+        // `varchar` column would silently store "1" where the declaration said
+        // "true".
+        Value::Bool(b) => literal(if *b { "true" } else { "false" }),
+        Value::Int(i) => i.to_string(),
+        Value::Text(t) => literal(t),
+    }
+}
+
+/// A row key as a T-SQL literal.
+///
+/// Always a string literal, because [`RowKey`] is always text (it is a map key,
+/// and JSON has no others). An `int` primary key therefore gets `= N'7'`, which
+/// the engine converts to the integer — the comparison is correct, and at
+/// reference-data size the lost index seek is not a cost anyone can measure.
+fn row_key(key: &RowKey) -> String {
+    literal(key.as_str())
+}
+
+/// One `INSERT`, naming the key column explicitly.
+///
+/// The column list is always written out. An `INSERT` without one depends on
+/// the table's column order, which is exactly what a later `AddColumn` changes
+/// — a plan saved today would then insert into the wrong columns.
+fn insert_row(table: &TableName, key_column: &str, key: &RowKey, row: &Row) -> Sql {
+    let mut columns = vec![quote(key_column)?];
+    let mut values = vec![row_key(key)];
+    for (column, v) in row.columns() {
+        columns.push(quote(column)?);
+        values.push(value_literal(v));
+    }
+    one(format!(
+        "INSERT INTO {} ({}) VALUES ({});",
+        qualified(table)?,
+        columns.join(", "),
+        values.join(", ")
+    ))
+}
+
+fn update_row(
+    table: &TableName,
+    key_column: &str,
+    key: &RowKey,
+    columns: &BTreeMap<String, (Value, Value)>,
+) -> Sql {
+    let mut sets = Vec::with_capacity(columns.len());
+    for (column, (_, to)) in columns {
+        sets.push(format!("{} = {}", quote(column)?, value_literal(to)));
+    }
+    // An empty SET is not valid T-SQL, and the differ never produces one — it
+    // emits an `UpdateRow` only for columns that differ. Refusing rather than
+    // writing `UPDATE t SET WHERE ...` keeps that guarantee checkable.
+    if sets.is_empty() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!("{table}: a row update with no changed column"),
+        });
+    }
+    one(format!(
+        "UPDATE {} SET {} WHERE {} = {};",
+        qualified(table)?,
+        sets.join(", "),
+        quote(key_column)?,
+        row_key(key)
+    ))
 }
 
 fn one(sql: String) -> Sql {
@@ -1147,5 +1266,182 @@ mod tests {
             sql_of(&an_index()),
             ["CREATE INDEX [ix_order_line_order] ON [dbo].[order_line] ([order_id] ASC);"]
         );
+    }
+
+    // ---- Reference data (ADR-0004) ----
+
+    fn row(cells: &[(&str, Value)]) -> Row {
+        cells
+            .iter()
+            .map(|(c, v)| ((*c).to_owned(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn an_insert_names_its_columns_and_leads_with_the_key() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.order_status"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("new"),
+            row: row(&[("label", Value::Text("New".to_owned()))]),
+        });
+        assert_eq!(
+            sql,
+            ["INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"]
+        );
+    }
+
+    /// An `INSERT` without a column list depends on the table's column order,
+    /// which a later `AddColumn` changes — a plan saved today would then insert
+    /// into the wrong columns.
+    #[test]
+    fn an_insert_always_writes_the_column_list() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            row: Row::default(),
+        });
+        assert!(sql[0].contains("([code])"), "{sql:?}");
+    }
+
+    #[test]
+    fn an_update_restates_only_the_changed_columns() {
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.order_status"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("new"),
+            columns: [(
+                "label".to_owned(),
+                (
+                    Value::Text("New".to_owned()),
+                    Value::Text("Opened".to_owned()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert_eq!(
+            sql,
+            ["UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';"]
+        );
+    }
+
+    /// `UPDATE t SET WHERE ...` is not T-SQL. The differ never produces an
+    /// empty column set, and refusing here is what makes that guarantee
+    /// checkable rather than assumed.
+    #[test]
+    fn an_update_with_no_changed_column_is_refused() {
+        assert!(
+            emit(
+                &Change::UpdateRow {
+                    table: tname("dbo.t"),
+                    key_column: "code".to_owned(),
+                    key: RowKey::from("a"),
+                    columns: BTreeMap::new(),
+                },
+                Strategy::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_delete_is_keyed_on_the_primary_key_column() {
+        let sql = sql_of(&Change::DeleteRow {
+            table: tname("dbo.order_status"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+        });
+        assert_eq!(
+            sql,
+            ["DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"]
+        );
+    }
+
+    /// The same rule identifiers follow: a value can never end its own literal.
+    /// If this regresses, reference data becomes an injection point — and it is
+    /// the one place in this tool where user *data* is written into SQL text.
+    #[test]
+    fn a_quote_in_a_value_cannot_escape_the_literal() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("o'brien"),
+            row: row(&[(
+                "label",
+                Value::Text("'); DROP TABLE [dbo].[t]; --".to_owned()),
+            )]),
+        });
+        // Pinned exactly rather than by substring: what matters is that the
+        // injected text is *inside* the literal, and only the whole statement
+        // shows that. Every quote the value contained is doubled, so none of it
+        // closes the literal early and none of it becomes statement text.
+        assert_eq!(
+            sql,
+            [concat!(
+                "INSERT INTO [dbo].[t] ([code], [label]) ",
+                r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');"
+            )]
+        );
+    }
+
+    /// `Bool` is never `0`/`1`. SQL Server has no boolean, so which spelling is
+    /// right depends on the column — and the engine converts `'true'` into a
+    /// `bit` correctly, while a bare `1` in a `varchar` column would silently
+    /// store "1" where the declaration said "true".
+    #[test]
+    fn a_boolean_goes_out_as_a_word_and_an_integer_bare() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            row: row(&[
+                ("flag", Value::Bool(true)),
+                ("n", Value::Int(-7)),
+                ("nothing", Value::Null),
+            ]),
+        });
+        assert!(sql[0].contains("N'true'"), "{sql:?}");
+        assert!(sql[0].contains(", -7,"), "{sql:?}");
+        assert!(sql[0].contains("NULL"), "{sql:?}");
+        // NULL is the keyword, never the string.
+        assert!(!sql[0].contains("N'NULL'"), "{sql:?}");
+    }
+
+    /// The mode is a property of the declaration, not of the database: it
+    /// decides what *future* plans do about undeclared rows.
+    #[test]
+    fn setting_the_data_mode_emits_nothing() {
+        assert!(
+            sql_of(&Change::SetDataMode {
+                table: tname("dbo.t"),
+                from: Some(pbps_model::DataMode::Ensure),
+                to: Some(pbps_model::DataMode::Exact),
+            })
+            .is_empty()
+        );
+    }
+
+    /// None of the DML takes `WITH (ONLINE = ON)`; it is a syntax error there.
+    #[test]
+    fn row_changes_are_never_online() {
+        for c in [
+            Change::InsertRow {
+                table: tname("dbo.t"),
+                key_column: "code".to_owned(),
+                key: RowKey::from("a"),
+                row: Row::default(),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.t"),
+                key_column: "code".to_owned(),
+                key: RowKey::from("a"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ] {
+            assert!(!takes_online(&c), "{c:?}");
+        }
     }
 }

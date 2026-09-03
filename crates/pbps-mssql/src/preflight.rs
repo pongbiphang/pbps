@@ -107,7 +107,14 @@ impl AsStored {
                 // applies to one.
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
-                | Change::DropModule { .. } => {}
+                | Change::DropModule { .. }
+                // A row change moves no name. It does *use* one — the table it
+                // writes to — but that table is already translated through
+                // `table()` below like every other name in a probe.
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. } => {}
             }
         }
         this
@@ -299,7 +306,21 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
-        | Change::DropIndex { .. } => Ok(Vec::new()),
+        | Change::DropIndex { .. }
+        // Inserting and updating a declared row need no probe: the row's whole
+        // content is in the plan, and anything the engine refuses about it
+        // rolls the plan back.
+        //
+        // A *delete* does have a hazard worth counting — the rows in other
+        // tables that point at the one going away — and it is deliberately not
+        // here yet: the probe belongs with the connected half of ADR-0004,
+        // beside the drift read-back that gives it something to compare. Until
+        // then a delete is gated as `data-delete` and the foreign key itself
+        // refuses it loudly, which is the same protection, later.
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. } => Ok(Vec::new()),
     }
 }
 

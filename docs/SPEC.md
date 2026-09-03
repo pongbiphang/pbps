@@ -304,6 +304,74 @@ until ADR-0005. ADR-0002 records the trade in full.
 
 ---
 
+### 4.6 Reference data (`data:`)
+
+Lookup tables are part of the program: the application names their rows the way
+it names a column, and an environment created without them is broken even
+though every structural object exists. Declaring one is
+[ADR-0004](ADR-0004-reference-data.md).
+
+```yaml
+table: dbo.order_status
+columns:
+  code:  {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false}
+primary_key: [code]
+
+data:
+  mode: exact          # exact | ensure
+  rows:
+    new:       {label: New}
+    shipped:   {label: Shipped}
+    cancelled: {label: Cancelled}
+```
+
+The block is the **opt-in that lets the tool touch rows at all**: without one,
+no plan pbps produces contains DML. §1.3's exclusion of data transformation is
+unchanged — it is about moving existing business data, which no structural diff
+can imply.
+
+- **Rows are keyed by primary-key value**, and the key is the row's whole
+  identity: no uid, no tombstone, no rename intent. A changed key is a delete
+  plus an insert, because a row's entire content is declared and recreating it
+  loses nothing (the generalized criterion of
+  [ADR-0005](ADR-0005-roles-and-grants.md)).
+- **A `data:` table needs a declared, single-column primary key.** Composite
+  keys are deferred: a written form for a tuple that later has to change is
+  worse than saying so.
+- **An omitted column means the column's declared default, or NULL.** It does
+  not mean "this row says nothing about it" — that reading would leave part of
+  an `exact` table undeclared. `validate` refuses a row that omits a `NOT NULL`
+  column with no default.
+- **A non-integer number must be quoted.** The exact decimal form written is
+  the literal that reaches the column, and reading `1.10` through a binary
+  float does not promise to give it back. Quoted, it is text, and the engine
+  converts it — the same "keep it verbatim, never parse it" the defaults and
+  check expressions get.
+- **Boolean-ish and number-shaped row keys are real** (`no` is a status code,
+  `1` is a key), so `fmt` quotes them, under the same rule as §4.3.
+
+| Mode | Meaning | DELETE emitted? |
+|---|---|---|
+| `exact` | The declared rows are the whole table; an undeclared row is drift | Yes, behind `data-delete` |
+| `ensure` | Declared rows must exist with the declared values; other rows are ignored — a seeded core in a table the application also writes to | Never |
+
+Removing the `data:` block deletes nothing. It means pbps stops managing those
+rows; reading it as "delete them all" would let deleting a *declaration*
+destroy data.
+
+`validate` warns above `max_data_rows` (default 1000) — "this does not look
+like reference data". A warning, never a refusal: the line between a lookup
+table and somebody's business table is a judgement about the project, and the
+cost being pointed at is that every plan from here on compares those rows one
+by one.
+
+**Ordering.** Rows go in after the table and its columns exist and before the
+constraints that check them, and they follow the foreign keys *between* the
+tables that declare them — a referenced table's rows first, and out last. That
+edge is the same one the live tests had to find at table granularity, one level
+down.
+
 ## 5. The identity file (`schema.ids.json`)
 
 ### 5.1 Format
@@ -496,6 +564,8 @@ exists when prod deploys the rename five versions later.
 | `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK | Existing rows may not satisfy it |
+| `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
+| `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
 
 The criterion is **whether this kind of change can fail at all**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is

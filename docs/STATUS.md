@@ -12,6 +12,10 @@ CLAUDE.md's "Development environment"; counts change too often to record here.
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
 
+Declarations may carry reference data (`data:`, ADR-0004): the offline half is
+built, and `max_data_rows` in `pbps.yml` sets when `validate` says a block has
+stopped looking like reference data.
+
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
@@ -86,9 +90,18 @@ of 14.1. It was placed ahead of the next dialect deliberately: broadening the
 object model improves coverage, but these improve the first hour and every
 failure after it.
 
-**Next — Phase 4, depth on SQL Server before breadth across engines**: declarative
-reference data (ADR-0004), roles and grants (ADR-0005), the `policies:` block
-and a wider built-in analyzer catalogue. The ordering was chosen against the
+**In progress — Phase 4, depth on SQL Server before breadth across engines**:
+declarative reference data (ADR-0004), roles and grants (ADR-0005), the
+`policies:` block and a wider built-in analyzer catalogue.
+
+Reference data's **offline half is built**: the `data:` block, its `exact` and
+`ensure` modes, the round trip through `fmt`, the rules `validate` reports, the
+typed row changes with the `data-update` and `data-delete` risk classes, the
+DML, and the ordering — rows after the table and before the constraints, and
+between two tables in the direction their foreign key points. The connected
+half (the pre-delete probe, the row read-back into `state_json` and the drift
+comparison, `pull --data`, `SET IDENTITY_INSERT`) is next; ADR-0004 lists it
+under "Implementation status". The ordering was chosen against the
 obvious one — engine count is what every comparison table measures — because a
 second dialect doubles the surface every later feature is built twice for, and
 does it while the first engine still cannot express an organization's own rules.

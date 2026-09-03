@@ -165,7 +165,41 @@ pub fn render(
         }
     }
 
+    // Last, and after the constraints, because it is the only block that is
+    // about the table's contents rather than its shape — and on a lookup table
+    // it is much the longest.
+    if let Some(d) = &table.data {
+        s.push_str("\ndata:\n");
+        let _ = writeln!(s, "  mode: {}", d.mode);
+        s.push_str("  rows:\n");
+        for (key, row) in &d.rows {
+            let cells: Vec<String> = row
+                .columns()
+                .map(|(c, v)| format!("{}: {}", scalar(c), value(v)))
+                .collect();
+            // The key goes through `scalar`, so a code that looks like a number
+            // or a boolean (`no`, `1`, `on` — all real status codes) comes back
+            // as the text it is. The loader reads keys as strings, and an
+            // unquoted `no:` would reach it as `false`.
+            let _ = writeln!(s, "    {}: {{{}}}", scalar(&key.0), cells.join(", "));
+        }
+    }
+
     s
+}
+
+/// One cell.
+///
+/// `Text` goes through `scalar`, which already quotes anything number-shaped —
+/// which is exactly what keeps a quoted `'1.50'` quoted, and so keeps it out of
+/// the float arm the loader refuses.
+fn value(v: &pbps_model::Value) -> String {
+    match v {
+        pbps_model::Value::Null => "null".to_owned(),
+        pbps_model::Value::Bool(b) => b.to_string(),
+        pbps_model::Value::Int(i) => i.to_string(),
+        pbps_model::Value::Text(t) => scalar(t),
+    }
 }
 
 /// Renders one module as canonical YAML (ADR-0002).
@@ -551,6 +585,94 @@ mod strategy_tests {
             "the error must name the offending key: {}",
             render_errors(&e)
         );
+    }
+
+    #[test]
+    fn a_data_block_round_trips() {
+        let yaml = "table: dbo.order_status\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: nvarchar(50), nullable: false}\n\nprimary_key: [code]\n\ndata:\n  mode: exact\n  rows:\n    cancelled: {label: Cancelled}\n    new: {label: New}\n";
+        let a = load(yaml);
+        let out = render(&a.name, &a.table, &a.intents, a.strategy.as_ref());
+        let b = load(&out);
+        assert_eq!(a.table, b.table, "output:\n{out}");
+        // Idempotent, like every other block.
+        assert_eq!(
+            out,
+            render(&b.name, &b.table, &b.intents, b.strategy.as_ref())
+        );
+    }
+
+    /// The trap this format has that no other block here does: reference data
+    /// is exactly where boolean-ish and number-shaped *codes* live. `no` is a
+    /// real status code, `1` is a real key, and YAML reads both as something
+    /// else unless `fmt` quotes them.
+    #[test]
+    fn boolish_and_numeric_row_keys_survive_a_round_trip() {
+        let t = load(
+            "table: dbo.answer\ncolumns:\n  code: {type: varchar(3), nullable: false}\n  n: {type: int}\nprimary_key: [code]\ndata:\n  mode: ensure\n  rows:\n    \"no\": {n: 0}\n    \"1\": {n: 1}\n",
+        );
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(
+            out.contains("\"no\":"),
+            "an unquoted `no` key is a boolean:\n{out}"
+        );
+        assert!(
+            out.contains("\"1\":"),
+            "an unquoted `1` key is a number:\n{out}"
+        );
+        let again = load(&out);
+        assert_eq!(t.table, again.table);
+    }
+
+    /// A quoted decimal must stay quoted, or the next load hits the refusal in
+    /// `convert_data` — `fmt` would have broken a file that was valid when it
+    /// arrived.
+    #[test]
+    fn a_quoted_decimal_stays_quoted() {
+        let t = load(
+            "table: dbo.rate\ncolumns:\n  code: {type: varchar(3), nullable: false}\n  pct: {type: \"decimal(5,2)\"}\nprimary_key: [code]\ndata:\n  mode: exact\n  rows:\n    std: {pct: \"1.50\"}\n",
+        );
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(out.contains("\"1.50\""), "{out}");
+        assert_eq!(t.table, load(&out).table);
+    }
+
+    /// The negative case for the whole block: an unquoted decimal is refused,
+    /// and the message says what to do rather than quietly rounding it.
+    #[test]
+    fn a_bare_decimal_is_refused_with_the_remedy() {
+        let errs = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: dbo.rate\ncolumns:\n  code: {type: varchar(3), nullable: false}\n  pct: {type: \"decimal(5,2)\"}\nprimary_key: [code]\ndata:\n  mode: exact\n  rows:\n    std: {pct: 1.50}\n",
+        )
+        .unwrap_err();
+        let text = render_errors(&errs);
+        assert!(text.contains("an unquoted decimal"), "{text}");
+        assert!(text.contains("pct"), "the column must be named: {text}");
+        // And it must not echo the number back — by then it has already been
+        // through `f64`, so `1.50` would print as `1.5`.
+        assert!(
+            !text.contains("1.5"),
+            "the diagnostic rounded the value: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_data_mode_is_refused() {
+        let errs = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: dbo.t\ncolumns:\n  a: {type: int, nullable: false}\nprimary_key: [a]\ndata:\n  mode: exactly\n  rows: {}\n",
+        )
+        .unwrap_err();
+        let text = render_errors(&errs);
+        assert!(text.contains("unknown data mode"), "{text}");
+    }
+
+    #[test]
+    fn a_table_with_no_data_block_renders_none() {
+        let t = load("table: dbo.t\ncolumns:\n  a: {type: int}\n");
+        assert!(t.table.data.is_none());
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(!out.contains("data:"), "{out}");
     }
 
     fn render_errors(errs: &[crate::LoadError]) -> String {

@@ -227,6 +227,16 @@ pub struct Config {
     /// offline, which is the default and a supported way to work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<Dev>,
+
+    /// How many rows a `data:` block may declare before `validate` says this
+    /// does not look like reference data (ADR-0004).
+    ///
+    /// A knob rather than a constant because the line between a lookup table
+    /// and somebody's business table is a judgement about *this* project — but
+    /// it is a warning either way, never a refusal: pbps does not get to decide
+    /// that a 1,200-row currency table is illegitimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_data_rows: Option<usize>,
 }
 
 fn default_schema_dir() -> PathBuf {

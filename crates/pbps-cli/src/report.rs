@@ -7,6 +7,7 @@
 //! no idea what to type.
 
 use pbps_diff::Blocker;
+use pbps_model::change::DeleteCause;
 use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
 
 /// One intent in the user's own vocabulary.
@@ -414,6 +415,28 @@ pub fn describe(c: &Change) -> String {
         // `CREATE OR ALTER` does and what the reviewer is approving.
         Change::AlterModule { module, .. } => format!("~ restate {}", module.kind),
         Change::DropModule { kind, .. } => format!("- drop {kind}"),
+        // Reference data (ADR-0004). The key identifies the row to a reviewer
+        // who has no connection, so it leads every line.
+        Change::InsertRow { key, row, .. } => {
+            format!("+ row {key} ({} values)", row.0.len() + 1)
+        }
+        Change::UpdateRow { key, columns, .. } => {
+            // Both ends, because the reviewer at the gate cannot look the old
+            // value up — and "sets label" is not something anyone can approve.
+            let cells: Vec<String> = columns
+                .iter()
+                .map(|(c, (from, to))| format!("{c} {from} -> {to}"))
+                .collect();
+            format!("~ row {key}: {}", cells.join(", "))
+        }
+        Change::DeleteRow { key, cause, .. } => match cause {
+            DeleteCause::Undeclared => format!("- row {key} (not declared)"),
+            DeleteCause::KeyChanged => format!("- row {key} (key changed)"),
+        },
+        Change::SetDataMode { to, .. } => match to {
+            Some(m) => format!("~ reference data is now `{m}`"),
+            None => "~ reference data is no longer declared".to_owned(),
+        },
     }
 }
 

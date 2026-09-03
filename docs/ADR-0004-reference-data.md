@@ -1,6 +1,6 @@
 # ADR-0004: Declarative reference data — the `data:` block
 
-- Status: decided (design; implementation targeted at Phase 4)
+- Status: accepted (Phase 4; the offline half is built — see "Implementation status")
 - Date: 2026-08-31
 - Related: docs/SPEC.md §1.3, §7.5, §8.2, §12;
   [ADR-0002](ADR-0002-module-model.md);
@@ -107,6 +107,41 @@ channels can be extended; not now.
 
 `pull --data <table>` reverse-generates the block from an existing table, the
 same onboarding story as structure.
+
+## Implementation status
+
+Built, offline: the block in the model and in `Schema` equality, the loader and
+`fmt` round trip, the model-level rules `validate` reports, the typed
+`InsertRow` / `UpdateRow` / `DeleteRow` / `SetDataMode` changes, the
+`data-update` and `data-delete` risk classes, the T-SQL DML, and the ordering —
+including the foreign-key order *between* two tables that both declare rows.
+
+Two decisions were taken during implementation that this document did not
+anticipate, both of them narrowings:
+
+1. **A bare non-integer number is refused**, with a diagnostic asking for
+   quotes. There is no floating-point arm in the model's `Value` at all: `f64`
+   is not `Eq`, which `Schema` equality needs, and passing `1.10` through a
+   binary float does not promise to give `1.10` back — a declaration that
+   disagrees with its own database on every plan is worse than no declaration.
+   Quoted, it is text, and the engine converts it.
+2. **An omitted column means the column's default, or NULL** — not "unspecified".
+   The alternative would leave part of an `exact` table undeclared, which is
+   exactly what `exact` claims not to be, and would undermine this document's
+   own argument that a row can be recreated losslessly.
+
+Not built yet, and deliberately together because they share one question — what
+the database actually holds:
+
+- the pre-delete probe counting the foreign-key references to the row;
+- reading `exact` tables' rows back into `state_json`, and the row half of the
+  drift comparison;
+- `pull --data <table>`;
+- `SET IDENTITY_INSERT` around an insert into an IDENTITY key column, which
+  needs the emitter to know the column is one.
+
+Until then a delete is gated as `data-delete` and the foreign key itself refuses
+it loudly, which is the same protection, later.
 
 ## Placement
 
