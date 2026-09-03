@@ -275,6 +275,12 @@ pub enum Change {
         /// nothing else, and a saved plan is applied on a host that may have no
         /// checkout at all — the same reason the plan carries its own ids.
         key_column: String,
+        /// Whether the key column is an `IDENTITY` column, which the engine
+        /// assigns unless told otherwise. Carried for the same reason the
+        /// column name is: the emitter sees the change and nothing else, and
+        /// an explicit value into an identity column is refused unless the
+        /// statement says `SET IDENTITY_INSERT ... ON` first (ADR-0004).
+        identity_key: bool,
         key: RowKey,
         row: Row,
     },

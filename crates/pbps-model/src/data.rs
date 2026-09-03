@@ -380,6 +380,22 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
                     "{name}: row `{key}` sets `{column}`, which the table does not declare"
                 ));
             }
+            // The key is the one identity column a row may pin, and it pins it
+            // through the map key with `SET IDENTITY_INSERT` around the
+            // insert. Any other identity column is the engine's to assign;
+            // a value for it would be refused at apply time, after `validate`
+            // had said the declaration was fine.
+            if table
+                .columns
+                .get(column)
+                .is_some_and(|c| c.identity.is_some())
+                && key_column.as_deref() != Some(column.as_str())
+            {
+                problems.push(format!(
+                    "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
+                     assigns — leave it out"
+                ));
+            }
             if key_column.as_deref() == Some(column.as_str()) {
                 // Not a style rule. If the body could restate the key, it could
                 // disagree with it, and there would be two answers to "which
@@ -598,6 +614,38 @@ mod tests {
             cell(&written, "n", Some(&with_default)),
             Cell::Value(Value::Int(7))
         );
+    }
+
+    /// The fourth review's shape, one step over: only the key may pin an
+    /// identity value, and it does so through the map key. A row writing a
+    /// non-key IDENTITY column is refused here rather than by the engine.
+    #[test]
+    fn a_row_writing_a_non_key_identity_column_is_refused() {
+        let mut t = table(
+            Some(vec!["code"]),
+            vec![(
+                "new",
+                vec![("label", Value::Text("New".into())), ("seq", Value::Int(1))],
+            )],
+        );
+        let mut seq = Column::new(ColumnType::from_str("int").unwrap()).not_null();
+        seq.identity = Some(crate::schema::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        t.columns.insert("seq".to_owned(), seq);
+        let p = check(&name(), &t);
+        assert!(p.iter().any(|m| m.contains("IDENTITY")), "{p:?}");
+        // The negative case: omitting it is fine, identity or not.
+        t.data.as_mut().unwrap().rows = [(
+            RowKey::from("new"),
+            [("label".to_owned(), Value::Text("New".into()))]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(check(&name(), &t), Vec::<String>::new());
     }
 
     #[test]

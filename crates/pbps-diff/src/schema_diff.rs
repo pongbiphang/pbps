@@ -159,10 +159,15 @@ pub fn diff_partial(
             // give the emitter a second place to produce DML.
             match (&table.data, table.primary_key.as_ref()) {
                 (Some(data), Some(pk)) if pk.columns.len() == 1 => {
+                    let identity_key = table
+                        .columns
+                        .get(&pk.columns[0])
+                        .is_some_and(|c| c.identity.is_some());
                     for (key, row) in &data.rows {
                         changes.push(Change::InsertRow {
                             table: name.clone(),
                             key_column: pk.columns[0].clone(),
+                            identity_key,
                             key: key.clone(),
                             row: row.clone(),
                         });
@@ -521,6 +526,11 @@ fn diff_data(
         _ => return,
     };
 
+    let identity_key = declared
+        .columns
+        .get(&key_column)
+        .is_some_and(|c| c.identity.is_some());
+
     let Some(declared_data) = &declared.data else {
         // The block was removed. Nothing is deleted and nothing is inserted:
         // removing the opt-in means pbps stops managing these rows, and reading
@@ -559,6 +569,7 @@ fn diff_data(
             None => changes.push(Change::InsertRow {
                 table: name.clone(),
                 key_column: key_column.clone(),
+                identity_key,
                 key: key.clone(),
                 row: row.clone(),
             }),

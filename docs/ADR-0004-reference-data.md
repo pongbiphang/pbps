@@ -163,9 +163,15 @@ the database actually holds:
 - reading `exact` tables' rows back into `state_json`, and the row half of the
   drift comparison — which is also what lifts the `plan --db` refusal above,
   and has to evaluate a `Cell::Default` against what the engine stored;
-- `pull --data <table>`;
-- `SET IDENTITY_INSERT` around an insert into an IDENTITY key column, which
-  needs the emitter to know the column is one.
+- `pull --data <table>`.
+
+An `IDENTITY` key is built: the insert carries whether its key column is one,
+and the emitter wraps it in `SET IDENTITY_INSERT ... ON` / `OFF` as a single
+statement, so the switch — a session setting at most one table may hold — is
+off again before the next table's insert. Only the key may pin an identity
+value; `validate` refuses a row that writes any other IDENTITY column. Proven
+against the engine by the live test `reference_data_reaches_the_engine_in_an_order_it_accepts`,
+which also covers `= DEFAULT` and the delete-after-the-child-moved order.
 
 Until then a delete is gated as `data-delete` and the foreign key itself refuses
 it loudly, which is the same protection, later.

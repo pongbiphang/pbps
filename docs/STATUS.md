@@ -102,8 +102,8 @@ between two tables in the direction their foreign key points. Until the connecte
 half exists, `plan --db` refuses a declaration with `data:` blocks rather than
 insert every row on every run. That half (the row read-back into `state_json`
 and the drift comparison, which lifts the refusal; the pre-delete probe;
-`pull --data`; `SET IDENTITY_INSERT`) is next; ADR-0004 lists it under
-"Implementation status". The ordering was chosen against the
+`pull --data`) is next; ADR-0004 lists it under "Implementation status". The
+DML itself, including an `IDENTITY` key, is covered by a live test. The ordering was chosen against the
 obvious one — engine count is what every comparison table measures — because a
 second dialect doubles the surface every later feature is built twice for, and
 does it while the first engine still cannot express an organization's own rules.

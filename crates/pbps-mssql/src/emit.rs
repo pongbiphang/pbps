@@ -107,9 +107,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::InsertRow {
             table,
             key_column,
+            identity_key,
             key,
             row,
-        } => insert_row(table, key_column, key, row),
+        } => insert_row(table, key_column, *identity_key, key, row),
 
         Change::UpdateRow {
             table,
@@ -426,19 +427,38 @@ fn row_key(key: &RowKey) -> String {
 /// The column list is always written out. An `INSERT` without one depends on
 /// the table's column order, which is exactly what a later `AddColumn` changes
 /// — a plan saved today would then insert into the wrong columns.
-fn insert_row(table: &TableName, key_column: &str, key: &RowKey, row: &Row) -> Sql {
+///
+/// An `IDENTITY` key is pinned by wrapping the insert in `SET IDENTITY_INSERT
+/// ... ON` / `OFF` (ADR-0004). The three go out as **one statement** and the
+/// switch is turned off in the same one: it is a session setting, at most one
+/// table may hold it at a time, and a plan that left it on would make the
+/// next table's insert fail with an error about a table it never mentioned.
+fn insert_row(
+    table: &TableName,
+    key_column: &str,
+    identity_key: bool,
+    key: &RowKey,
+    row: &Row,
+) -> Sql {
     let mut columns = vec![quote(key_column)?];
     let mut values = vec![row_key(key)];
     for (column, v) in row.columns() {
         columns.push(quote(column)?);
         values.push(value_literal(v));
     }
-    one(format!(
-        "INSERT INTO {} ({}) VALUES ({});",
-        qualified(table)?,
+    let table = qualified(table)?;
+    let insert = format!(
+        "INSERT INTO {table} ({}) VALUES ({});",
         columns.join(", "),
         values.join(", ")
-    ))
+    );
+    if identity_key {
+        one(format!(
+            "SET IDENTITY_INSERT {table} ON;\n{insert}\nSET IDENTITY_INSERT {table} OFF;"
+        ))
+    } else {
+        one(insert)
+    }
 }
 
 fn update_row(
@@ -1288,6 +1308,7 @@ mod tests {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.order_status"),
             key_column: "code".to_owned(),
+            identity_key: false,
             key: RowKey::from("new"),
             row: row(&[("label", Value::Text("New".to_owned()))]),
         });
@@ -1295,6 +1316,42 @@ mod tests {
             sql,
             ["INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"]
         );
+    }
+
+    /// An `IDENTITY` key can only be pinned with the switch on, and the switch
+    /// must be off again before the next table's insert: it is a session
+    /// setting and at most one table may hold it.
+    #[test]
+    fn an_identity_key_is_pinned_inside_one_statement_that_turns_the_switch_off_again() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "id".to_owned(),
+            identity_key: true,
+            key: RowKey::from("7"),
+            row: row(&[("label", Value::Text("Seven".to_owned()))]),
+        });
+        assert_eq!(
+            sql,
+            [concat!(
+                "SET IDENTITY_INSERT [dbo].[t] ON;\n",
+                "INSERT INTO [dbo].[t] ([id], [label]) VALUES (N'7', N'Seven');\n",
+                "SET IDENTITY_INSERT [dbo].[t] OFF;"
+            )]
+        );
+    }
+
+    /// The negative case: a key that is not an identity gets no switch, which
+    /// would itself be an error on a table with no identity column.
+    #[test]
+    fn a_plain_key_gets_no_identity_switch() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            identity_key: false,
+            key: RowKey::from("a"),
+            row: Row::default(),
+        });
+        assert!(!sql[0].contains("IDENTITY_INSERT"), "{sql:?}");
     }
 
     /// An `INSERT` without a column list depends on the table's column order,
@@ -1305,6 +1362,7 @@ mod tests {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
+            identity_key: false,
             key: RowKey::from("a"),
             row: Row::default(),
         });
@@ -1398,6 +1456,7 @@ mod tests {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
+            identity_key: false,
             key: RowKey::from("o'brien"),
             row: row(&[(
                 "label",
@@ -1426,6 +1485,7 @@ mod tests {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
+            identity_key: false,
             key: RowKey::from("a"),
             row: row(&[
                 ("flag", Value::Bool(true)),
@@ -1461,6 +1521,7 @@ mod tests {
             Change::InsertRow {
                 table: tname("dbo.t"),
                 key_column: "code".to_owned(),
+                identity_key: false,
                 key: RowKey::from("a"),
                 row: Row::default(),
             },

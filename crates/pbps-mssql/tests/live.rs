@@ -1660,3 +1660,176 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         ))
         .await;
 }
+
+/// ADR-0004 against the engine: the DML the emitter writes, in the order the
+/// differ sorts it, on a real table. Three things only a live server can say:
+/// that `SET IDENTITY_INSERT` around an insert pins an `IDENTITY` key and
+/// leaves the switch off for the next table; that `SET ... = DEFAULT` makes
+/// the engine evaluate the column's default; and that a parent row deleted
+/// *after* the child row moved away from it is an order the foreign key
+/// accepts — the shape that, the other way round, `ON DELETE CASCADE` would
+/// have swallowed silently.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+
+    fn rows(rows: &[(&str, &[(&str, Value)])]) -> std::collections::BTreeMap<RowKey, Row> {
+        rows.iter()
+            .map(|(k, cells)| {
+                (
+                    RowKey::from(*k),
+                    cells
+                        .iter()
+                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .collect::<Row>(),
+                )
+            })
+            .collect()
+    }
+    let text = |s: &str| Value::Text(s.to_owned());
+
+    // `status`: a varchar key, and a NOT NULL label with a default.
+    let mut status = Table::default();
+    status
+        .columns
+        .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+    let mut label = Column::new(ty("nvarchar(50)")).not_null();
+    label.default = Some("'Unlabelled'".to_owned());
+    status.columns.insert("label".to_owned(), label);
+    status.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".to_owned()],
+    });
+    status.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[
+            ("new", &[("label", text("New"))]),
+            ("old", &[("label", text("Old"))]),
+        ]),
+    });
+
+    // `kind`: an IDENTITY key, and a foreign key to `status`.
+    let mut kind = Table::default();
+    let mut id = Column::new(ty("int")).not_null();
+    id.identity = Some(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+    });
+    kind.columns.insert("id".to_owned(), id);
+    kind.columns.insert(
+        "status_code".to_owned(),
+        Column::new(ty("varchar(20)")).not_null(),
+    );
+    kind.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".to_owned()],
+    });
+    kind.foreign_keys.insert(
+        "fk_kind_status".to_owned(),
+        pbps_model::ForeignKey {
+            columns: vec!["status_code".to_owned()],
+            references_table: TableName::new("dbo", "status"),
+            references_columns: vec!["code".to_owned()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    // Key 7, not 1: the first identity value the engine would hand out is 1,
+    // so a pinned 1 proves nothing.
+    kind.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[("7", &[("status_code", text("old"))])]),
+    });
+
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert(TableName::new("dbo", "status"), status);
+    declared.tables.insert(TableName::new("dbo", "kind"), kind);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("refdata").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    async fn count(conn: &mut Conn, sql: &str) -> i32 {
+        let rows = conn
+            .query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{sql}\n{e}"));
+        rows[0].try_get_at(0).unwrap().unwrap()
+    }
+
+    assert_eq!(
+        count(&mut db.conn, "SELECT COUNT(*) FROM dbo.status;").await,
+        2
+    );
+    assert_eq!(
+        count(
+            &mut db.conn,
+            "SELECT COUNT(*) FROM dbo.kind WHERE id = 7 AND status_code = 'old';"
+        )
+        .await,
+        1,
+        "the IDENTITY key must be pinned to the declared value"
+    );
+
+    // The second revision: `old` leaves `status`, `new` stops writing its
+    // label (so it takes the default), kind 7 moves to `new`, and kind 9
+    // arrives. The delete of `old` is only acceptable after kind 7 has moved.
+    let mut next = declared.clone();
+    next.tables
+        .get_mut(&TableName::new("dbo", "status"))
+        .unwrap()
+        .data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[("new", &[])]),
+    });
+    next.tables
+        .get_mut(&TableName::new("dbo", "kind"))
+        .unwrap()
+        .data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: rows(&[
+            ("7", &[("status_code", text("new"))]),
+            ("9", &[("status_code", text("new"))]),
+        ]),
+    });
+    let next_ids = mint_ids(&next, &ids, &[]);
+    apply(&mut db.conn, &plan(&declared, &ids, &next, &next_ids)).await;
+
+    assert_eq!(
+        count(
+            &mut db.conn,
+            "SELECT COUNT(*) FROM dbo.status WHERE code = 'new' AND label = N'Unlabelled';"
+        )
+        .await,
+        1,
+        "`= DEFAULT` must make the engine evaluate the column's default"
+    );
+    assert_eq!(
+        count(&mut db.conn, "SELECT COUNT(*) FROM dbo.status;").await,
+        1,
+        "`old` must be gone"
+    );
+    assert_eq!(
+        count(
+            &mut db.conn,
+            "SELECT COUNT(*) FROM dbo.kind WHERE status_code = 'new' AND id IN (7, 9);"
+        )
+        .await,
+        2
+    );
+    // And the switch is off again: an ordinary insert must let the engine
+    // assign the key, which it cannot while IDENTITY_INSERT is on.
+    db.conn
+        .execute("INSERT INTO dbo.kind (status_code) VALUES ('new');")
+        .await
+        .expect("IDENTITY_INSERT must be off after the plan");
+
+    db.drop().await;
+}
