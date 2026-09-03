@@ -30,6 +30,11 @@ pub struct Rule {
     pub about: &'static str,
     /// The parameter names it accepts; anything else in its config is refused.
     pub params: &'static [&'static str],
+    /// The parameters a rule cannot run without. A rule switched on without
+    /// one is refused by the block's check rather than evaluated as a no-op:
+    /// `naming.table: error` with no `pattern` accepted every name, and
+    /// `change.window: error` with no `allow` refused every plan.
+    pub required: &'static [&'static str],
 }
 
 pub const NAMING_TABLE: &str = "naming.table";
@@ -50,6 +55,7 @@ pub const RULES: [Rule; 10] = [
         default: None,
         about: "a table's name (without its schema) matches `pattern`",
         params: &["pattern"],
+        required: &["pattern"],
     },
     Rule {
         id: NAMING_COLUMN,
@@ -57,6 +63,7 @@ pub const RULES: [Rule; 10] = [
         default: None,
         about: "a column's name matches `pattern`",
         params: &["pattern"],
+        required: &["pattern"],
     },
     Rule {
         id: NAMING_INDEX,
@@ -64,6 +71,7 @@ pub const RULES: [Rule; 10] = [
         default: None,
         about: "an index's name matches `pattern`",
         params: &["pattern"],
+        required: &["pattern"],
     },
     Rule {
         id: NAMING_CONSTRAINT,
@@ -71,6 +79,7 @@ pub const RULES: [Rule; 10] = [
         default: None,
         about: "a named constraint (primary key, unique, foreign key, check) matches `pattern`",
         params: &["pattern"],
+        required: &["pattern"],
     },
     Rule {
         id: DATA_MAX_ROWS,
@@ -79,6 +88,7 @@ pub const RULES: [Rule; 10] = [
         about: "a `data:` block declares at most `rows` rows — past that it stops looking like \
                 reference data (ADR-0004)",
         params: &["rows"],
+        required: &[],
     },
     Rule {
         id: COLUMN_NO_DEPRECATED_TYPE,
@@ -86,6 +96,7 @@ pub const RULES: [Rule; 10] = [
         default: Some(Severity::Warning),
         about: "a column does not use a type the engine has deprecated (text, ntext, image)",
         params: &[],
+        required: &[],
     },
     Rule {
         id: CHANGE_EXPAND_CONTRACT,
@@ -94,6 +105,7 @@ pub const RULES: [Rule; 10] = [
         about: "one revision does not both add and drop or narrow in the same table, which \
                 usually wants expand/contract staging (SPEC §13.3)",
         params: &[],
+        required: &[],
     },
     Rule {
         id: CHANGE_NARROWING_ON_DATA,
@@ -102,6 +114,7 @@ pub const RULES: [Rule; 10] = [
         about: "a type narrowing depends on the data already stored; the pre-flight probe \
                 measures it at apply time",
         params: &[],
+        required: &[],
     },
     Rule {
         id: GRANT_WIDEN,
@@ -110,6 +123,7 @@ pub const RULES: [Rule; 10] = [
         about: "a grant widens what a role can do (ADR-0005), for a project that wants the \
                 label at a severity of its own",
         params: &[],
+        required: &[],
     },
     Rule {
         id: CHANGE_WINDOW,
@@ -118,6 +132,7 @@ pub const RULES: [Rule; 10] = [
         about: "a connected plan is computed inside an allowed change window: `offset` \
                 (`+08:00`) and `allow` (`mon-fri 09:00-17:00`, ...)",
         params: &["offset", "allow"],
+        required: &["allow"],
     },
 ];
 
@@ -138,6 +153,13 @@ mod tests {
             assert!(r.about.len() > 20, "{} needs a real explanation", r.id);
             assert!(seen.insert(r.id), "{} twice", r.id);
             assert_eq!(rule(r.id), Some(r));
+            for req in r.required {
+                assert!(
+                    r.params.contains(req),
+                    "{}: `{req}` is required but not a parameter",
+                    r.id
+                );
+            }
         }
         assert_eq!(rule("naming.tabel"), None);
     }

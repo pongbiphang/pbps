@@ -1376,10 +1376,16 @@ pub fn validate_findings(
         }
         let only = match since {
             None => None,
-            Some(rev) => match (baseline::ids_at(project, rev), read_ids_opt(project)) {
-                (Ok(before), Ok(now)) => Some(baseline::changed_subjects(
+            Some(rev) => match (
+                baseline::ids_at(project, rev)
+                    .and_then(|ids| baseline::schema_at(project, rev).map(|schema| (ids, schema))),
+                read_ids_opt(project),
+            ) {
+                (Ok((before, before_schema)), Ok(now)) => Some(baseline::changed_subjects(
                     &before,
                     &now.unwrap_or_default(),
+                    &before_schema,
+                    &l.schema,
                 )),
                 (Err(e), _) => {
                     findings.push(output::Finding::error(

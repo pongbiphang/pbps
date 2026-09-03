@@ -5613,4 +5613,30 @@ fn validate_since_evaluates_only_what_changed() {
         .collect();
     assert_eq!(messages.len(), 1, "{v}");
     assert!(messages[0].contains("NewTable"), "{v}");
+
+    // A table changed in content only — same uid, same name, same columns,
+    // one type widened — is the object the revision touched, and identity
+    // alone never saw it: `--since` accepted an error-level rule on it. (A
+    // new column would mint a uid and count as identity; a type does not.)
+    d.commit();
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "committed: nothing changed since HEAD {}",
+        stderr(&o)
+    );
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: bigint}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("OldTable"), "{v}");
 }

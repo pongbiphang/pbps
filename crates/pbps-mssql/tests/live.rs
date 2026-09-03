@@ -2701,6 +2701,29 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         "the engine must refuse to drop a role that has members"
     );
 
+    // Ownership is the other thing the engine refuses to drop a role over,
+    // and the plan has to see it before anything runs.
+    db.conn
+        .execute("CREATE ROLE owner_role; EXEC('CREATE SCHEMA owned AUTHORIZATION owner_role');")
+        .await
+        .expect("a role that owns a schema");
+    let owned = pbps_mssql::catalog::role_owned_securables(&mut db.conn)
+        .await
+        .expect("owned securables");
+    assert_eq!(
+        owned.get("owner_role"),
+        Some(&vec!["SCHEMA::owned".to_owned()])
+    );
+    assert_eq!(
+        owned.get("stuck"),
+        None,
+        "owning nothing is absent, not empty"
+    );
+    assert!(
+        db.conn.execute("DROP ROLE owner_role;").await.is_err(),
+        "the engine must refuse to drop a role that owns a schema"
+    );
+
     db.drop().await;
 }
 

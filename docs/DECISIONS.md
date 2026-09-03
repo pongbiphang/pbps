@@ -624,3 +624,27 @@ SPEC is in sync with all of these.
     omits it; with no side at all it is kept, because a generated value is a
     value the block has to carry. A confirmed default is still omitted for
     `pull`: it *is* the default, and the shortest true block says so.
+81. **`validate --since` compares the declarations at the revision, not only
+    the identities.** Identity alone saw renames and new objects; a table
+    that gained an index, changed a type or grew its `data:` block kept its
+    uid and its name and was skipped — the one object the revision touched.
+    The declarations at the revision are checked out of git into a scratch
+    directory and loaded with the ordinary loader, and a table or role whose
+    declaration differs (matched by uid, so a rename does not hide a change
+    behind it) is evaluated too. Modules stay always-evaluated (ADR-0008
+    implementation item 4).
+82. **A rule switched on without what it runs on is refused, in either
+    spelling.** `naming.table: error` checked no name — an error-level
+    policy that accepted everything — and `change.window: error` had no
+    window and refused every plan; the bare-word form skipped the parameter
+    checks entirely. The catalogue names each rule's `required` parameters,
+    and the block's check refuses an enabled setting that lacks one, whether
+    it was switched on by a word, by its own severity, or by the catalogue's
+    default.
+83. **A connected plan refuses to drop a role that owns a securable.** The
+    engine refuses the `DROP ROLE`, and a staged apply would already have
+    committed every `DROP MEMBER` before finding out — users without access,
+    the role still there. Ownership is read with the memberships and the
+    plan is refused by name with the `ALTER AUTHORIZATION` to run by hand:
+    moving ownership is a decision about who owns a schema, not a
+    consequence of a drop pbps gets to make.

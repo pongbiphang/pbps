@@ -150,11 +150,44 @@ impl Policies {
                         problems.push(format!(
                             "policies: `{id}` is set to `{w}`; use error, warning, note or off"
                         ));
+                    } else if !w.eq_ignore_ascii_case("off") && !rule.required.is_empty() {
+                        // Switched on by a bare word, and the rule cannot run
+                        // on a word alone: evaluated, it would check nothing
+                        // (a naming rule) or refuse everything (a window).
+                        problems.push(format!(
+                            "policies: `{id}` needs `{}`; write it as a map, e.g. \
+                             `{id}: {{severity: {w}, {}: ...}}`",
+                            rule.required.join("`, `"),
+                            rule.required[0]
+                        ));
                     }
                     continue;
                 }
                 RuleSetting::Detailed(c) => c,
             };
+            // Switched on — by its own severity, or by the catalogue's default
+            // when it names none — the rule has to have what it runs on.
+            let on = match &config.severity {
+                Some(w) => !w.eq_ignore_ascii_case("off"),
+                None => rule.default.is_some(),
+            };
+            if on {
+                let has = |param: &str| match param {
+                    "pattern" => config.pattern.is_some(),
+                    "rows" => config.rows.is_some(),
+                    "offset" => config.offset.is_some(),
+                    "allow" => !config.allow.is_empty(),
+                    _ => false,
+                };
+                for req in rule.required {
+                    if !has(req) {
+                        problems.push(format!(
+                            "policies: `{id}` is switched on with no `{req}`, which it cannot \
+                             run without"
+                        ));
+                    }
+                }
+            }
             if let Some(w) = &config.severity
                 && !is_severity_word(w)
             {
@@ -198,18 +231,6 @@ impl Policies {
                 if let Err(e) = crate::evaluate::parse_window(w) {
                     problems.push(format!("policies: `{id}` window `{w}`: {e}"));
                 }
-            }
-            if id == rules::CHANGE_WINDOW
-                && config
-                    .severity
-                    .as_deref()
-                    .is_none_or(|s| !s.eq_ignore_ascii_case("off"))
-                && config.allow.is_empty()
-            {
-                problems.push(format!(
-                    "policies: `{id}` is switched on with no `allow` window, which would refuse \
-                     every plan"
-                ));
             }
         }
         for s in &self.suppress {
@@ -395,6 +416,29 @@ mod tests {
         );
         assert!(p.suppressed("grant.widen", Some("role r"), "2030-01-01"));
         assert!(p.suppressed("grant.widen", None, "2030-01-01"));
+    }
+
+    /// A rule switched on without what it runs on is refused, in either
+    /// spelling: `naming.table: error` checked no name at all, and
+    /// `change.window: error` refused every plan.
+    #[test]
+    fn a_rule_switched_on_without_its_required_parameter_is_refused() {
+        let p = block(r#"{"rules": {"naming.table": "error", "change.window": "warning"}}"#);
+        let problems = p.check();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("change.window") && problems[0].contains("`allow`"));
+        assert!(problems[1].contains("naming.table") && problems[1].contains("`pattern`"));
+        let p = block(r#"{"rules": {"naming.table": {"severity": "error"}}}"#);
+        let problems = p.check();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no `pattern`"), "{problems:?}");
+        // Off, in either spelling, needs nothing.
+        let p =
+            block(r#"{"rules": {"naming.table": "off", "change.window": {"severity": "off"}}}"#);
+        assert_eq!(p.check(), Vec::<String>::new());
+        // And a rule whose default is on needs nothing more than it has.
+        let p = block(r#"{"rules": {"data.max-rows": {"rows": 50}}}"#);
+        assert_eq!(p.check(), Vec::<String>::new());
     }
 
     /// `OFF` is accepted as a severity everywhere else; the window check

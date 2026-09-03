@@ -19,6 +19,7 @@
 //! actually going to be applied to an environment must be based on that
 //! environment's database as queried (Phase 3).
 
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -228,7 +229,12 @@ pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<IdsFile> {
 ///
 /// By uid, not by file: a renamed table counts as changed under both names,
 /// and a file moved between directories does not count at all.
-pub fn changed_subjects(before: &IdsFile, now: &IdsFile) -> std::collections::BTreeSet<String> {
+pub fn changed_subjects(
+    before: &IdsFile,
+    now: &IdsFile,
+    before_schema: &pbps_model::Schema,
+    now_schema: &pbps_model::Schema,
+) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for (uid, name) in before.tables.iter().chain(&now.tables) {
         if before.tables.get(uid) != now.tables.get(uid) {
@@ -245,7 +251,79 @@ pub fn changed_subjects(before: &IdsFile, now: &IdsFile) -> std::collections::BT
             out.insert(format!("role {role}"));
         }
     }
+    // The declarations themselves, matched through the uid so a rename does
+    // not hide a change behind it: a table that kept its name and gained an
+    // index, changed a type or grew its `data:` block is the object the
+    // revision touched, and identity alone never saw it.
+    for (name, table) in &now_schema.tables {
+        let was = now
+            .table_uid(name)
+            .and_then(|uid| before.tables.get(uid))
+            .and_then(|old_name| before_schema.tables.get(old_name));
+        if was != Some(table) {
+            out.insert(name.to_string());
+        }
+    }
+    for (name, role) in &now_schema.roles {
+        let was = now
+            .role_uid(name)
+            .and_then(|uid| before.roles.get(uid))
+            .and_then(|old_name| before_schema.roles.get(old_name));
+        if was != Some(role) {
+            out.insert(format!("role {name}"));
+        }
+    }
     out
+}
+
+/// The declarations as they were at `rev`: every file under the schema
+/// directory at that revision, checked out into a scratch directory and read
+/// by the ordinary loader, so `--since` compares what a reader of that commit
+/// would have seen. A revision with no declarations is an empty schema, which
+/// makes everything new — the right answer for a project's first policy run.
+pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Schema> {
+    let root = &project.root;
+    let dir_rel = relative_to(&project.schema_dir())?;
+    let listing =
+        git(root, &["ls-tree", "-r", "--name-only", rev, "--", &dir_rel]).unwrap_or_default();
+    let scratch = std::env::temp_dir().join(format!(
+        "pbps-since-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("cannot create `{}`", scratch.display()))?;
+    let result = (|| {
+        for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
+                continue;
+            }
+            let inside = path.strip_prefix(dir_rel.as_str()).unwrap_or(path);
+            let inside = inside.trim_start_matches('/');
+            let text = git(root, &["show", &format!("{rev}:{path}")])?;
+            let target = scratch.join(inside);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, text)?;
+        }
+        pbps_load::load_schema_dir(&scratch)
+            .map(|l| l.schema)
+            .map_err(|errs| {
+                anyhow::anyhow!(
+                    "the declarations at `{rev}` do not load: {}",
+                    errs.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 /// Rewrites a path relative to the repo root, which is what git's path arguments
@@ -302,4 +380,57 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Column, ColumnType, Schema, Table};
+    use std::str::FromStr;
+
+    fn table(cols: &[&str]) -> Table {
+        let mut t = Table::default();
+        for c in cols {
+            t.columns.insert(
+                (*c).to_owned(),
+                Column::new(ColumnType::from_str("int").unwrap()),
+            );
+        }
+        t
+    }
+
+    /// A rename is a change under both names; a content change with the
+    /// same identity is a change too — the case identity alone never saw.
+    #[test]
+    fn a_table_changed_in_content_only_is_a_changed_subject() {
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let mut before_ids = IdsFile::default();
+        before_ids
+            .tables
+            .insert(uid.clone(), "dbo.t".parse().unwrap());
+        let now_ids = before_ids.clone();
+        let mut before = Schema::default();
+        before
+            .tables
+            .insert("dbo.t".parse().unwrap(), table(&["id"]));
+        let mut now = before.clone();
+        assert!(
+            changed_subjects(&before_ids, &now_ids, &before, &now).is_empty(),
+            "untouched"
+        );
+        now.tables
+            .insert("dbo.t".parse().unwrap(), table(&["id", "added"]));
+        let changed = changed_subjects(&before_ids, &now_ids, &before, &now);
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), ["dbo.t"]);
+
+        // Renamed and unchanged inside: both names, through the uid.
+        let mut renamed_ids = before_ids.clone();
+        renamed_ids.tables.insert(uid, "dbo.t2".parse().unwrap());
+        let mut renamed = Schema::default();
+        renamed
+            .tables
+            .insert("dbo.t2".parse().unwrap(), table(&["id"]));
+        let changed = changed_subjects(&before_ids, &renamed_ids, &before, &renamed);
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), ["dbo.t", "dbo.t2"]);
+    }
 }

@@ -287,6 +287,48 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// compared, but a role cannot be dropped while it has members, and a plan
 /// that removes them has to say whom. A nested role is a member like any
 /// user and comes back the same way.
+/// Every securable each user-defined role **owns**, spelled the way T-SQL
+/// names it (`SCHEMA::sales`, `OBJECT::dbo.t`, `TYPE::dbo.money2`, ...).
+///
+/// The engine refuses to drop a role that owns anything, and ownership is
+/// each environment's own, like membership. A connected plan reads this so
+/// the drop is refused *before* anything runs — a staged apply would
+/// otherwise commit every `DROP MEMBER` and then fail on the `DROP ROLE`,
+/// leaving users without access and the role still there.
+pub async fn role_owned_securables(
+    conn: &mut Conn,
+) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+    const OWNED: &str = "\
+SELECT r.name AS role_name, x.securable
+  FROM sys.database_principals r
+  JOIN (
+        SELECT principal_id, N'SCHEMA::' + name AS securable FROM sys.schemas
+        UNION ALL
+        SELECT o.principal_id, N'OBJECT::' + SCHEMA_NAME(o.schema_id) + N'.' + o.name
+          FROM sys.objects o WHERE o.principal_id IS NOT NULL AND o.parent_object_id = 0
+        UNION ALL
+        SELECT t.principal_id, N'TYPE::' + SCHEMA_NAME(t.schema_id) + N'.' + t.name
+          FROM sys.types t WHERE t.principal_id IS NOT NULL
+        UNION ALL
+        SELECT a.principal_id, N'ASSEMBLY::' + a.name FROM sys.assemblies a
+        UNION ALL
+        SELECT c.principal_id, N'CERTIFICATE::' + c.name FROM sys.certificates c
+        UNION ALL
+        SELECT k.principal_id, N'SYMMETRIC KEY::' + k.name FROM sys.symmetric_keys k
+        UNION ALL
+        SELECT k.principal_id, N'ASYMMETRIC KEY::' + k.name FROM sys.asymmetric_keys k
+       ) AS x ON x.principal_id = r.principal_id
+ WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
+ ORDER BY r.name, x.securable;";
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in conn.query(OWNED).await? {
+        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+            .or_default()
+            .push(get::<&str>(&row, "securable")?.to_owned());
+    }
+    Ok(out)
+}
+
 pub async fn role_members(conn: &mut Conn) -> Result<BTreeMap<String, Vec<String>>, DbError> {
     const MEMBERS: &str = "\
 SELECT r.name AS role_name, m.name AS member_name
