@@ -143,9 +143,12 @@ Decisions taken during implementation that this document did not anticipate:
    declarable. A role the ids file does not name is unmanaged, like a table.
 4. **What the model cannot hold is reported by `pull`, never dropped.** A
    `DENY`, a column-level grant, a permission outside the closed set
-   (`CONTROL`, `TAKE OWNERSHIP`), `WITH GRANT OPTION`, and a grant on an
-   object the model does not hold (a sequence, a synonym, a module that could
-   not be read) each produce a warning naming the role and the target. The
+   (`CONTROL`, `TAKE OWNERSHIP`), and a grant on an object the model does not
+   hold (a sequence, a synonym, a module that could not be read) each produce
+   a warning naming the role and the target. A grant `WITH GRANT OPTION` is
+   wider than any grant a declaration can spell, so it is not a warning: it
+   is left out of the role's set and carried as unexpressible drift, which
+   `verify` reports and `plan --db` refuses to plan over (DECISIONS 95). The
    last one is left out of the role rather than written, because a grant
    target has to be a declared table or module and `validate` would refuse
    the project `pull` had just written.
@@ -214,6 +217,12 @@ Decisions taken during implementation that this document did not anticipate:
     NAME` statement records the rename it performs, as a table rename's
     statements do, so the checkpoint after it scopes the role under its new
     name (DECISIONS 93).
+15. **A managed role's grant `WITH GRANT OPTION` is drift, not a plain
+    grant.** Folded into the set it compared equal to the recorded grant and
+    `verify` called a role that could now delegate clean. Left out and
+    carried beside the comparison, `verify` names it with the `REVOKE GRANT
+    OPTION FOR` to run by hand, and `plan --db` refuses rather than restate a
+    `GRANT` that would leave the option in place (DECISIONS 95).
 
 ## Placement
 

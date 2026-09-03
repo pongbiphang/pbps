@@ -742,3 +742,24 @@ SPEC is in sync with all of these.
     nothing, so a checkpoint after it scoped the role out under its old
     name and a resume could not see what changed on it while paused. The
     second instance of a shape the first one had already named.
+94. **A non-key IDENTITY column is never read back.** A declaration cannot
+    set it (the model refuses the cell) and an `UPDATE` cannot change it, so
+    it is the engine's column and nobody else's. Read back, its generated
+    value met the omission every declared row has to make, and every
+    connected plan restated an `UPDATE` the engine refuses — a project with
+    such a table could plan and never apply. The row query leaves the column
+    out, so both sides omit it and omission agrees with omission; `pull
+    --data` writes a block without it, which is the block the model accepts.
+    The key is the one identity a row may pin (ADR-0004), and it is read as
+    before.
+95. **A grant `WITH GRANT OPTION` is unexpressible drift, never the plain
+    grant.** The catalog spells it `W`, and folding it into the role's set
+    beside a `G` let `verify` compare a role that can now delegate equal to
+    the recorded plain grant and say "no drift"; a warning on stderr does not
+    make that verdict safe. It is left out of the set and carried beside the
+    comparison (`Scoped::unexpressible`), where `verify` reports it as drift
+    with the `REVOKE GRANT OPTION FOR` to run by hand and `plan --db` refuses
+    to plan over it — restating the plain `GRANT` would leave the option in
+    place and the plan never converging. Representing the bit in the model
+    is a format change with an emitter half (`WITH GRANT OPTION` on the way
+    out) and belongs to an ADR, not a review fix.

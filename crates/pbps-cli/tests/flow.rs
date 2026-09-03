@@ -5165,11 +5165,16 @@ fn reference_data_round_trips_through_a_real_target() {
     });
     let connection = format!("{server};Database={name}");
 
+    // `seq` is the engine's column: a declaration cannot set it and an UPDATE
+    // cannot change it, so it is never read back and never compared — read
+    // back, its value met the omission every row has to make and the second
+    // plan restated an UPDATE the engine refuses (DECISIONS 94).
     let declared = "table: dbo.t
 columns:
   code: {type: varchar(20), nullable: false}
   label: {type: nvarchar(50), nullable: false, default: \"'Unlabelled'\"}
   rank: {type: int}
+  seq: {type: int, nullable: false, identity: [1, 1]}
 primary_key: {name: pk_t, columns: [code]}
 data:
   mode: exact

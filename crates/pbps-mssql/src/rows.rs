@@ -206,6 +206,15 @@ pub fn query(
         if *column == key {
             continue;
         }
+        // An IDENTITY column that is not the key is the engine's to assign: a
+        // declaration cannot set it (the model refuses the cell) and an UPDATE
+        // cannot change it. Read back, its value would be compared with the
+        // omission every declaration has to make, and every connected plan
+        // would restate an UPDATE the engine refuses. So it is never read:
+        // both sides omit it, and omission agrees with omission (DECISIONS 94).
+        if spec.identity.is_some() {
+            continue;
+        }
         let quoted = quote(column)?;
         let value_at = select.len();
         select.push(read_expr(&quoted, &spec.ty.base));
@@ -547,6 +556,37 @@ mod tests {
             q.sql
         );
         assert!(q.sql.trim_end().ends_with(';'), "{}", q.sql);
+    }
+
+    /// The engine's column, not the declaration's: never selected, so it never
+    /// meets the omission every declaration has to make.
+    #[test]
+    fn a_non_key_identity_column_is_never_read() {
+        let mut t = table(
+            Some(vec!["code"]),
+            &[
+                ("code", "varchar(10)", None),
+                ("label", "nvarchar(50)", None),
+            ],
+        );
+        let mut seq = Column::new(ColumnType::from_str("int").unwrap()).not_null();
+        seq.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        t.columns.insert("seq".to_owned(), seq);
+        let q = query(
+            &name(),
+            &t,
+            &RowScope::Every {
+                known: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(q.columns.len(), 1, "{:?}", q.columns);
+        assert_eq!(q.columns[0].column, "label");
+        assert!(!q.sql.contains("[seq]"), "{}", q.sql);
     }
 
     #[test]

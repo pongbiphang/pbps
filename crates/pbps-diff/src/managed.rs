@@ -47,6 +47,14 @@ pub struct Scoped {
     /// Left alone: their grants are neither compared nor touched.
     pub unmanaged_roles: Vec<String>,
 
+    /// Facts about the managed set that the model cannot hold and a drift
+    /// check must not call clean — a managed role's grant `WITH GRANT OPTION`,
+    /// which is wider than any grant a declaration can spell. Filled by the
+    /// caller from what introspection reported, since the differ never sees
+    /// them: they are carried beside the comparison as drift, never folded
+    /// into a side where they would compare equal (DECISIONS 95).
+    pub unexpressible: Vec<String>,
+
     /// Roles the identity file names that the database does not have.
     pub missing_roles: Vec<String>,
 }
@@ -124,6 +132,7 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectNa
         unmanaged_modules,
         unmanaged_roles,
         missing_roles,
+        unexpressible: Vec::new(),
     }
 }
 

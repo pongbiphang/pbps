@@ -123,7 +123,18 @@ async fn managed_state_full(
         unreadable.push((name, format!("{} {} ({})", m.kind, m.name, m.why)));
     }
 
-    let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
+    let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules);
+    // A managed role's grant WITH GRANT OPTION is wider than the plain grant
+    // the declarations can spell, and was left out of the role's set rather
+    // than folded in. Carried beside the comparison so `verify` reports it
+    // as drift and `plan --db` refuses to plan over it; on an unmanaged role
+    // it is that role's business, like its other grants (DECISIONS 95).
+    for (role, what) in &pulled.unexpressible {
+        if ids.roles.values().any(|managed| managed == role) {
+            eprintln!("warning: {what}");
+            scoped.unexpressible.push(what.clone());
+        }
+    }
     report_unmanaged(&scoped, unmanaged)?;
     let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, read)
         .await
@@ -420,7 +431,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // early, which skipped the hook: right verdict, and the alert that
         // exists to carry that verdict never fired.
         let changes = diffed.changes;
-        let unexpressible: Vec<String> = diffed.errors.iter().map(ToString::to_string).collect();
+        let unexpressible: Vec<String> = diffed
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .chain(scoped.unexpressible.iter().cloned())
+            .collect();
 
         Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
@@ -949,6 +965,17 @@ pub fn cmd_plan_db(
             &pbps_model::data::read_scopes(&recorded_data, &declared_data),
         )
         .await?;
+        // A managed role's grant WITH GRANT OPTION is not something to plan
+        // over either: left out of the live set, the differ would restate the
+        // plain GRANT on every plan and the engine would keep the option.
+        if !managed.scoped.unexpressible.is_empty() {
+            bail!(
+                "`{}` holds what the declarations cannot express:\n  {}\n\
+                 Resolve it by hand, then plan again.",
+                target.label,
+                managed.scoped.unexpressible.join("\n  ")
+            );
+        }
         // A declared name standing on an object introspection cannot express is
         // not something to plan around. It is absent from the scoped schema, so
         // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`

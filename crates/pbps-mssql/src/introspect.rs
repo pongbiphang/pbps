@@ -192,6 +192,14 @@ pub struct Pulled {
     /// the caller must show these, because each one is a difference that would
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
+    /// Grants the model cannot hold and a drift check must not call clean:
+    /// `(role, what)`. A grant `WITH GRANT OPTION` is wider than the plain
+    /// grant a declaration can spell, so it is left out of the role's set —
+    /// folded in, `verify` compared it equal to the plain grant and said
+    /// "no drift" about a role that could now delegate — and reported here
+    /// for the caller to put beside the other unexpressible differences
+    /// (DECISIONS 95).
+    pub unexpressible: Vec<(String, String)>,
     /// Modules the database has that pbps cannot manage: a CLR object, one
     /// created `WITH ENCRYPTION`, or one whose stored text does not have the
     /// shape the emitter can reproduce.
@@ -478,6 +486,7 @@ fn action(code: u8) -> ReferentialAction {
 /// managed set.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut warnings = Vec::new();
+    let mut unexpressible: Vec<(String, String)> = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
 
@@ -777,11 +786,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         };
         if p.state.trim() == "W" {
-            warnings.push(format!(
-                "role {}: {} on {target} was granted WITH GRANT OPTION, which is not modelled; \
-                 it is declared as a plain grant",
-                p.role, p.permission
+            // Not folded into the plain grant: it is wider, and a comparison
+            // that read it as equal would call a widened role clean.
+            unexpressible.push((
+                p.role.clone(),
+                format!(
+                    "role {}: {} on {target} is granted WITH GRANT OPTION, which the \
+                     declarations cannot express; revoke the grant option by hand \
+                     (`REVOKE GRANT OPTION FOR {} ON {} FROM {}`) to bring it under pbps",
+                    p.role,
+                    permission.as_str(),
+                    p.permission,
+                    target,
+                    p.role
+                ),
             ));
+            continue;
         }
         role.grants.entry(target).or_default().insert(permission);
     }
@@ -789,6 +809,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     Pulled {
         schema,
         warnings,
+        unexpressible,
         unmanaged_modules,
     }
 }
@@ -907,6 +928,46 @@ mod tests {
             "{:?}",
             p.warnings
         );
+    }
+
+    /// Wider than the plain grant, so never the plain grant: left out of the
+    /// set and reported where a drift check will see it, not in a warning.
+    #[test]
+    fn a_grant_with_grant_option_is_unexpressible_not_a_plain_grant() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |permission: &str, state: &str| RawPermission {
+            role: "app_reader".into(),
+            class: 1,
+            permission: permission.into(),
+            state: state.into(),
+            schema: "dbo".into(),
+            object: Some("customer".into()),
+            minor_id: 0,
+        };
+        raw.permissions.push(grant("SELECT", "G"));
+        raw.permissions.push(grant("UPDATE", "W"));
+        let p = assemble(&raw);
+        let target: pbps_model::GrantTarget = "dbo.customer".parse().unwrap();
+        let grants = &p.schema.roles["app_reader"].grants[&target];
+        assert!(grants.contains(&pbps_model::Permission::Select));
+        assert!(
+            !grants.contains(&pbps_model::Permission::Update),
+            "{grants:?}"
+        );
+        assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
+        assert_eq!(p.unexpressible[0].0, "app_reader");
+        assert!(
+            p.unexpressible[0].1.contains("WITH GRANT OPTION")
+                && p.unexpressible[0]
+                    .1
+                    .contains("REVOKE GRANT OPTION FOR UPDATE"),
+            "{:?}",
+            p.unexpressible
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]

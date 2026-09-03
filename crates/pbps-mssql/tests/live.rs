@@ -2613,7 +2613,8 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     db.conn
         .execute(
             "GRANT INSERT ON OBJECT::dbo.customer TO app_reader;\n\
-             DENY DELETE ON OBJECT::dbo.customer TO app_reader;",
+             DENY DELETE ON OBJECT::dbo.customer TO app_reader;\n\
+             GRANT UPDATE ON OBJECT::dbo.customer TO app_reader WITH GRANT OPTION;",
         )
         .await
         .expect("hand edits");
@@ -2624,6 +2625,27 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         again.warnings.iter().any(|w| w.contains("DENY DELETE")),
         "{:?}",
         again.warnings
+    );
+    // WITH GRANT OPTION is wider than any grant a declaration can spell: it
+    // is not folded into the set (that read a widened role as clean) and it
+    // is reported as unexpressible, where a drift check has to see it
+    // (DECISIONS 95). The catalog spells the state `W`; measured here.
+    assert!(
+        again
+            .unexpressible
+            .iter()
+            .any(|(role, what)| role == "app_reader"
+                && what.contains("UPDATE")
+                && what.contains("WITH GRANT OPTION")),
+        "{:?}",
+        again.unexpressible
+    );
+    assert!(
+        !again.schema.roles["app_reader"]
+            .grants
+            .get(&"dbo.customer".parse().unwrap())
+            .is_some_and(|g| g.contains(&Permission::Update)),
+        "the widened grant must not read as the plain one"
     );
     let live = pbps_diff::scope(&again.schema, &ids, &Default::default()).schema;
     let drift = pbps_diff::diff_partial(

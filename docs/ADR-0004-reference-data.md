@@ -203,6 +203,10 @@ Decisions taken during implementation that this document did not anticipate:
    refused rather than reconciled (74). The pre-delete probe counts a child
    row the plan updates unless the update sets the referencing column
    itself (73).
+   A non-key `IDENTITY` column is the engine's and is never read back: a
+   declaration cannot set it and an `UPDATE` cannot change it, so both sides
+   omit it and omission agrees with omission (DECISIONS 94); the key is the
+   one identity a row may pin.
 5. **A table the declarations take over is measured against what it holds.**
    The first connected plan for a table with a new `data:` block reads its
    rows, updates the ones that differ, inserts the ones missing, and — for
