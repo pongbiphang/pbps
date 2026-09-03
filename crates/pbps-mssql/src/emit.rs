@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{DialectError, Statement};
+use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
     Cell, Change, Column, ForeignKey, GrantTarget, Index, Module, ModuleKind, ObjectName,
     Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
@@ -99,7 +99,15 @@ pub fn takes_online(change: &Change) -> bool {
 
 pub fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
-        Change::CreateTable { name, table, .. } => create_table(name, table),
+        // The first statement is the one that brings the table into being;
+        // it says so, and a staged checkpoint adopts the table from there.
+        Change::CreateTable { name, table, .. } => {
+            let mut out = create_table(name, table)?;
+            if let Some(first) = out.first_mut() {
+                first.creates.push(Created::Table(name.clone()));
+            }
+            Ok(out)
+        }
 
         Change::DropTable { name, .. } => one(format!("DROP TABLE {};", qualified(name)?)),
 
@@ -139,7 +147,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
 
         // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
         // which is the reason a role rename is intent rather than drop + add.
-        Change::CreateRole { name, .. } => one(format!("CREATE ROLE {};", quote(name)?)),
+        Change::CreateRole { name, .. } => Ok(vec![
+            Statement::new(format!("CREATE ROLE {};", quote(name)?))
+                .creating(Created::Role(name.clone())),
+        ]),
         // The members go first, each in a statement of its own, and the role
         // last: the engine refuses to drop a role that still has members, and
         // a plan that listed them is a plan the reviewer saw.
@@ -203,7 +214,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                     qualified(table)?,
                     column_definition(table, name, column)?
                 ))
-                .own_batch(),
+                .own_batch()
+                .creating(Created::Column(table.clone(), name.clone())),
             ])
         }
 
@@ -1581,7 +1593,7 @@ mod tests {
         // do, so a staged checkpoint finds the role again (DECISIONS 93).
         let stmts = emit(
             &Change::RenameRole {
-                uid,
+                uid: uid.clone(),
                 from: "reader".into(),
                 to: "app_reader".into(),
             },
@@ -1593,6 +1605,17 @@ mod tests {
             [("reader".to_owned(), "app_reader".to_owned())]
         );
         assert!(stmts[0].renames.is_empty());
+        // And a created role says so, for the checkpoint to adopt it
+        // (DECISIONS 100).
+        let created = emit(
+            &Change::CreateRole {
+                uid: uid.clone(),
+                name: "auditors".into(),
+            },
+            Strategy::default(),
+        )
+        .unwrap();
+        assert_eq!(created[0].creates, [Created::Role("auditors".into())]);
     }
 
     #[test]

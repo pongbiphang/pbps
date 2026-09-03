@@ -401,6 +401,45 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "a `data:` block cannot key its rows by `{key}`, {what}: {why}"
             )));
         }
+        // The key travels as a string literal too, and the engine converts
+        // it on the way in. A key an `int` column cannot hold is not caught
+        // by the alias query on a table this plan creates — there is no
+        // table to ask yet — so the accepted plan failed at its first
+        // insert. Checked here, by the kind the column reads back as: an
+        // integer key is digits with an optional sign, a `bit` key one of
+        // its four spellings, and any text is a text key (DECISIONS 99).
+        if let Some(pk) = &table.primary_key
+            && let [key_column] = pk.columns.as_slice()
+            && let Some(base) = base_of(key_column)
+        {
+            let kind = ValueKind::of(&base);
+            for key in data.rows.keys() {
+                let text = key.as_str().trim();
+                let fits = match kind {
+                    ValueKind::Int => {
+                        let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                    }
+                    ValueKind::Bool => {
+                        matches!(text, "0" | "1")
+                            || text.eq_ignore_ascii_case("true")
+                            || text.eq_ignore_ascii_case("false")
+                    }
+                    ValueKind::Text => true,
+                };
+                if !fits {
+                    errs.push(invalid(format!(
+                        "row key `{key}` cannot be a `{base}`, the type of the key column \
+                         `{key_column}`: the engine would refuse the insert — {}",
+                        match kind {
+                            ValueKind::Int => "an integer key is digits, with an optional sign",
+                            ValueKind::Bool => "a `bit` key is `0`, `1`, `true` or `false`",
+                            ValueKind::Text => unreachable!(),
+                        }
+                    )));
+                }
+            }
+        }
         for (key, row) in &data.rows {
             for (column, value) in &row.0 {
                 let Some(base) = base_of(column) else {
@@ -751,6 +790,48 @@ mod tests {
         );
         let msg = messages(&table(&name, &t));
         assert!(!msg.contains("reads back"), "{msg}");
+    }
+
+    /// The key is a literal like any cell, and a table this plan creates has
+    /// no engine to ask about it; the kind of the key column decides.
+    #[test]
+    fn a_row_key_the_key_column_cannot_hold_is_refused_by_name() {
+        use pbps_model::{DataMode, Row, RowKey, TableData};
+        let (name, mut t) = base_table();
+        let with = |t: &mut Table, type_name: &str, keys: &[&str]| {
+            t.columns
+                .insert("k".into(), Column::new(ty(type_name)).not_null());
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["k".into()],
+            });
+            t.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: keys
+                    .iter()
+                    .map(|k| (RowKey::from(*k), Row::default()))
+                    .collect(),
+            });
+        };
+        with(&mut t, "int", &["1", "-7", "+3", "007"]);
+        assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(&mut t, "int", &["not-an-int", "1.5", ""]);
+        let msg = messages(&table(&name, &t));
+        assert!(
+            msg.contains("row key `not-an-int` cannot be a `int`"),
+            "{msg}"
+        );
+        assert!(msg.contains("row key `1.5`"), "{msg}");
+        assert!(msg.contains("row key ``"), "{msg}");
+        with(&mut t, "bit", &["0", "1", "TRUE", "false"]);
+        assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(&mut t, "bit", &["yes"]);
+        assert!(messages(&table(&name, &t)).contains("row key `yes` cannot be a `bit`"));
+        // Text takes anything; so does a decimal, which reads back as text.
+        with(&mut t, "varchar(10)", &["not-an-int", ""]);
+        assert!(!messages(&table(&name, &t)).contains("row key"));
+        with(&mut t, "decimal(5,2)", &["1.50"]);
+        assert!(!messages(&table(&name, &t)).contains("row key"));
     }
 
     /// Refused for what it is, not for its kind: the text would go in, but

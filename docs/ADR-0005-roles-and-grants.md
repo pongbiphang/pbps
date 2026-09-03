@@ -214,10 +214,13 @@ Decisions taken during implementation that this document did not anticipate:
     and refuses on any difference, and asks about ownership again the same
     way (DECISIONS 92). A staged apply that found out at `DROP ROLE` would
     already have committed every `DROP MEMBER` the reviewer saw.
-14. **A staged checkpoint follows a role rename.** The `ALTER ROLE ... WITH
-    NAME` statement records the rename it performs, as a table rename's
-    statements do, so the checkpoint after it scopes the role under its new
-    name (DECISIONS 93).
+14. **A staged checkpoint follows a role rename, and adopts a role the plan
+    creates.** The `ALTER ROLE ... WITH NAME` statement records the rename
+    it performs, as a table rename's statements do, so the checkpoint after
+    it scopes the role under its new name (DECISIONS 93); `CREATE ROLE`
+    records what it creates, so the checkpoint after it scopes the new role
+    in, and a grant it gains while the deployment is paused is seen by the
+    resume rather than recorded as clean (100).
 15. **A managed role's permission the model cannot hold is drift, not a
     warning.** Folded into the set, a grant `WITH GRANT OPTION` compared
     equal to the recorded grant; warned about and left out, a column-level

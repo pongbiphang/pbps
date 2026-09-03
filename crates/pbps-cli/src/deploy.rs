@@ -163,21 +163,62 @@ fn declared_scope(project: &Project) -> anyhow::Result<(BTreeSet<ObjectName>, Da
     ))
 }
 
-/// The scopes a plan's baseline is pinned under: the recorded ones, plus the
-/// plan's own for every table the recorded state does not cover yet.
+/// The scopes a plan's baseline is pinned under: the recorded ones and the
+/// plan's own, table by table, each the union of the two where both cover it.
 ///
 /// A table gaining its first `data:` block has rows the differ measured
-/// against and the recorded state knows nothing of. The baseline checksum
-/// and `apply`'s check both read this union — the recorded scope where there
-/// is one (the drift check's view), the plan's where there is none — so a row
-/// that appears in such a table between plan and apply is a mismatch, not a
-/// row the approved deletes silently missed.
+/// against and the recorded state knows nothing of; a table whose `ensure`
+/// block gains a key, or switches to `exact`, has rows the differ measured
+/// that the recorded scope alone would not look at again. The baseline
+/// checksum and `apply`'s check both read this union, so a row that appears
+/// or changes in such a table between plan and apply is a mismatch, not a
+/// row the approved changes silently missed or overwrote (DECISIONS 98).
 fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     let mut out = recorded.clone();
     for (name, scope) in planned {
-        out.entry(name.clone()).or_insert_with(|| scope.clone());
+        let pinned = match out.remove(name) {
+            Some(recorded) => recorded.union(scope.clone()),
+            None => scope.clone(),
+        };
+        out.insert(name.clone(), pinned);
     }
     out
+}
+
+/// Brings the objects a committed statement created into the live identities,
+/// under the uids the plan gave them, so the checkpoint taken next scopes
+/// them in. Before this, a role or a table the plan had just created stood
+/// outside every checkpoint until the closing entry, and a grant or a row it
+/// gained while the deployment was paused was recorded as clean without a
+/// resume ever comparing it (DECISIONS 100). A name the plan's ids do not
+/// know is left alone: there is no uid to adopt it under.
+fn adopt_created(live_ids: &mut IdsFile, plan_ids: &IdsFile, created: &[pbps_dialect::Created]) {
+    for c in created {
+        match c {
+            pbps_dialect::Created::Table(name) => {
+                if let Some(uid) = plan_ids.table_uid(name) {
+                    live_ids.tables.insert(uid.clone(), name.clone());
+                }
+                // Its columns come with it: the CREATE TABLE made them all.
+                for (uid, r) in &plan_ids.columns {
+                    if &r.table == name {
+                        live_ids.columns.insert(uid.clone(), r.clone());
+                    }
+                }
+            }
+            pbps_dialect::Created::Column(table, column) => {
+                let r = pbps_model::ColumnRef::new(table.clone(), column.clone());
+                if let Some(uid) = plan_ids.column_uid(&r) {
+                    live_ids.columns.insert(uid.clone(), r);
+                }
+            }
+            pbps_dialect::Created::Role(name) => {
+                if let Some(uid) = plan_ids.role_uid(name) {
+                    live_ids.roles.insert(uid.clone(), name.clone());
+                }
+            }
+        }
+    }
 }
 
 /// The plan's data scopes under the names the catalog has *now*.
@@ -1691,6 +1732,7 @@ async fn apply_staged_under_lock(
         for (from, to) in &stmt.role_renames {
             live_ids.rename_role(from, to);
         }
+        adopt_created(&mut live_ids, &plan.ids, &stmt.creates);
 
         // The unmanaged policy is deliberately not enforced between two
         // committed statements. It is a hygiene gate for the start of a
@@ -2131,12 +2173,86 @@ mod tests {
             .into_iter()
             .collect();
         let pinned = pinned_scopes(&recorded, &planned);
+        // Both cover `t`: the plan's `exact` widens the read, and the recorded
+        // key is still spelled so the engine can say which row it names.
+        assert_eq!(pinned[&t].mode, DataMode::Exact, "{:?}", pinned[&t]);
         assert_eq!(
-            pinned[&t], recorded[&t],
-            "the recorded scope, not the plan's"
+            pinned[&t].keys,
+            ["a"].into_iter().map(pbps_model::RowKey::from).collect()
         );
         assert_eq!(pinned[&u], exact, "newly covered: the plan's");
         assert_eq!(pinned.len(), 2);
+
+        // A key added to an `ensure` block is pinned too: read at plan time,
+        // it has to be checked again before apply, or a change to it in
+        // between is overwritten by an approved update nobody measured.
+        let wider: DataScopes = [(
+            t.clone(),
+            DataScope {
+                mode: DataMode::Ensure,
+                keys: ["a", "b"]
+                    .into_iter()
+                    .map(pbps_model::RowKey::from)
+                    .collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let pinned = pinned_scopes(&recorded, &wider);
+        assert_eq!(pinned[&t].mode, DataMode::Ensure);
+        assert_eq!(
+            pinned[&t].keys,
+            ["a", "b"]
+                .into_iter()
+                .map(pbps_model::RowKey::from)
+                .collect()
+        );
+    }
+
+    /// A created object enters the checkpoint's identities the moment its
+    /// statement commits, under the plan's uid, columns and all; a name the
+    /// plan does not know is left alone.
+    #[test]
+    fn a_created_object_is_adopted_into_the_live_identities_under_the_plans_uid() {
+        use pbps_dialect::Created;
+        let t_uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let c_uid: pbps_model::Uid = "c_aaaaaa".parse().unwrap();
+        let d_uid: pbps_model::Uid = "c_bbbbbb".parse().unwrap();
+        let r_uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
+        let table: TableName = "app.audit".parse().unwrap();
+        let mut plan_ids = IdsFile::default();
+        plan_ids.tables.insert(t_uid.clone(), table.clone());
+        plan_ids.columns.insert(
+            c_uid.clone(),
+            pbps_model::ColumnRef::new(table.clone(), "id"),
+        );
+        plan_ids.columns.insert(
+            d_uid.clone(),
+            pbps_model::ColumnRef::new("app.other".parse().unwrap(), "later"),
+        );
+        plan_ids.roles.insert(r_uid.clone(), "auditors".to_owned());
+
+        let mut live = IdsFile::default();
+        adopt_created(&mut live, &plan_ids, &[Created::Table(table.clone())]);
+        assert_eq!(live.tables.get(&t_uid), Some(&table));
+        assert!(live.columns.contains_key(&c_uid), "{live:?}");
+        assert!(!live.columns.contains_key(&d_uid), "another table's column");
+        assert!(live.roles.is_empty());
+
+        adopt_created(
+            &mut live,
+            &plan_ids,
+            &[
+                Created::Column("app.other".parse().unwrap(), "later".into()),
+                Created::Role("auditors".into()),
+                Created::Role("nobody".into()),
+                Created::Table("app.unknown".parse().unwrap()),
+            ],
+        );
+        assert!(live.columns.contains_key(&d_uid));
+        assert_eq!(live.roles.get(&r_uid).map(String::as_str), Some("auditors"));
+        assert_eq!(live.roles.len(), 1);
+        assert_eq!(live.tables.len(), 1);
     }
 
     /// Halfway through a rename that moves both schema and name, the table

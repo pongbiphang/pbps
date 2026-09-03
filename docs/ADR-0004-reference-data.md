@@ -212,7 +212,11 @@ Decisions taken during implementation that this document did not anticipate:
    rows, updates the ones that differ, inserts the ones missing, and — for
    `exact` — deletes the ones nobody declared, behind the gate. `plan --db`
    says so on stdout, because the plan shows the consequences and not the
-   takeover.
+   takeover. The baseline is pinned under the union of the recorded scope
+   and the plan's, table by table, so a key added to an `ensure` block or
+   an `ensure` -> `exact` switch is checked again before apply (DECISIONS
+   98). A row key has to be spellable in its key column's type, since a
+   table this plan creates has no engine to ask (99).
 6. **The pre-delete probe finds the referencing tables in the catalog at run
    time**, through `sys.foreign_keys` and dynamic SQL, rather than trusting
    the declarations to list them — a foreign key someone added by hand is

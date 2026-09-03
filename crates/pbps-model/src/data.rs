@@ -451,6 +451,20 @@ impl DataScope {
     }
 
     /// The rows the catalog has to fetch to answer this scope.
+    /// The scope that answers both: `exact` if either is, and every key
+    /// either spells. What a plan's baseline is pinned under when the
+    /// recorded scope and the plan's both cover a table — a key the plan adds
+    /// to an `ensure` block, or an `ensure` -> `exact` switch, has rows the
+    /// differ measured and the recorded scope alone would not check again
+    /// before apply (DECISIONS 98).
+    pub fn union(mut self, other: DataScope) -> DataScope {
+        if other.mode == DataMode::Exact {
+            self.mode = DataMode::Exact;
+        }
+        self.keys.extend(other.keys);
+        self
+    }
+
     pub fn rows_to_read(&self) -> RowScope {
         match self.mode {
             DataMode::Exact => RowScope::Every {

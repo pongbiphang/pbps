@@ -149,6 +149,24 @@ pub struct Statement {
     /// find the role under its new name, or it records the environment
     /// without it and a resume cannot see what changed on it while paused.
     pub role_renames: Vec<(String, String)>,
+
+    /// The objects this statement brings into being. A staged checkpoint
+    /// scopes the environment by the identities the catalog had before the
+    /// plan, and an object the plan just created is not among them — so a
+    /// grant a new role gained, or a row a new table gained, while the
+    /// deployment was paused went unseen by `--resume` and was recorded as
+    /// clean by the closing entry. The executor adopts each of these into
+    /// the live identities, under the uid the plan gave it, the moment the
+    /// statement commits (DECISIONS 100).
+    pub creates: Vec<Created>,
+}
+
+/// An object a statement creates, for a staged checkpoint to adopt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Created {
+    Table(TableName),
+    Column(TableName, String),
+    Role(String),
 }
 
 impl Statement {
@@ -159,6 +177,7 @@ impl Statement {
             transactional: true,
             renames: Vec::new(),
             role_renames: Vec::new(),
+            creates: Vec::new(),
         }
     }
 
@@ -171,6 +190,12 @@ impl Statement {
     /// Records that this statement renames the role `from` to `to`.
     pub fn renaming_role(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
         self.role_renames.push((from.into(), to.into()));
+        self
+    }
+
+    /// Records that this statement creates `what`.
+    pub fn creating(mut self, what: Created) -> Self {
+        self.creates.push(what);
         self
     }
 

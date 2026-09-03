@@ -779,3 +779,30 @@ SPEC is in sync with all of these.
     reported by `verify` as drift and refused by `plan --db`. `pull` still
     prints them as warnings, since nothing is being compared yet. The
     second instance of 95's shape, swept the same day.
+98. **The pinned baseline is the union of the recorded scope and the plan's,
+    table by table.** 77 pinned the plan's scope for a table the recorded
+    state did not cover, and kept the recorded scope wholesale where it did
+    — so a key added to an `ensure` block, or an `ensure` -> `exact`
+    switch, was read at plan time and never checked again before apply: a
+    change to the new key in between was overwritten by an approved update
+    nobody measured, and a row inserted in between made the approved insert
+    fail. `DataScope::union` (exact if either is, every key either spells)
+    is what both the checksum and `apply`'s check now read.
+99. **A row key has to be spellable in its key column's type.** The key
+    travels as a string literal like any cell (70), and the alias query
+    that lets the engine judge a spelling (71) has no table to ask on a
+    table this plan creates — so `not-an-int` for an `int` key passed
+    `validate` and the accepted plan failed at its first insert. `validate`
+    checks each key against the kind the column reads back as: an integer
+    key is digits with an optional sign, a `bit` key one of its four
+    spellings, text takes anything (a decimal reads back as text and stays
+    the engine's to judge).
+100. **An object a statement creates enters the live identities the moment
+    the statement commits.** A staged checkpoint scopes the environment by
+    the identities the catalog had before the plan, and a table, a column
+    or a role the plan had just created was outside every checkpoint until
+    the closing entry — a grant the new role gained, or a row the new table
+    gained, while the deployment was paused went unseen by `--resume` and
+    was recorded as clean. The emitter says what each statement creates
+    (`Statement::creates`), as it says what each renames (93), and the
+    executor adopts it under the plan's uid before the checkpoint is taken.
