@@ -524,3 +524,16 @@ SPEC is in sync with all of these.
     measured useless: metadata visibility hides a securable from an account
     with no permission on it, which is exactly the account `doctor` is
     checking, so the live query saw nothing precisely where the gap was.
+70. **A `data:` block may not put a value into a binary column.** Every row
+    value goes to the engine as a string literal and the engine converts it
+    (decision 53's "the database is the normalizer"), which is right for
+    numbers, dates and text and **wrong for bytes**: `N'0x01'` into a
+    `varbinary` stores the characters `0x01`, not the byte, and a key read
+    back as `0x01` then fails to select its own row. The emitter is handed a
+    change and no types, on purpose (a plan applies with no checkout), so it
+    cannot render the literal differently; and inventing a typed literal in
+    the plan format for one column family is a format change this review
+    fix does not get to make. `validate` therefore refuses a binary key and
+    a row that sets a binary cell, by name, and a `pull --data` of such a
+    table produces a declaration that says why it is refused. Lifting this
+    means a typed value in the model (`Value::Binary`), which is an ADR.

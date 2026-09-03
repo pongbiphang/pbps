@@ -206,6 +206,47 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         )));
     }
 
+    // A declared row value travels as a string literal and the engine
+    // converts it — right for numbers, dates and text, wrong for bytes:
+    // `N'0x01'` into a varbinary stores the characters, not the byte, and a
+    // key read back as `0x01` then fails to select its own row. The emitter
+    // carries no types (a plan applies with no checkout), so this is refused
+    // here, by name, rather than guessed at twice (DECISIONS 70).
+    if let Some(data) = &table.data {
+        let binary = |column: &str| {
+            table
+                .columns
+                .get(column)
+                .and_then(|c| types::normalize(&c.ty).ok())
+                .is_some_and(|t| {
+                    matches!(
+                        t.base.as_str(),
+                        "binary" | "varbinary" | "image" | "timestamp"
+                    )
+                })
+        };
+        if let Some(pk) = &table.primary_key
+            && let [key] = pk.columns.as_slice()
+            && binary(key)
+        {
+            errs.push(invalid(format!(
+                "a `data:` block cannot key its rows by `{key}`, a binary column: row values \
+                 are written as text, and text does not convert to the bytes it names"
+            )));
+        }
+        for (key, row) in &data.rows {
+            for column in row.0.keys() {
+                if binary(column) {
+                    errs.push(invalid(format!(
+                        "row `{key}` sets `{column}`, a binary column, which a `data:` block \
+                         cannot hold: row values are written as text, and text does not \
+                         convert to the bytes it names — leave the column out of the row"
+                    )));
+                }
+            }
+        }
+    }
+
     if let Some(pk) = &table.primary_key {
         if let Some(n) = &pk.name
             && let Err(e) = ident::quote(n)
@@ -425,6 +466,41 @@ mod tests {
         assert!(msg.contains("needs an integer type"), "{msg}");
         assert!(msg.contains("cannot be nullable"), "{msg}");
         assert!(msg.contains("never advances"), "{msg}");
+    }
+
+    /// Refused, not converted: the emitter has no types to convert with.
+    #[test]
+    fn a_binary_cell_or_key_in_a_data_block_is_refused_by_name() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let (name, mut t) = base_table();
+        t.columns
+            .insert("blob".into(), Column::new(ty("varbinary(8)")));
+        let mut row = Row::default();
+        row.0.insert("blob".into(), Value::Text("0x01".into()));
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("1"), row)].into_iter().collect(),
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("`blob`, a binary column"), "{msg}");
+
+        // The same row with the cell left out is fine: no value flows.
+        t.data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(RowKey::from("1"), Row::default());
+        assert!(!messages(&table(&name, &t)).contains("binary"));
+
+        // A binary key is refused whatever the rows set.
+        t.columns
+            .insert("id".into(), Column::new(ty("binary(4)")).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let msg = messages(&table(&name, &t));
+        assert!(msg.contains("key its rows by `id`"), "{msg}");
     }
 
     #[test]

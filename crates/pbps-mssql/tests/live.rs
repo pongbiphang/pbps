@@ -2626,6 +2626,20 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         "{gaps:?}"
     );
 
+    // A schema a role is granted on that the database does not have is
+    // reported as absent, not silently unasked: the GRANT would fail.
+    let nowhere = pbps_mssql::doctor::GrantTargets {
+        schemas: vec!["dbo".to_owned(), "nowhere".to_owned()],
+        ..targets.clone()
+    };
+    let held = pbps_mssql::doctor::permissions(&mut lp, &["dbo".to_owned()], &[], Some(&nowhere))
+        .await
+        .expect("read permissions");
+    assert_eq!(
+        held.absent_schemas.iter().cloned().collect::<Vec<_>>(),
+        ["nowhere"]
+    );
+
     // Granted exactly what the gaps name, the account is ready — and CONTROL
     // on the schema covers the object inside it, which is the inheritance
     // `HAS_PERMS_BY_NAME` has to account for.

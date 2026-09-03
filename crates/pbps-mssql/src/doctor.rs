@@ -300,7 +300,9 @@ pub struct Held {
     /// project that manages only `app` and never touches a `dbo` table.
     pub schemas: BTreeMap<String, BTreeSet<String>>,
 
-    /// Managed schemas the database does not have.
+    /// Managed schemas the database does not have — and schemas a managed
+    /// role is granted on, for the same reason: `GRANT ... ON SCHEMA::x`
+    /// fails on a schema that is not there.
     ///
     /// Not a permission problem, and not nothing either. The emitter never
     /// writes `CREATE SCHEMA` — a plan declaring `app.customer` against a
@@ -611,6 +613,11 @@ pub async fn permissions(
     // schema that does not exist yet is unasked rather than reported.
     let mut granted_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut granted_schemas: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // A schema a role is granted on that the database does not have: the
+    // `GRANT ... ON SCHEMA::x` fails at apply, and pbps never creates a
+    // schema, so it is reported like a managed schema that is missing rather
+    // than dropped by the join below.
+    let mut absent_granted: BTreeSet<String> = BTreeSet::new();
     if let Some(targets) = granted {
         let granted_perms: Vec<&str> = REQUIRED
             .iter()
@@ -742,6 +749,12 @@ pub async fn permissions(
                     entry.insert(permission.trim().to_ascii_uppercase());
                 }
             }
+            absent_granted.extend(
+                schemas_wanted
+                    .iter()
+                    .filter(|s| !granted_schemas.contains_key(*s))
+                    .cloned(),
+            );
         }
     }
 
@@ -749,11 +762,12 @@ pub async fn permissions(
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
     // somehow did not, that is not a declaration problem.
-    let absent_schemas: BTreeSet<String> = schemas
+    let mut absent_schemas: BTreeSet<String> = schemas
         .iter()
         .filter(|name| name.as_str() != LEDGER_SCHEMA && !per_schema.contains_key(*name))
         .cloned()
         .collect();
+    absent_schemas.extend(absent_granted);
     // Managed means declared. `dbo` stays only if the project actually declares
     // something in it.
     let managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();

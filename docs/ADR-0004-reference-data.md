@@ -183,6 +183,12 @@ Decisions taken during implementation that this document did not anticipate:
    is not seen, and the remedy for a column that matters is to write the
    value. A table whose live key is not a single column is **unreadable**,
    and the read fails rather than answering "no rows".
+   A binary column (`binary`, `varbinary`, `image`, `timestamp`) cannot hold
+   a declared value at all: row values travel as string literals, and the
+   engine's text-to-binary conversion stores the characters, not the bytes.
+   `validate` refuses a binary key and a row that sets a binary cell
+   (DECISIONS 70); a typed value in the model is the way to lift that, and
+   it is an ADR of its own.
 5. **A table the declarations take over is measured against what it holds.**
    The first connected plan for a table with a new `data:` block reads its
    rows, updates the ones that differ, inserts the ones missing, and — for

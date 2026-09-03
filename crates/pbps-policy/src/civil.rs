@@ -119,7 +119,8 @@ pub fn parse_date(s: &str) -> Result<(i64, u32, u32), String> {
     let [y, m, d] = parts.as_slice() else {
         return Err(bad());
     };
-    let digits = |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    let digits =
+        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
     if !digits(y, 4) || !digits(m, 2) || !digits(d, 2) {
         return Err(bad());
     }

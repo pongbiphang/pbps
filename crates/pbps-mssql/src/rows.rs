@@ -237,6 +237,10 @@ pub fn query(
     if let RowScope::Keys(keys) = scope {
         // The same rendering the emitter's `WHERE key = N'...'` uses: always a
         // string literal, converted by the engine to the key column's type.
+        // That conversion is wrong for a binary key — `N'0x01'` becomes the
+        // characters, not the byte — which is why `validate` refuses a
+        // binary column in a `data:` block (DECISIONS 70) rather than this
+        // read and the emitter each guessing a type they do not carry.
         let list: Vec<String> = keys.iter().map(|k| literal(k.as_str())).collect();
         sql.push_str(&format!(
             "\n WHERE {} IN ({})",
