@@ -183,6 +183,28 @@ fn scopes_at(plan: &pbps_model::SavedPlan, live_ids: &IdsFile) -> DataScopes {
     scopes_under(&plan.data, &plan.ids, live_ids)
 }
 
+/// The declared schema with its tables keyed by the names `live_ids` gives
+/// their uids — the names the database has before this plan runs — so that
+/// a scope, a row reference or a row spelling looked up by the live name
+/// finds the declaration of the same table. Everything inside a table is
+/// left as declared; only the map keys move.
+fn tables_under(schema: &Schema, final_ids: &IdsFile, live_ids: &IdsFile) -> Schema {
+    let mut out = schema.clone();
+    out.tables = schema
+        .tables
+        .iter()
+        .map(|(final_name, table)| {
+            let now = final_ids
+                .table_uid(final_name)
+                .and_then(|uid| live_ids.tables.get(uid))
+                .cloned()
+                .unwrap_or_else(|| final_name.clone());
+            (now, table.clone())
+        })
+        .collect();
+    out
+}
+
 /// [`scopes_at`] on its parts: `data` keyed by the names `final_ids` gives
 /// each table, re-keyed by the names `live_ids` gives the same uids.
 fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> DataScopes {
@@ -901,7 +923,13 @@ pub fn cmd_plan_db(
         // declarations against — every row an `exact` declaration is about to
         // delete included.
         let recorded_data = entry.snapshot.schema.data_scopes();
-        let declared_data = loaded.schema.data_scopes();
+        // The declarations under the names the database has *now*: a table
+        // this plan renames is read, scoped and measured under its old name,
+        // and a declared scope keyed by the new one would find no table and
+        // be skipped — an `ensure` -> `exact` switch in the same revision as
+        // the rename then planned none of its deletes.
+        let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
+        let declared_data = declared_live.data_scopes();
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -987,7 +1015,7 @@ pub fn cmd_plan_db(
             &scoped.schema,
             &managed.rows,
             &recorded_data,
-            &loaded.schema,
+            &declared_live,
         )?;
         let mut cs = pbps_diff::diff(
             pbps_diff::Side {
@@ -1363,7 +1391,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &recorded_ids,
         &recorded_modules,
         project.config.unmanaged,
-        &pinned_scopes(&entry.snapshot.schema.data_scopes(), &plan.data),
+        &pinned_scopes(
+            &entry.snapshot.schema.data_scopes(),
+            &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
+        ),
         &entry.snapshot.schema,
     )
     .await?;
@@ -1544,7 +1575,10 @@ async fn apply_staged_under_lock(
             &recorded_ids,
             &recorded_modules,
             project.config.unmanaged,
-            &pinned_scopes(&entry.snapshot.schema.data_scopes(), &plan.data),
+            &pinned_scopes(
+                &entry.snapshot.schema.data_scopes(),
+                &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
+            ),
             &entry.snapshot.schema,
         )
         .await?;
@@ -1904,6 +1938,42 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
 mod tests {
     use super::*;
     use pbps_model::{DataMode, DataScope};
+
+    /// A renamed table's declaration is found under the name the database
+    /// still has; an unrenamed one, and one the plan creates, stay put.
+    #[test]
+    fn the_declarations_are_keyed_by_the_names_the_database_has_now() {
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let mut final_ids = IdsFile::default();
+        final_ids
+            .tables
+            .insert(uid.clone(), "dbo.t2".parse().unwrap());
+        let mut live_ids = IdsFile::default();
+        live_ids.tables.insert(uid, "dbo.t".parse().unwrap());
+        let mut declared = Schema::default();
+        let t = pbps_model::Table {
+            data: Some(pbps_model::TableData {
+                mode: DataMode::Exact,
+                rows: BTreeMap::new(),
+            }),
+            ..Default::default()
+        };
+        declared.tables.insert("dbo.t2".parse().unwrap(), t);
+        declared
+            .tables
+            .insert("dbo.new".parse().unwrap(), pbps_model::Table::default());
+
+        let live = tables_under(&declared, &final_ids, &live_ids);
+        let names: Vec<String> = live.tables.keys().map(ToString::to_string).collect();
+        assert_eq!(names, ["dbo.new", "dbo.t"]);
+        assert!(
+            live.tables[&"dbo.t".parse::<TableName>().unwrap()]
+                .data
+                .is_some()
+        );
+        let scopes = live.data_scopes();
+        assert!(scopes.contains_key(&"dbo.t".parse::<TableName>().unwrap()));
+    }
 
     /// The recorded scope wins where there is one; a table only the plan
     /// covers is pinned under the plan's.

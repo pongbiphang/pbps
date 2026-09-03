@@ -139,10 +139,24 @@ pub fn parse_date(s: &str) -> Result<(i64, u32, u32), String> {
     let y: i64 = y.parse().map_err(|_| bad())?;
     let m: u32 = m.parse().map_err(|_| bad())?;
     let d: u32 = d.parse().map_err(|_| bad())?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // Against the calendar, not just the range: `2026-02-31` compared as
+    // text would keep a suppression alive to the end of February and expire
+    // it on March 1, for a date that never comes.
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return Err(bad());
     }
     Ok((y, m, d))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +214,13 @@ mod tests {
         assert!(parse_date("2026-9-4").is_err());
         assert!(parse_date("2026-09-4").is_err());
         assert!(parse_date("+2026-09-04").is_err());
+        // Against the calendar: a day the month does not have, a leap day in
+        // a year without one — and the leap days that do exist.
+        assert!(parse_date("2026-02-31").is_err());
+        assert!(parse_date("2025-02-29").is_err());
+        assert!(parse_date("2026-04-31").is_err());
+        assert!(parse_date("2100-02-29").is_err());
+        assert_eq!(parse_date("2024-02-29").unwrap(), (2024, 2, 29));
+        assert_eq!(parse_date("2000-02-29").unwrap(), (2000, 2, 29));
     }
 }

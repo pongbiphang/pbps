@@ -4931,6 +4931,94 @@ fn an_oversized_data_block_warns_but_still_plans() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 }
 
+/// A table this revision renames is read, scoped and measured under the name
+/// the database still has. With the declared scope keyed by the new name the
+/// read found no table, and an `ensure` -> `exact` switch in the same
+/// revision planned none of its deletes: the rogue row survived an apply
+/// that reported success.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_renamedata_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("renamedata-live");
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: ensure\n  rows:\n    new: {}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // Under `ensure` the application's own row is invisible, by design.
+    sql("INSERT INTO dbo.t (code) VALUES ('rogue');");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // One revision: the table is renamed and its block becomes `exact`.
+    std::fs::remove_file(d.dir.join("schema/dbo.t.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.t2.yml"),
+        "table: dbo.t2\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-table", "dbo.t", "dbo.t2"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("row rogue"),
+        "the rogue row is read under the old name: {out}"
+    );
+    assert!(out.contains("data-delete"), "{out}");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "rename,data-delete",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
+
 /// The connected half of ADR-0004, end to end through the real binary: the
 /// rows go in with `bootstrap`, come back into the recorded state in the
 /// engine's spelling, a hand-edited row is drift, a re-declared table plans

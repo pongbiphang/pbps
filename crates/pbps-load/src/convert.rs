@@ -57,6 +57,10 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
     let mut intents = Vec::new();
 
     let name = dto.role.value.trim().to_owned();
+    // A dot is not refused: a role is not in a schema, but `[app.reader]`
+    // is a legal principal name, the emitter quotes it, and `pull` writes
+    // it back as it is — refusing it here made a freshly pulled project
+    // fail to load.
     if name.is_empty() {
         errs.push(LoadError::semantic(
             src,
@@ -64,16 +68,6 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
             "a role must have a name",
             "empty",
         ));
-    } else if name.contains('.') {
-        errs.push(
-            LoadError::semantic(
-                src,
-                to_span(&dto.role.defined),
-                format!("`{name}` is not a role name: a role is not in a schema"),
-                "contains a dot",
-            )
-            .with_help("write the bare role name, e.g. `role: app_reader`"),
-        );
     }
 
     if let Some(from) = &dto.renamed_from {

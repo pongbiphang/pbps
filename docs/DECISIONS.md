@@ -595,3 +595,21 @@ SPEC is in sync with all of these.
     so the two can no longer name one path; the loader finds every `.yml`
     under the schema directory and tells a role by its content, so a
     hand-written role file anywhere still loads.
+77. **A connected plan reads the declarations under the names the database
+    has now.** The recorded state, the scoped live schema and the rows are
+    all keyed by the *old* name of a table this plan renames; the declared
+    scopes were keyed by the new one, so `read_scopes` never joined the two
+    and the declared scope found no table to read — an `ensure` -> `exact`
+    switch in the same revision as a rename planned none of its deletes and
+    applied cleanly. The declarations are re-keyed through the ids
+    (`tables_under`: final name -> uid -> live name) before the read, the
+    plan base and the pinning, and `apply` re-keys the plan's scopes the
+    same way (`scopes_under`), so the two checksums see the same tables.
+78. **A role name may contain a dot.** `[app.reader]` is a legal principal
+    name; the loader refused it as "not in a schema", and `pull` wrote it
+    back as it is, so the freshly pulled project failed to load. The emitter
+    quotes the name; nothing parses a dot in it.
+79. **A suppression's `until` is checked against the calendar.** Compared as
+    text, `2026-02-31` kept a suppression alive to the end of February and
+    expired it on March 1, for a date that never comes; `2025-02-29` the
+    same. The day is checked against its month, leap years included.

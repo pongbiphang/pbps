@@ -708,9 +708,16 @@ indexes:
     }
 
     #[test]
-    fn a_role_with_a_dotted_name_or_an_unknown_permission_is_refused() {
-        let errs = load_file_str(Path::new("r.yml"), "role: dbo.app_reader\n").unwrap_err();
-        assert!(errs[0].to_string().contains("not in a schema"), "{errs:?}");
+    fn a_role_with_a_dotted_name_loads_and_an_unknown_permission_is_refused() {
+        // `[app.reader]` is a legal principal name; a role is not in a
+        // schema, but the dot is the name's, and `pull` writes it back as is.
+        let f = load_file_str(Path::new("r.yml"), "role: app.reader\n").unwrap();
+        match f {
+            LoadedFile::Role(r) => assert_eq!(r.name, "app.reader"),
+            other @ (LoadedFile::Table(_) | LoadedFile::Module(_)) => {
+                panic!("not a role: {other:?}")
+            }
+        }
         let errs = load_file_str(Path::new("r.yml"), "role: r\ngrants:\n  dbo.t: [control]\n")
             .unwrap_err();
         assert!(errs[0].to_string().contains("control"), "{errs:?}");
