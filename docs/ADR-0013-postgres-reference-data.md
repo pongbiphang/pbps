@@ -418,11 +418,33 @@ that a value written and a value read compare equal.
 and ADR-0012 §4 already measured a fifth, `TimeZone`, deciding whether a type
 change rebuilds a table.
 
-**Decision: these settings are scoped to the reads, not pinned on the session.**
-`SET LOCAL` around the queries that render values — the reference-data read-back
-and the catalog reads that return value text — and **nothing applied to the
-session that executes DDL**. Named, because a decision about a set has to say
-what is in it:
+**Decision: these settings are scoped to the statements that carry *values*, not
+pinned on the session.** `SET LOCAL` around every statement where pbps is
+responsible for a value's text — the reference-data read-back, the catalog reads
+that return value text, **and the reference-data DML** — and **nothing applied
+to the session that executes opaque DDL**.
+
+An earlier version of this decision drew the line at read versus write, and that
+was the wrong line. **Measured**, the same declared literal stores two different
+dates depending on the session that inserts it:
+
+```
+'01/02/2026' inserted under MDY -> 2026-01-02
+the same literal under DMY      -> 2026-02-01
+```
+
+ADR-0004 permits a quoted value precisely so the engine converts the text, which
+makes that conversion pbps's business: without the scope on the write, one
+approved plan stores different data on different targets, and the checksum that
+was supposed to mean "exactly this will run" pins a statement whose *effect*
+depends on the deployment role's settings.
+
+The line that survives is not read versus write but **whose text it is**: a
+value pbps renders into a plan and parses back is the tool's responsibility, and
+a module body is the user's — so the first is canonicalized on both sides and
+the second is left as the operator's database reads it.
+
+Named, because a decision about a set has to say what is in it:
 
 | Setting | Why it is in the read scope |
 |---|---|
@@ -589,7 +611,29 @@ reads deterministic would have made them depend on the declarations.
   stays reachable with an empty path (measured: the catalog query answers), so
   introspection itself is unaffected.
 - **Writes use a path built per statement: the object's own schema first, then
-  the project's configured extras.** One global list ordered by anything else is
+  the project's configured extras — and the path each module was created under
+  is recorded with it.** The extras are ordered, so their order is part of what
+  a declaration *means*, and **measured**, a view keeps the binding it was
+  created with while a fresh one takes the new order:
+
+  ```
+  created under extras (m_ea, m_eb):        from m_ea
+  the same view after reordering to
+      (m_eb, m_ea):                         from m_ea — unchanged, nothing rebuilt it
+  a bootstrap of the same declaration
+      under the new order:                  from m_eb
+  ```
+
+  So reordering the extras silently divides the environment from a `bootstrap`
+  of the same revision, and nothing exposes it: the declarations are unchanged,
+  so the differ sees nothing, and both sides of the drift comparison read the
+  same live object. (The deparsed text does record the resolved binding, but
+  only when the read path makes qualification necessary — so it is not something
+  a comparison can be built on.) The state snapshot therefore records the write path
+  beside the declared text it already keeps (§2.2 of
+  [ADR-0009](ADR-0009-postgres-modules.md)), and a module whose recorded path
+  differs from the project's current one is rebuilt — the path is an input to
+  the declaration's meaning, so a change to it is a change to the module.** One global list ordered by anything else is
   unsafe the moment two managed schemas hold the same name — **measured**, a
   view in `m_b` created under a path ordered `(m_a, m_b)` binds to `m_a.t`:
 

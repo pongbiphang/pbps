@@ -627,9 +627,21 @@ the one where a rebuild hands an unmanaged role `SELECT`. Re-emitting the
 declared grants never removes it, because there was nothing declared to
 contradict it.
 
-So the enumeration is a **two-sided** obligation: after the `CREATE`, the plan
-brings the object's state to exactly what it recorded — emitting what is missing
-**and revoking what appeared** — and refuses if it cannot. `pg_default_acl` is
+So the enumeration is a **two-sided** obligation in a second sense too: it is
+asserted **immediately before the `DROP`** — that what the plan recorded is
+still what the object carries — and again **after the `CREATE`**, that the
+object now carries exactly that. The first assertion is the one this section
+lacked, and its absence is not hypothetical: `reloptions` are outside the model,
+so a DBA who hardens a view with `security_invoker = true` between `plan --db`
+and `apply` has that setting silently reverted by the rebuild, with the
+checksum unable to see it (§3 measures that nothing compares `reloptions`) and
+drift unable to report it. After the `DROP` the original is gone and there is
+nothing left to compare against, so the check has to happen while the object
+still exists.
+
+With both assertions, the plan brings the object's state to exactly what it
+recorded — emitting what is missing **and revoking what appeared** — and refuses
+if it cannot. `pg_default_acl` is
 where to look for what will appear, and the plan says so, because a `REVOKE`
 nobody can explain is worse than one the artifact predicted.
 

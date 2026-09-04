@@ -773,6 +773,36 @@ SELECT 'R50', 'and at extra_float_digits=-3',
        (SELECT d::text FROM m.fl) || ' — one stored value, three spellings';
 RESET extra_float_digits;
 
+-- ---------------------------- the twenty-second 2026-09-05 review round
+
+CREATE TABLE m.dml (id int PRIMARY KEY, d date);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.dml VALUES (1, '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.dml VALUES (2, '01/02/2026');
+RESET DateStyle;
+SELECT 'R51', 'one declared literal inserted under two DateStyles',
+       (SELECT string_agg(id::text || ' -> ' || d::text, ', ' ORDER BY id) FROM m.dml)
+       || ' — the same approved plan, different stored data';
+
+CREATE SCHEMA m_ea; CREATE SCHEMA m_eb;
+CREATE FUNCTION m_ea.helper() RETURNS text AS $$ SELECT 'from m_ea' $$ LANGUAGE sql;
+CREATE FUNCTION m_eb.helper() RETURNS text AS $$ SELECT 'from m_eb' $$ LANGUAGE sql;
+SET search_path = m, m_ea, m_eb;
+CREATE VIEW m.pathv AS SELECT helper() AS who;
+SELECT 'R52', 'a view created under extras ordered (m_ea, m_eb)',
+       (SELECT who FROM m.pathv)
+       || ', stored as: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.pathv'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m, m_eb, m_ea;
+SELECT 'R53', 'the same view after the project reorders its extras',
+       (SELECT who FROM m.pathv) || ' — unchanged, and nothing rebuilt it';
+CREATE VIEW m.pathv2 AS SELECT helper() AS who;
+SELECT 'R54', 'a bootstrap of the same declaration under the new order',
+       (SELECT who FROM m.pathv2) || ' — the environment and a bootstrap now differ';
+SET search_path = m;
+DROP SCHEMA m_ea CASCADE; DROP SCHEMA m_eb CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

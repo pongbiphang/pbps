@@ -138,3 +138,7 @@ R47 | the same row read under America/New_York | 2026-01-15 07:00:00-05 — diff
 R48 | a stored double rendered at extra_float_digits=0 | 0.123456789012346
 R49 | the same value at extra_float_digits=3 | 0.12345678901234568
 R50 | and at extra_float_digits=-3 | 0.123456789012 — one stored value, three spellings
+R51 | one declared literal inserted under two DateStyles | 1 -> 2026-01-02, 2 -> 2026-02-01 — the same approved plan, different stored data
+R52 | a view created under extras ordered (m_ea, m_eb) | from m_ea, stored as: SELECT helper() AS who;
+R53 | the same view after the project reorders its extras | from m_ea — unchanged, and nothing rebuilt it
+R54 | a bootstrap of the same declaration under the new order | from m_eb — the environment and a bootstrap now differ
