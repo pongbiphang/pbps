@@ -162,3 +162,7 @@ R68 | a BEGIN ATOMIC body called under (m, m_nb) | from m_na — bound at creati
 R69 | the plpgsql body after a function-local SET search_path | from m_na — the engine's own remedy
 A60 | a LANGUAGE sql string body naming a missing function | refused: function m.no_such(integer) does not exist
 A61 | a LANGUAGE plpgsql body naming a missing function | accepted — check_function_bodies is on
+A62 | reverse pg_depend edges to a callee with a SQL-language caller | none
+A63 | a callee-only rebuild, which never recreates the caller | accepted / accepted
+A64 | the unchanged SQL-language caller afterwards | refused: function m.oo_f(integer) does not exist
+A65 | and recreating that caller with its stale reference | refused: function m.oo_f(integer) does not exist — the engine checks only when it creates

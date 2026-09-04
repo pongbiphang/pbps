@@ -39,7 +39,7 @@ rule` are each quoted in an ADR.
 
 | File | |
 |---|---|
-| `postgres.sql` | 163 measurements: modules and overloading (A), privileges (B), type-change cost (T), reference data (R) |
+| `postgres.sql` | 167 measurements: modules and overloading (A), privileges (B), type-change cost (T), reference data (R) |
 | `sqlserver.sql` | 3 contrasts (M), and only 3 — see below |
 | `observed-*.txt` | what those produced on the pinned engines when the ADRs were written |
 
@@ -55,7 +55,7 @@ or a bug in shipped code. It is a hazard.
 
 | Lines | ADR |
 |---|---|
-| `A1`–`A61` | [ADR-0009](../../docs/ADR-0009-postgres-modules.md) — deparsing, overloading, what `CREATE OR REPLACE` cannot do, dependency refusals |
+| `A1`–`A65` | [ADR-0009](../../docs/ADR-0009-postgres-modules.md) — deparsing, overloading, what `CREATE OR REPLACE` cannot do, dependency refusals |
 | `B1`–`B12`, `M1`, `M2` | [ADR-0010](../../docs/ADR-0010-postgres-privileges.md) — `USAGE`, schema grants, default privileges, cluster-wide roles, the ACL |
 | `T-01`–`T-21` | [ADR-0012](../../docs/ADR-0012-postgres-type-catalogue.md) — what rewrites a table, what a session decides, the catalogue's spellings |
 | `R1`–`R69`, `M3` | [ADR-0013](../../docs/ADR-0013-postgres-reference-data.md) — defaults, identity keys, `NOT VALID`, collation, session-dependent rendering |

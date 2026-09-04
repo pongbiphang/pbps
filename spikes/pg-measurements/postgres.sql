@@ -914,6 +914,23 @@ SELECT 'A61', 'a LANGUAGE plpgsql body naming a missing function',
        m.accepts('CREATE FUNCTION m.bad_pl() RETURNS int AS $q$ BEGIN RETURN m.no_such(1); END $q$ LANGUAGE plpgsql')
        || ' — check_function_bodies is ' || current_setting('check_function_bodies');
 
+-- ---------------------------- the twenty-eighth 2026-09-05 review round
+
+CREATE FUNCTION m.oo_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.oo_sqlcaller() RETURNS int AS $$ SELECT m.oo_f(1) $$ LANGUAGE sql;
+SELECT 'A62', 'reverse pg_depend edges to a callee with a SQL-language caller',
+       coalesce((SELECT string_agg(DISTINCT d.objid::regprocedure::text, ', ') FROM pg_depend d
+                 WHERE d.refobjid = 'm.oo_f(int)'::regprocedure
+                   AND d.deptype = 'n' AND d.classid = 'pg_proc'::regclass), 'none');
+SELECT 'A63', 'a callee-only rebuild, which never recreates the caller',
+       m.accepts('DROP FUNCTION m.oo_f(int)') || ' / '
+       || m.accepts('CREATE FUNCTION m.oo_f(a int, b int) RETURNS int AS $q$ SELECT a + b $q$ LANGUAGE sql');
+SELECT 'A64', 'the unchanged SQL-language caller afterwards',
+       m.accepts('SELECT m.oo_sqlcaller()');
+SELECT 'A65', 'and recreating that caller with its stale reference',
+       m.accepts('CREATE OR REPLACE FUNCTION m.oo_sqlcaller() RETURNS int AS $q$ SELECT m.oo_f(1) $q$ LANGUAGE sql')
+       || ' — the engine checks only when it creates';
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

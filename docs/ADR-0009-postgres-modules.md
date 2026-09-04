@@ -1031,16 +1031,37 @@ Two things follow, and neither is a new mechanism:
       accepted
   ```
 
-  So a SQL-language body is validated at creation — a stale reference in one
-  fails loudly at `CREATE`, inside the plan's transaction, which is the engine
-  doing the check for us. **The refusal is therefore needed for PL/pgSQL bodies**
-  (and for anything assembled by dynamic SQL, which nothing checks), and for the
-  rest the engine is the validation the rule was standing in for.
+  So a SQL-language body is validated **when it is created** — and that is the
+  whole of it. A first version of this paragraph read that as "SQL-language
+  callers are safe", which attaches the exemption to the body's *language* when
+  it belongs to *whether the validating event happens*. **Measured**, a
+  callee-only rebuild never recreates the caller, so nothing validates anything:
 
-  It is worth contrasting that with the narrowing this decision had to withdraw a
-  round earlier: that one was narrow because the *identity* happened to be
-  cheaply knowable, and it let real failures through. This one is narrow because
-  a measurement says where the engine already refuses. Callers found **outside** the managed set are
+  ```
+  reverse pg_depend edges to oo.f:                            none
+  DROP FUNCTION oo.f(int)                                     accepted
+  CREATE FUNCTION oo.f(a int, b int) ...                      accepted
+  SELECT oo.sqlcaller()   refused: function oo.f(integer) does not exist
+  ```
+
+  and the engine only steps in when the plan does recreate it:
+
+  ```
+  CREATE OR REPLACE FUNCTION oo.sqlcaller() ... $$ SELECT oo.f(1) $$ ...
+      refused: function oo.f(integer) does not exist
+  ```
+
+  **So the exemption is: a SQL-language caller is excluded from the refusal only
+  when this plan actually recreates it**, because then the engine performs the
+  check. An unchanged one is refused like a PL/pgSQL one, and PL/pgSQL and
+  dynamic SQL are refused either way, since nothing validates them at all.
+
+  That is the fourth time in this section a rule has been attached to something
+  easy to see — the identity, the caller's declaration changing, the body's
+  language — rather than to the event that actually decides the outcome. The
+  three earlier ones are recorded above; this one is recorded here; and the
+  pattern is worth more than any of the four fixes, because the next rule
+  written in this section will be tempting for the same reason. Callers found **outside** the managed set are
   **reported, not refused**, and `depends_on:` remains the explicit escape hatch
   for what a scan cannot see.
 
