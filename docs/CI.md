@@ -521,22 +521,35 @@ Two things about the `apply` job are load-bearing:
 ```yaml
 stages: [check, plan, apply]
 
-default:
-  image: rust:1-bookworm
-  cache:
-    key: cargo
-    paths: [.cargo/, target/]
+variables:
+  GIT_DEPTH: 0                     # `--since` needs history
+
+# GitLab has no per-step environment: a protected variable is in the job's
+# environment from the moment the image's entrypoint runs. So the image is
+# inside the credential's trust boundary and a floating tag will not do —
+# resolve the digest once (`docker buildx imagetools inspect rust:1-bookworm`)
+# and bump it deliberately. See "Who can reach the credential".
+.rust:
+  image: rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
   before_script:
     - export CARGO_HOME="$PWD/.cargo"
     - cargo build --release --locked -p pbps-cli
     - export PATH="$PWD/target/release:$PATH"
 
-variables:
-  GIT_DEPTH: 0                     # `--since` needs history
+# The same boundary, one layer in: the cache below is written by every
+# merge-request pipeline, and `target/` in it is the binary the deployment
+# jobs would execute with the credential. They build from scratch instead.
+.deploys:
+  extends: .rust
+  cache: []
 
 # ---- the merge-request layer ----
 check:
+  extends: .rust
   stage: check
+  cache:
+    key: cargo
+    paths: [.cargo/, target/]
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
@@ -550,6 +563,7 @@ check:
 
 # ---- the deployment layer ----
 plan:prod:
+  extends: .deploys
   stage: plan
   rules:
     - if: $CI_COMMIT_TAG =~ /^prod-v/
@@ -563,6 +577,7 @@ plan:prod:
     expire_in: 1 month
 
 apply:prod:
+  extends: .deploys
   stage: apply
   needs: ['plan:prod']
   # `when: manual` decides *when*, never *who*. The environment does that, and
@@ -580,6 +595,29 @@ apply:prod:
 
 `PBPS_PROD_URL` is a masked, protected CI/CD variable; `APPROVED_PLAN_SHA256`
 is supplied by the approver when they run the manual job.
+
+**The GitHub half's containment does not transfer.** There the credential is
+named on individual steps, so the choice was to keep untrusted setup out of
+those jobs entirely. GitLab has no equivalent: a CI/CD variable is exported
+into the job's environment
+([GitLab docs](https://docs.gitlab.com/ci/variables/)), which means it is
+already there while the image's own entrypoint runs and while `before_script`
+builds. Everything the job pulls in is therefore inside the boundary, and two
+things follow.
+
+**Pin the image by digest**, as `.rust` above does. `rust:1-bookworm` is a
+mutable tag; whoever can publish it next runs code in a job holding a
+deploy-capable credential, before `pbps` exists on the runner to be gated. The
+digest in this file was resolved from Docker Hub and will go stale — re-resolve
+it and bump it as a reviewed change, which is the point of pinning rather than
+a cost of it.
+
+**Do not share the build cache with the merge-request pipeline.** `key: cargo`
+is one cache across every pipeline in the project, and `target/` in it is the
+`pbps` binary the deployment job puts on its `PATH` and runs with the
+credential. Any contributor whose merge request runs CI writes that cache. The
+deployment jobs therefore inherit `cache: []` and pay for a full build; the
+merge-request job, which builds that contributor's code anyway, keeps it.
 
 **`when: manual` is not an authorization.** It says the job waits for a person;
 it does not say which person. The pipeline is already running on a protected
