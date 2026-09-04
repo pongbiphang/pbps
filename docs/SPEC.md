@@ -602,7 +602,7 @@ pbps plan --db $ENV -> plan.json (the change list plus a checksum of the state i
                                   was computed against)
                        plan.sql  (human-readable, for the deployment gate's approver)
 
-pbps apply --db $ENV --plan plan.json --allow rename,destructive
+pbps apply --db $ENV --plan plan.json --checksum $APPROVED_PLAN_SHA256 --allow rename,destructive
 ```
 
 `apply` first verifies that the database's current checksum still equals the
@@ -674,7 +674,7 @@ pre-migration checks are hand-written SQL):
 
 | Risk class | Probe |
 |---|---|
-| `not-null` | Count the existing NULLs in the column |
+| `not-null` | Count existing NULLs when tightening a column; for a new required column with no DEFAULT/IDENTITY, count every existing row that lacks a value |
 | `constraint` | Count the rows that violate the new UNIQUE / FK / CHECK |
 | `narrowing` | Count the values that fail or truncate under conversion |
 | `rename` | The impact queries of 7.4 |
@@ -702,7 +702,7 @@ that the next plan tries to remove (14.3).
 CREATE TABLE dbo.__pbps_state (
     id            BIGINT IDENTITY PRIMARY KEY,
     applied_at    DATETIME2(3)   NOT NULL,
-    kind          VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap
+    kind          VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap | staged | failed
     git_sha       VARCHAR(40)    NULL,
     plan_checksum CHAR(64)       NULL,
     state_json    NVARCHAR(MAX)  NOT NULL,   -- the whole schema snapshot plus the
@@ -839,7 +839,7 @@ full state.
 | `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
-| `pbps apply --plan plan.json --allow ...` | Apply a plan. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
+| `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason --operator` | Reset the state baseline |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
@@ -941,8 +941,8 @@ speaks Slack or Teams: it execs a command and the command does the talking —
 no credentials to hold, no chat APIs to chase.
 
 **`pbps status`** reads each configured environment's `__pbps_state` and
-prints one screen: environment, last apply, git sha, drift state, last
-verified. The dashboard's database already exists — every environment
+prints one screen: environment, last apply, git sha, drift/policy/failed state,
+last verified. The dashboard's database already exists — every environment
 self-reports (8.1) — so there is nothing to host; `--format json` serves
 anyone who wants to render their own web view.
 
@@ -1045,8 +1045,8 @@ It answers, from the file alone:
 | Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
 | How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
 | What is checked first? | the derived pre-flight probes (7.5), by description |
-| What exactly do I type? | the `apply` command, with the target, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
-| What am I approving? | the plan checksum `apply` will recompute |
+| What exactly do I type? | the `apply` command, with the target, `--checksum`, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
+| What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It
@@ -1205,7 +1205,7 @@ plan:                            # the deployment layer: baselined on the target
 
 apply:
   script:
-    - pbps apply --db "$PROD_CONN" --plan plan.json --allow rename,narrowing
+    - pbps apply --db "$PROD_CONN" --plan plan.json --checksum "$APPROVED_PLAN_SHA256" --allow rename,narrowing
   when: manual
   only: [/^prod-v.*$/]
 
@@ -1297,7 +1297,7 @@ database is work with clearly drawn boundaries.
 
 | Purpose | Crate | Notes |
 |---|---|---|
-| SQL Server | `tiberius` | Pure Rust; **no driver to install** — one static binary, decisive for air-gapped environments. No upstream release since 2024-07, and its pinned TLS stack now carries findings no upgrade can reach: see open question 10, which is a live item rather than a note |
+| SQL Server | `tiberius-ng` (the `tiberius` library API) | Pure Rust; **no driver to install** — one static binary, decisive for air-gapped environments. Adopted after the original package's pinned TLS stack accumulated findings no upgrade could reach; see open question 10 |
 | PostgreSQL | `tokio-postgres` | Phase 5 |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
@@ -1378,7 +1378,7 @@ not by a version number.
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
-| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
+| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply`, `on_apply_attempt`, and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
 | **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
@@ -1461,10 +1461,12 @@ engine already supported.
    assertions are **derived automatically** from the typed ChangeSet — the
    preflight probes of 7.5 — rather than hand-written by users. User hooks
    stay deliberately minimal: an exec-only family in `pbps.yml` — `on_apply`
-   (receiving the plan path, checksum and outcome; also implements 8.1's
-   append-only ledger fan-out for tamper-evidence) and `on_drift` (receiving
-   `verify`'s typed drift JSON, see 9.4). The CI pipeline remains the real
-   hook system (see 10).
+   retains its original success-only contract and receives the complete plan
+   JSON; `on_apply_attempt` is the explicit opt-in migration path for a
+   versioned event carrying the plan path, checksum and success/failure outcome
+   (and implements 8.1's append-only ledger fan-out for tamper-evidence);
+   `on_drift` receives `verify`'s typed drift JSON (see 9.4). The CI pipeline
+   remains the real hook system (see 10).
 
 6. **How views and SPs should be handled** — settled; see
    [ADR-0002](ADR-0002-module-model.md). Modules (views, procedures,
@@ -1535,10 +1537,27 @@ engine already supported.
     The convergence, ledger, lock, all-or-nothing, probe-accuracy and module
     round-trip invariants therefore hold on it, not merely the offline suite.
 
-    So what is left is a decision, not an unknown. Until it is taken,
-    `deny.toml` carries the four findings as documented exceptions with this
-    entry as their reason, which is a statement about where the fix lives, not
-    about how much they matter.
+    The migration was adopted in September 2026. `tiberius-ng 0.13` retains the
+    `tiberius` library API, moves the TLS stack to `rustls 0.23`, and removes all
+    four advisory exceptions from `deny.toml`; the live suite remains the
+    acceptance test for future driver upgrades.
+
+    **The original crate is community-owned again, and the intent is to return
+    to it — but not yet.** Checked on 2026-09-04: the repository has moved from
+    `prisma/tiberius` to `tiberius-rs/tiberius`, is not archived, and received
+    commits on 2026-09-02 (CI, clippy, docker fixes). What has *not* happened is
+    a release: crates.io still serves 0.12.3 from 2024-07-19, and `main` still
+    carries `version = "0.12.3"` with `tokio-rustls 0.24` — the exact pin that
+    produces RUSTSEC-2026-0098, -0099, -0104 and -0134. Moving back today, by
+    version or by git revision, would restore all four exceptions to
+    `deny.toml` and replace a maintained driver with an unreleased one. The
+    move back is one dependency line plus the `deny.toml` re-check, in that
+    order, and it is taken when **all** of the following hold: a `tiberius`
+    release on crates.io newer than 0.12.3; its `rustls` feature resolving
+    `rustls >= 0.23` (so `cargo deny check advisories` passes with `ignore`
+    still empty); and the full live suite of 11.5 green on it. Until then
+    `tiberius-ng` stays, and this paragraph is the reminder that it is a
+    waypoint rather than the destination.
 
 11. **Whether a universal connection layer belongs here** — settled; see
     [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive sounding

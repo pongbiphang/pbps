@@ -32,8 +32,8 @@ groups of commands:
 |---|---|
 | `pull` | Reverse-generate declarations from an existing database |
 | `plan --db` / `--env` (`--staged`) | The applyable plan for one environment |
-| `apply --plan --allow` | Run an approved plan, in one transaction |
-| `apply --staged` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
+| `apply --plan --checksum --allow` | Run the checksum-pinned approved plan, in one transaction |
+| `apply --staged --checksum` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
 | `verify` (`--format json`) | The drift check; exits 2 on drift |
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |
@@ -115,6 +115,8 @@ environments:
   prod:
     url_env: PROD_CONN
 hooks:
+  on_apply: ./scripts/deployed.sh # success only; receives the unchanged plan JSON
+  on_apply_attempt: ./scripts/audit-apply.sh # success/failure; receives a versioned event JSON
   on_drift: ./scripts/alert.sh    # receives the drift report as JSON on stdin
 dev:                              # optional: the throwaway engine for `plan --dev`
   docker: mcr.microsoft.com/mssql/server:2022-latest
@@ -123,6 +125,12 @@ dev:                              # optional: the throwaway engine for `plan --d
 The dev database is always optional. Without one, previews fall back to
 lightweight normalization and say so — the tool has to remain usable where there
 is no Docker and no network.
+
+`on_apply` keeps its original success-only plan-JSON contract. Integrations that
+also need failed attempts opt into `on_apply_attempt`; its payload starts with
+`version: 1` and includes the plan path, checksum, outcome, environment, and the
+ledger entry or error. The separate key is the migration boundary, so enabling
+failed-attempt auditing cannot change what an existing deployment hook receives.
 
 ## What pbps deliberately does not do
 

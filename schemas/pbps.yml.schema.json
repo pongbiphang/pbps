@@ -89,7 +89,14 @@
       "type": "object",
       "properties": {
         "on_apply": {
-          "description": "Run after a successful `apply`, with the plan JSON on stdin.",
+          "description": "Run after a successful `apply`, with the unchanged plan JSON on stdin.\n\nThis is the original hook contract. Use `on_apply_attempt` for a\nversioned event that also reports failed attempts.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_apply_attempt": {
+          "description": "Run after either outcome of an `apply`, with a versioned event JSON on\nstdin containing the plan path, checksum, outcome and ledger entry or\nerror.",
           "type": [
             "string",
             "null"
@@ -164,6 +171,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 2,
+  "x-pbps-schema-version": 3,
   "x-pbps-tool-version": "0.0.0"
 }

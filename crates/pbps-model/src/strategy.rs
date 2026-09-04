@@ -31,6 +31,7 @@ use crate::name::TableName;
 /// no-op would leave the user believing a large table is being altered online
 /// when it is not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Strategy {
     /// Emit `WITH (ONLINE = ON)` where the dialect and the statement support it.
     ///

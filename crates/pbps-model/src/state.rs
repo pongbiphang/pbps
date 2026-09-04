@@ -7,6 +7,7 @@
 //! artifact passing and no environment-mapping strategy at all.
 
 use crate::ids::IdsFile;
+use crate::module::ModuleDeps;
 use crate::schema::Schema;
 
 /// The current state-snapshot format version.
@@ -22,9 +23,14 @@ use crate::schema::Schema;
 /// side by the checkpoint's — two different sets of objects — and refuse the
 /// resume with a checksum mismatch it cannot explain.
 ///
+/// Bumped to 4 when module dependency annotations and failed attempts joined
+/// the snapshot. The annotations are needed to order a later connected drop;
+/// failed attempts make the audit promise explicit without changing the schema
+/// recorded as the current baseline.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,6 +52,9 @@ pub enum StateKind {
     /// environment sitting on one is mid-deployment: planning or applying
     /// anything else against it would build on a half-finished change.
     Staged,
+    /// An apply or bootstrap attempt failed. The schema and ids in this entry
+    /// remain the last known current state; `reason` records the failure.
+    Failed,
 }
 
 impl StateKind {
@@ -57,6 +66,7 @@ impl StateKind {
             StateKind::Baseline => "baseline",
             StateKind::Bootstrap => "bootstrap",
             StateKind::Staged => "staged",
+            StateKind::Failed => "failed",
         }
     }
 }
@@ -73,6 +83,7 @@ impl std::fmt::Display for StateKind {
 /// drift detection compare in full, what makes the snapshot usable as a backup,
 /// and what lets it answer "what did this table look like three months ago?".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateSnapshot {
     pub version: u32,
     pub kind: StateKind,
@@ -86,6 +97,12 @@ pub struct StateSnapshot {
     /// current declarations by uid, and a rename degrades into "drop plus add" —
     /// which is data loss. State and identity have to be stored together.
     pub ids: IdsFile,
+
+    /// Explicit module ordering edges as of this state. They sit beside the
+    /// schema because creation order is not database state and must not
+    /// participate in drift comparison.
+    #[serde(default, skip_serializing_if = "ModuleDeps::is_empty")]
+    pub module_deps: ModuleDeps,
 
     /// The commit that produced this state. `None` for a baseline taken outside
     /// version control.
@@ -121,6 +138,7 @@ pub struct StateSnapshot {
 /// than mysterious is to record each completed statement as it completes —
 /// which is also what lets `--resume` know where to start.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagedProgress {
     /// How many of the plan's statements have run. The resume point.
     pub completed: usize,
@@ -149,6 +167,7 @@ impl StateSnapshot {
             kind,
             schema,
             ids,
+            module_deps: ModuleDeps::default(),
             git_sha: None,
             plan_checksum: None,
             operator: operator.into(),
@@ -281,9 +300,9 @@ mod tests {
             IdsFile::default(),
             "leon",
         );
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains(r#""version":1"#));
-        assert!(json.contains(r#""kind":"baseline""#));
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["version"], CURRENT_VERSION);
+        assert_eq!(json["kind"], "baseline");
     }
 
     /// The ledger writes `kind` into a column of its own so `status` can filter
@@ -295,6 +314,7 @@ mod tests {
             StateKind::Baseline,
             StateKind::Bootstrap,
             StateKind::Staged,
+            StateKind::Failed,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));

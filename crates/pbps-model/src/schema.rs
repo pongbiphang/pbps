@@ -25,6 +25,7 @@ use crate::types::ColumnType;
 
 /// The complete desired state of a project.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
 
@@ -74,6 +75,7 @@ impl Schema {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -112,6 +114,7 @@ pub struct Table {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     #[serde(rename = "type")]
     pub ty: ColumnType,
@@ -163,15 +166,51 @@ impl Column {
     pub fn is_deprecated(&self) -> bool {
         self.deprecated.is_some()
     }
+
+    /// Whether SQL Server has a declared source for existing rows when this is
+    /// added as a required column.
+    ///
+    /// Expressions stay opaque everywhere else, but a default that explicitly
+    /// invokes SQL Server's NULL-producing constructs is not a trustworthy
+    /// value source. This is deliberately a conservative lexical check rather
+    /// than an attempt to evaluate or normalize SQL.
+    pub fn has_required_add_value_source(&self) -> bool {
+        self.identity.is_some()
+            || self
+                .default
+                .as_deref()
+                .is_some_and(|default| !has_explicit_null_semantics(default))
+    }
+}
+
+fn has_explicit_null_semantics(expression: &str) -> bool {
+    // String literals and comments are not SQL expressions. Blanking them
+    // keeps a harmless default such as 'NULL' from being mistaken for the NULL
+    // keyword while still finding it inside CAST(NULL AS int), arithmetic, and
+    // other expression shapes.
+    crate::module::code_without_quoted_identifiers(expression)
+        // SQL Server regular identifiers use Unicode letters and decimal
+        // digits, plus these four continuation characters. Treating `$`, `@`,
+        // or `#` as punctuation would turn `seq$null` into a false NULL token.
+        .split(|ch: char| !crate::module::is_regular_identifier_continue(ch))
+        .any(|word| {
+            word.eq_ignore_ascii_case("null")
+                || word.eq_ignore_ascii_case("nullif")
+                || word.eq_ignore_ascii_case("try_cast")
+                || word.eq_ignore_ascii_case("try_convert")
+                || word.eq_ignore_ascii_case("try_parse")
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Identity {
     pub seed: i64,
     pub increment: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrimaryKey {
     /// The constraint name. `None` leaves the database to name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,11 +219,13 @@ pub struct PrimaryKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UniqueConstraint {
     pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub references_table: TableName,
@@ -224,12 +265,14 @@ pub enum ReferentialAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckConstraint {
     /// The check expression, kept verbatim.
     pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Index {
     pub columns: Vec<IndexColumn>,
 
@@ -246,6 +289,7 @@ pub struct Index {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexColumn {
     pub name: String,
     #[serde(default)]
@@ -278,6 +322,57 @@ mod tests {
     fn nullable_defaults_to_true() {
         assert!(Column::new(ty("int")).nullable);
         assert!(!Column::new(ty("int")).not_null().nullable);
+    }
+
+    #[test]
+    fn an_explicitly_nullable_default_is_not_a_required_add_value_source() {
+        let mut column = Column::new(ty("int"));
+        assert!(!column.has_required_add_value_source());
+
+        for default in [
+            "NULL",
+            " null ",
+            "(NULL)",
+            "((( null )))",
+            "CAST(NULL AS int)",
+            "CONVERT(int, NULL)",
+            "(NULL) + 1",
+            "NULLIF(1, 1)",
+            "TRY_CONVERT(int, 'not a number')",
+            // A bare CR ends a line comment on the engine (a YAML `"\r"`
+            // escape gets one there), so what follows it is the keyword.
+            "-- carried over\rNULL",
+            "-- carried over\r\nNULL",
+            "-- carried over\nNULL",
+        ] {
+            column.default = Some(default.into());
+            assert!(!column.has_required_add_value_source(), "{default:?}");
+        }
+
+        for default in [
+            "0",
+            "'NULL'",
+            "SYSUTCDATETIME()",
+            "NEWID()",
+            "NEXT VALUE FOR dbo.[null]",
+            "NEXT VALUE FOR dbo.\"try_cast\"",
+            "NEXT VALUE FOR dbo.[seq]]null]",
+            "NEXT VALUE FOR dbo.\"seq\"\"try_cast\"",
+            "NEXT VALUE FOR dbo.seq$null",
+            "NEXT VALUE FOR dbo.seq@null",
+            "NEXT VALUE FOR dbo.seq#null",
+            "NEXT VALUE FOR dbo.序列null",
+            "1 /* outer /* nested */ NULL */",
+            // These were measured not to end a comment; the engine sees a
+            // default of `1` and a long comment, and so must the scan.
+            "1 -- note\u{85}NULL",
+            "1 -- note\u{2028}NULL",
+            "1 -- note\u{0c}NULL",
+            "1 -- note\u{0b}NULL",
+        ] {
+            column.default = Some(default.into());
+            assert!(column.has_required_add_value_source(), "{default}");
+        }
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

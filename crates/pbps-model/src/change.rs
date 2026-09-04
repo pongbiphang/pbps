@@ -88,7 +88,7 @@ impl RiskClass {
                 "the new type may not hold what is already stored: values can be truncated or the statement rejected"
             }
             RiskClass::NotNull => {
-                "existing NULLs would violate the constraint and the statement fails"
+                "existing NULLs, or rows with no value for a newly required column, make the statement fail"
             }
             RiskClass::Constraint => {
                 "existing rows may not satisfy the new constraint and the statement fails"
@@ -137,7 +137,7 @@ impl std::str::FromStr for RiskClass {
 /// Every variant carries the UID of the object it affects, so that applying a
 /// plan never has to match on names — names are exactly what may be changing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
     CreateTable {
         uid: Uid,
@@ -451,8 +451,16 @@ impl Change {
             Change::DeleteRow { .. } => {
                 r.insert(RiskClass::DataDelete);
             }
+            Change::AddColumn { column, .. } => {
+                // Existing rows have no value for a newly added column. SQL
+                // Server can populate one from a DEFAULT or IDENTITY; without
+                // either, a NOT NULL addition is the same data hazard as
+                // tightening an existing nullable column (SPEC §7.1).
+                if !column.nullable && !column.has_required_add_value_source() {
+                    r.insert(RiskClass::NotNull);
+                }
+            }
             Change::CreateTable { .. }
-            | Change::AddColumn { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability {
                 to_nullable: true, ..
@@ -528,6 +536,7 @@ impl PlannedChange {
 /// (drop indexes before dropping columns, and so on) is the planner's job; the
 /// model only guarantees the order is preserved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeSet {
     pub changes: Vec<PlannedChange>,
 }
@@ -665,6 +674,37 @@ mod tests {
         assert!(make(false, false).intrinsic_risks().is_empty());
         assert!(make(true, true).intrinsic_risks().is_empty());
         assert!(make(false, true).intrinsic_risks().is_empty());
+    }
+
+    #[test]
+    fn adding_a_required_column_without_a_value_source_is_a_not_null_risk() {
+        let make = |nullable, default: Option<&str>, identity: bool| {
+            let mut column = Column::new(ty("int"));
+            column.nullable = nullable;
+            column.default = default.map(str::to_owned);
+            column.identity = identity.then_some(crate::schema::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            Change::AddColumn {
+                uid: uid("c_k7x2mq"),
+                table: "dbo.customer".parse().unwrap(),
+                name: "score".into(),
+                column: Box::new(column),
+            }
+        };
+
+        assert_eq!(
+            make(false, None, false).intrinsic_risks(),
+            BTreeSet::from([RiskClass::NotNull])
+        );
+        assert!(make(true, None, false).intrinsic_risks().is_empty());
+        assert!(make(false, Some("0"), false).intrinsic_risks().is_empty());
+        assert_eq!(
+            make(false, Some("CAST(NULL AS int)"), false).intrinsic_risks(),
+            BTreeSet::from([RiskClass::NotNull])
+        );
+        assert!(make(false, None, true).intrinsic_risks().is_empty());
     }
 
     #[test]

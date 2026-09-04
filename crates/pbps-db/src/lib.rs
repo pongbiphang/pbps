@@ -11,12 +11,16 @@
 //! queries, and Phase 4's `pbps-pg` will write its own. Keeping the types here
 //! is what stops the ledger's meaning from being defined twice.
 //!
-//! The driver is `tiberius` — pure Rust, so a single static binary needs no
-//! driver installed on the host (SPEC §11.3).
+//! The driver API is `tiberius`, supplied for now by the `tiberius-ng` package
+//! — pure Rust, so a single static binary needs no driver installed on the
+//! host (SPEC §11.3). The original crate is community-owned again and the plan
+//! is to return to it once it ships a release with a current `rustls`; the
+//! condition and the date it was last checked are on the dependency line in
+//! the workspace `Cargo.toml` and in SPEC open question 10.
 //!
 //! **`tiberius` is named nowhere but this file.** That is deliberate: the driver
-//! is a recorded supply-chain risk (SPEC open question 10), and this module is
-//! the seam it would be replaced through. [`Row`], [`FromColumn`] and [`Param`]
+//! is named nowhere else, and this module remains the seam for replacing it.
+//! [`Row`], [`FromColumn`] and [`Param`]
 //! exist for that reason alone — re-exporting the driver's own types would be
 //! shorter, and would make a replacement an API change for every caller instead
 //! of an edit to one file.
