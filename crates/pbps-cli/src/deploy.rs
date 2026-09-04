@@ -185,35 +185,85 @@ fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     out
 }
 
-/// Refuses, before anything is written, a role name another database
-/// principal holds: users, roles and application roles share one namespace,
-/// and `CREATE ROLE` on a taken name fails after everything ordered before
-/// it has run (DECISIONS 118).
+/// Refuses, before anything runs, a role name another database principal
+/// holds: users, roles and application roles share one namespace, and a
+/// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
+/// after everything ordered before it has run (DECISIONS 118).
+///
+/// `wanted` are the names the plan's remaining statements create or rename
+/// to; `vacated` the ones they drop or rename away, which are free for
+/// this purpose. The engine decides which names are the same, under the
+/// database's collation — `Shadow` is `shadow` to most databases and not
+/// to a string comparison here (DECISIONS 119).
 async fn refuse_taken_role_names(
     conn: &mut Conn,
-    roles: &[&str],
-    label: &str,
+    wanted: &[String],
+    vacated: &[String],
 ) -> anyhow::Result<()> {
-    if roles.is_empty() {
+    if wanted.is_empty() {
         return Ok(());
     }
-    let held = pbps_mssql::catalog::principal_names(conn)
+    let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let vacated: Vec<&str> = vacated.iter().map(String::as_str).collect();
+    let held = pbps_mssql::catalog::principals_holding(conn, &wanted, &vacated)
         .await
         .context("cannot read the database principals")?;
-    let taken: Vec<String> = roles
-        .iter()
-        .filter_map(|name| held.get(*name).map(|kind| format!("`{name}` is a {kind}")))
-        .collect();
-    if taken.is_empty() {
+    if held.is_empty() {
         return Ok(());
     }
+    let taken: Vec<String> = held
+        .iter()
+        .map(|(declared, held, kind)| {
+            if declared == held {
+                format!("`{declared}` is a {kind}")
+            } else {
+                format!("`{declared}` is `{held}` to this database, a {kind}")
+            }
+        })
+        .collect();
     bail!(
-        "a declared role's name is already held in `{label}`: {}.\n\
-         Users, roles and application roles share one namespace, and `CREATE ROLE` would be \
+        "a declared role's name is already held in this database: {}.\n\
+         Users, roles and application roles share one namespace, compared the way this \
+         database compares names, and `CREATE ROLE` or `ALTER ROLE ... WITH NAME` would be \
          refused after everything before it had run. Rename the role, or rename or drop the \
          principal by hand.",
         taken.join(", ")
     );
+}
+
+/// The role names the statements after `completed` still have to find free
+/// (`CREATE ROLE`, the new name of a rename) and the ones they free first
+/// (`DROP ROLE`, the old name of a rename): `(wanted, vacated)`. Counted per
+/// statement the way `role_drop_expectations` counts, so a staged resume
+/// asks only about the names its remaining statements touch (DECISIONS 119).
+fn role_name_expectations(
+    cs: &pbps_model::ChangeSet,
+    dialect: &dyn pbps_dialect::Dialect,
+    completed: usize,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut wanted = Vec::new();
+    let mut vacated = Vec::new();
+    let mut at = 0usize;
+    for p in &cs.changes {
+        let n = dialect
+            .emit(&p.change, p.strategy)
+            .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
+            .len();
+        // A change is pending while any of its statements is: a half-done
+        // role drop has removed members and still holds the name.
+        if completed < at + n {
+            if let pbps_model::Change::CreateRole { name, .. } = &p.change {
+                wanted.push(name.clone());
+            } else if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
+                wanted.push(to.clone());
+                vacated.push(from.clone());
+            } else if let pbps_model::Change::DropRole { name, .. } = &p.change {
+                vacated.push(name.clone());
+            }
+        }
+        at += n;
+    }
+    Ok((wanted, vacated))
 }
 
 /// Refuses a declaration whose text the engine would not read back as
@@ -981,8 +1031,8 @@ pub fn cmd_bootstrap(
         // Every declared role is created here, and a user of the same name
         // would refuse the `CREATE ROLE` after the tables went in
         // (DECISIONS 118).
-        let declared_roles: Vec<&str> = loaded.schema.roles.keys().map(String::as_str).collect();
-        refuse_taken_role_names(&mut conn, &declared_roles, &target.label).await?;
+        let declared_roles: Vec<String> = loaded.schema.roles.keys().cloned().collect();
+        refuse_taken_role_names(&mut conn, &declared_roles, &[]).await?;
         // Modules count as much as tables here. `CREATE OR ALTER` would not fail
         // on a view that is already there — it would quietly replace it, with no
         // plan, no risk classification and no approval, which is the opposite of
@@ -1319,23 +1369,13 @@ pub fn cmd_plan_db(
             );
         }
 
-        // A role this plan creates needs its name free of every principal,
-        // not only of the roles the managed set knows: users, roles and
-        // application roles share one namespace, and `CREATE ROLE` on a name
-        // a user holds fails after everything ordered before it has run
-        // (DECISIONS 118).
-        let created: Vec<&str> = cs
-            .changes
-            .iter()
-            .filter_map(|p| {
-                if let pbps_model::Change::CreateRole { name, .. } = &p.change {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        refuse_taken_role_names(&mut conn, &created, &target.label).await?;
+        // A role this plan creates or renames to needs its name free of
+        // every principal, not only of the roles the managed set knows:
+        // users, roles and application roles share one namespace, and
+        // `CREATE ROLE` on a name a user holds fails after everything
+        // ordered before it has run (DECISIONS 118, 119).
+        let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
+        refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
 
         // A role this plan drops still has this environment's members, which
         // the engine will not drop it over. They are read here and written
@@ -1885,6 +1925,10 @@ async fn apply_staged_under_lock(
             &role_drop_expectations(&plan.changes, dialect, progress.completed)?,
         )
         .await?;
+        // And a principal created while it was paused, under a name a
+        // remaining statement needs (119).
+        let (wanted, vacated) = role_name_expectations(&plan.changes, dialect, progress.completed)?;
+        refuse_taken_role_names(conn, &wanted, &vacated).await?;
         println!(
             "Resuming at statement {} of {} (checkpoint entry #{}).",
             progress.completed + 1,
@@ -2186,6 +2230,12 @@ async fn preflight(
     // again here, before statement one (DECISIONS 92), and again on a
     // resume, for the members whose statements have not run yet (102).
     check_role_drops(conn, &role_drop_expectations(&plan.changes, dialect, 0)?).await?;
+    // The same for a name this plan needs free: a user created since the
+    // plan is outside the managed state, so the checksum above cannot see
+    // it either, and `CREATE ROLE` would meet it after everything ordered
+    // before had run (119).
+    let (wanted, vacated) = role_name_expectations(&plan.changes, dialect, 0)?;
+    refuse_taken_role_names(conn, &wanted, &vacated).await?;
 
     // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
     // module changes sort before the table changes precisely so that the drop
@@ -2616,6 +2666,60 @@ mod tests {
             expect(4).is_empty(),
             "the role is dropped; nothing to expect"
         );
+    }
+
+    /// The names the remaining statements need free and the ones they free
+    /// first, counted off the emitter's statements the same way: a rename
+    /// wants its new name and vacates its old one until its statement runs,
+    /// and a half-done role drop still holds the name it is vacating.
+    #[test]
+    fn a_resume_asks_only_about_the_role_names_its_remaining_statements_touch() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let r1: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
+        let r2: pbps_model::Uid = "r_bbbbbb".parse().unwrap();
+        let r3: pbps_model::Uid = "r_cccccc".parse().unwrap();
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameRole {
+                    uid: r1,
+                    from: "reader".into(),
+                    to: "app_reader".into(),
+                }),
+                PlannedChange::new(Change::CreateRole {
+                    uid: r2,
+                    name: "auditors".into(),
+                }),
+                PlannedChange::new(Change::DropRole {
+                    uid: r3,
+                    name: "reporting".into(),
+                    members: vec!["a".into()],
+                }),
+            ],
+        };
+        let expect =
+            |completed: usize| role_name_expectations(&cs, &pbps_mssql::Mssql, completed).unwrap();
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            expect(0),
+            (s(&["app_reader", "auditors"]), s(&["reader", "reporting"])),
+            "before statement one"
+        );
+        assert_eq!(
+            expect(1),
+            (s(&["auditors"]), s(&["reporting"])),
+            "the rename is done: its new name is held, its old one is nobody's business"
+        );
+        assert_eq!(
+            expect(2),
+            (s(&[]), s(&["reporting"])),
+            "the CREATE ROLE is done; the drop has not started"
+        );
+        assert_eq!(
+            expect(3),
+            (s(&[]), s(&["reporting"])),
+            "one DROP MEMBER committed; the role still holds its name"
+        );
+        assert_eq!(expect(4), (s(&[]), s(&[])), "everything ran");
     }
 
     /// A created object enters the checkpoint's identities the moment its

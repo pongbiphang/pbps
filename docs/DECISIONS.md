@@ -996,3 +996,25 @@ SPEC is in sync with all of these.
     the tables and rows ordered before it had run. `sys.database_principals`
     of every type but `R` is read once, and a taken name is refused with
     the principal's kind, before anything runs.
+119. **Which principal holds a role's name is the engine's call, for a
+    rename's target as much as a creation's, and it is asked again before
+    apply.** 118 read the principals into a map and looked the created names
+    up in it: a rename onto a user's name was never looked up, and `Shadow`
+    was free to the map while `shadow` was taken to the database, whose
+    collation says they are one name. The names a plan's remaining
+    statements need free (`CREATE ROLE`, the new name of a rename) and the
+    ones they free first (`DROP ROLE`, the old name of a rename) go to the
+    engine in one query, compared under `COLLATE DATABASE_DEFAULT`, and the
+    answer names the holder in its own spelling. Asked by `plan --db` and
+    `bootstrap`, and again by `apply` before statement one and on a staged
+    resume: a principal is outside the managed state, so the checksum cannot
+    see one created in between, as 92 and 102 say of a member.
+120. **`pull --data` draws its row line through `validate`'s own
+    evaluation, not a count of its own.** 111 and 114 read the rule's
+    severity and count, but the loop was `pull`'s and never consulted the
+    suppressions, so a table the project had excused by name was refused at
+    the moment it was pulled and accepted by the next `validate`. The rule is
+    evaluated by the same function `validate` calls, over the pulled schema
+    and narrowed to `data.max-rows`, so the two commands cannot disagree
+    again; a block with problems contributes nothing, as it contributes
+    nothing to a plan.

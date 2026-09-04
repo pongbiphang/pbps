@@ -293,27 +293,66 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// compared, but a role cannot be dropped while it has members, and a plan
 /// that removes them has to say whom. A nested role is a member like any
 /// user and comes back the same way.
-/// Every database principal that is not a role, by name, with the catalog's
-/// own word for what it is (`SQL_USER`, `APPLICATION_ROLE`, ...). Users,
-/// roles and application roles share one namespace, and a `CREATE ROLE` on
-/// a name a user holds fails after everything ordered before it has run —
-/// so a declared role's name is checked against these before a connected
-/// plan is written (DECISIONS 118).
-pub async fn principal_names(conn: &mut Conn) -> Result<BTreeMap<String, String>, DbError> {
-    const PRINCIPALS: &str = "\
-SELECT p.name, p.type_desc
-  FROM sys.database_principals p
- WHERE p.type <> 'R'
- ORDER BY p.name;";
-    let mut out = BTreeMap::new();
-    for row in conn.query(PRINCIPALS).await? {
-        out.insert(
-            get::<&str>(&row, "name")?.to_owned(),
+/// The database principals holding any of `names`, as the engine compares
+/// names: one `(declared, held, kind)` per collision, `held` being the
+/// principal's own spelling and `kind` the catalog's word for what it is,
+/// in lower case with spaces (`sql user`, `database role`, `application
+/// role`). Users, roles and application roles share one namespace, and a
+/// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
+/// after everything ordered before it has run — so a declared role's name
+/// is checked against these before a connected plan is written and again
+/// before it is applied (DECISIONS 118, 119).
+///
+/// Asked of the engine under the database collation rather than compared
+/// here: `Shadow` and `shadow` are one name to a case-insensitive database
+/// and two to a `BTreeMap`, and a map lookup said the name was free.
+/// `except` names the principals this plan vacates — the roles it drops or
+/// renames away — which hold their name only until the statement that
+/// frees it, and are excluded the same way, by the engine.
+pub async fn principals_holding(
+    conn: &mut Conn,
+    names: &[&str],
+    except: &[&str],
+) -> Result<Vec<(String, String, String)>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = |names: &[&str]| {
+        names
+            .iter()
+            .map(|n| format!("({})", crate::ident::literal(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut sql = format!(
+        "SELECT d.name AS declared, p.name AS held, p.type_desc
+           FROM (VALUES {}) AS d(name)
+           JOIN sys.database_principals AS p
+             ON p.name = d.name COLLATE DATABASE_DEFAULT",
+        values(names)
+    );
+    if !except.is_empty() {
+        sql.push_str(&format!(
+            "
+ WHERE NOT EXISTS (SELECT 1 FROM (VALUES {}) AS v(name)
+                                WHERE v.name = p.name COLLATE DATABASE_DEFAULT)",
+            values(except)
+        ));
+    }
+    sql.push_str(
+        "
+ ORDER BY d.name, p.name;",
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        out.push((
+            get::<&str>(&row, "declared")?.to_owned(),
+            get::<&str>(&row, "held")?.to_owned(),
             get::<&str>(&row, "type_desc")?
                 .trim()
                 .to_ascii_lowercase()
                 .replace('_', " "),
-        );
+        ));
     }
     Ok(out)
 }

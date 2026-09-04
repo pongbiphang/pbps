@@ -161,6 +161,11 @@ Decisions taken during implementation:
    the boolean `false` as off rather than making the operator quote the word.
    `true` is refused, because "on" says nothing about the severity — the
    rule is switched on by naming one.
+7. **`pull --data` evaluates `data.max-rows` the way `validate` does.** The
+   same function, over the pulled schema, narrowed to that rule: its
+   severity, its row count and the project's suppressions apply at the
+   moment the block is written exactly as on the next `validate`, and at
+   `error` nothing is written (DECISIONS 111, 114, 120).
 
 ## Ruled out
 

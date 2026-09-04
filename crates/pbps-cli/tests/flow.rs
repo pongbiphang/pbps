@@ -5203,15 +5203,24 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
         stderr(&o)
     );
 
-    // Without the role the project bootstraps; declared afterwards, the
-    // role is refused by the connected plan the same way.
+    // Without the role the project bootstraps, with another role to rename
+    // later on.
     std::fs::remove_file(&role_file).unwrap();
     let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let reporter_file = d.dir.join("schema").join("roles").join("reporter.yml");
+    std::fs::write(
+        &reporter_file,
+        "role: reporter\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
     let o = d.run(&["bootstrap", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Declared afterwards, the role is refused by the connected plan the
+    // same way.
     std::fs::write(
         &role_file,
         "role: shadow\ngrants:\n  dbo.customer: [select]\n",
@@ -5225,6 +5234,89 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
         "{}",
         stderr(&o)
     );
+    std::fs::remove_file(&role_file).unwrap();
+    let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // And in another case: `Shadow` is `shadow` to this database, which is
+    // the engine's call under its collation, not a string comparison's
+    // (DECISIONS 119).
+    let shadow_file = d.dir.join("schema").join("roles").join("Shadow.yml");
+    std::fs::write(
+        &shadow_file,
+        "role: Shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`Shadow` is `shadow` to this database, a sql user"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_file(&shadow_file).unwrap();
+    let o = d.run(&["drop-role", "Shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A rename onto the name is checked like a creation: the target has to
+    // be free, or `ALTER ROLE ... WITH NAME` fails after everything before it.
+    std::fs::remove_file(&reporter_file).unwrap();
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-role", "reporter", "shadow"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Renamed to a free name instead, the plan is made — and a user created
+    // under that name before the apply is met before statement one: a
+    // principal is outside the managed state, so the checksum cannot see it.
+    std::fs::remove_file(&role_file).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("auditor.yml"),
+        "role: auditor\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-role", "shadow", "auditor"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("rename.plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    sql("CREATE USER auditor WITHOUT LOGIN;");
+    let apply = || {
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--allow",
+            "rename",
+        ])
+    };
+    let o = apply();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`auditor` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+    sql("DROP USER auditor;");
+    let o = apply();
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
@@ -5560,6 +5652,28 @@ data:
     let o = fresh.run(&["pull", "--db", &connection, "--data", "dbo.nope", "--force"]);
     assert_eq!(code(&o), 1);
     assert!(stderr(&o).contains("dbo.nope"), "{}", stderr(&o));
+    // The row line is `validate`'s rule, suppressions included: at `error`
+    // over the count nothing is written, and the same table excused by name
+    // is pulled without a word (DECISIONS 114, 120).
+    let strict = Demo::new("refdata-pull-strict");
+    let rule =
+        "dialect: mssql\npolicies:\n  rules:\n    data.max-rows: {severity: error, rows: 1}\n";
+    std::fs::write(strict.dir.join("pbps.yml"), rule).unwrap();
+    let o = strict.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("Nothing was written"), "{}", stderr(&o));
+    assert!(!strict.dir.join("schema").join("dbo.t.yml").exists());
+    std::fs::write(
+        strict.dir.join("pbps.yml"),
+        format!(
+            "{rule}  suppress:\n    - rule: data.max-rows\n      on: dbo.t\n      reason: known small\n"
+        ),
+    )
+    .unwrap();
+    let o = strict.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("rows"), "{}", stderr(&o));
+    assert!(strict.dir.join("schema").join("dbo.t.yml").is_file());
 
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
