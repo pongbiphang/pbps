@@ -59,6 +59,18 @@ say whether what the emitter sent is what comes back.
 
 ## Open items
 
+### Return the driver to `tiberius` once it ships a release
+
+(SPEC open question 10.) The driver is `tiberius-ng`, adopted because
+`tiberius` 0.12.3 pins a `rustls` stack with four open advisories and had no
+release since 2024. The original crate has since moved to the community-owned
+`tiberius-rs/tiberius` repository and is active again (commits on 2026-09-02),
+so the plan is to go back — after a crates.io release newer than 0.12.3 whose
+`rustls` feature resolves `rustls >= 0.23`. As of 2026-09-04 there is no such
+release and `main` still pins `tokio-rustls 0.24`, so moving back now would
+reinstate every advisory exception. The move is one line in the workspace
+`Cargo.toml`, then `cargo deny check`, then the live suite.
+
 ### No universal connection layer
 
 (ADR-0007, open question 11.) ODBC and ADBC

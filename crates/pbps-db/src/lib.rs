@@ -11,9 +11,12 @@
 //! queries, and Phase 4's `pbps-pg` will write its own. Keeping the types here
 //! is what stops the ledger's meaning from being defined twice.
 //!
-//! The driver API is `tiberius`, supplied by the maintained `tiberius-ng`
-//! package — pure Rust, so a single static binary needs no driver installed on
-//! the host (SPEC §11.3).
+//! The driver API is `tiberius`, supplied for now by the `tiberius-ng` package
+//! — pure Rust, so a single static binary needs no driver installed on the
+//! host (SPEC §11.3). The original crate is community-owned again and the plan
+//! is to return to it once it ships a release with a current `rustls`; the
+//! condition and the date it was last checked are on the dependency line in
+//! the workspace `Cargo.toml` and in SPEC open question 10.
 //!
 //! **`tiberius` is named nowhere but this file.** That is deliberate: the driver
 //! is named nowhere else, and this module remains the seam for replacing it.

@@ -1542,6 +1542,23 @@ engine already supported.
     four advisory exceptions from `deny.toml`; the live suite remains the
     acceptance test for future driver upgrades.
 
+    **The original crate is community-owned again, and the intent is to return
+    to it — but not yet.** Checked on 2026-09-04: the repository has moved from
+    `prisma/tiberius` to `tiberius-rs/tiberius`, is not archived, and received
+    commits on 2026-09-02 (CI, clippy, docker fixes). What has *not* happened is
+    a release: crates.io still serves 0.12.3 from 2024-07-19, and `main` still
+    carries `version = "0.12.3"` with `tokio-rustls 0.24` — the exact pin that
+    produces RUSTSEC-2026-0098, -0099, -0104 and -0134. Moving back today, by
+    version or by git revision, would restore all four exceptions to
+    `deny.toml` and replace a maintained driver with an unreleased one. The
+    move back is one dependency line plus the `deny.toml` re-check, in that
+    order, and it is taken when **all** of the following hold: a `tiberius`
+    release on crates.io newer than 0.12.3; its `rustls` feature resolving
+    `rustls >= 0.23` (so `cargo deny check advisories` passes with `ignore`
+    still empty); and the full live suite of 11.5 green on it. Until then
+    `tiberius-ng` stays, and this paragraph is the reminder that it is a
+    waypoint rather than the destination.
+
 11. **Whether a universal connection layer belongs here** — settled; see
     [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive sounding
     like an answer to question 10 and to dialect breadth at once, and they are
