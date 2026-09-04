@@ -456,10 +456,41 @@ privileged one, and nothing in the plan says so.
 
 - **preserves it** — an `ALTER … OWNER TO` after the `CREATE`, written into the
   plan so the approver sees it, exactly as the re-emitted grants are; and
-- **refuses the rebuild when it cannot**, because `ALTER … OWNER TO` requires
-  the deployment account to be a member of the target role, which is not
-  something pbps may assume or arrange. Refusing names the owner and the
-  membership that would be needed.
+- **refuses the rebuild when it cannot** — and "cannot" is more than one
+  condition. A first version of this bullet said `ALTER … OWNER TO` "requires
+  the deployment account to be a member of the target role", which is necessary
+  and not sufficient. **Measured**, as a non-superuser deployment account (a
+  superuser bypasses both checks, which is how the first attempt at this
+  measurement missed them):
+
+  ```
+  -- ow_deploy owns the view and is a member of ow_owner
+  ow_owner holds CREATE on the schema:   ALTER VIEW ow.v OWNER TO ow_owner   accepted
+  after REVOKE CREATE ON SCHEMA ow FROM ow_owner:
+                                         ALTER VIEW ow.v OWNER TO ow_owner
+                                         ERROR:  permission denied for schema ow
+  ```
+
+  The object stays validly owned by a role that has lost `CREATE` on its
+  schema — so an object can be in a state its own owner could not re-establish.
+  And membership can be granted without the right to use it:
+
+  ```
+  GRANT ow_owner TO ow_deploy WITH SET FALSE;
+      pg_auth_members: set_option=false
+      SET ROLE ow_owner  ->  ERROR: permission denied to set role "ow_owner"
+  ```
+
+  So the connected plan checks **both prerequisites before emitting the
+  statement**: the target owner's `CREATE` on the containing schema
+  (`has_schema_privilege`), and that the deployment account may actually assume
+  the role (`pg_auth_members.set_option`, which is the flag `WITH SET FALSE`
+  clears). Without them the plan is applyable and rolls back at the ownership
+  statement, which is the failure §7.5 exists to prevent — and here it would
+  arrive *after* the `DROP`, at the end of a rebuild.
+
+  Refusing names the owner, the schema, and which of the two prerequisites is
+  missing.
 
 A `SECURITY DEFINER` module whose owner cannot be preserved is the one case
 where refusing is not merely conservative but the only defensible answer: the

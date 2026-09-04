@@ -118,3 +118,6 @@ A45 | DROP FUNCTION with an expression index on it | refused: cannot drop functi
 R39 | a sequence advance after the transaction that made it rolled back | last_value 5 — the advance survived
 R40 | nextval on a CYCLE sequence, six calls | 8, 9, 10, 1, 2, 3 — not monotonic, so "advance until past the maximum" never ends
 R41 | what the catalog says about that sequence | cycle=true min=1 max=10 — detectable, though Identity records only seed and increment
+A46 | the target owner's CREATE on the containing schema | true — the prerequisite ALTER ... OWNER TO checks
+A47 | the same after REVOKE CREATE | false — an object may still be validly owned by it
+A48 | membership granted WITH SET FALSE | set_option=false — membership without the right to assume it

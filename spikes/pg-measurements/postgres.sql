@@ -651,8 +651,27 @@ SELECT 'R41', 'what the catalog says about that sequence',
        || ' — detectable, though Identity records only seed and increment'
 FROM pg_sequence WHERE seqrelid = 'm.cyc'::regclass;
 
+-- -------------------------------- the fifteenth 2026-09-05 review round
+-- The two ownership prerequisites. Both refusals need a *non-superuser*
+-- session — a superuser bypasses them — so the session transcripts are in
+-- ADR-0009 and what one connection can establish is the catalog state.
+
+CREATE ROLE m_ow_owner;
+CREATE ROLE m_ow_deploy LOGIN PASSWORD 'x';
+GRANT CREATE, USAGE ON SCHEMA m TO m_ow_owner;
+SELECT 'A46', 'the target owner''s CREATE on the containing schema',
+       has_schema_privilege('m_ow_owner','m','CREATE')::text || ' — the prerequisite ALTER ... OWNER TO checks';
+REVOKE CREATE ON SCHEMA m FROM m_ow_owner;
+SELECT 'A47', 'the same after REVOKE CREATE',
+       has_schema_privilege('m_ow_owner','m','CREATE')::text
+       || ' — an object may still be validly owned by it';
+GRANT m_ow_owner TO m_ow_deploy WITH SET FALSE;
+SELECT 'A48', 'membership granted WITH SET FALSE',
+       'set_option=' || set_option::text || ' — membership without the right to assume it'
+FROM pg_auth_members WHERE roleid='m_ow_owner'::regrole AND member='m_ow_deploy'::regrole;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
-DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander; DROP OWNED BY m_ow_owner; DROP OWNED BY m_ow_deploy;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander, m_ow_owner, m_ow_deploy;
