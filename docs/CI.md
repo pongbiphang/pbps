@@ -198,10 +198,11 @@ jobs:
     # released only to a job on such a tag, rather than a repository secret any
     # workflow run can read. See "Who can reach the credential" below.
     environment: production-plan
-    env:
-      PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
+    # The credential is *not* here. A job-level `env:` reaches every step,
+    # including the actions that check out, install a toolchain and build —
+    # none of which needs a database. See "Who can reach the credential".
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -209,13 +210,16 @@ jobs:
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
 
       - name: the account can deploy
+        env: { PBPS_PROD_URL: "${{ secrets.PBPS_PROD_URL }}" }
         run: pbps doctor --env prod
       - name: prod matches its recorded state
+        env: { PBPS_PROD_URL: "${{ secrets.PBPS_PROD_URL }}" }
         run: pbps verify --env prod     # drift is a finding, so this exits 2 (SPEC 14.1)
       - name: the plan for this environment
+        env: { PBPS_PROD_URL: "${{ secrets.PBPS_PROD_URL }}" }
         run: pbps plan --env prod --out plan.json --sql plan.sql
       - name: what the approver reads
-        run: pbps explain --plan plan.json      # prints the SHA-256 and the exact apply command
+        run: pbps explain --plan plan.json      # offline: no credential needed
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -293,10 +297,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: production        # configure required reviewers on this environment
-    env:
-      PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
+    # As in `plan`: the credential is on the one step that deploys, not on the
+    # job that also builds.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -323,6 +327,7 @@ jobs:
 
       - name: apply exactly the approved artifact
         env:
+          PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
           # Through the environment, never interpolated into the script: an
           # input is text somebody typed.
           CHECKSUM: ${{ inputs.checksum }}
@@ -369,6 +374,23 @@ The drift watch is the fourth setting, and the easiest one to get wrong: a
 scheduled run references no deployment environment, so it receives nothing from
 either of them. It has an environment of its own (`monitoring`) holding a
 read-only account — see "Drift watch".
+
+**The credential is on steps, never on jobs.** A job-level `env:` reaches every
+step in the job, so writing it there would hand the connection string to
+`actions/checkout`, the toolchain installer, the cache action and every build
+script `cargo` runs — none of which needs a database. In these pipelines it
+appears on exactly four steps: `doctor`, `verify` and the connected `plan`, and
+the `apply` itself. `explain` is offline and does not get it either.
+
+**Pin every third-party action to a full commit SHA** before this goes near a
+production credential ([GitHub's hardening guide](https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)).
+A tag is a mutable pointer: `@v4` is whatever that ref points at on the day the
+job runs. The examples here carry tags so that they run as pasted and stay
+readable, which is exactly the trade this file otherwise refuses to make — so
+it is called out rather than hidden. Step-scoping the credential is what limits
+the damage in the meantime: a compromised action in these jobs no longer has
+the connection string in its environment. It can still touch the workspace the
+build runs from, which is the reason to pin as well as to scope.
 
 `production-plan` has no required reviewers on purpose. Putting them there would
 ask a human to approve before the plan exists — before there is a checksum to
@@ -577,16 +599,15 @@ jobs:
     # deployment environments release nothing to a scheduled run, and this job
     # only ever reads. See "Who can reach the credential".
     environment: monitoring
-    env:
-      PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
-      - run: pbps verify --env prod --format json
+      - env: { PBPS_PROD_URL: "${{ secrets.PBPS_PROD_URL }}" }
+        run: pbps verify --env prod --format json
 ```
 
 A scheduled run references no deployment environment, so it is released
