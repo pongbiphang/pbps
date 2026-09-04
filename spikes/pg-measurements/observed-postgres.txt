@@ -1,0 +1,60 @@
+-- PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+A1 | a view definition is stored verbatim | no
+A2 | pretty and non-pretty deparse agree | no
+A3 | a string-literal function body is stored verbatim | yes
+A4 | a BEGIN ATOMIC function body is stored verbatim | no (prosrc is empty)
+A5 | functions and procedures overload on one name | 4 objects named m.f
+A6 | the engine normalizes the identity arguments | a character varying, b "char" / IN a date / a integer / a text
+A7 | DROP FUNCTION by bare name, with overloads present | refused: function name "m.f" is not unique
+A8 | a function may share a name with a table | accepted
+A9 | a view may share a name with a table | refused: relation "customer" already exists
+A10 | CREATE OR REPLACE VIEW appends a column | accepted
+A11 | CREATE OR REPLACE VIEW removes a column | refused: cannot drop columns from view
+A12 | CREATE OR REPLACE VIEW retypes a column | refused: cannot change data type of view column "a" from character varying(10) to text
+A13 | CREATE OR REPLACE FUNCTION changes the return type | refused: cannot change return type of existing function
+A14 | CREATE OR REPLACE FUNCTION given a new argument type | accepted, leaving 2 function(s) named m.g
+A15 | CREATE OR REPLACE VIEW keeps the grants | kept
+A16 | DROP VIEW then CREATE VIEW keeps the grants | lost
+A17 | a table rename follows into the stored view definition | yes
+A18 | and a column rename rewrites it as | SELECT customer_id, name AS full_name FROM m.client WHERE legacy_code IS NULL;
+A19 | ALTER COLUMN TYPE is refused while a plain view depends on it | refused: cannot alter type of a column used by a view or rule
+A20 | DROP COLUMN is refused while a plain view depends on it | refused: cannot drop column legacy_code of table customer because other objects depend on it
+B1 | a table grant without schema USAGE reads as held | true (schema USAGE: false)
+B2 | and the read actually succeeds | refused: permission denied for schema m
+B3 | GRANT ON ALL TABLES covers a table created afterwards | true for an existing table, false for a later one
+B4 | ALTER DEFAULT PRIVILEGES is keyed to the creating role | true for the named role, false for another
+B5 | a role is visible from every database in the cluster | roles live in pg_authid, which is cluster-wide: 1 row in pg_roles
+B6 | DROP ROLE while the role merely holds a grant | refused: role "m_reader" cannot be dropped because some objects depend on it
+B7 | a fresh function's ACL | NULL (the built-in default applies)
+B8 | GRANT ALTER | refused: unrecognized privilege type "alter"
+B9 | inserting into an identity column with only INSERT granted | accepted
+B10 | inserting into a serial column with only INSERT granted | refused: permission denied for sequence ser_id_seq
+T-01 | int -> bigint | rewrite
+T-02 | bigint -> int | rewrite
+T-03 | varchar(10) -> varchar(20) | no rewrite
+T-04 | varchar(20) -> varchar(10) | rewrite
+T-05 | varchar(20) -> text | no rewrite
+T-06 | text -> varchar(20) | rewrite
+T-07 | numeric(10,2)->(12,2) | no rewrite
+T-08 | numeric(10,2)->(10,4) | rewrite
+T-09 | int -> text | rewrite
+T-10 | text -> int, no USING | refused: column "c" cannot be cast automatically to type integer
+T-11 | narrowing over real data | refused: value too long for type character varying(5)
+T-12 | add column, no default | no rewrite
+T-13 | add column, const default | no rewrite
+T-14 | add column, volatile default | rewrite
+T-15 | SET NOT NULL | no rewrite
+T-16 | DROP COLUMN | no rewrite
+T-17 | timestamp -> timestamptz under UTC | no rewrite
+T-18 | timestamp -> timestamptz under America/New_York | rewrite
+T-19 | declared spelling -> catalog spelling | a=integer, b=integer, c=smallint, d=bigint, e=numeric(10,2), f=double precision, g=double precision, h=real, j=boolean, k=character varying, l=character varying(9), m_=character(5), n=time without time zone, o=time with time zone, p=timestamp without time zone, q=integer
+T-20 | float(n) either side of 24 | a=real, b=real, c=double precision, d=double precision
+T-21 | what a dropped column leaves in the catalog | 1:keep isdropped=false type=integer, 2:........pg.dropped.2........ isdropped=true type=-
+R1 | how a declared default is stored | a -> 'plain'::text, b -> 0, c -> 'x'::character varying
+R2 | an ordinary insert after keys were forced in | refused: duplicate key value violates unique constraint "pinned_pkey"
+R3 | a NOT VALID foreign key reads as | convalidated=false
+R4 | a new violating row under a NOT VALID key | refused: insert or update on table "child" violates foreign key constraint "fk_child"
+R5 | deleting a parent referenced under a NOT VALID key | refused: update or delete on table "parent" violates foreign key constraint "fk_child" on table "child"
+R6 | a key differing only in case | accepted (collation en_US.utf8)
+R7 | value rendering under the default session | \x0102 / 2026-09-05 / 1 day 02:00:00
+R8 | the same values after three SET commands | \001\002 / 05/09/2026 / 1 2:00:00
