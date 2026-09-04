@@ -1077,16 +1077,43 @@ fn refuse_unplanned_movement(
     let mut moved = Vec::new();
     let named = |n: &TableName| objects.contains(n);
     compare("", &before.tables, &after.tables, named, &mut moved);
-    for (name, was) in &before.tables {
+    // Every touched table, under the name it ends with — including the ones
+    // this plan creates, which have no `before` entry to be found under. A
+    // loop over the baseline alone never visited a new table, so an
+    // undeclared row that arrived in one (a DDL trigger, or another session
+    // between a staged `CREATE TABLE` and its checkpoint) was recorded into an
+    // `exact` snapshot and read as clean ever after (DECISIONS 163). A
+    // created table's baseline is simply no rows, which is what it had.
+    let carried: BTreeSet<&TableName> = before
+        .tables
+        .keys()
+        .map(|name| renamed.get(name).copied().unwrap_or(name))
+        .collect();
+    let no_rows = pbps_model::TableData {
+        mode: pbps_model::DataMode::Exact,
+        rows: Default::default(),
+    };
+    let touched_tables = before
+        .tables
+        .iter()
+        .map(|(name, was)| (name, was.data.as_ref()))
+        .chain(
+            after
+                .tables
+                .keys()
+                .filter(|name| named(name) && !carried.contains(*name))
+                .map(|name| (name, Some(&no_rows))),
+        );
+    for (name, was_rows) in touched_tables {
         if !named(name) {
             // Already compared whole, rows included.
             continue;
         }
         let now_name = renamed.get(name).copied().unwrap_or(name);
-        // Created, dropped, or outside the row scope on one side: there is no
-        // pair of row sets to compare, and "absent" is not "empty".
+        // Dropped, or outside the row scope on one side: there is no pair of
+        // row sets to compare, and "absent" is not "empty".
         let (Some(was_rows), Some(now_rows)) = (
-            was.data.as_ref(),
+            was_rows,
             after.tables.get(now_name).and_then(|t| t.data.as_ref()),
         ) else {
             continue;
@@ -1292,7 +1319,26 @@ fn refuse_unplanned_movement(
     // answerable for the rest of the role's set, and nothing else in the run
     // speaks for them — the statements grant and revoke what they were asked
     // to and say nothing about what they left alone (DECISIONS 156).
-    for (name, was) in &before_roles {
+    // Created roles included, with no grants before them — for the reason the
+    // tables above are: a loop over the baseline never visits a name that was
+    // not there, so a grant that arrived on a role this plan had just created
+    // was checked by nothing at all (DECISIONS 163). Its existence alone was.
+    let carried_roles: BTreeSet<&str> = before_roles
+        .keys()
+        .map(|name| renamed_roles.get(name.as_str()).copied().unwrap_or(name))
+        .collect();
+    let no_grants = pbps_model::Role {
+        description: None,
+        grants: BTreeMap::new(),
+    };
+    let touched_roles = before_roles.iter().chain(
+        after
+            .roles
+            .keys()
+            .filter(|name| named_role(name) && !carried_roles.contains(name.as_str()))
+            .map(|name| (name, &no_grants)),
+    );
+    for (name, was) in touched_roles {
         if !named_role(name) {
             // Already compared whole, grants included.
             continue;
@@ -4058,6 +4104,116 @@ mod tests {
         let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// An object this plan creates has no baseline entry, so a loop over the
+    /// baseline never visits it — and everything that arrived on it while it
+    /// was new went unchecked (DECISIONS 163).
+    #[test]
+    fn what_this_plan_creates_is_compared_too() {
+        use pbps_model::{DataMode, GrantTarget, Permission, RowKey, TableData};
+
+        // A rogue row in a table this plan creates `exact`.
+        let created = |keys: &[&str]| {
+            let t = pbps_model::Table {
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: keys
+                        .iter()
+                        .map(|k| (RowKey::from(*k), pbps_model::Row::default()))
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.new".parse().unwrap(), t);
+            s
+        };
+        let creating = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(pbps_model::Table::default()),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+                    table: "dbo.new".parse().unwrap(),
+                    key_column: "code".to_owned(),
+                    identity_key: false,
+                    key: RowKey::from("declared"),
+                    row: pbps_model::Row::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &creating,
+            &Schema::default(),
+            &created(&["declared"]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the row this plan inserts into the table it creates");
+        let e = refuse_unplanned_movement(
+            &creating,
+            &Schema::default(),
+            &created(&["declared", "rogue"]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a row nobody declared, in a table one statement old");
+        assert!(format!("{e:#}").contains("row `rogue`"), "{e:#}");
+
+        // And a grant on a role this plan creates.
+        let with_grants = |held: &[Permission]| {
+            let mut grants = BTreeMap::new();
+            if !held.is_empty() {
+                grants.insert(
+                    GrantTarget::Schema("dbo".to_owned()),
+                    held.iter().copied().collect::<BTreeSet<_>>(),
+                );
+            }
+            let mut s = Schema::default();
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let creating_role = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "app".to_owned(),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                    role: "app".to_owned(),
+                    target: GrantTarget::Schema("dbo".to_owned()),
+                    permissions: [Permission::Select].into_iter().collect(),
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &creating_role,
+            &Schema::default(),
+            &with_grants(&[Permission::Select]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the grant this plan gives the role it creates");
+        let e = refuse_unplanned_movement(
+            &creating_role,
+            &Schema::default(),
+            &with_grants(&[Permission::Select, Permission::Delete]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a permission nobody planned, on a role one statement old");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
     /// Three things the guard could not see, each because of where it looked

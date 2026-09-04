@@ -1949,3 +1949,24 @@ SPEC is in sync with all of these.
     real check and the aggressive one can be shown to be exact — as here, from
     the omission rule and from the plan's own statements — the exact one wins.
 
+163. **A loop over the baseline never visits what the plan creates.** Twice,
+    on the two halves of the model, and it is 162's lesson again one turn
+    later: the comparison was right and its *domain* was wrong.
+    A table this plan creates has no entry in the state it is measured
+    against, so the row comparison — which walks the baseline — never reached
+    it. Its rows were checked only for the *planned* keys being present, so an
+    undeclared row that arrived in a table one statement old (a DDL trigger,
+    or another session between a staged `CREATE TABLE` and its checkpoint) was
+    recorded into an `exact` snapshot and read as clean ever after. The same
+    for a role: a grant that landed on one the plan had just created was
+    checked by nothing, since only its existence was.
+    Both domains now include what the plan creates, with the baseline such an
+    object actually had: **no rows, and no grants**. That is not a
+    stand-in — a table that did not exist held no rows — and every branch
+    already written then does the right thing with it, which is why neither
+    fix needed a new comparison.
+    An `ensure` table needs no special case and gets none: its read covers the
+    declared keys only, so an undeclared row is never read on either side and
+    can neither be reported nor missed. The mode falls out of the scope
+    instead of being tested for.
+
