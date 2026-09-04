@@ -66,6 +66,18 @@ pub struct EnvStatus {
 
     /// When this line was produced, by the reporting machine's clock.
     pub checked_at: String,
+
+    /// Independently discovered verdicts that do not win the single-state
+    /// human summary. They are omitted from the row because the stable JSON
+    /// representation already exposes them through `findings`.
+    #[serde(skip)]
+    issues: Vec<StatusIssue>,
+}
+
+#[derive(Debug)]
+struct StatusIssue {
+    state: &'static str,
+    detail: String,
 }
 
 impl EnvStatus {
@@ -83,6 +95,7 @@ impl EnvStatus {
             locked_by: None,
             lock_unknown: None,
             checked_at: checked_at.to_owned(),
+            issues: Vec::new(),
         }
     }
 }
@@ -256,6 +269,7 @@ async fn one(
         locked_by,
         lock_unknown,
         checked_at: checked_at.to_owned(),
+        issues: Vec::new(),
     };
 
     if entry.snapshot.kind == pbps_model::StateKind::Failed {
@@ -374,12 +388,28 @@ fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String)
         row.detail = Some(detail);
         return;
     }
+    if row.state != state {
+        match row.issues.iter_mut().find(|issue| issue.state == state) {
+            Some(issue) => append_detail(&mut issue.detail, &detail),
+            None => row.issues.push(StatusIssue {
+                state,
+                detail: detail.clone(),
+            }),
+        }
+    }
     let previous = row.detail.take().unwrap_or_default();
     row.detail = Some(if previous.is_empty() {
         detail
     } else {
         format!("{previous} — {detail}")
     });
+}
+
+fn append_detail(existing: &mut String, detail: &str) {
+    if !existing.is_empty() {
+        existing.push_str(" — ");
+    }
+    existing.push_str(detail);
 }
 
 /// Notes a checksum mismatch on a row, without ever displacing `staged`.
@@ -391,12 +421,14 @@ fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String)
 /// finish the deployment they are actually in.
 fn record_drift(row: &mut EnvStatus, entry_id: i64, name: &str) {
     if row.state == "staged" {
-        let so_far = row.detail.take().unwrap_or_default();
         let arg = crate::report::env_arg(name);
-        row.detail = Some(format!(
-            "{so_far} — and it has moved since that checkpoint, which \
-             `pbps verify --env {arg}` will show"
-        ));
+        record_status_issue(
+            row,
+            "drift",
+            format!(
+                "it has moved since that checkpoint, which `pbps verify --env {arg}` will show"
+            ),
+        );
         return;
     }
     if row.state != "ok" {
@@ -480,40 +512,19 @@ fn render(rows: &[EnvStatus]) -> String {
 /// it succeeded. The per-environment truth is in `state`, which is the field a
 /// consumer should key off.
 fn findings(rows: &[EnvStatus]) -> Vec<output::Finding> {
-    let mut out: Vec<output::Finding> = rows
-        .iter()
-        .filter(|r| r.state != "ok")
-        .map(|r| {
-            let mut f = output::Finding::warning(
-                match r.state {
-                    "drift" => "state.drift",
-                    "policy" => "state.unmanaged-refused",
-                    "warning" => "state.unmanaged",
-                    "failed" => "state.failed",
-                    "staged" => "state.mid-deployment",
-                    "uninitialized" => "state.uninitialized",
-                    "unreachable" => "environment.unreachable",
-                    _ => "environment.unconfigured",
-                },
-                match &r.detail {
-                    Some(d) => format!("{}: {} — {d}", r.environment, r.state),
-                    None => format!("{}: {}", r.environment, r.state),
-                },
-            );
-            if r.state == "staged" {
-                // Named, for the same reason as `doctor`'s: `apply` requires a
-                // target, and `status` is the command that reports on six
-                // environments at once — a remedy without the name leaves the
-                // reader to work out which of the six it meant.
-                f = f.remedy(format!(
-                    "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
-                     --staged --resume",
-                    crate::report::env_arg(&r.environment),
-                ));
-            }
-            f
-        })
-        .collect();
+    let mut out = Vec::new();
+    for r in rows {
+        if r.state != "ok" {
+            out.push(status_finding(&r.environment, r.state, r.detail.as_deref()));
+        }
+        for issue in &r.issues {
+            out.push(status_finding(
+                &r.environment,
+                issue.state,
+                Some(&issue.detail),
+            ));
+        }
+    }
 
     // A held lock is not a `state`: the environment's recorded state is whatever
     // the ledger says, and an apply running on top of it is a second,
@@ -545,6 +556,35 @@ fn findings(rows: &[EnvStatus]) -> Vec<output::Finding> {
     out
 }
 
+fn status_finding(environment: &str, state: &'static str, detail: Option<&str>) -> output::Finding {
+    let mut finding = output::Finding::warning(
+        match state {
+            "drift" => "state.drift",
+            "policy" => "state.unmanaged-refused",
+            "warning" => "state.unmanaged",
+            "failed" => "state.failed",
+            "staged" => "state.mid-deployment",
+            "uninitialized" => "state.uninitialized",
+            "unreachable" => "environment.unreachable",
+            _ => "environment.unconfigured",
+        },
+        match detail {
+            Some(detail) => format!("{environment}: {state} — {detail}"),
+            None => format!("{environment}: {state}"),
+        },
+    );
+    if state == "staged" {
+        // Named, for the same reason as `doctor`'s: `apply` requires a target,
+        // and `status` reports on several environments at once.
+        finding = finding.remedy(format!(
+            "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
+             --staged --resume",
+            crate::report::env_arg(environment),
+        ));
+    }
+    finding
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +603,7 @@ mod tests {
             locked_by: None,
             lock_unknown: None,
             checked_at: "2026-08-31T09:20:00Z".into(),
+            issues: Vec::new(),
         }
     }
 
@@ -577,6 +618,8 @@ mod tests {
         let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("2 of 5"), "{detail}");
         assert!(detail.contains("moved since that checkpoint"), "{detail}");
+        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        assert_eq!(ids, ["state.mid-deployment", "state.drift"]);
     }
 
     #[test]
@@ -596,7 +639,24 @@ mod tests {
         let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("attempt failed"), "{detail}");
         assert!(detail.contains("no longer matches"), "{detail}");
-        assert_eq!(findings(&[r]).first().unwrap().id, "state.failed");
+        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        assert_eq!(ids, ["state.failed", "state.drift"]);
+    }
+
+    #[test]
+    fn an_unmanaged_refusal_reaches_findings_alongside_drift() {
+        let mut r = row("prod", "ok");
+        record_drift(&mut r, 7, "prod");
+        record_status_issue(
+            &mut r,
+            "policy",
+            "`unmanaged: error` sees dbo.surprise outside the managed set".into(),
+        );
+
+        let findings = findings(&[r]);
+        let ids: Vec<&str> = findings.iter().map(|finding| finding.id).collect();
+        assert_eq!(ids, ["state.drift", "state.unmanaged-refused"]);
+        assert!(findings[1].message.contains("dbo.surprise"));
     }
 
     #[test]
