@@ -489,6 +489,7 @@ What that enumeration covers today, each measured on this branch:
 | owner, and with it `SECURITY DEFINER`'s meaning | `relowner` / `proowner` | drop + create |
 | `security_invoker`, `security_barrier`, `check_option` | `pg_class.reloptions` | drop + create **and `CREATE OR REPLACE`** |
 | view column defaults | `pg_attrdef` | drop + create |
+| grants the *new* object inherits | `pg_default_acl`, keyed to the creating role | **gained**, not lost, by drop + create |
 
 The table is evidence, not the specification — it is what has been measured, and
 the next attribute nobody has looked for is exactly as dangerous as these were.
@@ -497,6 +498,38 @@ from memory.** A dialect that implements the list rather than the rule will be
 wrong again the moment PostgreSQL attaches something else, and every instance so
 far has failed in the same direction — access silently widened, verification
 silently clean.
+
+**And "carry" is not enough: the rule is *restore*, which includes taking away
+what arrived uninvited.** Every version of this section until now checked the
+*old* object and re-emitted what it found, which cannot see something the *new*
+object acquires on its own. **Measured**, it acquires plenty: with an
+`ALTER DEFAULT PRIVILEGES` entry for the deployment role — the ordinary way an
+estate arranges read access, and the construct [ADR-0010](ADR-0010-postgres-privileges.md)
+§2 measured as keyed to the creating role — a view that role creates arrives
+already granted:
+
+```
+the ACL of a view the deployment role just created:
+    {m_deploy=arwdDxtm/m_deploy, m_bystander=r/m_deploy}   -- granted by no declaration
+```
+
+and the failure is precisely in the gap the old check leaves:
+
+```
+old acl NULL  ->  passes a "reproduce the old ACL" check
+new acl        {m_deploy=…, m_bystander=r/m_deploy}
+```
+
+An object with no grants at all is the easiest case to wave through, and it is
+the one where a rebuild hands an unmanaged role `SELECT`. Re-emitting the
+declared grants never removes it, because there was nothing declared to
+contradict it.
+
+So the enumeration is a **two-sided** obligation: after the `CREATE`, the plan
+brings the object's state to exactly what it recorded — emitting what is missing
+**and revoking what appeared** — and refuses if it cannot. `pg_default_acl` is
+where to look for what will appear, and the plan says so, because a `REVOKE`
+nobody can explain is worse than one the artifact predicted.
 
 Two consequences worth naming, because they follow from the rule rather than
 from any one row: **the enumeration is `plan --db`'s work, not the emitter's**,

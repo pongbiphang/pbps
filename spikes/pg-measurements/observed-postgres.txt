@@ -99,3 +99,8 @@ R30 | setval(GREATEST(target, nextval)) interleaved with one other allocation | 
 R31 | a widened INCREMENT on a sequence never called | first nextval 1, second 101 — the increment does not apply to the first call
 R32 | ALTER SEQUENCE INCREMENT BY does not move last_value | last_value 101
 R33 | and after restoring the increment | last_value 101 — nothing was lowered
+A35 | the ACL of a view the deployment role just created | {m_deploy=arwdDxtm/m_deploy,m_bystander=r/m_deploy} — granted by no declaration
+A36 | so a rebuild of an object whose old ACL was NULL | old acl NULL passes an "reproduce the old ACL" check, new acl is {m_deploy=arwdDxtm/m_deploy,m_bystander=r/m_deploy}
+R34 | a catalog query with an empty search_path | 1 row(s) from pg_class — pg_catalog stays reachable
+R35 | deparse under an empty path is fully qualified | SELECT id, a FROM m.dp_t;
+R36 | the same view deparsed under the project path | SELECT id, a FROM dp_t;

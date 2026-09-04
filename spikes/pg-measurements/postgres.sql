@@ -539,8 +539,38 @@ ALTER SEQUENCE m.fresh_seq INCREMENT BY 1;
 SELECT 'R33', 'and after restoring the increment',
        (SELECT 'last_value ' || last_value::text || ' — nothing was lowered' FROM m.fresh_seq);
 
+-- ------------------------------------- the ninth 2026-09-05 review round
+
+CREATE ROLE m_deploy LOGIN PASSWORD 'x';
+CREATE ROLE m_bystander;
+GRANT CREATE, USAGE ON SCHEMA m TO m_deploy;
+CREATE TABLE m.dp_t (id int PRIMARY KEY, a text);
+ALTER TABLE m.dp_t OWNER TO m_deploy;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_deploy IN SCHEMA m GRANT SELECT ON TABLES TO m_bystander;
+SET ROLE m_deploy;
+CREATE VIEW m.dp_v AS SELECT id, a FROM m.dp_t;
+RESET ROLE;
+SELECT 'A35', 'the ACL of a view the deployment role just created',
+       coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.dp_v'::regclass), 'NULL')
+       || ' — granted by no declaration';
+SELECT 'A36', 'so a rebuild of an object whose old ACL was NULL',
+       'old acl NULL passes an "reproduce the old ACL" check, new acl is '
+       || coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.dp_v'::regclass), 'NULL');
+
+SET search_path = '';
+SELECT 'R34', 'a catalog query with an empty search_path',
+       count(*)::text || ' row(s) from pg_class — pg_catalog stays reachable'
+FROM pg_class WHERE relname = 'dp_t';
+SELECT 'R35', 'deparse under an empty path is fully qualified',
+       trim(both from regexp_replace(pg_get_viewdef('m.dp_v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'R36', 'the same view deparsed under the project path',
+       trim(both from regexp_replace(pg_get_viewdef('m.dp_v'::regclass, true), E'[\n ]+',' ','g'));
+
+ALTER DEFAULT PRIVILEGES FOR ROLE m_deploy IN SCHEMA m REVOKE SELECT ON TABLES FROM m_bystander;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
-DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander;

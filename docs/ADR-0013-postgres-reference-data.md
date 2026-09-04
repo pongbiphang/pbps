@@ -400,12 +400,37 @@ is the same fact that made an early draft of `A17` in
 `spikes/pg-measurements` read wrong, which is a reasonable warning about how
 easy it is to miss.
 
-**Decision.** The search path is **a project setting** — declared once in
-`pbps.yml`, defaulting to the schemas the project manages — and
-`pbps-postgres` applies **that same path** on every connection, for emitted DDL
-and for every introspection read alike. Deterministic, never inherited from the
-role, identical between the write and the read, and wide enough that a
-declaration PostgreSQL accepts is not refused by the tool.
+**But one path cannot serve both jobs, because a project setting moves.** A
+first version of this decision used a single project path, defaulting to the
+schemas the project manages, for DDL and for introspection alike. That default
+changes the moment a revision starts managing another schema — and **measured**,
+the deparse changes with it:
+
+```
+empty path:        SELECT id, a FROM m.dp_t;
+project path = m:  SELECT id, a FROM dp_t;
+```
+
+A snapshot recorded under the old path and a `plan --db` run under the new one
+then compare two spellings of an unchanged view, report drift that is not there,
+and refuse the very revision that widened the path. The setting meant to make
+reads deterministic would have made them depend on the declarations.
+
+**Decision, in two halves that do not share a value:**
+
+- **Reads use a canonical path: empty.** It is independent of the declarations,
+  identical in every revision, and — **measured** — makes the deparser fully
+  qualify every name, which is the spelling a snapshot should hold. `pg_catalog`
+  stays reachable with an empty path (measured: the catalog query answers), so
+  introspection itself is unaffected.
+- **Writes use the project path** — declared in `pbps.yml`, defaulting to the
+  schemas the project manages, wide enough that a definition PostgreSQL accepts
+  is not refused by the tool.
+
+Deterministic on both sides, never inherited from the role, and the read side no
+longer moves when the project's shape does. The snapshot therefore always holds
+fully-qualified text, which is also the form a human reading a state file would
+want.
 
 Refusing unqualified definitions outright is the alternative and is worse: it is
 a parsing rule enforced by an engine error, applied to exactly the text §8.2
