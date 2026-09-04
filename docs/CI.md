@@ -238,6 +238,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      # The run id is text somebody typed, and `apply` checks the plan's
+      # checksum and the live baseline — not which commit produced the plan.
+      # Two tags planned against the same baseline are both applyable, so the
+      # artifact is bound to the tag being dispatched before it is fetched.
+      - name: the plan must be this tag's
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+        run: |
+          plan_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PLAN_RUN" --jq .head_sha)
+          if [ "$plan_sha" != "$GITHUB_SHA" ]; then
+            echo "run $PLAN_RUN planned $plan_sha; this dispatch is at $GITHUB_SHA" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: plan
@@ -296,6 +311,14 @@ read-only account — see "Drift watch".
 `production-plan` has no required reviewers on purpose. Putting them there would
 ask a human to approve before the plan exists — before there is a checksum to
 approve — which is the thing this pipeline exists to avoid.
+
+The dispatch inputs are part of that boundary too. `apply` pins the artifact by
+its checksum and the live baseline; it does not care which commit produced the
+plan, so two `prod-v*` tags planned against the same baseline are both
+applyable and an approval meant for one could run the other's plan. The apply
+job therefore refuses a `plan_run` whose `head_sha` is not the ref being
+dispatched, before it downloads anything — the reviewer approving a run should
+not have to read its inputs to know which tag they are deploying.
 
 There is deliberately **no recording step after `apply`**. `apply` reads the
 database back and records that state itself, with the checksum of the plan it
