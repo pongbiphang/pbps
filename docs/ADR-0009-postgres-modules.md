@@ -867,9 +867,30 @@ Two things follow, and neither is a new mechanism:
   catalog's edges are supplemented by ADR-0002's existing device: a **best-effort
   identifier scan** — that ADR already permits scanning definition text for the
   names of managed objects, "no SQL semantics", for ordering — extended to the
-  bodies the catalog holds. Managed callers it finds are rebuilt with the rest;
-  callers it finds outside the managed set are **reported, not refused**, and
-  `depends_on:` remains the explicit escape hatch for what a scan cannot see.
+  bodies the catalog holds.
+
+  **What is then done with a managed caller is a refusal, not a rebuild.** A
+  first version of this decision said such callers are "rebuilt with the rest",
+  which accomplishes nothing: a rebuild recreates the caller from its
+  *unchanged* declaration, and **measured**, PostgreSQL accepts a plpgsql body
+  that names a function which does not exist —
+
+  ```
+  CREATE FUNCTION tz.caller() ... BEGIN RETURN tz.no_such_fn(1); END ...  accepted
+  SELECT tz.caller()   refused: function tz.no_such_fn(integer) does not exist
+  ```
+
+  — so the apply commits with the defect intact and the caller still fails at
+  its next call. Scheduling another rebuild preserves exactly the failure it was
+  meant to prevent.
+
+  So: when a plan changes or removes a routine's identity and the scan finds a
+  **managed** caller whose declaration this plan does not also change,
+  `plan --db` refuses and names both. The remedy is the user's, because only the
+  user can say what the caller should now call — which is the same division of
+  labour as rename and drop intent. Callers found **outside** the managed set are
+  **reported, not refused**, and `depends_on:` remains the explicit escape hatch
+  for what a scan cannot see.
 
   Reported rather than refused, deliberately: the scan matches a *name*, and
   with overloading a name is not an identity, so it over-approximates. A

@@ -419,9 +419,38 @@ and ADR-0012 §4 already measured a fifth, `TimeZone`, deciding whether a type
 change rebuilds a table.
 
 **Decision.** The PostgreSQL connection pins its session on every connect —
-`bytea_output`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `TimeZone`
-and **`standard_conforming_strings`** — and does it in `pbps-postgres`, not in
-`pbps-db`, because *which* settings matter is dialect knowledge. The values a
+`bytea_output`, `DateStyle`, `IntervalStyle`, `extra_float_digits` and
+**`standard_conforming_strings`** — and does it in `pbps-postgres`, not in
+`pbps-db`, because *which* settings matter is dialect knowledge.
+
+**`TimeZone` is deliberately not on that list, and an earlier version of this
+decision had it there.** Every setting above changes how a value is *written
+down*; `TimeZone` changes what a value *is*. **Measured**, the same wall-clock
+value converted from `timestamp` to `timestamptz` under two zones lands five
+hours apart:
+
+```
+'2026-01-15 12:00:00' converted under UTC:               2026-01-15 12:00:00+00
+the same value converted under America/New_York:         2026-01-15 17:00:00+00
+```
+
+Pinning it would mean pbps deciding, for every environment, which zone the
+existing wall-clock data was recorded in — and getting that wrong moves every
+row silently, with no error and nothing for `verify` to compare against, since
+both sides would be read back under the same wrong pin.
+
+That is a data decision, and SPEC §1.3 draws the line there: how data should be
+*moved* is a business decision a structural diff cannot derive. So the pin
+covers rendering only, and **a `timestamp` → `timestamptz` change is refused
+until the zone can be declared** — the same shape as the `serial` and array
+refusals in [ADR-0012](ADR-0012-postgres-type-catalogue.md), and for the same
+reason: the tool would otherwise be choosing what the data means.
+
+ADR-0012 §4 measured the other half of this — the zone also decides whether
+that conversion rewrites the table — and recorded it as a caveat on the
+estimate. It is worth noticing that the same setting turned out to be a
+correctness input and not only a cost one, which is why the estimate caveat was
+not enough on its own. The values a
 plan writes and the values it reads back then live in one space, which is what
 ADR-0004 requires and what "fixed CONVERT styles" achieves on the other engine.
 
@@ -624,7 +653,8 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | `pbps-model` | Nothing |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2) — and §3 adds a connect-time session pin and a project search path |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
-| `validate` | Two rules: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward; a key collision names the collation that decided it (§5) |
+| `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
+| `plan --db` | The key-collision check (§5). `cmd_validate` is offline and the collation lives on the live column, which this ADR keeps out of `pbps-model`, so offline `validate` cannot answer it — and under a nondeterministic collation it would answer *wrongly*, accepting keys whose inserts collide. It says it did not check rather than reporting clean (§9.1: offline is a preview) |
 
 ## Limits
 

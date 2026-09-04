@@ -708,6 +708,28 @@ SELECT 'A53', 'creating it again under a new signature',
 SELECT 'A54', 'and calling the plpgsql caller after that apply committed',
        m.accepts('SELECT m.dep_plpgsql()');
 
+-- ------------------------------- the nineteenth 2026-09-05 review round
+
+CREATE TABLE m.tz_a (t timestamp);
+CREATE TABLE m.tz_b (t timestamp);
+INSERT INTO m.tz_a VALUES ('2026-01-15 12:00:00');
+INSERT INTO m.tz_b VALUES ('2026-01-15 12:00:00');
+SET TimeZone = 'UTC';
+ALTER TABLE m.tz_a ALTER COLUMN t TYPE timestamptz;
+SET TimeZone = 'America/New_York';
+ALTER TABLE m.tz_b ALTER COLUMN t TYPE timestamptz;
+SET TimeZone = 'UTC';
+SELECT 'R42', 'the same wall-clock value converted under two session zones',
+       'UTC -> ' || (SELECT t::text FROM m.tz_a)
+       || ' / America/New_York -> ' || (SELECT t::text FROM m.tz_b)
+       || ' — they differ by ' || ((SELECT t FROM m.tz_b) - (SELECT t FROM m.tz_a))::text;
+RESET TimeZone;
+
+SELECT 'A55', 'creating a plpgsql body that names a function which does not exist',
+       m.accepts('CREATE FUNCTION m.missing_caller() RETURNS int AS $q$ BEGIN RETURN m.no_such_fn(1); END $q$ LANGUAGE plpgsql');
+SELECT 'A56', 'and calling it',
+       m.accepts('SELECT m.missing_caller()');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

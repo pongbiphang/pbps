@@ -127,3 +127,6 @@ A51 | which of three callers pg_depend records an edge for | dep_atomic() — th
 A52 | dropping the function with only opaque callers left | accepted
 A53 | creating it again under a new signature | accepted
 A54 | and calling the plpgsql caller after that apply committed | refused: function m.dep_f(integer) does not exist
+R42 | the same wall-clock value converted under two session zones | UTC -> 2026-01-15 12:00:00+00 / America/New_York -> 2026-01-15 17:00:00+00 — they differ by 05:00:00
+A55 | creating a plpgsql body that names a function which does not exist | accepted
+A56 | and calling it | refused: function m.no_such_fn(integer) does not exist
