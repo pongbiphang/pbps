@@ -1019,8 +1019,12 @@ fn refuse_unplanned_movement(
     // The permissions this plan moves, keyed by the role it moves them on and
     // the target they sit on. A role can be both granted and revoked on one
     // target in one plan, so the sets are unioned rather than replaced.
-    let mut granted: BTreeMap<(&str, &pbps_model::GrantTarget), BTreeSet<&pbps_model::Permission>> =
-        BTreeMap::new();
+    // What this plan leaves each role holding on each target it touches: the
+    // permissions it adds and the ones it takes away, kept apart because the
+    // comparison below reconstructs the set rather than excusing it.
+    type Permissions = BTreeSet<pbps_model::Permission>;
+    let mut granting: BTreeMap<(&str, &pbps_model::GrantTarget), Permissions> = BTreeMap::new();
+    let mut revoking: BTreeMap<(&str, &pbps_model::GrantTarget), Permissions> = BTreeMap::new();
     // The columns this plan changes, under the table they are on, and the
     // objects it removes outright. Both are things the plan does to a
     // *container* that show up somewhere else without any change of its own
@@ -1039,10 +1043,11 @@ fn refuse_unplanned_movement(
             written.entry(table).or_default().insert(key);
         }
         if let Some((role, target, permissions)) = p.change.grant() {
-            granted
-                .entry((role, target))
-                .or_default()
-                .extend(permissions);
+            let (side, permissions) = match permissions {
+                pbps_model::PermissionChange::Granted(p) => (&mut granting, p),
+                pbps_model::PermissionChange::Revoked(p) => (&mut revoking, p),
+            };
+            side.entry((role, target)).or_default().extend(permissions);
         }
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
@@ -1116,6 +1121,30 @@ fn refuse_unplanned_movement(
         }
     }
     compare("", &before.modules, &after.modules, named, &mut moved);
+    // A module the plan names is held to the definition the plan wrote, not
+    // exempted. `CREATE OR ALTER` reports success and says nothing about what
+    // is now stored, and no statement carries a postcondition for one — so a
+    // session, or a DDL trigger inside the statement itself, that altered or
+    // dropped the module straight afterwards was read back and recorded as
+    // this plan's own result (DECISIONS 160).
+    for p in &changes.changes {
+        let Some((name, expected)) = p.change.module() else {
+            continue;
+        };
+        match (expected, after.modules.get(name)) {
+            (pbps_model::ModuleAfter::Standing(wrote), Some(now)) if now == wrote => {}
+            (pbps_model::ModuleAfter::Standing(_), Some(_)) => moved.push(format!(
+                "{name} does not hold the definition this plan wrote"
+            )),
+            (pbps_model::ModuleAfter::Standing(_), None) => {
+                moved.push(format!("{name} is not there, and this plan writes it"))
+            }
+            (pbps_model::ModuleAfter::Gone, None) => {}
+            (pbps_model::ModuleAfter::Gone, Some(_)) => {
+                moved.push(format!("{name} is still there, and this plan drops it"))
+            }
+        }
+    }
     // The baseline's grants, spelled the way the read-back will spell them.
     // Measured: SQL Server carries a grant across `sp_rename`, so a plan that
     // renames a granted table changes no permission and the differ emits no
@@ -1181,25 +1210,24 @@ fn refuse_unplanned_movement(
             // is no pair of grant sets to compare.
             continue;
         };
-        let empty = BTreeSet::new();
+        let empty = Permissions::new();
         let targets: BTreeSet<_> = was.grants.keys().chain(now.grants.keys()).collect();
         for target in targets {
-            let moves = granted.get(&(now_name, target)).unwrap_or(&empty);
-            let held = |grants: &BTreeMap<_, BTreeSet<pbps_model::Permission>>| {
-                grants
-                    .get(target)
-                    .map(|held| {
-                        held.iter()
-                            .filter(|p| !moves.contains(p))
-                            .copied()
-                            .collect::<BTreeSet<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            if held(&was.grants) != held(&now.grants) {
+            // What the plan says the role will hold here: what it held, less
+            // what this plan revokes, plus what it grants. Excusing the moved
+            // permissions from both sides instead left the plan's own grant
+            // checked by nothing — no statement has a postcondition on a
+            // permission, so a session (or a DDL trigger) that reversed it
+            // straight away was recorded as the plan's result (DECISIONS 160).
+            let mut expected: Permissions = was.grants.get(target).cloned().unwrap_or_default();
+            for revoked in revoking.get(&(now_name, target)).unwrap_or(&empty) {
+                expected.remove(revoked);
+            }
+            expected.extend(granting.get(&(now_name, target)).unwrap_or(&empty));
+            let held = now.grants.get(target).cloned().unwrap_or_default();
+            if expected != held {
                 moved.push(format!(
-                    "role {now_name} holds different permissions on {target} than the plan was \
-                     approved over, and no change of this plan moves them"
+                    "role {now_name} does not hold on {target} what this plan leaves it holding"
                 ));
             }
         }
@@ -3793,6 +3821,87 @@ mod tests {
             })],
         };
         refuse(&revoking, &before, &schema(&[])).expect("the plan's own revoke");
+
+        // The other half, and the reason the two directions are kept apart:
+        // the plan's own change is *verified*, not excused. Nothing else in a
+        // run has a postcondition on a permission, so a grant reversed before
+        // the read-back — by another session, or by a DDL trigger inside the
+        // statement itself — was recorded as the plan's result (DECISIONS 160).
+        let e = refuse(&plan_granting(Permission::Insert), &before, &before)
+            .expect_err("the grant this plan asked for did not take");
+        assert!(e.contains("role app"), "{e}");
+        let e = refuse(&revoking, &before, &before)
+            .expect_err("the revoke this plan asked for did not take");
+        assert!(e.contains("role app"), "{e}");
+    }
+
+    /// A module the plan writes is held to the definition it wrote. Nothing
+    /// else in a run is: `CREATE OR ALTER` reports success and says nothing
+    /// about what is now stored (DECISIONS 160).
+    #[test]
+    fn a_module_this_plan_writes_is_held_to_what_it_wrote() {
+        let view = |definition: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            on: None,
+            definition: definition.to_owned(),
+        };
+        let schema_with = |module: Option<pbps_model::Module>| {
+            let mut s = Schema::default();
+            if let Some(m) = module {
+                s.modules.insert("dbo.v".parse().unwrap(), m);
+            }
+            s
+        };
+        let writing = |definition: &str| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterModule {
+                    name: "dbo.v".parse().unwrap(),
+                    module: Box::new(view(definition)),
+                },
+            )],
+        };
+        let before = schema_with(Some(view("SELECT 1")));
+
+        // What the plan wrote is what is there.
+        refuse_unplanned_movement(
+            &writing("SELECT 2"),
+            &before,
+            &schema_with(Some(view("SELECT 2"))),
+            "prod",
+        )
+        .expect("the plan's own definition");
+
+        // Something else rewrote it straight afterwards.
+        let e = refuse_unplanned_movement(
+            &writing("SELECT 2"),
+            &before,
+            &schema_with(Some(view("SELECT 3"))),
+            "prod",
+        )
+        .expect_err("not the definition this plan wrote");
+        assert!(format!("{e:#}").contains("dbo.v"), "{e:#}");
+
+        // Or dropped it.
+        let e =
+            refuse_unplanned_movement(&writing("SELECT 2"), &before, &schema_with(None), "prod")
+                .expect_err("the module is gone");
+        assert!(format!("{e:#}").contains("is not there"), "{e:#}");
+
+        // And the other direction: a module this plan drops must be gone.
+        let dropping = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropModule {
+                    name: "dbo.v".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                },
+            )],
+        };
+        refuse_unplanned_movement(&dropping, &before, &schema_with(None), "prod")
+            .expect("the plan's own drop");
+        let e = refuse_unplanned_movement(&dropping, &before, &before, "prod")
+            .expect_err("the module is still there");
+        assert!(format!("{e:#}").contains("is still there"), "{e:#}");
     }
 
     /// A grant on a table this plan renames is the same grant afterwards, under

@@ -1842,3 +1842,43 @@ SPEC is in sync with all of these.
     through the merge with the early return intact, which is its own lesson
     about resolving a conflict by keeping "our" side.
 
+160. **What the plan itself wrote is checked, not excused — and "empty" is
+    only safe where it is true.** Three findings, and the first two are one
+    mistake made twice: 156 and 150 both *exempted* what the plan touches,
+    and an exemption is only correct where something else does the checking.
+    For a row there is something else — every row write carries a
+    postcondition (132, 136, 143). For a permission and for a module there is
+    nothing. `GRANT` reports success and says nothing about what the role now
+    holds; `CREATE OR ALTER` reports success and says nothing about what is
+    now stored. So a session that reversed either straight afterwards — or a
+    database DDL trigger, which does it deterministically — was read back and
+    recorded as the plan's own result, with `verify` clean over it ever after.
+    **Permissions** are now reconstructed rather than subtracted: what the
+    role held, less what this plan revokes, plus what it grants, compared with
+    what it holds. That is exact — the statements are `GRANT p ON t TO r`,
+    with nothing for the engine to decide — and it subsumes 156, which was
+    the same comparison with both sides blinded to the interesting part.
+    `PermissionChange` carries the direction, because "the plan moves these"
+    cannot say what the role should end up with.
+    **Modules** are held to the definition the plan wrote. Comparing exactly
+    is safe for a reason the tool already depends on: a module read back
+    equals the declaration that produced it, and if it did not, every apply
+    would be followed by drift for ever — the live round-trip test says so in
+    those words.
+    **The third is the opposite shape.** `OLDEST_READABLE_VERSION` reached 3
+    through the merge, and a version 3 snapshot predates `module_deps`. For
+    `roles` the default is a *true* reading — an environment recorded before
+    roles were managed is one with no managed roles — and 138's argument for
+    reading it holds. For `module_deps` it is a *missing* one: a revision
+    removing several dependent modules has no declaration left carrying their
+    `depends_on:` edges, so the order comes from the snapshot, and defaulted
+    to empty it falls back to name order and can drop a schema-bound
+    dependency before its dependent. Refused, with the re-record
+    `check_version` already names. Absent, empty and unreadable are three
+    different things, and this is the version boundary being asked to tell
+    them apart.
+    **And a test that pinned nothing.** The version-boundary test was written
+    against `OLDEST_READABLE_VERSION`, so it followed the constant wherever it
+    went — it passed unchanged with the boundary put back to 3. A historical
+    format version is a fixed thing and the test now names it.
+

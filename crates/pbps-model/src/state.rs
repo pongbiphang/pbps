@@ -33,16 +33,27 @@ use crate::schema::Schema;
 /// report no drift about grants it never looked at.
 ///
 /// Readers refuse a version they do not understand rather than reading it
-/// partially. Versions 3 and 4 are still read: every field a later version
-/// added defaults to empty, and an environment recorded before roles were
-/// managed *is* one with no managed roles — refusing it would leave a
-/// deployed environment with no way to be read at all, since re-recording it
-/// reads the latest entry first (DECISIONS 138). Older than 3 is refused, for
-/// the reasons 2 and 3 give.
+/// partially.
+///
+/// Version 4 is still read, and 3 is not, and the line between them is the
+/// project's own rule about absence (DECISIONS 160). Every field a later
+/// version adds defaults to empty, but "empty" is only a safe reading where it
+/// is a *true* one. An environment recorded before roles were managed **is**
+/// one with no managed roles, so a version 4 snapshot read by this build says
+/// exactly what that environment was — and refusing it would leave a deployed
+/// environment with no way to be read at all, since re-recording one reads the
+/// latest entry first (DECISIONS 138). A version 3 snapshot predates
+/// `module_deps`, and "no dependencies" is not a true reading of it but a
+/// missing one: a later revision that removes several dependent modules has
+/// no declaration left carrying their `depends_on:` edges, so the drop order
+/// comes from the snapshot — and defaulted to empty it falls back to name
+/// order, which can drop a schema-bound dependency before its dependent.
+/// Refused, with the remedy `check_version` already names: re-record it with
+/// `pbps baseline --reason ...`.
 pub const CURRENT_VERSION: u32 = 5;
 
 /// The oldest snapshot version this build reads as its own.
-pub const OLDEST_READABLE_VERSION: u32 = 3;
+pub const OLDEST_READABLE_VERSION: u32 = 4;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -240,9 +251,11 @@ mod tests {
         assert!(snap.check_version().is_ok());
 
         // The version before roles is read as an environment with none: the
-        // fields it lacks default to empty, and refusing it would leave a
-        // deployed environment unreadable, its re-record included
-        // (DECISIONS 138).
+        // fields it lacks default to empty, that is a *true* reading of it,
+        // and refusing it would leave a deployed environment unreadable, its
+        // re-record included (DECISIONS 138). The version before that is
+        // refused, because "no module dependencies" is a missing reading
+        // rather than a true one (DECISIONS 160).
         snap.version = OLDEST_READABLE_VERSION;
         assert!(snap.check_version().is_ok());
         snap.version = OLDEST_READABLE_VERSION - 1;
@@ -254,10 +267,29 @@ mod tests {
     /// What an entry from before roles actually holds, read by this build: the
     /// same state with no roles, not an error and not a partial read.
     ///
-    /// Both earlier versions, not just the oldest. 4 is the one a deployed
-    /// environment is most likely to be sitting on — it is what the trunk
-    /// wrote before this phase — and "the oldest readable version still
-    /// works" says nothing about it.
+    /// Version 3 by its number, not by the constant. It is a fixed historical
+    /// format, and what makes it unreadable is a specific thing it lacks:
+    /// `module_deps`. A test written against `OLDEST_READABLE_VERSION` follows
+    /// the constant wherever it goes and pins nothing — it passed unchanged
+    /// with the boundary moved back to 3 (DECISIONS 160).
+    #[test]
+    fn a_snapshot_from_before_module_dependencies_is_refused() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        snap.version = 3;
+        let e = snap.check_version().expect_err("version 3 is not readable");
+        assert!(e.contains("older pbps"), "{e}");
+        // And the remedy, because refusing without one strands the operator.
+        assert!(e.contains("pbps baseline"), "{e}");
+    }
+
+    /// 4 is the one a deployed environment is most likely to be sitting on —
+    /// it is what the trunk wrote before this phase — and "the oldest
+    /// readable version still works" says nothing about it on its own.
     #[test]
     fn a_snapshot_from_before_roles_reads_as_one_with_no_managed_roles() {
         for version in OLDEST_READABLE_VERSION..CURRENT_VERSION {

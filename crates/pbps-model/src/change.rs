@@ -515,6 +515,32 @@ pub enum Change {
     },
 }
 
+/// What a module change leaves standing at its name.
+///
+/// An enum rather than `Option<Option<_>>`: "dropped" and "no module change
+/// here" are different answers, and nesting them is how they get confused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleAfter<'a> {
+    /// The definition the plan creates the module with, or replaces it by.
+    Standing(&'a Module),
+    /// Nothing: the plan drops it.
+    Gone,
+}
+
+/// Which way a [`Change::Grant`] or [`Change::Revoke`] moves a role's
+/// permissions on one target.
+///
+/// An enum rather than a flag beside the set: the caller adds one and
+/// subtracts the other, and a bool in that position is a mistake that
+/// compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChange<'a> {
+    /// The role holds these afterwards and did not before.
+    Granted(&'a BTreeSet<Permission>),
+    /// The role held these before and does not afterwards.
+    Revoked(&'a BTreeSet<Permission>),
+}
+
 impl Change {
     /// What this change acts on, for grouping in output and for ordering:
     /// `dbo.customer`, or `role app_reader`.
@@ -775,7 +801,13 @@ impl Change {
     }
 
     /// The permissions this change writes, where it writes any: the role, the
-    /// target they are on, and the set it adds or removes.
+    /// target they are on, and which way the set moves.
+    ///
+    /// The direction is carried rather than left to the caller because the
+    /// caller has to reconstruct what the role will hold, and "the plan moves
+    /// these" is not enough to do that — subtracting them from both sides
+    /// instead left the plan's own grant checked by nothing at all
+    /// (DECISIONS 160).
     ///
     /// The counterpart of [`Change::row`] on the other half of the model, and
     /// for the same caller. A role a plan touches is not a role the plan is
@@ -785,18 +817,18 @@ impl Change {
     // Exhaustive rather than a wildcard: a change added later that moves a
     // permission has to be named here, or the permission it moves would be
     // compared against a state it was never part of.
-    pub fn grant(&self) -> Option<(&str, &GrantTarget, &BTreeSet<Permission>)> {
+    pub fn grant(&self) -> Option<(&str, &GrantTarget, PermissionChange<'_>)> {
         match self {
             Change::Grant {
                 role,
                 target,
                 permissions,
-            }
-            | Change::Revoke {
+            } => Some((role, target, PermissionChange::Granted(permissions))),
+            Change::Revoke {
                 role,
                 target,
                 permissions,
-            } => Some((role, target, permissions)),
+            } => Some((role, target, PermissionChange::Revoked(permissions))),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -870,6 +902,55 @@ impl Change {
             | Change::DropModule { .. } => (None, None),
         };
         one.into_iter().chain(two)
+    }
+
+    /// What this plan leaves standing where a module change names one.
+    ///
+    /// A module statement has no postcondition of its own — `CREATE OR ALTER`
+    /// reports success and says nothing about what is now stored — so the only
+    /// thing that can hold one to what the plan wrote is a caller comparing
+    /// the read-back with the definition. Safe to compare exactly: a module
+    /// read back equals the declaration that produced it, which the whole
+    /// drift check already rests on, and an apply followed by drift for ever
+    /// is what it would mean if it did not (DECISIONS 160).
+    // Exhaustive rather than a wildcard, as every accessor here is: a change
+    // added later that leaves a definition standing has to say so, or the
+    // read-back would record whatever is there as this plan's own result.
+    pub fn module(&self) -> Option<(&ObjectName, ModuleAfter<'_>)> {
+        match self {
+            Change::CreateModule { name, module } | Change::AlterModule { name, module } => {
+                Some((name, ModuleAfter::Standing(module)))
+            }
+            Change::DropModule { name, .. } => Some((name, ModuleAfter::Gone)),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
     }
 
     /// The module this change acts on, if it is a module change at all.
