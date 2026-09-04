@@ -5203,6 +5203,105 @@ fn a_connected_plan_refuses_a_declaration_validate_would_reject() {
     }
 }
 
+/// One revision that retypes a column and deletes an undeclared row from the
+/// same `exact` table. `AlterColumnType` sorts before the row changes, so by
+/// the time the `DELETE` runs the engine has converted the recorded value out
+/// of the spelling the plan wrote down: `decimal(5,2)` `2.50` reads back as
+/// `2` under `int`, the predicate matched nothing, and the apply aborted —
+/// in staged mode after the conversion had committed (DECISIONS 146).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_delete_beside_a_type_change_in_the_same_revision_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_retype_delete_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let declared = |ty: &str| {
+        format!(
+            "table: dbo.t
+columns:
+  code: {{type: varchar(20), nullable: false}}
+  pct: {{type: '{ty}'}}
+primary_key: {{name: pk_t, columns: [code]}}
+data:
+  mode: exact
+  rows:
+    keep: {{}}
+"
+        )
+    };
+    let d = Demo::new("retype-delete-live");
+    d.table(&declared("decimal(5,2)"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A row the declaration does not have, adopted into the baseline so the
+    // next plan is the one that removes it.
+    sql("INSERT INTO dbo.t (code, pct) VALUES ('rogue', 2.50);");
+    assert_eq!(
+        code(&d.run(&[
+            "baseline",
+            "--db",
+            &connection,
+            "--reason",
+            "adopt the rogue row"
+        ])),
+        0
+    );
+
+    // The same revision retypes the column and deletes that row.
+    d.table(&declared("int"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("row rogue"), "{out}");
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "data-delete,narrowing,destructive,not-null",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// A schema name is the one name in a declaration with no identity behind
 /// it: text on both sides, whether it is a `schema::` grant target or the
 /// schema half of a qualified table name. Declared `schema::DBO` on a

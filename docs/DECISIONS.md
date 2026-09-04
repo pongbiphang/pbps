@@ -1430,3 +1430,26 @@ SPEC is in sync with all of these.
     to 1 and the pre-release upgrade path goes with them. Recorded in
     `docs/STATUS.md` under open items, because a decision that has to be acted
     on months later is worthless anywhere a reader does not look.
+
+146. **A cell whose column this plan retypes is carried, and held by
+    nothing.** `AlterColumnType` sorts at 7 and the row changes at 9 and 10,
+    so by the time an `UPDATE` or a `DELETE` runs the engine has already
+    converted the column — and the recorded text is the spelling the *old*
+    type gave it. Measured on SQL Server 2025: a `decimal(5,2)` holding `1.50`
+    reads back as `1` once the column is `int` (a truncation, not a rounding:
+    `1.60` also becomes `1`), so a predicate holding the cell to `N'1.50'`
+    matches nothing and the statement throws "changed or deleted since the
+    plan was made" — in a staged apply after the conversion has committed.
+    The obvious repair is worse than the fault: converting the recorded text
+    into the new type is not the conversion the engine performed on the value,
+    and `CONVERT(int, N'1.50')` is an error (Msg 245), so it would trade a
+    false refusal for a hard failure. Neither type can compare the cell, so
+    the precondition simply does not carry one for it — the same answer, on
+    the same path, as a type with no comparison at all (`xml`, `text`, the
+    spatial types). Both `UpdateRow` and `DeleteRow`: the update's
+    precondition had the fault too, which 140 did not reach because it was
+    about the postcondition. The postcondition is unaffected — it compares
+    the *declared* value, and `after_types` already reads it by the type the
+    column ends up with. The whole type is compared, not just its base:
+    `decimal(5,2)` to `decimal(9,4)` renders `1.50` as `1.5000`, so a widening
+    within one base type is no safer than a change of base.

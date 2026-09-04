@@ -644,7 +644,19 @@ fn diff_data(
                     // cell by the rendering that read it (DECISIONS 122). A
                     // column the base lacks has no recorded cell to hold the
                     // update to.
-                    if let Some(base_spec) = base_spec {
+                    // ... but only where this plan leaves the type alone. A
+                    // column retyped here is converted by an `AlterColumnType`
+                    // that sorts before the row changes, and the recorded text
+                    // is the old type's spelling of it: measured, a
+                    // `decimal(5,2)` holding `1.50` reads back as `1` once the
+                    // column is `int`, and converting `N'1.50'` to `int` is an
+                    // error rather than a match (Msg 245). Neither type can
+                    // compare it, so it is carried and not held — the same
+                    // answer as a type with no comparison at all
+                    // (DECISIONS 146).
+                    if let Some(base_spec) = base_spec
+                        && base_spec.ty == spec.ty
+                    {
                         types.insert(column.clone(), base_spec.ty.clone());
                     }
                     // And the type it has once this plan has run, where the
@@ -719,7 +731,13 @@ fn diff_data(
                         declared_column.clone(),
                         cell(before, base_column, Some(spec)),
                     );
-                    types.insert(declared_column.clone(), spec.ty.clone());
+                    // The type only where this plan leaves it alone: an
+                    // `AlterColumnType` sorts before the row changes, and the
+                    // recorded text is the old type's spelling of a value the
+                    // engine has since converted (DECISIONS 146).
+                    if declared.columns.get(declared_column).map(|d| &d.ty) == Some(&spec.ty) {
+                        types.insert(declared_column.clone(), spec.ty.clone());
+                    }
                 }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
@@ -1483,7 +1501,10 @@ mod tests {
 
     /// A cell needs two types when the same plan changes the column under it.
     /// `types` is what the *recorded* state holds — the emitter's
-    /// precondition, and a column the base lacks has no recorded cell at all.
+    /// precondition — and it carries a column only where this plan leaves its
+    /// type alone: a column the base lacks has no recorded cell at all, and a
+    /// column this plan retypes has one the engine has since converted out of
+    /// the spelling that was recorded (146).
     /// `after_types` is what the column will be once this plan's `AddColumn`
     /// and `AlterColumnType` have run, which is what the write is held to
     /// afterwards; carrying only the first left an added cell held by nothing,
@@ -1526,9 +1547,10 @@ mod tests {
         else {
             panic!("{:?}", row_ops(&cs));
         };
-        // The base has no `note` at all, so nothing recorded its cell.
-        assert_eq!(types.keys().collect::<Vec<_>>(), ["label"]);
-        assert_eq!(types["label"], ty("nvarchar(50)"));
+        // Neither column is held by the precondition: the base has no `note`
+        // at all, and `label`'s recorded text is the spelling the type it no
+        // longer has gave it (DECISIONS 146).
+        assert!(types.is_empty(), "{types:?}");
         // Both the added column and the retyped one carry what they will be;
         // a column neither added nor retyped carries nothing here, and the
         // emitter falls back to `types`.
@@ -2117,6 +2139,32 @@ mod tests {
         );
         assert!(!row.contains_key("label"), "{row:?}");
         assert!(!row.contains_key("note"), "{row:?}");
+    }
+
+    /// And the same for a delete: `AlterColumnType` sorts before the row
+    /// changes, so a cell whose column this plan retypes is carried for the
+    /// reviewer and held by nothing — the recorded text is the old type's
+    /// spelling of a value the engine has already converted (DECISIONS 146).
+    #[test]
+    fn a_delete_does_not_hold_a_cell_whose_type_this_plan_changes() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+        let mut declared_t = lookup(DataMode::Exact, &[]);
+        declared_t
+            .columns
+            .insert("label".to_owned(), Column::new(ty("varchar(50)")));
+        let declared = schema_of("dbo.s", declared_t);
+
+        let cs = run(&base, &declared, &[]);
+        let (row, types) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+        assert!(row.contains_key("label"), "{row:?}");
+        assert!(types.is_empty(), "{types:?}");
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently
