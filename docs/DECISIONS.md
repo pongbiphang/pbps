@@ -1882,3 +1882,40 @@ SPEC is in sync with all of these.
     went — it passed unchanged with the boundary put back to 3. A historical
     format version is a fixed thing and the test now names it.
 
+161. **A postcondition is only fair once the statement has run, and only
+    against the net result.** 160 gave the plan's own permissions and modules
+    a postcondition, which was right, and wired it in two places where it
+    could not hold.
+    **A module replacement is one name and two changes.** `diff_modules`
+    emits `DropModule` then `CreateModule` for a module that changes kind, or
+    a trigger that changes its target. Checked change by change, the create
+    satisfied `Standing` and the drop then reported the module "still there" —
+    because the create had put it back. **Every replacement was refused.**
+    Collapsed by name now: the plan is in `order_key` order, which puts the
+    drop first, so the last word on a name is the net one.
+    **A staged checkpoint is not the end of the plan.** `staged_movement`
+    passed the whole `ChangeSet` into a check that had just learned to demand
+    the plan's results, so at checkpoint 1 of N it required grants and modules
+    from statements still to come, and the run stopped at its first
+    checkpoint. `Settled` now says how much has run: `SoFar` compares movement
+    alone, `Whole` adds what the plan achieved, and only the last read of a
+    staged run gets `Whole`.
+    **Two gaps 160 left, of the same kind it closed.** A table the plan
+    creates, drops or renames was exempt from the whole-table comparison and
+    only its *rows* were checked underneath — so a created table dropped in
+    the window was recorded as success. A role with no grants has nothing but
+    its name, so the per-target grant comparison had nothing to compare and a
+    `CREATE ROLE` another session undid read as success too. Both are
+    existence checks now, and existence *only*: the shape of a table comes
+    back from the catalog precisely because the engine's stored form is the
+    one that compares equal on the next drift check, and holding it to the
+    declared shape would refuse valid applies.
+    **And a revert check that proved nothing.** The staged wiring was covered
+    by a test calling `refuse_unplanned_movement` directly, so reverting
+    `staged_movement`'s choice of mode left it green. A test of a pure
+    function does not pin the call site that chooses its arguments; the wiring
+    has its own test now. That is the second time this round — the version
+    boundary in 160 was the first — that a revert did not bite, and both were
+    a test written against the thing under it rather than the thing being
+    fixed.
+

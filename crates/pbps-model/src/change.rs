@@ -515,6 +515,17 @@ pub enum Change {
     },
 }
 
+/// Whether a name is there once this plan has run.
+///
+/// For the caller that has to check a plan did what it said: a `CREATE` that
+/// reports success and a table that is not there afterwards are two different
+/// facts, and nothing but this comparison puts them together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Present,
+    Absent,
+}
+
 /// What a module change leaves standing at its name.
 ///
 /// An enum rather than `Option<Option<_>>`: "dropped" and "no module change
@@ -902,6 +913,96 @@ impl Change {
             | Change::DropModule { .. } => (None, None),
         };
         one.into_iter().chain(two)
+    }
+
+    /// Which table names this change leaves standing, and which it leaves
+    /// empty.
+    ///
+    /// Existence only, deliberately: the *shape* of a table the plan creates
+    /// or alters is read back from the catalog precisely because the engine's
+    /// stored form is the only one that compares equal on the next drift check
+    /// (SPEC §8.2), so holding it to the declared shape would refuse valid
+    /// applies. Whether the object is there at all has no such ambiguity
+    /// (DECISIONS 161).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
+        match self {
+            Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
+            Change::DropTable { name, .. } => vec![(name, Presence::Absent)],
+            Change::RenameTable { from, to, .. } => {
+                vec![(from, Presence::Absent), (to, Presence::Present)]
+            }
+            Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// The same for roles. A role with no grants is invisible to every other
+    /// comparison here — its whole state is its name — so without this a
+    /// `CREATE ROLE` that another session undid was recorded as success.
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn roles_after(&self) -> Vec<(&str, Presence)> {
+        match self {
+            Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
+            Change::DropRole { name, .. } => vec![(name, Presence::Absent)],
+            Change::RenameRole { from, to, .. } => {
+                vec![(from, Presence::Absent), (to, Presence::Present)]
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
     }
 
     /// What this plan leaves standing where a module change names one.

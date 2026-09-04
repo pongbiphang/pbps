@@ -997,11 +997,28 @@ fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> 
 /// alters a column is meant to change the table, and a concurrent DDL on the
 /// same table has to wait for the schema lock this plan's own statements
 /// hold. Rows are what a trigger can move while the apply is running.
+/// How much of the plan has run by the time the comparison is made.
+///
+/// The two halves of this check need different amounts of it. Asking whether
+/// something the plan does *not* touch moved is fair at any point; asking
+/// whether the plan got what it wanted is only fair once every statement has
+/// run, and putting the whole plan's postconditions to a staged checkpoint
+/// demanded changes that had not executed yet — the run then stopped at its
+/// first checkpoint (DECISIONS 161).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// Every statement of the plan has run.
+    Whole,
+    /// Some of them have. Only movement is comparable.
+    SoFar,
+}
+
 fn refuse_unplanned_movement(
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
     label: &str,
+    settled: Settled,
 ) -> anyhow::Result<()> {
     let mut objects: BTreeSet<&TableName> = BTreeSet::new();
     let mut roles: BTreeSet<&str> = BTreeSet::new();
@@ -1127,10 +1144,23 @@ fn refuse_unplanned_movement(
     // session, or a DDL trigger inside the statement itself, that altered or
     // dropped the module straight afterwards was read back and recorded as
     // this plan's own result (DECISIONS 160).
+    // By name, not by change: a module that changes kind, or a trigger that
+    // changes its target, is a `DropModule` *and* a `CreateModule` for one
+    // name (`diff_modules`). Checked separately the drop always failed — the
+    // create had put the module back — and every replacement was refused
+    // (DECISIONS 161). The plan is in `order_key` order, which puts the drop
+    // first, so the last word on a name is the net one.
+    let mut modules_after_plan: BTreeMap<&pbps_model::ObjectName, pbps_model::ModuleAfter<'_>> =
+        BTreeMap::new();
     for p in &changes.changes {
-        let Some((name, expected)) = p.change.module() else {
-            continue;
-        };
+        if let Some((name, expected)) = p.change.module() {
+            modules_after_plan.insert(name, expected);
+        }
+    }
+    for (name, expected) in modules_after_plan {
+        if settled == Settled::SoFar {
+            break;
+        }
         match (expected, after.modules.get(name)) {
             (pbps_model::ModuleAfter::Standing(wrote), Some(now)) if now == wrote => {}
             (pbps_model::ModuleAfter::Standing(_), Some(_)) => moved.push(format!(
@@ -1142,6 +1172,43 @@ fn refuse_unplanned_movement(
             (pbps_model::ModuleAfter::Gone, None) => {}
             (pbps_model::ModuleAfter::Gone, Some(_)) => {
                 moved.push(format!("{name} is still there, and this plan drops it"))
+            }
+        }
+    }
+
+    // And the names the plan leaves standing or empty. Existence only: the
+    // shape of a table it creates comes back from the catalog for a reason,
+    // and holding it to the declared shape would refuse valid applies. A role
+    // with no grants has nothing *but* its name, so without this a
+    // `CREATE ROLE` another session undid was recorded as success
+    // (DECISIONS 161).
+    if settled == Settled::Whole {
+        let mut expected_tables: BTreeMap<&TableName, pbps_model::Presence> = BTreeMap::new();
+        let mut expected_roles: BTreeMap<&str, pbps_model::Presence> = BTreeMap::new();
+        for p in &changes.changes {
+            expected_tables.extend(p.change.tables_after());
+            expected_roles.extend(p.change.roles_after());
+        }
+        for (name, expected) in expected_tables {
+            match (expected, after.tables.contains_key(name)) {
+                (pbps_model::Presence::Present, false) => {
+                    moved.push(format!("{name} is not there, and this plan creates it"))
+                }
+                (pbps_model::Presence::Absent, true) => {
+                    moved.push(format!("{name} is still there, and this plan removes it"))
+                }
+                _ => {}
+            }
+        }
+        for (name, expected) in expected_roles {
+            match (expected, after.roles.contains_key(name)) {
+                (pbps_model::Presence::Present, false) => moved.push(format!(
+                    "role {name} is not there, and this plan creates it"
+                )),
+                (pbps_model::Presence::Absent, true) => moved.push(format!(
+                    "role {name} is still there, and this plan removes it"
+                )),
+                _ => {}
             }
         }
     }
@@ -1220,11 +1287,25 @@ fn refuse_unplanned_movement(
             // permission, so a session (or a DDL trigger) that reversed it
             // straight away was recorded as the plan's result (DECISIONS 160).
             let mut expected: Permissions = was.grants.get(target).cloned().unwrap_or_default();
-            for revoked in revoking.get(&(now_name, target)).unwrap_or(&empty) {
-                expected.remove(revoked);
+            let mut held = now.grants.get(target).cloned().unwrap_or_default();
+            let adds = granting.get(&(now_name, target)).unwrap_or(&empty);
+            let removes = revoking.get(&(now_name, target)).unwrap_or(&empty);
+            match settled {
+                // Every statement has run, so what the plan asked for is part
+                // of the answer.
+                Settled::Whole => {
+                    for revoked in removes {
+                        expected.remove(revoked);
+                    }
+                    expected.extend(adds);
+                }
+                // Mid-run: the grant may simply not have happened yet, so only
+                // the permissions this plan does not move can be compared.
+                Settled::SoFar => {
+                    expected.retain(|p| !adds.contains(p) && !removes.contains(p));
+                    held.retain(|p| !adds.contains(p) && !removes.contains(p));
+                }
             }
-            expected.extend(granting.get(&(now_name, target)).unwrap_or(&empty));
-            let held = now.grants.get(target).cloned().unwrap_or_default();
             if expected != held {
                 moved.push(format!(
                     "role {now_name} does not hold on {target} what this plan leaves it holding"
@@ -2900,7 +2981,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // the recording commands follow: a permission the declarations cannot
         // express stops a state being written down, whether it was there at
         // the start or arrived during the run (110).
-        refuse_unplanned_movement(&plan.changes, &before, &after.schema, &target.label)?;
+        refuse_unplanned_movement(
+            &plan.changes,
+            &before,
+            &after.schema,
+            &target.label,
+            Settled::Whole,
+        )?;
         refuse_unexpressible(&after, &target.label, "apply again")?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
@@ -3258,7 +3345,16 @@ fn staged_movement(
     completed: usize,
     total: usize,
 ) -> anyhow::Result<()> {
-    refuse_unplanned_movement(changes, before, after, label).map_err(|e| {
+    // Only the last read of a staged run can be asked what the plan achieved:
+    // at a checkpoint most of the plan has not happened, and putting its
+    // postconditions to one demanded changes that were still to come
+    // (DECISIONS 161).
+    let settled = if completed == total {
+        Settled::Whole
+    } else {
+        Settled::SoFar
+    };
+    refuse_unplanned_movement(changes, before, after, label, settled).map_err(|e| {
         anyhow::anyhow!(
             "{e:#}
 
@@ -3715,7 +3811,8 @@ mod tests {
             changes: c.into_iter().map(pbps_model::PlannedChange::new).collect(),
         };
         let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
-            refuse_unplanned_movement(cs, before, after, "prod").map_err(|e| format!("{e:#}"))
+            refuse_unplanned_movement(cs, before, after, "prod", Settled::Whole)
+                .map_err(|e| format!("{e:#}"))
         };
 
         let before = schema("int", &[pbps_model::Permission::Select]);
@@ -3796,7 +3893,8 @@ mod tests {
             })],
         };
         let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
-            refuse_unplanned_movement(cs, before, after, "prod").map_err(|e| format!("{e:#}"))
+            refuse_unplanned_movement(cs, before, after, "prod", Settled::Whole)
+                .map_err(|e| format!("{e:#}"))
         };
 
         let before = schema(&[Permission::Select]);
@@ -3869,6 +3967,7 @@ mod tests {
             &before,
             &schema_with(Some(view("SELECT 2"))),
             "prod",
+            Settled::Whole,
         )
         .expect("the plan's own definition");
 
@@ -3878,14 +3977,20 @@ mod tests {
             &before,
             &schema_with(Some(view("SELECT 3"))),
             "prod",
+            Settled::Whole,
         )
         .expect_err("not the definition this plan wrote");
         assert!(format!("{e:#}").contains("dbo.v"), "{e:#}");
 
         // Or dropped it.
-        let e =
-            refuse_unplanned_movement(&writing("SELECT 2"), &before, &schema_with(None), "prod")
-                .expect_err("the module is gone");
+        let e = refuse_unplanned_movement(
+            &writing("SELECT 2"),
+            &before,
+            &schema_with(None),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the module is gone");
         assert!(format!("{e:#}").contains("is not there"), "{e:#}");
 
         // And the other direction: a module this plan drops must be gone.
@@ -3897,11 +4002,163 @@ mod tests {
                 },
             )],
         };
-        refuse_unplanned_movement(&dropping, &before, &schema_with(None), "prod")
-            .expect("the plan's own drop");
-        let e = refuse_unplanned_movement(&dropping, &before, &before, "prod")
+        refuse_unplanned_movement(
+            &dropping,
+            &before,
+            &schema_with(None),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the plan's own drop");
+        let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A module that changes kind is a drop *and* a create for one name, and
+    /// the net of the two is what has to hold: checked separately, the drop
+    /// always failed because the create had put the module back, and every
+    /// replacement was refused (DECISIONS 161).
+    #[test]
+    fn a_module_replacement_is_judged_by_its_net_result() {
+        let module = |kind: pbps_model::ModuleKind| pbps_model::Module {
+            kind,
+            description: None,
+            on: None,
+            definition: "SELECT 1".to_owned(),
+        };
+        let schema_with = |kind: pbps_model::ModuleKind| {
+            let mut s = Schema::default();
+            s.modules.insert("dbo.v".parse().unwrap(), module(kind));
+            s
+        };
+        // `order_key` puts the drop first, which is the order a plan holds.
+        let replacing = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                    name: "dbo.v".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
+                    name: "dbo.v".parse().unwrap(),
+                    module: Box::new(module(pbps_model::ModuleKind::Function)),
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &replacing,
+            &schema_with(pbps_model::ModuleKind::View),
+            &schema_with(pbps_model::ModuleKind::Function),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// A staged checkpoint cannot be asked what the plan achieved: most of it
+    /// has not run. Only movement is comparable there (DECISIONS 161).
+    #[test]
+    fn a_half_run_plan_is_compared_on_movement_alone() {
+        let mut before = Schema::default();
+        before
+            .tables
+            .insert("dbo.kept".parse().unwrap(), pbps_model::Table::default());
+        let creating = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(pbps_model::Table::default()),
+                },
+            )],
+        };
+        // Mid-run the table is not there yet, and that is not a failure.
+        refuse_unplanned_movement(&creating, &before, &before, "prod", Settled::SoFar)
+            .expect("the statement has not run yet");
+        // Once every statement has run it is one: `CREATE TABLE` reporting
+        // success is not the table being there.
+        let e = refuse_unplanned_movement(&creating, &before, &before, "prod", Settled::Whole)
+            .expect_err("the table this plan creates is not there");
+        assert!(format!("{e:#}").contains("dbo.new"), "{e:#}");
+        // And movement is compared either way.
+        let mut moved = before.clone();
+        moved
+            .tables
+            .remove(&"dbo.kept".parse::<TableName>().unwrap());
+        let e = refuse_unplanned_movement(&creating, &before, &moved, "prod", Settled::SoFar)
+            .expect_err("an untouched table went");
+        assert!(format!("{e:#}").contains("dbo.kept"), "{e:#}");
+    }
+
+    /// And the wiring, not just the function: a staged run asks for movement
+    /// at every checkpoint and for the whole answer only at the last read.
+    ///
+    /// Its own test because the one above calls `refuse_unplanned_movement`
+    /// directly — reverting `staged_movement`'s choice of mode left that one
+    /// green, which is a revert check that proves nothing (DECISIONS 161).
+    #[test]
+    fn a_staged_checkpoint_is_not_asked_what_the_plan_achieved() {
+        let before = Schema::default();
+        let creating = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(pbps_model::Table::default()),
+                },
+            )],
+        };
+        staged_movement(&creating, &before, &before, "prod", 1, 2)
+            .expect("statement 1 of 2: the create has not run yet");
+        let e = staged_movement(&creating, &before, &before, "prod", 2, 2)
+            .expect_err("the last read is asked what the plan achieved");
+        let e = format!("{e:#}");
+        assert!(e.contains("dbo.new"), "{e}");
+        // And the message says what a staged run cannot do about it.
+        assert!(e.contains("nothing was rolled back"), "{e}");
+    }
+
+    /// A role with no grants has nothing but its name, so nothing else here
+    /// would notice it being dropped straight after it was created.
+    #[test]
+    fn a_role_this_plan_creates_has_to_be_there() {
+        let empty = Schema::default();
+        let creating = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "app".to_owned(),
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(&creating, &empty, &empty, "prod", Settled::Whole)
+            .expect_err("the role this plan creates is not there");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
+
+        let mut made = Schema::default();
+        made.roles.insert(
+            "app".to_owned(),
+            pbps_model::Role {
+                description: None,
+                grants: BTreeMap::new(),
+            },
+        );
+        refuse_unplanned_movement(&creating, &empty, &made, "prod", Settled::Whole)
+            .expect("the plan's own role");
+
+        // And a dropped role that came back.
+        let dropping = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "app".to_owned(),
+                    members: Vec::new(),
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(&dropping, &made, &made, "prod", Settled::Whole)
+            .expect_err("the role this plan drops is still there");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
     /// A grant on a table this plan renames is the same grant afterwards, under
@@ -3944,6 +4201,7 @@ mod tests {
             &granted_on("dbo.old"),
             &granted_on("dbo.new"),
             "prod",
+            Settled::Whole,
         )
         .expect("the grant moved with the table, which is not movement");
 
@@ -3951,8 +4209,14 @@ mod tests {
         // with the grant actually gone is movement, not bookkeeping.
         let mut robbed = granted_on("dbo.new");
         robbed.roles.get_mut("app").unwrap().grants.clear();
-        let e = refuse_unplanned_movement(&rename, &granted_on("dbo.old"), &robbed, "prod")
-            .expect_err("the grant is gone");
+        let e = refuse_unplanned_movement(
+            &rename,
+            &granted_on("dbo.old"),
+            &robbed,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the grant is gone");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
@@ -3998,6 +4262,7 @@ mod tests {
             &table(&[("old", "kept"), ("note", "same")]),
             &table(&[("new", "kept"), ("note", "same")]),
             "prod",
+            Settled::Whole,
         )
         .expect("a renamed column re-keys the row, which is not movement");
 
@@ -4007,6 +4272,7 @@ mod tests {
             &table(&[("old", "kept"), ("note", "same")]),
             &table(&[("new", "kept"), ("note", "rewritten")]),
             "prod",
+            Settled::Whole,
         )
         .expect_err("the untouched column moved");
         assert!(format!("{e:#}").contains("row `k`"), "{e:#}");
@@ -4051,7 +4317,7 @@ mod tests {
                 },
             )],
         };
-        refuse_unplanned_movement(&dropping, &before, &after, "prod")
+        refuse_unplanned_movement(&dropping, &before, &after, "prod", Settled::Whole)
             .expect("the grant went with the table it was on");
 
         // A grant on a table the plan does *not* drop still has to be there.
@@ -4060,7 +4326,7 @@ mod tests {
             GrantTarget::Schema("dbo".to_owned()),
             [Permission::Select].into_iter().collect(),
         );
-        let e = refuse_unplanned_movement(&dropping, &before_two, &after, "prod")
+        let e = refuse_unplanned_movement(&dropping, &before_two, &after, "prod", Settled::Whole)
             .expect_err("the schema grant did not go anywhere");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
@@ -4111,7 +4377,8 @@ mod tests {
             .map(pbps_model::PlannedChange::new)
             .collect(),
         };
-        refuse_unplanned_movement(&cs, &before, &after, "prod").expect("a rename is not movement");
+        refuse_unplanned_movement(&cs, &before, &after, "prod", Settled::Whole)
+            .expect("a rename is not movement");
     }
 
     /// A renamed table's declaration is found under the name the database
