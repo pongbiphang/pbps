@@ -1225,20 +1225,25 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
 fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
     let d = Demo::new("refused-attempt-hook");
     let hook_out = d.dir.join("apply-hook.json");
+    // A single-quoted YAML scalar, because this test runs on Windows CI where
+    // the path is `C:\Users\...` and a double-quoted scalar would read the
+    // backslashes as escapes and refuse the whole config. The other hook
+    // tests need a live server and never reach that runner.
     std::fs::write(
         d.dir.join("pbps.yml"),
         format!(
-            "dialect: mssql\nhooks:\n  on_apply_attempt: \"cat > {}\"\n",
+            "dialect: mssql\nhooks:\n  on_apply_attempt: 'cat > \"{}\"'\n",
             hook_out.display()
         ),
     )
     .unwrap();
     d.table(ONE_COLUMN);
-    d.run(&["plan"]);
+    assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
     d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  b: {type: int}\n");
     let plan = d.dir.join("preview.json");
-    d.run(&["plan", "--out", plan.to_str().unwrap()]);
+    let previewed = d.run(&["plan", "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&previewed), 0, "{}", stderr(&previewed));
     let checksum = plan_checksum(&plan);
     // A port nothing listens on: none of these may reach a connection, and one
     // that tried would fail instantly rather than waiting out a timeout.
