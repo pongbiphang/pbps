@@ -1225,16 +1225,20 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
 fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
     let d = Demo::new("refused-attempt-hook");
     let hook_out = d.dir.join("apply-hook.json");
-    // A single-quoted YAML scalar, because this test runs on Windows CI where
-    // the path is `C:\Users\...` and a double-quoted scalar would read the
-    // backslashes as escapes and refuse the whole config. The other hook
-    // tests need a live server and never reach that runner.
+    // This is the one hook test that reaches the Windows CI runner (the
+    // others need a live server), and it has been wrong about that runner
+    // twice: a double-quoted YAML scalar read the `C:\Users\...` backslashes
+    // as escapes and refused the whole config, and `cat` is not on `cmd`'s
+    // PATH there. So: a single-quoted scalar, and `more`, which is built in
+    // and copies stdin to stdout when neither is a console.
+    let capture = if cfg!(windows) {
+        format!("more > \"{}\"", hook_out.display())
+    } else {
+        format!("cat > \"{}\"", hook_out.display())
+    };
     std::fs::write(
         d.dir.join("pbps.yml"),
-        format!(
-            "dialect: mssql\nhooks:\n  on_apply_attempt: 'cat > \"{}\"'\n",
-            hook_out.display()
-        ),
+        format!("dialect: mssql\nhooks:\n  on_apply_attempt: '{capture}'\n"),
     )
     .unwrap();
     d.table(ONE_COLUMN);
@@ -1249,11 +1253,15 @@ fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
     // that tried would fail instantly rather than waiting out a timeout.
     const NOWHERE: &str = "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p";
 
-    let hook = |what: &str| -> serde_json::Value {
-        let raw = std::fs::read_to_string(&hook_out)
-            .unwrap_or_else(|e| panic!("{what}: the attempt hook did not run: {e}"));
+    let hook = |what: &str, out: &Output| -> serde_json::Value {
+        let raw = std::fs::read_to_string(&hook_out).unwrap_or_else(|e| {
+            panic!(
+                "{what}: the attempt hook did not run: {e}\nstderr was:\n{}",
+                stderr(out)
+            )
+        });
         std::fs::remove_file(&hook_out).unwrap();
-        serde_json::from_str(&raw).unwrap()
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{what}: not JSON ({e}): {raw:?}"))
     };
 
     // The finding's case: the artifact is fine, the approval is not.
@@ -1272,7 +1280,7 @@ fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
         "{}",
         stderr(&stale)
     );
-    let event = hook("stale checksum");
+    let event = hook("stale checksum", &stale);
     assert_eq!(event["outcome"], "failure", "{event}");
     assert_eq!(event["event"], "apply", "{event}");
     assert_eq!(
@@ -1301,7 +1309,7 @@ fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
     ]);
     assert_eq!(code(&preview), 1);
     assert!(stderr(&preview).contains("preview"), "{}", stderr(&preview));
-    let event = hook("preview refusal");
+    let event = hook("preview refusal", &preview);
     assert_eq!(event["outcome"], "failure", "{event}");
     assert!(
         event["error"]
