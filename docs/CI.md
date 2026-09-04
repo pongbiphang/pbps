@@ -270,6 +270,10 @@ jobs:
           # and the three inputs are text somebody typed; a fence here would
           # be closable from inside, and the summary is the control the
           # approver reads.
+          #
+          # `tr` first, because indenting is per *line* and a bare CR is a
+          # line ending to the renderer but not to `sed`: without it, a
+          # reason of "moved\r## Heading" puts that heading at column 0.
           {
             echo "## Deploying"
             echo
@@ -280,7 +284,7 @@ jobs:
               echo "plan run:  $PLAN_RUN"
               echo
               pbps explain --plan plan.json
-            } | sed 's/^/    /'
+            } | tr '\r' '\n' | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---- the gate: `environment:` is what makes GitHub ask a human ----
@@ -412,6 +416,15 @@ A fence around that is closable from inside it, and what follows renders as
 Markdown in the one place a reviewer is told to trust. Four spaces on every
 line cannot be closed by its own content. The three dispatch inputs go through
 the same indent for the same reason: they are text somebody typed.
+
+The `tr '\r' '\n'` in front of it is the same attack one layer down. A bare
+carriage return survives from the declaration into the output — measured,
+`deprecated: "moved\r## Nothing to see here"` comes out as one LF-delimited
+line containing a CR — and indenting is per *line*: `sed` would prefix that
+whole line once while a renderer treats the CR as a line ending, putting the
+heading back at column 0. Turning every CR into a real line ending *before*
+the indent is what makes "every line is indented" true of what the reader
+sees, not just of what `sed` counted.
 
 Approving without reading that summary is the residual risk, and no YAML
 closes it. An organisation that cannot accept it should move the apply into a
