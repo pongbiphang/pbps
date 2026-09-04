@@ -189,7 +189,10 @@ fn has_explicit_null_semantics(expression: &str) -> bool {
     // keyword while still finding it inside CAST(NULL AS int), arithmetic, and
     // other expression shapes.
     crate::module::code_without_quoted_identifiers(expression)
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        // SQL Server regular identifiers use Unicode letters and decimal
+        // digits, plus these four continuation characters. Treating `$`, `@`,
+        // or `#` as punctuation would turn `seq$null` into a false NULL token.
+        .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')))
         .any(|word| {
             word.eq_ignore_ascii_case("null")
                 || word.eq_ignore_ascii_case("nullif")
@@ -350,6 +353,10 @@ mod tests {
             "NEXT VALUE FOR dbo.\"try_cast\"",
             "NEXT VALUE FOR dbo.[seq]]null]",
             "NEXT VALUE FOR dbo.\"seq\"\"try_cast\"",
+            "NEXT VALUE FOR dbo.seq$null",
+            "NEXT VALUE FOR dbo.seq@null",
+            "NEXT VALUE FOR dbo.seq#null",
+            "NEXT VALUE FOR dbo.序列null",
         ] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
