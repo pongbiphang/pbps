@@ -203,10 +203,37 @@ Two things follow, and the first matters more:
   value being written.
 
   **So: never `setval`. Advance with `nextval` until the value is past every key
-  in use.** Every operation then moves the sequence forward and nothing can
-  lower it, so no interleaving produces a duplicate — the worst a concurrent
-  allocator can do is finish the advance sooner. The work is bounded by the gap,
-  which for a reference-data table is the handful of rows the declarations pin.
+  in use.** Every operation then moves the sequence forward and nothing pbps
+  does can lower it. The work is bounded by the gap, which for a reference-data
+  table is the handful of rows the declarations pin.
+
+  **That closes the reissue hazard and not the outstanding one, and nothing
+  closes the second.** An earlier version of this paragraph claimed no
+  interleaving could produce a duplicate. **Measured, with two sessions**, one
+  still can — because a value already handed out cannot be recalled:
+
+  ```
+  the sequence stands at 4; pbps locks the table and pins id 5
+  another session calls nextval() directly       -> it receives 5
+  pbps advances the sequence past the pinned row and commits
+  that session then inserts the value it was given:
+      ERROR:  duplicate key value violates unique constraint "t_pkey"
+      DETAIL:  Key (id)=(5) already exists.
+  ```
+
+  The advance stops pbps from issuing 5 again; it cannot un-issue the 5 the
+  other session is already holding. And the table lock does not help, because —
+  measured two rounds earlier — `nextval` walks past it, and PostgreSQL offers
+  no lock that does not.
+
+  **So the honest statement is a precondition, not a guarantee: pinning keys
+  into an identity column is safe only while nothing else is allocating from
+  that sequence.** `validate`'s rule on an identity-keyed `data:` block says so
+  in those words rather than warning vaguely — the block is safe at bootstrap
+  and during a quiesced window, and unsafe against a live writer, which is a
+  thing an operator can actually check. ADR-0004 already discourages declaring
+  rows by an identity key; this is the third independent reason, and the only
+  one the tool cannot engineer away.
 
   Widening the step first — `ALTER SEQUENCE … INCREMENT BY <gap>`, one `nextval`,
   then restore — makes the common case a single call, and **measured**, it is

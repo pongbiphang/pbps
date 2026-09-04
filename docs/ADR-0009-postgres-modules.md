@@ -597,27 +597,30 @@ advance application state, and `plan` is a read-only command in every other
 respect (§9.1). A planning step that mutates the thing it is planning against is
 not a preflight; it is a small unreviewed apply.
 
-**Decision.** The question is asked where DDL is free:
+**Decision: on PostgreSQL a module change is always emitted as drop + create.**
+The question is not answered because it cannot be asked, and the constraints
+that close every other route were each established separately:
 
-- **With a dev database (§9.3), the rehearsal answers it.** That engine is
-  throwaway and explicitly isolated, which is what it was built for, and the
-  answer is recorded in the plan — so the artifact the approver reads says which
-  shape will run and why.
-- **Without one, `plan --db` refuses to produce an applyable plan for that
-  module**, and names a rehearsal target as what it needs.
+| Route | Closed by |
+|---|---|
+| Ask the target, inside a savepoint | Planning must not execute DDL on the environment it plans against: the attempt takes DDL locks and fires event triggers whose effects do not roll back |
+| Carry both shapes and let `apply` choose | SPEC §7.3 — *"what gets approved is exactly the plan approved at the deployment gate"*. Replace and rebuild are not two spellings of one change; a checksum over "one of these two" pins nothing a reviewer read |
+| Ask a dev database from `plan --db` | `crates/pbps-cli/src/main.rs:642` refuses `--dev` with `--db`, and SPEC §9.3 gives the reason — *"a rehearsal answers a preview's question, and combining the two would invite a dev-verified plan to be read as a target-verified one"*, plus *"a dev-database-verified plan is still a preview"* |
+| Read the answer out of the declaration | The deciding facts — a view's column list, a function's return type — live inside `definition`, which §8.2 says this tool does not parse |
 
-A first version of this decision let the plan carry both possibilities and had
-`apply` choose. That is not a smaller compromise; it is the guardrail. SPEC §7.3:
-*"The checksum pins 'the plan approved at the deployment gate' to 'what actually
-runs'"*, and *"what gets approved is exactly the plan approved at the deployment
-gate"*. Replace and rebuild are not two spellings of one change — one of them
-drops the object and drags this section's whole ACL, owner, options and defaults
-restoration behind it. A checksum over "one of these two" pins nothing a
-reviewer read.
+Two earlier versions of this section took the first two routes in turn. This one
+takes none of them, and the reason it costs less than it appears to is §3's own
+measurements: `CREATE OR REPLACE` **also** drops `reloptions`, so the replace
+path never carried the object's full state either. What it saved over a rebuild
+was the ACL and the owner — and the enumeration above restores both anyway.
+Always rebuilding therefore removes a question the tool cannot answer, in
+exchange for a cost the tool was already paying.
 
-Refusing is friction, and it is the friction this project exists to charge:
-§9.3's dev database is cheap, `plan --dev` already exists, and the alternative is
-an approval that does not mean what §7.3 says approvals mean.
+The price is real and belongs in the open: every module edit on PostgreSQL drops
+and recreates the object, carries the full restore obligation, and **refuses**
+when it cannot carry one. That is a lot of refusing for an estate that adjusts
+privileges by hand. It is also the only shape in which the artifact a human
+approved is the artifact that runs.
 
 An offline `plan` has nobody to ask at all and says so, which is what §9.1
 already means by "anything computed offline is a preview".
