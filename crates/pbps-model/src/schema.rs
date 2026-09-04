@@ -192,7 +192,7 @@ fn has_explicit_null_semantics(expression: &str) -> bool {
         // SQL Server regular identifiers use Unicode letters and decimal
         // digits, plus these four continuation characters. Treating `$`, `@`,
         // or `#` as punctuation would turn `seq$null` into a false NULL token.
-        .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')))
+        .split(|ch: char| !crate::module::is_regular_identifier_continue(ch))
         .any(|word| {
             word.eq_ignore_ascii_case("null")
                 || word.eq_ignore_ascii_case("nullif")

@@ -328,7 +328,17 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 /// `dbo.active_customer` — the qualified needle is tried first and answers that
 /// case properly.
 fn is_ident_char(c: Option<char>) -> bool {
-    matches!(c, Some(c) if c.is_alphanumeric() || c == '_' || c == '@' || c == '#' || c == '.')
+    c.is_some_and(|c| is_regular_identifier_continue(c) || c == '.')
+}
+
+/// Whether a character can continue an unquoted SQL Server identifier.
+///
+/// Unicode letters and decimal digits are covered conservatively by
+/// `is_alphanumeric`; SQL Server additionally admits these four symbols after
+/// the first character. Keyword and dependency scans share this boundary so
+/// `seq$null` cannot mean one token to one and two tokens to the other.
+pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')
 }
 
 /// The order in which modules must be created: a module comes after everything
@@ -520,6 +530,9 @@ mod tests {
             "SELECT * FROM dbo.active_customer_archive",
             "SELECT * FROM dbo.old_active_customer",
             "SELECT @active_customer",
+            "SELECT seq$active_customer",
+            "SELECT seq#active_customer",
+            "SELECT 序列active_customer",
         ] {
             assert!(
                 !references(definition, &n("dbo.active_customer")),
