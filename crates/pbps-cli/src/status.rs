@@ -315,12 +315,8 @@ async fn one(
     // it lives beside the schema, not in it, so the checksum below cannot
     // see it. The same filter `verify` applies: an unmanaged role's grants
     // are its own business (DECISIONS 95, 125).
-    let unexpressible: Vec<&str> = pulled
-        .unexpressible
-        .iter()
-        .filter(|(role, _)| recorded_ids.roles.values().any(|managed| managed == role))
-        .map(|(_, what)| what.as_str())
-        .collect();
+    let unexpressible =
+        crate::deploy::unexpressible_permissions(&pulled, &recorded_ids, &recorded_modules);
     // Recorded and carried, never returned on. An unexpressible permission is
     // drift, and so is a row that moved, a fact the projection could not hold,
     // or an object `unmanaged: error` refuses — each established

@@ -1029,8 +1029,11 @@ fn cmd_pull(
     // A role's permission the model cannot hold: for `pull` a warning like
     // the others, since nothing is being compared yet; for `verify` the same
     // fact is drift (DECISIONS 97).
-    for (_, w) in &pulled.unexpressible {
-        eprintln!("warning: {w}");
+    // Every one of them, unfiltered: `pull` is writing the declarations, not
+    // comparing them, so there is no managed set yet to be somebody else's
+    // business (DECISIONS 176 filters where there is one).
+    for u in &pulled.unexpressible {
+        eprintln!("warning: {}", u.what);
     }
     // The same line `validate` draws, at the moment the block is written
     // rather than on the next run: a table this size is somebody's business

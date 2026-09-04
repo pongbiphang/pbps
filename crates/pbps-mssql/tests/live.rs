@@ -4597,7 +4597,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         again
             .unexpressible
             .iter()
-            .any(|(role, w)| role == "app_reader" && w.contains("CREATE TABLE on the database")),
+            .any(|u| u.role == "app_reader" && u.what.contains("CREATE TABLE on the database")),
         "{:?}",
         again.unexpressible
     );
@@ -4607,7 +4607,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         again
             .unexpressible
             .iter()
-            .any(|(role, w)| role == "app_reader" && w.contains("DENY DELETE")),
+            .any(|u| u.role == "app_reader" && u.what.contains("DENY DELETE")),
         "{:?}",
         again.unexpressible
     );
@@ -4616,12 +4616,9 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     // is reported as unexpressible, where a drift check has to see it
     // (DECISIONS 95). The catalog spells the state `W`; measured here.
     assert!(
-        again
-            .unexpressible
-            .iter()
-            .any(|(role, what)| role == "app_reader"
-                && what.contains("UPDATE")
-                && what.contains("WITH GRANT OPTION")),
+        again.unexpressible.iter().any(|u| u.role == "app_reader"
+            && u.what.contains("UPDATE")
+            && u.what.contains("WITH GRANT OPTION")),
         "{:?}",
         again.unexpressible
     );

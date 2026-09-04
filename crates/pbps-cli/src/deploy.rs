@@ -283,13 +283,11 @@ fn cut(
     // A managed role's grant WITH GRANT OPTION is wider than the plain grant
     // the declarations can spell, and was left out of the role's set rather
     // than folded in. Carried beside the comparison so `verify` reports it
-    // as drift and `plan --db` refuses to plan over it; on an unmanaged role
-    // it is that role's business, like its other grants (DECISIONS 95).
-    for (role, what) in &pulled.unexpressible {
-        if ids.roles.values().any(|managed| managed == role) {
-            eprintln!("warning: {what}");
-            scoped.unexpressible.push(what.clone());
-        }
+    // as drift and `plan --db` refuses to plan over it; on an unmanaged role,
+    // or on somebody else's object, it is not ours (DECISIONS 95, 176).
+    for what in unexpressible_permissions(pulled, ids, modules) {
+        eprintln!("warning: {what}");
+        scoped.unexpressible.push(what.to_owned());
     }
     report_unmanaged(&scoped, unreadable, modules, unmanaged)?;
     Ok(scoped)
@@ -796,6 +794,46 @@ pub(crate) fn managed_limitations(
                 .filter(|m| modules.contains(&m.name))
                 .map(|m| format!("{} {} is in the managed set, but {}", m.kind, m.name, m.why)),
         )
+        .collect()
+}
+
+/// The unexpressible permissions that are this project's business.
+///
+/// A managed role's, first — an unmanaged role's grants are its own
+/// (DECISIONS 95, 125). And then, on the securable: a `DENY`, a column-level
+/// grant or a `WITH GRANT OPTION` on an object **outside the managed set** is
+/// that object's business too, exactly as `pbps_diff::scope` says of the
+/// *plain* grant beside it — "a grant on somebody else's table is that table's
+/// business, and comparing it would have the next plan revoke a permission the
+/// declarations were never allowed to name". Filtered by role alone, the plain
+/// grant was dropped and the unsupported one stopped every command
+/// (DECISIONS 176).
+///
+/// Membership is tested against the managed set as *declared*, not against the
+/// cut schema: a managed module the catalog could not read back is absent from
+/// the second and still ours (491edd9).
+///
+/// Schema targets and the targetless ones stay. A schema grant is declarable,
+/// so a `DENY` on one is a difference the declarations cannot hold; a
+/// permission on the database itself belongs to no object at all, and a role
+/// that gained one has changed (DECISIONS 105).
+pub(crate) fn unexpressible_permissions<'a>(
+    pulled: &'a pbps_mssql::introspect::Pulled,
+    ids: &IdsFile,
+    modules: &BTreeSet<ObjectName>,
+) -> Vec<&'a str> {
+    let managed_tables: BTreeSet<&TableName> = ids.tables.values().collect();
+    pulled
+        .unexpressible
+        .iter()
+        .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
+        .filter(|u| match &u.target {
+            Some(pbps_model::GrantTarget::Object(o)) => {
+                managed_tables.contains(o) || modules.contains(o)
+            }
+            Some(pbps_model::GrantTarget::Schema(_)) | None => true,
+        })
+        .map(|u| u.what.as_str())
         .collect()
 }
 
@@ -4219,6 +4257,67 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
 
 #[cfg(test)]
 mod tests {
+
+    /// `scope` drops a managed role's *plain* grant on an object nobody
+    /// manages, with its reason recorded: that is the object's business. The
+    /// unsupported permission beside it — a DENY, a column-level grant, a
+    /// WITH GRANT OPTION — was filtered by role alone, so it stopped every
+    /// command over a securable outside the managed set (DECISIONS 176).
+    #[test]
+    fn an_unsupported_permission_on_somebody_elses_object_is_not_this_projects_drift() {
+        use pbps_mssql::introspect::{Pulled, Unexpressible};
+
+        let mine: TableName = "dbo.mine".parse().unwrap();
+        let theirs: TableName = "dbo.theirs".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), mine.clone());
+        ids.roles
+            .insert("r_aaaaaa".parse().unwrap(), "app".to_owned());
+        let module: ObjectName = "dbo.v".parse().unwrap();
+        let modules: BTreeSet<ObjectName> = [module.clone()].into_iter().collect();
+
+        let entry =
+            |role: &str, target: Option<pbps_model::GrantTarget>, what: &str| Unexpressible {
+                role: role.to_owned(),
+                target,
+                what: what.to_owned(),
+            };
+        let object = |t: &TableName| Some(pbps_model::GrantTarget::Object(t.clone()));
+        let pulled = Pulled {
+            schema: Schema::default(),
+            warnings: Vec::new(),
+            limitations: Vec::new(),
+            unmanaged_modules: Vec::new(),
+            unexpressible: vec![
+                entry("app", object(&mine), "on a table this project manages"),
+                entry("app", object(&module), "on a module this project manages"),
+                entry("app", object(&theirs), "on somebody else's table"),
+                entry("other", object(&mine), "an unmanaged role's business"),
+                // No object to belong to: a permission on the database itself,
+                // and a class the model cannot even name (105).
+                entry("app", None, "on the database"),
+                // Declarable, so a DENY on one is a difference we must hold.
+                entry(
+                    "app",
+                    Some(pbps_model::GrantTarget::Schema("dbo".to_owned())),
+                    "on a schema",
+                ),
+            ],
+        };
+
+        let kept = unexpressible_permissions(&pulled, &ids, &modules);
+        assert_eq!(
+            kept,
+            [
+                "on a table this project manages",
+                "on a module this project manages",
+                "on the database",
+                "on a schema",
+            ],
+            "{kept:?}"
+        );
+    }
+
     use super::*;
     use pbps_model::{DataMode, DataScope};
     use pbps_mssql::introspect::{IntrospectionLimitation, Pulled, UnmanagedModule};

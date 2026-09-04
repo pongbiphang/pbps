@@ -2371,3 +2371,34 @@ SPEC is in sync with all of these.
     reason goes, the test that pins it is testing the reason, not the
     property.** The right move was to state the better property, not to keep
     the old assertion alive.
+
+176. **An unsupported permission on somebody else's object is somebody else's
+    business, exactly as the ordinary one beside it is.**
+    `pbps_diff::scope` drops a managed role's grant on an object outside the
+    managed set, and its reason is recorded there: "a grant on somebody else's
+    table is that table's business, and comparing it would have the next plan
+    revoke a permission the declarations were never allowed to name." But
+    `pulled.unexpressible` carried only `(role, message)` — the securable was
+    rendered into the text and then gone — so the filter beside it could ask
+    one question, and asked the only one it could. A `DENY`, a column-level
+    grant or a `WITH GRANT OPTION` on an unmanaged table therefore made
+    `verify` report drift and `plan --db` refuse, while the *plain* grant on
+    that same table was dropped without comment. One securable, two answers.
+    The fix is to keep the target: `Unexpressible { role, target, what }`, and
+    one filter both callers use — `verify`'s and `status`'s copies had been
+    written twice and could have drifted apart, which is the second half of
+    this entry and the reason the helper is shared rather than corrected
+    twice.
+    Three things stay, and each for its own reason. A **schema** target is
+    declarable (`grants: schema::dbo:`), so a DENY on one is a difference the
+    declarations genuinely cannot hold. A **targetless** permission — on the
+    database itself, or of a class the model cannot name — belongs to no
+    object at all, and a role that gained one has changed (DECISIONS 105).
+    And `pull` still warns about **every** one of them unfiltered: it is
+    writing the declarations rather than comparing them, so there is no
+    managed set yet for anything to be outside of.
+    Membership is tested against the managed set as *declared* — the ids
+    file's tables and the module set — and not against the cut schema. A
+    managed module the catalog could not read back is missing from the second
+    and is still ours (491edd9); testing against what came back would have
+    excused exactly the case that commit exists for.

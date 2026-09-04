@@ -198,14 +198,14 @@ pub struct Pulled {
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
     /// Permissions the model cannot hold and a drift check must not call
-    /// clean: `(role, what)`. A grant `WITH GRANT OPTION`, a DENY, a
-    /// column-level grant, a permission outside the closed set, a grant on
-    /// an object the model does not hold: each is left out of the role's set
-    /// — folded in or merely warned about, `verify` compared the sets that
-    /// remained equal and said "no drift" about a role that had changed —
-    /// and reported here for the caller to put beside the other
-    /// unexpressible differences (DECISIONS 95, 97).
-    pub unexpressible: Vec<(String, String)>,
+    /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
+    /// permission outside the closed set, a grant on an object the model does
+    /// not hold: each is left out of the role's set — folded in or merely
+    /// warned about, `verify` compared the sets that remained equal and said
+    /// "no drift" about a role that had changed — and reported here for the
+    /// caller to put beside the other unexpressible differences
+    /// (DECISIONS 95, 97).
+    pub unexpressible: Vec<Unexpressible>,
     /// Unsupported facts associated with a table. Callers use the parent name
     /// to distinguish a limitation inside the managed set (unexpressible
     /// drift) from one on somebody else's table.
@@ -223,6 +223,25 @@ pub struct Pulled {
     /// they are an inventory of what is left alone, and the user needs the
     /// count and the names.
     pub unmanaged_modules: Vec<UnmanagedModule>,
+}
+
+/// One permission the model cannot hold, and enough about it for the caller
+/// to decide whether it is any of this project's business.
+///
+/// The securable travels with it. Filtered by role alone, a `DENY` or a
+/// column-level grant on somebody else's table stopped every command — while
+/// the *plain* grant on that same table was dropped by `scope`, whose recorded
+/// reason is that it is that table's business (DECISIONS 176).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unexpressible {
+    pub role: String,
+    /// The securable, where the permission names one a declaration could.
+    /// `None` for a permission on the database itself and for a class the
+    /// model cannot name at all — neither is any object's business, and a
+    /// role that gained one has changed (DECISIONS 105).
+    pub target: Option<pbps_model::GrantTarget>,
+    /// The difference, already rendered.
+    pub what: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,7 +544,7 @@ fn action(code: u8) -> ReferentialAction {
 /// managed set.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut warnings = Vec::new();
-    let mut unexpressible: Vec<(String, String)> = Vec::new();
+    let mut unexpressible: Vec<Unexpressible> = Vec::new();
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
@@ -803,20 +822,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             // and a role that gained one out of band has changed even when
             // every grant the model does hold still matches (DECISIONS 105).
             (0, _) => {
-                unexpressible.push((
-                    p.role.clone(),
-                    format!(
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: None,
+                    what: format!(
                         "role {}: {} on the database is not modelled; the declarations cannot \
                          express it",
                         p.role, p.permission
                     ),
-                ));
+                });
                 continue;
             }
             _ => {
-                unexpressible.push((
-                    p.role.clone(),
-                    format!(
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: None,
+                    what: format!(
                         "role {}: {} on a {} (class {}) is not modelled; the declarations \
                          cannot express it",
                         p.role,
@@ -824,7 +845,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         p.class_desc.to_ascii_lowercase().replace('_', " "),
                         p.class
                     ),
-                ));
+                });
                 continue;
             }
         };
@@ -840,69 +861,75 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             && !schema.tables.contains_key(object)
             && !schema.modules.contains_key(object)
         {
-            unexpressible.push((
-                p.role.clone(),
-                format!(
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: Some(target.clone()),
+                what: format!(
                     "role {}: {} on {target} is on an object pbps does not model, or could not \
                      read; the declarations cannot express it",
                     p.role, p.permission
                 ),
-            ));
+            });
             continue;
         }
         if p.minor_id != 0 {
-            unexpressible.push((
-                p.role.clone(),
-                format!(
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: Some(target.clone()),
+                what: format!(
                     "role {}: a column-level {} on {target} is not modelled; the declarations \
                      cannot express it",
                     p.role, p.permission
                 ),
-            ));
+            });
             continue;
         }
         match p.state.trim() {
             "G" | "W" => {}
             "D" => {
-                unexpressible.push((
-                    p.role.clone(),
-                    format!(
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: Some(target.clone()),
+                    what: format!(
                         "role {}: DENY {} on {target} is not modelled (ADR-0005); the \
                          declarations cannot express it",
                         p.role, p.permission
                     ),
-                ));
+                });
                 continue;
             }
             other => {
-                unexpressible.push((
-                    p.role.clone(),
-                    format!(
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: Some(target.clone()),
+                    what: format!(
                         "role {}: permission state `{other}` on {target} is not modelled; the \
                          declarations cannot express it",
                         p.role
                     ),
-                ));
+                });
                 continue;
             }
         }
         let Ok(permission) = p.permission.parse::<pbps_model::Permission>() else {
-            unexpressible.push((
-                p.role.clone(),
-                format!(
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: Some(target.clone()),
+                what: format!(
                     "role {}: {} on {target} is outside the permissions pbps manages; the \
                      declarations cannot express it",
                     p.role, p.permission
                 ),
-            ));
+            });
             continue;
         };
         if p.state.trim() == "W" {
             // Not folded into the plain grant: it is wider, and a comparison
             // that read it as equal would call a widened role clean.
-            unexpressible.push((
-                p.role.clone(),
-                format!(
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: Some(target.clone()),
+                what: format!(
                     "role {}: {} on {target} is granted WITH GRANT OPTION, which the \
                      declarations cannot express; revoke the grant option by hand \
                      (`REVOKE GRANT OPTION FOR {} ON {} FROM {}`) to bring it under pbps",
@@ -912,7 +939,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     target,
                     p.role
                 ),
-            ));
+            });
             continue;
         }
         role.grants.entry(target).or_default().insert(permission);
@@ -1043,10 +1070,10 @@ mod tests {
         assert_eq!(targets, ["dbo.customer", "schema::dbo"]);
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
-        assert_eq!(p.unexpressible[0].0, "app_reader");
+        assert_eq!(p.unexpressible[0].role, "app_reader");
         assert!(
-            p.unexpressible[0].1.contains("dbo.order_seq")
-                && p.unexpressible[0].1.contains("does not model"),
+            p.unexpressible[0].what.contains("dbo.order_seq")
+                && p.unexpressible[0].what.contains("does not model"),
             "{:?}",
             p.unexpressible
         );
@@ -1085,9 +1112,9 @@ mod tests {
             [pbps_model::Permission::Select],
             "only the plain grant on the whole object is the declaration's"
         );
-        let what: Vec<&str> = p.unexpressible.iter().map(|(_, w)| w.as_str()).collect();
+        let what: Vec<&str> = p.unexpressible.iter().map(|u| u.what.as_str()).collect();
         assert_eq!(what.len(), 4, "{what:?}");
-        assert!(p.unexpressible.iter().all(|(r, _)| r == "app_reader"));
+        assert!(p.unexpressible.iter().all(|u| u.role == "app_reader"));
         assert!(
             what.iter()
                 .any(|w| w.contains("WITH GRANT OPTION")
@@ -1128,7 +1155,7 @@ mod tests {
             .push(grant(4, "DATABASE_PRINCIPAL", "IMPERSONATE"));
         let p = assemble(&raw);
         assert!(p.schema.roles["app_reader"].grants.is_empty());
-        let what: Vec<&str> = p.unexpressible.iter().map(|(_, w)| w.as_str()).collect();
+        let what: Vec<&str> = p.unexpressible.iter().map(|u| u.what.as_str()).collect();
         assert_eq!(what.len(), 3, "{what:?}");
         assert!(
             what.iter()
