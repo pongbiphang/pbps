@@ -133,9 +133,18 @@ impl Environment {
 )]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
-    /// Run after a successful `apply`, with the plan JSON on stdin.
+    /// Run after a successful `apply`, with the unchanged plan JSON on stdin.
+    ///
+    /// This is the original hook contract. Use `on_apply_attempt` for a
+    /// versioned event that also reports failed attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_apply: Option<String>,
+
+    /// Run after either outcome of an `apply`, with a versioned event JSON on
+    /// stdin containing the plan path, checksum, outcome and ledger entry or
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_apply_attempt: Option<String>,
 
     /// Run when `verify` finds drift, with the drift report JSON on stdin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,6 +437,7 @@ mod tests {
                 "  staging:\n",
                 "    url_env: STAGING_CONN\n",
                 "hooks:\n",
+                "  on_apply_attempt: ./scripts/audit-apply.sh\n",
                 "  on_drift: ./scripts/alert.sh\n",
             ),
             Path::new("pbps.yml"),
@@ -436,6 +446,10 @@ mod tests {
         assert_eq!(c.unmanaged, Unmanaged::Warn);
         assert_eq!(c.environments["prod"].url_env, "PROD_CONN");
         assert_eq!(c.environments["staging"].description, None);
+        assert_eq!(
+            c.hooks.on_apply_attempt.as_deref(),
+            Some("./scripts/audit-apply.sh")
+        );
         assert_eq!(c.hooks.on_drift.as_deref(), Some("./scripts/alert.sh"));
         assert_eq!(c.hooks.on_apply, None);
     }

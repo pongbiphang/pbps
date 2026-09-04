@@ -8,9 +8,10 @@
 //!
 //! # Why a failing hook does not fail the command
 //!
-//! `on_apply` runs after a transaction has committed and `on_drift` after the
-//! verdict is already decided — in both cases the fact being reported has
-//! happened, and a non-zero exit from the notifier cannot un-happen it.
+//! `on_apply` runs after a transaction has committed, `on_apply_attempt` after
+//! either apply outcome, and `on_drift` after the verdict is already decided —
+//! in every case the fact being reported has happened, and a non-zero exit from
+//! the notifier cannot un-happen it.
 //! Returning failure here would report "the apply failed" about a database that
 //! was changed successfully, which is the more dangerous lie. So the failure is
 //! printed loudly and the command's own verdict stands.
@@ -19,11 +20,14 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Stable input for `on_apply`. Unlike the plan JSON itself this reports the
-/// event, so the same hook sees both completed and failed attempts and can fan
-/// the ledger out to append-only storage without guessing from process state.
+/// Stable input for `on_apply_attempt`. Unlike the legacy `on_apply` plan JSON,
+/// this reports the event, so one hook sees both completed and failed attempts
+/// and can fan the ledger out to append-only storage without guessing from
+/// process state. The explicit version lets consumers reject a future contract
+/// they do not understand rather than silently misreading it.
 #[derive(serde::Serialize)]
-struct ApplyPayload<'a> {
+struct ApplyAttemptPayload<'a> {
+    version: u32,
     event: &'static str,
     plan_path: String,
     checksum: &'a str,
@@ -35,8 +39,8 @@ struct ApplyPayload<'a> {
     error: Option<&'a str>,
 }
 
-/// Runs the typed `on_apply` hook for either outcome of an apply attempt.
-pub fn run_apply(
+/// Runs the typed `on_apply_attempt` hook for either apply outcome.
+pub fn run_apply_attempt(
     command: &str,
     plan_path: &Path,
     checksum: &str,
@@ -44,7 +48,8 @@ pub fn run_apply(
     ledger_entry: Option<i64>,
     error: Option<&str>,
 ) {
-    let payload = ApplyPayload {
+    let payload = ApplyAttemptPayload {
+        version: 1,
         event: "apply",
         plan_path: plan_path.display().to_string(),
         checksum,
@@ -61,8 +66,8 @@ pub fn run_apply(
     // failure semantics even if that ever changes: notification must not
     // replace the deployment result.
     match serde_json::to_string(&payload) {
-        Ok(json) => run(command, &json, "on_apply"),
-        Err(e) => eprintln!("warning: the on_apply payload could not be serialized: {e}"),
+        Ok(json) => run(command, &json, "on_apply_attempt"),
+        Err(e) => eprintln!("warning: the on_apply_attempt payload could not be serialized: {e}"),
     }
 }
 
@@ -116,7 +121,8 @@ mod tests {
 
     #[test]
     fn apply_payload_names_the_artifact_pin_and_outcome() {
-        let payload = ApplyPayload {
+        let payload = ApplyAttemptPayload {
+            version: 1,
             event: "apply",
             plan_path: "release/plan.json".into(),
             checksum: "abc123",
@@ -126,6 +132,7 @@ mod tests {
             error: Some("permission denied"),
         };
         let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["version"], 1);
         assert_eq!(json["plan_path"], "release/plan.json");
         assert_eq!(json["checksum"], "abc123");
         assert_eq!(json["outcome"], "failure");

@@ -5120,8 +5120,9 @@ fn snapshot_and_baseline_refuse_a_held_deployment_lock() {
 }
 
 /// A failed preflight is still a deployment attempt: it leaves the schema
-/// unchanged, appends a failed ledger row, and sends the same typed hook shape
-/// as success with `outcome: failure`.
+/// unchanged, appends a failed ledger row, and sends the same typed attempt-hook
+/// shape as success with `outcome: failure`. The legacy success hook must not
+/// run for this outcome.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
@@ -5132,11 +5133,13 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
         .unwrap();
     let d = Demo::new("failed-audit");
     let hook_out = d.dir.join("apply-hook.json");
+    let legacy_hook_out = d.dir.join("legacy-apply-hook.json");
     std::fs::write(
         d.dir.join("pbps.yml"),
         format!(
-            "dialect: mssql\nhooks:\n  on_apply: \"cat > {}\"\n",
-            hook_out.display()
+            "dialect: mssql\nhooks:\n  on_apply: \"cat > {}\"\n  on_apply_attempt: \"cat > {}\"\n",
+            legacy_hook_out.display(),
+            hook_out.display(),
         ),
     )
     .unwrap();
@@ -5212,10 +5215,15 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
 
     let hook: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&hook_out).unwrap()).unwrap();
+    assert_eq!(hook["version"], 1, "{hook}");
     assert_eq!(hook["outcome"], "failure", "{hook}");
     assert_eq!(hook["checksum"], checksum, "{hook}");
     assert_eq!(hook["plan_path"], plan.display().to_string(), "{hook}");
     assert!(hook.get("ledger_entry").is_none(), "{hook}");
+    assert!(
+        !legacy_hook_out.exists(),
+        "the success-only on_apply hook ran after a failed apply"
+    );
 }
 
 /// SQL Server DDL is transactional, but that guarantee is lost if COMMIT comes
@@ -5932,11 +5940,13 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
         .unwrap();
     let d = Demo::new("unlock-after-success");
     let hook_out = d.dir.join("apply-hook.json");
+    let legacy_hook_out = d.dir.join("legacy-apply-hook.json");
     std::fs::write(
         d.dir.join("pbps.yml"),
         format!(
-            "dialect: mssql\nunmanaged: ignore\nhooks:\n  on_apply: \"cat > {}\"\n",
-            hook_out.display()
+            "dialect: mssql\nunmanaged: ignore\nhooks:\n  on_apply: \"cat > {}\"\n  on_apply_attempt: \"cat > {}\"\n",
+            legacy_hook_out.display(),
+            hook_out.display(),
         ),
     )
     .unwrap();
@@ -6012,9 +6022,15 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
 
     let hook: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&hook_out).unwrap()).unwrap();
+    assert_eq!(hook["version"], 1, "{hook}");
     assert_eq!(hook["outcome"], "success", "{hook}");
     assert!(hook["ledger_entry"].is_number(), "{hook}");
     assert!(hook.get("error").is_none(), "{hook}");
+    assert_eq!(
+        std::fs::read_to_string(&legacy_hook_out).unwrap(),
+        std::fs::read_to_string(&plan).unwrap(),
+        "the legacy on_apply hook must still receive the unchanged plan JSON"
+    );
 
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();

@@ -1378,7 +1378,7 @@ not by a version number.
 | **Phase 0** | Workspace skeleton, the `pbps-model` data model, finalizing the YAML and ids formats, the `Dialect` trait, verifying the YAML crate's span capabilities | The foundation for everything, and the most expensive to change |
 | **Phase 1** | `load` / `fmt` / `diff` / the ids file / the three intent channels / `plan` / `plan --check` / `validate` | Files only, zero risk. Already produces a plan.sql for a human to run |
 | **Phase 2** | The MSSQL emitter, introspection and **`pbps pull`**; `pbps docs` (9.4); the `strategy:` block enters the format ([ADR-0003](ADR-0003-execution-strategy.md)) and `pull` inventories unmanaged modules ([ADR-0002](ADR-0002-module-model.md)) | Reverse generation removes the adoption barrier — and with `docs`, first contact yields browsable documentation and an ERD in one step |
-| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply` and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
+| **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply`, `on_apply_attempt`, and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
 | **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
@@ -1461,10 +1461,12 @@ engine already supported.
    assertions are **derived automatically** from the typed ChangeSet — the
    preflight probes of 7.5 — rather than hand-written by users. User hooks
    stay deliberately minimal: an exec-only family in `pbps.yml` — `on_apply`
-   (receiving the plan path, checksum and outcome; also implements 8.1's
-   append-only ledger fan-out for tamper-evidence) and `on_drift` (receiving
-   `verify`'s typed drift JSON, see 9.4). The CI pipeline remains the real
-   hook system (see 10).
+   retains its original success-only contract and receives the complete plan
+   JSON; `on_apply_attempt` is the explicit opt-in migration path for a
+   versioned event carrying the plan path, checksum and success/failure outcome
+   (and implements 8.1's append-only ledger fan-out for tamper-evidence);
+   `on_drift` receives `verify`'s typed drift JSON (see 9.4). The CI pipeline
+   remains the real hook system (see 10).
 
 6. **How views and SPs should be handled** — settled; see
    [ADR-0002](ADR-0002-module-model.md). Modules (views, procedures,

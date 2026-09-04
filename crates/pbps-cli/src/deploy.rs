@@ -1332,9 +1332,9 @@ pub fn cmd_apply(
     let (outcome, released) = match execution {
         Ok(pair) => pair,
         Err(error) => {
-            if let Some(hook) = &project.config.hooks.on_apply {
+            if let Some(hook) = &project.config.hooks.on_apply_attempt {
                 let message = error.to_string();
-                crate::hooks::run_apply(
+                crate::hooks::run_apply_attempt(
                     hook,
                     plan_path,
                     &plan_checksum,
@@ -1355,8 +1355,15 @@ pub fn cmd_apply(
                 target.label,
                 if staged { " (staged)" } else { "" }
             );
+            // Preserve the original public hook contract: successful applies
+            // receive the exact approved plan JSON. Attempt events use their
+            // own key so existing success-only integrations cannot be invoked
+            // on a failure or misread an unrelated payload shape.
             if let Some(hook) = &project.config.hooks.on_apply {
-                crate::hooks::run_apply(
+                crate::hooks::run(hook, &raw, "on_apply");
+            }
+            if let Some(hook) = &project.config.hooks.on_apply_attempt {
+                crate::hooks::run_apply_attempt(
                     hook,
                     plan_path,
                     &plan_checksum,
@@ -1372,9 +1379,9 @@ pub fn cmd_apply(
             Ok(())
         }
         Err(error) => {
-            if let Some(hook) = &project.config.hooks.on_apply {
+            if let Some(hook) = &project.config.hooks.on_apply_attempt {
                 let message = error.to_string();
-                crate::hooks::run_apply(
+                crate::hooks::run_apply_attempt(
                     hook,
                     plan_path,
                     &plan_checksum,
