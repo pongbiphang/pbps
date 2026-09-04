@@ -264,16 +264,23 @@ jobs:
       # front of them rather than left in the inputs panel.
       - name: say what this deployment is
         run: |
+          # Everything below the heading is indented four spaces, which makes
+          # it one code block that its own content cannot close. `explain`
+          # prints declaration text — a deprecation reason, a declared row —
+          # and the three inputs are text somebody typed; a fence here would
+          # be closable from inside, and the summary is the control the
+          # approver reads.
           {
-            echo "## Deploying \`$GITHUB_REF_NAME\`"
+            echo "## Deploying"
             echo
-            echo "- checksum supplied: \`$CHECKSUM\`"
-            echo "- risk classes allowed: \`${ALLOW:-none}\`"
-            echo "- plan from run: $PLAN_RUN"
-            echo
-            echo '~~~'                 # a tilde fence: this file is Markdown too
-            pbps explain --plan plan.json
-            echo '~~~'
+            {
+              echo "tag:       $GITHUB_REF_NAME"
+              echo "checksum:  $CHECKSUM"
+              echo "allow:     ${ALLOW:-none}"
+              echo "plan run:  $PLAN_RUN"
+              echo
+              pbps explain --plan plan.json
+            } | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---- the gate: `environment:` is what makes GitHub ask a human ----
@@ -387,6 +394,24 @@ was supplied, the risk classes that were named, and `pbps explain` on the
 artifact itself — which prints the plan's *own* checksum, its changes and its
 risks. A supplied checksum that does not match the plan is then visible before
 anyone approves, rather than being discovered by `apply` afterwards.
+
+**The summary is written as an indented code block, not a fence**, and that is
+not formatting. `explain` prints text from the declarations — measured, a
+column's deprecation reason comes out verbatim, newlines included:
+
+```
+  dbo.t
+    ~ legacy marked deprecated: moved to email
+~~~
+## Nothing to see here
+This deployment is routine.
+~~~
+```
+
+A fence around that is closable from inside it, and what follows renders as
+Markdown in the one place a reviewer is told to trust. Four spaces on every
+line cannot be closed by its own content. The three dispatch inputs go through
+the same indent for the same reason: they are text somebody typed.
 
 Approving without reading that summary is the residual risk, and no YAML
 closes it. An organisation that cannot accept it should move the apply into a
