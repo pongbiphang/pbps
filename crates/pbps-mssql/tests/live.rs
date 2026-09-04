@@ -2277,6 +2277,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let moved = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                unchanged: Default::default(),
                 types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
@@ -2312,6 +2313,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let same_key = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                unchanged: Default::default(),
                 types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
@@ -2353,6 +2355,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                unchanged: Default::default(),
                 types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
@@ -2583,6 +2586,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         changes: vec![
             moved.changes[0].clone(),
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                unchanged: Default::default(),
                 types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
@@ -2706,6 +2710,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     }
     let pair_update = |id: &str, cells: &[(&str, Value)]| {
         pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+            unchanged: Default::default(),
             types: Default::default(),
             table: TableName::new("dbo", "pair_child"),
             key_column: "id".to_owned(),
@@ -3139,6 +3144,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         )]
         .into_iter()
         .collect(),
+        unchanged: Default::default(),
         types: [("label".to_owned(), ty("nvarchar(50)"))]
             .into_iter()
             .collect(),
@@ -3292,6 +3298,148 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("and without the trigger the same insert goes in");
     db.conn.execute(&sql).await.expect("the ordinary case");
 
+    // A column the table gives no default is left at NULL, and the row is
+    // held to that: the trigger writes `memo`, which the insert never names
+    // and no default touches (DECISIONS 136).
+    db.conn
+        .execute("ALTER TABLE dbo.status ADD memo nvarchar(50) NULL;")
+        .await
+        .expect("a column with no default the insert omits");
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.write_memo ON dbo.status AFTER INSERT AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET memo = N'written'\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that fills a column left to nothing");
+    let left_null = pbps_model::Change::InsertRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        identity_key: false,
+        key: RowKey::from("fifth"),
+        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+            .into_iter()
+            .collect(),
+        types: [
+            ("note".to_owned(), ty("nvarchar(50)")),
+            ("memo".to_owned(), ty("nvarchar(50)")),
+        ]
+        .into_iter()
+        .collect(),
+        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    };
+    let sql = sql_of(&left_null);
+    let err = db
+        .conn
+        .execute(&sql)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a filled-in NULL was taken for the plan's own:\n{sql}"));
+    assert!(
+        err.to_string().contains("is not what this plan wrote"),
+        "{err}"
+    );
+    assert_eq!(label_of("fifth").await, None, "the insert rolled back");
+    db.conn
+        .execute("DROP TRIGGER dbo.write_memo;")
+        .await
+        .expect("and without the trigger the same insert goes in");
+    db.conn.execute(&sql).await.expect("the ordinary case");
+
+    // An update is held to the cells it leaves alone as well, before and
+    // after: a trigger rewriting `note`, which the update never sets, and a
+    // hand edit to `memo` since the plan was made are both refused
+    // (DECISIONS 136).
+    db.conn
+        .execute("UPDATE dbo.status SET note = N'plain', memo = NULL WHERE code = 'old';")
+        .await
+        .expect("the row as the plan recorded it");
+    let whole_row = pbps_model::Change::UpdateRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        columns: [(
+            "label".to_owned(),
+            (
+                Cell::Value(Value::Text("Ancient".to_owned())),
+                Cell::Value(Value::Text("Newer".to_owned())),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: [
+            (
+                "note".to_owned(),
+                Cell::Value(Value::Text("plain".to_owned())),
+            ),
+            ("memo".to_owned(), Cell::Value(Value::Null)),
+        ]
+        .into_iter()
+        .collect(),
+        types: [
+            ("label".to_owned(), ty("nvarchar(50)")),
+            ("note".to_owned(), ty("nvarchar(50)")),
+            ("memo".to_owned(), ty("nvarchar(50)")),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let sql = sql_of(&whole_row);
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.rewrite_note_on_update ON dbo.status AFTER UPDATE AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET note = N'rewritten'\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that rewrites a cell the update leaves alone");
+    let err = db.conn.execute(&sql).await.err().unwrap_or_else(|| {
+        panic!("a rewritten untouched cell was taken for the plan's own:\n{sql}")
+    });
+    assert!(
+        err.to_string().contains("is not what this plan wrote"),
+        "{err}"
+    );
+    assert_eq!(
+        label_of("old").await.as_deref(),
+        Some("Ancient"),
+        "the update rolled back, trigger and all"
+    );
+    db.conn
+        .execute("DROP TRIGGER dbo.rewrite_note_on_update;")
+        .await
+        .expect("take the rewriting trigger off");
+    db.conn
+        .execute("UPDATE dbo.status SET memo = N'edited' WHERE code = 'old';")
+        .await
+        .expect("a hand edit to a cell the plan does not set");
+    let err =
+        db.conn.execute(&sql).await.err().unwrap_or_else(|| {
+            panic!("a hand-edited untouched cell was overwritten around:\n{sql}")
+        });
+    assert!(
+        err.to_string().contains("is not as the plan recorded it"),
+        "{err}"
+    );
+    db.conn
+        .execute("UPDATE dbo.status SET memo = NULL WHERE code = 'old';")
+        .await
+        .expect("the row as recorded again");
+    db.conn
+        .execute(&sql)
+        .await
+        .expect("and with the whole row as recorded, the update goes through");
+    assert_eq!(label_of("old").await.as_deref(), Some("Newer"));
+
     // And the same for a delete a trigger undoes.
     // `CREATE TRIGGER` must be the first statement of its batch.
     db.conn
@@ -3318,7 +3466,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     );
     assert_eq!(
         label_of("old").await.as_deref(),
-        Some("Ancient"),
+        Some("Newer"),
         "the row is still there, and still what it was"
     );
 

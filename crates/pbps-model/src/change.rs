@@ -323,12 +323,16 @@ pub enum Change {
         /// an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         defaults: BTreeMap<String, String>,
-        /// The type of each column in `defaults`, for the same reason
-        /// `UpdateRow` carries one: the emitter holds the row to what it
-        /// wrote, and a column left to a *constant* default is checked by
-        /// comparing it against that default — which needs the type to know
-        /// the comparison is one the engine allows at all (DECISIONS 133).
-        /// Absent from older plans, which is an empty map.
+        /// The type of every column the row omits, the key and an `IDENTITY`
+        /// column aside — the columns in `defaults`, and the ones the table
+        /// gives no default, which the insert leaves at NULL. Carried for the
+        /// same reason `UpdateRow` carries one: the emitter holds the row to
+        /// what it wrote, and a column left to a *constant* default is
+        /// checked by comparing it against that default — which needs the
+        /// type to know the comparison is one the engine allows at all
+        /// (DECISIONS 133) — while a column left to nothing is held to NULL
+        /// (136). Absent from older plans, which is an empty map and holds
+        /// nothing here.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
     },
@@ -347,11 +351,22 @@ pub enum Change {
         /// [`Cell`], not [`Value`]: an omitted column means the declared
         /// default, and the emitter has to write `DEFAULT`, not `NULL`.
         columns: BTreeMap<String, (Cell, Cell)>,
-        /// The type each updated column has in the state the plan was made
-        /// against, for the columns that state has. The emitter compares the
-        /// `before` cell by the rendering that read it — which is the
-        /// column's type's — and refuses the update when the row is no
-        /// longer as recorded (DECISIONS 122). A column the base does not
+        /// The declared cells the row already holds — every non-key column
+        /// outside `columns`, resolved by the omission rule. Never restated
+        /// in the `UPDATE`'s `SET`, for the reason `columns` gives; but the
+        /// statement holds the row to them, before and after it runs: a
+        /// cell the plan did not touch is still one the declaration claims,
+        /// and a trigger rewriting it, or a hand edit since the plan was
+        /// made, would otherwise be read back and recorded as the plan's
+        /// own result (DECISIONS 136). Absent from older plans, which is an
+        /// empty map and holds the row to its changed cells alone.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        unchanged: BTreeMap<String, Cell>,
+        /// The type each column in `columns` or `unchanged` has in the state
+        /// the plan was made against, for the columns that state has. The
+        /// emitter compares each cell by the rendering that read it — which
+        /// is the column's type's — and refuses the update when the row is
+        /// no longer as recorded (DECISIONS 122). A column the base does not
         /// have is absent: its `before` is what this plan's `AddColumn`
         /// leaves there, not a recorded cell. Absent from older plans,
         /// which is an empty map.

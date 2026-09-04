@@ -601,6 +601,7 @@ fn diff_data(
                 // and the database already agree on, and would make plan.sql
                 // claim a change that is not one.
                 let mut columns = BTreeMap::new();
+                let mut unchanged = BTreeMap::new();
                 let mut types = BTreeMap::new();
                 for (column, spec) in &declared.columns {
                     // The key lives in the map key, not in either row, so it
@@ -608,6 +609,14 @@ fn diff_data(
                     // omission rule would read a default added to the key
                     // column as "set every key to DEFAULT".
                     if *column == key_column {
+                        continue;
+                    }
+                    // A non-key `IDENTITY` column is the engine's: never
+                    // written by a row (`validate` refuses it) and never read
+                    // back (DECISIONS 94), so both sides resolve it to NULL
+                    // and it is neither a change nor a cell the row can be
+                    // held to — the engine assigned it.
+                    if spec.identity.is_some() {
                         continue;
                     }
                     // Each side against *its own* table, and the base side
@@ -627,17 +636,22 @@ fn diff_data(
                         None => Cell::Value(Value::Null),
                     };
                     let d = cell(row, column, Some(spec));
-                    if b != d {
-                        // The base column's type, so the emitter can compare
-                        // the `before` by the rendering that read it
-                        // (DECISIONS 122). A column the base lacks has no
-                        // recorded cell to hold the update to.
-                        if let Some(base_spec) = base_name_of
-                            .get(column)
-                            .and_then(|base_column| base.columns.get(base_column))
-                        {
-                            types.insert(column.clone(), base_spec.ty.clone());
-                        }
+                    // The base column's type, so the emitter can compare each
+                    // cell by the rendering that read it (DECISIONS 122). A
+                    // column the base lacks has no recorded cell to hold the
+                    // update to.
+                    if let Some(base_spec) = base_name_of
+                        .get(column)
+                        .and_then(|base_column| base.columns.get(base_column))
+                    {
+                        types.insert(column.clone(), base_spec.ty.clone());
+                    }
+                    if b == d {
+                        // Not restated, but still held: the declaration
+                        // claims this cell as much as the changed ones, and
+                        // the statement checks the whole row (DECISIONS 136).
+                        unchanged.insert(column.clone(), d);
+                    } else {
                         columns.insert(column.clone(), (b, d));
                     }
                 }
@@ -647,6 +661,7 @@ fn diff_data(
                         key_column: key_column.clone(),
                         key: key.clone(),
                         columns,
+                        unchanged,
                         types,
                     });
                 }
@@ -1039,13 +1054,16 @@ fn order_key(c: &Change) -> u8 {
 /// The defaults an inserted row is left to: every column the row omits, the
 /// key aside, that the table gives a default. An `IDENTITY` column is the
 /// engine's own and never one of these (DECISIONS 94, 117).
+///
+/// The types cover every omitted column, defaulted or not: a column the
+/// table gives no default is left at NULL, and the emitter holds the row to
+/// that as it holds a defaulted column to its default (DECISIONS 136).
 fn omitted_defaults(
     table: &Table,
     key_column: &str,
     row: &pbps_model::Row,
 ) -> (BTreeMap<String, String>, BTreeMap<String, ColumnType>) {
     let types = omitted_columns(table, key_column, row)
-        .filter(|(_, spec)| spec.default.is_some())
         .map(|(c, spec)| (c.clone(), spec.ty.clone()))
         .collect();
     let defaults = omitted_columns(table, key_column, row)
@@ -1102,12 +1120,13 @@ mod tests {
             defaults.into_iter().collect::<Vec<_>>(),
             [("status_code".to_owned(), "('old')".to_owned())]
         );
-        // And the type of each, so the emitter can hold the row to the
-        // default it left the column at (DECISIONS 133). Only the defaulted
-        // ones: a column with nothing to check has nothing to carry.
+        // And the type of every omitted column, so the emitter can hold the
+        // row to the default it left the column at (DECISIONS 133) — or to
+        // NULL, where the table gives none (136). Not the key, not the
+        // spelled column, not the identity column.
         assert_eq!(
             types.keys().collect::<Vec<_>>(),
-            [&"status_code".to_owned()]
+            [&"rank".to_owned(), &"status_code".to_owned()]
         );
     }
     use super::*;
@@ -1292,6 +1311,83 @@ mod tests {
         // that also set the columns which agree would overwrite values nobody
         // asked to change.
         assert_eq!(row_ops(&run(&base, &declared, &[])), ["update new [label]"]);
+    }
+
+    /// The cells the plan leaves alone travel beside the changed ones, with
+    /// their base types, so the emitter can hold the whole declared row —
+    /// never restate it (DECISIONS 136). A column the row omits is carried as
+    /// the default it resolves to.
+    #[test]
+    fn an_update_carries_the_cells_it_leaves_alone() {
+        let mut base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        base_t
+            .columns
+            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+        let mut sort = Column::new(ty("int"));
+        sort.default = Some("(0)".to_owned());
+        base_t.columns.insert("sort".to_owned(), sort);
+        // The engine's own: never read back, so never a cell to hold the
+        // row to (DECISIONS 94) — holding it to NULL would refuse every
+        // update on the table.
+        let mut seq = Column::new(ty("int")).not_null();
+        seq.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        base_t.columns.insert("seq".to_owned(), seq);
+        base_t
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("new"))
+            .unwrap()
+            .0
+            .insert("note".to_owned(), Value::Text("kept".to_owned()));
+        let mut declared_t = base_t.clone();
+        declared_t
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("new"))
+            .unwrap()
+            .0
+            .insert("label".to_owned(), Value::Text("Opened".to_owned()));
+
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        let Some(Change::UpdateRow {
+            columns,
+            unchanged,
+            types,
+            ..
+        }) = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateRow { .. }))
+        else {
+            panic!("{:?}", row_ops(&cs));
+        };
+        assert_eq!(columns.keys().collect::<Vec<_>>(), ["label"]);
+        assert_eq!(
+            unchanged.iter().collect::<Vec<_>>(),
+            [
+                (
+                    &"note".to_owned(),
+                    &Cell::Value(Value::Text("kept".to_owned()))
+                ),
+                (&"sort".to_owned(), &Cell::Default("(0)".to_owned())),
+            ]
+        );
+        // The key is neither: it lives in the map key, not in the row. Nor
+        // is the identity column.
+        assert_eq!(types.keys().collect::<Vec<_>>(), ["label", "note", "sort"]);
+        assert!(!unchanged.contains_key("seq"), "{unchanged:?}");
     }
 
     #[test]

@@ -128,8 +128,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key_column,
             key,
             columns,
+            unchanged,
             types,
-        } => update_row(table, key_column, key, columns, types),
+        } => update_row(table, key_column, key, columns, unchanged, types),
 
         // The row's content is not carried (the pinned baseline holds it),
         // so the delete holds the row to its existence: a row already gone
@@ -543,11 +544,17 @@ fn insert_row(
     }
     // And the columns the row left to the table: a trigger rewriting one of
     // those is the same silence, so a *constant* default is compared against
-    // itself. Anything the engine would have to run to answer — `NEWID()`,
-    // `NEXT VALUE FOR` — is not asked: it has no value before it runs, and
-    // asking would consume a sequence value (DECISIONS 133).
-    for (column, default) in defaults {
-        cells.extend(defaulted_cell(column, default, types.get(column))?);
+    // itself, and a column the table gives no default is held to the NULL
+    // the insert left there (DECISIONS 133, 136). Anything the engine would
+    // have to run to answer — `NEWID()`, `NEXT VALUE FOR` — is not asked: it
+    // has no value before it runs, and asking would consume a sequence
+    // value. `types` names every omitted column; a plan made before it
+    // travelled names none, and holds nothing here.
+    for (column, ty) in types {
+        cells.extend(match defaults.get(column) {
+            Some(default) => defaulted_cell(column, default, Some(ty))?,
+            None => Some(format!("{} IS NULL", quote(column)?)),
+        });
     }
     let wrote = wrote_the_row(table, key, key_column, &cells)?;
     let table = qualified(table)?;
@@ -582,11 +589,19 @@ fn insert_row(
 /// `before` at a default is compared as the read-back compared it, and only
 /// where the read-back did — a literal default on a type with `=`; a default
 /// the engine would have to run has no value to hold the row to.
+///
+/// The cells the plan leaves alone are held the same way, before and after:
+/// the declaration claims them as much as the changed ones, and an `UPDATE`
+/// that checked only what it set would let a trigger rewrite the rest of the
+/// row — or a hand edit since the plan was made stand — and have the result
+/// read back as the plan's own (DECISIONS 136). They are never restated in
+/// `SET`, for the reason `UpdateRow` gives.
 fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
     columns: &BTreeMap<String, (Cell, Cell)>,
+    unchanged: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
     let mut sets = Vec::with_capacity(columns.len());
@@ -600,27 +615,10 @@ fn update_row(
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{quoted} = {rhs}"));
-        let Some(ty) = types.get(column) else {
-            continue;
-        };
-        match from {
-            Cell::Value(Value::Null) => recorded.push(format!("{quoted} IS NULL")),
-            // Binary, so a change of case alone is a change: the drift check
-            // compares the recorded text the same way.
-            Cell::Value(v) => recorded.push(format!(
-                "{} = {} COLLATE Latin1_General_BIN2",
-                crate::rows::read_expr(&quoted, &ty.base),
-                literal(&recorded_text(v))
-            )),
-            Cell::Default(d)
-                if crate::rows::comparable(&ty.base) && crate::rows::is_constant(d) =>
-            {
-                recorded.push(format!(
-                    "({quoted} = ({d}) OR ({quoted} IS NULL AND ({d}) IS NULL))"
-                ));
-            }
-            Cell::Default(_) => {}
-        }
+        recorded.extend(recorded_cell(column, from, types.get(column))?);
+    }
+    for (column, held) in unchanged {
+        recorded.extend(recorded_cell(column, held, types.get(column))?);
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -644,32 +642,53 @@ fn update_row(
     }
     sql.push_str(";\n");
     sql.push_str(&exactly_one_row(table, key));
-    // And what the row holds afterwards. Each cell the plan spells, compared
-    // by the rendering that read it, so a trigger that rewrote the row —
-    // or took it away — rolls this statement back instead of being read
-    // back as the plan's own result. A cell set to `DEFAULT` has no value
-    // here to check, and a column outside `columns` is not this plan's.
+    // And what the row holds afterwards: each cell the plan spells and each
+    // it leaves alone, compared by the rendering that read it, so a trigger
+    // that rewrote the row — or took it away — rolls this statement back
+    // instead of being read back as the plan's own result. A cell set to
+    // `DEFAULT` is held to that default where it is a constant, exactly as
+    // the `before` side is; a column the declaration does not name is the
+    // application's business.
     let mut cells = Vec::new();
     for (column, (_, to)) in columns {
-        let quoted = quote(column)?;
-        let Some(ty) = types.get(column) else {
-            continue;
-        };
-        match to {
-            Cell::Value(Value::Null) => cells.push(format!("{quoted} IS NULL")),
-            Cell::Value(v) => cells.push(format!(
-                "{} = {} COLLATE Latin1_General_BIN2",
-                crate::rows::read_expr(&quoted, &ty.base),
-                literal(&recorded_text(v))
-            )),
-            // Set to `DEFAULT`: held to that default where it is a constant,
-            // exactly as the `before` side is (`defaulted_cell`).
-            Cell::Default(d) => cells.extend(defaulted_cell(column, d, Some(ty))?),
-        }
+        cells.extend(recorded_cell(column, to, types.get(column))?);
+    }
+    for (column, held) in unchanged {
+        cells.extend(recorded_cell(column, held, types.get(column))?);
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
     one(atomically(&sql))
+}
+
+/// One cell as a predicate holding the row to it, by the rendering that read
+/// it back (DECISIONS 122): a NULL as `IS NULL`, a value under a binary
+/// collation so a change of case alone is a change — the drift check
+/// compares the recorded text the same way — and a default as
+/// `defaulted_cell` holds it.
+///
+/// A column whose type the plan does not carry holds nothing, NULL included:
+/// it is a column the base state lacks, whose `before` is what this plan's
+/// `AddColumn` left there — NULL by the differ's convention, but the default
+/// on a `NOT NULL` add — not a recorded cell.
+fn recorded_cell(
+    column: &str,
+    cell: &Cell,
+    ty: Option<&ColumnType>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    Ok(match cell {
+        Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
+        Cell::Value(v) => Some(format!(
+            "{} = {} COLLATE Latin1_General_BIN2",
+            crate::rows::read_expr(&quoted, &ty.base),
+            literal(&recorded_text(v))
+        )),
+        Cell::Default(d) => defaulted_cell(column, d, Some(ty))?,
+    })
 }
 
 /// A recorded cell as the read-back's text: what `rows::value_of` decoded.
@@ -1711,6 +1730,11 @@ mod tests {
                 ("seq", "int"),
                 ("stamp", "datetime2"),
                 ("doc", "xml"),
+                // No default at all: the insert leaves NULL, and the row is
+                // held to that (DECISIONS 136) — on a type without `=` too,
+                // since `IS NULL` needs none.
+                ("rank", "int"),
+                ("body", "xml"),
             ]
             .into_iter()
             .map(|(c, t)| (c.to_owned(), ty(t)))
@@ -1721,12 +1745,19 @@ mod tests {
             "[label] = N'New'",
             "([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
             "([note] = ((NULL)) OR ([note] IS NULL AND ((NULL)) IS NULL))",
+            " AND [rank] IS NULL",
+            " AND [body] IS NULL",
         ] {
             assert!(sql.contains(held), "{held}\n{sql}");
         }
         for absent in ["[seq]", "[stamp]", "[doc]", "[old]"] {
             assert!(!sql.contains(absent), "{absent}\n{sql}");
         }
+        // And the insert itself names only what the row spells.
+        assert!(
+            sql.contains("INSERT INTO [dbo].[t] ([code], [label]) VALUES (N'a', N'New');"),
+            "{sql}"
+        );
     }
 
     /// An `IDENTITY` key can only be pinned with the switch on, and the switch
@@ -1798,6 +1829,7 @@ mod tests {
     #[test]
     fn an_update_restates_only_the_changed_columns() {
         let sql = sql_of(&Change::UpdateRow {
+            unchanged: Default::default(),
             types: Default::default(),
             table: tname("dbo.order_status"),
             key_column: "code".to_owned(),
@@ -1891,6 +1923,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            unchanged: Default::default(),
             types: [
                 ("label", "nvarchar(50)"),
                 ("since", "date"),
@@ -1949,6 +1982,69 @@ mod tests {
         assert!(update.ends_with(';'), "{update}");
     }
 
+    /// The cells the plan leaves alone are held too, before and after — but
+    /// never restated in `SET`. A trigger rewriting a cell the plan did not
+    /// touch, or a hand edit to it since the plan was made, is otherwise
+    /// read back as the plan's own result (DECISIONS 136). A cell without a
+    /// carried type holds nothing, as a changed one does not.
+    #[test]
+    fn an_update_holds_the_cells_it_leaves_alone_too() {
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [("label".to_owned(), (text("Old"), text("New")))]
+                .into_iter()
+                .collect(),
+            unchanged: [
+                ("note".to_owned(), text("kept")),
+                ("rank".to_owned(), Cell::Value(Value::Null)),
+                ("sort".to_owned(), Cell::Default("((0))".to_owned())),
+                ("stamp".to_owned(), Cell::Default("(getdate())".to_owned())),
+                ("added".to_owned(), text("z")),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("note", "nvarchar(50)"),
+                ("rank", "int"),
+                ("sort", "int"),
+                ("stamp", "datetime2"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+        });
+        let sql = &sql[0];
+        let update = sql
+            .lines()
+            .find(|l| l.starts_with("UPDATE "))
+            .expect("the update");
+        let wrote = sql
+            .lines()
+            .find(|l| l.starts_with("IF NOT EXISTS"))
+            .expect("the postcondition");
+        // Only the changed column is set.
+        assert!(
+            update.starts_with("UPDATE [dbo].[t] SET [label] = N'New' WHERE [code] = N'a'"),
+            "{update}"
+        );
+        for held in [
+            " AND CONVERT(nvarchar(max), [note]) = N'kept' COLLATE Latin1_General_BIN2",
+            " AND [rank] IS NULL",
+            " AND ([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
+        ] {
+            assert!(update.contains(held), "{held}\n{update}");
+            assert!(wrote.contains(held), "{held}\n{wrote}");
+        }
+        for not_held in ["[stamp]", "[added]"] {
+            assert!(!update.contains(not_held), "{not_held}\n{update}");
+            assert!(!wrote.contains(not_held), "{not_held}\n{wrote}");
+        }
+    }
+
     /// An omitted column means the declared default, and only the keyword can
     /// ask the engine for it. Writing NULL instead fails a NOT NULL column that
     /// `validate` had passed, and stores NULL in a nullable one where the
@@ -1956,6 +2052,7 @@ mod tests {
     #[test]
     fn an_update_to_the_default_says_default_not_null() {
         let sql = sql_of(&Change::UpdateRow {
+            unchanged: Default::default(),
             types: Default::default(),
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
@@ -1987,6 +2084,7 @@ mod tests {
         assert!(
             emit(
                 &Change::UpdateRow {
+                    unchanged: Default::default(),
                     types: Default::default(),
                     table: tname("dbo.t"),
                     key_column: "code".to_owned(),

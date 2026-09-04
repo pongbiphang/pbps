@@ -255,6 +255,16 @@ Decisions taken during implementation that this document did not anticipate:
    `@@ROWCOUNT` is one — so a row changed or deleted in between names itself
    and rolls the plan back, instead of being overwritten or missed and then
    recorded as applied (122).
+8. **A row write holds itself to the whole declared row once it has run.**
+   An `AFTER` trigger runs inside the statement and may rewrite the row or
+   take it away; the apply then read the result back and recorded it as its
+   own. Each row statement now ends with a postcondition inside a
+   transaction of its own — the row is there and holds every declared cell,
+   or for a delete is still gone — over the cells the plan spells (132), the
+   columns it leaves to a constant default (133), the columns it leaves to
+   nothing, held to NULL, and the cells an `UPDATE` does not restate, which
+   `UpdateRow` carries as `unchanged` beside its changed columns (136). A
+   default the engine would have to run is not asked about.
 
 The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
 the read-back, the drift on rows, the `ensure` read staying inside its keys,

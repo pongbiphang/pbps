@@ -1244,3 +1244,31 @@ SPEC is in sync with all of these.
     underneath: a declaration is written into git and has to resolve to the
     same file on every platform that checks the repository out. This is the
     file-level half of the shape 123 records at the database level.
+136. **A row write is held to the whole declared row, not to the cells it
+    changes.** 132 and 133 checked what the statement spelled and what it
+    left to a default; two columns were still nobody's. An `UpdateRow`
+    carries only the columns that differ — restating the rest would make
+    plan.sql claim a change that is not one — so an `AFTER UPDATE` trigger
+    rewriting a declared cell the plan did not touch passed the check, and
+    an insert that omitted a column the table gives *no* default left it to
+    NULL without holding it there, so a trigger filling it passed too. Both
+    ended the same way as before: the rewritten value read back, recorded,
+    reported as success, and proposed again by every plan after.
+
+    `UpdateRow` now carries the declared cells it leaves alone (`unchanged`),
+    resolved by the omission rule, with their base types beside the changed
+    columns'; the `SET` still names only what changes, but the stale
+    predicate and the postcondition hold every declared cell. That closes a
+    second gap with the same statement: a hand edit to an untouched cell
+    since the plan was made now names itself as a stale baseline rather than
+    being read back as the plan's own. `InsertRow` types now name every
+    omitted column, and one absent from `defaults` is held to `IS NULL` —
+    which needs no `=` on the type, so an `xml` column left to nothing is
+    held where a defaulted one could not be. A plan made before either
+    travelled carries neither, and checks what it always did.
+
+    A non-key `IDENTITY` column is in neither set. It is never written by a
+    row and never read back (94), so both sides resolve it to NULL and it
+    compared equal — and holding it to NULL would have refused every update
+    on the table, since the engine assigned it. The live round-trip caught
+    this before the unit tests did: the fixture table has one.
