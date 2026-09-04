@@ -1025,6 +1025,47 @@ enum Settled {
     SoFar,
 }
 
+/// Every field of a column two reads disagree on, with the word to call it.
+///
+/// Field by field because the exclusion above is: a plan that retypes a column
+/// cannot be held to what the type became — only the engine's stored form says
+/// that — while the same column's default, identity and nullability came back
+/// from two reads like anything else (DECISIONS 173).
+///
+/// `description` and `deprecated` are compared too, and are always equal today
+/// because no catalog reads them back. That is the right way round: if one
+/// ever does, a description another session changed is drift, and no change of
+/// this model moves it.
+fn differing(
+    was: &pbps_model::Column,
+    now: &pbps_model::Column,
+) -> Vec<(Option<pbps_model::ColumnField>, &'static str)> {
+    use pbps_model::ColumnField;
+    let mut out = Vec::new();
+    if was.ty != now.ty {
+        out.push((Some(ColumnField::Type), "type"));
+    }
+    if was.nullable != now.nullable {
+        out.push((Some(ColumnField::Nullable), "nullability"));
+    }
+    if was.default != now.default {
+        out.push((Some(ColumnField::Default), "default"));
+    }
+    if was.deprecated != now.deprecated {
+        out.push((Some(ColumnField::Deprecated), "deprecation"));
+    }
+    // `None` is "no change of this model moves this", so nothing can excuse
+    // it: an identity or a description that differs across an apply is
+    // somebody else's work, and the whole-column exclusion used to hide it.
+    if was.identity != now.identity {
+        out.push((None, "identity"));
+    }
+    if was.description != now.description {
+        out.push((None, "description"));
+    }
+    out
+}
+
 fn refuse_unplanned_movement(
     changes: &pbps_model::ChangeSet,
     before: &Schema,
@@ -1060,7 +1101,13 @@ fn refuse_unplanned_movement(
     // saying so: a renamed column re-keys every row of its table, and a
     // dropped table takes its grants with it (DECISIONS 158).
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
-    let mut redefined: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+    // Per column *and* field: the reason for excluding anything here is
+    // field-sized. Only the engine's stored form says what a retyped column
+    // became, but that column's default, identity and nullability still came
+    // back from two reads, and a whole-column exclusion meant nothing
+    // compared them (DECISIONS 173).
+    let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
+        BTreeMap::new();
     let mut gone: BTreeSet<&TableName> = BTreeSet::new();
     // The constraints and indexes this plan moves, and the tables whose
     // primary key it sets. Everything else on a touched table then answers for
@@ -1095,11 +1142,13 @@ fn refuse_unplanned_movement(
         // A second set, because the two comparisons ask different questions of
         // it: `columns` is whose *reading* moved, for the rows; this is whose
         // *definition* moved, for the shape (DECISIONS 170).
-        for column in p.change.columns_redefined() {
+        for (column, field) in p.change.columns_redefined() {
             redefined
                 .entry(column.table)
                 .or_default()
-                .insert(column.name);
+                .entry(column.name)
+                .or_default()
+                .insert(field);
         }
         if let Some(part) = p.change.constraints() {
             match part.name {
@@ -1171,19 +1220,33 @@ fn refuse_unplanned_movement(
         // went into `previous`, after which the final comparison measured the
         // contaminated shape against itself (DECISIONS 167).
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
-            let no_columns = BTreeSet::new();
-            let moved_columns = redefined.get(now_name).unwrap_or(&no_columns);
+            let no_fields = BTreeMap::new();
+            let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
             let no_names = BTreeSet::new();
             let moved_parts = constraints.get(now_name).unwrap_or(&no_names);
-            let held = |c: &String| !moved_columns.contains(c);
+            let empty = BTreeSet::new();
             for column in was.columns.keys().chain(now.columns.keys()) {
-                if !held(column) {
+                let moves = moved_columns.get(column).unwrap_or(&empty);
+                // Added, dropped or renamed: the column is on one side only,
+                // and its presence is what `columns_after` answers for.
+                if moves.contains(&pbps_model::ColumnField::Whole) {
                     continue;
                 }
-                if was.columns.get(column) != now.columns.get(column) {
+                let (Some(was_c), Some(now_c)) = (was.columns.get(column), now.columns.get(column))
+                else {
                     moved.push(format!(
-                        "{now_name} column `{column}` is not what the plan was approved over, \
-                         and no change of this plan moves it"
+                        "{now_name} column `{column}` is not on both sides, and no change of \
+                         this plan adds or removes it"
+                    ));
+                    continue;
+                };
+                for (field, what) in differing(was_c, now_c) {
+                    if field.is_some_and(|f| moves.contains(&f)) {
+                        continue;
+                    }
+                    moved.push(format!(
+                        "{now_name} column `{column}` has a different {what} from the one the \
+                         plan was approved over, and no change of this plan moves it"
                     ));
                 }
             }
@@ -4895,6 +4958,115 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// The exclusion was per *column*, and its reason covers one *field*. A
+    /// plan that retypes a column could not be held to what its type became —
+    /// only the engine's stored form says that — but everything else about
+    /// that column still came back from two reads, and nothing compared them.
+    /// So a default, an identity or a nullability another session changed
+    /// while the plan ran was recorded as this plan's own result
+    /// (DECISIONS 173).
+    #[test]
+    fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
+        let schema_with = |ty: &str, default: Option<&str>, nullable: bool| {
+            let mut c = pbps_model::Column::new(ty.parse().unwrap());
+            c.default = default.map(str::to_owned);
+            c.nullable = nullable;
+            let mut t = pbps_model::Table::default();
+            t.columns.insert("note".to_owned(), c);
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let widening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.t.note".parse().unwrap(),
+                    from: "nvarchar(50)".parse().unwrap(),
+                    to: "nvarchar(100)".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: true,
+                },
+            )],
+        };
+        let before = schema_with("nvarchar(50)", None, true);
+
+        // The type is the plan's own business: only the stored form says what
+        // it became, which is why the field is excluded at all.
+        refuse_unplanned_movement(
+            &widening,
+            &before,
+            &schema_with("nvarchar(100)", None, true),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the column this plan retypes");
+
+        // A default that arrived beside it is not.
+        let e = refuse_unplanned_movement(
+            &widening,
+            &before,
+            &schema_with("nvarchar(100)", Some("N'x'"), true),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a default nobody planned");
+        assert!(format!("{e:#}").contains("default"), "{e:#}");
+
+        // Nor is a nullability this plan's own statement does not move: the
+        // change carries `from_nullable == to_nullable`, so the restatement
+        // leaves a value two reads still agree on.
+        let e = refuse_unplanned_movement(
+            &widening,
+            &before,
+            &schema_with("nvarchar(100)", None, false),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a nullability nobody planned");
+        assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+
+        // Where the plan does move it, it is the plan's own business again.
+        let tightening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.t.note".parse().unwrap(),
+                    from: "nvarchar(50)".parse().unwrap(),
+                    to: "nvarchar(100)".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: false,
+                },
+            )],
+        };
+        refuse_unplanned_movement(
+            &tightening,
+            &before,
+            &schema_with("nvarchar(100)", None, false),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("a type change folds the nullability into itself");
+
+        // And an identity nothing in this model can move is never excused.
+        let mut with_identity = schema_with("nvarchar(100)", None, true);
+        with_identity
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .columns
+            .get_mut("note")
+            .unwrap()
+            .identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        let e =
+            refuse_unplanned_movement(&widening, &before, &with_identity, "prod", Settled::Whole)
+                .expect_err("an identity nobody planned");
+        assert!(format!("{e:#}").contains("identity"), "{e:#}");
     }
 
     /// `Change::columns` answers "whose *reading* did this move", which 162

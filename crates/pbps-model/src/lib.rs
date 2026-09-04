@@ -39,8 +39,8 @@ pub mod types;
 pub mod uid;
 
 pub use change::{
-    Change, ChangeSet, ModuleAfter, Part, PartChange, PermissionChange, PlannedChange, Presence,
-    RiskClass, RowAfter,
+    Change, ChangeSet, ColumnField, ModuleAfter, Part, PartChange, PermissionChange, PlannedChange,
+    Presence, RiskClass, RowAfter,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,

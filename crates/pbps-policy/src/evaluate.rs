@@ -213,11 +213,33 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     None
                 }
                 Change::DropColumn { column, .. } => Some(&column.table),
-                Change::AlterColumnType { column, .. }
-                    if p.risks.contains(&RiskClass::Narrowing) =>
+                // Narrowing, and tightening to NOT NULL: the rule's own words
+                // are "drop **or narrow**", and a column that stops accepting
+                // NULL accepts less than it did — `intrinsic_risks` calls it
+                // "the same data hazard as tightening an existing nullable
+                // column". A type change folds a nullability change into
+                // itself (§12), so it carries `NotNull` rather than
+                // `Narrowing` when that is all it does (DECISIONS 173).
+                Change::AlterColumnType {
+                    column,
+                    from_nullable,
+                    to_nullable,
+                    ..
+                } if p.risks.contains(&RiskClass::Narrowing)
+                    || (*from_nullable && !*to_nullable) =>
                 {
                     Some(&column.table)
                 }
+                // Keyed on the change, not on `RiskClass::NotNull`: a NOT NULL
+                // column *addition* with no value source carries that risk too
+                // (SPEC §7.1), and it is an add. Asking the risk would make one
+                // added column both sides of the pattern and fire the rule on
+                // it alone.
+                Change::AlterColumnNullability {
+                    column,
+                    to_nullable: false,
+                    ..
+                } => Some(&column.table),
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
                 | Change::DropTable { .. }
@@ -568,6 +590,82 @@ mod tests {
         // The negative cases: one of the two alone is not a contraction.
         assert!(plan(&cs(vec![add]), &Policies::default(), &ctx()).is_empty());
         assert!(plan(&cs(vec![drop]), &Policies::default(), &ctx()).is_empty());
+    }
+
+    /// A column that stops accepting NULL accepts less than it did, which is
+    /// the "narrow" half of the rule's own words. Both spellings of it were
+    /// missing: the change of its own, and the type change that folds one in
+    /// and so carries `NotNull` rather than `Narrowing` (DECISIONS 173).
+    #[test]
+    fn tightening_to_not_null_is_the_contraction_half_too() {
+        let add = PlannedChange::new(Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: table(),
+            name: "full_name".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        });
+        let tighten = PlannedChange::new(Change::AlterColumnNullability {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: table().column("name"),
+            ty: "int".parse().unwrap(),
+            to_nullable: false,
+        });
+        // A widening type change that also tightens: `Narrowing` is not among
+        // its risks, and it is still a contraction.
+        let widen_and_tighten = PlannedChange::new(Change::AlterColumnType {
+            uid: "c_cccccc".parse().unwrap(),
+            column: table().column("n"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: false,
+        });
+        assert!(
+            !widen_and_tighten.risks.contains(&RiskClass::Narrowing),
+            "the premise: {:?}",
+            widen_and_tighten.risks
+        );
+
+        for contraction in [tighten.clone(), widen_and_tighten] {
+            let f = plan(
+                &cs(vec![add.clone(), contraction]),
+                &Policies::default(),
+                &ctx(),
+            );
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(f[0].1.id, "change.expand-contract", "{f:?}");
+        }
+
+        // Loosening is not: a column that starts accepting NULL accepts more.
+        let loosen = PlannedChange::new(Change::AlterColumnNullability {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: table().column("name"),
+            ty: "int".parse().unwrap(),
+            to_nullable: true,
+        });
+        assert!(plan(&cs(vec![add.clone(), loosen]), &Policies::default(), &ctx()).is_empty());
+
+        // And neither half alone is the pattern. A NOT NULL column *addition*
+        // carries `RiskClass::NotNull` as well (SPEC §7.1) — asking the risk
+        // rather than the change would make that one change both sides and
+        // fire on it alone.
+        let add_not_null = PlannedChange::new(Change::AddColumn {
+            uid: "c_dddddd".parse().unwrap(),
+            table: table(),
+            name: "full_name".into(),
+            column: Box::new({
+                let mut c = Column::new("int".parse().unwrap());
+                c.nullable = false;
+                c
+            }),
+        });
+        assert!(
+            add_not_null.risks.contains(&RiskClass::NotNull),
+            "the premise: {:?}",
+            add_not_null.risks
+        );
+        assert!(plan(&cs(vec![add_not_null]), &Policies::default(), &ctx()).is_empty());
+        assert!(plan(&cs(vec![tighten]), &Policies::default(), &ctx()).is_empty());
     }
 
     #[test]

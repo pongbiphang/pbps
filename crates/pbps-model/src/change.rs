@@ -532,6 +532,27 @@ pub enum RowAfter<'a> {
     Gone,
 }
 
+/// Which attribute of a column a change moves.
+///
+/// A caller excluding what a plan does from a before/after comparison has to
+/// exclude exactly that. Per *column* the exclusion was wider than its reason:
+/// only the engine's stored form can say what a retyped column became, but
+/// that column's default, identity and nullability still came back from two
+/// reads, and excusing the whole value meant nothing compared them
+/// (DECISIONS 173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ColumnField {
+    /// The column is on one side of the comparison only — added, dropped, or
+    /// under another name — so there is no pair of values to compare at all.
+    Whole,
+    Type,
+    Nullable,
+    Default,
+    /// Named for exhaustiveness rather than because a comparison turns on it:
+    /// deprecation emits no statement and no catalog reads it back.
+    Deprecated,
+}
+
 /// Which of a table's named parts a change is about.
 ///
 /// The kind travels with the name because the engine keeps indexes and
@@ -880,18 +901,48 @@ impl Change {
     // Exhaustive rather than a wildcard, for the reason [`Change::columns`]
     // gives: a change added later that alters a column has to be named here,
     // or the plan's own edit is reported as movement.
-    pub fn columns_redefined(&self) -> Vec<ColumnRef> {
+    pub fn columns_redefined(&self) -> Vec<(ColumnRef, ColumnField)> {
         match self {
-            Change::AddColumn { table, name, .. } => vec![table.column(name)],
+            Change::AddColumn { table, name, .. } => {
+                vec![(table.column(name), ColumnField::Whole)]
+            }
             Change::RenameColumn {
                 table, from, to, ..
-            } => vec![table.column(from), table.column(to)],
-            Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnNullability { column, .. } => vec![column.clone()],
-            Change::SetColumnDeprecated { .. }
-            | Change::CreateTable { .. }
+            } => vec![
+                (table.column(from), ColumnField::Whole),
+                (table.column(to), ColumnField::Whole),
+            ],
+            Change::DropColumn { column, .. } => vec![(column.clone(), ColumnField::Whole)],
+            // The type, and the nullability only where it actually moves:
+            // `ALTER COLUMN` restates the whole definition (§12), so the
+            // statement carries both, but a restatement that changes nothing
+            // leaves a value two reads still agree on.
+            Change::AlterColumnType {
+                column,
+                from_nullable,
+                to_nullable,
+                ..
+            } => {
+                let mut out = vec![(column.clone(), ColumnField::Type)];
+                if from_nullable != to_nullable {
+                    out.push((column.clone(), ColumnField::Nullable));
+                }
+                out
+            }
+            // Not the type: the differ emits this change only where the type
+            // is unchanged, and the statement restates the one it read.
+            // Measured: `ALTER COLUMN` leaves the default constraint's stored
+            // definition untouched, so that stays comparable too.
+            Change::AlterColumnNullability { column, .. } => {
+                vec![(column.clone(), ColumnField::Nullable)]
+            }
+            Change::AlterColumnDefault { column, .. } => {
+                vec![(column.clone(), ColumnField::Default)]
+            }
+            Change::SetColumnDeprecated { column, .. } => {
+                vec![(column.clone(), ColumnField::Deprecated)]
+            }
+            Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }

@@ -2254,3 +2254,44 @@ SPEC is in sync with all of these.
     `==`.
     `SCHEMA_VERSION` goes to 5 for the reason it exists: an editor notices, in
     the way that matters most to it.
+
+173. **An exclusion the size of its reason: per field, not per column — and
+    "narrow" includes NOT NULL.**
+    **The column.** 166 made a touched table's shape comparable and excused
+    the columns the plan moves; 170 gave that exclusion its own question. Both
+    excused the whole `Column`. The reason is smaller than that: only the
+    engine's stored form can say what a *retyped* column became, which is why
+    the type is excused at all — but that column's default, nullability,
+    identity and description still came back from two reads, like everything
+    else on the table. So a default another session added beside the plan's
+    own `ALTER COLUMN` was recorded as this plan's result, and `verify`
+    reported clean ever after. `ColumnField` makes the exclusion field-sized.
+    This is the third form of one lesson, and worth stating as the general
+    rule: **an exclusion is correct only where something else does the
+    checking, and it must be no wider than the thing that is unknowable.** 160
+    found the first, 168 the second ("every time this guard excludes
+    something, the next question is what checks it instead"), and this one
+    says the exclusion's *shape* is part of the question, not only its
+    existence.
+    Two things fell out of asking which fields actually move. A type change
+    folds a nullability change into itself (§12), so it excuses the
+    nullability only where `from_nullable != to_nullable` — a restatement that
+    changes nothing leaves a value two reads still agree on. And measured on
+    the engine: `ALTER COLUMN` leaves the default constraint's stored
+    definition untouched, so a retyped column still answers for its default.
+    Identity and description are excused by nothing at all, because no change
+    in this model moves either; the whole-column exclusion had been hiding
+    both.
+    **The contraction.** `change.expand-contract` counted a drop and a
+    narrowing type change, and its own description says "add and drop **or
+    narrow**". A column that stops accepting NULL accepts less than it did —
+    `intrinsic_risks` calls it "the same data hazard as tightening an existing
+    nullable column" — and it was neither half. Two spellings were missing:
+    `AlterColumnNullability` to NOT NULL, and the type change that folds one
+    in, which then carries `NotNull` rather than `Narrowing`. A project
+    raising the rule to `error` could still ship exactly the plan it forbids.
+    Keyed on the change and not on `RiskClass::NotNull`, deliberately: a NOT
+    NULL column *addition* with no value source carries that risk too
+    (SPEC §7.1), and it is an add. Asking the risk would make one added column
+    both sides of the pattern and fire the rule on it alone — which is why the
+    named arms in that match are worth the length they cost.
