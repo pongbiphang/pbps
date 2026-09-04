@@ -188,7 +188,10 @@ jobs:
 
   # ---- the deployment layer: on a tag, against prod as queried ----
   plan:
-    if: startsWith(github.ref, 'refs/tags/prod-v')
+    # The event as well as the ref: the approver dispatches the apply *from
+    # this same tag*, and a ref-only condition would start a second plan
+    # against production alongside the deployment being approved.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/prod-v')
     runs-on: ubuntu-latest
     # An environment with no reviewers, whose deployment *tag* rule is
     # `prod-v*`: that is what makes the credential below an environment secret
