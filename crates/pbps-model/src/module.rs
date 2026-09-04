@@ -184,6 +184,16 @@ pub(crate) fn code_without_quoted_identifiers(definition: &str) -> String {
     lexical_code(definition, false)
 }
 
+/// The characters SQL Server's lexer takes as the end of a `--` comment.
+///
+/// Exactly these two. The others that look like candidates — NEL (U+0085),
+/// LINE SEPARATOR (U+2028), form feed and vertical tab — were tried against
+/// the engine and left the comment open, so treating them as line endings here
+/// would blank code the engine runs.
+fn is_line_ending(ch: char) -> bool {
+    ch == '\n' || ch == '\r'
+}
+
 fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     enum At {
         Code,
@@ -205,11 +215,15 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     let mut out = String::with_capacity(definition.len());
     let mut at = At::Code;
     let bytes = definition.as_bytes();
-    // A newline always survives: it ends a line comment, and the `GO` check
-    // reads lines.
+    // A line ending always survives: it ends a line comment, and the `GO`
+    // check reads lines. Both `\n` and `\r` count, because the engine ends a
+    // `--` comment at either — measured, not assumed: a bare CR terminated it,
+    // while NEL, U+2028, form feed and vertical tab did not. Blanking the CR
+    // to a space would make `-- note\rNULL` read as one long comment, and a
+    // required column with that default would skip the gate and fail at apply.
     fn blank(out: &mut String, ch: char) {
-        if ch == '\n' {
-            out.push('\n');
+        if is_line_ending(ch) {
+            out.push(ch);
         } else {
             for _ in 0..ch.len_utf8() {
                 out.push(' ');
@@ -247,7 +261,7 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
                 }
             }
             At::Line => {
-                if ch == '\n' {
+                if is_line_ending(ch) {
                     at = At::Code;
                 }
                 blank(&mut out, ch);
@@ -711,6 +725,43 @@ mod tests {
             "SELECT * FROM \"dbo\".\"active_customer\"",
             &target
         ));
+    }
+
+    /// The engine ends a `--` comment at a bare carriage return, so a scan
+    /// that waited for `\n` blanked real code: the name after the CR is a
+    /// reference the engine resolves, and a `NULL` after it is the keyword.
+    /// The other vertical-whitespace characters were measured *not* to end
+    /// the comment, and the scan must agree in that direction too — or it
+    /// would invent a reference from text the engine never reads.
+    #[test]
+    fn a_carriage_return_ends_a_line_comment_and_other_vertical_whitespace_does_not() {
+        let target: ObjectName = "dbo.active_customer".parse().unwrap();
+        assert!(references(
+            "SELECT 1 -- note\rUNION ALL SELECT id FROM dbo.active_customer",
+            &target
+        ));
+        assert!(references(
+            "SELECT 1 -- note\r\nUNION ALL SELECT id FROM dbo.active_customer",
+            &target
+        ));
+        assert_eq!(
+            code_only("a -- b\rc\r\nd"),
+            "a     \rc\r\nd",
+            "line endings survive so line structure does"
+        );
+        for (name, separator) in [
+            ("NEL", '\u{85}'),
+            ("LINE SEPARATOR", '\u{2028}'),
+            ("form feed", '\u{0c}'),
+            ("vertical tab", '\u{0b}'),
+        ] {
+            let definition =
+                format!("SELECT 1 -- note{separator}UNION ALL SELECT id FROM dbo.active_customer");
+            assert!(
+                !references(&definition, &target),
+                "{name} does not end a line comment on the engine"
+            );
+        }
     }
 
     /// An ordering edge that silently does not exist is the failure this check

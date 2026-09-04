@@ -307,6 +307,27 @@ fn a_null_default_does_not_bypass_the_required_column_gate() {
     assert!(text.contains("--allow not-null"), "{text}");
 }
 
+/// A YAML double-quoted scalar can carry a bare `\r`, and the engine ends a
+/// `--` comment there. Read as one long comment, the `NULL` after it vanished
+/// from the value-source scan, the gate was skipped, and the apply failed on
+/// the first existing row.
+#[test]
+fn a_null_default_behind_a_carriage_return_does_not_bypass_the_required_column_gate() {
+    let d = Demo::new("add-required-cr-null-default");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false, default: \"-- carried over\\rNULL\"}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = stdout(&o);
+    assert!(text.contains("not-null"), "{text}");
+    assert!(text.contains("--allow not-null"), "{text}");
+}
+
 #[test]
 fn an_invalid_declaration_is_rejected() {
     let d = Demo::new("invalid");

@@ -107,6 +107,22 @@ An absent table gives **Msg 208** on that same statement. `HAS_PERMS_BY_NAME` �
 the natural repair — answers 0 for both cases, so only attempting the statement
 separates them. Measurement changed the fix here, it did not merely confirm it.
 
+A `--` comment ends at a bare carriage return, and at nothing else that looks
+like a line ending. The lexical scan behind the value-source check and the
+module dependency scan waited for `\n`, so `-- note\rNULL` read as one long
+comment and a required column with that default skipped the gate. Measured with
+`EXEC` of a variable holding the character (plain `EXEC('…' + CHAR(13))` is
+refused — see above):
+
+| character after `-- c` | `SELECT 1 AS a -- c<char>, 2 AS b` returns |
+|---|---|
+| CR (`CHAR(13)`) | **two columns** — the comment ended |
+| LF (`CHAR(10)`) | two columns |
+| NEL (`NCHAR(133)`), U+2028, form feed, vertical tab | one column — still a comment |
+
+And the consequence the check exists to prevent: `ALTER TABLE … ADD c int NOT
+NULL DEFAULT --x<CR>NULL` on a table with one row fails with **Msg 515**.
+
 ## `shell_arg` has been wrong about shells five times
 
 **The test written to pin the second fix asserted the bug.**

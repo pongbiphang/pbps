@@ -339,9 +339,14 @@ mod tests {
             "(NULL) + 1",
             "NULLIF(1, 1)",
             "TRY_CONVERT(int, 'not a number')",
+            // A bare CR ends a line comment on the engine (a YAML `"\r"`
+            // escape gets one there), so what follows it is the keyword.
+            "-- carried over\rNULL",
+            "-- carried over\r\nNULL",
+            "-- carried over\nNULL",
         ] {
             column.default = Some(default.into());
-            assert!(!column.has_required_add_value_source(), "{default}");
+            assert!(!column.has_required_add_value_source(), "{default:?}");
         }
 
         for default in [
@@ -358,6 +363,12 @@ mod tests {
             "NEXT VALUE FOR dbo.seq#null",
             "NEXT VALUE FOR dbo.序列null",
             "1 /* outer /* nested */ NULL */",
+            // These were measured not to end a comment; the engine sees a
+            // default of `1` and a long comment, and so must the scan.
+            "1 -- note\u{85}NULL",
+            "1 -- note\u{2028}NULL",
+            "1 -- note\u{0c}NULL",
+            "1 -- note\u{0b}NULL",
         ] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
