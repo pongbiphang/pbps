@@ -148,25 +148,40 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             table,
             key_column,
             key,
+            row,
+            types,
             ..
-        } => one(atomically(&format!(
-            // The guard, the delete and the checks after it are one
-            // transaction of their own (`atomically`): the range locks the
-            // guard takes have to be held through the delete they protect,
-            // and a staged apply runs each statement outside a transaction.
-            "{}\n\
-             DELETE FROM {} WHERE {} = {};\n\
-             {}\n\
-             {}",
-            crate::preflight::still_referenced(table, key_column, key)?,
-            qualified(table)?,
-            quote(key_column)?,
-            row_key(key),
-            exactly_one_row(table, key),
-            // And the row stayed gone: a trigger that put it back would
-            // otherwise be read back and recorded as this plan's result.
-            gone_row(table, key, key_column)?
-        ))),
+        } => {
+            // Keyed *and* held to the row the plan recorded. The checksum
+            // pins the state only up to the moment `apply` reads it, so a
+            // key-only DELETE removes whatever an application session left
+            // under that key in between, and `@@ROWCOUNT = 1` calls the loss
+            // a success. Each recorded cell is compared the way the read-back
+            // rendered it, exactly as an update's precondition does; a cell
+            // whose type has no comparison is carried and not held
+            // (DECISIONS 143).
+            let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+            for (column, cell) in row {
+                predicates.extend(recorded_cell(column, cell, types.get(column))?);
+            }
+            one(atomically(&format!(
+                // The guard, the delete and the checks after it are one
+                // transaction of their own (`atomically`): the range locks the
+                // guard takes have to be held through the delete they protect,
+                // and a staged apply runs each statement outside a transaction.
+                "{}\n\
+                 DELETE FROM {} WHERE {};\n\
+                 {}\n\
+                 {}",
+                crate::preflight::still_referenced(table, key_column, key)?,
+                qualified(table)?,
+                predicates.join(" AND "),
+                exactly_one_row(table, key),
+                // And the row stayed gone: a trigger that put it back would
+                // otherwise be read back and recorded as this plan's result.
+                gone_row(table, key, key_column)?
+            )))
+        }
 
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
@@ -2241,6 +2256,52 @@ mod tests {
         );
     }
 
+    /// The checksum pins the state up to the moment `apply` reads it, so the
+    /// row the plan recorded travels into the predicate: a row an application
+    /// rewrote in between is not the row that was reviewed (DECISIONS 143).
+    #[test]
+    fn a_delete_holds_the_row_to_what_the_plan_recorded() {
+        let sql = sql_of(&Change::DeleteRow {
+            table: tname("dbo.order_status"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: [
+                (
+                    "label".to_owned(),
+                    Cell::Value(Value::Text("Old".to_owned())),
+                ),
+                ("rank".to_owned(), Cell::Value(Value::Null)),
+                // No type, so nothing to compare it by: carried, not held.
+                (
+                    "shape".to_owned(),
+                    Cell::Value(Value::Text("POINT (1 1)".to_owned())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label".to_owned(), ty("nvarchar(50)")),
+                ("rank".to_owned(), ty("int")),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        assert!(
+            sql.contains("DELETE FROM [dbo].[order_status] WHERE [code] = N'old' AND "),
+            "{sql}"
+        );
+        // Each cell by the rendering that read it, and a NULL as IS NULL.
+        assert!(sql.contains("COLLATE Latin1_General_BIN2"), "{sql}");
+        assert!(sql.contains("[rank] IS NULL"), "{sql}");
+        assert!(!sql.contains("[shape]"), "{sql}");
+        // And still keyed, guarded and checked as before.
+        assert!(sql.contains(&stale("dbo.order_status", "old")), "{sql}");
+        assert!(sql.contains("WITH (HOLDLOCK)"), "{sql}");
+    }
+
     #[test]
     fn a_delete_is_keyed_on_the_primary_key_column() {
         let sql = sql_of(&Change::DeleteRow {
@@ -2248,6 +2309,8 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            row: BTreeMap::new(),
+            types: BTreeMap::new(),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
@@ -2466,6 +2529,8 @@ mod tests {
                 key_column: "code".to_owned(),
                 key: RowKey::from("a"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ] {
             assert!(!takes_online(&c), "{c:?}");

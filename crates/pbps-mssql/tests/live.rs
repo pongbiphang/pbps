@@ -1917,6 +1917,8 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
                 key_column: "code".to_owned(),
                 key: RowKey::from("ghost"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: std::collections::BTreeMap::new(),
+                types: std::collections::BTreeMap::new(),
             },
         )],
     };
@@ -2200,6 +2202,8 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         key_column: "code".to_owned(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
+        row: std::collections::BTreeMap::new(),
+        types: std::collections::BTreeMap::new(),
     });
     let alone = pbps_model::ChangeSet {
         changes: vec![delete.clone()],
@@ -2839,6 +2843,112 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     db.drop().await;
 }
 
+/// The baseline checksum pins the state up to the moment `apply` reads it,
+/// and the delete runs later still. A row an application session rewrote in
+/// between was, until the delete carried the recorded row in its predicate,
+/// removed as if it were the reviewed one — `@@ROWCOUNT = 1` and all
+/// (DECISIONS 143).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_one() {
+    use pbps_model::{Cell, RowKey, Value};
+
+    let mut db = TestDb::create("late_write").await;
+    for sql in [
+        "CREATE TABLE dbo.status (\n\
+             code varchar(10) NOT NULL CONSTRAINT pk_status PRIMARY KEY,\n\
+             label nvarchar(50) NULL,\n\
+             rank int NULL\n\
+         );",
+        "INSERT INTO dbo.status (code, label, rank) VALUES ('old', N'Old', 1);",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let delete = pbps_model::Change::DeleteRow {
+        table: TableName::new("dbo", "status"),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: [
+            (
+                "label".to_owned(),
+                Cell::Value(Value::Text("Old".to_owned())),
+            ),
+            ("rank".to_owned(), Cell::Value(Value::Int(1))),
+        ]
+        .into_iter()
+        .collect(),
+        types: [
+            ("label".to_owned(), ty("nvarchar")),
+            ("rank".to_owned(), ty("int")),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let sql = Mssql.emit(&delete, Default::default()).expect("emit")[0]
+        .sql
+        .clone();
+
+    // Another connection, as an application would: the row is rewritten
+    // after the plan was reviewed and before the delete runs.
+    let mut other = Conn::connect(&conn_str()).await.expect("second connection");
+    other
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    other
+        .execute("UPDATE dbo.status SET label = N'Renamed by the application' WHERE code = 'old';")
+        .await
+        .expect("an application rewrites the row");
+
+    let err = db
+        .conn
+        .execute(&sql)
+        .await
+        .expect_err("the delete refuses a row that is not the one reviewed");
+    assert!(
+        err.to_string()
+            .contains("changed or deleted since the plan was made"),
+        "{err}"
+    );
+
+    let mut c = Conn::connect(&conn_str()).await.expect("connect");
+    c.execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    let n: i32 = c
+        .query("SELECT COUNT(*) FROM dbo.status WHERE code = 'old';")
+        .await
+        .expect("count")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 1, "the application's row is still there");
+
+    // Put it back as the plan recorded it, and the same statement deletes it.
+    c.execute("UPDATE dbo.status SET label = N'Old' WHERE code = 'old';")
+        .await
+        .expect("restore");
+    db.conn
+        .execute(&sql)
+        .await
+        .expect("the reviewed row is deleted");
+    let n: i32 = c
+        .query("SELECT COUNT(*) FROM dbo.status WHERE code = 'old';")
+        .await
+        .expect("count")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "and it is gone");
+
+    db.drop().await;
+}
+
 /// The preflight probe counts before the first statement; the delete runs
 /// later. A child row committed in between was, until the delete carried a
 /// guard of its own, taken silently by `ON DELETE CASCADE` — and the closing
@@ -2869,6 +2979,8 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         key_column: "code".to_owned(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
+        row: std::collections::BTreeMap::new(),
+        types: std::collections::BTreeMap::new(),
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
@@ -3160,6 +3272,8 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         key_column: "code".to_owned(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
+        row: std::collections::BTreeMap::new(),
+        types: std::collections::BTreeMap::new(),
     };
     let sql_of = |change: &pbps_model::Change| {
         let stmts = Mssql.emit(change, Default::default()).expect("emit");

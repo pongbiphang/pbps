@@ -1463,6 +1463,8 @@ mod tests {
             key_column: "code".into(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            row: BTreeMap::new(),
+            types: BTreeMap::new(),
         }]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -1516,6 +1518,8 @@ mod tests {
             key_column: "code".into(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            row: BTreeMap::new(),
+            types: BTreeMap::new(),
         };
         let insert = |default: &str| Change::InsertRow {
             table: tname("dbo.kind"),
@@ -1651,6 +1655,8 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ]);
         let p = probes(&cs);
@@ -1719,6 +1725,8 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ]);
         let p = probes(&cs);
@@ -1781,12 +1789,16 @@ mod tests {
                 key_column: "id".into(),
                 key: RowKey::from("8"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ]);
         let p = probes(&cs);
@@ -1826,6 +1838,8 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ]);
         let p = probes(&cs);
@@ -1857,6 +1871,8 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         ]);
         assert!(probes(&cs).is_empty());

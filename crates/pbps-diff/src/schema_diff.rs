@@ -686,13 +686,36 @@ fn diff_data(
     if declared_data.mode == DataMode::Exact
         && let Some(base_rows) = base_rows
     {
-        for key in base_rows.keys() {
+        for (key, before) in base_rows {
             if !declared_data.rows.contains_key(key) {
+                // The recorded row travels with the delete, so the statement
+                // removes what the reviewer saw rather than whatever holds
+                // the key when it runs (DECISIONS 143). Read from the *base*
+                // table: the columns and types the recorded state has, under
+                // the names it knew them by.
+                let mut row = BTreeMap::new();
+                let mut types = BTreeMap::new();
+                // The base's own name for the key column: the delete's key
+                // lives in the map key, and on a renamed column the base
+                // spells it differently from the declaration.
+                let base_key = base_name_of.get(&key_column).map(String::as_str);
+                for (column, spec) in &base.columns {
+                    // The key is the map key, and a non-key IDENTITY is the
+                    // engine's — neither is a cell a row can be held to, for
+                    // the same reasons as in an update.
+                    if Some(column.as_str()) == base_key || spec.identity.is_some() {
+                        continue;
+                    }
+                    row.insert(column.clone(), cell(before, column, Some(spec)));
+                    types.insert(column.clone(), spec.ty.clone());
+                }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
                     key_column: key_column.clone(),
                     key: key.clone(),
                     cause: DeleteCause::Undeclared,
+                    row,
+                    types,
                 });
             }
         }
@@ -1992,6 +2015,33 @@ mod tests {
             .position(|c| c == "DeleteRow")
             .unwrap_or_else(|| panic!("{k:?}"));
         assert!(update < delete, "{k:?}");
+    }
+
+    /// The row a delete removes travels with it: `apply` checks the baseline
+    /// and then runs, and a row rewritten in between is not the row the
+    /// reviewer approved (DECISIONS 143).
+    #[test]
+    fn a_deleted_row_carries_the_cells_and_types_the_baseline_recorded() {
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+        let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+        let cs = run(&base, &declared, &[]);
+        let delete = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+        assert_eq!(
+            delete.0.get("label"),
+            Some(&pbps_model::Cell::Value(Value::Text("Old".to_owned())))
+        );
+        // The key is the delete's own key, not a cell; the type is the base's,
+        // so the predicate compares each cell the way the read-back rendered
+        // it.
+        assert!(!delete.0.contains_key("code"), "{:?}", delete.0);
+        assert_eq!(delete.1.get("label"), Some(&ty("nvarchar(50)")));
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently

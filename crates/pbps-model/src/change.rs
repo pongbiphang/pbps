@@ -406,6 +406,26 @@ pub enum Change {
         /// complete and this row is not in it. Recorded because the two reasons
         /// read very differently at the gate.
         cause: DeleteCause,
+        /// The row as the baseline recorded it, so the `DELETE` removes the
+        /// row that was reviewed and not whatever stands under that key when
+        /// it runs.
+        ///
+        /// The checksum pins the state only up to the moment `apply` reads
+        /// it: an application session that rewrites this row in between
+        /// leaves a key-only `DELETE` deleting the new version and
+        /// `@@ROWCOUNT = 1` calling it the reviewed one — an unreviewed loss
+        /// the apply then records as its own result. An update holds every
+        /// declared cell for exactly this reason (136); a delete has more to
+        /// lose, since what it removes cannot be compared afterwards
+        /// (DECISIONS 143). Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        row: BTreeMap<String, Cell>,
+        /// The type each recorded cell was read by, so the predicate compares
+        /// it the way the read-back rendered it (122). A cell whose type has
+        /// no comparison — `xml`, `text`, the spatial types — is carried but
+        /// not held, exactly as in an update.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        types: BTreeMap<String, ColumnType>,
     },
     /// `exact` <-> `ensure`. It emits no SQL by itself — the row changes it
     /// implies are separate entries — but it is a change to the declaration

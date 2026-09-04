@@ -1381,3 +1381,22 @@ SPEC is in sync with all of these.
     "Bootstrapped: 0 table(s) created", reported as success — and named as
     drift by the `verify` immediately after. Both halves ask the server the
     same question, so both are refused by the same check.
+
+143. **A row delete is keyed *and* held to the row the plan recorded.** The
+    baseline checksum pins the environment up to the moment `apply` reads it,
+    and the `DELETE` runs later still — after the lock is taken, but an
+    application session writes to these tables all the same. A key-only
+    `DELETE` therefore removed whatever stood under the key when it ran, and
+    `@@ROWCOUNT = 1` reported that as the reviewed row: an unreviewed loss the
+    apply then recorded as its own result. Measured by reverting the predicate
+    and rewriting the row from a second connection mid-statement — the delete
+    succeeded and took the application's version with it. An update has held
+    every declared cell since 136; a delete has more to lose, because what it
+    removes cannot be compared afterwards. So `DeleteRow` carries the
+    baseline's cells and the types they were read by, and the predicate is
+    built by the same `recorded_cell` the update's precondition uses: each
+    cell compared by the rendering that read it, a NULL as `IS NULL`, and a
+    cell whose type has no comparison (`xml`, `text`, the spatial types)
+    carried but not held — the same limit, in the same place, as an update's.
+    A mismatch is `@@ROWCOUNT <> 1`, which already says "changed or deleted
+    since the plan was made. Plan again."
