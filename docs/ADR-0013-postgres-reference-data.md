@@ -419,10 +419,37 @@ and ADR-0012 §4 already measured a fifth, `TimeZone`, deciding whether a type
 change rebuilds a table.
 
 **Decision: these settings are scoped to the statements that carry *values*, not
-pinned on the session.** Set **and restored** around every statement where pbps
-is responsible for a value's text — the reference-data read-back, the catalog
-reads that return value text, **and the reference-data DML** — leaving opaque
-DDL to run under whatever the operator's database has.
+pinned on the session, and not wrapped around the writes at all.**
+
+- **Reads** — the reference-data read-back and the catalog reads that return
+  value text — run inside the canonical scope, set and restored. A read executes
+  no user code, so the scope reaches nothing but the rendering it is for.
+- **Writes** carry their canonicalization *in the values themselves*: the DML
+  pbps emits renders each value as an unambiguous typed literal, or binds it as
+  a parameter. **No session setting is changed around a write.**
+- **Opaque DDL** runs under whatever the operator's database has, as before.
+
+The write half was a session scope in an earlier version, and **measured, a
+scope around a statement is also a scope around everything that statement
+fires**:
+
+```
+-- the same trigger, the same literal '01/02/2026'::date, two rows
+inserted inside pbps's scoped ISO, DMY:      the trigger wrote 2026-02-01
+inserted under the database's ISO, MDY:      the trigger wrote 2026-01-02
+```
+
+§3 has already established that a PL/pgSQL body resolves and parses when it
+*runs*; a scope held over the `INSERT` is therefore held over the user's trigger
+too, and pbps ends up deciding what somebody else's code means. Canonicalizing
+the values instead reaches exactly as far as it should: pbps's own text, and
+nothing the engine does with it afterwards.
+
+That measurement took two attempts, and the first said the opposite: run in one
+session, the trigger's plan was cached from its first execution under the
+database's own `DateStyle`, so the scope appeared not to reach it. Plan caching
+masks a per-session effect, and the two rows above had to be inserted from two
+fresh connections.
 
 **`SET LOCAL` is not enough on its own, because it is transaction-scoped and a
 plan is one transaction.** **Measured**, the setting outlives the statement it
@@ -465,7 +492,28 @@ value pbps renders into a plan and parses back is the tool's responsibility, and
 a module body is the user's — so the first is canonicalized on both sides and
 the second is left as the operator's database reads it.
 
-Named, because a decision about a set has to say what is in it:
+Named **with values**, because a decision about a set has to say what is in it
+and what each one is set to — and the read scope is worth nothing if the
+implementation has to guess between `MDY` and `DMY`:
+
+| Setting | Canonical value | |
+|---|---|---|
+| `DateStyle` | `ISO, YMD` | unambiguous in and out |
+| `IntervalStyle` | `iso_8601` | `P1DT2H`, no locale in it |
+| `bytea_output` | `hex` | |
+| `TimeZone` | `UTC` | |
+| `timezone_abbreviations` | `Default` | |
+| `extra_float_digits` | `3` | **measured**, `double precision` and `real` both round-trip through their text at this value; `0` is lossy |
+| `standard_conforming_strings` | `on` | ADR-0011's scanner rule is true only here |
+
+**Measured**, one row written and read back under exactly those values:
+
+```
+2026-01-02 | P1DT2H | \x0102 | 0.12345678901234568 | 0.12345678 | 2026-01-15 12:00:00+00
+float round-trips: true, real round-trips: true
+```
+
+And what each setting does to a value, which is why it is on the list at all:
 
 | Setting | Why it is in the read scope |
 |---|---|
@@ -789,7 +837,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the canonical settings are set **and restored** around **every statement that carries a value** — the reference-data read-back, the catalog reads that return value text, **and the reference-data DML** — while opaque DDL runs under the settings the operator's database has. `SET LOCAL` alone would not do it: it is transaction-scoped, and a plan is one transaction |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all: the canonical settings (with their values, §3) are set and restored around the **reads** that render values, the **writes** carry their canonicalization in the values themselves as unambiguous typed literals or bound parameters, and opaque DDL runs under whatever the operator's database has. A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |

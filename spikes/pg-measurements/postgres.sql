@@ -931,6 +931,24 @@ SELECT 'A65', 'and recreating that caller with its stale reference',
        m.accepts('CREATE OR REPLACE FUNCTION m.oo_sqlcaller() RETURNS int AS $q$ SELECT m.oo_f(1) $q$ LANGUAGE sql')
        || ' — the engine checks only when it creates';
 
+-- ---------------------------- the twenty-ninth 2026-09-05 review round
+-- The trigger half needs two fresh connections (plan caching masks it in one)
+-- and is quoted in ADR-0013 §3.
+
+SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'iso_8601'; SET bytea_output = 'hex';
+SET extra_float_digits = 3; SET TimeZone = 'UTC'; SET timezone_abbreviations = 'Default';
+CREATE TABLE m.canon (d date, i interval, b bytea, f double precision, r real, t timestamptz);
+INSERT INTO m.canon VALUES ('2026-01-02', '1 day 2 hours', '\x0102',
+                            0.1234567890123456789, 0.12345678, '2026-01-15 12:00:00+00');
+SELECT 'R70', 'one row rendered under the canonical values',
+       (SELECT d::text || ' | ' || i::text || ' | ' || b::text || ' | '
+               || f::text || ' | ' || r::text || ' | ' || t::text FROM m.canon);
+SELECT 'R71', 'and whether the floats survive that text',
+       (SELECT 'double precision: ' || (f::text::double precision = f)::text
+               || ', real: ' || (r::text::real = r)::text FROM m.canon);
+RESET DateStyle; RESET IntervalStyle; RESET bytea_output;
+RESET extra_float_digits; RESET TimeZone; RESET timezone_abbreviations;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

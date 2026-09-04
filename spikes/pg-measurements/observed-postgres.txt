@@ -166,3 +166,5 @@ A62 | reverse pg_depend edges to a callee with a SQL-language caller | none
 A63 | a callee-only rebuild, which never recreates the caller | accepted / accepted
 A64 | the unchanged SQL-language caller afterwards | refused: function m.oo_f(integer) does not exist
 A65 | and recreating that caller with its stale reference | refused: function m.oo_f(integer) does not exist — the engine checks only when it creates
+R70 | one row rendered under the canonical values | 2026-01-02 | P1DT2H | \x0102 | 0.12345678901234568 | 0.12345678 | 2026-01-15 12:00:00+00
+R71 | and whether the floats survive that text | double precision: true, real: true
