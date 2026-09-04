@@ -1004,6 +1004,108 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
 
+/// A probe runs before the first statement, so a column the same plan is
+/// *adding* is not there to be read — and every probe over one was
+/// `Msg 207, Invalid column name`, which the runner reports as unchecked and
+/// the apply then proceeds past (DECISIONS 124, 171).
+///
+/// Live because every claim in that fix is a claim about this engine: that
+/// naming the column throws, that `ADD col NULL DEFAULT x` leaves the existing
+/// rows NULL while `NOT NULL DEFAULT` backfills them, and that the counts the
+/// substituted probes report are the ones the constraints would refuse. A unit
+/// test can only check that the SQL says what I think it says.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refuses() {
+    use pbps_dialect::Dialect;
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("addedcol").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.region (region_id varchar(10) NOT NULL CONSTRAINT pk_r PRIMARY KEY);
+             CREATE TABLE dbo.customer (id int NOT NULL);
+             INSERT INTO dbo.region VALUES ('eu');
+             INSERT INTO dbo.customer VALUES (1), (2), (3);",
+        )
+        .await
+        .expect("create");
+
+    let add = |nullable: bool, default: Option<&str>| {
+        let mut column = pbps_model::Column::new(ty("varchar(10)"));
+        column.nullable = nullable;
+        column.default = default.map(str::to_owned);
+        PlannedChange::new(Change::AddColumn {
+            uid: "c_cccccc".parse().unwrap(),
+            table: TableName::new("dbo", "customer"),
+            name: "region_id".into(),
+            column: Box::new(column),
+        })
+    };
+    let unique = PlannedChange::new(Change::AddUnique {
+        table: TableName::new("dbo", "customer"),
+        name: "uq_region".into(),
+        constraint: UniqueConstraint {
+            columns: vec!["region_id".into()],
+        },
+    });
+    let fk = PlannedChange::new(Change::AddForeignKey {
+        table: TableName::new("dbo", "customer"),
+        name: "fk_customer_region".into(),
+        constraint: Box::new(ForeignKey {
+            columns: vec!["region_id".into()],
+            references_table: TableName::new("dbo", "region"),
+            references_columns: vec!["region_id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        }),
+    });
+
+    let mut counts = Vec::new();
+    for (label, changes) in [
+        // Nullable: the engine backfills nothing, so all three rows are NULL —
+        // exempt from the foreign key, and one NULL too many for the unique.
+        (
+            "nullable",
+            vec![add(true, Some("'zz'")), unique.clone(), fk.clone()],
+        ),
+        // NOT NULL with a constant default: all three rows are backfilled with
+        // it, so all three collide and all three reference a real parent.
+        (
+            "backfilled",
+            vec![add(false, Some("'eu'")), unique.clone(), fk.clone()],
+        ),
+        // The same, pointing at a parent row that is not there.
+        ("orphaned", vec![add(false, Some("'us'")), unique, fk]),
+    ] {
+        for probe in Mssql.preflight(&ChangeSet { changes }) {
+            let rows = db.conn.query(&probe.sql).await.unwrap_or_else(|e| {
+                panic!("the engine rejected a probe ({label}):\n{}\n{e}", probe.sql)
+            });
+            let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+            counts.push((label, probe.description, n));
+        }
+    }
+    db.drop().await;
+
+    let by = |label: &str, needle: &str| {
+        counts
+            .iter()
+            .find(|(l, d, _)| *l == label && d.contains(needle))
+            .unwrap_or_else(|| panic!("no `{needle}` probe for {label} in {counts:?}"))
+            .2
+    };
+    // Three rows share one value, whichever value it is: the unique refuses
+    // all three, and `GROUP BY` cannot be asked — every row agrees.
+    assert_eq!(by("nullable", "collide"), 3, "{counts:?}");
+    assert_eq!(by("backfilled", "collide"), 3, "{counts:?}");
+    // NULL references are the ones a foreign key exempts.
+    assert_eq!(by("nullable", "parent"), 0, "{counts:?}");
+    assert_eq!(by("backfilled", "parent"), 0, "{counts:?}");
+    // And the backfilled value that has no parent row is three orphans.
+    assert_eq!(by("orphaned", "parent"), 3, "{counts:?}");
+}
+
 /// The permission check against a real least-privilege login.
 ///
 /// This is the shape the check exists for and the shape no unit test can

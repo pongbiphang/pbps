@@ -172,6 +172,30 @@ default" into "omitted", and a row that spelled a value equal to its default
 compared unequal to itself on every plan. The catalog cannot know how a row
 was written; only the side reading it can (decision 67).
 
+## A probe reads a state that is not there yet
+
+Every probe runs **before the first statement**, so it may only name what the
+catalog holds *now*. `AsStored` exists for that and translates renames — but a
+column the plan **adds** is a state the probe cannot read at all, and
+`AsStored::column` used to fall back to the declared name, so three probes
+asked the engine about a column that would not exist for another few
+milliseconds.
+
+The tell is that the failure is silent in the direction that matters: an
+invalid probe throws, a throw is reported as *unchecked*, and an unchecked
+probe does not stop an apply. The check most worth having — a unique
+constraint or a foreign key over a column that has *just* arrived, where every
+existing row holds the same value — was the one guaranteed to be skipped.
+
+What such a row will hold is knowable without asking, and the rule is an
+engine fact worth keeping written down: **SQL Server backfills only a NOT NULL
+column.** `ADD col NULL DEFAULT x` leaves every existing row at NULL. So a
+nullable addition reads as `NULL`, a NOT NULL one as its default, and a
+default no probe can evaluate reads as no answer at all. Substituting is not
+always literal: `GROUP BY NULL` is `Msg 164` — a constant groups nothing, so
+it leaves the `GROUP BY` list instead, and an empty list means every row is in
+one group.
+
 ## An exclusion wider than its reason
 
 The pre-delete probe left out every child row the plan *updated*, because a
@@ -264,6 +288,10 @@ ledger or the permission checks.
 - Three permission bugs that survived the first live test because `sa` holds
   `CONTROL`. The permission matrix now runs against **real least-privilege
   logins** created inside the container.
+- A probe naming a column the same plan is *adding*: `Msg 207, Invalid column
+  name`, which the runner reports as unchecked and the apply proceeds past. The
+  unit suite could only ever check that the SQL said what its author thought it
+  said — and it did.
 
 ## Tests that pass for the wrong reason
 

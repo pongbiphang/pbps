@@ -2187,3 +2187,41 @@ SPEC is in sync with all of these.
     that way the guard is what to revisit. **A hazard made unrepresentable
     still needs the invariant written down** — otherwise the next reader adds
     the case, or removes the rule.
+
+171. **A probe may only name what the catalog holds now — and a column this
+    plan adds is not that.**
+    Found by sweeping 170's shape rather than reported: `rows_after` had just
+    been taught that a relation missing a row is not that table's contents,
+    and the same function was building the stored branch out of
+    `alias.[column]` for a column the plan had yet to add. `AsStored` exists
+    to translate a plan's names into the catalog's, and `AsStored::column`
+    falls back to the declared name when it knows no other — which is right
+    for a rename and wrong for an addition. Measured: the probe fails with
+    `Msg 207, Invalid column name`. A probe that throws is reported as
+    unchecked and the apply proceeds (124), so the effect is the silence, not
+    a failure.
+    It was three probes, not one: the foreign-key relation, `AddUnique`'s
+    duplicate probe and `SetPrimaryKey`'s null and duplicate probes. And the
+    skipped check is precisely the one worth having — a key over a column that
+    has just arrived, where every existing row holds the same value in it, is
+    the case that *fails*.
+    What those rows will hold needs no asking, and the rule is an engine fact:
+    **SQL Server backfills only a NOT NULL column.** Measured on 2025 —
+    `ADD col NULL DEFAULT 'zz'` leaves every existing row NULL, while
+    `ADD col NOT NULL DEFAULT 'yy'` writes `yy` into all of them, which is
+    also why NOT NULL is the only kind whose value source the engine insists
+    on (`has_required_add_value_source`). So `Added` is three cases: `Null`,
+    `Backfilled(constant)`, and `Unspellable` for an identity or a default
+    that is not a constant — the same three-way answer an unprobeable default
+    gets everywhere else (117).
+    Substitution is not uniformly literal, which is the part only the engine
+    could say. A constant is fine in a `SELECT` list and in `WHERE x IS NULL`,
+    but `GROUP BY NULL` is `Msg 164, Each GROUP BY expression must contain at
+    least one column that is not an outer reference`. A column every row
+    agrees on groups nothing, so it leaves the `GROUP BY` list altogether —
+    grouping by `(a, k)` where every row shares `k` is grouping by `(a)` — and
+    an empty list means one group holding every row, which is
+    `CASE WHEN COUNT(*) > 1 THEN COUNT(*) ELSE 0 END`.
+    The live test is the point of this entry. Every claim above is a claim
+    about the engine, and a unit test can only confirm that the SQL says what
+    I think it says — which it did, while the engine refused it.

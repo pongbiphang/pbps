@@ -51,6 +51,28 @@ pub fn probes(changes: &ChangeSet) -> Vec<Probe> {
         .collect()
 }
 
+/// What every row *already in the table* holds in a column this plan adds.
+///
+/// A probe runs before any statement, so naming such a column against the
+/// stored table is `Msg 207, Invalid column name` — measured — and a probe
+/// that throws is reported as unchecked and the apply proceeds, which is the
+/// silence DECISIONS 124 is about. What those rows will hold is knowable
+/// without asking, and measured on SQL Server 2025: `ADD col NULL DEFAULT x`
+/// leaves every existing row at NULL, because the engine backfills only a
+/// NOT NULL column — which is also the only kind whose value source it
+/// insists on (`has_required_add_value_source`) (DECISIONS 171).
+#[derive(Debug)]
+enum Added {
+    /// Nullable: NULL in every stored row, whatever default it declares.
+    Null,
+    /// NOT NULL with a constant default: that default, in every stored row.
+    Backfilled(String),
+    /// A value no probe can evaluate before the `ALTER` runs: an identity, or
+    /// a default that is not a constant (117). No answer, as everywhere else
+    /// one of those reaches.
+    Unspellable,
+}
+
 /// Translates the names a plan uses into the names the database still has.
 ///
 /// Probes run before the first statement, so every object they mention has to
@@ -88,6 +110,10 @@ struct AsStored {
     /// already holds its final type, and the engine coerces a literal to it
     /// the same way the `INSERT` will.
     types: BTreeMap<ColumnRef, ColumnType>,
+    /// Columns this plan adds to a table that is already there, and what a
+    /// row already in it will hold in one. See [`Added`]: not `alias.[name]`,
+    /// because the column is not there when the probe runs.
+    added: BTreeMap<ColumnRef, Added>,
     /// The foreign keys this plan takes away before the deletes run: a
     /// `DropForeignKey`, and every key into the table a `DropTable` removes.
     /// Both sort before `DeleteRow` (`order_key`), so counting a child
@@ -225,6 +251,18 @@ impl AsStored {
                     ..
                 } => {
                     this.types.insert(table.column(name), column.ty.clone());
+                    // Nullable first: the engine backfills only a NOT NULL
+                    // column, so a declared default on a nullable one reaches
+                    // no row that is already there (DECISIONS 171).
+                    let added = if column.nullable {
+                        Added::Null
+                    } else {
+                        match column.default.as_deref().and_then(constant_default) {
+                            Some(e) => Added::Backfilled(format!("({e})")),
+                            None => Added::Unspellable,
+                        }
+                    };
+                    this.added.insert(table.column(name), added);
                 }
                 Change::AlterColumnType { column, to, .. } => {
                     this.types.insert(column.clone(), to.clone());
@@ -370,6 +408,23 @@ impl AsStored {
             .unwrap_or_else(|| column.name.clone());
         Some(table.column(&name))
     }
+
+    /// How a row already in the table reads in this column: `stored` where the
+    /// column is there to be read, and what the `ALTER` will put in it where
+    /// it is not. `None` is "no probe can say", never "empty" (DECISIONS 171).
+    ///
+    /// `column` is the declared ref; `stored` the rendered reference to use
+    /// when this plan is not the one adding it. The callers hold different
+    /// spellings of that reference — one qualified by a table alias, one bare
+    /// — so it is passed in rather than built here.
+    fn reads(&self, column: &ColumnRef, stored: String) -> Option<String> {
+        match self.added.get(column) {
+            None => Some(stored),
+            Some(Added::Null) => Some("NULL".to_owned()),
+            Some(Added::Backfilled(e)) => Some(e.clone()),
+            Some(Added::Unspellable) => None,
+        }
+    }
 }
 
 fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
@@ -397,7 +452,11 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             to_nullable: false,
             ..
         } => match names.column(column) {
-            Some(stored) => Ok(vec![null_probe(column, &stored)?]),
+            Some(stored) => Ok(vec![null_probe(
+                column,
+                &stored.table,
+                &quote(&stored.name)?,
+            )?]),
             None => Ok(Vec::new()),
         },
 
@@ -416,7 +475,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // A type change folds a nullability change into itself (§12), so it
             // has to carry that change's probe too.
             if *from_nullable && !*to_nullable {
-                out.push(null_probe(column, &stored)?);
+                out.push(null_probe(column, &stored.table, &quote(&stored.name)?)?);
             }
             if types::change_risk(from, to).risk_class().is_some() {
                 out.extend(conversion_probe(column, &stored, to)?);
@@ -455,11 +514,14 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             name,
             constraint,
         } => match stored_columns(names, table, &constraint.columns) {
-            Some((stored, columns)) => Ok(vec![duplicate_probe(
-                &stored,
-                &columns,
-                &format!("rows that would collide under the new unique constraint {name}"),
-            )?]),
+            Some((stored, columns)) => match varying(names, table, &constraint.columns, &columns) {
+                Some(varying) => Ok(vec![duplicate_probe(
+                    &stored,
+                    &varying,
+                    &format!("rows that would collide under the new unique constraint {name}"),
+                )?]),
+                None => Ok(Vec::new()),
+            },
             None => Ok(Vec::new()),
         },
 
@@ -473,16 +535,23 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             };
             let mut out = Vec::new();
             for (declared, current) in pk.columns.iter().zip(&columns) {
-                out.push(null_probe(
-                    &table.column(declared),
-                    &stored.column(current),
+                let declared = table.column(declared);
+                // A column this plan adds is not there to be read: what every
+                // stored row will hold in it stands in its place, and where
+                // that is unknowable there is no probe rather than a wrong one
+                // (DECISIONS 171).
+                let Some(reads) = names.reads(&declared, quote(current)?) else {
+                    continue;
+                };
+                out.push(null_probe(&declared, &stored, &reads)?);
+            }
+            if let Some(varying) = varying(names, table, &pk.columns, &columns) {
+                out.push(duplicate_probe(
+                    &stored,
+                    &varying,
+                    "rows that would collide under the new primary key",
                 )?);
             }
-            out.push(duplicate_probe(
-                &stored,
-                &columns,
-                "rows that would collide under the new primary key",
-            )?);
             Ok(out)
         }
 
@@ -1223,52 +1292,59 @@ fn rows_after(
 
     // What the table already holds, where it already exists.
     if let Some((stored, stored_columns)) = stored_columns(names, table, columns) {
-        let selected: Vec<String> = stored_columns
-            .iter()
-            .zip(columns)
-            .enumerate()
-            .map(|(i, (stored_column, column))| {
-                Ok(projected(
-                    i,
-                    column,
-                    format!("{alias}.{}", quote(stored_column)?),
-                ))
-            })
-            .collect::<Result<_, DialectError>>()?;
-        let mut sql = format!(
-            "SELECT {} FROM {} AS {alias}",
-            selected.join(", "),
-            qualified(&stored)?
-        );
-        // Minus the rows this plan takes away or moves within these columns:
-        // both run first, so counting them is counting a state that will not
-        // be there. A row the plan rewrites comes back below, as it will be.
-        if let Some(m) = moved {
-            // A set, so the list is sorted and a key named by both halves is
-            // named once: serialization is deterministic here as everywhere.
-            let gone: BTreeSet<String> = m
-                .deleted
-                .iter()
-                .chain(
-                    m.updated
-                        .iter()
-                        .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
-                        .map(|(key, _)| key),
-                )
-                .map(|k| literal(k.as_str()))
-                .collect();
-            if !gone.is_empty() {
-                let Some(key_column) = names.column(&table.column(&m.key_column)) else {
-                    return Ok(None);
-                };
-                sql.push_str(&format!(
-                    " WHERE {alias}.{} NOT IN ({})",
-                    quote(&key_column.name)?,
-                    gone.into_iter().collect::<Vec<_>>().join(", ")
-                ));
+        // A column this plan *adds* is not there for the probe to read: naming
+        // it is `Msg 207` — measured — and a probe that throws is reported as
+        // unchecked and the apply proceeds (124). What every row already in
+        // the table will hold in it stands in its place instead
+        // (DECISIONS 171).
+        let mut selected: Vec<String> = Vec::new();
+        for (i, (stored_column, column)) in stored_columns.iter().zip(columns).enumerate() {
+            let read = format!("{alias}.{}", quote(stored_column)?);
+            match names.reads(&table.column(column), read) {
+                Some(read) => selected.push(projected(i, column, read)),
+                None => {
+                    selected.clear();
+                    unspellable = true;
+                    break;
+                }
             }
         }
-        branches.push(sql);
+        if !selected.is_empty() {
+            let mut sql = format!(
+                "SELECT {} FROM {} AS {alias}",
+                selected.join(", "),
+                qualified(&stored)?
+            );
+            // Minus the rows this plan takes away or moves within these columns:
+            // both run first, so counting them is counting a state that will not
+            // be there. A row the plan rewrites comes back below, as it will be.
+            if let Some(m) = moved {
+                // A set, so the list is sorted and a key named by both halves is
+                // named once: serialization is deterministic here as everywhere.
+                let gone: BTreeSet<String> = m
+                    .deleted
+                    .iter()
+                    .chain(
+                        m.updated
+                            .iter()
+                            .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
+                            .map(|(key, _)| key),
+                    )
+                    .map(|k| literal(k.as_str()))
+                    .collect();
+                if !gone.is_empty() {
+                    let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                        return Ok(None);
+                    };
+                    sql.push_str(&format!(
+                        " WHERE {alias}.{} NOT IN ({})",
+                        quote(&key_column.name)?,
+                        gone.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            branches.push(sql);
+        }
     }
 
     // And what this plan puts there.
@@ -1392,6 +1468,32 @@ fn rows_after(
     Ok(Some(format!("SELECT {} WHERE 1 = 0", empty.join(", "))))
 }
 
+/// The columns of a key that a row already in the table can still vary in.
+///
+/// `None` where one of them is a column this plan adds with a value no probe
+/// can evaluate: the grouping cannot be reasoned about at all then, and no
+/// probe is the honest answer (DECISIONS 171).
+fn varying(
+    names: &AsStored,
+    table: &TableName,
+    declared: &[String],
+    stored: &[String],
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for (declared, stored) in declared.iter().zip(stored) {
+        let declared = table.column(declared);
+        // Present, unmoved by this plan: the only kind a stored row varies in.
+        if names.added.contains_key(&declared) {
+            // Present but constant, or unknowable: `reads` is what tells the
+            // two apart, and only the second means "no probe".
+            names.reads(&declared, String::new())?;
+        } else {
+            out.push(stored.clone());
+        }
+    }
+    Some(out)
+}
+
 /// The table and columns as the database currently names them, or `None` when
 /// the table does not exist yet.
 fn stored_columns(
@@ -1433,22 +1535,44 @@ fn schema_probe(role: &str, schema: &str) -> Probe {
 
 /// `column` names it as the plan does — for the message a human reads — and
 /// `stored` as the database does, for the query.
-fn null_probe(column: &ColumnRef, stored: &ColumnRef) -> Result<Probe, DialectError> {
+/// `reads` is how a row already in the table reads in this column — usually
+/// the quoted column name, but a constant where this plan is the one adding it
+/// (`AsStored::reads`). Measured: `NULL IS NULL` counts every row and
+/// `(N'yy') IS NULL` counts none, which is what those two additions leave
+/// behind (DECISIONS 171).
+fn null_probe(column: &ColumnRef, table: &TableName, reads: &str) -> Result<Probe, DialectError> {
     Ok(Probe::new(
         format!("existing NULLs in {column}, which NOT NULL would reject"),
         format!(
-            "SELECT COUNT(*) AS n FROM {} WHERE {} IS NULL;",
-            qualified(&stored.table)?,
-            quote(&stored.name)?
+            "SELECT COUNT(*) AS n FROM {} WHERE {reads} IS NULL;",
+            qualified(table)?
         ),
     ))
 }
 
+/// `columns` are the constraint's columns a stored row can still *vary* in.
+///
+/// A column this plan adds holds one value in every row already there, so it
+/// groups nothing and is left out — grouping by `(a, k)` where every row
+/// shares `k` is grouping by `(a)`. It cannot simply be substituted:
+/// measured, `GROUP BY NULL` is `Msg 164, Each GROUP BY expression must
+/// contain at least one column that is not an outer reference`. With none
+/// left, every row is in one group and any two of them collide
+/// (DECISIONS 171).
 fn duplicate_probe(
     table: &TableName,
     columns: &[String],
     description: &str,
 ) -> Result<Probe, DialectError> {
+    if columns.is_empty() {
+        return Ok(Probe::new(
+            description,
+            format!(
+                "SELECT CASE WHEN COUNT(*) > 1 THEN COUNT(*) ELSE 0 END AS n FROM {};",
+                qualified(table)?
+            ),
+        ));
+    }
     let list = columns
         .iter()
         .map(|c| quote(c))
@@ -2099,6 +2223,120 @@ mod tests {
         assert!(
             !sql.iter().any(|s| s.contains("k0")),
             "a partial relation is not an answer: {sql:?}"
+        );
+    }
+
+    /// A probe runs before the first statement, so a column this plan is
+    /// *adding* is not there to be read. Naming it is `Msg 207` — measured —
+    /// and a probe that throws is reported as unchecked and the apply
+    /// proceeds, which is the silence 124 is about. What every row already in
+    /// the table will hold is knowable: measured, the engine backfills only a
+    /// NOT NULL column, so a nullable addition is NULL in every stored row
+    /// (DECISIONS 171).
+    #[test]
+    fn a_column_this_plan_adds_is_read_as_what_the_alter_will_put_there() {
+        let added = |nullable: bool, default: Option<&str>| {
+            let mut c = pbps_model::Column::new(ty("varchar(10)"));
+            c.nullable = nullable;
+            c.default = default.map(str::to_owned);
+            Change::AddColumn {
+                uid: uid("c_cccccc"),
+                table: tname("dbo.customer"),
+                name: "region_id".into(),
+                column: Box::new(c),
+            }
+        };
+        let sql = |change: Change| {
+            probes(&plan(vec![change, fk()]))
+                .into_iter()
+                .map(|p| p.sql)
+                .collect::<Vec<_>>()
+        };
+
+        // Nullable: every stored row is NULL there, whatever it declares as a
+        // default — and a NULL reference is one the constraint exempts.
+        for column in [added(true, None), added(true, Some("N'zz'"))] {
+            let s = sql(column);
+            let child = s.iter().find(|s| s.contains("k0")).expect("a probe");
+            assert!(
+                child.contains("TRY_CONVERT(varchar(10), NULL) AS k0 FROM [dbo].[customer]"),
+                "{child}"
+            );
+            assert!(
+                !child.contains("c.[region_id]"),
+                "the column is not there yet: {child}"
+            );
+        }
+
+        // NOT NULL with a constant default: the engine backfills it, so every
+        // stored row holds it and every one of them is a reference to check.
+        let s = sql(added(false, Some("N'eu'")));
+        let child = s.iter().find(|s| s.contains("k0")).expect("a probe");
+        assert!(
+            child.contains("TRY_CONVERT(varchar(10), (N'eu')) AS k0 FROM [dbo].[customer]"),
+            "{child}"
+        );
+
+        // NOT NULL with a default no probe can evaluate: no answer, which is
+        // what an unprobeable default gets everywhere else (117).
+        let s = sql(added(false, Some("CONVERT(varchar(10), 'eu')")));
+        assert!(
+            !s.iter().any(|s| s.contains("k0")),
+            "no answer is the honest one: {s:?}"
+        );
+    }
+
+    /// The same column, the same reason, in the other two probes that read the
+    /// stored table. A unique constraint or a primary key over a column this
+    /// plan adds was `Msg 207` and therefore unchecked — and it is exactly the
+    /// case that fails: every existing row holds the same value in a column
+    /// that has just arrived (DECISIONS 171).
+    #[test]
+    fn a_key_over_a_column_this_plan_adds_is_still_probed() {
+        let add = |nullable: bool, default: Option<&str>| {
+            let mut c = pbps_model::Column::new(ty("varchar(10)"));
+            c.nullable = nullable;
+            c.default = default.map(str::to_owned);
+            Change::AddColumn {
+                uid: uid("c_cccccc"),
+                table: tname("dbo.customer"),
+                name: "region_id".into(),
+                column: Box::new(c),
+            }
+        };
+        let unique = Change::AddUnique {
+            table: tname("dbo.customer"),
+            name: "uq_region".into(),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec!["region_id".into()],
+            },
+        };
+
+        // Nothing left to group by: every stored row shares the one value, so
+        // any two of them collide. `GROUP BY NULL` is not the way to say that
+        // — measured, it is Msg 164.
+        let s = probes(&plan(vec![add(true, None), unique.clone()]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect::<Vec<_>>();
+        assert!(
+            s.iter()
+                .any(|s| s.contains("CASE WHEN COUNT(*) > 1 THEN COUNT(*) ELSE 0 END AS n")),
+            "{s:?}"
+        );
+        assert!(!s.iter().any(|s| s.contains("GROUP BY")), "{s:?}");
+
+        // And no answer where the value itself is unknowable.
+        let s = probes(&plan(vec![
+            add(false, Some("NEXT VALUE FOR dbo.seq")),
+            unique,
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        assert!(
+            !s.iter().any(|s| s.contains("collide")),
+            "no answer is the honest one: {s:?}"
         );
     }
 
