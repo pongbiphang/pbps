@@ -599,6 +599,20 @@ SET search_path = m;
 SELECT 'A38', 'recreating that view from the unchanged declaration text',
        m.accepts('CREATE VIEW m.rebuilt AS SELECT id, full_name FROM m.cust');
 
+-- ---------------------------------- the twelfth 2026-09-05 review round
+
+CREATE TABLE m.orders (id int PRIMARY KEY);
+CREATE TABLE m.customers (id int PRIMARY KEY);
+CREATE FUNCTION m.noop() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER audit AFTER INSERT ON m.orders FOR EACH ROW EXECUTE FUNCTION m.noop();
+CREATE TRIGGER audit AFTER INSERT ON m.customers FOR EACH ROW EXECUTE FUNCTION m.noop();
+SELECT 'A39', 'two triggers of the same name in one schema',
+       string_agg(c.relname || '.' || t.tgname, ', ' ORDER BY c.relname)
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'm' AND NOT t.tgisinternal;
+SELECT 'A40', 'DROP TRIGGER without naming the table', m.accepts('DROP TRIGGER audit');
+SELECT 'A41', 'DROP TRIGGER naming the table', m.accepts('DROP TRIGGER audit ON m.orders');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

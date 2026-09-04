@@ -108,3 +108,6 @@ R37 | a view in m_b created under a path ordered (m_a, m_b) | binds to schema m_
 R38 | the same view with its own schema first | binds to schema m_b
 A37 | what a table rename leaves in the view's stored definition | SELECT id, full_name FROM m.clnt;
 A38 | recreating that view from the unchanged declaration text | refused: relation "m.cust" does not exist
+A39 | two triggers of the same name in one schema | customers.audit, orders.audit
+A40 | DROP TRIGGER without naming the table | refused: syntax error at end of input
+A41 | DROP TRIGGER naming the table | accepted

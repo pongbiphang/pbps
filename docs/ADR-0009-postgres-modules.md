@@ -109,10 +109,39 @@ Three consequences, each measured rather than deduced:
 
 ### The decision
 
-**The key of `Schema::modules` becomes a `ModuleId` carrying the qualified name
-and, for the kinds that overload, the argument types as the dialect normalizes
-them.** For SQL Server the argument list is always absent, so every existing
-value, file and snapshot means what it meant before.
+**The key of `Schema::modules` becomes a `ModuleId`, and what identifies an
+object depends on its kind** — which is itself a finding, because a first
+version of this decision said "the qualified name plus, where they overload, the
+argument types" and that is right for two kinds out of four:
+
+| Kind | Identified by | Because |
+|---|---|---|
+| view | `schema.name` | one `pg_class` namespace with tables |
+| function, procedure | `schema.name` + normalized argument types | they overload (§1) |
+| **trigger** | **its table** + name | **measured** below |
+
+**Measured**, a trigger's name is scoped to the table it is on, not to the
+schema:
+
+```
+=> CREATE TRIGGER audit AFTER INSERT ON tg.orders ...;
+=> CREATE TRIGGER audit AFTER INSERT ON tg.customers ...;
+   both accepted: customers.audit, orders.audit
+
+=> DROP TRIGGER audit;              syntax error at end of input
+=> DROP TRIGGER audit ON tg.orders; accepted
+```
+
+So two valid declarations map to one `app.audit` key under a name-only identity,
+and every statement the emitter writes for a trigger needs the table anyway.
+`Module::on` already holds it — ADR-0002 put it in the model rather than in an
+annotation precisely because "moving a trigger to another table is a different
+object" — so this is the identity catching up with a field that was already
+there for the right reason.
+
+For SQL Server nothing moves: the argument list is always absent, and a trigger
+name is unique per schema, so every existing value, file and snapshot means what
+it meant before.
 
 ```yaml
 # schema/app.f.function.yml
@@ -256,12 +285,23 @@ Three consequences:
 
    So the slot is **left empty**, and empty means "never applied through this
    tool" rather than "equal to nothing". A module whose declared slot is empty
-   is restated once by the next plan — `CREATE OR REPLACE` where the engine
-   allows it, which is cheap, idempotent and grant-preserving — and both slots
-   are filled properly by that apply. Adoption therefore costs one restatement
-   per managed module, which is §8.2's "the cost of a false positive is
-   restating one definition" paid once, at the moment the project takes
-   responsibility for the schema.
+   is restated once by the next plan, and both slots are filled properly by that
+   apply.
+
+   **On PostgreSQL that restatement is a rebuild**, because §3 emits every
+   module change as drop + create — so adopting a database rebuilds every
+   managed module once, carrying the full restore obligation and refusing
+   wherever it cannot carry something. A first version of this paragraph called
+   the restatement "cheap, idempotent and grant-preserving", which described a
+   `CREATE OR REPLACE` path §3 has since removed; two parts of one document
+   should not disagree about what the tool does.
+
+   Stated plainly, that is the cost of adoption on this engine, and it lands
+   where an estate is most likely to have hand-made grants and owners. It is
+   also the moment to discover them: adoption is exactly when a project finds
+   out what the database is carrying that the declarations do not say, and a
+   refusal that names the object and the grant is a better first day than a
+   silent one.
 
    That is also the answer to the second failure above rather than an accident:
    after a `baseline`, a hand-edited module is **not** silently blessed. It is
@@ -553,6 +593,22 @@ brings the object's state to exactly what it recorded — emitting what is missi
 where to look for what will appear, and the plan says so, because a `REVOKE`
 nobody can explain is worse than one the artifact predicted.
 
+**And `apply` asks again before statement one.** The revoke list is computed
+from `pg_default_acl` at plan time, and `pg_default_acl` is not part of the
+schema the checksum is taken over — so a default grant added in the window
+between planning and applying makes the approved list stale, the replacement
+inherits access no statement removes, and the managed-role comparison still
+reports clean because the grantee is not a managed role. The preflight compares
+the live default-ACL state with what the plan assumed and refuses on any
+difference.
+
+That is not a new mechanism: ADR-0005 note 13 already has `apply` re-asking
+about a dropped role's members for exactly this reason — *"the members listed at
+plan time can be stale by apply time, and the checksum cannot see it"*. This is
+the same sentence with a different catalog, and it is worth noticing that the
+sentence generalizes: **anything the plan reasons about that the checksum does
+not cover has to be re-asked at apply time.**
+
 Two consequences worth naming, because they follow from the rule rather than
 from any one row: **the enumeration is `plan --db`'s work, not the emitter's**,
 since only a connection can see what an object carries; and **a rebuild is
@@ -699,9 +755,10 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 | The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
+| `ModuleDeps` keyed by `ModuleId` on **both** sides | Today `BTreeMap<ObjectName, BTreeSet<ObjectName>>`, which cannot say that `app.f(integer)` depends on something while `app.f(text)` does not — two valid declarations would share or overwrite one hint entry, and the ordering it exists to fix would be computed from the wrong graph |
 
-Everything else — `Module`, `ModuleKind`, `ModuleDeps`, the ids file (modules
-still carry no identity), the differ, `docs`, the policy engine — is unchanged.
+Everything else — `Module`, `ModuleKind`, the ids file (modules still carry no
+identity), the differ, `docs`, the policy engine — is unchanged.
 
 **The abstraction holds, with one correction to what that costs.** The first
 draft of this document claimed the whole bill was one map key. It is one map
