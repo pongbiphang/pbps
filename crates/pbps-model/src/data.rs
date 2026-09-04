@@ -25,6 +25,7 @@ use crate::schema::Table;
 
 /// The declared contents of one table.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableData {
     pub mode: DataMode,
 

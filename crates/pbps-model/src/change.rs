@@ -701,7 +701,7 @@ mod tests {
         assert!(make(true, None, false).intrinsic_risks().is_empty());
         assert!(make(false, Some("0"), false).intrinsic_risks().is_empty());
         assert_eq!(
-            make(false, Some("((NULL))"), false).intrinsic_risks(),
+            make(false, Some("CAST(NULL AS int)"), false).intrinsic_risks(),
             BTreeSet::from([RiskClass::NotNull])
         );
         assert!(make(false, None, true).intrinsic_risks().is_empty());

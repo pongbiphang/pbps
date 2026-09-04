@@ -516,7 +516,7 @@ mod tests {
     fn a_null_default_does_not_hide_the_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
-        column.default = Some("((NULL))".into());
+        column.default = Some("CONVERT(int, NULL)".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),

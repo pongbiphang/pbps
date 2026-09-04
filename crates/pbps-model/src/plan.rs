@@ -258,6 +258,7 @@ fn digest_of<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::*;
     use crate::change::{Change, PlannedChange};
+    use crate::module::{Module, ModuleKind};
     use crate::name::TableName;
     use crate::schema::{Column, Table};
     use crate::types::ColumnType;
@@ -406,6 +407,58 @@ mod tests {
         .unwrap();
         json["changes"]["changes"][0]["approved"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<SavedPlan>(json).is_err());
+    }
+
+    /// Strictness has to follow the whole artifact tree. Checking only the
+    /// SavedPlan and Change envelopes would still let a typo silently disappear
+    /// from the reviewed execution strategy or model payload before hashing.
+    #[test]
+    fn unknown_nested_plan_fields_are_refused() {
+        let add_column = || {
+            plan_over(ChangeSet {
+                changes: vec![PlannedChange::new(Change::AddColumn {
+                    uid: "c_a1b2c3".parse().unwrap(),
+                    table: TableName::new("dbo", "customer"),
+                    name: "score".into(),
+                    column: Box::new(Column::new("int".parse().unwrap())),
+                })],
+            })
+        };
+
+        let mut column = serde_json::to_value(add_column()).unwrap();
+        column["changes"]["changes"][0]["column"]["nulable"] = serde_json::Value::Bool(false);
+        assert!(serde_json::from_value::<SavedPlan>(column).is_err());
+
+        let mut strategy = serde_json::to_value(add_column()).unwrap();
+        strategy["changes"]["changes"][0]["strategy"] = serde_json::json!({ "onlien": true });
+        assert!(serde_json::from_value::<SavedPlan>(strategy).is_err());
+
+        let mut table = serde_json::to_value(plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_a1b2c3".parse().unwrap(),
+                name: TableName::new("dbo", "customer"),
+                table: Box::new(Table::default()),
+            })],
+        }))
+        .unwrap();
+        table["changes"]["changes"][0]["table"]["colums"] = serde_json::json!({});
+        assert!(serde_json::from_value::<SavedPlan>(table).is_err());
+
+        let mut module = serde_json::to_value(plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateModule {
+                name: TableName::new("dbo", "active_customer"),
+                module: Box::new(Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    on: None,
+                    definition: "SELECT 1 AS id".into(),
+                }),
+            })],
+        }))
+        .unwrap();
+        module["changes"]["changes"][0]["module"]["defintion"] =
+            serde_json::Value::String("SELECT 2 AS id".into());
+        assert!(serde_json::from_value::<SavedPlan>(module).is_err());
     }
 
     /// The mode is part of the pinned artifact: a plan approved as staged must

@@ -85,6 +85,7 @@ impl std::fmt::Display for ModuleKind {
 /// As everywhere else in the model, the container holds the name: a module's
 /// name is the key in [`crate::Schema::modules`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Module {
     pub kind: ModuleKind,
 

@@ -298,7 +298,7 @@ fn a_null_default_does_not_bypass_the_required_column_gate() {
     d.commit();
 
     d.table(
-        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false, default: \"((NULL))\"}\n",
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false, default: \"CAST(NULL AS int)\"}\n",
     );
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -5446,6 +5446,37 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         let state = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(state.snapshot.module_deps.len(), 1);
     });
+
+    // A surviving module owns its current declaration hints. Reversing the old
+    // edge must replace it rather than adding both directions and manufacturing
+    // a cycle that falls back to name order.
+    d.module(
+        "dbo.pbps_dep_base.yml",
+        "view: dbo.pbps_dep_base\ndepends_on: [dbo.pbps_dep_leaf]\ndefinition: |-\n  SELECT 2 AS id\n",
+    );
+    d.module(
+        "dbo.pbps_dep_leaf.yml",
+        "view: dbo.pbps_dep_leaf\ndefinition: |-\n  SELECT 2 AS id\n",
+    );
+    let reordered_path = d.dir.join("reordered-modules.json");
+    let reordered = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        reordered_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&reordered), 0, "{}", stderr(&reordered));
+    let reordered: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&reordered_path).unwrap()).unwrap();
+    let altered: Vec<String> = reordered
+        .changes
+        .changes
+        .iter()
+        .filter(|planned| matches!(planned.change, pbps_model::Change::AlterModule { .. }))
+        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .collect();
+    assert_eq!(altered, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
     std::fs::remove_file(d.dir.join("schema/dbo.pbps_dep_leaf.yml")).unwrap();
     std::fs::remove_file(d.dir.join("schema/dbo.pbps_dep_base.yml")).unwrap();

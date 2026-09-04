@@ -25,6 +25,7 @@ use crate::types::ColumnType;
 
 /// The complete desired state of a project.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
 
@@ -74,6 +75,7 @@ impl Schema {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -112,6 +114,7 @@ pub struct Table {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     #[serde(rename = "type")]
     pub ty: ColumnType,
@@ -167,34 +170,44 @@ impl Column {
     /// Whether SQL Server has a declared source for existing rows when this is
     /// added as a required column.
     ///
-    /// Expressions stay opaque everywhere else, but an explicit `NULL`
-    /// literal is definitively not a value source. SQL Server also stores
-    /// defaults wrapped in redundant parentheses, so those are peeled without
-    /// attempting to interpret any other expression.
+    /// Expressions stay opaque everywhere else, but a default that explicitly
+    /// invokes SQL Server's NULL-producing constructs is not a trustworthy
+    /// value source. This is deliberately a conservative lexical check rather
+    /// than an attempt to evaluate or normalize SQL.
     pub fn has_required_add_value_source(&self) -> bool {
         self.identity.is_some()
             || self
                 .default
                 .as_deref()
-                .is_some_and(|default| !is_explicit_null(default))
+                .is_some_and(|default| !has_explicit_null_semantics(default))
     }
 }
 
-fn is_explicit_null(expression: &str) -> bool {
-    let mut expression = expression.trim();
-    while expression.starts_with('(') && expression.ends_with(')') {
-        expression = expression[1..expression.len() - 1].trim();
-    }
-    expression.eq_ignore_ascii_case("null")
+fn has_explicit_null_semantics(expression: &str) -> bool {
+    // String literals and comments are not SQL expressions. Blanking them
+    // keeps a harmless default such as 'NULL' from being mistaken for the NULL
+    // keyword while still finding it inside CAST(NULL AS int), arithmetic, and
+    // other expression shapes.
+    crate::module::code_only(expression)
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|word| {
+            word.eq_ignore_ascii_case("null")
+                || word.eq_ignore_ascii_case("nullif")
+                || word.eq_ignore_ascii_case("try_cast")
+                || word.eq_ignore_ascii_case("try_convert")
+                || word.eq_ignore_ascii_case("try_parse")
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Identity {
     pub seed: i64,
     pub increment: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrimaryKey {
     /// The constraint name. `None` leaves the database to name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,11 +216,13 @@ pub struct PrimaryKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UniqueConstraint {
     pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub references_table: TableName,
@@ -247,12 +262,14 @@ pub enum ReferentialAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckConstraint {
     /// The check expression, kept verbatim.
     pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Index {
     pub columns: Vec<IndexColumn>,
 
@@ -269,6 +286,7 @@ pub struct Index {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexColumn {
     pub name: String,
     #[serde(default)]
@@ -304,16 +322,26 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_null_default_is_not_a_required_add_value_source() {
+    fn an_explicitly_nullable_default_is_not_a_required_add_value_source() {
         let mut column = Column::new(ty("int"));
         assert!(!column.has_required_add_value_source());
 
-        for default in ["NULL", " null ", "(NULL)", "((( null )))"] {
+        for default in [
+            "NULL",
+            " null ",
+            "(NULL)",
+            "((( null )))",
+            "CAST(NULL AS int)",
+            "CONVERT(int, NULL)",
+            "(NULL) + 1",
+            "NULLIF(1, 1)",
+            "TRY_CONVERT(int, 'not a number')",
+        ] {
             column.default = Some(default.into());
             assert!(!column.has_required_add_value_source(), "{default}");
         }
 
-        for default in ["0", "'NULL'", "NULLIF(1, 2)"] {
+        for default in ["0", "'NULL'", "SYSUTCDATETIME()", "NEWID()"] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
         }

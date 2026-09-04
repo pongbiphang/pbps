@@ -1029,10 +1029,9 @@ pub fn cmd_plan_db(
         // annotations so connected planning can still drop dependents first.
         let mut hints = loaded.hints.clone();
         for (name, dependencies) in &entry.snapshot.module_deps {
-            hints
-                .module_deps
-                .entry(name.clone())
-                .or_insert_with(|| dependencies.clone());
+            if !loaded.schema.modules.contains_key(name) {
+                hints.module_deps.insert(name.clone(), dependencies.clone());
+            }
         }
         let cs = pbps_diff::diff(
             pbps_diff::Side {
