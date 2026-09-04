@@ -272,6 +272,10 @@ fn report_unmanaged(
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
     let names = unmanaged_objects(scoped, unreadable, managed_modules);
+    apply_unmanaged_policy(&names, policy)
+}
+
+fn apply_unmanaged_policy(names: &[String], policy: pbps_config::Unmanaged) -> anyhow::Result<()> {
     if names.is_empty() {
         return Ok(());
     }
@@ -333,7 +337,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     let checked_at = crate::now();
 
     let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
-    let (report, unmanaged_refusal) = match rt.block_on(async {
+    let (report, unmanaged_refusal, unmanaged_inventory) = match rt.block_on(async {
         let mut conn = db::connect(target).await?;
 
         let Some(baseline) = pbps_mssql::state::latest(&mut conn).await? else {
@@ -399,18 +403,16 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // has only this one typed failure, but preserve any future operational
         // error as an inability to answer rather than misclassifying it as a
         // policy finding.
-        let unmanaged_refusal = match report_unmanaged(
-            &scoped,
-            &managed.unreadable,
-            &recorded_modules,
-            project.config.unmanaged,
-        ) {
-            Ok(()) => None,
-            Err(error) => match error.downcast::<UnmanagedPolicy>() {
-                Ok(policy) => Some(policy),
-                Err(error) => return Err(error),
-            },
-        };
+        let unmanaged_inventory =
+            unmanaged_objects(&scoped, &managed.unreadable, &recorded_modules);
+        let unmanaged_refusal =
+            match apply_unmanaged_policy(&unmanaged_inventory, project.config.unmanaged) {
+                Ok(()) => None,
+                Err(error) => match error.downcast::<UnmanagedPolicy>() {
+                    Ok(policy) => Some(policy),
+                    Err(error) => return Err(error),
+                },
+            };
 
         Ok((
             pbps_model::DriftReport {
@@ -431,6 +433,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 unexpressible,
             },
             unmanaged_refusal,
+            unmanaged_inventory,
         ))
     }) {
         Ok(outcome) => outcome,
@@ -486,10 +489,13 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             format!("{}: {e}", target.label),
         ));
     }
-    for table in &report.unmanaged {
+    // The typed report predates managed modules and carries tables only. JSON
+    // findings use the complete policy inventory so readable and unreadable
+    // modules cannot disappear from the machine view while stderr names them.
+    for object in &unmanaged_inventory {
         findings.push(crate::output::Finding::note(
             "state.unmanaged",
-            format!("{table} is in the database and outside the managed set; it was not compared"),
+            format!("{object} is in the database and outside the managed set; it was not compared"),
         ));
     }
     if let Some(ref refusal) = unmanaged_refusal {

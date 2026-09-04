@@ -5661,6 +5661,40 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
         .unwrap();
     });
 
+    // Warning policy still has to reach the JSON findings. The catalog cannot
+    // put this encrypted procedure in `scoped.unmanaged_modules`, so this pins
+    // the separate unreadable inventory all the way through verify's envelope.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nunmanaged: warn\nenvironments:\n  test:\n    url_env: {env}\n\
+             hooks:\n  on_drift: \"cat > {}\"\n",
+            drift_hook.display()
+        ),
+    )
+    .unwrap();
+    let warned = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let warned_report: serde_json::Value = serde_json::from_str(&stdout(&warned)).unwrap();
+    assert_eq!(code(&warned), 0, "{warned_report}");
+    assert!(warned_report["findings"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["id"] == "state.unmanaged"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("pbps_unreadable.policy_secret"))
+        })
+    }));
+
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nunmanaged: error\nenvironments:\n  test:\n    url_env: {env}\n\
+             hooks:\n  on_drift: \"cat > {}\"\n",
+            drift_hook.display()
+        ),
+    )
+    .unwrap();
+
     let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
     let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
     assert_eq!(code(&verify), FINDING, "{report}");

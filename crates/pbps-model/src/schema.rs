@@ -188,7 +188,7 @@ fn has_explicit_null_semantics(expression: &str) -> bool {
     // keeps a harmless default such as 'NULL' from being mistaken for the NULL
     // keyword while still finding it inside CAST(NULL AS int), arithmetic, and
     // other expression shapes.
-    crate::module::code_only(expression)
+    crate::module::code_without_quoted_identifiers(expression)
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .any(|word| {
             word.eq_ignore_ascii_case("null")
@@ -341,7 +341,14 @@ mod tests {
             assert!(!column.has_required_add_value_source(), "{default}");
         }
 
-        for default in ["0", "'NULL'", "SYSUTCDATETIME()", "NEWID()"] {
+        for default in [
+            "0",
+            "'NULL'",
+            "SYSUTCDATETIME()",
+            "NEWID()",
+            "NEXT VALUE FOR dbo.[null]",
+            "NEXT VALUE FOR dbo.\"try_cast\"",
+        ] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
         }

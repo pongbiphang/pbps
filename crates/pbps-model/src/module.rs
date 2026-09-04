@@ -153,8 +153,6 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
     contains_word(&haystack, &format!("{schema}.{object}")) || contains_word(&haystack, &object)
 }
 
-/// Lower-cases, drops the quoting characters and closes the gaps around dots,
-/// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 /// The definition with everything that is not code blanked out.
 ///
 /// String literals and both comment forms are replaced by spaces, character for
@@ -173,11 +171,25 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 /// text before, where a name inside a comment invented a dependency edge and a
 /// `GO` inside a literal refused a valid procedure.
 pub fn code_only(definition: &str) -> String {
+    lexical_code(definition, true)
+}
+
+/// The definition with literals, comments, and quoted identifiers blanked.
+///
+/// [`code_only`] retains quoted identifiers because dependency and batch scans
+/// need their names. Keyword detection needs the opposite: `[null]` and
+/// `"try_cast"` are identifiers, not the SQL constructs their contents happen
+/// to spell.
+pub(crate) fn code_without_quoted_identifiers(definition: &str) -> String {
+    lexical_code(definition, false)
+}
+
+fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     enum At {
         Code,
         /// Inside `'...'`: blanked, because its contents are data.
         Literal,
-        /// Inside `[...]` or `"..."`: kept, because its contents are a name.
+        /// Inside `[...]` or `"..."`: its contents are a name.
         Ident(char),
         Line,
         /// Carrying how many characters have been consumed, so that the `*` of
@@ -213,7 +225,11 @@ pub fn code_only(definition: &str) -> String {
                 if if q == '[' { ch == ']' } else { ch == q } {
                     at = At::Code;
                 }
-                out.push(ch);
+                if keep_quoted_identifiers {
+                    out.push(ch);
+                } else {
+                    blank(&mut out, ch);
+                }
             }
             At::Line => {
                 if ch == '\n' {
@@ -246,7 +262,11 @@ pub fn code_only(definition: &str) -> String {
                     }
                     ('[' | '"', _) => {
                         at = At::Ident(ch);
-                        out.push(ch);
+                        if keep_quoted_identifiers {
+                            out.push(ch);
+                        } else {
+                            blank(&mut out, ch);
+                        }
                     }
                     _ => out.push(ch),
                 }
@@ -256,6 +276,8 @@ pub fn code_only(definition: &str) -> String {
     out
 }
 
+/// Lower-cases, drops the quoting characters and closes the gaps around dots,
+/// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 fn scannable(definition: &str) -> String {
     let lowered = code_only(definition).to_ascii_lowercase();
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
