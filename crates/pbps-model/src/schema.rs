@@ -348,6 +348,8 @@ mod tests {
             "NEWID()",
             "NEXT VALUE FOR dbo.[null]",
             "NEXT VALUE FOR dbo.\"try_cast\"",
+            "NEXT VALUE FOR dbo.[seq]]null]",
+            "NEXT VALUE FOR dbo.\"seq\"\"try_cast\"",
         ] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");

@@ -189,8 +189,10 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
         Code,
         /// Inside `'...'`: blanked, because its contents are data.
         Literal,
-        /// Inside `[...]` or `"..."`: its contents are a name.
-        Ident(char),
+        /// Inside `[...]` or `"..."`: its contents are a name. The flag marks
+        /// the second delimiter in an escaped pair (`]]` or `""`) so it cannot
+        /// also close the identifier.
+        Ident(char, bool),
         Line,
         /// Carrying how many characters have been consumed, so that the `*` of
         /// the opener cannot also close it (`/*/`).
@@ -211,6 +213,7 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
         }
     }
     for (i, ch) in definition.char_indices() {
+        let next = bytes.get(i + ch.len_utf8()).copied();
         match at {
             At::Literal => {
                 // A doubled `''` needs no special case: the first closes and the
@@ -221,9 +224,17 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
                 }
                 blank(&mut out, ch);
             }
-            At::Ident(q) => {
-                if if q == '[' { ch == ']' } else { ch == q } {
-                    at = At::Code;
+            At::Ident(closing, escaped_closer) => {
+                if escaped_closer {
+                    at = At::Ident(closing, false);
+                } else if ch == closing {
+                    at = if next == Some(closing as u8) {
+                        At::Ident(closing, true)
+                    } else {
+                        At::Code
+                    };
+                } else {
+                    at = At::Ident(closing, false);
                 }
                 if keep_quoted_identifiers {
                     out.push(ch);
@@ -245,32 +256,29 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
                 };
                 blank(&mut out, ch);
             }
-            At::Code => {
-                let next = bytes.get(i + ch.len_utf8()).copied();
-                match (ch, next) {
-                    ('-', Some(b'-')) => {
-                        at = At::Line;
-                        blank(&mut out, ch);
-                    }
-                    ('/', Some(b'*')) => {
-                        at = At::Block(0);
-                        blank(&mut out, ch);
-                    }
-                    ('\'', _) => {
-                        at = At::Literal;
-                        blank(&mut out, ch);
-                    }
-                    ('[' | '"', _) => {
-                        at = At::Ident(ch);
-                        if keep_quoted_identifiers {
-                            out.push(ch);
-                        } else {
-                            blank(&mut out, ch);
-                        }
-                    }
-                    _ => out.push(ch),
+            At::Code => match (ch, next) {
+                ('-', Some(b'-')) => {
+                    at = At::Line;
+                    blank(&mut out, ch);
                 }
-            }
+                ('/', Some(b'*')) => {
+                    at = At::Block(0);
+                    blank(&mut out, ch);
+                }
+                ('\'', _) => {
+                    at = At::Literal;
+                    blank(&mut out, ch);
+                }
+                ('[' | '"', _) => {
+                    at = At::Ident(if ch == '[' { ']' } else { ch }, false);
+                    if keep_quoted_identifiers {
+                        out.push(ch);
+                    } else {
+                        blank(&mut out, ch);
+                    }
+                }
+                _ => out.push(ch),
+            },
         }
     }
     out

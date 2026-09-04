@@ -530,7 +530,7 @@ mod tests {
     fn a_quoted_null_identifier_does_not_invent_a_required_add_probe() {
         let mut column = pbps_model::Column::new(ty("bigint"));
         column.nullable = false;
-        column.default = Some("NEXT VALUE FOR dbo.[null]".into());
+        column.default = Some("NEXT VALUE FOR dbo.[seq]]null]".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
