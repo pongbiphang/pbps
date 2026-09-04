@@ -752,6 +752,40 @@ fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
     depth
 }
 
+/// Re-orders the role drops of a change set parent before member, once their
+/// members are known.
+///
+/// The differ ranks them by [`member_depth`] when it sorts, but a `DropRole`
+/// leaves the differ with no members — `plan --db` reads them from the
+/// environment afterwards and writes them into the plan — so the rank the
+/// differ used was every role at depth zero, and the name tiebreaker decided.
+/// This is the same ranking applied again, over the positions the drops
+/// already hold, after the members are in: nothing else moves, and a plan
+/// whose dropped roles hold none of each other keeps the order it had
+/// (DECISIONS 127, 139).
+pub fn order_role_drops(cs: &mut ChangeSet) {
+    let depth = member_depth(&cs.changes);
+    let slots: Vec<usize> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p.change, Change::DropRole { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let mut drops: Vec<PlannedChange> = slots.iter().rev().map(|&i| cs.changes.remove(i)).collect();
+    drops.reverse();
+    // Stable: two drops at one depth keep the order the differ gave them.
+    drops.sort_by_key(|p| {
+        let Change::DropRole { name, .. } = &p.change else {
+            return 0;
+        };
+        depth.get(name).copied().unwrap_or(0)
+    });
+    for (slot, drop) in slots.into_iter().zip(drops) {
+        cs.changes.insert(slot, drop);
+    }
+}
+
 /// Where a change sorts *within* its ordering class.
 ///
 /// Modules and reference rows both have a dependency order among themselves;
@@ -3030,5 +3064,52 @@ mod tests {
         assert_eq!(depth["a"], 0);
         assert_eq!(depth["z"], 0);
         assert!(!depth.contains_key("some_user"));
+    }
+
+    /// The differ never sees a dropped role's members — `plan --db` writes
+    /// them in afterwards — so the parent-first order has to be applied again
+    /// once they are known, over the slots the drops already occupy, with
+    /// everything else where it was (DECISIONS 139).
+    #[test]
+    fn role_drops_are_reordered_parent_first_once_their_members_are_known() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let drop = |name: &str, members: &[&str]| {
+            PlannedChange::new(Change::DropRole {
+                uid: "r_aaaaaa".parse().unwrap(),
+                name: name.to_owned(),
+                members: members.iter().map(|m| (*m).to_owned()).collect(),
+            })
+        };
+        let other = PlannedChange::new(Change::DropTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: TableName::new("dbo", "gone"),
+        });
+        // As the differ left them: name order, with a table drop in between.
+        let mut cs = ChangeSet {
+            changes: vec![
+                drop("a", &["some_user"]),
+                other.clone(),
+                drop("top", &["z"]),
+                drop("z", &["a"]),
+            ],
+        };
+        super::order_role_drops(&mut cs);
+        let names: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::DropRole { name, .. } => name.clone(),
+                _ => "table".to_owned(),
+            })
+            .collect();
+        assert_eq!(names, ["top", "table", "z", "a"]);
+
+        // Nothing holding anything: untouched.
+        let mut flat = ChangeSet {
+            changes: vec![drop("a", &[]), other, drop("z", &["some_user"])],
+        };
+        let before = format!("{:?}", flat.changes);
+        super::order_role_drops(&mut flat);
+        assert_eq!(format!("{:?}", flat.changes), before);
     }
 }

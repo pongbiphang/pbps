@@ -258,6 +258,16 @@ Decisions taken during implementation that this document did not anticipate:
     with the permission named**, under the same managed-role filter `verify`
     applies: the permission is carried beside the schema the checksum is
     computed from, so the checksum alone read it as clean (DECISIONS 125).
+20. **Roles dropped together are dropped parent before member**, or the
+    holder's `DROP MEMBER` names a principal already gone and the engine
+    refuses it by name. The differ ranks the drops by who holds whom, and
+    `plan --db` applies the same ranking again once it has read the members
+    from the environment and written them into the plan, since the differ
+    never sees them (DECISIONS 127, 139).
+21. **A version 3 state snapshot — one recorded before roles were managed —
+    is still read**, as an environment with no managed roles: the `roles`
+    sections default to empty, and refusing it would have left every
+    deployed environment unreadable, its re-record included (DECISIONS 138).
 
 ## Placement
 

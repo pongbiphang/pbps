@@ -27,8 +27,16 @@ use crate::schema::Schema;
 /// and report no drift about grants it never looked at.
 ///
 /// Readers refuse a version they do not understand rather than reading it
-/// partially.
+/// partially. A version 3 snapshot is still read: the fields 4 added default
+/// to empty, and an environment recorded before roles were managed *is* one
+/// with no managed roles — refusing it would leave a deployed environment
+/// with no way to be read at all, since re-recording it reads the latest
+/// entry first (DECISIONS 138). Older than 3 is refused, for the reasons 2
+/// and 3 give.
 pub const CURRENT_VERSION: u32 = 4;
+
+/// The oldest snapshot version this build reads as its own.
+pub const OLDEST_READABLE_VERSION: u32 = 3;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -173,7 +181,7 @@ impl StateSnapshot {
     /// are the objects a drift check compares. Silently reporting "no drift"
     /// about half a schema is the one answer this tool must never give.
     pub fn check_version(&self) -> Result<(), String> {
-        if self.version == CURRENT_VERSION {
+        if (OLDEST_READABLE_VERSION..=CURRENT_VERSION).contains(&self.version) {
             return Ok(());
         }
         Err(format!(
@@ -206,10 +214,38 @@ mod tests {
         );
         assert!(snap.check_version().is_ok());
 
-        snap.version = CURRENT_VERSION - 1;
+        // The version before roles is read as an environment with none: the
+        // fields it lacks default to empty, and refusing it would leave a
+        // deployed environment unreadable, its re-record included
+        // (DECISIONS 138).
+        snap.version = OLDEST_READABLE_VERSION;
+        assert!(snap.check_version().is_ok());
+        snap.version = OLDEST_READABLE_VERSION - 1;
         assert!(snap.check_version().unwrap_err().contains("older pbps"));
         snap.version = CURRENT_VERSION + 1;
         assert!(snap.check_version().unwrap_err().contains("newer pbps"));
+    }
+
+    /// What a version 3 entry actually holds, read by this build: the same
+    /// state with no roles, not an error and not a partial read.
+    #[test]
+    fn a_version_3_snapshot_reads_as_one_with_no_managed_roles() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        snap.version = 3;
+        let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        // A version 3 writer never wrote these sections at all.
+        json["schema"].as_object_mut().unwrap().remove("roles");
+        json["ids"].as_object_mut().unwrap().remove("roles");
+        let read: StateSnapshot = serde_json::from_value(json).unwrap();
+        assert!(read.check_version().is_ok());
+        assert!(read.schema.roles.is_empty());
+        assert!(read.ids.roles.is_empty());
+        assert_eq!(read.schema, snap.schema);
     }
     use super::*;
     use crate::ids::IdsFile;

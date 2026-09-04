@@ -5417,6 +5417,111 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
 
 /// A dropped role's members are listed at plan time so a reviewer sees who
 /// loses the role, and membership is each environment's own — so a member
+/// Two roles dropped together, one a member of the other: the differ ranks
+/// the drops parent-first (DECISIONS 127), but it never sees the members —
+/// `plan --db` writes them in afterwards — so the order has to be applied
+/// again once they are known (139). The names are chosen so that the name
+/// tiebreaker alone would drop the member first, after which the holder's
+/// `DROP MEMBER` names a principal already gone and the whole apply rolls
+/// back. Only a real engine refuses that by name.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_nestedroles_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    let roles = || -> i32 {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let rows = c
+                .query(&format!(
+                    "USE [{name}]; SELECT COUNT(*) FROM sys.database_principals \
+                     WHERE type = 'R' AND name IN ('a_analysts', 'z_reporting');"
+                ))
+                .await
+                .expect("count roles");
+            rows[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("nestedroles-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    let roles_dir = d.dir.join("schema").join("roles");
+    std::fs::create_dir_all(&roles_dir).unwrap();
+    for role in ["a_analysts", "z_reporting"] {
+        std::fs::write(
+            roles_dir.join(format!("{role}.yml")),
+            format!("role: {role}\ngrants:\n  dbo.customer: [select]\n"),
+        )
+        .unwrap();
+    }
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The environment makes one role a member of the other — the member
+    // sorts first by name, which is the wrong order to drop them in.
+    sql("ALTER ROLE z_reporting ADD MEMBER a_analysts;");
+    for role in ["a_analysts", "z_reporting"] {
+        std::fs::remove_file(roles_dir.join(format!("{role}.yml"))).unwrap();
+        let o = d.run(&["drop-role", role, "--reason", "SEC-9 retired"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let listing = stdout(&o);
+    let holder = listing
+        .find("drop role z_reporting, removing 1 member(s) first: a_analysts")
+        .unwrap_or_else(|| panic!("the holder's drop lists its member:\n{listing}"));
+    let member = listing
+        .find("drop role a_analysts")
+        .unwrap_or_else(|| panic!("the member's drop:\n{listing}"));
+    assert!(holder < member, "the holder is dropped first:\n{listing}");
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "revoke",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(roles(), 0, "both roles are gone");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// added between `plan --db` and `apply` is invisible to the checksum. The
 /// apply has to ask again before statement one (DECISIONS 92): a staged apply
 /// that found out at `DROP ROLE` would have committed every `DROP MEMBER` the

@@ -1452,6 +1452,11 @@ pub fn cmd_plan_db(
                     *m = members.get(name).cloned().unwrap_or_default();
                 }
             }
+            // The differ sorted the drops before it could know who holds
+            // whom; now that the members are in, a role holding another
+            // dropped role goes first, or its `DROP MEMBER` names a principal
+            // already gone (DECISIONS 127, 139).
+            pbps_diff::order_role_drops(&mut cs);
         }
 
         // The plan rules (ADR-0008), the connected ones included: this is the

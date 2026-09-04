@@ -13,7 +13,7 @@ pub mod schema_diff;
 
 pub use identity::{Blocker, Context, Resolution, intent_is_absorbed, resolve};
 pub use managed::{Scoped, observed_ids, scope};
-pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial};
+pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
 
 #[cfg(test)]
 // In tests, a catch-all arm with a panic is the right way to say "this should be

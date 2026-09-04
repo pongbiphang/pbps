@@ -1287,3 +1287,27 @@ SPEC is in sync with all of these.
     value does and the comparison stays about the value, not about how two
     types spell it. An older plan carries no type for a spelled cell and
     compares as it did.
+138. **A version 3 state snapshot is still read, as an environment with no
+    managed roles.** 84 bumped the snapshot to version 4 when `Schema` grew
+    `roles`, so that an *older* client would refuse a state it could only
+    read in part — and the check was equality, so this client refused the
+    older version too. Every environment recorded before this release holds
+    a version 3 entry as its latest, and the recovery the message named,
+    `pbps baseline --reason ...`, reads that entry first and failed the same
+    way: a deployed environment had no path to the new version at all. The
+    fields 4 added default to empty on read, and an environment recorded
+    before roles were managed is exactly one with no managed roles, so 3 is
+    read as its own; the next record writes 4. Anything older than 3 is
+    still refused, for the reasons 2 and 3 give, and anything newer for the
+    reason the check exists.
+139. **The role drops are re-ordered after `plan --db` fills their members.**
+    127 ranked the drops parent before member in the differ's sort — where
+    every `DropRole` still has no members, because they are read from the
+    environment afterwards and written into the plan. The rank was every
+    role at depth zero, the name tiebreaker decided, and the live case that
+    measured 127 passed because it handed the emitter changes with the
+    members already in. The same ranking is now applied again, over the
+    slots the drops already hold, once the members are known; a plan whose
+    dropped roles hold none of each other keeps its order, and nothing else
+    moves. Measured end to end this time, through `plan --db` and `apply`,
+    with names chosen so that the name order is the wrong one.
