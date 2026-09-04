@@ -986,9 +986,10 @@ Two things follow, and neither is a new mechanism:
   cannot tell them from a harmless edit — which means the trigger for the scan
   cannot be "the identity changed".
 
-  **Decision.** When a plan rebuilds a routine whose opaque declaration changed
-  **at all** — identity or body — the catalog's edges are supplemented by
-  ADR-0002's existing device: a **best-effort identifier scan** — that ADR already permits scanning definition text for the
+  **Decision.** When a plan **rebuilds or removes** a routine — a `DropModule` is
+  the case with the most to lose and a first version of this trigger said only
+  "rebuild" — the catalog's edges are supplemented by ADR-0002's existing device:
+  a **best-effort identifier scan** — that ADR already permits scanning definition text for the
   names of managed objects, "no SQL semantics", for ordering — extended to the
   bodies the catalog holds.
 
@@ -1007,11 +1008,39 @@ Two things follow, and neither is a new mechanism:
   its next call. Scheduling another rebuild preserves exactly the failure it was
   meant to prevent.
 
-  So: when a plan rebuilds a routine whose declaration changed and the scan finds
-  a **managed** caller whose declaration this plan does not also change,
-  `plan --db` refuses and names both. The remedy is the user's, because only the
-  user can say what the caller should now call — which is the same division of
-  labour as rename and drop intent. Callers found **outside** the managed set are
+  So: when a plan rebuilds or removes a routine and the scan finds a **managed**
+  caller, `plan --db` refuses and names both. The remedy is the user's, because
+  only the user can say what the caller should now call — which is the same
+  division of labour as rename and drop intent.
+
+  **The refusal does not lift because the caller's declaration also changed.** A
+  first version of this rule exempted a caller the same plan edits, treating a
+  changed declaration as evidence the call had been repaired. It is not:
+  **measured** (§4, and again here), PostgreSQL accepts recreating a PL/pgSQL
+  body that names a function which does not exist, so an unrelated edit to the
+  caller buys an exemption and the apply still commits with the defect.
+
+  **But the exposure is narrower than "every opaque body", and this time the
+  narrowing is the hazard's shape rather than a convenient proxy.** Measured,
+  with `check_function_bodies` at its default `on`:
+
+  ```
+  LANGUAGE sql string body naming a missing function:
+      refused: function nn.no_such(integer) does not exist
+  LANGUAGE plpgsql body naming a missing function:
+      accepted
+  ```
+
+  So a SQL-language body is validated at creation — a stale reference in one
+  fails loudly at `CREATE`, inside the plan's transaction, which is the engine
+  doing the check for us. **The refusal is therefore needed for PL/pgSQL bodies**
+  (and for anything assembled by dynamic SQL, which nothing checks), and for the
+  rest the engine is the validation the rule was standing in for.
+
+  It is worth contrasting that with the narrowing this decision had to withdraw a
+  round earlier: that one was narrow because the *identity* happened to be
+  cheaply knowable, and it let real failures through. This one is narrow because
+  a measurement says where the engine already refuses. Callers found **outside** the managed set are
   **reported, not refused**, and `depends_on:` remains the explicit escape hatch
   for what a scan cannot see.
 

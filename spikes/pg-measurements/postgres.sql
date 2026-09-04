@@ -885,6 +885,35 @@ SELECT 'R65', 'the same literal under Australia',
        || ' — the same approved value, a different instant';
 RESET timezone_abbreviations; RESET TimeZone;
 
+-- --------------------------- the twenty-seventh 2026-09-05 review round
+
+CREATE SCHEMA m_na; CREATE SCHEMA m_nb;
+CREATE FUNCTION m_na.helper() RETURNS text AS $$ SELECT 'from m_na' $$ LANGUAGE sql;
+CREATE FUNCTION m_nb.helper() RETURNS text AS $$ SELECT 'from m_nb' $$ LANGUAGE sql;
+SET search_path = m, m_na;
+CREATE FUNCTION m.opaque_res() RETURNS text AS $$ BEGIN RETURN helper(); END $$ LANGUAGE plpgsql;
+CREATE FUNCTION m.parsed_res() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT helper(); END;
+SELECT 'R66', 'a plpgsql body created under (m, m_na), called under the same',
+       (SELECT m.opaque_res());
+SET search_path = m, m_nb;
+SELECT 'R67', 'the same plpgsql body called under (m, m_nb)',
+       (SELECT m.opaque_res()) || ' — resolved when it runs, not when it was created';
+SELECT 'R68', 'a BEGIN ATOMIC body called under (m, m_nb)',
+       (SELECT m.parsed_res()) || ' — bound at creation';
+SET search_path = m, m_na;
+ALTER FUNCTION m.opaque_res() SET search_path = m, m_na;
+SET search_path = m, m_nb;
+SELECT 'R69', 'the plpgsql body after a function-local SET search_path',
+       (SELECT m.opaque_res()) || ' — the engine''s own remedy';
+SET search_path = m;
+DROP SCHEMA m_na CASCADE; DROP SCHEMA m_nb CASCADE;
+
+SELECT 'A60', 'a LANGUAGE sql string body naming a missing function',
+       m.accepts('CREATE FUNCTION m.bad_sql() RETURNS int AS $q$ SELECT m.no_such(1) $q$ LANGUAGE sql');
+SELECT 'A61', 'a LANGUAGE plpgsql body naming a missing function',
+       m.accepts('CREATE FUNCTION m.bad_pl() RETURNS int AS $q$ BEGIN RETURN m.no_such(1); END $q$ LANGUAGE plpgsql')
+       || ' — check_function_bodies is ' || current_setting('check_function_bodies');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

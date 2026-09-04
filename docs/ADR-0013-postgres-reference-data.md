@@ -646,8 +646,35 @@ reads deterministic would have made them depend on the declarations.
       under the new order:                  from m_eb
   ```
 
-  So reordering the extras silently divides the environment from a `bootstrap`
-  of the same revision, and nothing exposes it: the declarations are unchanged,
+  **That binding is only real for modules PostgreSQL parses at creation.**
+  **Measured**, an opaque PL/pgSQL body resolves an unqualified name when it
+  *runs*, under whatever path the caller has:
+
+  ```
+  created under (nn, nn_a), called under the same:   from nn_a
+  the same function called under (nn, nn_b):         from nn_b
+  a BEGIN ATOMIC body called under (nn, nn_b):       from nn_a
+  ```
+
+  So recording the creation path makes a view or a `BEGIN ATOMIC` routine
+  deterministic and does **not** make a PL/pgSQL one deterministic — its
+  resolution is decided by whoever calls it, which pbps does not control and
+  cannot record. The engine's own remedy is a function-local path, and
+  **measured**, it works:
+
+  ```
+  ALTER FUNCTION nn2.pinned() SET search_path = nn2, nn2a;
+  called under (nn2, nn2b):  from nn2a
+  ```
+
+  pbps does not add one, for the reason it adds no `GRANT USAGE`: it would be
+  configuration nobody declared. It belongs in the PostgreSQL documentation
+  beside the `BEGIN ATOMIC` recommendation, as the second thing a project does
+  to make its routines say what they mean.
+
+  For the modules the recording *does* cover, reordering the extras silently
+  divides the environment from a `bootstrap` of the same revision, and nothing
+  exposes it: the declarations are unchanged,
   so the differ sees nothing, and both sides of the drift comparison read the
   same live object. (The deparsed text does record the resolved binding, but
   only when the read path makes qualification necessary — so it is not something

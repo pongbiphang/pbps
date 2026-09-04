@@ -156,3 +156,9 @@ A58 | the identity after renaming only the parameter | pn_f(integer) — unchang
 A59 | and the same caller now | refused: function m.pn_f(a => integer) does not exist
 R64 | a quoted timestamptz with an abbreviation, under Default | 2026-01-15 18:00:00+00
 R65 | the same literal under Australia | 2026-01-15 02:30:00+00 — the same approved value, a different instant
+R66 | a plpgsql body created under (m, m_na), called under the same | from m_na
+R67 | the same plpgsql body called under (m, m_nb) | from m_nb — resolved when it runs, not when it was created
+R68 | a BEGIN ATOMIC body called under (m, m_nb) | from m_na — bound at creation
+R69 | the plpgsql body after a function-local SET search_path | from m_na — the engine's own remedy
+A60 | a LANGUAGE sql string body naming a missing function | refused: function m.no_such(integer) does not exist
+A61 | a LANGUAGE plpgsql body naming a missing function | accepted — check_function_bodies is on
