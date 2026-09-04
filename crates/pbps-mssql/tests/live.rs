@@ -2843,6 +2843,84 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     db.drop().await;
 }
 
+/// `NOCHECK CONSTRAINT` leaves a foreign key in the catalog and stops the
+/// engine enforcing it. Measured here rather than assumed: with the
+/// constraint disabled the parent delete succeeds, the child row stays, and
+/// the `ON DELETE CASCADE` does not run — so counting those children refused
+/// a delete the engine allows, and refused it for ever (DECISIONS 144).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
+    use pbps_model::RowKey;
+
+    let mut db = TestDb::create("nocheck").await;
+    for sql in [
+        "CREATE TABLE dbo.status (code varchar(10) NOT NULL CONSTRAINT pk_status PRIMARY KEY);",
+        "CREATE TABLE dbo.kind (\n\
+             id int NOT NULL CONSTRAINT pk_kind PRIMARY KEY,\n\
+             status_code varchar(10) NULL CONSTRAINT fk_kind_status\n\
+                 REFERENCES dbo.status (code) ON DELETE CASCADE\n\
+         );",
+        "INSERT INTO dbo.status (code) VALUES ('old');",
+        "INSERT INTO dbo.kind (id, status_code) VALUES (1, 'old');",
+        "ALTER TABLE dbo.kind NOCHECK CONSTRAINT fk_kind_status;",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let delete = pbps_model::Change::DeleteRow {
+        table: TableName::new("dbo", "status"),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: std::collections::BTreeMap::new(),
+        types: std::collections::BTreeMap::new(),
+    };
+    let cs = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(delete.clone())],
+    };
+
+    // The probe counts nothing: the child is there, but nothing enforces the
+    // constraint that would take it.
+    let probe = Mssql
+        .preflight(&cs)
+        .into_iter()
+        .find(|p| p.description.contains("row `old`"))
+        .expect("the delete carries a probe");
+    let n: i32 = db.conn.query(&probe.sql).await.expect("probe")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "a disabled foreign key is not one the engine enforces"
+    );
+
+    // And the delete's own guard agrees, so the statement runs.
+    let stmts = Mssql.emit(&delete, Default::default()).expect("emit");
+    db.conn
+        .execute(&stmts[0].sql)
+        .await
+        .expect("the engine allows this delete, so pbps must too");
+
+    // What the engine actually did, measured rather than assumed: the child
+    // row is still there, uncascaded.
+    let left: i32 = db
+        .conn
+        .query("SELECT COUNT(*) FROM dbo.kind;")
+        .await
+        .expect("count")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(left, 1, "a disabled cascade does not run");
+
+    db.drop().await;
+}
+
 /// The baseline checksum pins the state up to the moment `apply` reads it,
 /// and the delete runs later still. A row an application session rewrote in
 /// between was, until the delete carried the recorded row in its predicate,

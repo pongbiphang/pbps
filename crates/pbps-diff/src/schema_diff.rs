@@ -690,24 +690,36 @@ fn diff_data(
             if !declared_data.rows.contains_key(key) {
                 // The recorded row travels with the delete, so the statement
                 // removes what the reviewer saw rather than whatever holds
-                // the key when it runs (DECISIONS 143). Read from the *base*
-                // table: the columns and types the recorded state has, under
-                // the names it knew them by.
+                // the key when it runs (DECISIONS 143).
+                //
+                // Values come from the *base* row, under the names the base
+                // knew them by; the predicate names them as the table has
+                // them when the DELETE runs, which is the declared name.
+                // Every column change sorts before the row changes
+                // (`order_key`), so a column renamed by this same plan is
+                // already renamed by then, and one this plan drops is gone —
+                // it holds nothing, and naming it would be a predicate on a
+                // column that no longer exists.
                 let mut row = BTreeMap::new();
                 let mut types = BTreeMap::new();
-                // The base's own name for the key column: the delete's key
-                // lives in the map key, and on a renamed column the base
-                // spells it differently from the declaration.
-                let base_key = base_name_of.get(&key_column).map(String::as_str);
-                for (column, spec) in &base.columns {
+                for (declared_column, base_column) in base_name_of {
                     // The key is the map key, and a non-key IDENTITY is the
                     // engine's — neither is a cell a row can be held to, for
                     // the same reasons as in an update.
-                    if Some(column.as_str()) == base_key || spec.identity.is_some() {
+                    if *declared_column == key_column {
                         continue;
                     }
-                    row.insert(column.clone(), cell(before, column, Some(spec)));
-                    types.insert(column.clone(), spec.ty.clone());
+                    let Some(spec) = base.columns.get(base_column) else {
+                        continue;
+                    };
+                    if spec.identity.is_some() {
+                        continue;
+                    }
+                    row.insert(
+                        declared_column.clone(),
+                        cell(before, base_column, Some(spec)),
+                    );
+                    types.insert(declared_column.clone(), spec.ty.clone());
                 }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
@@ -2042,6 +2054,69 @@ mod tests {
         // it.
         assert!(!delete.0.contains_key("code"), "{:?}", delete.0);
         assert_eq!(delete.1.get("label"), Some(&ty("nvarchar(50)")));
+    }
+
+    /// Every column change sorts before the row changes, so the delete's
+    /// predicate has to name the columns as the table has them by then: the
+    /// new name for one this plan renames, and nothing at all for one it
+    /// drops — a predicate on a column that no longer exists fails an
+    /// otherwise valid apply (DECISIONS 143).
+    #[test]
+    fn a_delete_names_the_columns_the_table_has_when_it_runs() {
+        let with_label = |label: &str, extra: Option<&str>| {
+            let mut t = lookup(DataMode::Exact, &[]);
+            let held = t.columns.shift_remove("label").expect("the lookup's label");
+            t.columns.insert(label.to_owned(), held);
+            if let Some(extra) = extra {
+                t.columns
+                    .insert(extra.to_owned(), Column::new(ty("nvarchar(50)")));
+            }
+            t
+        };
+        let mut base_table = with_label("label", Some("note"));
+        base_table.data = Some(pbps_model::TableData {
+            mode: DataMode::Exact,
+            rows: [(
+                pbps_model::RowKey::from("old"),
+                [
+                    ("label".to_owned(), Value::Text("Old".to_owned())),
+                    ("note".to_owned(), Value::Text("dropped".to_owned())),
+                ]
+                .into_iter()
+                .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let base = schema_of("dbo.s", base_table);
+        let declared = schema_of("dbo.s", with_label("caption", None));
+        let intents = vec![
+            Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "caption".into(),
+            },
+            Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".to_owned(),
+            },
+        ];
+        let cs = run(&base, &declared, &intents);
+        let (row, _) = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+        assert_eq!(
+            row.get("caption"),
+            Some(&pbps_model::Cell::Value(Value::Text("Old".to_owned()))),
+            "{row:?}"
+        );
+        assert!(!row.contains_key("label"), "{row:?}");
+        assert!(!row.contains_key("note"), "{row:?}");
     }
 
     /// A `data:` block whose rows have no identity is refused, not silently

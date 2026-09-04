@@ -1400,3 +1400,33 @@ SPEC is in sync with all of these.
     carried but not held — the same limit, in the same place, as an update's.
     A mismatch is `@@ROWCOUNT <> 1`, which already says "changed or deleted
     since the plan was made. Plan again."
+
+144. **A disabled foreign key is not counted when a row is deleted.**
+    `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops
+    the engine enforcing it, so the delete probe and the delete's own
+    `HOLDLOCK` guard were counting children of a constraint that would neither
+    block the delete nor cascade through it — refusing, permanently, a
+    deletion the engine allows. Measured rather than assumed, because "what
+    does a disabled constraint still do" is exactly the kind of question this
+    project has been wrong about: with `fk_cascade` disabled, `DELETE` on the
+    parent succeeds, the child row is still there afterwards, and the
+    `ON DELETE CASCADE` does not run. `fk.is_disabled = 0` now filters both the
+    shared counting statement and the unprobeable-default probe. Enabled is
+    the test, not trusted: a constraint re-enabled `WITH NOCHECK` is
+    `is_not_trusted` but enforced from that moment on, and its children are
+    the ones a delete really can take.
+
+145. **The artifact format versions reset to 1 at the first release.** The
+    plan file reached 4 and the state snapshot 4 — with 3 accepted as an
+    upgrade path — before this tool was ever released: the workspace is
+    `0.0.0` and there is no tag. Every one of those bumps was correct by the
+    rule that owns them (a reader that silently ignores a field it does not
+    know is a reader that acts on half a plan), and the numbers still record a
+    history nobody has: the "older pbps" whose ledger entries the state reader
+    tolerates never existed. Before the release the cost of a bump is zero — a
+    plan file lives for one deployment window, and no environment holds a
+    ledger this project did not write in a test — so they stay cheap and
+    honest until then, and at the first tagged release both constants go back
+    to 1 and the pre-release upgrade path goes with them. Recorded in
+    `docs/STATUS.md` under open items, because a decision that has to be acted
+    on months later is worthless anywhere a reader does not look.

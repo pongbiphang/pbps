@@ -853,8 +853,15 @@ struct Referencing<'a> {
     arrival: &'a str,
 }
 
-/// Counts, into `@n`, the rows of every table with a foreign key into the
-/// parent whose key tuple is the deleted row's.
+/// Counts, into `@n`, the rows of every table with an *enabled* foreign key
+/// into the parent whose key tuple is the deleted row's.
+///
+/// `NOCHECK CONSTRAINT` leaves the constraint in `sys.foreign_keys` and stops
+/// the engine enforcing it. Measured: with the constraint disabled, deleting
+/// the parent succeeds, the child row is left where it is, and an
+/// `ON DELETE CASCADE` does not run. Counting those children refused a delete
+/// the engine would have allowed — and refused it for ever, since nothing in
+/// the plan re-enables the constraint (DECISIONS 144).
 ///
 /// The statements are built in a derived table and aggregated outside it: the
 /// fragments carry subqueries over the key's columns, and an aggregate's
@@ -880,6 +887,7 @@ fn counting_statement(r: &Referencing<'_>) -> String {
                    JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
                    JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
                   WHERE fk.referenced_object_id = OBJECT_ID({})\n\
+                        AND fk.is_disabled = 0\n\
                         {gone}) AS x;\n\
          IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {key}, @n = @n OUTPUT;",
         literal(&format!(" AS ch{hint} WHERE EXISTS ({parent_row}")),
@@ -1068,6 +1076,7 @@ fn unprobeable_probe(
                JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n \
               WHERE fk.referenced_object_id = OBJECT_ID({})\n   \
                 AND fk.parent_object_id = OBJECT_ID({})\n   \
+                AND fk.is_disabled = 0\n   \
                 AND c.name IN ({}){};",
             literal(&qualified(&stored.table)?),
             literal(&qualified(&stored_child)?),

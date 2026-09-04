@@ -65,6 +65,18 @@ say whether what the emitter sent is what comes back.
 
 ## Open items
 
+### Artifact format versions reset at the first release
+
+The plan file is at version 4 and the state snapshot at 4, with the snapshot
+reader accepting 3 as an upgrade path — but this tool has never been released:
+the workspace is `0.0.0` and there is no tag. Those numbers therefore record a
+history that nobody has, and the upgrade path leads from a version no
+deployment ever wrote. **At the first tagged release, reset `plan::CURRENT_VERSION`
+and `state::CURRENT_VERSION` to 1 and drop `state::OLDEST_READABLE_VERSION`'s
+back-compatibility with the pre-release numbering** (DECISIONS 145). Until
+then, bump freely: a plan file lives for the length of one deployment window,
+and there is nothing in the field to invalidate.
+
 ### Supply chain — live, not filed away
 
 (SPEC open question 10.) `tiberius` has had no release since 2024-07 and pins `rustls 0.21`, whose

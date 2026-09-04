@@ -1241,9 +1241,10 @@ fn staged_needs_a_target() {
 /// list is enough, and nothing here has to connect.
 fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
+    let version = pbps_model::plan::CURRENT_VERSION;
     let plan = format!(
         r#"{{
-  "version": 3,
+  "version": {version},
   "origin": "database",
   "mode": "{mode}",
   "dialect": "mssql",
@@ -2816,13 +2817,21 @@ fn explain_refuses_a_plan_version_it_does_not_understand() {
 
     // The same plan, one version ahead.
     let raw = std::fs::read_to_string(&plan).unwrap();
-    let bumped = raw.replace("\"version\": 3", "\"version\": 4");
+    let current = pbps_model::plan::CURRENT_VERSION;
+    let bumped = raw.replace(
+        &format!("\"version\": {current}"),
+        &format!("\"version\": {}", current + 1),
+    );
     assert_ne!(raw, bumped, "the fixture must carry a version to bump");
     std::fs::write(&plan, bumped).unwrap();
 
     let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("version 4"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(&format!("version {}", current + 1)),
+        "{}",
+        stderr(&o)
+    );
     assert!(
         !stdout(&o).contains("pbps apply"),
         "a plan this build cannot read must not come with an approval command: {}",

@@ -44,7 +44,17 @@ use crate::schema::Schema;
 /// which tables' rows the state recorded after the apply has to cover; an older
 /// `apply` would run the plan's DML, record a state with no rows in it, and
 /// leave every later `verify` blind to the rows it had just written.
-pub const CURRENT_VERSION: u32 = 3;
+///
+/// Bumped to 4 for the guards each row change now carries: `InsertRow`'s
+/// `defaults` and `types`, `UpdateRow`'s `types` and `after_types`, and
+/// `DeleteRow`'s `row` and `types` (DECISIONS 133, 136, 137, 140, 143). They
+/// are what holds a write to what the plan said, and every one of them is
+/// `#[serde(default)]` — so an older `apply` reads the file, drops them
+/// silently, and executes the same DML with none of its preconditions or
+/// postconditions. That is the exact failure this number exists to prevent.
+/// One bump covers all six: they arrived in one release cycle, and a version
+/// per guard would invalidate saved plans six times over for one story.
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -385,7 +395,10 @@ mod tests {
     #[test]
     fn the_format_version_is_written() {
         let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":3"#), "{json}");
+        assert!(
+            json.contains(&format!(r#""version":{CURRENT_VERSION}"#)),
+            "{json}"
+        );
         assert!(json.contains(r#""origin":"database""#), "{json}");
     }
 
