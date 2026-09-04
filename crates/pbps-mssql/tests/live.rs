@@ -2279,6 +2279,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2315,6 +2316,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2357,6 +2359,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2588,6 +2591,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("42"),
@@ -2712,6 +2716,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
+            after_types: Default::default(),
             table: TableName::new("dbo", "pair_child"),
             key_column: "id".to_owned(),
             key: RowKey::from(id),
@@ -3148,6 +3153,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         types: [("label".to_owned(), ty("nvarchar(50)"))]
             .into_iter()
             .collect(),
+        after_types: Default::default(),
     };
     let delete = pbps_model::Change::DeleteRow {
         table: table.clone(),
@@ -3473,6 +3479,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         ]
         .into_iter()
         .collect(),
+        after_types: Default::default(),
     };
     let sql = sql_of(&whole_row);
     db.conn
@@ -3524,6 +3531,90 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("and with the whole row as recorded, the update goes through");
     assert_eq!(label_of("old").await.as_deref(), Some("Newer"));
 
+    // A column this same plan adds and populates has no recorded cell to
+    // hold the row to *before* the write — but `AddColumn` has already run by
+    // the time the row changes do, so the row is answerable for it after
+    // (DECISIONS 140). Held by the base's types alone, this cell was checked
+    // by nothing at all and a trigger rewriting it read back as the plan's
+    // own result.
+    db.conn
+        .execute("ALTER TABLE dbo.status ADD tier nvarchar(20) NULL;")
+        .await
+        .expect("the column this plan adds");
+    let added = pbps_model::Change::UpdateRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        columns: [
+            (
+                "label".to_owned(),
+                (
+                    Cell::Value(Value::Text("Newer".to_owned())),
+                    Cell::Value(Value::Text("Newest".to_owned())),
+                ),
+            ),
+            // The differ's `before` for a column the base lacks: NULL by
+            // convention, not something the base recorded.
+            (
+                "tier".to_owned(),
+                (
+                    Cell::Value(Value::Null),
+                    Cell::Value(Value::Text("gold".to_owned())),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: [("label".to_owned(), ty("nvarchar(50)"))]
+            .into_iter()
+            .collect(),
+        after_types: [("tier".to_owned(), ty("nvarchar(20)"))]
+            .into_iter()
+            .collect(),
+    };
+    let sql = sql_of(&added);
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.rewrite_tier_on_update ON dbo.status AFTER UPDATE AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET tier = N'bronze'\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that rewrites the column this plan just added");
+    let err =
+        db.conn.execute(&sql).await.err().unwrap_or_else(|| {
+            panic!("a rewritten added cell was taken for the plan's own:\n{sql}")
+        });
+    assert!(
+        err.to_string().contains("is not what this plan wrote"),
+        "{err}"
+    );
+    assert_eq!(
+        label_of("old").await.as_deref(),
+        Some("Newer"),
+        "the update rolled back, trigger and all"
+    );
+    db.conn
+        .execute("DROP TRIGGER dbo.rewrite_tier_on_update;")
+        .await
+        .expect("take the rewriting trigger off");
+    // And nothing holds the added column *before* the write: whatever
+    // `AddColumn` left there — here the engine's NULL, but a `NOT NULL` add
+    // leaves the default — is not a cell the base recorded.
+    db.conn
+        .execute("UPDATE dbo.status SET tier = N'silver' WHERE code = 'old';")
+        .await
+        .expect("something in the column the plan is about to set");
+    db.conn
+        .execute(&sql)
+        .await
+        .expect("the added column is not part of the precondition");
+    assert_eq!(label_of("old").await.as_deref(), Some("Newest"));
+
     // And the same for a delete a trigger undoes.
     // `CREATE TRIGGER` must be the first statement of its batch.
     db.conn
@@ -3550,7 +3641,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     );
     assert_eq!(
         label_of("old").await.as_deref(),
-        Some("Newer"),
+        Some("Newest"),
         "the row is still there, and still what it was"
     );
 

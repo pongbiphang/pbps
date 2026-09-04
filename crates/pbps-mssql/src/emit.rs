@@ -130,7 +130,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             columns,
             unchanged,
             types,
-        } => update_row(table, key_column, key, columns, unchanged, types),
+            after_types,
+        } => update_row(
+            table,
+            key_column,
+            key,
+            columns,
+            unchanged,
+            types,
+            after_types,
+        ),
 
         // The row's content is not carried (the pinned baseline holds it),
         // so the delete holds the row to its existence: a row already gone
@@ -606,6 +615,14 @@ fn insert_row(
 /// row — or a hand edit since the plan was made stand — and have the result
 /// read back as the plan's own (DECISIONS 136). They are never restated in
 /// `SET`, for the reason `UpdateRow` gives.
+///
+/// The two checks read a cell by two types, not one. The precondition asks
+/// what the *recorded* state holds, so a column that state lacks is held to
+/// nothing. The postcondition asks what the row holds once the statement has
+/// run, by which time this plan's `AddColumn` and `AlterColumnType` have
+/// already run — so every declared cell is held, the added column included
+/// (DECISIONS 140).
+#[allow(clippy::too_many_arguments)]
 fn update_row(
     table: &TableName,
     key_column: &str,
@@ -613,7 +630,15 @@ fn update_row(
     columns: &BTreeMap<String, (Cell, Cell)>,
     unchanged: &BTreeMap<String, Cell>,
     types: &BTreeMap<String, ColumnType>,
+    after_types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
+    // The type the *precondition* reads a cell by is the one the recorded
+    // state holds it in; the type the *postcondition* reads it by is the one
+    // the column has once this plan's column changes have run, which sort
+    // before the row changes. Two lookups rather than one, so neither check
+    // can quietly borrow the other's type (DECISIONS 140).
+    let before_ty = |column: &String| types.get(column);
+    let after_ty = |column: &String| after_types.get(column).or_else(|| types.get(column));
     let mut sets = Vec::with_capacity(columns.len());
     let mut recorded = Vec::new();
     for (column, (from, to)) in columns {
@@ -625,10 +650,10 @@ fn update_row(
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{quoted} = {rhs}"));
-        recorded.extend(recorded_cell(column, from, types.get(column))?);
+        recorded.extend(recorded_cell(column, from, before_ty(column))?);
     }
     for (column, held) in unchanged {
-        recorded.extend(recorded_cell(column, held, types.get(column))?);
+        recorded.extend(recorded_cell(column, held, before_ty(column))?);
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -661,10 +686,10 @@ fn update_row(
     // application's business.
     let mut cells = Vec::new();
     for (column, (_, to)) in columns {
-        cells.extend(recorded_cell(column, to, types.get(column))?);
+        cells.extend(recorded_cell(column, to, after_ty(column))?);
     }
     for (column, held) in unchanged {
-        cells.extend(recorded_cell(column, held, types.get(column))?);
+        cells.extend(recorded_cell(column, held, after_ty(column))?);
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
@@ -677,10 +702,12 @@ fn update_row(
 /// compares the recorded text the same way — and a default as
 /// `defaulted_cell` holds it.
 ///
-/// A column whose type the plan does not carry holds nothing, NULL included:
-/// it is a column the base state lacks, whose `before` is what this plan's
-/// `AddColumn` left there — NULL by the differ's convention, but the default
-/// on a `NOT NULL` add — not a recorded cell.
+/// A column whose type the caller does not supply holds nothing, NULL
+/// included. That is the *precondition*'s case for a column the base state
+/// lacks: its `before` is what this plan's `AddColumn` left there — NULL by
+/// the differ's convention, but the default on a `NOT NULL` add — not a
+/// recorded cell. The postcondition always has a type for a declared column
+/// and never takes this path (DECISIONS 140).
 fn recorded_cell(
     column: &str,
     cell: &Cell,
@@ -1864,6 +1891,7 @@ mod tests {
         let sql = sql_of(&Change::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.order_status"),
             key_column: "code".to_owned(),
             key: RowKey::from("new"),
@@ -1969,6 +1997,7 @@ mod tests {
             .into_iter()
             .map(|(c, t)| (c.to_owned(), t.parse::<ColumnType>().unwrap()))
             .collect(),
+            after_types: Default::default(),
         });
         let sql = &sql[0];
         let body = sql
@@ -1988,7 +2017,9 @@ mod tests {
         ] {
             assert!(wrote.contains(held), "{held}\n{wrote}");
         }
-        // The column with no type carried has no rendering to be compared by.
+        // The column with no type carried on either side has no rendering to
+        // be compared by. (A column the base merely lacks *does* have one
+        // after the plan runs; that is `after_types`, and the test below.)
         assert!(!wrote.contains("[added]"), "{wrote}");
         assert!(
             update.starts_with(
@@ -2049,6 +2080,7 @@ mod tests {
             .into_iter()
             .map(|(c, t)| (c.to_owned(), ty(t)))
             .collect(),
+            after_types: Default::default(),
         });
         let sql = &sql[0];
         let update = sql
@@ -2078,6 +2110,83 @@ mod tests {
         }
     }
 
+    /// A column this plan adds and populates in the same revision has no
+    /// recorded cell to hold the row to *before* the write — but it has one
+    /// after: `AddColumn` and `AlterColumnType` both sort ahead of the row
+    /// changes, so the `UPDATE` meets the declared type. Held to the base
+    /// type alone, the added cell was checked by nothing, and an `AFTER
+    /// UPDATE` trigger rewriting it was recorded as the plan's own result
+    /// (DECISIONS 140).
+    #[test]
+    fn a_column_the_plan_adds_is_held_after_the_write_but_not_before() {
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [
+                ("label".to_owned(), (text("Old"), text("New"))),
+                // Added by this same plan: the differ's `before` is NULL by
+                // convention, not something the base recorded.
+                ("added".to_owned(), (Cell::Value(Value::Null), text("y"))),
+                // Retyped by this same plan: `varchar` before, `date` after,
+                // and the two render differently.
+                ("since".to_owned(), (text("2026-09-03"), text("2026-09-04"))),
+            ]
+            .into_iter()
+            .collect(),
+            unchanged: [("note".to_owned(), text("kept"))].into_iter().collect(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("note", "nvarchar(50)"),
+                ("since", "varchar(10)"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+            after_types: [("added", "nvarchar(50)"), ("since", "date")]
+                .into_iter()
+                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .collect(),
+        });
+        let sql = &sql[0];
+        let update = sql
+            .lines()
+            .find(|l| l.starts_with("UPDATE "))
+            .expect("the update");
+        let wrote = sql
+            .lines()
+            .find(|l| l.starts_with("IF NOT EXISTS"))
+            .expect("the postcondition");
+        let precondition = update.split_once(" WHERE ").expect("the key predicate").1;
+        // Nothing recorded the added column, so nothing holds it beforehand.
+        assert!(!precondition.contains("[added]"), "{update}");
+        // But the row is answerable for it afterwards, by the type the
+        // column will have.
+        assert!(
+            wrote.contains("CONVERT(nvarchar(max), [added]) = N'y' COLLATE Latin1_General_BIN2"),
+            "{wrote}"
+        );
+        // A retyped column is read by the base type before and the declared
+        // type after: `varchar` plainly, `date` in style 126.
+        assert!(
+            precondition.contains(
+                "CONVERT(nvarchar(max), [since]) = N'2026-09-03' COLLATE Latin1_General_BIN2"
+            ),
+            "{update}"
+        );
+        assert!(
+            wrote.contains(
+                "CONVERT(nvarchar(max), [since], 126) = N'2026-09-04' COLLATE Latin1_General_BIN2"
+            ),
+            "{wrote}"
+        );
+        // A column neither added nor retyped reads the same on both sides.
+        let held = "CONVERT(nvarchar(max), [note]) = N'kept' COLLATE Latin1_General_BIN2";
+        assert!(precondition.contains(held), "{held}\n{update}");
+        assert!(wrote.contains(held), "{held}\n{wrote}");
+    }
+
     /// An omitted column means the declared default, and only the keyword can
     /// ask the engine for it. Writing NULL instead fails a NOT NULL column that
     /// `validate` had passed, and stores NULL in a nullable one where the
@@ -2087,6 +2196,7 @@ mod tests {
         let sql = sql_of(&Change::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
             key: RowKey::from("a"),
@@ -2119,6 +2229,7 @@ mod tests {
                 &Change::UpdateRow {
                     unchanged: Default::default(),
                     types: Default::default(),
+                    after_types: Default::default(),
                     table: tname("dbo.t"),
                     key_column: "code".to_owned(),
                     key: RowKey::from("a"),

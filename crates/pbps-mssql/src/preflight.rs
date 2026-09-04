@@ -1574,6 +1574,7 @@ mod tests {
         let update = Change::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.kind"),
             key_column: "id".into(),
             key: RowKey::from("7"),
@@ -1610,6 +1611,7 @@ mod tests {
         let update = |key: &str, cells: &[(&str, Value)]| Change::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.pair_child"),
             key_column: "id".into(),
             key: RowKey::from(key),
@@ -1689,6 +1691,7 @@ mod tests {
             Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: tname("dbo.kind"),
                 key_column: "id".into(),
                 key: RowKey::from("7"),
@@ -1750,6 +1753,7 @@ mod tests {
             Change::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
+                after_types: Default::default(),
                 table: tname("dbo.kind"),
                 key_column: "id".into(),
                 key: RowKey::from("7"),

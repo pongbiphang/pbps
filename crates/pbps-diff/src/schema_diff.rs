@@ -603,6 +603,7 @@ fn diff_data(
                 let mut columns = BTreeMap::new();
                 let mut unchanged = BTreeMap::new();
                 let mut types = BTreeMap::new();
+                let mut after_types = BTreeMap::new();
                 for (column, spec) in &declared.columns {
                     // The key lives in the map key, not in either row, so it
                     // has nothing to compare — and resolving it through the
@@ -629,6 +630,9 @@ fn diff_data(
                     // which is an UPDATE — and the right one: adding a default
                     // does not backfill existing rows, and the declaration
                     // says the row should hold it.
+                    let base_spec = base_name_of
+                        .get(column)
+                        .and_then(|base_column| base.columns.get(base_column));
                     let b = match base_name_of.get(column) {
                         Some(base_column) => {
                             cell(before, base_column, base.columns.get(base_column))
@@ -640,11 +644,18 @@ fn diff_data(
                     // cell by the rendering that read it (DECISIONS 122). A
                     // column the base lacks has no recorded cell to hold the
                     // update to.
-                    if let Some(base_spec) = base_name_of
-                        .get(column)
-                        .and_then(|base_column| base.columns.get(base_column))
-                    {
+                    if let Some(base_spec) = base_spec {
                         types.insert(column.clone(), base_spec.ty.clone());
+                    }
+                    // And the type it has once this plan has run, where the
+                    // two differ: the column this plan adds, and the column
+                    // whose type it changes. Both are in place by the time
+                    // the row changes run, so the write's *postcondition*
+                    // reads the cell back the way the column will actually
+                    // hold it — where carrying only the base type left an
+                    // added column held to nothing at all (DECISIONS 140).
+                    if base_spec.map(|s| &s.ty) != Some(&spec.ty) {
+                        after_types.insert(column.clone(), spec.ty.clone());
                     }
                     if b == d {
                         // Not restated, but still held: the declaration
@@ -663,6 +674,7 @@ fn diff_data(
                         columns,
                         unchanged,
                         types,
+                        after_types,
                     });
                 }
             }
@@ -1432,6 +1444,62 @@ mod tests {
         // is the identity column.
         assert_eq!(types.keys().collect::<Vec<_>>(), ["label", "note", "sort"]);
         assert!(!unchanged.contains_key("seq"), "{unchanged:?}");
+    }
+
+    /// A cell needs two types when the same plan changes the column under it.
+    /// `types` is what the *recorded* state holds — the emitter's
+    /// precondition, and a column the base lacks has no recorded cell at all.
+    /// `after_types` is what the column will be once this plan's `AddColumn`
+    /// and `AlterColumnType` have run, which is what the write is held to
+    /// afterwards; carrying only the first left an added cell held by nothing,
+    /// so a trigger could rewrite it and be recorded as the plan's own result
+    /// (DECISIONS 140).
+    #[test]
+    fn an_update_carries_the_type_each_cell_will_have_as_well_as_the_one_it_had() {
+        let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+        let mut declared_t = base_t.clone();
+        // Added and populated in this same revision.
+        declared_t
+            .columns
+            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+        // Retyped in this same revision, and its cell left alone.
+        declared_t
+            .columns
+            .insert("label".to_owned(), Column::new(ty("nvarchar(80)")));
+        let row = declared_t
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("new"))
+            .unwrap();
+        row.0
+            .insert("note".to_owned(), Value::Text("fresh".to_owned()));
+
+        let cs = run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[],
+        );
+        let Some(Change::UpdateRow {
+            types, after_types, ..
+        }) = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateRow { .. }))
+        else {
+            panic!("{:?}", row_ops(&cs));
+        };
+        // The base has no `note` at all, so nothing recorded its cell.
+        assert_eq!(types.keys().collect::<Vec<_>>(), ["label"]);
+        assert_eq!(types["label"], ty("nvarchar(50)"));
+        // Both the added column and the retyped one carry what they will be;
+        // a column neither added nor retyped carries nothing here, and the
+        // emitter falls back to `types`.
+        assert_eq!(after_types.keys().collect::<Vec<_>>(), ["label", "note"]);
+        assert_eq!(after_types["label"], ty("nvarchar(80)"));
+        assert_eq!(after_types["note"], ty("nvarchar(50)"));
     }
 
     #[test]

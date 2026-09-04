@@ -375,6 +375,28 @@ pub enum Change {
         /// which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
+        /// The type each column has *once this plan has run*, where that is
+        /// not the type in `types` — a column this plan adds, and a column
+        /// whose type it changes. Both sort before the row changes
+        /// (`order_key`), so the `UPDATE` meets the declared type, not the
+        /// base one.
+        ///
+        /// Separate from `types` because the two checks around the write ask
+        /// different questions of the same cell. The precondition asks what
+        /// the recorded state holds, and a column the base lacks has no
+        /// recorded cell to hold the row to. The postcondition asks what the
+        /// row holds afterwards, and *every* declared cell is one the write
+        /// is answerable for — including the one this plan's `AddColumn` just
+        /// made room for. Carrying one map made the added column unheld: an
+        /// `AFTER UPDATE` trigger could rewrite it, the apply would record the
+        /// rewritten value, and the next plan would propose the update again
+        /// (DECISIONS 140).
+        ///
+        /// Only the entries that differ, so the plan does not carry the
+        /// whole column list twice per row. The emitter falls back to
+        /// `types`. Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        after_types: BTreeMap<String, ColumnType>,
     },
     DeleteRow {
         table: TableName,

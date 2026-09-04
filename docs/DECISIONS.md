@@ -1311,3 +1311,27 @@ SPEC is in sync with all of these.
     dropped roles hold none of each other keeps its order, and nothing else
     moves. Measured end to end this time, through `plan --db` and `apply`,
     with names chosen so that the name order is the wrong one.
+140. **A row update reads each cell by two types: the one the base recorded,
+    and the one the column will have when the statement runs.** 122 held the
+    update to what the recorded state held, and 136 extended that to the cells
+    the plan leaves alone — both through one `UpdateRow.types`, the base
+    side's, whose absence for a column doubled as "the base has no recorded
+    cell here, so hold the row to nothing". That reading is right *before* the
+    write and wrong after it. When one revision adds a column and populates it
+    in the same declared row, `AddColumn` sorts at 6 and the row changes at 9,
+    so by the time the `UPDATE` runs the column exists and holds the declared
+    type — but the postcondition looked the column up in the base's map, found
+    nothing, and held the new cell to nothing at all. An `AFTER UPDATE`
+    trigger could rewrite exactly that cell, the apply would read the rewrite
+    back and record it, and the next connected plan would propose the same
+    update forever: the silence 132 exists to close, reopened for the one
+    column the revision was about. The same shape hid a second case, since
+    `AlterColumnType` sorts at 7: a column retyped in the same plan had its
+    result compared by the rendering of the type it no longer had.
+    `after_types` now carries the post-plan type wherever it differs from the
+    base's — the added column and the retyped one — and the emitter resolves
+    the precondition through `types` and the postcondition through
+    `after_types` falling back to `types`, as two named lookups rather than
+    one map consulted twice, so neither check can quietly borrow the other's
+    type. Only the differing entries travel: a plan already carries the whole
+    column list once per changed row, and twice is a cost with no reader.
