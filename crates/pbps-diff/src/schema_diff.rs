@@ -2358,6 +2358,78 @@ mod tests {
         );
     }
 
+    /// A table name that is still declared is still that table: `resolve`
+    /// binds a name on both sides to the uid it already has, so no intent can
+    /// retire a uid and hand its name to a new object in one revision.
+    ///
+    /// Pinned because a caller depends on it. `refuse_unplanned_movement`
+    /// pairs the baseline read with the read-back **by name**, and a plan that
+    /// could drop `dbo.t` and put a different `dbo.t` back would make that
+    /// pairing compare two unrelated tables with no change of the plan naming
+    /// the difference — every such apply refused. The guard needs no case for
+    /// it because this rule makes it unrepresentable, which is the better half
+    /// of that trade; if this test ever fails, that guard is what to revisit
+    /// (DECISIONS 170).
+    #[test]
+    fn a_declared_name_cannot_be_dropped_and_reoccupied_in_one_revision() {
+        let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+
+        // Declared again under its own name, with drop intent: the intent is
+        // unused, because the name still resolves to the uid it had.
+        let replaced = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+        let blockers = crate::resolve(
+            &replaced,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "dbo.t".parse().unwrap(),
+                reason: "replaced".into(),
+            }],
+            &ctx(),
+        )
+        .expect_err("a declared name cannot also be dropped");
+        assert!(
+            blockers
+                .iter()
+                .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
+            "{blockers:?}"
+        );
+
+        // And the same for handing the name to another table by rename.
+        let mut two = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+        two.tables.insert(
+            "dbo.a".parse().unwrap(),
+            table(&[("a", Column::new(ty("int")))]),
+        );
+        let two_ids = crate::resolve(&two, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let blockers = crate::resolve(
+            &replaced,
+            &two_ids,
+            &[
+                Intent::DropTable {
+                    table: "dbo.t".parse().unwrap(),
+                    reason: "replaced".into(),
+                },
+                Intent::RenameTable {
+                    from: "dbo.a".parse().unwrap(),
+                    to: "dbo.t".parse().unwrap(),
+                },
+            ],
+            &ctx(),
+        )
+        .expect_err("a rename cannot take an occupied name either");
+        assert!(
+            blockers
+                .iter()
+                .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
+            "{blockers:?}"
+        );
+    }
+
     #[test]
     fn identical_schemas_produce_no_changes() {
         let s = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));

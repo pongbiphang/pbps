@@ -1342,6 +1342,22 @@ fn rows_after(
         }
     }
 
+    // Before the branches, not after them. A relation missing one row is not
+    // this table's contents, and which way it lies depends only on which side
+    // of the constraint it is: on the parent side a child matching the missing
+    // row reads as an orphan and a valid foreign key is refused; on the child
+    // side an orphan hidden in the missing row is not counted, the probe
+    // reports zero, and under `apply --staged` the table and row statements
+    // commit before `ADD FOREIGN KEY` fails. 165 asked whether *every* branch
+    // had fallen away, which is the same question one row too late
+    // (DECISIONS 170).
+    //
+    // "This table will hold rows I cannot spell" is one answer whether it also
+    // holds rows I can. No answer is the honest one, as it is everywhere else
+    // an unprobeable default reaches.
+    if unspellable {
+        return Ok(None);
+    }
     if !branches.is_empty() {
         return Ok(Some(branches.join("\n UNION ALL ")));
     }
@@ -1353,15 +1369,11 @@ fn rows_after(
     // and the row changes before it commit before the constraint fails
     // (DECISIONS 164).
     //
-    // Only where there was nothing to write, though. A table that declares
-    // rows whose key cells this probe cannot spell will *not* be empty, and
-    // calling it empty counts every matching child as an orphan and refuses a
-    // foreign key the engine would have created (DECISIONS 165). No answer is
-    // the honest one there, as it is everywhere else an unprobeable default
-    // reaches.
-    if unspellable {
-        return Ok(None);
-    }
+    // Only where there was nothing to write, though — which the `unspellable`
+    // return above has already settled: a table that declares rows whose key
+    // cells this probe cannot spell will *not* be empty, and calling it empty
+    // counts every matching child as an orphan and refuses a foreign key the
+    // engine would have created (DECISIONS 165).
     //
     // Typed and named like any other branch, so the outer query can compare
     // against it; `WHERE 1 = 0` is what makes it the empty relation. A column
@@ -2023,6 +2035,70 @@ mod tests {
         assert!(
             !sql.iter().any(|s| s.contains("k0")),
             "no answer is the honest one, not `the parent is empty`: {sql:?}"
+        );
+    }
+
+    /// And one row it cannot spell is enough. 165 asked "did *every* branch
+    /// fall away", so a parent declaring one spellable row beside one
+    /// unspellable one produced a relation holding just the first — a subset
+    /// presented as the whole. On the parent side a child matching the missing
+    /// row reads as an orphan and the constraint is refused; on the child side
+    /// an orphan hidden in the missing row is not counted at all, and under
+    /// `apply --staged` the table and row statements commit before the
+    /// `ADD FOREIGN KEY` fails (DECISIONS 170).
+    #[test]
+    fn one_row_the_probe_cannot_spell_takes_the_whole_relation_with_it() {
+        let mut region = pbps_model::Table::default();
+        let mut code = pbps_model::Column::new(ty("varchar(10)"));
+        code.default = Some("CONVERT(varchar(10), 'eu')".to_owned());
+        region.columns.insert("region_id".to_owned(), code);
+        let spelled = pbps_model::Row(
+            [(
+                "region_id".to_owned(),
+                pbps_model::Value::Text("us".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let sql = probes(&plan(vec![
+            Change::CreateTable {
+                uid: uid("t_bbbbbb"),
+                name: tname("dbo.region"),
+                table: Box::new(region),
+            },
+            // This one the probe can spell.
+            Change::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "other".into(),
+                identity_key: false,
+                key: RowKey::from("r0"),
+                row: spelled,
+                defaults: Default::default(),
+                types: Default::default(),
+            },
+            // This one it cannot, and that is the whole relation's answer.
+            Change::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "other".into(),
+                identity_key: false,
+                key: RowKey::from("r1"),
+                row: pbps_model::Row::default(),
+                defaults: [(
+                    "region_id".to_owned(),
+                    "CONVERT(varchar(10), 'eu')".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                types: Default::default(),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        assert!(
+            !sql.iter().any(|s| s.contains("k0")),
+            "a partial relation is not an answer: {sql:?}"
         );
     }
 

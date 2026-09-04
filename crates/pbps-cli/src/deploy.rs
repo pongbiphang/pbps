@@ -1060,6 +1060,7 @@ fn refuse_unplanned_movement(
     // saying so: a renamed column re-keys every row of its table, and a
     // dropped table takes its grants with it (DECISIONS 158).
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+    let mut redefined: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
     let mut gone: BTreeSet<&TableName> = BTreeSet::new();
     // The constraints and indexes this plan moves, and the tables whose
     // primary key it sets. Everything else on a touched table then answers for
@@ -1090,6 +1091,15 @@ fn refuse_unplanned_movement(
         }
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
+        }
+        // A second set, because the two comparisons ask different questions of
+        // it: `columns` is whose *reading* moved, for the rows; this is whose
+        // *definition* moved, for the shape (DECISIONS 170).
+        for column in p.change.columns_redefined() {
+            redefined
+                .entry(column.table)
+                .or_default()
+                .insert(column.name);
         }
         if let Some(part) = p.change.constraints() {
             match part.name {
@@ -1162,7 +1172,7 @@ fn refuse_unplanned_movement(
         // contaminated shape against itself (DECISIONS 167).
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
             let no_columns = BTreeSet::new();
-            let moved_columns = columns.get(now_name).unwrap_or(&no_columns);
+            let moved_columns = redefined.get(now_name).unwrap_or(&no_columns);
             let no_names = BTreeSet::new();
             let moved_parts = constraints.get(now_name).unwrap_or(&no_names);
             let held = |c: &String| !moved_columns.contains(c);
@@ -4885,6 +4895,69 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// `Change::columns` answers "whose *reading* did this move", which 162
+    /// narrowed for the row comparison; 166 then reused the same set to
+    /// exclude the plan's own shape edits. Nullability rewrites no cell and so
+    /// is rightly absent there, but the catalog reads `is_nullable` back — so
+    /// the shape comparison saw the plan's own `ALTER COLUMN ... NOT NULL` as
+    /// somebody else's work and refused every nullability-only plan
+    /// (DECISIONS 170).
+    #[test]
+    fn a_column_this_plan_makes_not_null_is_its_own_business() {
+        let schema_with = |nullable: bool| {
+            let mut t = pbps_model::Table::default();
+            let mut c = pbps_model::Column::new("int".parse().unwrap());
+            c.nullable = nullable;
+            t.columns.insert("note".to_owned(), c);
+            t.columns.insert(
+                "other".to_owned(),
+                pbps_model::Column::new("int".parse().unwrap()),
+            );
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let tightening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnNullability {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.t.note".parse().unwrap(),
+                    ty: "int".parse().unwrap(),
+                    to_nullable: false,
+                },
+            )],
+        };
+        refuse_unplanned_movement(
+            &tightening,
+            &schema_with(true),
+            &schema_with(false),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the column this plan makes NOT NULL is its own business");
+
+        // Its own, and no wider: another column changing underneath it is
+        // still movement.
+        let mut other_moved = schema_with(false);
+        let mut c = pbps_model::Column::new("int".parse().unwrap());
+        c.nullable = false;
+        other_moved
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .columns
+            .insert("other".to_owned(), c);
+        let e = refuse_unplanned_movement(
+            &tightening,
+            &schema_with(true),
+            &other_moved,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a column nobody planned");
+        assert!(format!("{e:#}").contains("`other`"), "{e:#}");
     }
 
     /// The same for a table's parts, one field over. A constraint or an index

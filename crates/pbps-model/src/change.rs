@@ -860,6 +860,64 @@ impl Change {
         }
     }
 
+    /// Every column this change alters the **definition** of.
+    ///
+    /// The sibling of [`Change::columns`], and deliberately not the same set.
+    /// That one answers "whose *reading* did this move" for a caller comparing
+    /// rows; this one answers "whose *definition* did this move" for a caller
+    /// comparing a table's shape across an apply. 162 removed nullability from
+    /// the first, correctly — it rewrites no cell — and 166 then reused the
+    /// first set for the second question, so the shape comparison read a
+    /// plan's own `ALTER COLUMN ... NOT NULL` as somebody else's work and
+    /// refused it. The catalog reads `is_nullable` back; the two questions
+    /// have different answers and now have different functions
+    /// (DECISIONS 170).
+    ///
+    /// **Deprecation is in neither.** It emits no statement at all, and the
+    /// catalog reads back neither it nor the description, so it can move
+    /// nothing in a read-back — and excusing its column would drop a real
+    /// comparison to buy nothing.
+    // Exhaustive rather than a wildcard, for the reason [`Change::columns`]
+    // gives: a change added later that alters a column has to be named here,
+    // or the plan's own edit is reported as movement.
+    pub fn columns_redefined(&self) -> Vec<ColumnRef> {
+        match self {
+            Change::AddColumn { table, name, .. } => vec![table.column(name)],
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![table.column(from), table.column(to)],
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnNullability { column, .. } => vec![column.clone()],
+            Change::SetColumnDeprecated { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
     /// The object this change removes from the database outright, if it
     /// removes one.
     ///

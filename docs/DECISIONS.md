@@ -2145,3 +2145,45 @@ SPEC is in sync with all of these.
     builds the granted and revoked permission sets by `difference` in both
     directions, so they are disjoint and the guard's "held, less revoked, plus
     granted" is already the net.
+
+170. **Two questions that shared one answer, one question asked a row too
+    late, and one hazard that turned out to be unrepresentable.**
+    **The columns.** `Change::columns` answers "whose *reading* did this
+    move", for the caller comparing a table's rows across an apply; 162
+    narrowed it by dropping nullability and deprecation, correctly, because
+    neither rewrites a cell. 166 then reused that same set to excuse the
+    plan's own edits from the *shape* comparison — a different question with a
+    different answer. The catalog reads `is_nullable` back, so the shape
+    comparison saw the plan's own `ALTER COLUMN ... NOT NULL` as somebody
+    else's work and **every nullability-only plan was refused**.
+    `columns_redefined` is the second question now. Deprecation is in neither
+    set, and that is not an oversight: it emits no statement at all and the
+    catalog reads back neither it nor the description, so it can move nothing
+    in a read-back — excusing its column would drop a real comparison to buy
+    nothing. This is CLAUDE.md's "a guard whose reason has gone is a filter
+    nobody re-reads", in the form where the *reason* moved rather than went:
+    when a set acquires a second caller, the question to ask is whether both
+    callers are asking it the same thing.
+    **The probe.** `rows_after` returns the rows a table will hold, and 165
+    taught it that a row whose key cells no probe can spell is not an empty
+    table — no answer is the honest one. But it asked that question after
+    returning whatever branches it *had* built, so it only fired when *every*
+    branch fell away. One unspellable row beside one spellable one produced a
+    relation holding just the second: a subset presented as the whole. Which
+    way it lies depends only on which side of the constraint it is — on the
+    parent side a child matching the missing row reads as an orphan and a
+    valid foreign key is refused; on the child side an orphan hidden in the
+    missing row is not counted, the probe reports zero, and under
+    `apply --staged` the table and row statements commit before
+    `ADD FOREIGN KEY` fails. The check is hoisted above the branches.
+    **The one that was not there.** A review also reported that a table
+    replaced under its own name — `DropTable` plus `CreateTable` for one name,
+    with a new uid — would have the guard compare two unrelated tables with an
+    empty skip set. It would; the plan cannot exist. `resolve` binds a
+    declared name to the uid that name already has, so a drop intent for a
+    still-declared name is `UnusedIntent` and a rename onto an occupied name
+    is too. Rather than add a case for it, the rule it depends on is now
+    pinned by a test that names the guard, so if identity ever stops working
+    that way the guard is what to revisit. **A hazard made unrepresentable
+    still needs the invariant written down** — otherwise the next reader adds
+    the case, or removes the rule.
