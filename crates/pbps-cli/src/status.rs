@@ -300,8 +300,7 @@ async fn one(
     let pulled = match pbps_mssql::catalog::introspect(&mut conn).await {
         Ok(p) => p,
         Err(e) => {
-            row.state = "unreachable";
-            row.detail = Some(e.to_string());
+            record_unreachable(&mut row, e.to_string());
             return row;
         }
     };
@@ -428,6 +427,26 @@ fn append_detail(existing: &mut String, detail: &str) {
         existing.push_str(" — ");
     }
     existing.push_str(detail);
+}
+
+/// Makes a failed catalog read the primary status without discarding facts
+/// already established from the ledger. In particular, a failed deployment is
+/// still failed when the principal can read `__pbps_state` but not `sys.*`.
+fn record_unreachable(row: &mut EnvStatus, detail: String) {
+    let previous_state = row.state;
+    let previous_detail = row.detail.take();
+    let mut detail = detail;
+    if previous_state != "ok"
+        && previous_state != "unreachable"
+        && let Some(previous_detail) = &previous_detail
+    {
+        record_supplemental_issue(row, previous_state, previous_detail);
+    }
+    if let Some(previous_detail) = previous_detail {
+        append_detail(&mut detail, &previous_detail);
+    }
+    row.state = "unreachable";
+    row.detail = Some(detail);
 }
 
 /// Notes a checksum mismatch on a row, without ever displacing `staged`.
@@ -673,6 +692,22 @@ mod tests {
         assert!(detail.contains("no longer matches"), "{detail}");
         let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
         assert_eq!(ids, ["state.failed", "state.drift"]);
+    }
+
+    #[test]
+    fn a_failed_attempt_stays_visible_when_catalog_inspection_fails() {
+        let mut r = row("prod", "failed");
+        r.detail = Some("the last deployment attempt failed: denied".into());
+        record_unreachable(&mut r, "permission denied reading sys.tables".into());
+
+        assert_eq!(r.state, "unreachable");
+        let detail = r.detail.as_deref().unwrap();
+        assert!(detail.contains("permission denied reading sys.tables"));
+        assert!(detail.contains("deployment attempt failed"));
+        let findings = findings(&[r]);
+        let ids: Vec<&str> = findings.iter().map(|finding| finding.id).collect();
+        assert_eq!(ids, ["environment.unreachable", "state.failed"]);
+        assert!(findings[1].message.contains("deployment attempt failed"));
     }
 
     #[test]

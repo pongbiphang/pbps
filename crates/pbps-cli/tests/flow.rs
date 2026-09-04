@@ -5700,6 +5700,33 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
         })
     }));
 
+    // A separate managed drift must survive beside the policy verdict. The
+    // policy-only runs above intentionally have no drift data and no hook;
+    // after this catalog change both the completed report and its alert are
+    // required.
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("ALTER TABLE dbo.pbps_unreadable_policy ADD drifted int NULL;")
+            .await
+            .unwrap();
+    });
+    let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(code(&verify), FINDING, "{report}");
+    let finding_ids: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["id"].as_str())
+        .collect();
+    assert!(finding_ids.contains(&"state.drift"), "{report}");
+    assert!(finding_ids.contains(&"state.unmanaged-refused"), "{report}");
+    assert!(
+        report.get("data").is_some(),
+        "drift report was discarded: {report}"
+    );
+    assert!(drift_hook.exists(), "managed drift did not fire on_drift");
+
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         conn.execute(

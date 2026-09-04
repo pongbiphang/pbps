@@ -333,7 +333,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     let checked_at = crate::now();
 
     let rt = crate::output::or_unanswerable("verify", json, "runtime.unavailable", db::runtime())?;
-    let report = match rt.block_on(async {
+    let (report, unmanaged_refusal) = match rt.block_on(async {
         let mut conn = db::connect(target).await?;
 
         let Some(baseline) = pbps_mssql::state::latest(&mut conn).await? else {
@@ -393,52 +393,47 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
-        // Unmanaged objects are outside the drift scope by definition. Apply
-        // their policy as its own verdict so `unmanaged: error` reaches the
-        // `state.unmanaged-refused` handler below and never fires `on_drift`.
-        report_unmanaged(
+        // Unmanaged objects are outside the drift scope by definition. Keep
+        // their policy verdict beside the completed drift report: neither can
+        // erase the other when both are present. `report_unmanaged` currently
+        // has only this one typed failure, but preserve any future operational
+        // error as an inability to answer rather than misclassifying it as a
+        // policy finding.
+        let unmanaged_refusal = match report_unmanaged(
             &scoped,
             &managed.unreadable,
             &recorded_modules,
             project.config.unmanaged,
-        )?;
-
-        Ok(pbps_model::DriftReport {
-            version: pbps_model::drift::CURRENT_VERSION,
-            environment: target.label.clone(),
-            checked_at,
-            baseline: pbps_model::DriftBaseline {
-                entry_id: baseline.id,
-                applied_at: baseline.applied_at.clone(),
-                checksum: pbps_model::state_checksum(&baseline.snapshot.schema, &recorded_ids),
+        ) {
+            Ok(()) => None,
+            Err(error) => match error.downcast::<UnmanagedPolicy>() {
+                Ok(policy) => Some(policy),
+                Err(error) => return Err(error),
             },
-            // The checksum compares like with like: both sides fingerprinted
-            // with the recorded mapping, so a derived identity for a hand-added
-            // column cannot by itself make the two differ.
-            live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
-            changes,
-            unmanaged: scoped.unmanaged,
-            unexpressible,
-        })
+        };
+
+        Ok((
+            pbps_model::DriftReport {
+                version: pbps_model::drift::CURRENT_VERSION,
+                environment: target.label.clone(),
+                checked_at,
+                baseline: pbps_model::DriftBaseline {
+                    entry_id: baseline.id,
+                    applied_at: baseline.applied_at.clone(),
+                    checksum: pbps_model::state_checksum(&baseline.snapshot.schema, &recorded_ids),
+                },
+                // The checksum compares like with like: both sides fingerprinted
+                // with the recorded mapping, so a derived identity for a hand-added
+                // column cannot by itself make the two differ.
+                live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
+                changes,
+                unmanaged: scoped.unmanaged,
+                unexpressible,
+            },
+            unmanaged_refusal,
+        ))
     }) {
-        Ok(r) => r,
-        // The project's own policy, refused on a database that was read
-        // successfully. `verify` answered — exit 2 and the schema owner's, not
-        // exit 1 and CI's.
-        Err(e) if e.downcast_ref::<UnmanagedPolicy>().is_some() => {
-            let findings = vec![
-                crate::output::Finding::error(
-                    "state.unmanaged-refused",
-                    format!("{}: {e}", target.label),
-                )
-                .remedy("pbps pull, or relax `unmanaged:` in pbps.yml"),
-            ];
-            if json {
-                return crate::output::Report::new("verify", findings, None::<()>).emit_json();
-            }
-            eprintln!("{e}");
-            return Err(crate::Found::reported().into());
-        }
+        Ok(outcome) => outcome,
         Err(e) => {
             // Unanswerable: `verify` was asked whether this database still
             // matches its recorded state, and it could not look. Without
@@ -497,32 +492,56 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             format!("{table} is in the database and outside the managed set; it was not compared"),
         ));
     }
+    if let Some(ref refusal) = unmanaged_refusal {
+        findings.push(
+            crate::output::Finding::error(
+                "state.unmanaged-refused",
+                format!("{}: {refusal}", target.label),
+            )
+            .remedy("pbps pull, or relax `unmanaged:` in pbps.yml"),
+        );
+    }
 
     if json {
+        // Preserve the established policy-only shape (`data` absent), while a
+        // real drift still carries its complete report even when the unmanaged
+        // policy also failed.
+        let data = if unmanaged_refusal.is_some() && !report.has_drift() {
+            None
+        } else {
+            Some(&report)
+        };
         // The envelope, not the bare report: a consumer reading `verify` beside
         // `validate` should not need a second parser for one of them (SPEC
         // §14.1). The report itself is unchanged, one level down in `data`.
         println!(
             "{}",
-            serde_json::to_string_pretty(&crate::output::Report::new(
-                "verify",
-                findings,
-                Some(&report)
-            ))?
+            serde_json::to_string_pretty(&crate::output::Report::new("verify", findings, data))?
         );
     } else {
-        print!("{}", crate::report::drift(&report));
+        if unmanaged_refusal.is_none() || report.has_drift() {
+            print!("{}", crate::report::drift(&report));
+        }
+        if let Some(ref refusal) = unmanaged_refusal {
+            eprintln!("{refusal}");
+        }
     }
 
-    if !report.has_drift() {
-        return Ok(());
+    if report.has_drift() {
+        if let Some(hook) = &project.config.hooks.on_drift {
+            crate::hooks::run(hook, &payload, "on_drift");
+        }
+        // A distinct exit code so a scheduled pipeline can tell "the database moved"
+        // from "the tool could not run" — the two need different people woken up.
+        return Err(crate::Found::reported().into());
     }
-    if let Some(hook) = &project.config.hooks.on_drift {
-        crate::hooks::run(hook, &payload, "on_drift");
+    if unmanaged_refusal.is_some() {
+        // The project's own policy was refused on a database that was read
+        // successfully. `verify` answered — exit 2 and the schema owner's, not
+        // exit 1 and CI's.
+        return Err(crate::Found::reported().into());
     }
-    // A distinct exit code so a scheduled pipeline can tell "the database moved"
-    // from "the tool could not run" — the two need different people woken up.
-    Err(crate::Found::reported().into())
+    Ok(())
 }
 
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
