@@ -77,15 +77,7 @@ pub fn run_apply_attempt(
 /// redirection and `$VAR` all work, and the alternative would be a config
 /// format that reinvents argv.
 pub fn run(command: &str, payload: &str, what: &str) {
-    let mut shell = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    let mut shell = platform_shell(command);
 
     let child = shell.stdin(Stdio::piped()).env("PBPS_HOOK", what).spawn();
 
@@ -113,6 +105,27 @@ pub fn run(command: &str, payload: &str, what: &str) {
         ),
         Err(e) => eprintln!("warning: the {what} hook could not be waited for: {e}"),
     }
+}
+
+#[cfg(windows)]
+fn platform_shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt as _;
+
+    let mut shell = Command::new("cmd.exe");
+    shell.arg("/D").arg("/S").arg("/C");
+    // `cmd.exe` does not decode the standard argv quoting that `Command::arg`
+    // applies. Pass its command line verbatim, with the outer quotes `/S`
+    // removes, so quotes inside a hook remain shell syntax instead of becoming
+    // backslash-escaped text (for example, `more > "C:\\a path\\hook.json"`).
+    shell.raw_arg(format!("\"{command}\""));
+    shell
+}
+
+#[cfg(not(windows))]
+fn platform_shell(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(command);
+    shell
 }
 
 #[cfg(test)]
