@@ -130,3 +130,8 @@ A54 | and calling the plpgsql caller after that apply committed | refused: funct
 R42 | the same wall-clock value converted under two session zones | UTC -> 2026-01-15 12:00:00+00 / America/New_York -> 2026-01-15 17:00:00+00 — they differ by 05:00:00
 A55 | creating a plpgsql body that names a function which does not exist | accepted
 A56 | and calling it | refused: function m.no_such_fn(integer) does not exist
+R43 | an ambiguous date literal under DateStyle MDY | 2026-01-02
+R44 | the same literal under DateStyle DMY | 2026-02-01 — a month apart, and this is what gets stored
+R45 | the same DEFAULT text created under two DateStyles | '2026-01-02'::date / '2026-02-01'::date
+R46 | an unchanged timestamptz read under UTC | 2026-01-15 12:00:00+00
+R47 | the same row read under America/New_York | 2026-01-15 07:00:00-05 — different text, and the stored instant is identical: true

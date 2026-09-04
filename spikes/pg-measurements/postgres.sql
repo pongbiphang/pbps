@@ -730,6 +730,36 @@ SELECT 'A55', 'creating a plpgsql body that names a function which does not exis
 SELECT 'A56', 'and calling it',
        m.accepts('SELECT m.missing_caller()');
 
+-- ------------------------------- the twentieth 2026-09-05 review round
+
+SET DateStyle = 'ISO, MDY';
+SELECT 'R43', 'an ambiguous date literal under DateStyle MDY',
+       ('01/02/2026'::date)::text;
+SET DateStyle = 'ISO, DMY';
+SELECT 'R44', 'the same literal under DateStyle DMY',
+       ('01/02/2026'::date)::text || ' — a month apart, and this is what gets stored';
+SET DateStyle = 'ISO, MDY';
+CREATE TABLE m.ds_a (d date DEFAULT '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE m.ds_b (d date DEFAULT '01/02/2026');
+SET DateStyle = 'ISO, MDY';
+SELECT 'R45', 'the same DEFAULT text created under two DateStyles',
+       (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.ds_a'::regclass)
+       || ' / '
+       || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.ds_b'::regclass);
+RESET DateStyle;
+
+CREATE TABLE m.tzr (t timestamptz);
+INSERT INTO m.tzr VALUES ('2026-01-15 12:00:00+00');
+SET TimeZone = 'UTC';
+SELECT 'R46', 'an unchanged timestamptz read under UTC', (SELECT t::text FROM m.tzr);
+SET TimeZone = 'America/New_York';
+SELECT 'R47', 'the same row read under America/New_York',
+       (SELECT t::text FROM m.tzr)
+       || ' — different text, and the stored instant is identical: '
+       || (SELECT (t = '2026-01-15 12:00:00+00'::timestamptz)::text FROM m.tzr);
+RESET TimeZone;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

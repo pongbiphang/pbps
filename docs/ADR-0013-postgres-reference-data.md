@@ -418,39 +418,71 @@ that a value written and a value read compare equal.
 and ADR-0012 §4 already measured a fifth, `TimeZone`, deciding whether a type
 change rebuilds a table.
 
-**Decision.** The PostgreSQL connection pins its session on every connect —
-`bytea_output`, `DateStyle`, `IntervalStyle`, `extra_float_digits` and
-**`standard_conforming_strings`** — and does it in `pbps-postgres`, not in
-`pbps-db`, because *which* settings matter is dialect knowledge.
+**Decision: these settings are scoped to the reads, not pinned on the session.**
+`SET LOCAL` around the queries that render values — the reference-data read-back
+and the catalog reads that return value text — and **nothing applied to the
+session that executes DDL**.
 
-**`TimeZone` is deliberately not on that list, and an earlier version of this
-decision had it there.** Every setting above changes how a value is *written
-down*; `TimeZone` changes what a value *is*. **Measured**, the same wall-clock
-value converted from `timestamp` to `timestamptz` under two zones lands five
-hours apart:
+Two earlier versions of this decision got the *presence* of each setting right
+and its *scope* wrong, in opposite directions, and both are measured.
+
+**A session-wide pin changes what DDL means.** `DateStyle` is not only an output
+format; it decides how an ambiguous literal is read:
 
 ```
-'2026-01-15 12:00:00' converted under UTC:               2026-01-15 12:00:00+00
-the same value converted under America/New_York:         2026-01-15 17:00:00+00
+MDY: '01/02/2026'::date = 2026-01-02
+DMY: '01/02/2026'::date = 2026-02-01
 ```
 
-Pinning it would mean pbps deciding, for every environment, which zone the
-existing wall-clock data was recorded in — and getting that wrong moves every
-row silently, with no error and nothing for `verify` to compare against, since
-both sides would be read back under the same wrong pin.
+and that reading is what gets stored, so the same definition text recreated
+under a pinned session yields a different object than the target's own settings
+would:
 
-That is a data decision, and SPEC §1.3 draws the line there: how data should be
-*moved* is a business decision a structural diff cannot derive. So the pin
-covers rendering only, and **a `timestamp` → `timestamptz` change is refused
-until the zone can be declared** — the same shape as the `serial` and array
-refusals in [ADR-0012](ADR-0012-postgres-type-catalogue.md), and for the same
-reason: the tool would otherwise be choosing what the data means.
+```
+DEFAULT '01/02/2026' created under MDY  ->  stored as '2026-01-02'::date
+the same text created under DMY         ->  stored as '2026-02-01'::date
+```
 
-ADR-0012 §4 measured the other half of this — the zone also decides whether
-that conversion rewrites the table — and recorded it as a caveat on the
-estimate. It is worth noticing that the same setting turned out to be a
-correctness input and not only a cost one, which is why the estimate caveat was
-not enough on its own. The values a
+Since §3 of [ADR-0009](ADR-0009-postgres-modules.md) makes every module edit a
+drop and create, a pinned session would silently rewrite dates inside opaque
+definitions on every rebuild — a month apart, with no error anywhere.
+
+**And removing a setting entirely breaks the read-back it was there for.** An
+earlier version dropped `TimeZone` from the list outright. **Measured**, the text
+of an unchanged `timestamptz` moves with the session while the stored instant
+does not:
+
+```
+read under UTC:              2026-01-15 12:00:00+00
+read under America/New_York: 2026-01-15 07:00:00-05
+the stored instant is the same: true
+```
+
+Without a canonical zone for reads, the same row compares differently between a
+plan and a `verify` run by a role with another default, and produces phantom
+updates and phantom drift.
+
+So the two failures have one fix: **scope**. Rendering is canonicalized where
+rendering happens; the DDL session is left as the operator's database has it, so
+an opaque definition means what it means there.
+
+`standard_conforming_strings` is the one that stays on both sides, and it is
+worth saying why rather than leaving it to be found: it *does* change how DDL
+text parses, but in the safe direction — pinned `on`, a definition that relied
+on `off` fails loudly at `CREATE` instead of being silently misread, and
+ADR-0011's scanner rule is only true while it is `on`.
+
+**What no scope can fix stays refused.** A `timestamp` → `timestamptz` change
+asks which zone the existing wall-clock data was recorded in — **measured**, the
+same value lands five hours apart under two zones — and that is a data decision
+SPEC §1.3 puts outside a structural diff. It is refused until the zone can be
+declared, like `serial` and arrays in
+[ADR-0012](ADR-0012-postgres-type-catalogue.md).
+
+ADR-0012 §4 had measured that same setting deciding whether the conversion
+rewrites the table, and filed it as a caveat on the *estimate*. Filing a
+correctness input in the cost column is what let it survive into a session pin,
+which is worth more than the fix. The values a
 plan writes and the values it reads back then live in one space, which is what
 ADR-0004 requires and what "fixed CONVERT styles" achieves on the other engine.
 
