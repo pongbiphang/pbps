@@ -949,3 +949,28 @@ SPEC is in sync with all of these.
     with the count now, and at `error` nothing is written at all: refusing
     before the write is the difference between "no files" and "files you
     must now delete by hand".
+115. **`money` and `smallmoney` are read with conversion style 2.** The type
+    holds four decimal places and the default style renders two: measured on
+    a live server, `1.0001` came back `1.00` and `2.5678` came back `2.57`.
+    A `pull` then wrote a declaration for a value the table does not hold,
+    and `verify` compared the two truncations and reported clean — a cell
+    that could never be seen to differ. Style 2 renders all four and
+    round-trips. It also renders `1234567.891` as `1234567.8910`, which is
+    the engine's spelling and therefore the one a declaration has to use;
+    the spelling probe (101) already says so before anything is written.
+116. **The pre-delete probe asks about every foreign key to the table, not
+    only the ones that reference the key column.** A foreign key may target
+    any unique key of the parent, and filtering the catalog to
+    `rc.name = <the key column>` dropped those constraints out of the query
+    altogether — so `ON DELETE CASCADE` could take child rows, in an
+    unmanaged application table as easily as a declared one, with the probe
+    reporting nothing. The filter is gone; every fragment that meant "the
+    parent row being deleted" now says so by *its* key column
+    (`<key column> = @key`) and compares the child against
+    `(SELECT <referenced column> FROM <parent> WHERE <key column> = @key)`,
+    which is the same query for the primary-key case.
+
+    A composite foreign key still contributes one count per column, so a
+    child matching one column of a two-column key is counted. That
+    over-counts, which refuses a delete that might have been fine; the
+    direction that under-counts is the one that loses rows.

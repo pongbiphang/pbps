@@ -498,7 +498,8 @@ pub fn decode_alias(name: &TableName, row: &pbps_db::Row) -> Result<(RowKey, Row
 ///
 /// Styles are fixed so the spelling never depends on a session setting:
 /// `126` is ISO 8601 for every date and time type, `1` keeps the `0x` prefix
-/// on binary, and `3` is the round-trippable 17-digit form for floats. A
+/// on binary, `3` is the round-trippable 17-digit form for floats, and `2`
+/// is the four-decimal form for money. A
 /// fixed-width `char` is trimmed because the engine itself ignores the padding
 /// when it compares — `'ab' = 'ab   '` — and a declaration should not have to
 /// count spaces to agree with it.
@@ -508,6 +509,13 @@ fn read_expr(quoted: &str, base: &str) -> String {
             format!("CONVERT(nvarchar(max), {quoted}, 126)")
         }
         "float" | "real" => format!("CONVERT(nvarchar(max), {quoted}, 3)"),
+        // `money` and `smallmoney` hold four decimal places and the default
+        // style renders two: `1.0001` came back `1.00`, so a pull wrote a
+        // declaration for a value the table does not hold and the next
+        // `verify` compared the two truncations and called them equal.
+        // Measured on a live server; style 2 renders all four and round-trips
+        // (DECISIONS 115).
+        "money" | "smallmoney" => format!("CONVERT(nvarchar(max), {quoted}, 2)"),
         "binary" | "varbinary" | "timestamp" => format!("CONVERT(nvarchar(max), {quoted}, 1)"),
         "image" => format!("CONVERT(nvarchar(max), CONVERT(varbinary(max), {quoted}), 1)"),
         // CLR types have no conversion to a string type; they render themselves.
@@ -1019,6 +1027,13 @@ mod tests {
         assert_eq!(read_expr("[c]", "char"), "RTRIM([c])");
         assert_eq!(read_expr("[g]", "geography"), "[g].ToString()");
         assert_eq!(read_expr("[n]", "decimal"), "CONVERT(nvarchar(max), [n])");
+        // The default style truncates money to two decimals; the type holds
+        // four.
+        assert_eq!(read_expr("[m]", "money"), "CONVERT(nvarchar(max), [m], 2)");
+        assert_eq!(
+            read_expr("[m]", "smallmoney"),
+            "CONVERT(nvarchar(max), [m], 2)"
+        );
     }
 
     #[test]

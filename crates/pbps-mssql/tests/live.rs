@@ -2351,6 +2351,64 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         assert_eq!(n, want, "{why}");
     }
 
+    // A foreign key need not target the primary key. The probe filtered the
+    // catalog to `rc.name = <the key column>`, so a child referencing some
+    // other unique key of the same parent row was left out of the query
+    // altogether — and `ON DELETE CASCADE` would take it, unreported, in an
+    // unmanaged application table as easily as a declared one.
+    // One batch per statement: SQL Server compiles a whole batch before it
+    // runs any of it, so a column added and used in the same one is
+    // "Invalid column name".
+    for sql in [
+        "ALTER TABLE dbo.status ADD alt int NULL;",
+        "UPDATE dbo.status SET alt = CASE code WHEN 'old' THEN 1 WHEN 'new' THEN 2 ELSE 3 END;",
+        "ALTER TABLE dbo.status ADD CONSTRAINT uq_status_alt UNIQUE (alt);",
+        "CREATE TABLE dbo.alt_child (\n\
+             id int NOT NULL CONSTRAINT pk_alt_child PRIMARY KEY,\n\
+             alt int NULL CONSTRAINT fk_alt_child REFERENCES dbo.status (alt) ON DELETE CASCADE\n\
+         );",
+        "INSERT INTO dbo.alt_child (id, alt) VALUES (1, 1), (2, 2);",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("an alternate key and a child for it:\n{sql}\n{e}"));
+    }
+    let probe = probe_for(&moved);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "alt_child 1 references `old` through uq_status_alt, and the delete would cascade into it"
+    );
+    // And the child that references a *different* parent row through the
+    // same alternate key is not counted: the probe reads the row being
+    // deleted, not the constraint.
+    db.conn
+        .execute("DELETE FROM dbo.alt_child WHERE id = 1;")
+        .await
+        .expect("leave only the child of another row");
+    let probe = probe_for(&moved);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "alt_child 2 references `new`, which is not going");
+    db.conn
+        .execute("DROP TABLE dbo.alt_child;")
+        .await
+        .expect("out of the way of the checks below");
+
     // A table that has lost its key is unreadable, not empty.
     db.conn
         .execute("ALTER TABLE dbo.kind DROP CONSTRAINT fk_kind_status; DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.status') AND type = 'PK'); EXEC('ALTER TABLE dbo.status DROP CONSTRAINT ' + @pk);")
@@ -2364,6 +2422,89 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .await
         .expect_err("rows without a key cannot be read");
     assert!(err.to_string().contains("dbo.status"), "{err}");
+
+    db.drop().await;
+}
+
+/// `money` and `smallmoney` hold four decimal places, and the default
+/// conversion style renders two. Read that way, `1.0001` came back `1.00`:
+/// `pull` wrote a declaration for a value the table does not hold, and
+/// `verify` compared two truncations and called them equal. Measured here
+/// rather than reasoned about (DECISIONS 115).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn money_reads_back_with_the_four_decimals_it_holds() {
+    use pbps_model::{DataMode, Row, RowKey, RowScope, TableData, Value};
+
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut t = Table::default();
+    t.columns
+        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+    t.columns
+        .insert("m".to_owned(), Column::new(ty("money")).not_null());
+    t.columns
+        .insert("sm".to_owned(), Column::new(ty("smallmoney")).not_null());
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".to_owned()],
+    });
+    // The engine's own spelling, which the spelling probe already forces a
+    // declaration to use (101): four decimals, always.
+    t.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [(
+            RowKey::from("1"),
+            [
+                ("m".to_owned(), text("1.0001")),
+                ("sm".to_owned(), text("2.5678")),
+            ]
+            .into_iter()
+            .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let name = TableName::new("dbo", "money_t");
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("money").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let scopes = declared.data_scopes();
+    let read: std::collections::BTreeMap<TableName, RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("read rows");
+    let back = live
+        .with_observed_rows(&observed, &scopes, &declared)
+        .unwrap();
+    let row = &back.tables[&name].data.as_ref().unwrap().rows[&RowKey::from("1")];
+    let cell = |c: &str| {
+        row.columns()
+            .find(|(n, _)| n.as_str() == c)
+            .map(|(_, v)| v.clone())
+    };
+    // The fourth decimal survives. Under the default style these were
+    // `1.00` and `2.57`, and the declaration above would have been silently
+    // rewritten to them.
+    assert_eq!(cell("m"), Some(text("1.0001")), "{row:?}");
+    assert_eq!(cell("sm"), Some(text("2.5678")), "{row:?}");
+    // Which is the property that matters: the read agrees with the
+    // declaration, so the drift check has nothing to say.
+    assert_eq!(back.tables[&name].data, declared.tables[&name].data);
 
     db.drop().await;
 }

@@ -500,6 +500,16 @@ fn delete_probe(
     // the catalog query knows (`c.name`): a deleted row is gone for every
     // column, an updated row only for the columns its update sets. A row
     // updated elsewhere still points at the parent, and is counted.
+    let parent = qualified(&stored.table)?;
+    // The row being deleted, named by the column the *plan* keys it on. Every
+    // fragment below that means "this parent row" says so this way, because a
+    // foreign key may reference some other unique key of the same row, and
+    // `rc.name` is then not the key column at all (DECISIONS 116).
+    let this_row = format!("{} = @key", quote(&stored.name)?);
+    // A quoted identifier may itself hold a `'` — `quote` escapes `]`, not
+    // quotes — so every fragment carrying one into the generated statement
+    // goes through `literal`, never straight into the outer `N'...'`.
+    let from_this_row = literal(&format!(" FROM {parent} WHERE {this_row})"));
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
@@ -510,7 +520,6 @@ fn delete_probe(
             continue;
         };
         let key_sql = quote(&stored_key.name)?;
-        let parent = qualified(&stored.table)?;
         // Deleted rows are gone whatever they pointed at.
         let deleted = (!moved.deleted.is_empty()).then(|| {
             let list: Vec<String> = moved.deleted.iter().map(|k| literal(k.as_str())).collect();
@@ -538,9 +547,7 @@ fn delete_probe(
                     literal(child_key.as_str())
                 )));
                 pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(&format!(" = {} AND ", literal(after))));
-                pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(" = @key))"));
+                pieces.push(literal(&format!(" = {} AND {this_row}))", literal(after))));
             }
             let then = if pieces.is_empty() {
                 "N''".to_owned()
@@ -569,7 +576,7 @@ fn delete_probe(
                 let value = match arrival {
                     Arrival::Inserted(v) => {
                         // Nothing stored to double-count: the row is either
-                        // arriving on the deleted key or it is not.
+                        // arriving on the deleted row or it is not.
                         pieces.push(literal(&format!(
                             " + (CASE WHEN EXISTS (SELECT 1 FROM {parent} WHERE "
                         )));
@@ -577,25 +584,31 @@ fn delete_probe(
                     }
                     Arrival::Updated(v) => {
                         // The row exists, so it may already be inside the
-                        // count: only one that is *not* on the key now is
+                        // count: only one that is *not* on the parent now is
                         // arriving. A NULL foreign key is not on it either,
-                        // and `NULL <> @key` is unknown, so it is named.
+                        // and `NULL NOT IN (...)` is unknown, so it is named.
                         pieces.push(literal(&format!(
                             " + (SELECT COUNT(*) FROM {child_sql} WHERE {key_sql} = {} AND \
-                             ({column_sql} IS NULL OR {column_sql} <> @key) AND EXISTS (SELECT 1 \
-                             FROM {parent} WHERE ",
+                             ({column_sql} IS NULL OR {column_sql} NOT IN (SELECT ",
                             literal(child_key.as_str())
+                        )));
+                        pieces.push("QUOTENAME(rc.name)".to_owned());
+                        pieces.push(literal(&format!(
+                            " FROM {parent} WHERE {this_row})) AND EXISTS (SELECT 1 FROM \
+                             {parent} WHERE "
                         )));
                         v
                     }
                 };
                 pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(&format!(" = {} AND ", literal(value))));
-                pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(match arrival {
-                    Arrival::Inserted(_) => " = @key) THEN 1 ELSE 0 END)",
-                    Arrival::Updated(_) => " = @key))",
-                }));
+                pieces.push(literal(&format!(
+                    " = {} AND {this_row}{}",
+                    literal(value),
+                    match arrival {
+                        Arrival::Inserted(_) => ") THEN 1 ELSE 0 END)",
+                        Arrival::Updated(_) => "))",
+                    }
+                )));
             }
             if !pieces.is_empty() {
                 arrivals_per_column.push(format!(
@@ -645,18 +658,18 @@ fn delete_probe(
             "DECLARE @n int = 0, @sql nvarchar(max);\n\
              SELECT @sql = STRING_AGG(CONVERT(nvarchar(max),\n\
                  N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
-                 + N' WHERE ' + QUOTENAME(c.name) + N' = @key' + {exclusion} + N')' + {arrival} + N';'), N' ')\n\
+                 + N' WHERE ' + QUOTENAME(c.name) + N' IN (SELECT ' + QUOTENAME(rc.name)\n\
+                 + {from_this_row} + {exclusion} + N')' + {arrival} + N';'), N' ')\n\
                FROM sys.foreign_keys fk\n\
                JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n\
                JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
                JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
                JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n\
                JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id\n\
-              WHERE fk.referenced_object_id = OBJECT_ID({}) AND rc.name = {};\n\
+              WHERE fk.referenced_object_id = OBJECT_ID({});\n\
              IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {}, @n = @n OUTPUT;\n\
              SELECT @n AS n;",
-            literal(&qualified(&stored.table)?),
-            literal(&stored.name),
+            literal(&parent),
             literal(key.as_str())
         ),
     ))
@@ -1018,7 +1031,20 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         let sql = &p[0].sql;
         assert!(sql.contains("OBJECT_ID(N'[dbo].[status]')"), "{sql}");
-        assert!(sql.contains("rc.name = N'code'"), "{sql}");
+        // Every foreign key to the table, whatever key of it they target:
+        // the filter that was here dropped a constraint referencing some
+        // other unique key out of the query altogether (116).
+        assert!(!sql.contains("rc.name = N'code'"), "{sql}");
+        // The child is compared against the referenced column *of the row
+        // being deleted*, which is the same query when that column is the
+        // key.
+        assert!(
+            sql.contains(
+                "QUOTENAME(c.name) + N' IN (SELECT ' + QUOTENAME(rc.name)\n\
+                 + N' FROM [dbo].[status] WHERE [code] = @key)'"
+            ),
+            "{sql}"
+        );
         assert!(sql.contains("@key = N'old'"), "{sql}");
         assert!(sql.contains("sys.foreign_keys"), "{sql}");
         assert!(sql.contains("QUOTENAME"), "{sql}");
@@ -1076,7 +1102,7 @@ mod tests {
         assert!(
             sql.contains(
                 "N' AND NOT ([id] = N''7'' AND NOT EXISTS (SELECT 1 FROM [dbo].[status] WHERE ' + \
-                 QUOTENAME(rc.name) + N' = N''new'' AND ' + QUOTENAME(rc.name) + N' = @key))'"
+                 QUOTENAME(rc.name) + N' = N''new'' AND [code] = @key))'"
             ),
             "{sql}"
         );
