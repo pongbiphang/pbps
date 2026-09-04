@@ -15,9 +15,8 @@ now out of date, noted in "Credentials" below.
 
 ## The contract a pipeline branches on
 
-Three exit codes, one meaning each, the same across every read-only command a
-pipeline gates on — `validate`, `fmt --check`, `plan`, `verify`, `doctor`,
-`explain`:
+Three exit codes, one meaning each, across the commands a pipeline gates on —
+`validate`, `fmt --check`, `plan`, `verify`, `doctor`:
 
 | Code | Means | A pipeline should |
 |---|---|---|
@@ -29,24 +28,40 @@ The split matters because the two failures have different owners: a `2` from
 `pbps validate` belongs to the author of the change, and a `1` from
 `pbps verify` usually means the database was unreachable, which does not.
 
-**`pbps status` is the exception, and it is not an accident.** It reports every
-configured environment in one pass — including ones that are drifted,
-unreachable or mid-deployment — and exits `0` with all of that in the report,
-because one unreachable database must not cost the operator the other five
-lines. Measured: an unreachable environment gives exit `0`, `"result": "ok"`,
-and an `environment.unreachable` warning in the findings. So never branch a
-pipeline on `status`'s exit code: read its JSON, or use `verify`, which is the
-command whose answer *is* a gate.
+**`status` and `explain` are outside it, and that is not an accident.** Both
+are *reports*: they describe a situation rather than judging it, so they exit
+`0` and put what they found in the report.
+
+- `pbps status` covers every configured environment in one pass — drifted,
+  unreachable, mid-deployment — because one unreachable database must not cost
+  the operator the other five lines. Measured: an unreachable environment gives
+  exit `0`, `"result": "ok"`, and an `environment.unreachable` warning in the
+  findings.
+- `pbps explain` describes a plan for the human who has to approve it, and says
+  so where the plan cannot be applied at all: measured, `explain --plan` on an
+  offline preview prints `origin  computed offline — a preview; apply will
+  refuse it` and still exits `0`. The refusal belongs to `apply`, which is
+  where it happens.
+
+So never branch a pipeline on either one's exit code. Read the JSON, or gate on
+`verify` — the command whose answer *is* a gate.
 
 Verified by running them: `validate` on a clean project exits `0`, on a
 declaration with an unknown type `2`, and outside any project `1`;
 `fmt --check` exits `2` on a file that is not in canonical form.
 
-Add `--format json` to any read-only command for the same findings as typed
-data — the shape a job summary or a code-review annotation should be built
-from. **Vendor-native annotations are produced by a converter in `scripts/`,
-never by the binary** (SPEC 14.3): the JSON is the stable surface, and a
-converter can be rewritten for a platform the binary has never heard of.
+Add `--format json` to a read-only command for the same findings as typed data
+— the shape a job summary or a code-review annotation should be built from.
+**Vendor-native annotations are produced by a converter in `scripts/`, never by
+the binary** (SPEC 14.3): the JSON is the stable surface, and a converter can be
+rewritten for a platform the binary has never heard of.
+
+One command refuses it, on purpose: a **connected** plan. `pbps plan --env prod
+--format json` exits `1` with `flags.conflicting` — measured — because
+`--format json` describes findings while `plan --db` produces a plan, and the
+two are different artifacts. The tool says what to do instead, and so does this
+file: write the plan with `--out plan.json`, then read it with
+`pbps explain --plan plan.json --format json`.
 
 ## Credentials
 
@@ -72,7 +87,7 @@ has no `url:` field for the same reason.
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true` |
+| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true`. An **environment** secret / **protected** variable — see "Who can reach the credential" |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
 | `APPROVED_PLAN_SHA256` | `apply --checksum` | not a secret; it is the approval, supplied by whoever approved |
 
@@ -161,6 +176,11 @@ jobs:
   plan:
     if: startsWith(github.ref, 'refs/tags/prod-v')
     runs-on: ubuntu-latest
+    # An environment with no reviewers, whose deployment *tag* rule is
+    # `prod-v*`: that is what makes the credential below an environment secret
+    # released only to a job on such a tag, rather than a repository secret any
+    # workflow run can read. See "Who can reach the credential" below.
+    environment: production-plan
     env:
       PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
     steps:
@@ -211,6 +231,33 @@ jobs:
             --checksum "${{ vars.APPROVED_PLAN_SHA256 }}" \
             --allow rename,narrowing
 ```
+
+### Who can reach the credential
+
+The `apply` job is behind `environment: production` with required reviewers, and
+that is the approval gate. It is not, by itself, the credential boundary: the
+`plan` job runs first, builds this repository from the tagged commit, and needs
+a deploy-capable connection string to query production at all. So whoever can
+create a `prod-v*` tag can run code of their choosing with that credential in
+its environment, before any reviewer sees anything.
+
+Three settings make that boundary deliberate rather than accidental, and none
+of them is optional:
+
+- **`PBPS_PROD_URL` is an environment secret, not a repository secret**, on both
+  `production-plan` and `production`. A repository secret is readable by any
+  workflow run that names it; an environment secret is released only to a job
+  that references that environment, after its protection rules pass
+  ([GitHub docs](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments#environment-secrets)).
+- **Both environments carry a deployment tag rule of `prod-v*`**, so neither
+  releases anything to a job on some other ref.
+- **A repository ruleset restricts who may create `prod-v*` tags.** The tag push
+  is what starts all of this; without that rule the two settings above only
+  decide *which job* gets the credential, never *who* set it running.
+
+`production-plan` has no required reviewers on purpose. Putting them there would
+ask a human to approve before the plan exists — before there is a checksum to
+approve — which is the thing this pipeline exists to avoid.
 
 There is deliberately **no recording step after `apply`**. `apply` reads the
 database back and records that state itself, with the checksum of the plan it
@@ -319,6 +366,17 @@ apply:prod:
 
 `PBPS_PROD_URL` is a masked, protected CI/CD variable; `APPROVED_PLAN_SHA256`
 is supplied by the approver when they run the manual job.
+
+**Protect the `prod-v*` tags as well, in the same setting-up.** A protected
+variable is given only to jobs running on a protected branch or a protected tag
+([GitLab docs](https://docs.gitlab.com/ci/variables/#protect-a-cicd-variable)),
+and the `rules:` regex above selects tag pipelines without protecting anything.
+Protect the variable and not the tag pattern and the two deployment jobs run
+with `PBPS_PROD_URL` unset — `pbps doctor --env prod` then fails on a
+`url_env:` naming a variable that is not there, which reads as a broken
+pipeline rather than as the missing permission it is. The protected tag pattern
+is also what decides who may start a deployment at all, which is the same
+boundary the GitHub half draws with a ruleset.
 
 ## Drift watch
 
