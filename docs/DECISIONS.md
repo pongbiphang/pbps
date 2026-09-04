@@ -1919,3 +1919,33 @@ SPEC is in sync with all of these.
     a test written against the thing under it rather than the thing being
     fixed.
 
+162. **Three places the guard looked, rather than three things it compared.**
+    Every one of these is the check being correct about the wrong domain.
+    **A target only the plan names.** The per-target grant comparison iterated
+    the targets *either side* holds permissions on. A plan that adds the first
+    permission a role has on a target puts it in neither set the moment that
+    grant is reversed — so the one thing being verified was the one thing the
+    loop never visited. The planned targets are unioned in now.
+    **A row after its statement commits.** A row write holds itself to what it
+    wrote (132, 136, 143), and that is enough inside one transaction: the row
+    stays locked until the commit, so nothing else can reach it. A staged run
+    commits each statement, and the row is loose from then until the
+    checkpoint read. Rows the plan writes are held to being *there* or *gone*
+    at the settled comparison. Their **contents** are not, and that is a
+    limit rather than an omission: predicting a cell's read-back spelling is
+    what 149 exists to avoid, and a declared value equal to its column's
+    default is *omitted* from the read-back, so comparing spelled cells would
+    refuse valid applies.
+    **A column change that moves no reading.** 158 put every column-level
+    change into the skip set, arguing that naming one too many only narrows a
+    comparison. It does, and the narrowing has a price: a skipped column is a
+    cell nothing compares. Nullability rewrites no stored value, and the
+    read-back's omission rule turns on whether a column has a *default*, not
+    on whether it accepts NULL; a deprecation is a description. Both are out
+    of the set now, and a change to the default stays in it.
+    Two of the three are the argument of 158 running out: "conservative" is
+    the right instinct against a guard that has invented movement six times,
+    and it is not free. Where the conservative reading can be shown to cost a
+    real check and the aggressive one can be shown to be exact — as here, from
+    the omission rule and from the plan's own statements — the exact one wins.
+

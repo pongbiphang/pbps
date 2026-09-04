@@ -673,14 +673,21 @@ impl Change {
     /// wrote (132, 136, 143); nothing else in a run speaks for the second, and
     /// an `AFTER` trigger reaches them from inside the very statement that
     /// writes a row the plan *did* name.
+    ///
+    /// The direction comes with it because those statements stop speaking at
+    /// their own commit. In one transaction that is enough — the row stays
+    /// locked until the commit, so nothing can reach it — but a staged run
+    /// commits each statement, and between that and the checkpoint read a row
+    /// it inserted can be deleted, or one it deleted put back (DECISIONS 162).
     // Exhaustive rather than a wildcard: a change added later that writes a
     // declared row has to be named here, or the row it writes would be
     // compared against a state it was never part of.
-    pub fn row(&self) -> Option<(&TableName, &RowKey)> {
+    pub fn row(&self) -> Option<(&TableName, &RowKey, Presence)> {
         match self {
-            Change::InsertRow { table, key, .. }
-            | Change::UpdateRow { table, key, .. }
-            | Change::DeleteRow { table, key, .. } => Some((table, key)),
+            Change::InsertRow { table, key, .. } | Change::UpdateRow { table, key, .. } => {
+                Some((table, key, Presence::Present))
+            }
+            Change::DeleteRow { table, key, .. } => Some((table, key, Presence::Absent)),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -712,19 +719,25 @@ impl Change {
         }
     }
 
-    /// Every column this change alters in any way — its name, its type, its
-    /// default, anything.
+    /// Every column this change moves the *reading* of: its name, or the way
+    /// its cells come back.
     ///
     /// For a caller comparing a table's rows before and after an apply. A row
     /// is keyed by column name and each cell reads back in its column's own
     /// rendering, so a column the plan renames, adds, drops or retypes changes
-    /// the *shape* of every row in the table without any row change saying so.
+    /// the shape of every row in the table without any row change saying so.
     /// Compared whole, those rows all read as somebody else's work
     /// (DECISIONS 158).
     ///
-    /// Deliberately every column-level change and not the subset that can be
-    /// argued to alter a rendering: naming one too many only narrows a
-    /// comparison, and naming one too few refuses a valid plan.
+    /// 158 named every column-level change on the argument that naming one too
+    /// many only narrows a comparison. It does — and that narrowing has a
+    /// price: a column skipped here is a cell nothing compares. The two that
+    /// move no reading are excluded now (DECISIONS 162). **Nullability**
+    /// rewrites no stored value, and the read-back's omission rule turns on
+    /// whether a column *has a default*, not on whether it accepts NULL. A
+    /// column's **deprecation** is a description; it touches no cell at all.
+    /// A change to the **default** stays, because a cell at its default is
+    /// spelled from that default and omitted where it matches.
     // Exhaustive rather than a wildcard: a change added later that touches a
     // column has to be named here, or the rows of its table would be compared
     // against a shape the plan itself moved.
@@ -736,10 +749,10 @@ impl Change {
             } => vec![table.column(from), table.column(to)],
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::SetColumnDeprecated { column, .. } => vec![column.clone()],
-            Change::CreateTable { .. }
+            | Change::AlterColumnDefault { column, .. } => vec![column.clone()],
+            Change::AlterColumnNullability { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }

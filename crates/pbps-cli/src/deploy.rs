@@ -1056,7 +1056,7 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
         }
-        if let Some((table, key)) = p.change.row() {
+        if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
         }
         if let Some((role, target, permissions)) = p.change.grant() {
@@ -1176,6 +1176,35 @@ fn refuse_unplanned_movement(
         }
     }
 
+    // The rows the plan writes, held to being there or gone once every
+    // statement has run. Their *contents* are held by the statement itself
+    // (132, 136, 143) — but only until it commits. In one transaction that is
+    // the whole story, because the row stays locked until the commit and
+    // nothing else can reach it; a staged run commits each statement, and a
+    // row it inserted can be deleted before the checkpoint read
+    // (DECISIONS 162).
+    if settled == Settled::Whole {
+        for p in &changes.changes {
+            let Some((table, key, expected)) = p.change.row() else {
+                continue;
+            };
+            // Out of the read's row scope, or the table itself is gone: the
+            // table checks below answer for that, and "absent" is not "empty".
+            let Some(rows) = after.tables.get(table).and_then(|t| t.data.as_ref()) else {
+                continue;
+            };
+            match (expected, rows.rows.contains_key(key)) {
+                (pbps_model::Presence::Present, false) => moved.push(format!(
+                    "{table} row `{key}` is not there, and this plan writes it"
+                )),
+                (pbps_model::Presence::Absent, true) => moved.push(format!(
+                    "{table} row `{key}` is still there, and this plan deletes it"
+                )),
+                _ => {}
+            }
+        }
+    }
+
     // And the names the plan leaves standing or empty. Existence only: the
     // shape of a table it creates comes back from the catalog for a reason,
     // and holding it to the declared shape would refuse valid applies. A role
@@ -1278,7 +1307,23 @@ fn refuse_unplanned_movement(
             continue;
         };
         let empty = Permissions::new();
-        let targets: BTreeSet<_> = was.grants.keys().chain(now.grants.keys()).collect();
+        // Every target either side holds permissions on, *and* every target
+        // this plan names. A plan that adds the first permission a role has on
+        // a target puts it in neither set when the grant is reversed before
+        // the read — so the one thing being checked was the one thing the loop
+        // never visited (DECISIONS 162).
+        let targets: BTreeSet<_> = was
+            .grants
+            .keys()
+            .chain(now.grants.keys())
+            .chain(
+                granting
+                    .keys()
+                    .chain(revoking.keys())
+                    .filter(|(role, _)| *role == now_name)
+                    .map(|(_, target)| *target),
+            )
+            .collect();
         for target in targets {
             // What the plan says the role will hold here: what it held, less
             // what this plan revokes, plus what it grants. Excusing the moved
@@ -4013,6 +4058,116 @@ mod tests {
         let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// Three things the guard could not see, each because of where it looked
+    /// rather than what it compared (DECISIONS 162).
+    #[test]
+    fn the_guard_looks_where_the_plan_reaches() {
+        use pbps_model::{DataMode, GrantTarget, Permission, RowKey, TableData, Value};
+
+        // 1. A target only the plan names. Reversed before the read, it is in
+        //    neither side's grants and the loop never visited it.
+        let role = |grants: BTreeMap<GrantTarget, BTreeSet<Permission>>| {
+            let mut s = Schema::default();
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let granting = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                role: "app".to_owned(),
+                target: GrantTarget::Schema("dbo".to_owned()),
+                permissions: [Permission::Select].into_iter().collect(),
+            })],
+        };
+        let none = role(BTreeMap::new());
+        let e = refuse_unplanned_movement(&granting, &none, &none, "prod", Settled::Whole)
+            .expect_err("the first permission on a target is still a permission");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
+
+        // 2. A row the plan writes, gone before the read. Its statement's own
+        //    postcondition stopped speaking at the commit.
+        let table = |keys: &[&str]| {
+            let t = pbps_model::Table {
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: keys
+                        .iter()
+                        .map(|k| (RowKey::from(*k), pbps_model::Row::default()))
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let inserting = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::InsertRow {
+                    table: "dbo.t".parse().unwrap(),
+                    key_column: "code".to_owned(),
+                    identity_key: false,
+                    key: RowKey::from("new"),
+                    row: pbps_model::Row::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+            )],
+        };
+        let e =
+            refuse_unplanned_movement(&inserting, &table(&[]), &table(&[]), "prod", Settled::Whole)
+                .expect_err("the row this plan inserts is not there");
+        assert!(format!("{e:#}").contains("row `new`"), "{e:#}");
+        // Mid-run it simply has not happened yet.
+        refuse_unplanned_movement(&inserting, &table(&[]), &table(&[]), "prod", Settled::SoFar)
+            .expect("the insert has not run yet");
+
+        // 3. A column change that moves no reading leaves its cells compared.
+        let with_note = |note: &str| {
+            let t = pbps_model::Table {
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: [(
+                        RowKey::from("k"),
+                        [("note".to_owned(), Value::Text(note.to_owned()))]
+                            .into_iter()
+                            .collect::<pbps_model::Row>(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let tightening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnNullability {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.t.note".parse().unwrap(),
+                    ty: "nvarchar(50)".parse().unwrap(),
+                    to_nullable: false,
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(
+            &tightening,
+            &with_note("kept"),
+            &with_note("rewritten"),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("nullability rewrites no value, so the cell is still compared");
+        assert!(format!("{e:#}").contains("row `k`"), "{e:#}");
     }
 
     /// A module that changes kind is a drop *and* a create for one name, and
