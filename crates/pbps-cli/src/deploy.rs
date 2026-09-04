@@ -607,11 +607,13 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         .await;
         let released = pbps_mssql::state::unlock(&mut conn).await;
         let (id, tables) = result?;
-        released?;
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
             target.label, tables
         );
+        // The ledger row is durable even when deleting the lock row fails.
+        // Report that before surfacing cleanup so retrying cannot look safe.
+        released?;
         Ok(())
     })
 }
@@ -646,12 +648,13 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
         .await;
         let released = pbps_mssql::state::unlock(&mut conn).await;
         let (id, tables) = result?;
-        released?;
         println!(
             "Baselined `{}` as entry #{id}: {} table(s) are now the starting point.",
             target.label, tables
         );
         println!("Reason recorded: {reason}");
+        // The baseline was recorded even if cleanup now reports an error.
+        released?;
         Ok(())
     })
 }
@@ -807,12 +810,13 @@ pub fn cmd_bootstrap(
         }
         let unlocked = pbps_mssql::state::unlock(&mut conn).await;
         let (id, snapshot) = result?;
-        unlocked?;
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
             target.label,
             snapshot.schema.tables.len()
         );
+        // Both the DDL and ledger row committed before lock cleanup began.
+        unlocked?;
         Ok(())
     })
 }

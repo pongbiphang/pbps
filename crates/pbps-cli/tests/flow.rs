@@ -6040,3 +6040,147 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
         .unwrap();
     });
 }
+
+/// Snapshot, baseline and bootstrap all make their ledger entry durable before
+/// deleting the deployment lock. If that cleanup fails, reporting only the
+/// error makes a retry look appropriate even though it would append another
+/// successful entry (and, for bootstrap, repeat already-committed DDL).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn durable_record_commands_report_success_before_an_unlock_failure() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("unlock-after-record");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nunmanaged: ignore\n",
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_unlock_record\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    const BLOCK_UNLOCK: &str = "CREATE TRIGGER dbo.pbps_block_unlock ON dbo.__pbps_lock INSTEAD OF DELETE AS \
+         BEGIN THROW 51000, 'unlock denied by test', 1; END;";
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "IF OBJECT_ID(N'dbo.pbps_block_unlock', N'TR') IS NOT NULL \
+             DROP TRIGGER dbo.pbps_block_unlock; \
+             IF OBJECT_ID(N'dbo.pbps_unlock_record', N'U') IS NOT NULL \
+             DROP TABLE dbo.pbps_unlock_record; \
+             IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
+             IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state; \
+             CREATE TABLE dbo.pbps_unlock_record (id int NOT NULL);",
+        )
+        .await
+        .unwrap();
+        pbps_mssql::state::lock(&mut conn, "unlock test setup")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(BLOCK_UNLOCK).await.unwrap();
+    });
+
+    let baselined = d.run(&[
+        "baseline",
+        "--db",
+        &connection,
+        "--reason",
+        "unlock regression",
+    ]);
+    assert_eq!(code(&baselined), 1, "cleanup should still fail");
+    assert!(
+        stdout(&baselined).contains("Baselined"),
+        "{}",
+        stdout(&baselined)
+    );
+    assert!(
+        stdout(&baselined).contains("Reason recorded: unlock regression"),
+        "{}",
+        stdout(&baselined)
+    );
+    assert!(stderr(&baselined).contains("unlock denied by test"));
+
+    let baseline_id = rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Baseline);
+        conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(BLOCK_UNLOCK).await.unwrap();
+        latest.id
+    });
+
+    let snapshotted = d.run(&["snapshot", "--db", &connection, "--force"]);
+    assert_eq!(code(&snapshotted), 1, "cleanup should still fail");
+    assert!(
+        stdout(&snapshotted).contains("Recorded the state"),
+        "{}",
+        stdout(&snapshotted)
+    );
+    assert!(stderr(&snapshotted).contains("unlock denied by test"));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert!(latest.id > baseline_id);
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Apply);
+        conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(
+            "DROP TABLE dbo.pbps_unlock_record; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+
+        // Bootstrap needs an empty managed target, while the trigger needs the
+        // internal lock table to exist before the command starts.
+        pbps_mssql::state::lock(&mut conn, "unlock test setup")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(BLOCK_UNLOCK).await.unwrap();
+    });
+
+    let bootstrapped = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&bootstrapped), 1, "cleanup should still fail");
+    assert!(
+        stdout(&bootstrapped).contains("Bootstrapped"),
+        "{}",
+        stdout(&bootstrapped)
+    );
+    assert!(stderr(&bootstrapped).contains("unlock denied by test"));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Bootstrap);
+        let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&"dbo.pbps_unlock_record".parse().unwrap())
+        );
+
+        conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(
+            "DROP TABLE dbo.pbps_unlock_record; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
