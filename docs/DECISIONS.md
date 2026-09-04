@@ -2120,3 +2120,28 @@ SPEC is in sync with all of these.
     only remaining direct assignments are inside the recorders themselves and
     on a row that has just been built, where there is nothing to preserve.
 
+
+169. **A postcondition is keyed by what it is about, not collected per change.**
+    A constraint or an index whose *definition* changes is a drop and an add
+    under one table, kind and name — `diff_constraints` has no `ALTER` to emit
+    for either, so `by_name!` pushes both. 168 gave those parts a `Presence`
+    each and held it in a `Vec`, which meant the final read-back satisfied the
+    add and then necessarily failed the drop's `Absent`: a transactional apply
+    rolled back the replacement it had just installed correctly, and a staged
+    one stopped. Every redefinition of a unique, a foreign key, a check or an
+    index was refused.
+    This is 161 one field over, and one entry after it: modules were collapsed
+    by name for exactly this reason, and the parts beside them were not. The
+    columns already were, by being a `BTreeMap<ColumnRef, _>` — which is the
+    tell. **A postcondition collection keyed by identity gets the collapsing
+    for free; one keyed by nothing has to remember to.** The plan is in
+    `order_key` order, which puts the drops first, so the last word on a
+    `(table, part, name)` is the net one.
+    Swept: the guard now holds five outcome collections — tables, roles,
+    columns, parts and modules — and every one of them is a map keyed by the
+    identity it speaks about. Rows and grants need no collapsing and it is
+    worth recording why, so the next reader does not add it: the row differ
+    branches on presence and emits at most one change per key, and `diff_roles`
+    builds the granted and revoked permission sets by `difference` in both
+    directions, so they are disjoint and the guard's "held, less revoked, plus
+    granted" is already the net.

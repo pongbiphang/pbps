@@ -1376,10 +1376,23 @@ fn refuse_unplanned_movement(
         // reason 166 gives about a table's shape.
         let mut expected_columns: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence> =
             BTreeMap::new();
-        let mut expected_parts: Vec<pbps_model::PartChange<'_>> = Vec::new();
+        // Keyed, not collected: a constraint or index whose *definition*
+        // changes is a drop and an add under one name (`by_name!` in the
+        // differ), and holding both outcomes meant the add satisfied
+        // `Present` while the drop then failed `Absent` — every redefinition
+        // refused (DECISIONS 169). The plan is in `order_key` order, which
+        // puts the drops first, so the last word on a name is the net one.
+        // The same collapsing the columns beside it get from being a map, and
+        // the same 161 gave the modules.
+        let mut expected_parts: BTreeMap<
+            (&TableName, pbps_model::Part, Option<&str>),
+            pbps_model::Presence,
+        > = BTreeMap::new();
         for p in &changes.changes {
             expected_columns.extend(p.change.columns_after());
-            expected_parts.extend(p.change.constraints());
+            if let Some(part) = p.change.constraints() {
+                expected_parts.insert((part.table, part.part, part.name), part.after);
+            }
         }
         for (column, expected) in expected_columns {
             let Some(table) = after.tables.get(&column.table) else {
@@ -1398,11 +1411,11 @@ fn refuse_unplanned_movement(
                 _ => {}
             }
         }
-        for part in expected_parts {
-            let Some(table) = after.tables.get(part.table) else {
+        for ((table_name, part, part_name), after_it) in expected_parts {
+            let Some(table) = after.tables.get(table_name) else {
                 continue;
             };
-            let (kind, there) = match (part.part, part.name) {
+            let (kind, there) = match (part, part_name) {
                 (pbps_model::Part::PrimaryKey, _) => ("primary key", table.primary_key.is_some()),
                 (pbps_model::Part::Unique, Some(n)) => ("unique", table.unique.contains_key(n)),
                 (pbps_model::Part::ForeignKey, Some(n)) => {
@@ -1413,15 +1426,13 @@ fn refuse_unplanned_movement(
                 // Only the primary key is nameless, and it is matched above.
                 (_, None) => continue,
             };
-            let name = part.name.unwrap_or("");
-            match (part.after, there) {
+            let name = part_name.unwrap_or("");
+            match (after_it, there) {
                 (pbps_model::Presence::Present, false) => moved.push(format!(
-                    "{} {kind} `{name}` is not there, and this plan writes it",
-                    part.table
+                    "{table_name} {kind} `{name}` is not there, and this plan writes it"
                 )),
                 (pbps_model::Presence::Absent, true) => moved.push(format!(
-                    "{} {kind} `{name}` is still there, and this plan removes it",
-                    part.table
+                    "{table_name} {kind} `{name}` is still there, and this plan removes it"
                 )),
                 _ => {}
             }
@@ -4874,6 +4885,72 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// The same for a table's parts, one field over. A constraint or an index
+    /// whose *definition* changes is a drop and an add under one name — the
+    /// differ's `by_name!` emits both — so holding both outcomes made the add
+    /// satisfy `Present` and the drop then fail `Absent`, refusing every
+    /// redefinition (DECISIONS 169).
+    #[test]
+    fn a_redefined_index_is_judged_by_its_net_result() {
+        let index = |unique: bool| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                name: "note".to_owned(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique,
+            filter: None,
+        };
+        let schema_with = |unique: bool| {
+            let mut t = pbps_model::Table::default();
+            t.indexes.insert("ix_note".to_owned(), index(unique));
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        // `order_key` puts the drop first, which is the order a plan holds.
+        let redefining = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::DropIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".to_owned(),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AddIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".to_owned(),
+                    index: Box::new(index(true)),
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &redefining,
+            &schema_with(false),
+            &schema_with(true),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("a redefinition is a drop and an add, and the add is the net");
+
+        // Net, not blanket: a plan that only drops still has to see it gone.
+        let dropping = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".to_owned(),
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(
+            &dropping,
+            &schema_with(false),
+            &schema_with(false),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the drop did not take");
+        assert!(format!("{e:#}").contains("ix_note"), "{e:#}");
     }
 
     /// A staged checkpoint cannot be asked what the plan achieved: most of it
