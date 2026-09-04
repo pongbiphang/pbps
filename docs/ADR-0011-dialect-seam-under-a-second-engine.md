@@ -144,6 +144,31 @@ delimiters**:
 | string | `'` … `'`, doubled to escape | `'` … `'`, doubled to escape |
 | — | | `E'` … `'`, **backslash escapes** |
 | — | | `$tag$` … `$tag$`, no escapes at all |
+| block comments | `/*` … `*/`, **nesting** | `/*` … `*/`, **nesting** |
+
+**And the description has to carry comment nesting, not only literals.**
+**Measured**, `SELECT /* a /* b */ c */ 1` returns `1` on **both** engines —
+block comments nest in T-SQL and in PostgreSQL alike — while the shared
+scanner's `Block` state exits at the first `*/`. Its consequence is the silent
+one again, measured by running it:
+
+```
+SELECT /* outer /* inner */ it's here */ 'a  b' FROM t
+SELECT /* outer /* inner */ it's here */ 'a b'  FROM t
+    compare equal? true
+```
+
+The scanner leaves the comment early, the apostrophe in `it's` opens a quoted
+region, and the real literal's spacing is folded as though it were code — so two
+definitions that return different strings are never distinguished.
+
+**This one is not a PostgreSQL finding.** Both engines nest, `pbps-mssql` does
+not override `normalize_definition`, and the shared default is what runs today —
+so the gap is in shipped code. It is worth noting that this repository already
+contains a nesting-aware comment scanner, added by `3b5c9de` ("track nested
+T-SQL comments") in `pbps-model/src/module.rs` for the identifier scan: **two
+comment scanners, and only one of them nests.** The second was fixed because
+somebody hit it; the first has the same defect and a quieter failure.
 
 The *default* implementation is removed, so a new dialect cannot silently
 inherit another engine's answer. Two of the three failures on this page came

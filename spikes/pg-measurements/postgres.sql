@@ -949,6 +949,12 @@ SELECT 'R71', 'and whether the floats survive that text',
 RESET DateStyle; RESET IntervalStyle; RESET bytea_output;
 RESET extra_float_digits; RESET TimeZone; RESET timezone_abbreviations;
 
+-- ------------------------------ the thirtieth 2026-09-05 review round
+
+SELECT 'R72', 'a nested block comment',
+       (SELECT /* a /* b */ c */ 1)::text
+       || ' — it nests, and measured separately, so does T-SQL';
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

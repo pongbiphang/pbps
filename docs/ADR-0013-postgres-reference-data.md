@@ -427,7 +427,20 @@ pinned on the session, and not wrapped around the writes at all.**
 - **Writes** carry their canonicalization *in the values themselves*: the DML
   pbps emits renders each value as an unambiguous typed literal, or binds it as
   a parameter. **No session setting is changed around a write.**
-- **Opaque DDL** runs under whatever the operator's database has, as before.
+- **Opaque DDL** runs under whatever the operator's database has — **with one
+  explicit exception, `standard_conforming_strings = on`**, set and restored
+  around it. That exception was stated two rounds earlier and dropped when this
+  decision was rewritten, which is the second setting to fall out of a list
+  during a rewrite about something else. It is not a rendering setting: it
+  decides how the *definition text itself* parses, and
+  [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md)'s scanner rule —
+  plain strings escape by doubling — is true only while it is `on`. On a target
+  where it is `off`, a definition containing `'it\'s  here'` is accepted as one
+  literal (measured, `R25`) while the normalizer closes it at the escaped quote,
+  so a later whitespace edit *inside that literal* compares equal and is never
+  planned. Pinning it `on` keeps the scanner's rule true, and the failure it
+  introduces is the safe one: a definition that relied on `off` is refused at
+  `CREATE`, loudly.
 
 The write half was a session scope in an earlier version, and **measured, a
 scope around a statement is also a scope around everything that statement
