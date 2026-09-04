@@ -159,7 +159,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 let mut conn = pbps_db::Conn::connect(&connection).await?;
                 pbps_mssql::catalog::introspect(&mut conn).await
             })?;
-            let ids = mint_ids(&pulled.schema)?;
+            let ids = mint_ids(&pulled.schema, &root)?;
             (
                 pulled.schema,
                 ids,
@@ -378,8 +378,8 @@ fn yaml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
-fn mint_ids(schema: &Schema) -> anyhow::Result<IdsFile> {
-    pbps_diff::resolve(schema, &IdsFile::default(), &[], &context())
+fn mint_ids(schema: &Schema, root: &Path) -> anyhow::Result<IdsFile> {
+    pbps_diff::resolve(schema, &IdsFile::default(), &[], &context(root))
         .map(|resolved| resolved.ids)
         .map_err(|blockers| {
             anyhow::anyhow!(

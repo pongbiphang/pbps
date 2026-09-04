@@ -286,6 +286,11 @@ enum Command {
         #[arg(long)]
         plan: PathBuf,
 
+        /// SHA-256 printed by `pbps explain` for the artifact the deployment
+        /// gate approved
+        #[arg(long, value_parser = plan_checksum_arg)]
+        checksum: String,
+
         /// Risk classes this deployment is approved for, comma-separated
         #[arg(long, value_delimiter = ',')]
         allow: Vec<pbps_model::RiskClass>,
@@ -415,6 +420,14 @@ enum StateCommand {
         #[arg(long, default_value_t = pbps_db::ledger::DEFAULT_KEEP)]
         keep: u32,
     },
+}
+
+/// Canonical SHA-256 spelling used by the review gate.
+fn plan_checksum_arg(value: &str) -> Result<String, String> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("a plan checksum must be exactly 64 hexadecimal characters".to_owned());
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 /// How a read-only command should speak.
@@ -721,6 +734,7 @@ fn run() -> anyhow::Result<()> {
         Command::Apply {
             target,
             plan,
+            checksum,
             allow,
             staged,
             resume,
@@ -729,10 +743,13 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_apply(
                 &project,
                 &target,
-                &plan,
-                &allow.into_iter().collect(),
-                staged,
-                resume,
+                &deploy::ApplyRequest {
+                    plan_path: &plan,
+                    approved_checksum: &checksum,
+                    allow: &allow.into_iter().collect(),
+                    staged,
+                    resume,
+                },
             )
         }
         Command::Doctor { target, format } => {
@@ -1084,8 +1101,13 @@ fn cmd_pull(
     // Mint fresh identity for everything pulled. resolve with an empty baseline
     // can produce no blockers (nothing disappears from empty), so a failure here
     // is a bug, not a user problem.
-    let res = pbps_diff::resolve(&pulled.schema, &IdsFile::default(), &[], &context())
-        .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
+    let res = pbps_diff::resolve(
+        &pulled.schema,
+        &IdsFile::default(),
+        &[],
+        &context(project.root()),
+    )
+    .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
 
     // Before the first file: two declarations whose names differ only in case
     // encode to filenames that differ only in case, and a filesystem that
@@ -1390,9 +1412,9 @@ fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn context() -> Context {
+fn context(root: &std::path::Path) -> Context {
     Context {
-        operator: operator(),
+        operator: operator(root),
         today: today(),
     }
 }
@@ -1796,7 +1818,7 @@ fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
     let mut intents = loaded.intents;
     intents.push(intent);
 
-    match pbps_diff::resolve(&loaded.schema, &ids, &intents, &context()) {
+    match pbps_diff::resolve(&loaded.schema, &ids, &intents, &context(project.root())) {
         Ok(res) => {
             if res.ids == ids {
                 println!(
@@ -1840,7 +1862,8 @@ fn resolve_with_intent(
     quiet: bool,
 ) -> anyhow::Result<Result<pbps_diff::Resolution, Vec<pbps_diff::Blocker>>> {
     let mut intents = loaded.intents.clone();
-    let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
+    let original = match pbps_diff::resolve(&loaded.schema, ids, &intents, &context(project.root()))
+    {
         Ok(r) => return Ok(Ok(r)),
         Err(b) => b,
     };
@@ -1863,7 +1886,7 @@ fn resolve_with_intent(
             // ordinary intents, and running them through the same call is what
             // makes the prompt a wrapper rather than a second implementation of
             // identity resolution.
-            match pbps_diff::resolve(&loaded.schema, ids, &intents, &context()) {
+            match pbps_diff::resolve(&loaded.schema, ids, &intents, &context(project.root())) {
                 Ok(r) => {
                     // Written now, so the answers survive whatever the rest of
                     // this plan does. They are the user's decisions, and losing
@@ -2230,6 +2253,7 @@ fn cmd_plan(
             cs.clone(),
             res.ids.clone(),
         );
+        plan.module_deps = loaded.hints.module_deps.clone();
         plan.git_sha = db::git_sha(project.root());
         // The artifact is the deliverable, so failing to write it is a failure
         // of the whole command — but it is still the *command* that could not
@@ -2415,10 +2439,56 @@ fn statements(
     Ok(statements)
 }
 
+/// Validates the parts of a saved artifact that must not be trusted merely
+/// because they deserialize.
+///
+/// Risks are redundant on purpose: they make the reviewed file readable, while
+/// the typed change remains the authority. Re-deriving them here prevents an
+/// edited `risks: []` from turning a DROP into an ungated operation. Type-change
+/// risk needs dialect knowledge, exactly as it did when the differ produced the
+/// plan.
+pub(crate) fn validate_saved_plan(
+    plan: &pbps_model::SavedPlan,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<()> {
+    plan.ids
+        .validate()
+        .context("the plan's post-apply identity mapping is inconsistent")?;
+
+    for (index, planned) in plan.changes.changes.iter().enumerate() {
+        let mut expected = planned.change.intrinsic_risks();
+        if let pbps_model::Change::AlterColumnType { from, to, .. } = &planned.change
+            && let Some(risk) = dialect.type_change_risk(from, to).risk_class()
+        {
+            expected.insert(risk);
+        }
+        if planned.risks != expected {
+            let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {
+                risks
+                    .iter()
+                    .map(|risk| risk.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            bail!(
+                "change {} in the plan carries inconsistent risks (file: [{}], derived: [{}]).\n\
+                 The artifact was edited or produced by a broken planner; regenerate it with \
+                 `pbps plan --db`.",
+                index + 1,
+                names(&planned.risks),
+                names(&expected)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The operator. An audit asks "who did this", and git's configuration is the
 /// closest thing to the truth available.
-fn operator() -> String {
+fn operator(root: &std::path::Path) -> String {
     std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["config", "user.name"])
         .output()
         .ok()
@@ -2485,6 +2555,13 @@ mod tests {
     /// only the rule's default: raising the threshold, lowering it and
     /// turning the rule off each has to reach `pull`, or it warns about files
     /// `validate` accepts and stays quiet about files it rejects.
+    #[test]
+    fn plan_checksums_are_exact_and_canonical() {
+        assert_eq!(plan_checksum_arg(&"A".repeat(64)).unwrap(), "a".repeat(64));
+        assert!(plan_checksum_arg(&"a".repeat(63)).is_err());
+        assert!(plan_checksum_arg(&format!("{}g", "a".repeat(63))).is_err());
+    }
+
     #[test]
     fn civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));

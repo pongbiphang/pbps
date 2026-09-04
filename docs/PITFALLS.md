@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Seventeen instances so far. **Absent, empty and unreadable are three different
+Nineteen instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -33,6 +33,15 @@ things, and only one of them is good news.**
   revision", which calls every table new. From a project in a subdirectory it
   was empty every time: the pathspec lacked the `--full-tree` its sibling
   `load_from_git` had carried for exactly this since the baseline was written.
+- A declared module the catalog **cannot read back** reduced to a warning. The
+  recorder went ahead, the snapshot's schema could not hold the module, the
+  scope every later command rebuilds from that schema forgot it, and the first
+  `verify` refused an untouched database as a policy violation. It is a partial
+  schema inside the managed set, and the recorders now refuse it as one.
+- An unlock failure **after a command had already failed** dropped on the floor:
+  `apply` reported its own error and left `__pbps_lock` held with no word about
+  it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`
+  and `bootstrap`; the success path had been fixed one round earlier.
 
 ### 2. Failures escaping the one-envelope contract
 
@@ -47,6 +56,14 @@ What holds now is structural, not vigilance: an exhaustive match at the entry
 point, refusals typed `Result<Infallible>` so an edit cannot fall through one,
 and `Location.file` as a `String` so an unspellable path cannot break
 serialization.
+
+The `on_apply_attempt` hook had the same shape one layer down: the failure
+event was emitted at each site that could fail after the lock, and the
+refusals before it — a stale `--checksum`, a preview, an unapproved risk —
+returned past it, so the audit sink advertised as seeing every attempt never
+saw the rejected artifact. Same repair: everything after the plan is
+identified lives in one function whose only exits are a typed outcome or an
+error, and the hook fires from the one place both arrive.
 
 ### 3. A failure routed to the wrong person
 
@@ -168,6 +185,24 @@ database. The managed roles' grants are asked about too (decision 69) — from
 the recorded state, because the first fix read them from the catalog, and the
 catalog hides a securable from an account with no permission on it: the live
 suite showed the query returning nothing for exactly the login being checked.
+
+## A comment ends at a carriage return
+
+A `--` comment ends at a bare carriage return, and at nothing else that looks
+like a line ending. The lexical scan behind the value-source check and the
+module dependency scan waited for `\n`, so `-- note\rNULL` read as one long
+comment and a required column with that default skipped the gate. Measured with
+`EXEC` of a variable holding the character (plain `EXEC('…' + CHAR(13))` is
+refused — see above):
+
+| character after `-- c` | `SELECT 1 AS a -- c<char>, 2 AS b` returns |
+|---|---|
+| CR (`CHAR(13)`) | **two columns** — the comment ended |
+| LF (`CHAR(10)`) | two columns |
+| NEL (`NCHAR(133)`), U+2028, form feed, vertical tab | one column — still a comment |
+
+And the consequence the check exists to prevent: `ALTER TABLE … ADD c int NOT
+NULL DEFAULT --x<CR>NULL` on a table with one row fails with **Msg 515**.
 
 ## `shell_arg` has been wrong about shells five times
 

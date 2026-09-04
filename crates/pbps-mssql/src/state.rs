@@ -38,6 +38,30 @@ BEGIN
     );
 END;";
 
+/// The width of `__pbps_state.reason`, in the unit `NVARCHAR(n)` is measured
+/// in: UTF-16 code units, not characters. Measured, not assumed — an
+/// `NVARCHAR(4)` refused two emoji plus one ASCII letter with Msg 2628.
+pub const REASON_UTF16_UNITS: usize = 1000;
+
+/// Cuts a reason down to what the ledger column can hold.
+///
+/// Counts `char::len_utf16`, because a Rust `char` above U+FFFF occupies two
+/// units and a count of characters could hand the column twice its width. The
+/// cut never splits a character, so what remains is valid text. Used on the
+/// best-effort audit paths, where a failed attempt that cannot be recorded is
+/// the opposite of what the row exists for; a user-supplied `--reason` is not
+/// truncated and fails loudly instead, since an audit text silently shortened
+/// is a different kind of loss.
+pub fn truncate_reason(text: &str) -> String {
+    let mut units = 0;
+    text.chars()
+        .take_while(|ch| {
+            units += ch.len_utf16();
+            units <= REASON_UTF16_UNITS
+        })
+        .collect()
+}
+
 const CREATE_LOCK: &str = "\
 IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL
 BEGIN
@@ -287,6 +311,41 @@ fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constant and the DDL have to agree, or the truncation is measured
+    /// against a width the column does not have.
+    #[test]
+    fn the_reason_width_is_the_one_the_ddl_declares() {
+        assert!(
+            CREATE_STATE.contains(&format!(
+                "reason        NVARCHAR({REASON_UTF16_UNITS}) NULL"
+            )),
+            "{CREATE_STATE}"
+        );
+    }
+
+    /// A character count is the natural cut and the wrong one: 1000 emoji are
+    /// 2000 units, and the audit insert for a failed apply was refused with
+    /// Msg 2628 — the one row that exists to say what went wrong, dropped
+    /// because of how it was said.
+    #[test]
+    fn a_reason_is_cut_by_utf16_units_and_never_inside_a_character() {
+        let ascii = "x".repeat(REASON_UTF16_UNITS);
+        assert_eq!(truncate_reason(&ascii), ascii);
+        assert_eq!(truncate_reason(&format!("{ascii}y")), ascii);
+
+        let emoji = "😀".repeat(REASON_UTF16_UNITS);
+        let cut = truncate_reason(&emoji);
+        assert_eq!(cut.encode_utf16().count(), REASON_UTF16_UNITS);
+        assert_eq!(cut.chars().count(), REASON_UTF16_UNITS / 2);
+
+        // An odd unit left over cannot hold half a pair: the cut falls short
+        // by one rather than splitting the character.
+        let odd = format!("x{emoji}");
+        let cut = truncate_reason(&odd);
+        assert_eq!(cut.encode_utf16().count(), REASON_UTF16_UNITS - 1);
+        assert!(cut.chars().all(|c| c == 'x' || c == '😀'));
+    }
     use pbps_db::ledger::{LOCK_TABLE, STATE_TABLE};
 
     /// The two table names in the SQL must be the ones `pbps-db` documents and

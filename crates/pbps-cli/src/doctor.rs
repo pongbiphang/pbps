@@ -612,7 +612,8 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "pbps apply --env {} --plan <plan.json> --staged --resume",
+                "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
+                 --staged --resume",
                 crate::report::env_arg(&d.environment)
             )),
         ),

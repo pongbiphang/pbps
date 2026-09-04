@@ -7,6 +7,7 @@
 //! artifact passing and no environment-mapping strategy at all.
 
 use crate::ids::IdsFile;
+use crate::module::ModuleDeps;
 use crate::schema::Schema;
 
 /// The current state-snapshot format version.
@@ -22,18 +23,23 @@ use crate::schema::Schema;
 /// side by the checkpoint's — two different sets of objects — and refuse the
 /// resume with a checksum mismatch it cannot explain.
 ///
-/// Bumped to 4 when `Schema` grew `roles` (ADR-0005), for the reason 2 was:
-/// an older client would drop the field, compare every table and no role,
-/// and report no drift about grants it never looked at.
+/// Bumped to 4 when module dependency annotations and failed attempts joined
+/// the snapshot. The annotations are needed to order a later connected drop;
+/// failed attempts make the audit promise explicit without changing the schema
+/// recorded as the current baseline.
+///
+/// Bumped to 5 when `Schema` grew `roles` (ADR-0005), for the reason 2 was:
+/// an older client would drop the field, compare every table and no role, and
+/// report no drift about grants it never looked at.
 ///
 /// Readers refuse a version they do not understand rather than reading it
-/// partially. A version 3 snapshot is still read: the fields 4 added default
-/// to empty, and an environment recorded before roles were managed *is* one
-/// with no managed roles — refusing it would leave a deployed environment
-/// with no way to be read at all, since re-recording it reads the latest
-/// entry first (DECISIONS 138). Older than 3 is refused, for the reasons 2
-/// and 3 give.
-pub const CURRENT_VERSION: u32 = 4;
+/// partially. Versions 3 and 4 are still read: every field a later version
+/// added defaults to empty, and an environment recorded before roles were
+/// managed *is* one with no managed roles — refusing it would leave a
+/// deployed environment with no way to be read at all, since re-recording it
+/// reads the latest entry first (DECISIONS 138). Older than 3 is refused, for
+/// the reasons 2 and 3 give.
+pub const CURRENT_VERSION: u32 = 5;
 
 /// The oldest snapshot version this build reads as its own.
 pub const OLDEST_READABLE_VERSION: u32 = 3;
@@ -58,6 +64,9 @@ pub enum StateKind {
     /// environment sitting on one is mid-deployment: planning or applying
     /// anything else against it would build on a half-finished change.
     Staged,
+    /// An apply or bootstrap attempt failed. The schema and ids in this entry
+    /// remain the last known current state; `reason` records the failure.
+    Failed,
 }
 
 impl StateKind {
@@ -69,6 +78,7 @@ impl StateKind {
             StateKind::Baseline => "baseline",
             StateKind::Bootstrap => "bootstrap",
             StateKind::Staged => "staged",
+            StateKind::Failed => "failed",
         }
     }
 }
@@ -85,6 +95,7 @@ impl std::fmt::Display for StateKind {
 /// drift detection compare in full, what makes the snapshot usable as a backup,
 /// and what lets it answer "what did this table look like three months ago?".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateSnapshot {
     pub version: u32,
     pub kind: StateKind,
@@ -98,6 +109,12 @@ pub struct StateSnapshot {
     /// current declarations by uid, and a rename degrades into "drop plus add" —
     /// which is data loss. State and identity have to be stored together.
     pub ids: IdsFile,
+
+    /// Explicit module ordering edges as of this state. They sit beside the
+    /// schema because creation order is not database state and must not
+    /// participate in drift comparison.
+    #[serde(default, skip_serializing_if = "ModuleDeps::is_empty")]
+    pub module_deps: ModuleDeps,
 
     /// The commit that produced this state. `None` for a baseline taken outside
     /// version control.
@@ -133,6 +150,7 @@ pub struct StateSnapshot {
 /// than mysterious is to record each completed statement as it completes —
 /// which is also what lets `--resume` know where to start.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagedProgress {
     /// How many of the plan's statements have run. The resume point.
     pub completed: usize,
@@ -161,6 +179,7 @@ impl StateSnapshot {
             kind,
             schema,
             ids,
+            module_deps: ModuleDeps::default(),
             git_sha: None,
             plan_checksum: None,
             operator: operator.into(),
@@ -200,6 +219,12 @@ impl StateSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ids::IdsFile;
+    use crate::name::TableName;
+    use crate::schema::{Column, Table};
+    use crate::types::ColumnType;
+    use indexmap::IndexMap;
 
     /// Serde accepts a newer file by ignoring what it does not know, and the
     /// fields a state gains are the objects a drift check compares. "No drift"
@@ -226,33 +251,34 @@ mod tests {
         assert!(snap.check_version().unwrap_err().contains("newer pbps"));
     }
 
-    /// What a version 3 entry actually holds, read by this build: the same
-    /// state with no roles, not an error and not a partial read.
+    /// What an entry from before roles actually holds, read by this build: the
+    /// same state with no roles, not an error and not a partial read.
+    ///
+    /// Both earlier versions, not just the oldest. 4 is the one a deployed
+    /// environment is most likely to be sitting on — it is what the trunk
+    /// wrote before this phase — and "the oldest readable version still
+    /// works" says nothing about it.
     #[test]
-    fn a_version_3_snapshot_reads_as_one_with_no_managed_roles() {
-        let mut snap = StateSnapshot::new(
-            StateKind::Apply,
-            Schema::default(),
-            IdsFile::default(),
-            "leon",
-        );
-        snap.version = 3;
-        let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
-        // A version 3 writer never wrote these sections at all.
-        json["schema"].as_object_mut().unwrap().remove("roles");
-        json["ids"].as_object_mut().unwrap().remove("roles");
-        let read: StateSnapshot = serde_json::from_value(json).unwrap();
-        assert!(read.check_version().is_ok());
-        assert!(read.schema.roles.is_empty());
-        assert!(read.ids.roles.is_empty());
-        assert_eq!(read.schema, snap.schema);
+    fn a_snapshot_from_before_roles_reads_as_one_with_no_managed_roles() {
+        for version in OLDEST_READABLE_VERSION..CURRENT_VERSION {
+            let mut snap = StateSnapshot::new(
+                StateKind::Apply,
+                Schema::default(),
+                IdsFile::default(),
+                "leon",
+            );
+            snap.version = version;
+            let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+            // A writer before roles never wrote these sections at all.
+            json["schema"].as_object_mut().unwrap().remove("roles");
+            json["ids"].as_object_mut().unwrap().remove("roles");
+            let read: StateSnapshot = serde_json::from_value(json).unwrap();
+            assert!(read.check_version().is_ok(), "version {version}");
+            assert!(read.schema.roles.is_empty(), "version {version}");
+            assert!(read.ids.roles.is_empty(), "version {version}");
+            assert_eq!(read.schema, snap.schema, "version {version}");
+        }
     }
-    use super::*;
-    use crate::ids::IdsFile;
-    use crate::name::TableName;
-    use crate::schema::{Column, Table};
-    use crate::types::ColumnType;
-    use indexmap::IndexMap;
 
     fn schema_with(ty: &str) -> Schema {
         let mut columns = IndexMap::new();
@@ -344,6 +370,7 @@ mod tests {
             StateKind::Baseline,
             StateKind::Bootstrap,
             StateKind::Staged,
+            StateKind::Failed,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));

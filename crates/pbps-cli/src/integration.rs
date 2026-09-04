@@ -38,12 +38,13 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
-// 3: the `role:` file (ADR-0005) and the `policies:` block in `pbps.yml`
+// 3: the `hooks.on_apply_attempt` event hook.
+// 4: the `role:` file (ADR-0005) and the `policies:` block in `pbps.yml`
 //    (ADR-0008). Both schemas grew, and a consumer keying on this number
-//    could not tell the widened schemas from the version-2 ones.
+//    could not tell the widened schemas from the version-3 ones.
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {

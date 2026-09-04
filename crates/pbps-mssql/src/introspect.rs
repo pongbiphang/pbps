@@ -17,7 +17,7 @@
 //! plan the column's destruction on the next run. The caller decides whether the
 //! warnings are acceptable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::DialectError;
 use pbps_model::{
@@ -206,6 +206,15 @@ pub struct Pulled {
     /// and reported here for the caller to put beside the other
     /// unexpressible differences (DECISIONS 95, 97).
     pub unexpressible: Vec<(String, String)>,
+    /// Unsupported facts associated with a table. Callers use the parent name
+    /// to distinguish a limitation inside the managed set (unexpressible
+    /// drift) from one on somebody else's table.
+    ///
+    /// The same argument as `unexpressible` above, on the other half of the
+    /// model: one is about a role's permissions, the other about a table's
+    /// features, and neither may be folded into the comparison or dropped
+    /// from it.
+    pub limitations: Vec<IntrospectionLimitation>,
     /// Modules the database has that pbps cannot manage: a CLR object, one
     /// created `WITH ENCRYPTION`, or one whose stored text does not have the
     /// shape the emitter can reproduce.
@@ -216,11 +225,35 @@ pub struct Pulled {
     pub unmanaged_modules: Vec<UnmanagedModule>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntrospectionLimitation {
+    pub table: TableName,
+    pub detail: String,
+}
+
+fn push_limitation(
+    warnings: &mut Vec<String>,
+    limitations: &mut Vec<IntrospectionLimitation>,
+    table: Option<&TableName>,
+    detail: String,
+) {
+    warnings.push(detail.clone());
+    if let Some(table) = table {
+        limitations.push(IntrospectionLimitation {
+            table: table.clone(),
+            detail,
+        });
+    }
+}
+
 /// One module the database has and `pbps` does not manage.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnmanagedModule {
     pub kind: &'static str,
-    pub name: String,
+    /// Kept structured because a legal quoted identifier can itself contain a
+    /// period. Formatting and parsing it again would turn `[audit.v1]` into an
+    /// apparent third name component and silently lose the inventory entry.
+    pub name: ObjectName,
     /// Why it is not managed, in the operator's words.
     pub why: String,
 }
@@ -493,6 +526,7 @@ fn action(code: u8) -> ReferentialAction {
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut warnings = Vec::new();
     let mut unexpressible: Vec<(String, String)> = Vec::new();
+    let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
 
@@ -517,26 +551,41 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let table_name = name_of(c.object_id, &names);
 
         if c.is_computed {
-            warnings.push(format!(
-                "{table_name}.{}: computed columns are not supported yet; it was left out of the declarations",
-                c.name
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: computed columns are not supported yet; it was left out of the declarations",
+                    c.name
+                ),
+            );
             continue;
         }
         if c.is_user_defined_type {
-            warnings.push(format!(
-                "{table_name}.{}: user-defined type `{}` is not supported yet; it was left out of the declarations",
-                c.name, c.type_name
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: user-defined type `{}` is not supported yet; it was left out of the declarations",
+                    c.name, c.type_name
+                ),
+            );
             continue;
         }
         let ty = match column_type(c) {
             Ok(t) => t,
             Err(e) => {
-                warnings.push(format!(
-                    "{table_name}.{}: {e}; it was left out of the declarations",
-                    c.name
-                ));
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&c.object_id),
+                    format!(
+                        "{table_name}.{}: {e}; it was left out of the declarations",
+                        c.name
+                    ),
+                );
                 continue;
             }
         };
@@ -605,6 +654,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         );
     }
 
+    let mut clustered_indexes = BTreeSet::new();
     for i in &raw.index_columns {
         let Some(table) = tables.get_mut(&i.object_id) else {
             continue;
@@ -613,14 +663,19 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             // The model has no clustered-ness; recording the index without it
             // would make bootstrap create a different physical layout.
             let table_name = name_of(i.object_id, &names);
-            if !warnings
-                .iter()
-                .any(|w| w.contains(&format!("index `{}`", i.index_name)))
-            {
-                warnings.push(format!(
-                    "{table_name}: index `{}` is clustered, which is not modelled yet; it was left out of the declarations",
-                    i.index_name
-                ));
+            // One catalog row is returned per index column. Deduplicate those
+            // rows by the owning object as well as the index name: SQL Server
+            // permits two tables to use the same index name.
+            if clustered_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{table_name}: index `{}` is clustered, which is not modelled yet; it was left out of the declarations",
+                        i.index_name
+                    ),
+                );
             }
             continue;
         }
@@ -652,9 +707,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // empty table — that would plan the drop of the columns it really has.
         if table.columns.is_empty() {
             let table_name = name_of(id, &names);
-            warnings.push(format!(
-                "{table_name}: no supported columns remain; the whole table was left out of the declarations"
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&id),
+                format!(
+                    "{table_name}: no supported columns remain; the whole table was left out of the declarations"
+                ),
+            );
             continue;
         }
         schema.tables.insert(names.remove(&id).unwrap(), table);
@@ -670,7 +730,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut unmanageable = |why: &str| {
             unmanaged_modules.push(UnmanagedModule {
                 kind: m.kind.as_str(),
-                name: name.to_string(),
+                name: name.clone(),
                 why: why.to_owned(),
             });
         };
@@ -862,6 +922,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         schema,
         warnings,
         unexpressible,
+        limitations,
         unmanaged_modules,
     }
 }
@@ -1124,6 +1185,12 @@ mod tests {
 
         let p = assemble(&raw);
         assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
+        assert_eq!(p.limitations.len(), 2, "{:?}", p.limitations);
+        assert!(
+            p.limitations
+                .iter()
+                .all(|limitation| limitation.table == TableName::new("dbo", "customer"))
+        );
         assert!(p.warnings[0].contains("computed"), "{:?}", p.warnings);
         assert!(p.warnings[1].contains("my_udt"), "{:?}", p.warnings);
         // The table itself survives with the supported columns.
@@ -1146,6 +1213,7 @@ mod tests {
         };
         let p = assemble(&raw);
         assert!(p.schema.tables.is_empty());
+        assert_eq!(p.limitations[0].table, TableName::new("dbo", "shapes"));
         assert!(
             p.warnings.iter().any(|w| w.contains("whole table")),
             "{:?}",
@@ -1228,9 +1296,28 @@ mod tests {
     #[test]
     fn clustered_indexes_are_warned_about_and_left_out() {
         let mut raw = one_table_catalog();
-        raw.index_columns.push(RawIndexColumn {
+        raw.tables.push(raw_table(20, "dbo", "archive"));
+        raw.columns.push(raw_column(20, "id", "bigint"));
+        let customer_index = RawIndexColumn {
             object_id: 10,
-            index_name: "cx_customer".into(),
+            index_name: "cx_shared".into(),
+            is_unique: false,
+            is_clustered: true,
+            filter: None,
+            column: "id".into(),
+            is_included: false,
+            is_descending: false,
+        };
+        // Multiple columns of one clustered index produce one limitation.
+        raw.index_columns.push(customer_index.clone());
+        raw.index_columns.push(RawIndexColumn {
+            column: "email".into(),
+            ..customer_index
+        });
+        // The same index name on a different table is a distinct limitation.
+        raw.index_columns.push(RawIndexColumn {
+            object_id: 20,
+            index_name: "cx_shared".into(),
             is_unique: false,
             is_clustered: true,
             filter: None,
@@ -1244,7 +1331,18 @@ mod tests {
                 .indexes
                 .is_empty()
         );
-        assert!(p.warnings.iter().any(|w| w.contains("clustered")));
+        assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
+        assert_eq!(p.limitations.len(), 2, "{:?}", p.limitations);
+        assert_eq!(
+            p.limitations
+                .iter()
+                .map(|limitation| limitation.table.clone())
+                .collect::<Vec<_>>(),
+            [
+                TableName::new("dbo", "customer"),
+                TableName::new("dbo", "archive")
+            ]
+        );
     }
 
     /// Rows for tables outside the managed set (dropped between queries, or
@@ -1435,9 +1533,24 @@ mod module_tests {
         assert_eq!(
             p.unmanaged_modules
                 .iter()
-                .map(|m| m.name.as_str())
+                .map(|m| m.name.to_string())
                 .collect::<Vec<_>>(),
-            ["app.aaa", "dbo.zzz"]
+            ["app.aaa".to_owned(), "dbo.zzz".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_module_keeps_a_dotted_identifier_structured() {
+        let p = assemble(&catalog_with(vec![module(
+            "dbo",
+            "audit.v1",
+            ModuleKind::Procedure,
+            None,
+        )]));
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert_eq!(
+            p.unmanaged_modules[0].name,
+            ObjectName::new("dbo", "audit.v1")
         );
     }
 

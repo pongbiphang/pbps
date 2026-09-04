@@ -27,9 +27,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Supply chain (SPEC 11.5, open questions 1 and 10). Two of this project's
-  # dependencies are small enough that "is it still maintained, is it still
-  # clean" has to be answered by something other than memory.
+  # Supply chain (SPEC 11.5). "Is it still maintained, is it still clean" has
+  # to be answered reproducibly rather than from memory; this gate is also what
+  # keeps the retired TLS advisory exceptions from quietly returning.
   deny:
     runs-on: ubuntu-latest
     steps:

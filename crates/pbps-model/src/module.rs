@@ -85,6 +85,7 @@ impl std::fmt::Display for ModuleKind {
 /// As everywhere else in the model, the container holds the name: a module's
 /// name is the key in [`crate::Schema::modules`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Module {
     pub kind: ModuleKind,
 
@@ -152,8 +153,6 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
     contains_word(&haystack, &format!("{schema}.{object}")) || contains_word(&haystack, &object)
 }
 
-/// Lower-cases, drops the quoting characters and closes the gaps around dots,
-/// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 /// The definition with everything that is not code blanked out.
 ///
 /// String literals and both comment forms are replaced by spaces, character for
@@ -172,25 +171,59 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 /// text before, where a name inside a comment invented a dependency edge and a
 /// `GO` inside a literal refused a valid procedure.
 pub fn code_only(definition: &str) -> String {
+    lexical_code(definition, true)
+}
+
+/// The definition with literals, comments, and quoted identifiers blanked.
+///
+/// [`code_only`] retains quoted identifiers because dependency and batch scans
+/// need their names. Keyword detection needs the opposite: `[null]` and
+/// `"try_cast"` are identifiers, not the SQL constructs their contents happen
+/// to spell.
+pub(crate) fn code_without_quoted_identifiers(definition: &str) -> String {
+    lexical_code(definition, false)
+}
+
+/// The characters SQL Server's lexer takes as the end of a `--` comment.
+///
+/// Exactly these two. The others that look like candidates — NEL (U+0085),
+/// LINE SEPARATOR (U+2028), form feed and vertical tab — were tried against
+/// the engine and left the comment open, so treating them as line endings here
+/// would blank code the engine runs.
+fn is_line_ending(ch: char) -> bool {
+    ch == '\n' || ch == '\r'
+}
+
+fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     enum At {
         Code,
         /// Inside `'...'`: blanked, because its contents are data.
         Literal,
-        /// Inside `[...]` or `"..."`: kept, because its contents are a name.
-        Ident(char),
+        /// Inside `[...]` or `"..."`: its contents are a name. The flag marks
+        /// the second delimiter in an escaped pair (`]]` or `""`) so it cannot
+        /// also close the identifier.
+        Ident(char, bool),
         Line,
-        /// Carrying how many characters have been consumed, so that the `*` of
-        /// the opener cannot also close it (`/*/`).
-        Block(usize),
+        /// SQL Server block comments nest. `depth` tracks the unmatched
+        /// openers; `seen` prevents an opener's `*` from also closing it in
+        /// the overlapping spelling `/*/`.
+        Block {
+            depth: usize,
+            seen: usize,
+        },
     }
     let mut out = String::with_capacity(definition.len());
     let mut at = At::Code;
     let bytes = definition.as_bytes();
-    // A newline always survives: it ends a line comment, and the `GO` check
-    // reads lines.
+    // A line ending always survives: it ends a line comment, and the `GO`
+    // check reads lines. Both `\n` and `\r` count, because the engine ends a
+    // `--` comment at either — measured, not assumed: a bare CR terminated it,
+    // while NEL, U+2028, form feed and vertical tab did not. Blanking the CR
+    // to a space would make `-- note\rNULL` read as one long comment, and a
+    // required column with that default would skip the gate and fail at apply.
     fn blank(out: &mut String, ch: char) {
-        if ch == '\n' {
-            out.push('\n');
+        if is_line_ending(ch) {
+            out.push(ch);
         } else {
             for _ in 0..ch.len_utf8() {
                 out.push(' ');
@@ -198,6 +231,7 @@ pub fn code_only(definition: &str) -> String {
         }
     }
     for (i, ch) in definition.char_indices() {
+        let next = bytes.get(i + ch.len_utf8()).copied();
         match at {
             At::Literal => {
                 // A doubled `''` needs no special case: the first closes and the
@@ -208,53 +242,83 @@ pub fn code_only(definition: &str) -> String {
                 }
                 blank(&mut out, ch);
             }
-            At::Ident(q) => {
-                if if q == '[' { ch == ']' } else { ch == q } {
-                    at = At::Code;
+            At::Ident(closing, escaped_closer) => {
+                if escaped_closer {
+                    at = At::Ident(closing, false);
+                } else if ch == closing {
+                    at = if next == Some(closing as u8) {
+                        At::Ident(closing, true)
+                    } else {
+                        At::Code
+                    };
+                } else {
+                    at = At::Ident(closing, false);
                 }
-                out.push(ch);
+                if keep_quoted_identifiers {
+                    out.push(ch);
+                } else {
+                    blank(&mut out, ch);
+                }
             }
             At::Line => {
-                if ch == '\n' {
+                if is_line_ending(ch) {
                     at = At::Code;
                 }
                 blank(&mut out, ch);
             }
-            At::Block(seen) => {
+            At::Block { depth, seen } => {
                 at = if ch == '/' && seen >= 2 && bytes[i - 1] == b'*' {
-                    At::Code
+                    if depth == 1 {
+                        At::Code
+                    } else {
+                        At::Block {
+                            depth: depth - 1,
+                            seen: 2,
+                        }
+                    }
+                } else if ch == '/' && next == Some(b'*') {
+                    At::Block {
+                        depth: depth + 1,
+                        seen: 0,
+                    }
                 } else {
-                    At::Block(seen + 1)
+                    At::Block {
+                        depth,
+                        seen: seen + 1,
+                    }
                 };
                 blank(&mut out, ch);
             }
-            At::Code => {
-                let next = bytes.get(i + ch.len_utf8()).copied();
-                match (ch, next) {
-                    ('-', Some(b'-')) => {
-                        at = At::Line;
-                        blank(&mut out, ch);
-                    }
-                    ('/', Some(b'*')) => {
-                        at = At::Block(0);
-                        blank(&mut out, ch);
-                    }
-                    ('\'', _) => {
-                        at = At::Literal;
-                        blank(&mut out, ch);
-                    }
-                    ('[' | '"', _) => {
-                        at = At::Ident(ch);
-                        out.push(ch);
-                    }
-                    _ => out.push(ch),
+            At::Code => match (ch, next) {
+                ('-', Some(b'-')) => {
+                    at = At::Line;
+                    blank(&mut out, ch);
                 }
-            }
+                ('/', Some(b'*')) => {
+                    at = At::Block { depth: 1, seen: 0 };
+                    blank(&mut out, ch);
+                }
+                ('\'', _) => {
+                    at = At::Literal;
+                    blank(&mut out, ch);
+                }
+                ('[' | '"', _) => {
+                    at = At::Ident(if ch == '[' { ']' } else { ch }, false);
+                    if keep_quoted_identifiers {
+                        out.push(ch);
+                    } else {
+                        blank(&mut out, ch);
+                    }
+                }
+                _ => out.push(ch),
+            },
         }
     }
     out
 }
 
+/// Lower-cases, drops the quoting characters and closes the gaps around dots,
+/// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 fn scannable(definition: &str) -> String {
     let lowered = code_only(definition).to_ascii_lowercase();
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
@@ -297,7 +361,17 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 /// `dbo.active_customer` — the qualified needle is tried first and answers that
 /// case properly.
 fn is_ident_char(c: Option<char>) -> bool {
-    matches!(c, Some(c) if c.is_alphanumeric() || c == '_' || c == '@' || c == '#' || c == '.')
+    c.is_some_and(|c| is_regular_identifier_continue(c) || c == '.')
+}
+
+/// Whether a character can continue an unquoted SQL Server identifier.
+///
+/// Unicode letters and decimal digits are covered conservatively by
+/// `is_alphanumeric`; SQL Server additionally admits these four symbols after
+/// the first character. Keyword and dependency scans share this boundary so
+/// `seq$null` cannot mean one token to one and two tokens to the other.
+pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')
 }
 
 /// The order in which modules must be created: a module comes after everything
@@ -489,6 +563,9 @@ mod tests {
             "SELECT * FROM dbo.active_customer_archive",
             "SELECT * FROM dbo.old_active_customer",
             "SELECT @active_customer",
+            "SELECT seq$active_customer",
+            "SELECT seq#active_customer",
+            "SELECT 序列active_customer",
         ] {
             assert!(
                 !references(definition, &n("dbo.active_customer")),
@@ -634,6 +711,7 @@ mod tests {
         for definition in [
             "SELECT 1 -- superseded by dbo.active_customer",
             "/* see dbo.active_customer */ SELECT 1",
+            "SELECT 1 /* outer /* nested */ dbo.active_customer */",
             "SELECT 'dbo.active_customer' AS note",
         ] {
             assert!(
@@ -647,6 +725,43 @@ mod tests {
             "SELECT * FROM \"dbo\".\"active_customer\"",
             &target
         ));
+    }
+
+    /// The engine ends a `--` comment at a bare carriage return, so a scan
+    /// that waited for `\n` blanked real code: the name after the CR is a
+    /// reference the engine resolves, and a `NULL` after it is the keyword.
+    /// The other vertical-whitespace characters were measured *not* to end
+    /// the comment, and the scan must agree in that direction too — or it
+    /// would invent a reference from text the engine never reads.
+    #[test]
+    fn a_carriage_return_ends_a_line_comment_and_other_vertical_whitespace_does_not() {
+        let target: ObjectName = "dbo.active_customer".parse().unwrap();
+        assert!(references(
+            "SELECT 1 -- note\rUNION ALL SELECT id FROM dbo.active_customer",
+            &target
+        ));
+        assert!(references(
+            "SELECT 1 -- note\r\nUNION ALL SELECT id FROM dbo.active_customer",
+            &target
+        ));
+        assert_eq!(
+            code_only("a -- b\rc\r\nd"),
+            "a     \rc\r\nd",
+            "line endings survive so line structure does"
+        );
+        for (name, separator) in [
+            ("NEL", '\u{85}'),
+            ("LINE SEPARATOR", '\u{2028}'),
+            ("form feed", '\u{0c}'),
+            ("vertical tab", '\u{0b}'),
+        ] {
+            let definition =
+                format!("SELECT 1 -- note{separator}UNION ALL SELECT id FROM dbo.active_customer");
+            assert!(
+                !references(&definition, &target),
+                "{name} does not end a line comment on the engine"
+            );
+        }
     }
 
     /// An ordering edge that silently does not exist is the failure this check

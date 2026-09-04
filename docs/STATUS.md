@@ -27,7 +27,8 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 takes `--format human|json`; `--no-input` is global.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
-(`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
+(`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` /
+`--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
 `status` (`--format json`).
@@ -67,26 +68,28 @@ say whether what the emitter sent is what comes back.
 
 ### Artifact format versions reset at the first release
 
-The plan file is at version 4 and the state snapshot at 4, with the snapshot
-reader accepting 3 as an upgrade path — but this tool has never been released:
-the workspace is `0.0.0` and there is no tag. Those numbers therefore record a
-history that nobody has, and the upgrade path leads from a version no
-deployment ever wrote. **At the first tagged release, reset `plan::CURRENT_VERSION`
-and `state::CURRENT_VERSION` to 1 and drop `state::OLDEST_READABLE_VERSION`'s
+The plan file, the state snapshot and the published editor schemas are each
+several versions in, and the snapshot reader carries an upgrade path from the
+older ones — but this tool has never been released: the workspace is `0.0.0`
+and there is no tag. Those numbers therefore record a history nobody has, and
+the upgrade path leads from versions no deployment ever wrote. **At the first
+tagged release, reset `plan::CURRENT_VERSION`, `state::CURRENT_VERSION` and
+`integration::SCHEMA_VERSION` to 1 and drop `state::OLDEST_READABLE_VERSION`'s
 back-compatibility with the pre-release numbering** (DECISIONS 145). Until
 then, bump freely: a plan file lives for the length of one deployment window,
 and there is nothing in the field to invalidate.
 
-### Supply chain — live, not filed away
+### Return the driver to `tiberius` once it ships a release
 
-(SPEC open question 10.) `tiberius` has had no release since 2024-07 and pins `rustls 0.21`, whose
-`rustls-webpki 0.101.7` carries three vulnerabilities — two of them certificate
-validation — that no `cargo update` can reach, because every fix needs
-`rustls 0.22+`. `deny.toml` holds them as documented exceptions naming the fix.
-The fix is the driver: `tiberius-ng` keeps the library name, so the change is
-one dependency line, and on 2026-09-01 it passed all fourteen live tests against
-SQL Server 2025. **What is left is a decision, not an unknown** — do not treat
-the exceptions as settled, and delete all four when the driver moves.
+(SPEC open question 10.) The driver is `tiberius-ng`, adopted because
+`tiberius` 0.12.3 pins a `rustls` stack with four open advisories and had no
+release since 2024. The original crate has since moved to the community-owned
+`tiberius-rs/tiberius` repository and is active again (commits on 2026-09-02),
+so the plan is to go back — after a crates.io release newer than 0.12.3 whose
+`rustls` feature resolves `rustls >= 0.23`. As of 2026-09-04 there is no such
+release and `main` still pins `tokio-rustls 0.24`, so moving back now would
+reinstate every advisory exception. The move is one line in the workspace
+`Cargo.toml`, then `cargo deny check`, then the live suite.
 
 ### No universal connection layer
 
