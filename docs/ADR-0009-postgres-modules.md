@@ -591,6 +591,7 @@ What that enumeration covers today, each measured on this branch:
 | owner, and with it `SECURITY DEFINER`'s meaning | `relowner` / `proowner` | drop + create |
 | `security_invoker`, `security_barrier`, `check_option` | `pg_class.reloptions` | drop + create **and `CREATE OR REPLACE`** |
 | view column defaults | `pg_attrdef` | drop + create |
+| a trigger's enabled state (`DISABLE`, `ENABLE REPLICA`, `ENABLE ALWAYS`) | `pg_trigger.tgenabled` | drop + create |
 | grants the *new* object inherits | `pg_default_acl`, keyed to the creating role | **gained**, not lost, by drop + create |
 
 The table is evidence, not the specification — it is what has been measured, and
@@ -660,8 +661,8 @@ create and both assertions one serialized unit.
 LOCK TABLE kk.f IN ACCESS EXCLUSIVE MODE;   refused: relation "kk.f" does not exist
 ```
 
-A routine still has a serializing mechanism, and it is a row lock on its catalog
-entry — **measured**, holding one blocks a concurrent `ALTER FUNCTION`:
+A row lock on its catalog entry does serialize it — **measured**, holding one
+blocks a concurrent `ALTER FUNCTION`:
 
 ```
 session A:  BEGIN; SELECT oid FROM pg_proc WHERE oid='kk2.f(int)'::regprocedure FOR UPDATE;
@@ -670,17 +671,57 @@ session B:  ALTER FUNCTION kk2.f(int) OWNER TO kk_other;
     CONTEXT:  while updating tuple (19,41) in relation "pg_proc"
 ```
 
-So the rule is "serialize before reading the carried state", and **the mechanism
-differs by object kind**: `LOCK TABLE … ACCESS EXCLUSIVE` for a relation, a
-`FOR UPDATE` on the `pg_proc` row for a routine.
+**and the deployment account cannot take it.** `SELECT … FOR UPDATE` needs
+`UPDATE` on the selected relation, and owning a routine grants nothing on
+`pg_proc`. **Measured**, as the non-superuser account that owns the function:
 
-That second one is worth flagging rather than filing: it locks a system catalog
-row, which is an implementation detail and not an interface PostgreSQL
-documents. It is measured to work on 18.6 and it is exactly the kind of thing a
-major version can change without notice, so the PostgreSQL live suite has to
-assert it per version rather than assume it. If a version ever stops honouring
-it, this section is back where ADR-0013 §2 ended up — refuse the construct —
-and the suite is what would say so.
+```
+ll_deploy:  SELECT oid FROM pg_proc WHERE oid='ll.f(int)'::regprocedure FOR UPDATE;
+    ERROR:  permission denied for table pg_proc
+postgres:   the same statement                       accepted
+```
+
+So the mechanism exists and is out of reach, and a design that prescribed it
+would fail before every routine rebuild for exactly the accounts this tool is
+built for.
+
+**Decision.** The plan takes the lock **when the account can** — a superuser
+deployment account is not rare in a controlled pipeline — and otherwise
+**states that this rebuild is not serialized**, in the plan, beside the object.
+Refusing instead would refuse every function edit, since §3 makes them all
+rebuilds; and pretending is not available, so the residual is named where the
+reviewer sees it: a concurrent `ALTER FUNCTION` between the read and the `DROP`
+is reverted by the rebuild, and pbps cannot stop it without privileges it should
+not need.
+
+**And triggers are the fourth kind, with a lock of their own.** A trigger is not
+a relation and not a routine; **measured**, its carried state is lost by the
+rebuild like everything else in §3's table —
+
+```
+after DISABLE, tgenabled = D
+after a drop-and-create rebuild, tgenabled = O — the disable is gone
+```
+
+— so an ordinary trigger edit silently reactivates behaviour an operator
+disabled. The serializing lock is the **parent table's**, and **measured**, it
+works:
+
+```
+BEGIN; LOCK TABLE l2.t IN ACCESS EXCLUSIVE MODE;
+-- from another session:
+ALTER TABLE l2.t DISABLE TRIGGER audit;   ERROR: canceling statement due to lock timeout
+```
+
+`tgenabled` therefore joins the enumeration, and `Module::on` — already the
+trigger's identity (§1) — is also where its lock comes from.
+
+So "serialize before reading the carried state" has **four** shapes, not two:
+the object's own lock for a view, the parent table's for a trigger, a catalog
+row lock for a routine *if the account is privileged enough*, and nothing at all
+for the sequence of ADR-0013 §2. Only the engine can say which applies, and only
+a measurement taken **as the account that will run it** can say whether it is
+reachable.
 
 Worth setting beside [ADR-0013](ADR-0013-postgres-reference-data.md) §2, where
 the same shape had no such remedy: there the racing operation was `nextval`,

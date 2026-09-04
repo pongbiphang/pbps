@@ -840,6 +840,27 @@ SELECT 'R60', 'a row lock on its pg_proc entry',
        m.accepts('SELECT oid FROM pg_proc WHERE oid = ''m.lockable_fn(int)''::regprocedure FOR UPDATE')
        || ' — and measured with two sessions, holding it blocks ALTER FUNCTION (ADR-0009 §3)';
 
+-- ----------------------------- the twenty-fifth 2026-09-05 review round
+-- R61 is taken as the superuser this script runs as; the same statement as a
+-- non-superuser owner is refused, which is the finding and is in ADR-0009 §3.
+
+CREATE TABLE m.tg_t (id int PRIMARY KEY);
+CREATE FUNCTION m.tg_noop() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_audit AFTER INSERT ON m.tg_t FOR EACH ROW EXECUTE FUNCTION m.tg_noop();
+ALTER TABLE m.tg_t DISABLE TRIGGER tg_audit;
+SELECT 'R61', 'a trigger''s enabled state after DISABLE',
+       'tgenabled = ' || (SELECT tgenabled::text FROM pg_trigger
+                          WHERE tgrelid = 'm.tg_t'::regclass AND tgname = 'tg_audit');
+DROP TRIGGER tg_audit ON m.tg_t;
+CREATE TRIGGER tg_audit AFTER INSERT ON m.tg_t FOR EACH ROW EXECUTE FUNCTION m.tg_noop();
+SELECT 'R62', 'the same trigger after a drop-and-create rebuild',
+       'tgenabled = ' || (SELECT tgenabled::text FROM pg_trigger
+                          WHERE tgrelid = 'm.tg_t'::regclass AND tgname = 'tg_audit')
+       || ' — the disable is gone';
+SELECT 'R63', 'is a trigger a lockable relation of its own?',
+       CASE WHEN to_regclass('m.tg_audit') IS NULL THEN 'no — its lock is the parent table''s'
+            ELSE 'yes' END;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
