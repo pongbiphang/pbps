@@ -1334,7 +1334,32 @@ fn rows_after(
         }
     }
 
-    Ok((!branches.is_empty()).then(|| branches.join("\n UNION ALL ")))
+    if !branches.is_empty() {
+        return Ok(Some(branches.join("\n UNION ALL ")));
+    }
+    // A table this plan creates that declares no rows will hold none, and
+    // "none" is an answer rather than the absence of one: every non-NULL
+    // reference on the child side is then an orphan. Returning `None` made the
+    // whole probe disappear, so a plan that added a foreign key to an empty
+    // new parent was unchecked — and under `apply --staged` the table creation
+    // and the row changes before it commit before the constraint fails
+    // (DECISIONS 164).
+    //
+    // Typed and named like any other branch, so the outer query can compare
+    // against it; `WHERE 1 = 0` is what makes it the empty relation. A column
+    // whose type this plan does not decide cannot be spelled, and that is the
+    // one case left with no probe.
+    let mut empty = Vec::new();
+    for (i, column) in columns.iter().enumerate() {
+        let Some(ty) = names.types.get(&table.column(column)) else {
+            return Ok(None);
+        };
+        empty.push(format!(
+            "TRY_CONVERT({}, NULL) AS k{i}",
+            types::normalize(ty).unwrap_or_else(|_| ty.clone())
+        ));
+    }
+    Ok(Some(format!("SELECT {} WHERE 1 = 0", empty.join(", "))))
 }
 
 /// The table and columns as the database currently names them, or `None` when
@@ -1937,6 +1962,40 @@ mod tests {
             fk_sql.contains("SELECT p.[region_id] AS k0 FROM [dbo].[region] AS p"),
             "{fk_sql}"
         );
+    }
+
+    /// A parent this plan creates with no declared rows will hold none, and
+    /// that is an answer: every non-NULL child reference is an orphan. Read as
+    /// "no question" the probe disappeared entirely (DECISIONS 164).
+    #[test]
+    fn a_foreign_key_to_an_empty_new_parent_is_still_probed() {
+        let mut region = pbps_model::Table::default();
+        region.columns.insert(
+            "region_id".to_owned(),
+            pbps_model::Column::new(ty("varchar(10)")),
+        );
+        let sql = probes(&plan(vec![
+            Change::CreateTable {
+                uid: uid("t_bbbbbb"),
+                name: tname("dbo.region"),
+                table: Box::new(region),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        let fk_sql = sql
+            .iter()
+            .find(|s| s.contains("k0"))
+            .unwrap_or_else(|| panic!("the probe must still be asked: {sql:?}"));
+        assert!(
+            fk_sql.contains("SELECT TRY_CONVERT(varchar(10), NULL) AS k0 WHERE 1 = 0"),
+            "{fk_sql}"
+        );
+        // And the child side is still the stored table, so the count is its
+        // non-NULL rows.
+        assert!(fk_sql.contains("FROM [dbo].[customer] AS c"), "{fk_sql}");
     }
 
     fn fk() -> Change {

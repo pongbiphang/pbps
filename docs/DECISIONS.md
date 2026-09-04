@@ -1970,3 +1970,34 @@ SPEC is in sync with all of these.
     can neither be reported nor missed. The mode falls out of the scope
     instead of being tested for.
 
+164. **A module leaves the managed set when its `DROP` runs, not when the plan
+    is written — and an empty new parent is an answer.**
+    **The scope.** `modules_after` built the set the *finished* plan leaves,
+    and a staged run used it at every checkpoint. So a module whose `DROP` had
+    not happened yet was already outside the managed set: absent from each
+    checkpoint's schema, and invisible to `--resume`, which scopes the live
+    side the same way and therefore compared two states that both omitted it.
+    A pause, a hand edit to that module, and the remaining `DROP` ran against
+    an object nobody had looked at since the plan was approved.
+    The function now takes `Settled` — the same one the movement guard uses,
+    because it is the same question — and only removes a dropped module under
+    `Whole`. Keeping it mid-run needs no knowledge of which statements have
+    run: one already dropped is simply absent from the catalog, which the read
+    records truthfully; one still standing stays watched.
+    One function with a required argument rather than two functions, on the
+    reasoning the `Deployment` struct records: five call sites choose between
+    these two answers, and a choice you have to write down is one you cannot
+    make by not thinking about it.
+    **The probe.** `rows_after` returned `None` for a table this plan creates
+    that declares no rows, and `AddForeignKey` read that as "no question" and
+    emitted no probe at all. But an empty parent is a very definite answer:
+    *every* non-NULL reference on the child side is an orphan. Measured, the
+    empty typed relation asks it — `SELECT TRY_CONVERT(varchar(10), NULL) AS
+    k0 WHERE 1 = 0` counts 2 of 3 rows, the NULL exempt as the rule says. Under
+    `apply --staged` this is the difference between a refusal before statement
+    one and a table creation plus every row change committing before the
+    constraint fails.
+    Absent, empty and unreadable are three different things: this is the third
+    time in this phase that "no rows to compare" was returned where "no rows"
+    was the finding.
+

@@ -5324,5 +5324,35 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .expect_err("the constraint cannot be created over this row");
     assert!(err.contains("fk_customer_region2"), "{err}");
 
+    // And a parent this plan creates with no declared rows at all: it will
+    // hold none, so every non-NULL child reference is an orphan. Read as "no
+    // question" this probe was not asked at all (DECISIONS 164).
+    let mut bare = Table::default();
+    bare.columns
+        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+    let to_an_empty_parent = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::CreateTable {
+                uid: "t_cccccc".parse().unwrap(),
+                name: TableName::new("dbo", "band"),
+                table: Box::new(bare),
+            }),
+            PlannedChange::new(Change::AddForeignKey {
+                table: TableName::new("dbo", "customer"),
+                name: "fk_customer_band".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["region_code".into()],
+                    references_table: TableName::new("dbo", "band"),
+                    references_columns: vec!["code".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                }),
+            }),
+        ],
+    };
+    // `dbo.customer` holds one row whose `region_code` is non-NULL, and no
+    // `dbo.band` will ever hold it.
+    assert_eq!(count(&mut db.conn, &to_an_empty_parent).await, 1);
+
     db.drop().await;
 }

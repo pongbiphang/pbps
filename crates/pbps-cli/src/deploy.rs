@@ -717,6 +717,7 @@ pub(crate) fn managed_limitations(
 fn modules_after(
     recorded: &pbps_model::StateSnapshot,
     changes: &pbps_model::ChangeSet,
+    settled: Settled,
 ) -> BTreeSet<ObjectName> {
     let mut set: BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
     for p in &changes.changes {
@@ -725,7 +726,18 @@ fn modules_after(
         let Some(name) = p.change.module_name() else {
             continue;
         };
-        if matches!(p.change, pbps_model::Change::DropModule { .. }) {
+        // A module the plan drops leaves the set only once the plan has run.
+        // Removed from every mid-run read as well, a module whose `DROP` had
+        // not happened yet was already outside the managed set at each
+        // checkpoint — absent from the checkpoint's schema, and invisible to
+        // `--resume`, which scopes the live side the same way. The remaining
+        // `DROP` then ran against an object nobody had looked at since the
+        // plan was approved (DECISIONS 164).
+        //
+        // Keeping it needs no knowledge of which statements have run: one
+        // already dropped is simply absent from the catalog, which the read
+        // records truthfully, and one still standing stays watched.
+        if settled == Settled::Whole && matches!(p.change, pbps_model::Change::DropModule { .. }) {
             set.remove(name);
         } else {
             set.insert(name.clone());
@@ -3058,7 +3070,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         let after = managed_state(
             conn,
             &plan.ids,
-            &modules_after(&entry.snapshot, &plan.changes),
+            &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
             project.config.unmanaged,
             &plan.data,
             &Schema::default(),
@@ -3163,7 +3175,7 @@ async fn apply_staged_under_lock(
         // plan's here instead would leave a table that is mid-rename out of both
         // sides, and a change someone made to it while the deployment was
         // paused would pass unseen into the closing entry.
-        let after_modules = modules_after(&entry.snapshot, &plan.changes);
+        let after_modules = modules_after(&entry.snapshot, &plan.changes, Settled::SoFar);
         let at_checkpoint = &entry.snapshot.ids;
         let scoped = managed_state(
             conn,
@@ -3293,7 +3305,7 @@ async fn apply_staged_under_lock(
     let mut previous = managed_state(
         conn,
         &live_ids,
-        &modules_after(&entry.snapshot, &plan.changes),
+        &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
         pbps_config::Unmanaged::Ignore,
         &scopes_at(plan, &live_ids),
         &Schema::default(),
@@ -3336,7 +3348,7 @@ async fn apply_staged_under_lock(
         let after = managed_state(
             conn,
             &live_ids,
-            &modules_after(&entry.snapshot, &plan.changes),
+            &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             pbps_config::Unmanaged::Ignore,
             &scopes_at(plan, &live_ids),
             &Schema::default(),
@@ -3388,7 +3400,7 @@ async fn apply_staged_under_lock(
     let after = managed_state(
         conn,
         &plan.ids,
-        &modules_after(&entry.snapshot, &plan.changes),
+        &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
         project.config.unmanaged,
         &plan.data,
         &Schema::default(),
@@ -4104,6 +4116,67 @@ mod tests {
         let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A module the plan drops leaves the managed set only once the plan has
+    /// run. Out of it from the first checkpoint, it was absent from the
+    /// checkpoint's schema and invisible to the `--resume` that scopes the
+    /// live side the same way — so the remaining `DROP` ran against an object
+    /// nobody had looked at since the plan was approved (DECISIONS 164).
+    #[test]
+    fn a_module_still_to_be_dropped_stays_in_the_staged_scope() {
+        let module = |name: &str| {
+            (
+                name.parse::<pbps_model::ObjectName>().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    on: None,
+                    definition: "SELECT 1".to_owned(),
+                },
+            )
+        };
+        let mut schema = Schema::default();
+        schema.modules.extend([module("dbo.a"), module("dbo.b")]);
+        let recorded = StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "leon");
+        let dropping = pbps_model::ChangeSet {
+            changes: ["dbo.a", "dbo.b"]
+                .into_iter()
+                .map(|name| {
+                    pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                        name: name.parse().unwrap(),
+                        kind: pbps_model::ModuleKind::View,
+                    })
+                })
+                .collect(),
+        };
+        // Once the plan has run they are gone, which is what the closing entry
+        // records.
+        assert!(
+            modules_after(&recorded, &dropping, Settled::Whole).is_empty(),
+            "the finished plan drops both"
+        );
+        // Until then both are still watched — including the one whose own
+        // `DROP` has already run, which the read simply finds absent.
+        let during = modules_after(&recorded, &dropping, Settled::SoFar);
+        assert_eq!(during.len(), 2, "{during:?}");
+
+        // And a module the plan creates is watched from the start either way.
+        let creating = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateModule {
+                    name: "dbo.c".parse().unwrap(),
+                    module: Box::new(module("dbo.c").1),
+                },
+            )],
+        };
+        for settled in [Settled::Whole, Settled::SoFar] {
+            assert!(
+                modules_after(&recorded, &creating, settled)
+                    .contains(&"dbo.c".parse::<pbps_model::ObjectName>().unwrap()),
+                "a module the plan adds is in the set from the start"
+            );
+        }
     }
 
     /// An object this plan creates has no baseline entry, so a loop over the
