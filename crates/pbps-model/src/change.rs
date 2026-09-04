@@ -456,7 +456,7 @@ impl Change {
                 // Server can populate one from a DEFAULT or IDENTITY; without
                 // either, a NOT NULL addition is the same data hazard as
                 // tightening an existing nullable column (SPEC §7.1).
-                if !column.nullable && column.default.is_none() && column.identity.is_none() {
+                if !column.nullable && !column.has_required_add_value_source() {
                     r.insert(RiskClass::NotNull);
                 }
             }
@@ -700,6 +700,10 @@ mod tests {
         );
         assert!(make(true, None, false).intrinsic_risks().is_empty());
         assert!(make(false, Some("0"), false).intrinsic_risks().is_empty());
+        assert_eq!(
+            make(false, Some("((NULL))"), false).intrinsic_risks(),
+            BTreeSet::from([RiskClass::NotNull])
+        );
         assert!(make(false, None, true).intrinsic_risks().is_empty());
     }
 

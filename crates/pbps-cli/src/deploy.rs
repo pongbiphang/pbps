@@ -53,15 +53,23 @@ async fn managed_state(
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let managed = managed_state_full(conn, ids, modules, unmanaged).await?;
-    if !managed.limitations.is_empty() {
+    refuse_managed_limitations(&managed.limitations)?;
+    Ok(managed.scoped)
+}
+
+/// Refuses to use a catalog projection that omitted facts inside the managed
+/// set. Both recording and connected planning need the same guard: a partial
+/// schema is neither an honest snapshot nor a safe baseline for an artifact.
+fn refuse_managed_limitations(limitations: &[String]) -> anyhow::Result<()> {
+    if !limitations.is_empty() {
         bail!(
             "{} fact(s) inside the managed set cannot be represented:\n  {}\n\
-             Refusing to compare or record a partial schema.",
-            managed.limitations.len(),
-            managed.limitations.join("\n  ")
+             Refusing to compare, plan from, or record a partial schema.",
+            limitations.len(),
+            limitations.join("\n  ")
         );
     }
-    Ok(managed.scoped)
+    Ok(())
 }
 
 /// Introspects, cuts the result down to the managed set, and reports whatever
@@ -959,6 +967,12 @@ pub fn cmd_plan_db(
             pbps_config::Unmanaged::Ignore,
         )
         .await?;
+        // A connected plan becomes an applyable artifact. If introspection
+        // omitted a fact on a recorded table, its scoped checksum can still
+        // match while the real database does not; planning from that partial
+        // projection would bless the omission and an empty apply would never
+        // reconnect to catch it.
+        refuse_managed_limitations(&managed.limitations)?;
         // A declared name standing on an object introspection cannot express is
         // not something to plan around. It is absent from the scoped schema, so
         // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`

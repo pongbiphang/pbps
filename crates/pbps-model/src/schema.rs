@@ -163,6 +163,29 @@ impl Column {
     pub fn is_deprecated(&self) -> bool {
         self.deprecated.is_some()
     }
+
+    /// Whether SQL Server has a declared source for existing rows when this is
+    /// added as a required column.
+    ///
+    /// Expressions stay opaque everywhere else, but an explicit `NULL`
+    /// literal is definitively not a value source. SQL Server also stores
+    /// defaults wrapped in redundant parentheses, so those are peeled without
+    /// attempting to interpret any other expression.
+    pub fn has_required_add_value_source(&self) -> bool {
+        self.identity.is_some()
+            || self
+                .default
+                .as_deref()
+                .is_some_and(|default| !is_explicit_null(default))
+    }
+}
+
+fn is_explicit_null(expression: &str) -> bool {
+    let mut expression = expression.trim();
+    while expression.starts_with('(') && expression.ends_with(')') {
+        expression = expression[1..expression.len() - 1].trim();
+    }
+    expression.eq_ignore_ascii_case("null")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -278,6 +301,22 @@ mod tests {
     fn nullable_defaults_to_true() {
         assert!(Column::new(ty("int")).nullable);
         assert!(!Column::new(ty("int")).not_null().nullable);
+    }
+
+    #[test]
+    fn an_explicit_null_default_is_not_a_required_add_value_source() {
+        let mut column = Column::new(ty("int"));
+        assert!(!column.has_required_add_value_source());
+
+        for default in ["NULL", " null ", "(NULL)", "((( null )))"] {
+            column.default = Some(default.into());
+            assert!(!column.has_required_add_value_source(), "{default}");
+        }
+
+        for default in ["0", "'NULL'", "NULLIF(1, 2)"] {
+            column.default = Some(default.into());
+            assert!(column.has_required_add_value_source(), "{default}");
+        }
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

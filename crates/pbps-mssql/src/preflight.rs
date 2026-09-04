@@ -151,7 +151,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             name,
             column,
             ..
-        } if !column.nullable && column.default.is_none() && column.identity.is_none() => {
+        } if !column.nullable && !column.has_required_add_value_source() => {
             let Some(stored) = names.table(table) else {
                 return Ok(Vec::new());
             };
@@ -503,6 +503,20 @@ mod tests {
     fn adding_a_required_column_counts_every_existing_row() {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
+        let sql = sql_of(&Change::AddColumn {
+            uid: uid("c_aaaaaa"),
+            table: tname("dbo.customer"),
+            name: "score".into(),
+            column: Box::new(column),
+        });
+        assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
+    }
+
+    #[test]
+    fn a_null_default_does_not_hide_the_required_add_probe() {
+        let mut column = pbps_model::Column::new(ty("int"));
+        column.nullable = false;
+        column.default = Some("((NULL))".into());
         let sql = sql_of(&Change::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),

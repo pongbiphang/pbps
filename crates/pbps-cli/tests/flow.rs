@@ -291,6 +291,23 @@ fn adding_a_required_column_to_an_existing_table_is_gated() {
 }
 
 #[test]
+fn a_null_default_does_not_bypass_the_required_column_gate() {
+    let d = Demo::new("add-required-null-default");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false, default: \"((NULL))\"}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = stdout(&o);
+    assert!(text.contains("not-null"), "{text}");
+    assert!(text.contains("--allow not-null"), "{text}");
+}
+
+#[test]
 fn an_invalid_declaration_is_rejected() {
     let d = Demo::new("invalid");
     d.table("table: no_schema_prefix\ncolumns:\n  a: {type: int}\n");
@@ -5335,6 +5352,16 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
             .await
             .unwrap();
     });
+
+    let plan = d.dir.join("partial-plan.json");
+    let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&planned), 1, "{}", stdout(&planned));
+    assert!(
+        stderr(&planned).contains("computed"),
+        "{}",
+        stderr(&planned)
+    );
+    assert!(!plan.exists(), "a partial connected plan was written");
 
     let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
     let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
