@@ -1175,3 +1175,31 @@ SPEC is in sync with all of these.
     the emitter writes no `COLLATE`. Nothing outside text has a collation,
     and `COLLATE` on a number is an error rather than a no-op, so a non-text
     key keeps the plain query.
+132. **A row write holds itself to what it wrote.** The engine reporting a
+    successful `INSERT` or `UPDATE` is not the same as the row being what the
+    plan says: an `AFTER` trigger runs inside the statement and may rewrite
+    the row or take it away again, and `DELETE` has the mirror shape — a
+    trigger that puts the row back. The apply then read the result back,
+    recorded *that*, and reported success, so `verify` was clean against a
+    state nobody declared and every plan after it proposed the same change
+    again. Each row statement now ends with a postcondition — the row exists
+    and holds the cells the plan spelled, or for a delete is still gone — and
+    throws otherwise, inside the write's own transaction, so the plan rolls
+    back instead of blessing the result.
+
+    Only the cells the plan spells are checked, by the rendering that reads
+    them back (the comparison of 122). A cell left to a default has no value
+    in the plan to hold the row to; a column the plan never names is the
+    application's business. A connected plan cannot fail this on spelling
+    alone — `plan --db` refuses a declaration the engine reads back
+    differently before the plan exists (101) — but an offline plan carries no
+    such promise, so a value the engine stores differently now stops here
+    rather than being applied, recorded, and proposed for ever. The message
+    names all three causes.
+
+    The envelope is the delete guard's (129), now shared: `BEGIN TRANSACTION`
+    / `TRY` / `CATCH` around the write and its checks, because a staged apply
+    runs each statement outside a transaction and a postcondition that merely
+    threw would leave the write it rejected committed. `SET IDENTITY_INSERT`
+    goes off before the check can throw: it is a session setting, not a
+    transactional one, and a rollback would leave it on for the connection.

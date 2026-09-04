@@ -546,6 +546,37 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
     }
 }
 
+/// What a plan takes away from one child table before its deletes run.
+enum Removal {
+    /// The table itself: every key it holds goes with it.
+    Table,
+    /// The named constraints, and nothing else.
+    Keys(Vec<String>),
+}
+
+impl AsStored {
+    /// The keys this plan removes from `stored_child` before the deletes,
+    /// under the names the catalog has now. Read by both probes over foreign
+    /// keys: a constraint that will be gone must count nothing (DECISIONS
+    /// 128).
+    fn removed_from(&self, stored_child: &TableName) -> Removal {
+        let mut keys = Vec::new();
+        for removed in &self.removed {
+            let table = self
+                .table(&removed.table)
+                .unwrap_or_else(|| removed.table.clone());
+            if &table != stored_child {
+                continue;
+            }
+            match &removed.constraint {
+                Some(constraint) => keys.push(constraint.clone()),
+                None => return Removal::Table,
+            }
+        }
+        Removal::Keys(keys)
+    }
+}
+
 /// The rows in other tables that still point at a row about to be deleted
 /// (ADR-0004).
 ///
@@ -986,6 +1017,13 @@ fn unprobeable_probe(
     let Some(stored_child) = names.table(child) else {
         return Ok(None);
     };
+    // The same filtering `delete_probe` does: a key this plan removes before
+    // the deletes cannot carry a default onto the deleted row, and refusing
+    // the write for it refuses a plan the engine would accept (DECISIONS 128).
+    let removed = match names.removed_from(&stored_child) {
+        Removal::Table => return Ok(None),
+        Removal::Keys(keys) => keys,
+    };
     let mut columns = Vec::new();
     let mut described = Vec::new();
     for (column, rows) in &moved.unprobeable {
@@ -1017,10 +1055,22 @@ fn unprobeable_probe(
                JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n \
               WHERE fk.referenced_object_id = OBJECT_ID({})\n   \
                 AND fk.parent_object_id = OBJECT_ID({})\n   \
-                AND c.name IN ({});",
+                AND c.name IN ({}){};",
             literal(&qualified(&stored.table)?),
             literal(&qualified(&stored_child)?),
-            columns.join(", ")
+            columns.join(", "),
+            if removed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n     AND fk.name NOT IN ({})",
+                    removed
+                        .iter()
+                        .map(|k| literal(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         ),
     )))
 }

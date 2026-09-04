@@ -138,32 +138,24 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key_column,
             key,
             ..
-        } => one(format!(
-            // The guard and the delete are one transaction of their own: a
-            // staged apply runs each statement outside one (SPEC 7.5), and
-            // the range locks the guard takes would then be released before
-            // the delete they exist to protect. Inside the transactional
-            // apply this nests, where `COMMIT` only decrements the count and
-            // the outer transaction still decides everything. The `CATCH`
-            // rolls back and rethrows, so a staged run never leaves the
-            // connection holding an open transaction (DECISIONS 129).
-            "BEGIN TRANSACTION;\n\
-             BEGIN TRY\n\
-             {}\n\
+        } => one(atomically(&format!(
+            // The guard, the delete and the checks after it are one
+            // transaction of their own (`atomically`): the range locks the
+            // guard takes have to be held through the delete they protect,
+            // and a staged apply runs each statement outside a transaction.
+            "{}\n\
              DELETE FROM {} WHERE {} = {};\n\
              {}\n\
-             COMMIT TRANSACTION;\n\
-             END TRY\n\
-             BEGIN CATCH\n\
-             IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n\
-             THROW;\n\
-             END CATCH",
+             {}",
             crate::preflight::still_referenced(table, key_column, key)?,
             qualified(table)?,
             quote(key_column)?,
             row_key(key),
-            exactly_one_row(table, key)
-        )),
+            exactly_one_row(table, key),
+            // And the row stayed gone: a trigger that put it back would
+            // otherwise be read back and recorded as this plan's result.
+            gone_row(table, key, key_column)?
+        ))),
 
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
@@ -533,19 +525,38 @@ fn insert_row(
         columns.push(quote(column)?);
         values.push(value_literal(v));
     }
+    // What the row must hold afterwards, by the same literals the insert
+    // writes: a trigger that deleted it again, or wrote something else,
+    // would otherwise be read back and recorded as the plan's own result
+    // (`wrote_the_row`). A column the row leaves to its default has no
+    // value here to check it against.
+    let mut cells = Vec::new();
+    for (column, v) in row.columns() {
+        cells.push(match v {
+            Value::Null => format!("{} IS NULL", quote(column)?),
+            v @ (Value::Bool(_) | Value::Int(_) | Value::Text(_)) => {
+                format!("{} = {}", quote(column)?, value_literal(v))
+            }
+        });
+    }
+    let wrote = wrote_the_row(table, key, key_column, &cells)?;
     let table = qualified(table)?;
     let insert = format!(
         "INSERT INTO {table} ({}) VALUES ({});",
         columns.join(", "),
         values.join(", ")
     );
-    if identity_key {
-        one(format!(
-            "SET IDENTITY_INSERT {table} ON;\n{insert}\nSET IDENTITY_INSERT {table} OFF;"
-        ))
+    // The `IDENTITY_INSERT` goes off before the check can throw: it is a
+    // session setting, not a transactional one, and a rollback would leave
+    // it on for the rest of the connection.
+    let body = if identity_key {
+        format!(
+            "SET IDENTITY_INSERT {table} ON;\n{insert}\nSET IDENTITY_INSERT {table} OFF;\n{wrote}"
+        )
     } else {
-        one(insert)
-    }
+        format!("{insert}\n{wrote}")
+    };
+    one(atomically(&body))
 }
 
 /// One `UPDATE`, holding the row to what the plan recorded.
@@ -623,7 +634,30 @@ fn update_row(
     }
     sql.push_str(";\n");
     sql.push_str(&exactly_one_row(table, key));
-    one(sql)
+    // And what the row holds afterwards. Each cell the plan spells, compared
+    // by the rendering that read it, so a trigger that rewrote the row —
+    // or took it away — rolls this statement back instead of being read
+    // back as the plan's own result. A cell set to `DEFAULT` has no value
+    // here to check, and a column outside `columns` is not this plan's.
+    let mut cells = Vec::new();
+    for (column, (_, to)) in columns {
+        let quoted = quote(column)?;
+        let Some(ty) = types.get(column) else {
+            continue;
+        };
+        match to {
+            Cell::Value(Value::Null) => cells.push(format!("{quoted} IS NULL")),
+            Cell::Value(v) => cells.push(format!(
+                "{} = {} COLLATE Latin1_General_BIN2",
+                crate::rows::read_expr(&quoted, &ty.base),
+                literal(&recorded_text(v))
+            )),
+            Cell::Default(_) => {}
+        }
+    }
+    sql.push('\n');
+    sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
+    one(atomically(&sql))
 }
 
 /// A recorded cell as the read-back's text: what `rows::value_of` decoded.
@@ -640,6 +674,89 @@ fn recorded_text(v: &Value) -> String {
 /// row, the one the plan recorded. In the same batch, because `@@ROWCOUNT`
 /// is the last statement's. Measured with an `AFTER` trigger on the table:
 /// the count is the statement's own, not the trigger's.
+/// The check after a row's `DELETE`: it is still gone once the statement has
+/// run. A trigger that reinserted it would otherwise be read back and
+/// recorded as this plan's own result (DECISIONS 132).
+fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String, DialectError> {
+    Ok(format!(
+        "IF EXISTS (SELECT 1 FROM {} WHERE {} = {})\n  THROW 50000, {}, 1;",
+        qualified(table)?,
+        quote(key_column)?,
+        row_key(key),
+        literal(&format!(
+            "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
+             or another writer inside it. Nothing was applied."
+        ))
+    ))
+}
+
+/// A row statement and the postconditions it holds itself to, as one
+/// transaction of its own.
+///
+/// A staged apply runs each statement outside a transaction (SPEC §7.5), so
+/// a postcondition that merely threw would leave the write it rejected
+/// committed. Inside the transactional apply this nests, where `COMMIT` only
+/// decrements the count and the outer transaction still decides everything.
+/// The `CATCH` rolls back and rethrows, so no staged run is left holding an
+/// open transaction (DECISIONS 129).
+fn atomically(body: &str) -> String {
+    format!(
+        "BEGIN TRANSACTION;\n\
+         BEGIN TRY\n\
+         {body}\n\
+         COMMIT TRANSACTION;\n\
+         END TRY\n\
+         BEGIN CATCH\n\
+         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n\
+         THROW;\n\
+         END CATCH"
+    )
+}
+
+/// What a row write holds itself to once it has run: the row is there, and
+/// it holds what the plan wrote.
+///
+/// The engine reporting a successful `INSERT` or `UPDATE` is not the same as
+/// the row being what the plan says. An `AFTER` trigger runs inside the
+/// statement and may delete the row again or rewrite what it holds, and the
+/// apply would then read the result back, record it, and report success —
+/// leaving `verify` clean against a state nobody declared and the next
+/// connected plan proposing the same change forever. Checked here, inside
+/// the write's own transaction, so the plan rolls back instead
+/// (DECISIONS 132).
+///
+/// Only the cells the plan spells are checked, by the rendering that reads
+/// them back. A cell left to a default has no value in the plan to hold the
+/// row to, and a column the plan never names is the application's business,
+/// not this statement's.
+///
+/// A *connected* plan cannot fail this on spelling alone: `plan --db` refuses
+/// a declaration the engine reads back differently before the plan exists
+/// (DECISIONS 101). An offline plan carries no such promise, and a value the
+/// engine stores differently from the way it is declared stops here rather
+/// than being applied, recorded, and proposed again by every plan after it —
+/// which is what the message names alongside a trigger.
+fn wrote_the_row(
+    table: &TableName,
+    key: &RowKey,
+    key_column: &str,
+    cells: &[String],
+) -> Result<String, DialectError> {
+    let mut predicate = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    predicate.extend(cells.iter().cloned());
+    Ok(format!(
+        "IF NOT EXISTS (SELECT 1 FROM {} WHERE {})\n  THROW 50000, {}, 1;",
+        qualified(table)?,
+        predicate.join(" AND "),
+        literal(&format!(
+            "{table} row `{key}` is not what this plan wrote once the statement had run — a \
+             trigger on the table, another writer inside it, or a value the engine stores \
+             differently from the way it is declared. Nothing was applied; `pbps plan --db` \
+             says which."
+        ))
+    ))
+}
+
 fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
     format!(
         "IF @@ROWCOUNT <> 1 THROW 50000, {}, 1;",
@@ -1501,9 +1618,24 @@ mod tests {
             defaults: Default::default(),
             row: row(&[("label", Value::Text("New".to_owned()))]),
         });
-        assert_eq!(
-            sql,
-            ["INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"]
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"
+            ),
+            "{}",
+            sql[0]
+        );
+        // And the row is held to what was written: a trigger that took it
+        // away again would otherwise be recorded as this plan's own result
+        // (DECISIONS 132).
+        assert!(
+            sql[0].contains(
+                "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
+                 WHERE [code] = N'new' AND [label] = N'New')"
+            ),
+            "{}",
+            sql[0]
         );
     }
 
@@ -1520,13 +1652,22 @@ mod tests {
             defaults: Default::default(),
             row: row(&[("label", Value::Text("Seven".to_owned()))]),
         });
-        assert_eq!(
-            sql,
-            [concat!(
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(concat!(
                 "SET IDENTITY_INSERT [dbo].[t] ON;\n",
                 "INSERT INTO [dbo].[t] ([id], [label]) VALUES (N'7', N'Seven');\n",
                 "SET IDENTITY_INSERT [dbo].[t] OFF;"
-            )]
+            )),
+            "{}",
+            sql[0]
+        );
+        // The switch goes off before the postcondition can throw: it is a
+        // session setting, and a rollback would leave it on.
+        assert!(
+            sql[0].find("SET IDENTITY_INSERT [dbo].[t] OFF;") < sql[0].find("IF NOT EXISTS"),
+            "{}",
+            sql[0]
         );
     }
 
@@ -1579,13 +1720,20 @@ mod tests {
             .collect(),
         });
         // No type carried (an older plan): the key alone holds the row, and
-        // the count still has to be one.
+        // the count still has to be one. The postcondition is the key alone
+        // for the same reason — a cell with no type has no rendering to be
+        // compared by.
         assert_eq!(
             sql,
-            [format!(
-                "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}",
+            [atomically(&format!(
+                "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
+                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new')\n  \
+                 THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
+                 statement had run — a trigger on the table, another writer inside it, or a \
+                 value the engine stores differently from the way it is declared. Nothing was \
+                 applied; `pbps plan --db` says which.', 1;",
                 stale("dbo.order_status", "new")
-            )]
+            ))]
         );
     }
 
@@ -1664,8 +1812,25 @@ mod tests {
             .collect(),
         });
         let sql = &sql[0];
-        let (update, check) = sql.split_once('\n').expect("two statements");
-        assert_eq!(check, stale("dbo.t", "a"));
+        let body = sql
+            .strip_prefix("BEGIN TRANSACTION;\nBEGIN TRY\n")
+            .expect("the write and its checks are one transaction");
+        let mut lines = body.split('\n');
+        let update = lines.next().expect("the update");
+        assert_eq!(lines.next(), Some(stale("dbo.t", "a").as_str()));
+        // And the row holds what the plan wrote, by the same rendering
+        // (DECISIONS 132).
+        let wrote = lines.next().expect("the postcondition");
+        for held in [
+            "[code] = N'a'",
+            "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
+            "CONVERT(nvarchar(max), [rank]) = N'2' COLLATE Latin1_General_BIN2",
+            "CONVERT(nvarchar(max), [since], 126) = N'2026-09-04' COLLATE Latin1_General_BIN2",
+        ] {
+            assert!(wrote.contains(held), "{held}\n{wrote}");
+        }
+        // The column with no type carried has no rendering to be compared by.
+        assert!(!wrote.contains("[added]"), "{wrote}");
         assert!(
             update.starts_with(
                 "UPDATE [dbo].[t] SET [added] = N'y', [doc] = N'<a/>', [flag] = N'false', \
@@ -1709,14 +1874,16 @@ mod tests {
             .into_iter()
             .collect(),
         });
-        assert_eq!(
-            sql,
-            [format!(
-                "UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';\n{}",
-                stale("dbo.t", "a")
-            )]
+        assert!(
+            sql[0].contains("UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"),
+            "{}",
+            sql[0]
         );
-        assert!(!sql[0].contains("NULL"), "{sql:?}");
+        assert!(sql[0].contains(&stale("dbo.t", "a")), "{}", sql[0]);
+        // `NOT EXISTS` is the postcondition's own; nothing here writes NULL,
+        // and nothing compares against one.
+        assert!(!sql[0].contains("= NULL"), "{}", sql[0]);
+        assert!(!sql[0].contains("IS NULL"), "{}", sql[0]);
     }
 
     /// `UPDATE t SET WHERE ...` is not T-SQL. The differ never produces an
@@ -1884,12 +2051,23 @@ mod tests {
         // Pinned exactly rather than by substring: what matters is that the
         // injected text is *inside* the literal, and only the whole statement
         // shows that. Every quote the value contained is doubled, so none of it
-        // closes the literal early and none of it becomes statement text.
+        // closes the literal early and none of it becomes statement text — in
+        // the postcondition the write holds itself to as much as in the
+        // `INSERT` (DECISIONS 132).
         assert_eq!(
             sql,
             [concat!(
+                "BEGIN TRANSACTION;\nBEGIN TRY\n",
                 "INSERT INTO [dbo].[t] ([code], [label]) ",
-                r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');"
+                r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
+                "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
+                r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
+                "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
+                "the statement had run — a trigger on the table, another writer inside it, ",
+                "or a value the engine stores differently from the way it is declared. ",
+                "Nothing was applied; `pbps plan --db` says which.', 1;",
+                "\nCOMMIT TRANSACTION;\nEND TRY\nBEGIN CATCH\n",
+                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\nTHROW;\nEND CATCH"
             )]
         );
     }

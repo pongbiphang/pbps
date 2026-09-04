@@ -2497,6 +2497,41 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         "{}",
         probe.description
     );
+    // The same filtering the count does: a key this plan takes away before
+    // the deletes cannot carry a default onto the deleted row, so refusing
+    // the write for it would refuse a plan the engine accepts (128).
+    let mut without_the_key = unprobeable.clone();
+    without_the_key.changes.insert(
+        0,
+        pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
+            table: TableName::new("dbo", "kind"),
+            name: "fk_kind_status".to_owned(),
+        }),
+    );
+    let probe = refusal_for(&without_the_key).expect("the probe is still built");
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "the only key spanning the column is going first");
+    // And the whole child table going takes its keys with it.
+    let mut without_the_table = unprobeable.clone();
+    without_the_table.changes.insert(
+        0,
+        pbps_model::PlannedChange::new(pbps_model::Change::DropTable {
+            uid: "t_cccccc".parse().unwrap(),
+            name: TableName::new("dbo", "kind"),
+        }),
+    );
+    assert!(
+        refusal_for(&without_the_table).is_none(),
+        "a table this plan drops first has nothing left to refuse"
+    );
+
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
             moved.changes[0].clone(),
@@ -3046,6 +3081,187 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         "the column holds `a` and `A` apart, whatever the database does: {conflicts:?}"
     );
     ci_db.drop().await;
+
+    db.drop().await;
+}
+
+/// The engine reporting a successful write is not the same as the row being
+/// what the plan says. An `AFTER` trigger runs inside the statement, and one
+/// that rewrites the row, or puts a deleted one back, left `apply` reading
+/// the result back, recording it, and reporting success — `verify` then clean
+/// against a state nobody declared, and every plan after it proposing the
+/// same change (DECISIONS 132).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
+    use pbps_model::{Cell, Row, RowKey, Value};
+
+    let mut db = TestDb::create("triggers").await;
+    for sql in [
+        "CREATE TABLE dbo.status (\n\
+             code varchar(10) NOT NULL CONSTRAINT pk_status PRIMARY KEY,\n\
+             label nvarchar(50) NULL\n\
+         );",
+        "INSERT INTO dbo.status (code, label) VALUES ('old', 'Old');",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let table = TableName::new("dbo", "status");
+    let insert = |key: &str| pbps_model::Change::InsertRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        identity_key: false,
+        key: RowKey::from(key),
+        defaults: Default::default(),
+        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    };
+    let update = |from: &str, to: &str| pbps_model::Change::UpdateRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        columns: [(
+            "label".to_owned(),
+            (
+                Cell::Value(Value::Text(from.to_owned())),
+                Cell::Value(Value::Text(to.to_owned())),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        types: [("label".to_owned(), ty("nvarchar(50)"))]
+            .into_iter()
+            .collect(),
+    };
+    let delete = pbps_model::Change::DeleteRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+    };
+    let sql_of = |change: &pbps_model::Change| {
+        let stmts = Mssql.emit(change, Default::default()).expect("emit");
+        assert_eq!(stmts.len(), 1, "{stmts:?}");
+        stmts[0].sql.clone()
+    };
+    let db_name = db.name.clone();
+    let label_of = |code: &'static str| {
+        let db_name = db_name.clone();
+        async move {
+            let mut c = Conn::connect(&conn_str()).await.expect("connect");
+            c.execute(&format!("USE [{db_name}];")).await.expect("use");
+            let rows = c
+                .query(&format!(
+                    "SELECT label FROM dbo.status WHERE code = '{code}';"
+                ))
+                .await
+                .expect("read the row");
+            rows.first()
+                .map(|r| r.try_get::<&str>("label").unwrap().unwrap().to_owned())
+        }
+    };
+
+    // Nothing in the way: the postcondition refuses only what it has to.
+    for (change, why) in [
+        (insert("new"), "an ordinary insert"),
+        (update("Old", "Ancient"), "an ordinary update"),
+    ] {
+        let sql = sql_of(&change);
+        db.conn
+            .execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{why} is refused:\n{sql}\n{e}"));
+    }
+
+    // A trigger that quietly rewrites whatever was just written.
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.undo ON dbo.status AFTER INSERT, UPDATE AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET label = N'Undone'\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that rewrites what was written");
+
+    for (change, why) in [
+        (update("Ancient", "Newer"), "an update the trigger rewrote"),
+        (insert("third"), "an insert the trigger rewrote"),
+    ] {
+        let sql = sql_of(&change);
+        let err = db
+            .conn
+            .execute(&sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{why} was taken for this plan's own result:\n{sql}"));
+        assert!(
+            err.to_string().contains("is not what this plan wrote"),
+            "{why}: {err}"
+        );
+    }
+    assert_eq!(
+        label_of("old").await.as_deref(),
+        Some("Ancient"),
+        "the update rolled back, trigger and all"
+    );
+    assert_eq!(
+        label_of("third").await,
+        None,
+        "and so did the insert: the row is not there"
+    );
+    // The connection is left clean: a staged apply runs each statement
+    // outside a transaction, and an abandoned one would hold its locks.
+    let open: i32 = db
+        .conn
+        .query("SELECT @@TRANCOUNT;")
+        .await
+        .expect("trancount")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(open, 0, "the CATCH rolled its own transaction back");
+
+    // And the same for a delete a trigger undoes.
+    // `CREATE TRIGGER` must be the first statement of its batch.
+    db.conn
+        .execute("DROP TRIGGER dbo.undo;")
+        .await
+        .expect("take the first trigger off");
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.put_back ON dbo.status AFTER DELETE AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               INSERT INTO dbo.status (code, label) SELECT code, label FROM deleted;\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that puts a deleted row back");
+    let sql = sql_of(&delete);
+    let err = db
+        .conn
+        .execute(&sql)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("the delete was taken for this plan's own result:\n{sql}"));
+    assert!(
+        err.to_string()
+            .contains("is back after this plan deleted it"),
+        "{err}"
+    );
+    assert_eq!(
+        label_of("old").await.as_deref(),
+        Some("Ancient"),
+        "the row is still there, and still what it was"
+    );
 
     db.drop().await;
 }
