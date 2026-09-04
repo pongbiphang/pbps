@@ -130,6 +130,28 @@ Two things follow, and the first matters more:
   `max(the table's own keys, the sequence's current value) + 1`, which is a
   question for the engine at apply time rather than arithmetic over the plan.
 
+  **And asking the engine is not enough on its own: the table has to be locked
+  before the question, not by it.** Reading `max(id)` and then restarting is a
+  time-of-check-to-time-of-use race against an application that is still
+  inserting — being inside the plan's transaction does not close it, because
+  MVCC lets the other session commit in between. **Measured**, the locks arrive
+  in the wrong order:
+
+  ```
+  BEGIN;
+  SELECT max(id) FROM m.lockseq;        -- AccessShareLock: does not block INSERT
+  ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2;
+                                        -- AccessExclusiveLock: taken too late
+  ```
+
+  A concurrent transaction can allocate and commit the next key in that window,
+  and the restart then points at a key that already exists. So the emitter takes
+  the exclusive lock **first** — before reading either value — and holds it
+  through the restart, which is one statement in front of the two it already
+  emits. The window is small and the failure it produces is a duplicate key in
+  the application, which is precisely the failure this whole section exists to
+  prevent.
+
 - **And `+ 1` assumes the identity counts upwards, which the model does not.**
   `Identity` is `{ seed: i64, increment: i64 }` and the only rule on it refuses
   an increment of `0`, so `identity: [100, -1]` is a declaration this project

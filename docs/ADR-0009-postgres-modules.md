@@ -245,6 +245,30 @@ Three consequences:
    there is nothing to converge. The cost is one field per module in the state
    snapshot, and it is the honest price of an engine that does not store what it
    was given.
+
+   **And `baseline` has nothing to put in the declared slot.** `cmd_baseline`
+   builds its snapshot from `managed_state` — the live catalog, scoped by the
+   declarations — because its whole purpose is to take the database as it stands
+   (§9.2). No declaration was applied, so neither obvious filling works: the
+   live deparsed text restores the endless restatement this section just fixed,
+   and the current YAML makes a module somebody edited by hand in the database
+   compare **unchanged for ever**, while the database no longer matches it.
+
+   So the slot is **left empty**, and empty means "never applied through this
+   tool" rather than "equal to nothing". A module whose declared slot is empty
+   is restated once by the next plan — `CREATE OR REPLACE` where the engine
+   allows it, which is cheap, idempotent and grant-preserving — and both slots
+   are filled properly by that apply. Adoption therefore costs one restatement
+   per managed module, which is §8.2's "the cost of a false positive is
+   restating one definition" paid once, at the moment the project takes
+   responsibility for the schema.
+
+   That is also the answer to the second failure above rather than an accident:
+   after a `baseline`, a hand-edited module is **not** silently blessed. It is
+   restated to match the declarations, which is what declaring it meant.
+   `baseline` resets the drift comparison; it does not redefine the desired
+   state. The same rule covers `snapshot`, and `bootstrap` needs no exception
+   because it creates every module from the declarations it holds.
 3. **A deparser is a version-dependent function.** A PostgreSQL major upgrade
    can change how it renders, and every managed view would then read back
    differently on the same unchanged database — mass phantom drift, at the
@@ -344,6 +368,40 @@ on PostgreSQL, pbps will refuse to edit a view or function whose access
 somebody adjusted by hand — in either direction — until that adjustment is
 either declared or undone. That is friction. The alternative is a deployment
 that hands the world execute rights on a function and reports success.
+
+### Ownership is not in the ACL, and a rebuild takes it
+
+The ACL check above is necessary and not sufficient, because PostgreSQL keeps
+ownership somewhere else — `pg_class.relowner`, `pg_proc.proowner` — and a
+`DROP` followed by a `CREATE` makes the deployment account the owner.
+**Measured:**
+
+```
+before: owner=m_owner  secdef=true  acl=NULL
+                       -- pbps, connected as the deployment account, rebuilds it
+after:  owner=postgres secdef=true  acl=NULL
+```
+
+The ACL is `NULL` on both sides, so **the two-directional ACL refusal cannot
+see this at all**. And the third column is why it matters more than tidiness: a
+`SECURITY DEFINER` function keeps that flag through the rebuild and now runs
+with the *deployment account's* privileges instead of its original owner's. The
+deployment account is the most privileged principal in the environment (ADR-0005
+§ self-hosting), so an ordinary return-type edit turns a narrow function into a
+privileged one, and nothing in the plan says so.
+
+**Decision.** The connected plan reads the owner alongside the ACL, and:
+
+- **preserves it** — an `ALTER … OWNER TO` after the `CREATE`, written into the
+  plan so the approver sees it, exactly as the re-emitted grants are; and
+- **refuses the rebuild when it cannot**, because `ALTER … OWNER TO` requires
+  the deployment account to be a member of the target role, which is not
+  something pbps may assume or arrange. Refusing names the owner and the
+  membership that would be needed.
+
+A `SECURITY DEFINER` module whose owner cannot be preserved is the one case
+where refusing is not merely conservative but the only defensible answer: the
+alternative is a silent privilege escalation that verifies clean.
 
 ### How the plan knows a rebuild is needed
 

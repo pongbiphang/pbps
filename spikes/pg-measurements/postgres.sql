@@ -92,9 +92,15 @@ FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' A
 
 CREATE ROLE m_reader;
 GRANT SELECT ON m.v TO m_reader;
+-- The replace has to happen *after* the grant, or this measures only that the
+-- GRANT worked. A15 read `kept` for that reason in the first version of this
+-- file, and would have gone on reading `kept` if a later PostgreSQL dropped
+-- privileges during a replacement.
+SELECT m.accepts('CREATE OR REPLACE VIEW m.v AS SELECT id, a, b, id AS also_id FROM m.t') \gset a15_
 SELECT 'A15', 'CREATE OR REPLACE VIEW keeps the grants',
-       CASE WHEN (SELECT relacl::text FROM pg_class WHERE oid='m.v'::regclass) LIKE '%m_reader%'
-            THEN 'kept' ELSE 'lost' END;
+       :'a15_accepts' || ', and the grant is '
+       || CASE WHEN (SELECT relacl::text FROM pg_class WHERE oid='m.v'::regclass) LIKE '%m_reader%'
+               THEN 'kept' ELSE 'LOST' END;
 DROP VIEW m.v; CREATE VIEW m.v AS SELECT id, a FROM m.t;
 SELECT 'A16', 'DROP VIEW then CREATE VIEW keeps the grants',
        CASE WHEN coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.v'::regclass), '') LIKE '%m_reader%'
@@ -338,8 +344,42 @@ SELECT 'R13', 'a backslash-escaped quote inside an E-string',
        || ', E''it\''s  here'' is ' || length(E'it\'s  here')::text
        || ' characters: ' || E'it\'s  here';
 
+-- ------------------------------------- the fourth 2026-09-05 review round
+
+CREATE ROLE m_owner LOGIN PASSWORD 'x';
+GRANT CREATE, USAGE ON SCHEMA m TO m_owner;
+SET ROLE m_owner;
+CREATE FUNCTION m.owned(a int) RETURNS int SECURITY DEFINER AS $$ SELECT a; $$ LANGUAGE sql;
+RESET ROLE;
+SELECT 'A26', 'a SECURITY DEFINER function before a rebuild',
+       'owner=' || (SELECT proowner::regrole::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' secdef=' || (SELECT prosecdef::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' acl=' || coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure), 'NULL');
+DROP FUNCTION m.owned(int);
+CREATE FUNCTION m.owned(a int) RETURNS bigint SECURITY DEFINER AS $$ SELECT a::bigint; $$ LANGUAGE sql;
+SELECT 'A27', 'the same function after the deployment account rebuilds it',
+       'owner=' || (SELECT proowner::regrole::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' secdef=' || (SELECT prosecdef::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' acl=' || coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure),
+                              'NULL — so the ACL check cannot see the change');
+
+CREATE TABLE m.lockseq (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.lockseq (v) VALUES ('a');
+BEGIN;
+SELECT max(id) FROM m.lockseq;
+SELECT 'R14', 'the lock held after only reading max(id)',
+       coalesce((SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
+                 WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid()), '(none)')
+       || ' — which does not block INSERT';
+ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2;
+SELECT 'R15', 'the lock held once the RESTART runs',
+       (SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
+        WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid())
+       || ' — taken too late to close the window';
+COMMIT;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
-DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner;

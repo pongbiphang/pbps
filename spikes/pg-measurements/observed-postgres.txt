@@ -13,7 +13,7 @@ A11 | CREATE OR REPLACE VIEW removes a column | refused: cannot drop columns fro
 A12 | CREATE OR REPLACE VIEW retypes a column | refused: cannot change data type of view column "a" from character varying(10) to text
 A13 | CREATE OR REPLACE FUNCTION changes the return type | refused: cannot change return type of existing function
 A14 | CREATE OR REPLACE FUNCTION given a new argument type | accepted, leaving 2 function(s) named m.g
-A15 | CREATE OR REPLACE VIEW keeps the grants | kept
+A15 | CREATE OR REPLACE VIEW keeps the grants | accepted, and the grant is kept
 A16 | DROP VIEW then CREATE VIEW keeps the grants | lost
 A17 | a table rename follows into the stored view definition | yes
 A18 | and a column rename rewrites it as | SELECT customer_id, name AS full_name FROM m.client WHERE legacy_code IS NULL;
@@ -70,3 +70,7 @@ R10 | a descending identity, with no MAXVALUE the model could carry | refused: S
 R11 | RESTART at max(keys)+1 on a descending identity | refused: RESTART value (101) cannot be greater than MAXVALUE (100)
 R12 | RESTART at min(keys)-1, the direction the sequence counts | accepted / accepted
 R13 | a backslash-escaped quote inside an E-string | standard_conforming_strings=on, E'it\'s  here' is 10 characters: it's  here
+A26 | a SECURITY DEFINER function before a rebuild | owner=m_owner secdef=true acl=NULL
+A27 | the same function after the deployment account rebuilds it | owner=postgres secdef=true acl=NULL — so the ACL check cannot see the change
+R14 | the lock held after only reading max(id) | AccessShareLock — which does not block INSERT
+R15 | the lock held once the RESTART runs | AccessExclusiveLock, AccessShareLock — taken too late to close the window
