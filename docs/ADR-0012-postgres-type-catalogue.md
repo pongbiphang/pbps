@@ -38,8 +38,9 @@ named as an open question rather than asserted.
 | `numeric` | `numeric` | | `time` | `time without time zone` |
 | `real` | `real` | | `timetz` | `time with time zone` |
 | `float`, `float8`, `double precision` | `double precision` | | `timestamp` | `timestamp without time zone` |
-| `float(1)`, `float(24)` | **`real`** | | `interval`, `json`, `jsonb`, `uuid`, `text[]` | unchanged |
+| `float(1)`, `float(24)` | **`real`** | | `interval`, `json`, `jsonb`, `uuid` | unchanged |
 | `float(25)`, `float(53)` | **`double precision`** | | `serial` | **`integer`** + an owned sequence |
+| | | | `text[]` | unchanged by the catalog, and **unloadable** — see below |
 
 Two of these are traps rather than aliases:
 
@@ -56,12 +57,35 @@ to the catalog's own spelling — `integer`, not `int`; `character varying`, not
 `varchar`. Users may write either; two files that differ only in the spelling
 produce equal `Schema`s, which is inviolable constraint 1.
 
-Arrays (`text[]`) round-trip exactly and are **in scope** as a suffix on a
-catalogued element type. Domains, enums and composite types are **out of scope**:
-they are user-defined *objects* with their own creation, ownership and drop
+**Arrays are out of scope**, and a first draft of this ADR had them in on the
+strength of `text[]` round-tripping through `format_type`. It does — and the
+declaration never reaches that far. **Measured**, against this repository's own
+parser:
+
+```
+"text[]"     -> Err(BadBaseName("text[]"))
+"integer[]"  -> Err(BadBaseName("integer[]"))
+"text ARRAY" -> Ok(ColumnType { base: "text array", args: [] })
+```
+
+`ColumnType::from_str` allows only `[A-Za-z0-9_ ]` in a base name, so the common
+spelling is refused — and **the SQL-standard spelling is not**, because spaces
+are legal in a base name (`double precision`, `timestamp with time zone`). That
+second line is the dangerous one: `text ARRAY` loads happily as the base name
+`text array`, which no catalog will ever return, so the column is reported as
+changed on every single run and no plan can ever fix it.
+
+So arrays need a representation in `ColumnType` — a dimension flag, not a
+spelling — before they can be declared at all, and that is a `pbps-model` change
+this document is not taking. Until it is taken, **the dialect refuses both
+spellings explicitly**, `text ARRAY` included, rather than letting one of them
+through into a comparison it cannot win.
+
+Domains, enums and composite types are out of scope for a different reason: they
+are user-defined *objects* with their own creation, ownership and drop
 semantics, not spellings of a built-in, and modelling them is a separate ADR.
-`pull` reports a column of such a type as unmanaged rather than guessing a
-base type — the alternative is a declaration that silently widens a domain's
+`pull` reports a column of such a type as unmanaged rather than guessing a base
+type — the alternative is a declaration that silently widens a domain's
 constraint away.
 
 ## 2. `TypeChangeRisk` answers its question, and it answers it correctly
@@ -239,7 +263,7 @@ replacement is a declared transformation with its own ADR, not a flag.
 
 | | |
 |---|---|
-| `pbps-model` | **Nothing.** `ColumnType` holds a base and arguments; every spelling above fits |
+| `pbps-model` | **Nothing, because arrays are out.** `ColumnType` holds a base and arguments, which fits every spelling this catalogue admits. Admitting `text[]` would need a dimension in `ColumnType` — a real model change, and the reason arrays wait (§1) |
 | `pbps-dialect` | `normalize_type`'s contract, already named in [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) Amendment 3 |
 | `TypeChangeRisk` | **Nothing** — §2 |
 | The estimate (14.1 P1) | Gains its first measured dataset and a stated boundary — §3 |
@@ -254,6 +278,10 @@ replacement is a declared transformation with its own ADR, not a flag.
   as something else on every run.
 - **Folding domains and enums into their base types** (§1). Silently drops a
   constraint the user wrote.
+- **Admitting arrays on the strength of the catalog round-trip** (§1). The
+  catalog is not the part that refuses them; the loader is, and one of the two
+  spellings is refused while the other is silently accepted as a base name no
+  catalog will ever return.
 
 ## Limits
 

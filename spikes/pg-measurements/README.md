@@ -39,7 +39,7 @@ rule` are each quoted in an ADR.
 
 | File | |
 |---|---|
-| `postgres.sql` | 59 measurements: modules and overloading (A), privileges (B), type-change cost (T), reference data (R) |
+| `postgres.sql` | 64 measurements: modules and overloading (A), privileges (B), type-change cost (T), reference data (R) |
 | `sqlserver.sql` | 3 contrasts (M), and only 3 — see below |
 | `observed-*.txt` | what those produced on the pinned engines when the ADRs were written |
 
@@ -55,10 +55,10 @@ or a bug in shipped code. It is a hazard.
 
 | Lines | ADR |
 |---|---|
-| `A1`–`A20` | [ADR-0009](../../docs/ADR-0009-postgres-modules.md) — deparsing, overloading, what `CREATE OR REPLACE` cannot do, dependency refusals |
-| `B1`–`B10`, `M1`, `M2` | [ADR-0010](../../docs/ADR-0010-postgres-privileges.md) — `USAGE`, schema grants, default privileges, cluster-wide roles, the ACL |
+| `A1`–`A22` | [ADR-0009](../../docs/ADR-0009-postgres-modules.md) — deparsing, overloading, what `CREATE OR REPLACE` cannot do, dependency refusals |
+| `B1`–`B12`, `M1`, `M2` | [ADR-0010](../../docs/ADR-0010-postgres-privileges.md) — `USAGE`, schema grants, default privileges, cluster-wide roles, the ACL |
 | `T-01`–`T-21` | [ADR-0012](../../docs/ADR-0012-postgres-type-catalogue.md) — what rewrites a table, what a session decides, the catalogue's spellings |
-| `R1`–`R8`, `M3` | [ADR-0013](../../docs/ADR-0013-postgres-reference-data.md) — defaults, identity keys, `NOT VALID`, collation, session-dependent rendering |
+| `R1`–`R9`, `M3` | [ADR-0013](../../docs/ADR-0013-postgres-reference-data.md) — defaults, identity keys, `NOT VALID`, collation, session-dependent rendering |
 | — | [ADR-0014](../../docs/ADR-0014-driver-seam-tested.md) measures the driver seam instead, in `../pg-driver` |
 
 ## Two things this is not
@@ -71,6 +71,16 @@ suite already knows are worth covering.
 
 It is **not product code**. Like `spikes/yaml-span` and `spikes/pg-driver`, it
 goes when what it was built to decide has been decided.
+
+## The 2026-09-05 additions
+
+`A21`, `A22`, `B11`, `B12` and `R9` were added after a review of PR #12 found
+five defects in the ADRs. Four of them needed an engine to settle, and all four
+confirmed the reviewer: a type modifier does not distinguish two routines, a
+function nobody granted is executable by `PUBLIC`, and restarting a sequence at
+the highest key *this plan* wrote can move it backwards past a row the plan
+never touched. They live here so the corrections are as reproducible as the
+claims they replaced.
 
 ## One caveat found by running it
 

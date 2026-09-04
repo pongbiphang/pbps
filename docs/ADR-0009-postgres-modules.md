@@ -28,8 +28,12 @@ The verdict, up front:
 | `CREATE OR ALTER` avoids drop + create, and so preserves grants | **Not for sale.** PostgreSQL's replace can only *append* view columns |
 | The schema-bound ordering problem is one deferred corner case | **It is the common case** |
 
-One model change, one new read-back rule, and one bargain that lapses. The
-bargain is affordable only because ADR-0005 has since shipped — see §3.
+Two model changes — a map key and a field in the state snapshot — and one
+bargain that lapses. The bargain is affordable only because ADR-0005 has since
+shipped (§3). Both model changes are small; what is not small is that the
+signature is normalized by *routine* rules rather than column rules (§1), and
+that the state has to keep what was declared as well as what came back (§2),
+because on this engine those are permanently different texts.
 
 ## What was measured, and against what
 
@@ -130,8 +134,39 @@ Three things this deliberately does **not** do:
 - **It does not fold the signature into a string.** `app.f(int, text)` and
   `app.f(integer,text)` are the same object, and constraint 1 says two
   semantically identical `Schema`s must be `==`. A string key makes them
-  unequal; a key holding normalized types makes them equal, and normalization
-  is already the dialect's job (`Dialect::normalize_type`).
+  unequal; a key holding normalized types makes them equal.
+
+### The normalization is *routine* normalization, not column normalization
+
+The obvious move is to reuse `Dialect::normalize_type`, which already folds
+`int` to `integer`. **Measured, that is wrong**, and wrong in the direction that
+produces two declarations for one object:
+
+```
+=> CREATE FUNCTION v.f(a varchar(10)) RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;
+=> CREATE FUNCTION v.f(a varchar(20)) RETURNS int AS $$ SELECT 2; $$ LANGUAGE sql;
+ERROR:  function "f" already exists with same argument types
+
+=> SELECT pg_get_function_identity_arguments(oid) ...;
+ a character varying          -- the length is gone
+```
+
+and the same for precision: `h(numeric(10,2))` and `h(numeric(12,4))` are one
+function, identified as `numeric`. **PostgreSQL discards type modifiers when it
+identifies a routine.** A column's `varchar(10)` and `varchar(20)` are different
+types and must stay different — that is what `normalize_type` is for — so the
+two normalizations answer different questions and cannot be the same function.
+
+**Decision.** The dialect gains a second, narrower hook — "normalize this type
+*for routine identity*" — which on PostgreSQL strips the modifiers
+`normalize_type` deliberately keeps, and on SQL Server is never called because
+nothing there overloads. Reusing the column-oriented one would key
+`f(varchar(10))` and `f(varchar(20))` as two modules over one engine object, and
+every drop and grant the plan emitted would name a signature the engine resolves
+to something else.
+
+This is the same lesson as ADR-0011 Amendment 2 arriving one layer down: a
+normalizer is only neutral with respect to the question it was written for.
 
 **The cost is duplication, and it is real.** The argument types appear in the
 key and again inside `definition`, and nothing offline can check that they
@@ -185,15 +220,31 @@ Three consequences:
    never converge. Left alone, every `plan --db` would restate every view,
    forever: not a wrong plan, but a plan that cries wolf daily, which ADR-0002
    names as the failure to avoid.
-2. **So the dialect must say which side of the comparison a text came from.**
-   The decision: after a successful apply, the read-back replaces the module's
-   recorded definition — as it already does — and the differ compares a
-   declared definition against a *recorded* one only after passing both through
-   `normalize_definition`; where they still differ and the recorded side is
-   deparsed output, the change is emitted, the read-back replaces it, and the
-   **next** plan is clean. Convergence in one round, not never. This is the
-   same "restate one definition" cost §8.2 already accepts, paid once per
-   edited module rather than once per run.
+2. **So the recorded state has to keep the declaration, not only the read-back.**
+   A first draft of this ADR said the read-back replaces the recorded definition
+   and the *next* plan is clean — convergence in one round. **That is wrong, and
+   the measurement that disproves it is one already in this document**: a
+   `BEGIN ATOMIC` body written as `SELECT a + 1` comes back as `SELECT (a + 1)`,
+   with its comment gone. That difference is not layout, so
+   `normalize_definition` cannot close it, and replacing the baseline with
+   another deparsed copy never makes it equal to the unchanged hand-written
+   declaration. `plan --db` would emit the same `CREATE OR REPLACE` on every
+   run, for ever — the cry-wolf loop this section claimed to avoid.
+
+   The decision: the state snapshot records, for each managed module, **both**
+   texts — the definition **as declared** when it was applied, and what the
+   engine returned. Then each comparison stays inside one space, which is what
+   §8.2 asks for:
+
+   | Question | Compares |
+   |---|---|
+   | has the *declaration* changed? (the differ, `plan --db` included) | declared-now against declared-at-last-apply |
+   | has the *environment* changed? (drift, `verify`) | the recorded read-back against the live read-back |
+
+   Neither comparison ever puts a hand-written text beside a deparsed one, so
+   there is nothing to converge. The cost is one field per module in the state
+   snapshot, and it is the honest price of an engine that does not store what it
+   was given.
 3. **A deparser is a version-dependent function.** A PostgreSQL major upgrade
    can change how it renders, and every managed view would then read back
    differently on the same unchanged database — mass phantom drift, at the
@@ -321,14 +372,20 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 |---|---|
 | `Schema::modules` keyed by `ModuleId` instead of `ObjectName` | One key type; every dialect-agnostic user of it goes through the map |
 | `GrantTarget::Object` must be able to name a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
+| The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
-| A dialect hook for "which module kinds overload" | Data, not behaviour |
+| A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
 
 Everything else — `Module`, `ModuleKind`, `ModuleDeps`, the ids file (modules
 still carry no identity), the differ, `docs`, the policy engine — is unchanged.
-**The abstraction passes its own test.** It is worth recording that the test
-was run and what it cost, because "we checked" is not the same claim as "it
-held", and only one of them is evidence.
+
+**The abstraction holds, with one correction to what that costs.** The first
+draft of this document claimed the whole bill was one map key. It is one map
+key *and a field in the state snapshot*, because §2.2's convergence argument was
+wrong and the fix is to record what was declared. Recording it here rather than
+quietly widening the earlier claim is the point: "we checked" is not the same
+claim as "it held", and a verdict that was revised is worth more than one that
+never moved.
 
 ## Ruled out
 

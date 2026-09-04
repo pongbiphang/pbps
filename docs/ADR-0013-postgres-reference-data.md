@@ -108,8 +108,27 @@ to avoid.
 Two things follow, and the first matters more:
 
 - **The emitter must restart the sequence** after pinned inserts, in the same
-  transaction, to the maximum key it wrote plus one. It is one statement and it
-  turns a delayed foreign failure into no failure.
+  transaction — **above every key the table holds and above where the sequence
+  already stands**, not merely above what this plan wrote.
+
+  A first draft of this section said "to the maximum key it wrote plus one", and
+  **measured, that is worse than doing nothing**, because it can move the
+  sequence *backwards*. In `ensure` mode the table keeps rows pbps does not
+  declare, and one of them can hold a higher key:
+
+  ```
+  INSERT ... OVERRIDING SYSTEM VALUE VALUES (100, 'an undeclared row');
+  INSERT ... OVERRIDING SYSTEM VALUE VALUES (1,   'the row this plan writes');
+  ALTER TABLE v.seq ALTER COLUMN id RESTART WITH 2;   -- max(written) + 1
+  INSERT INTO v.seq (v) VALUES ('the next one');       -> accepted
+  ```
+
+  The next insert is **accepted**, which is the trap: it takes id 2, and the
+  collision waits until the sequence has walked back up to 100. A failure that
+  arrives immediately is a bug report; one that arrives ninety-eight inserts
+  later is an incident with no obvious cause. The restart value has to be
+  `max(the table's own keys, the sequence's current value) + 1`, which is a
+  question for the engine at apply time rather than arithmetic over the plan.
 - **The declaration should be discouraged, not merely supported.** ADR-0004
   already says an identity primary key "hands out different values per
   environment, so declaring rows by id would be a lie by default". PostgreSQL

@@ -260,14 +260,50 @@ nobody while every role in the cluster can execute it, and `verify` calls it
 clean. This is the third member of CLAUDE.md's set — absent, empty and
 unreadable — and it is the one that reads as good news.
 
-**Decision.** The PostgreSQL catalog reader expands a NULL ACL to the engine's
-documented default for that object kind, or refuses to answer; it never returns
-an empty set for it. Grants to `PUBLIC` are **unexpressible in the model** —
-`PUBLIC` is a pseudo-role, not a role pbps could declare — and therefore travel
-the path ADR-0005 notes 4 and 15 already built for `DENY`, `WITH GRANT OPTION`
-and column-level grants: left out of the role's set, carried beside the
-comparison, reported by `pull`, reported as drift by `verify` and `status`, and
-refused by `plan --db` rather than planned over.
+**Decision, in two halves, and the second half is a correction.**
+
+**The reader never returns an empty set for a NULL ACL.** It expands it to the
+engine's documented default for that object kind, or refuses to answer. "No row
+in the catalog" and "nobody is granted anything" are different facts and only
+one of them is good news.
+
+**But the default is the zero point, not drift, and not a refusal.** A first
+draft of this ADR routed `PUBLIC` down the path ADR-0005 notes 4 and 15 built
+for `DENY` and `WITH GRANT OPTION` — unexpressible, and `plan --db` refuses
+rather than plan over it. **Measured, that deadlocks the tool on its own
+output:**
+
+```
+-- a function pbps has just created, granted by nobody:
+proacl IS NULL       -> t
+SET ROLE v_nobody;   -- holds only USAGE on the schema
+SELECT v.fresh(7);   -> 7          -- PUBLIC executed it
+```
+
+Every function pbps creates arrives with `EXECUTE` to `PUBLIC`. Under the first
+draft, the very next `plan --db` would refuse, and managing functions at all
+would require an undocumented manual revoke after every create. A rule that
+makes the tool's own successful apply unplannable is not a safe rule; it is a
+broken one.
+
+So the managed set is drawn where ADR-0005 note 3 already draws it, one axis
+further: **only grants to *managed roles* are compared.** `PUBLIC` is not a role
+the ids file can name, so what it holds is outside the managed set the way an
+undeclared role's grants already are — reported by `pull` and carried by
+`status` as context, never as drift and never as a gate. What stays
+*unexpressible*, and keeps the ADR-0005 treatment, is a deviation the model can
+name no part of: `WITH GRANT OPTION` (`a*r`), column-level grants in
+`pg_attribute.attacl`, and privileges outside the closed set — all of them
+**on a managed role**, which is what makes them that role's business.
+
+**The residual, stated rather than hidden.** `EXECUTE` to `PUBLIC` on a function
+is a real exposure, and revoking it is ordinary hardening — measured, the revoke
+leaves `{postgres=X/postgres}` and PUBLIC is refused. pbps cannot express either
+that state or the intent to reach it, so a project that wants it does the revoke
+outside pbps, and pbps will not undo it (it compares only managed roles) nor
+report it. That is a gap, not a design: expressing "revoked from `PUBLIC`" needs
+a grantee the model does not have, and it should get one before this engine's
+privileges are called done.
 
 That path existing already is the reassuring part of this ADR. The mechanism for
 "the engine holds a permission this model cannot describe, and silence about it
@@ -345,8 +381,15 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
 - **Managing role existence on PostgreSQL** (§3). The object is cluster-scoped;
   the tool is database-scoped.
 - **A per-dialect `Permission` type** (§6). Puts the dialect inside the model.
-- **Modelling `PUBLIC`** (§5). It is not a role that could be declared; treating
-  it as one would make "grant to everybody" look like an ordinary row.
+- **Modelling `PUBLIC` as an ordinary role** (§5). Putting it in the ids file
+  with an `r_` uid would make "granted to everybody" read as one more row in a
+  list, and would have pbps creating and dropping a principal the engine owns.
+  A dedicated grantee — something a `role:` file can name but the ids file
+  cannot mint — is the shape that would work, and it is a follow-up rather than
+  a decision taken here.
+- **Refusing to plan over the engine's own default** (§5). It was the first
+  draft's rule, and measured, it makes a function unplannable the moment pbps
+  creates one.
 
 ## Limits
 
@@ -358,6 +401,11 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
   its own, the rest are cluster or connection concerns.
 - **Sequence, type, domain and foreign-data-wrapper grants are unmodelled** and
   reported, not folded.
+- **What `PUBLIC` holds cannot be declared, and therefore cannot be revoked by
+  pbps** (§5). Every function arrives executable by everyone, and hardening that
+  is a step taken outside the tool which the tool will neither undo nor mention.
+  This is the largest gap in this document and it should close before PostgreSQL
+  privileges are called finished.
 - **The `MAINTAIN` privilege is PostgreSQL 17+**; the dialect must gate it on the
   server version the way `plan --db` already gates on SQL Server's edition.
 - **Everything here is proposed.** No PostgreSQL dialect exists, and every

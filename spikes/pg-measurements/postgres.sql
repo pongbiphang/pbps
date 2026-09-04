@@ -261,8 +261,43 @@ SELECT 'R8', 'the same values after three SET commands',
        (SELECT b::text || ' / ' || d::text || ' / ' || i::text FROM m.vals);
 RESET bytea_output; RESET datestyle; RESET intervalstyle;
 
+-- ------------------------------------------- the 2026-09-05 review round
+-- Five findings on PR #12; these are the four that needed an engine.
+
+SELECT 'A21', 'a type modifier distinguishes two routines',
+       m.accepts('CREATE FUNCTION m.mod1(a varchar(10)) RETURNS int AS $q$ SELECT 1; $q$ LANGUAGE sql')
+       || ' / ' ||
+       m.accepts('CREATE FUNCTION m.mod1(a varchar(20)) RETURNS int AS $q$ SELECT 2; $q$ LANGUAGE sql');
+SELECT 'A22', 'how the engine identifies that routine',
+       string_agg(pg_get_function_identity_arguments(p.oid), ' | ')
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' AND p.proname='mod1';
+
+CREATE FUNCTION m.fresh(a int) RETURNS int AS $$ SELECT a; $$ LANGUAGE sql;
+CREATE ROLE m_nobody;
+GRANT USAGE ON SCHEMA m TO m_nobody;
+SELECT 'B11', 'PUBLIC executing a function nobody granted',
+       m.accepts('SET ROLE m_nobody; SELECT m.fresh(7); RESET ROLE');
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION m.fresh(int) FROM PUBLIC;
+SELECT 'B12', 'the ACL after revoking EXECUTE from PUBLIC',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.fresh(int)'::regprocedure), 'NULL')
+       || ', and then: ' || m.accepts('SET ROLE m_nobody; SELECT m.fresh(7); RESET ROLE');
+RESET ROLE;
+
+CREATE TABLE m.seq (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.seq (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'an undeclared row');
+INSERT INTO m.seq (id, v) OVERRIDING SYSTEM VALUE VALUES (1, 'the row this plan writes');
+ALTER TABLE m.seq ALTER COLUMN id RESTART WITH 2;   -- max(written by the plan) + 1
+SELECT m.accepts('INSERT INTO m.seq (v) VALUES (''the next one'')') \gset r9_
+SELECT 'R9', 'the next insert after restarting at max(written)+1',
+       :'r9_accepts' || ', taking id '
+       || (SELECT max(id)::text FROM m.seq WHERE v = 'the next one')
+       || ' while the table already holds a row at id '
+       || (SELECT max(id)::text FROM m.seq);
+
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
 DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody;

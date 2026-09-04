@@ -58,3 +58,8 @@ R5 | deleting a parent referenced under a NOT VALID key | refused: update or del
 R6 | a key differing only in case | accepted (collation en_US.utf8)
 R7 | value rendering under the default session | \x0102 / 2026-09-05 / 1 day 02:00:00
 R8 | the same values after three SET commands | \001\002 / 05/09/2026 / 1 2:00:00
+A21 | a type modifier distinguishes two routines | accepted / refused: function "mod1" already exists with same argument types
+A22 | how the engine identifies that routine | a character varying
+B11 | PUBLIC executing a function nobody granted | accepted
+B12 | the ACL after revoking EXECUTE from PUBLIC | {postgres=X/postgres}, and then: refused: permission denied for function fresh
+R9 | the next insert after restarting at max(written)+1 | accepted, taking id 2 while the table already holds a row at id 100
