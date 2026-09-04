@@ -274,9 +274,16 @@ of them is optional:
   ([GitHub docs](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments#environment-secrets)).
 - **Both environments carry a deployment tag rule of `prod-v*`**, so neither
   releases anything to a job on some other ref.
-- **A repository ruleset restricts who may create `prod-v*` tags.** The tag push
-  is what starts all of this; without that rule the two settings above only
-  decide *which job* gets the credential, never *who* set it running.
+- **A repository ruleset restricts who may create *and update* `prod-v*` tags.**
+  The tag push is what starts all of this; without those rules the two settings
+  above only decide *which job* gets the credential, never *who* set it running.
+  Both rules, not one: GitHub counts restricting creations and restricting
+  updates as [separate rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#restrict-updates),
+  and `on: push: tags:` fires for an update as readily as for a creation — so
+  restricting only creation holds until the first release tag exists, and then
+  anyone who can move it runs their own code in `production-plan` again. The
+  same question is worth asking of a GitLab project: a protected tag pattern
+  decides who may create one, and who may move it is the other half.
 
 The drift watch is the fourth setting, and the easiest one to get wrong: a
 scheduled run references no deployment environment, so it receives nothing from
