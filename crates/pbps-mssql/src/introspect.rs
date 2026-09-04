@@ -162,6 +162,10 @@ pub struct Pulled {
     /// the caller must show these, because each one is a difference that would
     /// otherwise surface as phantom drift or a destructive plan later.
     pub warnings: Vec<String>,
+    /// Unsupported facts associated with a table. Callers use the parent name
+    /// to distinguish a limitation inside the managed set (unexpressible
+    /// drift) from one on somebody else's table.
+    pub limitations: Vec<IntrospectionLimitation>,
     /// Modules the database has that pbps cannot manage: a CLR object, one
     /// created `WITH ENCRYPTION`, or one whose stored text does not have the
     /// shape the emitter can reproduce.
@@ -170,6 +174,27 @@ pub struct Pulled {
     /// they are an inventory of what is left alone, and the user needs the
     /// count and the names.
     pub unmanaged_modules: Vec<UnmanagedModule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntrospectionLimitation {
+    pub table: TableName,
+    pub detail: String,
+}
+
+fn push_limitation(
+    warnings: &mut Vec<String>,
+    limitations: &mut Vec<IntrospectionLimitation>,
+    table: Option<&TableName>,
+    detail: String,
+) {
+    warnings.push(detail.clone());
+    if let Some(table) = table {
+        limitations.push(IntrospectionLimitation {
+            table: table.clone(),
+            detail,
+        });
+    }
 }
 
 /// One module the database has and `pbps` does not manage.
@@ -448,6 +473,7 @@ fn action(code: u8) -> ReferentialAction {
 /// managed set.
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut warnings = Vec::new();
+    let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
 
@@ -472,26 +498,41 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let table_name = name_of(c.object_id, &names);
 
         if c.is_computed {
-            warnings.push(format!(
-                "{table_name}.{}: computed columns are not supported yet; it was left out of the declarations",
-                c.name
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: computed columns are not supported yet; it was left out of the declarations",
+                    c.name
+                ),
+            );
             continue;
         }
         if c.is_user_defined_type {
-            warnings.push(format!(
-                "{table_name}.{}: user-defined type `{}` is not supported yet; it was left out of the declarations",
-                c.name, c.type_name
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{table_name}.{}: user-defined type `{}` is not supported yet; it was left out of the declarations",
+                    c.name, c.type_name
+                ),
+            );
             continue;
         }
         let ty = match column_type(c) {
             Ok(t) => t,
             Err(e) => {
-                warnings.push(format!(
-                    "{table_name}.{}: {e}; it was left out of the declarations",
-                    c.name
-                ));
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&c.object_id),
+                    format!(
+                        "{table_name}.{}: {e}; it was left out of the declarations",
+                        c.name
+                    ),
+                );
                 continue;
             }
         };
@@ -572,10 +613,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .iter()
                 .any(|w| w.contains(&format!("index `{}`", i.index_name)))
             {
-                warnings.push(format!(
-                    "{table_name}: index `{}` is clustered, which is not modelled yet; it was left out of the declarations",
-                    i.index_name
-                ));
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{table_name}: index `{}` is clustered, which is not modelled yet; it was left out of the declarations",
+                        i.index_name
+                    ),
+                );
             }
             continue;
         }
@@ -607,9 +653,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // empty table — that would plan the drop of the columns it really has.
         if table.columns.is_empty() {
             let table_name = name_of(id, &names);
-            warnings.push(format!(
-                "{table_name}: no supported columns remain; the whole table was left out of the declarations"
-            ));
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&id),
+                format!(
+                    "{table_name}: no supported columns remain; the whole table was left out of the declarations"
+                ),
+            );
             continue;
         }
         schema.tables.insert(names.remove(&id).unwrap(), table);
@@ -677,6 +728,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     Pulled {
         schema,
         warnings,
+        limitations,
         unmanaged_modules,
     }
 }
@@ -802,6 +854,12 @@ mod tests {
 
         let p = assemble(&raw);
         assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
+        assert_eq!(p.limitations.len(), 2, "{:?}", p.limitations);
+        assert!(
+            p.limitations
+                .iter()
+                .all(|limitation| limitation.table == TableName::new("dbo", "customer"))
+        );
         assert!(p.warnings[0].contains("computed"), "{:?}", p.warnings);
         assert!(p.warnings[1].contains("my_udt"), "{:?}", p.warnings);
         // The table itself survives with the supported columns.
@@ -824,6 +882,7 @@ mod tests {
         };
         let p = assemble(&raw);
         assert!(p.schema.tables.is_empty());
+        assert_eq!(p.limitations[0].table, TableName::new("dbo", "shapes"));
         assert!(
             p.warnings.iter().any(|w| w.contains("whole table")),
             "{:?}",
@@ -923,6 +982,11 @@ mod tests {
                 .is_empty()
         );
         assert!(p.warnings.iter().any(|w| w.contains("clustered")));
+        assert!(
+            p.limitations
+                .iter()
+                .any(|limitation| limitation.detail.contains("clustered"))
+        );
     }
 
     /// Rows for tables outside the managed set (dropped between queries, or

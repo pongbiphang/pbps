@@ -41,6 +41,7 @@ pub enum IdsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdsFile {
     pub version: u32,
 
@@ -71,6 +72,7 @@ impl Default for IdsFile {
 /// the declarations only ever contain what you want and never accumulate zombie
 /// columns over the years (SPEC §4.4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tombstone {
     /// The full name at the moment of deletion. An audit has to be able to answer
     /// "what was this column called?".

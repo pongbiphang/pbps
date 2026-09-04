@@ -146,6 +146,24 @@ impl AsStored {
 
 fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> {
     match change {
+        Change::AddColumn {
+            table,
+            name,
+            column,
+            ..
+        } if !column.nullable && column.default.is_none() && column.identity.is_none() => {
+            let Some(stored) = names.table(table) else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![Probe::new(
+                format!(
+                    "rows that have no value for the new NOT NULL column {}",
+                    table.column(name)
+                ),
+                format!("SELECT COUNT(*) AS n FROM {};", qualified(&stored)?),
+            )])
+        }
+
         Change::AlterColumnNullability {
             column,
             to_nullable: false,
@@ -479,6 +497,39 @@ mod tests {
             sql,
             ["SELECT COUNT(*) AS n FROM [dbo].[customer] WHERE [email] IS NULL;"]
         );
+    }
+
+    #[test]
+    fn adding_a_required_column_counts_every_existing_row() {
+        let mut column = pbps_model::Column::new(ty("int"));
+        column.nullable = false;
+        let sql = sql_of(&Change::AddColumn {
+            uid: uid("c_aaaaaa"),
+            table: tname("dbo.customer"),
+            name: "score".into(),
+            column: Box::new(column),
+        });
+        assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
+    }
+
+    #[test]
+    fn a_required_column_on_a_new_table_needs_no_probe() {
+        let mut column = pbps_model::Column::new(ty("int"));
+        column.nullable = false;
+        let cs = plan(vec![
+            Change::CreateTable {
+                uid: uid("t_aaaaaa"),
+                name: tname("dbo.customer"),
+                table: Box::new(pbps_model::Table::default()),
+            },
+            Change::AddColumn {
+                uid: uid("c_aaaaaa"),
+                table: tname("dbo.customer"),
+                name: "score".into(),
+                column: Box::new(column),
+            },
+        ]);
+        assert!(probes(&cs).is_empty());
     }
 
     /// Relaxing to nullable cannot fail, and a probe that always returns zero

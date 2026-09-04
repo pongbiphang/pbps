@@ -91,6 +91,13 @@ fn code(o: &Output) -> i32 {
     o.status.code().unwrap_or(-1)
 }
 
+fn plan_checksum(path: &std::path::Path) -> String {
+    let raw = std::fs::read_to_string(path).unwrap();
+    serde_json::from_str::<pbps_model::SavedPlan>(&raw)
+        .unwrap()
+        .checksum()
+}
+
 /// The command ran correctly and found something the user must act on.
 ///
 /// Distinct from 1, which means the tool could not answer at all (SPEC §14.1).
@@ -202,6 +209,10 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
         "the tombstone must record the reason: {ids}"
     );
     assert!(
+        ids.contains(r#""operator": "demo""#),
+        "audit identity must come from the project repository, not the caller's cwd: {ids}"
+    );
+    assert!(
         !std::fs::read_to_string(d.dir.join("schema/dbo.t.yml"))
             .unwrap()
             .contains("pii"),
@@ -260,6 +271,23 @@ fn narrowing_a_type_is_reported_as_a_risk() {
         s.contains("--allow narrowing"),
         "the user must be told how to approve it: {s}"
     );
+}
+
+#[test]
+fn adding_a_required_column_to_an_existing_table_is_gated() {
+    let d = Demo::new("add-required");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = stdout(&o);
+    assert!(text.contains("not-null"), "{text}");
+    assert!(text.contains("--allow not-null"), "{text}");
 }
 
 #[test]
@@ -625,7 +653,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
-        "version": 3,
+        "version": 4,
         "kind": "baseline",
         "schema": { "tables": { "dbo.t": { "columns": {
             "id": { "type": "bigint", "nullable": false }
@@ -1043,6 +1071,7 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
     d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  b: {type: int}\n");
     let plan = d.dir.join("preview.json");
     d.run(&["plan", "--out", plan.to_str().unwrap()]);
+    let checksum = plan_checksum(&plan);
 
     let o = d.run(&[
         "apply",
@@ -1052,6 +1081,8 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
         "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
         "--plan",
         plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
         "--allow",
         "destructive",
     ]);
@@ -1060,6 +1091,90 @@ fn apply_refuses_an_offline_preview_without_ever_connecting() {
     assert!(err.contains("preview"), "{err}");
     assert!(err.contains("plan --db"), "the remedy must be named: {err}");
     assert!(!err.contains("connect"), "it must not have tried: {err}");
+}
+
+/// The checksum shown to the reviewer is an input to apply, not merely an
+/// audit value written afterwards. A different artifact must be rejected
+/// before the target is contacted even when both files deserialize cleanly.
+#[test]
+fn apply_refuses_an_artifact_that_does_not_match_the_approved_checksum() {
+    let d = Demo::new("apply-pin");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "plan.json", "transactional");
+    let actual = plan_checksum(&plan);
+    let approved = if actual.starts_with('0') {
+        "1".repeat(64)
+    } else {
+        "0".repeat(64)
+    };
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &approved,
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("approved checksum"), "{err}");
+    assert!(err.contains("plan checksum now"), "{err}");
+    assert!(
+        !err.contains("connect"),
+        "the target must not be contacted: {err}"
+    );
+}
+
+/// `risks` is reviewer-facing redundant data. Recompute it from the typed
+/// change so changing both the artifact and the command-line checksum cannot
+/// turn a DROP into an ungated operation.
+#[test]
+fn apply_refuses_a_plan_whose_risks_were_removed() {
+    let d = Demo::new("apply-risks");
+    d.table(ONE_COLUMN);
+    let plan_path = d.dir.join("riskless-drop.json");
+    let plan = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        "mssql",
+        "2026-09-04T00:00:00Z",
+        pbps_model::PlanBaseline {
+            description: "test as queried".into(),
+            checksum: "0".repeat(64),
+        },
+        pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange {
+                change: pbps_model::Change::DropTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.t".parse().unwrap(),
+                },
+                risks: Default::default(),
+                strategy: Default::default(),
+            }],
+        },
+        pbps_model::IdsFile::default(),
+    );
+    std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+    let checksum = plan.checksum();
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("inconsistent risks"), "{err}");
+    assert!(err.contains("destructive"), "{err}");
+    assert!(
+        !err.contains("connect"),
+        "the target must not be contacted: {err}"
+    );
 }
 
 // ---- Phase 3.5: the module model (ADR-0002) ----
@@ -1221,7 +1336,7 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
     let plan = format!(
         r#"{{
-  "version": 2,
+  "version": 3,
   "origin": "database",
   "mode": "{mode}",
   "dialect": "mssql",
@@ -1249,12 +1364,15 @@ fn apply_refuses_a_mode_the_plan_does_not_declare() {
 
     // A transactional plan applied with --staged.
     let plain = write_plan(&d, "plain.json", "transactional");
+    let plain_checksum = plan_checksum(&plain);
     let o = d.run(&[
         "apply",
         "--db",
         unreachable,
         "--plan",
         plain.to_str().unwrap(),
+        "--checksum",
+        &plain_checksum,
         "--staged",
     ]);
     assert_eq!(code(&o), 1);
@@ -1262,12 +1380,15 @@ fn apply_refuses_a_mode_the_plan_does_not_declare() {
 
     // ...and a staged plan applied without it.
     let staged = write_plan(&d, "staged.json", "staged");
+    let staged_checksum = plan_checksum(&staged);
     let o = d.run(&[
         "apply",
         "--db",
         unreachable,
         "--plan",
         staged.to_str().unwrap(),
+        "--checksum",
+        &staged_checksum,
     ]);
     assert_eq!(code(&o), 1);
     assert!(stderr(&o).contains("staged plan"), "{}", stderr(&o));
@@ -2754,13 +2875,13 @@ fn explain_refuses_a_plan_version_it_does_not_understand() {
 
     // The same plan, one version ahead.
     let raw = std::fs::read_to_string(&plan).unwrap();
-    let bumped = raw.replace("\"version\": 2", "\"version\": 3");
+    let bumped = raw.replace("\"version\": 3", "\"version\": 4");
     assert_ne!(raw, bumped, "the fixture must carry a version to bump");
     std::fs::write(&plan, bumped).unwrap();
 
     let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("version 3"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("version 4"), "{}", stderr(&o));
     assert!(
         !stdout(&o).contains("pbps apply"),
         "a plan this build cannot read must not come with an approval command: {}",
@@ -4926,4 +5047,489 @@ fn a_connected_plan_refuses_reference_data_it_cannot_observe() {
     assert!(err.contains("ADR-0004"), "{err}");
     // Refused for the right reason, not because the bogus server was tried.
     assert!(!err.contains("cannot connect"), "{err}");
+}
+
+// ---- SPEC safety invariant repairs ----
+
+/// Recording a baseline or snapshot changes the authoritative state every
+/// later plan compares against, so it must respect the deployment lock just as
+/// apply does. Otherwise a snapshot can bless the half-built schema between two
+/// staged statements.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn snapshot_and_baseline_refuse_a_held_deployment_lock() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("record-lock");
+    d.table("table: dbo.pbps_record_lock\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        pbps_mssql::state::lock(&mut conn, "another-deployment")
+            .await
+            .unwrap();
+    });
+
+    for args in [
+        vec!["snapshot", "--db", &connection, "--force"],
+        vec!["baseline", "--db", &connection, "--reason", "test"],
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{}", stderr(&o));
+        assert!(stderr(&o).contains("another-deployment"), "{}", stderr(&o));
+    }
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        pbps_mssql::state::unlock(&mut conn).await.unwrap();
+        conn.execute("DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;")
+            .await
+            .unwrap();
+    });
+}
+
+/// A failed preflight is still a deployment attempt: it leaves the schema
+/// unchanged, appends a failed ledger row, and sends the same typed hook shape
+/// as success with `outcome: failure`.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("failed-audit");
+    let hook_out = d.dir.join("apply-hook.json");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nhooks:\n  on_apply: \"cat > {}\"\n",
+            hook_out.display()
+        ),
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_failed_audit\ncolumns:\n  id: {type: bigint, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;")
+            .await;
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;")
+            .await;
+        conn.execute(
+            "IF OBJECT_ID(N'dbo.pbps_failed_audit', N'U') IS NOT NULL DROP TABLE dbo.pbps_failed_audit; \
+             CREATE TABLE dbo.pbps_failed_audit (id bigint NOT NULL); \
+             INSERT INTO dbo.pbps_failed_audit (id) VALUES (1);",
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    d.table(
+        "table: dbo.pbps_failed_audit\ncolumns:\n  id: {type: bigint, nullable: false}\n  required: {type: int, nullable: false}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("failed.json");
+    let made = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&made), 0, "{}", stderr(&made));
+    let checksum = plan_checksum(&plan);
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "not-null",
+    ]);
+    assert_eq!(code(&applied), 1, "{}", stdout(&applied));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
+        assert_eq!(latest.snapshot.plan_checksum.as_deref(), Some(checksum.as_str()));
+        assert!(latest
+            .snapshot
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("data will not accept")));
+        let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
+        assert!(!pulled.schema.tables[&"dbo.pbps_failed_audit".parse().unwrap()]
+            .columns
+            .contains_key("required"));
+        conn.execute(
+            "DROP TABLE dbo.pbps_failed_audit; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+
+    let hook: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_out).unwrap()).unwrap();
+    assert_eq!(hook["outcome"], "failure", "{hook}");
+    assert_eq!(hook["checksum"], checksum, "{hook}");
+    assert_eq!(hook["plan_path"], plan.display().to_string(), "{hook}");
+    assert!(hook.get("ledger_entry").is_none(), "{hook}");
+}
+
+/// SQL Server DDL is transactional, but that guarantee is lost if COMMIT comes
+/// before read-back or the success-ledger insert. Force the latter to fail and
+/// prove the column addition is rolled back with it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("atomic-ledger");
+    d.table("table: dbo.pbps_atomic_ledger\ncolumns:\n  id: {type: bigint, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.pbps_deny_state', N'TR') IS NOT NULL DROP TRIGGER dbo.pbps_deny_state;")
+            .await;
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;")
+            .await;
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;")
+            .await;
+        conn.execute(
+            "IF OBJECT_ID(N'dbo.pbps_atomic_ledger', N'U') IS NOT NULL DROP TABLE dbo.pbps_atomic_ledger; \
+             CREATE TABLE dbo.pbps_atomic_ledger (id bigint NOT NULL);",
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    d.table(
+        "table: dbo.pbps_atomic_ledger\ncolumns:\n  id: {type: bigint, nullable: false}\n  note: {type: nvarchar(50)}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("atomic.json");
+    assert_eq!(
+        code(&d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()])),
+        0
+    );
+    let checksum = plan_checksum(&plan);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER dbo.pbps_deny_state ON dbo.__pbps_state INSTEAD OF INSERT AS \
+             BEGIN THROW 51000, 'ledger insert denied by test', 1; END;",
+        )
+        .await
+        .unwrap();
+    });
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&applied), 1, "{}", stdout(&applied));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("DROP TRIGGER dbo.pbps_deny_state;").await.unwrap();
+        let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
+        assert!(!pulled.schema.tables[&"dbo.pbps_atomic_ledger".parse().unwrap()]
+            .columns
+            .contains_key("note"));
+        let latest = pbps_mssql::state::latest(&mut conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Baseline);
+        conn.execute(
+            "DROP TABLE dbo.pbps_atomic_ledger; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// Unsupported catalog facts inside a managed table are drift, even when the
+/// expressible subset still has the same checksum.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("computed-drift");
+    let env = format!("PBPS_COMPUTED_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nunmanaged: ignore\nenvironments:\n  test:\n    url_env: {env}\n"),
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_computed_drift\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;")
+            .await;
+        let _ = conn
+            .execute("IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;")
+            .await;
+        conn.execute(
+            "IF OBJECT_ID(N'dbo.pbps_computed_drift', N'U') IS NOT NULL DROP TABLE dbo.pbps_computed_drift; \
+             CREATE TABLE dbo.pbps_computed_drift (id int NOT NULL);",
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("ALTER TABLE dbo.pbps_computed_drift ADD twice AS (id * 2);")
+            .await
+            .unwrap();
+    });
+
+    let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(code(&verify), FINDING, "{report}");
+    assert!(
+        report["data"]["unexpressible"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|s| s.contains("computed"))))
+    );
+
+    let status = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&env, &connection)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(report["data"][0]["state"], "drift", "{report}");
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE dbo.pbps_computed_drift; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// A module's `depends_on` annotation disappears with its declaration. Carrying
+/// it in the snapshot is what lets a later connected plan still drop the
+/// dependent before the dependency.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn connected_planning_keeps_dependencies_for_deleted_modules() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("deleted-module-deps");
+    d.module(
+        "dbo.pbps_dep_base.yml",
+        "view: dbo.pbps_dep_base\ndefinition: |-\n  SELECT 1 AS id\n",
+    );
+    d.module(
+        "dbo.pbps_dep_leaf.yml",
+        "view: dbo.pbps_dep_leaf\ndepends_on: [dbo.pbps_dep_base]\ndefinition: |-\n  SELECT 1 AS id\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_dep_leaf', N'V') IS NOT NULL DROP VIEW dbo.pbps_dep_leaf;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_dep_base', N'V') IS NOT NULL DROP VIEW dbo.pbps_dep_base;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+    });
+    let boot = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&boot), 0, "{}", stderr(&boot));
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let state = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(state.snapshot.module_deps.len(), 1);
+    });
+
+    std::fs::remove_file(d.dir.join("schema/dbo.pbps_dep_leaf.yml")).unwrap();
+    std::fs::remove_file(d.dir.join("schema/dbo.pbps_dep_base.yml")).unwrap();
+    let plan_path = d.dir.join("drop-modules.json");
+    let planned = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    let plan: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+    let dropped: Vec<String> = plan
+        .changes
+        .changes
+        .iter()
+        .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .collect();
+    assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "DROP VIEW dbo.pbps_dep_leaf; DROP VIEW dbo.pbps_dep_base; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// `status` is a report rather than a gate, but it must still reflect the
+/// configured unmanaged-object policy instead of silently acting as `ignore`.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn status_reports_the_unmanaged_error_policy() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("status-unmanaged");
+    let env = format!("PBPS_UNMANAGED_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nunmanaged: error\nenvironments:\n  test:\n    url_env: {env}\n"),
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_status_managed\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn.execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;").await;
+        let _ = conn.execute("IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;").await;
+        conn.execute(
+            "IF OBJECT_ID(N'dbo.pbps_status_managed', N'U') IS NOT NULL DROP TABLE dbo.pbps_status_managed; \
+             IF OBJECT_ID(N'dbo.pbps_status_unmanaged', N'U') IS NOT NULL DROP TABLE dbo.pbps_status_unmanaged; \
+             CREATE TABLE dbo.pbps_status_managed (id int NOT NULL);",
+        )
+        .await
+        .unwrap();
+    });
+    // Adopt before introducing the object that violates the policy.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nunmanaged: ignore\nenvironments:\n  test:\n    url_env: {env}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nunmanaged: error\nenvironments:\n  test:\n    url_env: {env}\n"),
+    )
+    .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("CREATE TABLE dbo.pbps_status_unmanaged (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+
+    let status = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&env, &connection)
+        .output()
+        .unwrap();
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(report["data"][0]["state"], "policy", "{report}");
+    assert!(report["findings"].as_array().is_some_and(|findings| {
+        findings
+            .iter()
+            .any(|f| f["id"] == "state.unmanaged-refused")
+    }));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE dbo.pbps_status_unmanaged; DROP TABLE dbo.pbps_status_managed; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
 }

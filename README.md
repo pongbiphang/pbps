@@ -32,8 +32,8 @@ groups of commands:
 |---|---|
 | `pull` | Reverse-generate declarations from an existing database |
 | `plan --db` / `--env` (`--staged`) | The applyable plan for one environment |
-| `apply --plan --allow` | Run an approved plan, in one transaction |
-| `apply --staged` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
+| `apply --plan --checksum --allow` | Run the checksum-pinned approved plan, in one transaction |
+| `apply --staged --checksum` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
 | `verify` (`--format json`) | The drift check; exits 2 on drift |
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |

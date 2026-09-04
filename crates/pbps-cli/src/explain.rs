@@ -150,6 +150,13 @@ pub fn cmd_explain(
         path,
         dialect_of(&plan),
     )?;
+    output::or_unanswerable_at(
+        "explain",
+        json,
+        "plan.inconsistent",
+        path,
+        crate::validate_saved_plan(&plan, dialect.as_ref()),
+    )?;
 
     // The third failure the envelope has to survive, and the least obvious: a
     // plan that reads and deserializes fine can still carry a typed change the
@@ -275,14 +282,15 @@ fn explain(
         // redacted label, which is not a connection string and must never be
         // printed as if it were, so that case gets the placeholder too.
         let mut approve = format!(
-            "pbps apply --env {} --plan {}",
+            "pbps apply --env {} --plan {} --checksum {}",
             // The placeholder is generated, not user input, and must stay
             // visibly a placeholder rather than become a quoted string.
             match env {
                 Some(name) => shell_arg(name).unwrap_or_else(|| ENV_PLACEHOLDER.to_owned()),
                 None => ENV_PLACEHOLDER.to_owned(),
             },
-            plan_arg
+            plan_arg,
+            plan.checksum()
         );
         if !present.is_empty() {
             approve.push_str(&format!(

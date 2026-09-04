@@ -142,8 +142,8 @@ or data-driven.
   into a serialized form and losing every type guarantee the trait currently
   gives. Worse, it is a stability commitment: once third-party dialect plugins
   exist, `ChangeSet` is a public API that cannot be refactored — and the model
-  is still moving, having just taken the plan format to 2 and the state format
-  to 3. Note this does **not** collide with §14.3's plugin-engine guardrail:
+  is still moving, having since taken the plan format to 3 and the state format
+  to 4. Note this does **not** collide with §14.3's plugin-engine guardrail:
   an emitter runs *before* a plan exists, so the checksum still describes what
   runs. The objection is supply chain — the SQL in your plan would come from
   third-party code — and premature API freeze.

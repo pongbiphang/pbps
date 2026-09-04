@@ -31,7 +31,8 @@ pub struct EnvStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// `ok`, `staged`, `drift`, `uninitialized`, `unreachable` or `unconfigured`.
+    /// `ok`, `warning`, `policy`, `failed`, `staged`, `drift`, `uninitialized`,
+    /// `unreachable` or `unconfigured`.
     pub state: &'static str,
 
     /// What went wrong, when something did. Never a connection string.
@@ -142,7 +143,12 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let mut row = rt.block_on(one(&connection, name, &checked_at));
+        let mut row = rt.block_on(one(
+            &connection,
+            name,
+            &checked_at,
+            project.config.unmanaged,
+        ));
         row.description = environment.description.clone();
         rows.push(row);
     }
@@ -180,7 +186,12 @@ async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
     }
 }
 
-async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
+async fn one(
+    connection: &str,
+    name: &str,
+    checked_at: &str,
+    unmanaged: pbps_config::Unmanaged,
+) -> EnvStatus {
     let mut conn = match Conn::connect(connection).await {
         Ok(c) => c,
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
@@ -247,6 +258,14 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         checked_at: checked_at.to_owned(),
     };
 
+    if entry.snapshot.kind == pbps_model::StateKind::Failed {
+        row.state = "failed";
+        row.detail = Some(match &entry.snapshot.reason {
+            Some(reason) => format!("the last deployment attempt failed: {reason}"),
+            None => "the last deployment attempt failed".to_owned(),
+        });
+    }
+
     // An environment sitting on a staged checkpoint is mid-deployment, and that
     // is the first thing an operator needs to know about it: `plan --db` and
     // `apply` both refuse until it is finished, so a screen that read "ok"
@@ -259,13 +278,24 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
         // metacharacter, something that runs. These `detail` strings advertise
         // commands exactly as the remedies do, and were the one place that
         // bypassed the helper.
-        row.detail = Some(format!(
+        let failure = row.detail.take();
+        let mut detail = format!(
             "a staged apply stopped after {} of {} statement(s); continue it with \
-             `pbps apply --staged --resume --env {} --plan ...`",
+             `pbps apply --staged --resume --env {} --plan ... --checksum {}`",
             progress.completed,
             progress.total,
-            crate::report::env_arg(name)
-        ));
+            crate::report::env_arg(name),
+            entry
+                .snapshot
+                .plan_checksum
+                .as_deref()
+                .unwrap_or("<approved-checksum>")
+        );
+        if let Some(failure) = failure {
+            detail.push_str(" — ");
+            detail.push_str(&failure);
+        }
+        row.detail = Some(detail);
     }
 
     // The drift verdict is the checksum, computed exactly as `verify` computes
@@ -290,7 +320,71 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     if live != recorded {
         record_drift(&mut row, entry.id, name);
     }
+
+    let managed_tables: std::collections::BTreeSet<_> = recorded_ids.tables.values().collect();
+    let limitations: Vec<&str> = pulled
+        .limitations
+        .iter()
+        .filter(|limitation| managed_tables.contains(&limitation.table))
+        .map(|limitation| limitation.detail.as_str())
+        .collect();
+    if !limitations.is_empty() {
+        record_status_issue(
+            &mut row,
+            "drift",
+            format!(
+                "{} fact(s) inside the managed set could not be compared: {}",
+                limitations.len(),
+                limitations.join(", ")
+            ),
+        );
+    }
+
+    if unmanaged != pbps_config::Unmanaged::Ignore
+        && (!scoped.unmanaged.is_empty() || !scoped.unmanaged_modules.is_empty())
+    {
+        let names: Vec<String> = scoped
+            .unmanaged
+            .iter()
+            .chain(&scoped.unmanaged_modules)
+            .map(ToString::to_string)
+            .collect();
+        record_status_issue(
+            &mut row,
+            if unmanaged == pbps_config::Unmanaged::Error {
+                "policy"
+            } else {
+                "warning"
+            },
+            format!(
+                "`unmanaged: {}` sees {} object(s) outside the managed set: {}",
+                if unmanaged == pbps_config::Unmanaged::Error {
+                    "error"
+                } else {
+                    "warn"
+                },
+                names.len(),
+                names.join(", ")
+            ),
+        );
+    }
     row
+}
+
+/// Adds an independently discovered state issue without hiding a staged apply
+/// or another, more important verdict already on the row.
+fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String) {
+    if row.state == "ok" {
+        row.state = state;
+        row.detail = Some(detail);
+        return;
+    }
+    let previous = row.detail.take().unwrap_or_default();
+    row.detail = Some(if previous.is_empty() {
+        detail
+    } else {
+        format!("{previous} — {detail}")
+    });
 }
 
 /// Notes a checksum mismatch on a row, without ever displacing `staged`.
@@ -308,6 +402,17 @@ fn record_drift(row: &mut EnvStatus, entry_id: i64, name: &str) {
             "{so_far} — and it has moved since that checkpoint, which \
              `pbps verify --env {arg}` will show"
         ));
+        return;
+    }
+    if row.state != "ok" {
+        let arg = crate::report::env_arg(name);
+        record_status_issue(
+            row,
+            "drift",
+            format!(
+                "the database no longer matches entry #{entry_id}; run `pbps verify --env {arg}`"
+            ),
+        );
         return;
     }
     row.state = "drift";
@@ -387,6 +492,9 @@ fn findings(rows: &[EnvStatus]) -> Vec<output::Finding> {
             let mut f = output::Finding::warning(
                 match r.state {
                     "drift" => "state.drift",
+                    "policy" => "state.unmanaged-refused",
+                    "warning" => "state.unmanaged",
+                    "failed" => "state.failed",
                     "staged" => "state.mid-deployment",
                     "uninitialized" => "state.uninitialized",
                     "unreachable" => "environment.unreachable",
@@ -403,8 +511,9 @@ fn findings(rows: &[EnvStatus]) -> Vec<output::Finding> {
                 // environments at once — a remedy without the name leaves the
                 // reader to work out which of the six it meant.
                 f = f.remedy(format!(
-                    "pbps apply --env {} --plan <plan.json> --staged --resume",
-                    crate::report::env_arg(&r.environment)
+                    "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
+                     --staged --resume",
+                    crate::report::env_arg(&r.environment),
                 ));
             }
             f
@@ -470,7 +579,7 @@ mod tests {
         r.detail = Some("a staged apply stopped after 2 of 5 statement(s)".into());
         record_drift(&mut r, 7, "prod");
         assert_eq!(r.state, "staged");
-        let detail = r.detail.unwrap();
+        let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("2 of 5"), "{detail}");
         assert!(detail.contains("moved since that checkpoint"), "{detail}");
     }
@@ -481,6 +590,18 @@ mod tests {
         record_drift(&mut r, 7, "prod");
         assert_eq!(r.state, "drift");
         assert!(r.detail.unwrap().contains("entry #7"));
+    }
+
+    #[test]
+    fn a_failed_attempt_stays_visible_when_the_database_also_drifted() {
+        let mut r = row("prod", "failed");
+        r.detail = Some("the last deployment attempt failed: denied".into());
+        record_drift(&mut r, 7, "prod");
+        assert_eq!(r.state, "failed");
+        let detail = r.detail.as_deref().unwrap();
+        assert!(detail.contains("attempt failed"), "{detail}");
+        assert!(detail.contains("no longer matches"), "{detail}");
+        assert_eq!(findings(&[r]).first().unwrap().id, "state.failed");
     }
 
     #[test]

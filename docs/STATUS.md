@@ -23,7 +23,7 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 takes `--format human|json`; `--no-input` is global.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
-`plan --db` (`--staged`), `apply` (`--plan` / `--allow` / `--staged` /
+`plan --db` (`--staged`), `apply` (`--plan` / `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
 `status` (`--format json`).
@@ -58,17 +58,6 @@ The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
 
 ## Open items
-
-### Supply chain — live, not filed away
-
-(SPEC open question 10.) `tiberius` has had no release since 2024-07 and pins `rustls 0.21`, whose
-`rustls-webpki 0.101.7` carries three vulnerabilities — two of them certificate
-validation — that no `cargo update` can reach, because every fix needs
-`rustls 0.22+`. `deny.toml` holds them as documented exceptions naming the fix.
-The fix is the driver: `tiberius-ng` keeps the library name, so the change is
-one dependency line, and on 2026-09-01 it passed all fourteen live tests against
-SQL Server 2025. **What is left is a decision, not an unknown** — do not treat
-the exceptions as settled, and delete all four when the driver moves.
 
 ### No universal connection layer
 

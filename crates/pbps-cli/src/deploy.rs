@@ -32,6 +32,9 @@ use crate::db::{self, Target};
 /// by name and outside the scoped schema in fact.
 pub struct Managed {
     pub scoped: pbps_diff::Scoped,
+    /// Catalog facts attached to managed tables that the model cannot express.
+    /// They are drift findings, never ignorable warnings.
+    pub limitations: Vec<String>,
     /// Every module in the database that introspection cannot express, by name,
     /// with the reason already rendered.
     ///
@@ -49,9 +52,16 @@ async fn managed_state(
     modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    Ok(managed_state_full(conn, ids, modules, unmanaged)
-        .await?
-        .scoped)
+    let managed = managed_state_full(conn, ids, modules, unmanaged).await?;
+    if !managed.limitations.is_empty() {
+        bail!(
+            "{} fact(s) inside the managed set cannot be represented:\n  {}\n\
+             Refusing to compare or record a partial schema.",
+            managed.limitations.len(),
+            managed.limitations.join("\n  ")
+        );
+    }
+    Ok(managed.scoped)
 }
 
 /// Introspects, cuts the result down to the managed set, and reports whatever
@@ -91,20 +101,19 @@ async fn managed_state_full(
     }
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
+    let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
+    let limitations = pulled
+        .limitations
+        .iter()
+        .filter(|limitation| managed_tables.contains(&limitation.table))
+        .map(|limitation| limitation.detail.clone())
+        .collect();
     report_unmanaged(&scoped, unmanaged)?;
-    Ok(Managed { scoped, unreadable })
-}
-
-/// The modules the declarations name, for the commands that record a state.
-///
-/// `snapshot` and `baseline` write down what the environment is; a module the
-/// declarations manage has to be in that record, or the next `verify` would not
-/// be watching it. The ids file is already required by both, so requiring the
-/// declarations to parse as well changes nothing about when they can run.
-fn declared_modules(
-    project: &Project,
-) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ObjectName>> {
-    Ok(managed_modules(None, Some(&crate::load(project)?.schema)))
+    Ok(Managed {
+        scoped,
+        limitations,
+        unreadable,
+    })
 }
 
 /// The modules a plan leaves the environment holding.
@@ -130,6 +139,50 @@ fn modules_after(
         }
     }
     set
+}
+
+/// The dependency annotations that describe an intermediate staged state.
+///
+/// `plan.module_deps` is the complete post-plan annotation set, including the
+/// meaningful absence of an edge that was removed. It is therefore right for
+/// every module that survives the plan. A module scheduled for deletion may
+/// still exist at an early checkpoint, though, and its declaration has already
+/// disappeared; until its DROP runs, preserve the dependency information from
+/// the recorded state. Edges to modules no longer present at this checkpoint
+/// are discarded so the snapshot never claims an impossible dependency.
+fn dependency_hints_for_schema(
+    recorded: &pbps_model::StateSnapshot,
+    plan: &pbps_model::SavedPlan,
+    schema: &Schema,
+) -> pbps_model::ModuleDeps {
+    let dropped: std::collections::BTreeSet<_> = plan
+        .changes
+        .changes
+        .iter()
+        .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|planned| planned.change.module_name())
+        .collect();
+    let present: std::collections::BTreeSet<_> = schema.modules.keys().collect();
+    let mut dependencies = pbps_model::ModuleDeps::new();
+
+    for name in schema.modules.keys() {
+        let source = if dropped.contains(name) {
+            recorded.module_deps.get(name)
+        } else {
+            plan.module_deps.get(name)
+        };
+        let Some(source) = source else {
+            continue;
+        };
+        let filtered = source
+            .iter()
+            .filter(|dependency| present.contains(*dependency))
+            .cloned()
+            .collect();
+        dependencies.insert(name.clone(), filtered);
+    }
+    dependencies.retain(|_, required| !required.is_empty());
+    dependencies
 }
 
 /// The modules a command is answerable for.
@@ -249,13 +302,14 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
         let recorded_ids = baseline.snapshot.ids.clone();
         let recorded_modules = managed_modules(Some(&baseline.snapshot), None);
-        let scoped = managed_state(
+        let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
             &recorded_modules,
-            project.config.unmanaged,
+            pbps_config::Unmanaged::Ignore,
         )
         .await?;
+        let scoped = managed.scoped;
 
         // The live side is identified by what is actually there, not by the
         // recorded mapping. Comparing two sides that share one identity file
@@ -292,7 +346,26 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // early, which skipped the hook: right verdict, and the alert that
         // exists to carry that verdict never fired.
         let changes = diffed.changes;
-        let unexpressible: Vec<String> = diffed.errors.iter().map(ToString::to_string).collect();
+        let mut unexpressible: Vec<String> =
+            diffed.errors.iter().map(ToString::to_string).collect();
+        unexpressible.extend(managed.limitations);
+        if project.config.unmanaged == pbps_config::Unmanaged::Error
+            && (!scoped.unmanaged.is_empty() || !scoped.unmanaged_modules.is_empty())
+        {
+            let names: Vec<String> = scoped
+                .unmanaged
+                .iter()
+                .chain(&scoped.unmanaged_modules)
+                .map(ToString::to_string)
+                .collect();
+            unexpressible.push(format!(
+                "`unmanaged: error` rejects {} object(s) outside the managed set: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        } else if project.config.unmanaged == pbps_config::Unmanaged::Warn {
+            report_unmanaged(&scoped, pbps_config::Unmanaged::Warn)?;
+        }
 
         Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
@@ -420,52 +493,63 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
-    let declared_modules = declared_modules(project)?;
-    let operator = crate::operator();
+    let loaded = crate::load(project)?;
+    let declared_modules = managed_modules(None, Some(&loaded.schema));
+    let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let scoped =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        report_missing(&scoped);
+        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        let result = async {
+            let scoped =
+                managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+            report_missing(&scoped);
 
-        // Comparing against the recorded state is the whole guard. A snapshot
-        // that overwrites a state it differs from is exactly "somebody SSHed in
-        // and changed the schema" being quietly adopted by a pipeline.
-        match pbps_mssql::state::latest(&mut conn).await {
-            Ok(Some(previous)) if !previous.snapshot.matches(&scoped.schema) && !force => {
-                bail!(
-                    "`{}` differs from the state recorded at {} (entry #{}).\n\
-                     `pbps verify` shows what changed. Then either put the database back and \
-                     re-run, or accept it with `pbps baseline --reason ...`.\n\
-                     `--force` records it anyway.",
-                    target.label,
-                    previous.applied_at,
-                    previous.id
-                );
+            // Comparing against the recorded state is the whole guard. A snapshot
+            // that overwrites a state it differs from is exactly "somebody SSHed in
+            // and changed the schema" being quietly adopted by a pipeline.
+            match pbps_mssql::state::latest(&mut conn).await {
+                Ok(Some(previous)) if !previous.snapshot.matches(&scoped.schema) && !force => {
+                    bail!(
+                        "`{}` differs from the state recorded at {} (entry #{}).\n\
+                         `pbps verify` shows what changed. Then either put the database back and \
+                         re-run, or accept it with `pbps baseline --reason ...`.\n\
+                         `--force` records it anyway.",
+                        target.label,
+                        previous.applied_at,
+                        previous.id
+                    );
+                }
+                Ok(Some(_)) => {}
+                // Taking the lock initializes the tables, so a first snapshot
+                // is now represented by an empty ledger rather than
+                // `NotInitialized`. It remains an adoption decision.
+                Ok(None) if !force => bail!(
+                    "pbps has never recorded a state for `{}`.\n\
+                     Adopt it deliberately with `pbps baseline --reason ...`, or `--force` to \
+                     record it as it stands.",
+                    target.label
+                ),
+                Ok(None) => {}
+                Err(e) => return Err(e.into()),
             }
-            Ok(_) => {}
-            // A database with no ledger is being recorded for the first time,
-            // which is a decision, not a refresh.
-            Err(pbps_db::LedgerError::NotInitialized) if !force => bail!(
-                "pbps has never recorded a state for `{}`.\n\
-                 Adopt it deliberately with `pbps baseline --reason ...`, or `--force` to \
-                 record it as it stands.",
-                target.label
-            ),
-            Err(pbps_db::LedgerError::NotInitialized) => {}
-            Err(e) => return Err(e.into()),
-        }
 
-        let snapshot = with_provenance(
-            project.root(),
-            StateSnapshot::new(StateKind::Apply, scoped.schema, ids.clone(), &operator),
-        );
-        let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            let mut snapshot = with_provenance(
+                project.root(),
+                StateSnapshot::new(StateKind::Apply, scoped.schema, ids.clone(), &operator),
+            );
+            snapshot.module_deps = loaded.hints.module_deps.clone();
+            let tables = snapshot.schema.tables.len();
+            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            Ok::<_, anyhow::Error>((id, tables))
+        }
+        .await;
+        let released = pbps_mssql::state::unlock(&mut conn).await;
+        let (id, tables) = result?;
+        released?;
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
-            target.label,
-            snapshot.schema.tables.len()
+            target.label, tables
         );
         Ok(())
     })
@@ -475,26 +559,36 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
-    let declared_modules = declared_modules(project)?;
-    let operator = crate::operator();
+    let loaded = crate::load(project)?;
+    let declared_modules = managed_modules(None, Some(&loaded.schema));
+    let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let scoped =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        report_missing(&scoped);
+        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        let result = async {
+            let scoped =
+                managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+            report_missing(&scoped);
 
-        let mut snapshot = with_provenance(
-            project.root(),
-            StateSnapshot::new(StateKind::Baseline, scoped.schema, ids.clone(), &operator),
-        );
-        snapshot.reason = Some(reason.to_owned());
+            let mut snapshot = with_provenance(
+                project.root(),
+                StateSnapshot::new(StateKind::Baseline, scoped.schema, ids.clone(), &operator),
+            );
+            snapshot.module_deps = loaded.hints.module_deps.clone();
+            snapshot.reason = Some(reason.to_owned());
 
-        let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            let tables = snapshot.schema.tables.len();
+            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            Ok::<_, anyhow::Error>((id, tables))
+        }
+        .await;
+        let released = pbps_mssql::state::unlock(&mut conn).await;
+        let (id, tables) = result?;
+        released?;
         println!(
             "Baselined `{}` as entry #{id}: {} table(s) are now the starting point.",
-            target.label,
-            snapshot.schema.tables.len()
+            target.label, tables
         );
         println!("Reason recorded: {reason}");
         Ok(())
@@ -569,79 +663,90 @@ pub fn cmd_bootstrap(
 
     db::require_mssql(project, "bootstrap")?;
     let statements = crate::statements(&cs, dialect.as_ref())?;
-    let operator = crate::operator();
+    let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-
-        // Bootstrap means "into an empty database". Running it over an existing
-        // managed set would fail halfway through on the first CREATE of a table
-        // that is already there, leaving a partly built schema and a ledger that
-        // never mentioned it.
-        let existing =
-            managed_state_full(&mut conn, &ids, &declared_modules, project.config.unmanaged)
-                .await?;
-        // Modules count as much as tables here. `CREATE OR ALTER` would not fail
-        // on a view that is already there — it would quietly replace it, with no
-        // plan, no risk classification and no approval, which is the opposite of
-        // what "builds into an empty database" promises.
-        // The unreadable ones count too. A declared view that is already there
-        // with SCHEMABINDING, or a procedure created WITH ENCRYPTION, never
-        // reaches the scoped schema — introspection cannot express it — so
-        // without this the target reads as empty and `CREATE OR ALTER` replaces
-        // the object that is standing there.
-        let unreadable_declared: Vec<&str> = existing
-            .unreadable
-            .iter()
-            .filter(|(n, _)| declared_modules.contains(n))
-            .map(|(_, why)| why.as_str())
-            .collect();
-        if !existing.scoped.schema.tables.is_empty()
-            || !existing.scoped.schema.modules.is_empty()
-            || !unreadable_declared.is_empty()
-        {
-            let names: Vec<String> = existing
-                .scoped
-                .schema
-                .tables
-                .keys()
-                .map(ToString::to_string)
-                .chain(
-                    existing
-                        .scoped
-                        .schema
-                        .modules
-                        .keys()
-                        .map(ToString::to_string),
-                )
-                .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
-                .collect();
-            bail!(
-                "`{}` already has {} of the declared object(s): {}.\n\
-                 Bootstrap builds into an empty database; use `pbps plan --db` and `pbps apply` \
-                 to migrate it instead.",
-                target.label,
-                names.len(),
-                names.join(", ")
-            );
-        }
-
         pbps_mssql::state::lock(&mut conn, &operator).await?;
-        let result = run_in_transaction(&mut conn, &statements).await;
-        let unlocked = pbps_mssql::state::unlock(&mut conn).await;
-        result?;
-        unlocked?;
+        let mut transaction_attempted = false;
+        let result = async {
+            // The empty-target check is protected by the same lock as the
+            // build. Checking before it would let two bootstraps both observe
+            // emptiness, then let the second continue after the first had
+            // committed and released the lock.
+            let existing =
+                managed_state_full(&mut conn, &ids, &declared_modules, project.config.unmanaged)
+                    .await?;
 
-        // The state recorded is what the engine actually built, read back — not
-        // what was declared. Expressions come back in the engine's stored form,
-        // and only that form compares equal on the next drift check (SPEC §8.2).
-        let built =
-            managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
-        let snapshot = with_provenance(
-            project.root(),
-            StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
-        );
-        let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            // Bootstrap means "into an empty database". Running it over an
+            // existing managed set would fail halfway through on the first
+            // CREATE and leave a partly built schema unless the transaction
+            // catches it. Modules count too: `CREATE OR ALTER` would otherwise
+            // replace one without a plan or approval.
+            let unreadable_declared: Vec<&str> = existing
+                .unreadable
+                .iter()
+                .filter(|(n, _)| declared_modules.contains(n))
+                .map(|(_, why)| why.as_str())
+                .collect();
+            if !existing.scoped.schema.tables.is_empty()
+                || !existing.scoped.schema.modules.is_empty()
+                || !unreadable_declared.is_empty()
+            {
+                let names: Vec<String> = existing
+                    .scoped
+                    .schema
+                    .tables
+                    .keys()
+                    .map(ToString::to_string)
+                    .chain(
+                        existing
+                            .scoped
+                            .schema
+                            .modules
+                            .keys()
+                            .map(ToString::to_string),
+                    )
+                    .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
+                    .collect();
+                bail!(
+                    "`{}` already has {} of the declared object(s): {}.\n\
+                     Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
+                     apply` to migrate it instead.",
+                    target.label,
+                    names.len(),
+                    names.join(", ")
+                );
+            }
+
+            transaction_attempted = true;
+            execute_transaction_body(&mut conn, &statements).await?;
+
+            // Read-back and the success ledger row are part of the same
+            // transaction as the DDL. If either fails, the database is still
+            // empty and bootstrap can be retried honestly.
+            let built =
+                managed_state(&mut conn, &ids, &declared_modules, project.config.unmanaged).await?;
+            let mut snapshot = with_provenance(
+                project.root(),
+                StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
+            );
+            snapshot.module_deps = loaded.hints.module_deps.clone();
+            let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            Ok::<_, anyhow::Error>((id, snapshot))
+        }
+        .await;
+        let result = if transaction_attempted {
+            finish_transaction(&mut conn, result).await
+        } else {
+            result
+        };
+        if transaction_attempted && let Err(error) = &result {
+            record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
+        }
+        let unlocked = pbps_mssql::state::unlock(&mut conn).await;
+        let (id, snapshot) = result?;
+        unlocked?;
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
             target.label,
@@ -649,6 +754,32 @@ pub fn cmd_bootstrap(
         );
         Ok(())
     })
+}
+
+/// Best-effort audit row for a bootstrap whose transactional work was rolled
+/// back. The empty state was established before the lock was taken, so it is
+/// the last trustworthy state to carry forward; the declared identity mapping
+/// has not become an environment mapping until the build succeeds.
+async fn record_failed_bootstrap(
+    conn: &mut Conn,
+    root: &std::path::Path,
+    operator: &str,
+    error: &anyhow::Error,
+) {
+    let mut failed = StateSnapshot::new(
+        StateKind::Failed,
+        Schema::default(),
+        IdsFile::default(),
+        operator,
+    );
+    failed.git_sha = db::git_sha(root);
+    failed.reason = Some(error.to_string().chars().take(1000).collect());
+    match pbps_mssql::state::record(conn, &failed).await {
+        Ok(id) => eprintln!("Bootstrap failure recorded as ledger entry #{id}."),
+        Err(audit_error) => eprintln!(
+            "warning: the failed bootstrap could not be added to the ledger: {audit_error}"
+        ),
+    }
 }
 
 /// `pbps state prune` — drop old snapshots.
@@ -744,14 +875,18 @@ pub fn cmd_plan_db(
     let dialect = crate::dialect(project)?;
     let created_at = crate::now();
 
-    let resolved =
-        match pbps_diff::resolve(&loaded.schema, &ids, &loaded.intents, &crate::context()) {
-            Ok(r) => r,
-            Err(blockers) => {
-                eprintln!("{}", crate::report::blockers(&blockers));
-                bail!("some changes could not be decided automatically");
-            }
-        };
+    let resolved = match pbps_diff::resolve(
+        &loaded.schema,
+        &ids,
+        &loaded.intents,
+        &crate::context(project.root()),
+    ) {
+        Ok(r) => r,
+        Err(blockers) => {
+            eprintln!("{}", crate::report::blockers(&blockers));
+            bail!("some changes could not be decided automatically");
+        }
+    };
     if resolved.ids != ids {
         bail!(
             "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
@@ -838,6 +973,16 @@ pub fn cmd_plan_db(
             );
         }
 
+        // A removed module no longer has a declaration carrying its
+        // `depends_on:` edge. The newest snapshot keeps those baseline
+        // annotations so connected planning can still drop dependents first.
+        let mut hints = loaded.hints.clone();
+        for (name, dependencies) in &entry.snapshot.module_deps {
+            hints
+                .module_deps
+                .entry(name.clone())
+                .or_insert_with(|| dependencies.clone());
+        }
         let cs = pbps_diff::diff(
             pbps_diff::Side {
                 schema: &scoped.schema,
@@ -848,7 +993,7 @@ pub fn cmd_plan_db(
                 ids: &resolved.ids,
             },
             dialect.as_ref(),
-            &loaded.hints,
+            &hints,
         )
         .map_err(|errs| {
             for e in &errs {
@@ -924,13 +1069,15 @@ pub fn cmd_plan_db(
         cs,
         resolved.ids,
     );
+    plan.module_deps = loaded.hints.module_deps.clone();
     plan.git_sha = db::git_sha(project.root());
     if staged {
         plan = plan.staged();
         println!(
             "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
-             recorded in the ledger as it completes. Apply it with `pbps apply --staged`, and \n\
-             continue an interrupted run with `--staged --resume`.",
+             recorded in the ledger as it completes. Apply it with `pbps apply --staged \n\
+             --checksum <approved-checksum>`, and continue an interrupted run with \n\
+             `--staged --resume`.",
             statements.len()
         );
     }
@@ -962,13 +1109,14 @@ pub fn cmd_apply(
     project: &Project,
     target: &Target,
     plan_path: &std::path::Path,
+    approved_checksum: &str,
     allow: &std::collections::BTreeSet<pbps_model::RiskClass>,
     staged: bool,
     resume: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "apply")?;
     let dialect = crate::dialect(project)?;
-    let operator = crate::operator();
+    let operator = crate::operator(project.root());
 
     let raw = std::fs::read_to_string(plan_path)
         .with_context(|| format!("cannot read `{}`", plan_path.display()))?;
@@ -982,6 +1130,16 @@ pub fn cmd_apply(
             plan_path.display(),
             plan.version,
             pbps_model::plan::CURRENT_VERSION
+        );
+    }
+    if plan_checksum != approved_checksum {
+        bail!(
+            "`{}` no longer matches the artifact approved at the deployment gate.\n\
+             approved checksum: {approved_checksum}\n\
+             plan checksum now: {plan_checksum}\n\
+             Do not approve the new value implicitly: retrieve the reviewed artifact or run \
+             `pbps explain --plan ...` and send it through approval again.",
+            plan_path.display()
         );
     }
     // A preview's baseline is a git revision, so its checksum describes
@@ -1003,6 +1161,7 @@ pub fn cmd_apply(
             dialect.name()
         );
     }
+    crate::validate_saved_plan(&plan, dialect.as_ref())?;
     // The mode lives in the file because that is what the gate approved; the
     // flag exists so that the CI configuration says out loud which kind of
     // deployment this is. A disagreement between them is somebody's mistake,
@@ -1070,7 +1229,7 @@ pub fn cmd_apply(
         operator: &operator,
     };
 
-    let recorded = db::runtime()?.block_on(async {
+    let outcome = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
 
         // The lock comes first, before the checks and not after them: a
@@ -1082,24 +1241,84 @@ pub fn cmd_apply(
         } else {
             apply_under_lock(&mut conn, &deployment).await
         };
+        if let Err(error) = &result {
+            record_failed_apply(&mut conn, &deployment, error).await;
+        }
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
         let released = pbps_mssql::state::unlock(&mut conn).await;
         let recorded = result?;
         released?;
         Ok::<i64, anyhow::Error>(recorded)
-    })?;
+    });
 
-    println!(
-        "Applied {} change(s) to `{}`{}; recorded as entry #{recorded}.",
-        plan.changes.changes.len(),
-        target.label,
-        if staged { " (staged)" } else { "" }
-    );
-    if let Some(hook) = &project.config.hooks.on_apply {
-        crate::hooks::run(hook, &raw, "on_apply");
+    match outcome {
+        Ok(recorded) => {
+            println!(
+                "Applied {} change(s) to `{}`{}; recorded as entry #{recorded}.",
+                plan.changes.changes.len(),
+                target.label,
+                if staged { " (staged)" } else { "" }
+            );
+            if let Some(hook) = &project.config.hooks.on_apply {
+                crate::hooks::run_apply(
+                    hook,
+                    plan_path,
+                    &plan_checksum,
+                    &target.label,
+                    Some(recorded),
+                    None,
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(hook) = &project.config.hooks.on_apply {
+                let message = error.to_string();
+                crate::hooks::run_apply(
+                    hook,
+                    plan_path,
+                    &plan_checksum,
+                    &target.label,
+                    None,
+                    Some(&message),
+                );
+            }
+            Err(error)
+        }
     }
-    Ok(())
+}
+
+/// Best-effort audit row for an apply that did not complete. The schema and ids
+/// come from the newest trustworthy checkpoint; for a transactional apply that
+/// is the unchanged pre-plan state, and for a staged apply it is the last
+/// completed statement. A failure to write the audit must never replace the
+/// original deployment error.
+async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow::Error) {
+    let current = match pbps_mssql::state::latest(conn).await {
+        Ok(Some(entry)) => entry.snapshot,
+        Ok(None) | Err(pbps_db::LedgerError::NotInitialized) => return,
+        Err(audit_error) => {
+            eprintln!("warning: the failed apply could not be added to the ledger: {audit_error}");
+            return;
+        }
+    };
+    let mut failed = current;
+    failed.kind = StateKind::Failed;
+    failed.operator = d.operator.to_owned();
+    failed.git_sha = d
+        .plan
+        .git_sha
+        .clone()
+        .or_else(|| db::git_sha(d.project.root()));
+    failed.plan_checksum = Some(d.plan_checksum.to_owned());
+    failed.reason = Some(error.to_string().chars().take(1000).collect());
+    match pbps_mssql::state::record(conn, &failed).await {
+        Ok(id) => eprintln!("Apply failure recorded as ledger entry #{id}."),
+        Err(audit_error) => {
+            eprintln!("warning: the failed apply could not be added to the ledger: {audit_error}")
+        }
+    }
 }
 
 /// Everything one `apply` carries from its command body into the locked section.
@@ -1177,30 +1396,35 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     preflight(conn, dialect, plan, rename_targets).await?;
 
     println!("Applying {} statement(s)...", statements.len());
-    run_in_transaction(conn, statements).await?;
+    let result = async {
+        execute_transaction_body(conn, statements).await?;
 
-    // What gets recorded is the database read back, not the plan applied to the
-    // old state. Expressions come back in the engine's stored form, and only
-    // that form compares equal on the next drift check (SPEC §8.2).
-    let after = managed_state(
-        conn,
-        &plan.ids,
-        &modules_after(&entry.snapshot, &plan.changes),
-        project.config.unmanaged,
-    )
-    .await?;
-    let mut snapshot = pbps_model::StateSnapshot::new(
-        pbps_model::StateKind::Apply,
-        after.schema,
-        // The plan's mapping, not the baseline's: after a rename the two
-        // disagree, and recording the old one would say the rename never
-        // happened — leaving the next plan to propose it all over again.
-        plan.ids.clone(),
-        operator,
-    );
-    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
-    snapshot.plan_checksum = Some(plan_checksum.to_owned());
-    Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+        // What gets recorded is the database read back, not the plan applied to
+        // the old state. Read-back and ledger insertion both happen before
+        // COMMIT so a failure in either rolls the DDL back as well.
+        let after = managed_state(
+            conn,
+            &plan.ids,
+            &modules_after(&entry.snapshot, &plan.changes),
+            project.config.unmanaged,
+        )
+        .await?;
+        let mut snapshot = pbps_model::StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            after.schema,
+            // The plan's mapping, not the baseline's: after a rename the two
+            // disagree, and recording the old one would say the rename never
+            // happened — leaving the next plan to propose it all over again.
+            plan.ids.clone(),
+            operator,
+        );
+        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
+        snapshot.plan_checksum = Some(plan_checksum.to_owned());
+        Ok::<_, anyhow::Error>(pbps_mssql::state::record(conn, &snapshot).await?)
+    }
+    .await;
+    finish_transaction(conn, result).await
 }
 
 /// A staged apply: one logical change, run statement by statement outside a
@@ -1244,7 +1468,7 @@ async fn apply_staged_under_lock(
 
     let start = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
-            (Some(p), StateKind::Staged) => p.clone(),
+            (Some(p), StateKind::Staged | StateKind::Failed) => p.clone(),
             _ => bail!(
                 "`{}` has no staged apply in progress: its newest entry (#{}) is an ordinary \
                  {} state.\n\
@@ -1396,12 +1620,14 @@ async fn apply_staged_under_lock(
         // neither end. `--resume` reads this mapping back and compares against
         // it, so a hand-made change to that table while the deployment is
         // paused is seen rather than carried silently into the closing entry.
+        let module_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
             after.schema,
             live_ids.clone(),
             operator,
         );
+        checkpoint.module_deps = module_deps;
         checkpoint.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         checkpoint.plan_checksum = Some(plan_checksum.to_owned());
         checkpoint.staged = Some(pbps_model::StagedProgress {
@@ -1429,6 +1655,7 @@ async fn apply_staged_under_lock(
         plan.ids.clone(),
         operator,
     );
+    snapshot.module_deps = plan.module_deps.clone();
     snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
@@ -1648,14 +1875,13 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
 /// The rollback is attempted on every failure path and its own error is
 /// deliberately not allowed to replace the original one — the statement that
 /// broke is what the operator needs to see.
-pub async fn run_in_transaction(
+async fn execute_transaction_body(
     conn: &mut Conn,
     statements: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
     conn.begin().await.context("cannot open a transaction")?;
     for stmt in statements {
         if let Err(e) = conn.execute(&stmt.sql).await {
-            let _ = conn.rollback().await;
             return Err(anyhow::anyhow!(
                 "the database rejected this statement, and the whole plan was rolled back:\n\
                  {}\n\n{e}",
@@ -1663,11 +1889,27 @@ pub async fn run_in_transaction(
             ));
         }
     }
-    if let Err(e) = conn.commit().await {
-        let _ = conn.rollback().await;
-        return Err(anyhow::Error::new(e).context("the transaction could not be committed"));
-    }
     Ok(())
+}
+
+/// Commits only after every post-DDL operation succeeded; otherwise rolls back
+/// while preserving the original error as the useful one.
+async fn finish_transaction<T>(conn: &mut Conn, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => {
+            if let Err(error) = conn.commit().await {
+                let _ = conn.rollback().await;
+                return Err(
+                    anyhow::Error::new(error).context("the transaction could not be committed")
+                );
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 /// Stamps a snapshot with where it came from.

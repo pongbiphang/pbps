@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::change::ChangeSet;
 use crate::ids::IdsFile;
+use crate::module::ModuleDeps;
 use crate::schema::Schema;
 
 /// The current plan-file format version.
@@ -37,7 +38,11 @@ use crate::schema::Schema;
 /// unknown fields, and run a staged plan inside a transaction with the reviewed
 /// online strategy silently dropped. `apply` compares this exactly, so an older
 /// deployment host refuses the artifact instead.
-pub const CURRENT_VERSION: u32 = 2;
+///
+/// Bumped to 3 when the post-plan module dependency annotations joined the
+/// artifact. A connected plan needs the baseline annotations to order drops,
+/// and the state written after apply needs the new ones for the next plan.
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -95,6 +100,7 @@ impl std::fmt::Display for PlanMode {
 
 /// What the plan was computed against.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanBaseline {
     /// Human-readable, for the approver reading the plan at the gate: "prod as
     /// queried", "git HEAD~3".
@@ -107,6 +113,7 @@ pub struct PlanBaseline {
 
 /// A plan as written to disk by `pbps plan --out`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedPlan {
     pub version: u32,
 
@@ -143,6 +150,15 @@ pub struct SavedPlan {
 
     pub changes: ChangeSet,
 
+    /// The explicit module ordering edges after this plan.
+    ///
+    /// These remain annotations rather than schema state: they do not
+    /// participate in drift comparison. They travel with the artifact and the
+    /// ledger so a later connected plan can order drops for modules whose
+    /// declaration file has disappeared.
+    #[serde(default, skip_serializing_if = "ModuleDeps::is_empty")]
+    pub module_deps: ModuleDeps,
+
     /// The identity mapping the environment has **after** this plan.
     ///
     /// Carried so that `apply` needs nothing but the plan file: the state it
@@ -173,6 +189,7 @@ impl SavedPlan {
             git_sha: None,
             baseline,
             changes,
+            module_deps: ModuleDeps::default(),
             ids,
         }
     }
@@ -367,8 +384,28 @@ mod tests {
     #[test]
     fn the_format_version_is_written() {
         let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":2"#), "{json}");
+        assert!(json.contains(r#""version":3"#), "{json}");
         assert!(json.contains(r#""origin":"database""#), "{json}");
+    }
+
+    #[test]
+    fn unknown_plan_fields_are_refused() {
+        let mut json = serde_json::to_value(plan_over(ChangeSet::default())).unwrap();
+        json["approved"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<SavedPlan>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_change_fields_are_refused() {
+        let mut json = serde_json::to_value(plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::DropTable {
+                uid: "t_a1b2c3".parse().unwrap(),
+                name: TableName::new("dbo", "customer"),
+            })],
+        }))
+        .unwrap();
+        json["changes"]["changes"][0]["approved"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<SavedPlan>(json).is_err());
     }
 
     /// The mode is part of the pinned artifact: a plan approved as staged must

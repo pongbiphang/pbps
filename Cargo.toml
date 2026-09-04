@@ -40,7 +40,7 @@ serde      = { version = "1", features = ["derive"] }
 # The driver is pure Rust: no ODBC to install, which matters on air-gapped
 # hosts (SPEC §11.3). tokio is pulled for the driver, not embraced: only
 # pbps-db and the mssql introspection are async, and the CLI block_on's them.
-tiberius   = { version = "0.12", default-features = false, features = ["rustls", "tds73"] }
+tiberius   = { package = "tiberius-ng", version = "0.13", default-features = false, features = ["rustls", "tds73"] }
 # `time` is for the connect timeout: a firewall that drops rather than
 # refuses would otherwise leave a pipeline waiting out the OS retry.
 tokio      = { version = "1", features = ["net", "rt", "time"] }
