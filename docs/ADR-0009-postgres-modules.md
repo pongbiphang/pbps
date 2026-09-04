@@ -308,19 +308,81 @@ loss is named rather than hidden:
 
 - A grant to a **declared** role comes back. Measured behaviour, existing code
   path, and it is the case the tool is for.
-- A grant to an **undeclared** principal does not. It is destroyed silently by
-  the engine, and pbps cannot restore what it does not model. **This must be a
-  refusal, not a warning**: a connected plan that is about to drop and create a
-  module reads the object's ACL first and refuses if it carries a grant the
-  declarations do not hold — the same shape as ADR-0005 note 4's "`plan --db`
-  refuses to plan over a role it cannot describe", and for the same reason.
-  Warning and proceeding would put "the application lost access" behind a line
-  of output nobody reads at 3am.
+- Anything else in the object's ACL does not. It is destroyed by the engine, and
+  pbps cannot restore what it does not model. **This must be a refusal, not a
+  warning**: a connected plan that is about to drop and create a module reads
+  the object's ACL first and refuses unless the declarations can reproduce it
+  exactly — the same shape as ADR-0005 note 4's "`plan --db` refuses to plan
+  over a role it cannot describe", and for the same reason. Warning and
+  proceeding would put "the application lost access" behind a line of output
+  nobody reads at 3am.
+
+**The refusal is on any ACL the declarations cannot reproduce, in either
+direction**, and the second direction is easy to miss. A first draft of this
+section said "a grant the declarations do not hold", which covers somebody
+having granted *more* and misses somebody having granted *less*. **Measured**,
+the second is the more dangerous one:
+
+```
+REVOKE EXECUTE ON FUNCTION w.f(int) FROM PUBLIC;
+   -> {postgres=X/postgres}          -- an operator hardens the function
+
+DROP FUNCTION w.f(int); CREATE FUNCTION w.f(a int) RETURNS bigint ...;
+   -> NULL                           -- pbps rebuilds it: the default is back
+SET ROLE w_nobody; SELECT w.f(7);  -> 7
+```
+
+A revocation is not a row in the ACL — it is the *absence* of the engine's
+default — so a rebuild restores the default and **silently reopens a function
+somebody deliberately closed**. That is a security regression caused by an
+ordinary return-type edit, and [ADR-0010](ADR-0010-postgres-privileges.md) §5
+records the same fact from the other side: pbps cannot express "revoked from
+`PUBLIC`", so it cannot put it back, so it must not take it away.
 
 That refusal is the honest cost of this ADR, and it is worth stating plainly:
-on PostgreSQL, pbps will refuse to edit a view that somebody granted access on
-by hand, until that grant is either declared or removed. That is friction. The
-alternative is destroying it.
+on PostgreSQL, pbps will refuse to edit a view or function whose access
+somebody adjusted by hand — in either direction — until that adjustment is
+either declared or undone. That is friction. The alternative is a deployment
+that hands the world execute rights on a function and reports success.
+
+### How the plan knows a rebuild is needed
+
+The paragraph above conditions drop + create on "what `CREATE OR REPLACE`
+cannot express", and §3 has just established that the deciding facts — the
+return type, the view's column list — live inside the opaque `definition` this
+tool does not parse. Left there, the rule is unimplementable: the planner would
+be conditioning on something it has said it cannot know.
+
+**Measured**, the engine will answer the question if it is asked inside a
+savepoint:
+
+```
+BEGIN;
+INSERT INTO w.evidence VALUES ('work done before the attempt');
+SAVEPOINT try_replace;
+CREATE OR REPLACE FUNCTION w.g(a int) RETURNS bigint ...;
+   ERROR:  cannot change return type of existing function
+ROLLBACK TO SAVEPOINT try_replace;
+INSERT INTO w.evidence VALUES ('work done after rolling back');
+COMMIT;                                  -- 2 rows, both committed
+```
+
+A failed statement dooms a PostgreSQL transaction, but `ROLLBACK TO SAVEPOINT`
+un-dooms it: the attempt is recoverable and the surrounding work survives.
+
+**Decision.** `plan --db` asks — it has a connection, which is the whole
+difference between the two planning layers (§7.3) — attempting the replace
+inside a savepoint it always rolls back, and **records the answer in the plan**.
+The artifact the approver reads therefore says which shape will run and why,
+rather than leaving it to be discovered at apply time. Nothing is parsed and
+nothing is guessed; the engine is asked, which is §8.2's rule applied to a
+question about SQL rather than about a value.
+
+An offline `plan` has nobody to ask. It emits the replace — the cheaper and
+non-destructive of the two — and says the shape is unresolved, which is what
+§9.1 already means by "anything computed offline is a preview". The refusal
+above still stands in front of the rebuild, so the preview cannot become a
+silent rebuild later.
 
 ## 4. The dependency refusal is the common case, not the corner
 

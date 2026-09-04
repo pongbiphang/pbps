@@ -296,14 +296,36 @@ name no part of: `WITH GRANT OPTION` (`a*r`), column-level grants in
 `pg_attribute.attacl`, and privileges outside the closed set — all of them
 **on a managed role**, which is what makes them that role's business.
 
-**The residual, stated rather than hidden.** `EXECUTE` to `PUBLIC` on a function
-is a real exposure, and revoking it is ordinary hardening — measured, the revoke
-leaves `{postgres=X/postgres}` and PUBLIC is refused. pbps cannot express either
-that state or the intent to reach it, so a project that wants it does the revoke
-outside pbps, and pbps will not undo it (it compares only managed roles) nor
-report it. That is a gap, not a design: expressing "revoked from `PUBLIC`" needs
-a grantee the model does not have, and it should get one before this engine's
-privileges are called done.
+**The residual, stated rather than hidden — and it is sharper than "pbps stays
+out of the way".** `EXECUTE` to `PUBLIC` on a function is a real exposure, and
+revoking it is ordinary hardening: measured, the revoke leaves
+`{postgres=X/postgres}` and PUBLIC is refused. pbps can express neither that
+state nor the intent to reach it.
+
+A first draft of this paragraph concluded that pbps therefore "will not undo it".
+**Measured, that is false**, because a revocation is not a row in the ACL — it is
+the *absence* of the engine's default — and [ADR-0009](ADR-0009-postgres-modules.md)
+§3 rebuilds a function by drop + create whenever `CREATE OR REPLACE` cannot
+express the change:
+
+```
+REVOKE EXECUTE ON FUNCTION w.f(int) FROM PUBLIC;  -> {postgres=X/postgres}
+DROP FUNCTION w.f(int); CREATE FUNCTION w.f(a int) RETURNS bigint ...;
+                                                  -> NULL
+SET ROLE w_nobody; SELECT w.f(7);                 -> 7
+```
+
+An ordinary return-type edit silently reopens a function somebody deliberately
+closed. Comparing only managed roles keeps pbps from *reporting* the difference;
+it does not keep pbps from *destroying* it.
+
+So the two documents close it from both sides. ADR-0009 §3 refuses a rebuild
+whose ACL the declarations cannot reproduce **in either direction**, which is
+what stops the regression today. And this remains the largest gap in this
+document: expressing "revoked from `PUBLIC`" needs a grantee the model does not
+have, and until it has one, hardening a managed function and managing it are
+mutually exclusive. That should be closed before PostgreSQL privileges are
+called done.
 
 That path existing already is the reassuring part of this ADR. The mechanism for
 "the engine holds a permission this model cannot describe, and silence about it
@@ -401,10 +423,12 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
   its own, the rest are cluster or connection concerns.
 - **Sequence, type, domain and foreign-data-wrapper grants are unmodelled** and
   reported, not folded.
-- **What `PUBLIC` holds cannot be declared, and therefore cannot be revoked by
-  pbps** (§5). Every function arrives executable by everyone, and hardening that
-  is a step taken outside the tool which the tool will neither undo nor mention.
-  This is the largest gap in this document and it should close before PostgreSQL
+- **What `PUBLIC` holds cannot be declared** (§5). Every function arrives
+  executable by everyone; hardening that is a step taken outside the tool, which
+  the tool cannot mention — and, without ADR-0009 §3's two-directional refusal,
+  would silently undo on the next rebuild. Until the model has a grantee for it,
+  hardening a managed function and managing it are mutually exclusive. This is
+  the largest gap in this document and it should close before PostgreSQL
   privileges are called finished.
 - **The `MAINTAIN` privilege is PostgreSQL 17+**; the dialect must gate it on the
   server version the way `plan --db` already gates on SQL Server's edition.

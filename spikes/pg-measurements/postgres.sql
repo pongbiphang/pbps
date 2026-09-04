@@ -296,6 +296,43 @@ SELECT 'R9', 'the next insert after restarting at max(written)+1',
        || (SELECT max(id)::text FROM m.seq);
 
 
+-- ------------------------------------ the second 2026-09-05 review round
+-- Three more findings on PR #12, all consequences of the first round's fixes.
+
+CREATE FUNCTION m.reb(a int) RETURNS int AS $$ SELECT a; $$ LANGUAGE sql;
+REVOKE EXECUTE ON FUNCTION m.reb(int) FROM PUBLIC;
+SELECT 'A23', 'the ACL after an operator revokes EXECUTE from PUBLIC',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.reb(int)'::regprocedure), 'NULL');
+DROP FUNCTION m.reb(int);
+CREATE FUNCTION m.reb(a int) RETURNS bigint AS $$ SELECT a::bigint; $$ LANGUAGE sql;
+SELECT 'A24', 'the ACL after a drop-and-create rebuild of that function',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.reb(int)'::regprocedure),
+                'NULL — the default is back, and PUBLIC can execute it again');
+
+-- Can "try the replace, and recover" be implemented? A failed statement dooms
+-- a PostgreSQL transaction; ROLLBACK TO SAVEPOINT un-dooms it.
+CREATE FUNCTION m.sp(a int) RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;
+CREATE TABLE m.evidence (note text);
+BEGIN;
+INSERT INTO m.evidence VALUES ('before the attempt');
+SAVEPOINT try_replace;
+CREATE OR REPLACE FUNCTION m.sp(a int) RETURNS bigint AS $$ SELECT 1::bigint; $$ LANGUAGE sql;
+ROLLBACK TO SAVEPOINT try_replace;
+INSERT INTO m.evidence VALUES ('after rolling back to the savepoint');
+COMMIT;
+SELECT 'A25', 'work surviving a failed CREATE OR REPLACE inside a savepoint',
+       count(*)::text || ' of 2 rows committed' FROM m.evidence;
+
+SELECT 'R10', 'a descending identity, with no MAXVALUE the model could carry',
+       m.accepts('CREATE TABLE m.desc_id (id int GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY -1) PRIMARY KEY)');
+CREATE TABLE m.desc_ok (id int GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY -1 MAXVALUE 100 MINVALUE -1000) PRIMARY KEY, v text);
+INSERT INTO m.desc_ok (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'the pinned row');
+SELECT 'R11', 'RESTART at max(keys)+1 on a descending identity',
+       m.accepts('ALTER TABLE m.desc_ok ALTER COLUMN id RESTART WITH 101');
+SELECT 'R12', 'RESTART at min(keys)-1, the direction the sequence counts',
+       m.accepts('ALTER TABLE m.desc_ok ALTER COLUMN id RESTART WITH 99')
+       || ' / ' || m.accepts('INSERT INTO m.desc_ok (v) VALUES (''generated'')');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

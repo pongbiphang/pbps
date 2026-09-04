@@ -129,6 +129,39 @@ Two things follow, and the first matters more:
   later is an incident with no obvious cause. The restart value has to be
   `max(the table's own keys, the sequence's current value) + 1`, which is a
   question for the engine at apply time rather than arithmetic over the plan.
+
+- **And `+ 1` assumes the identity counts upwards, which the model does not.**
+  `Identity` is `{ seed: i64, increment: i64 }` and the only rule on it refuses
+  an increment of `0`, so `identity: [100, -1]` is a declaration this project
+  accepts today. Every formula above is then pointing the wrong way.
+
+  **Measured**, PostgreSQL closes most of that hole itself, and in a way the
+  model cannot work around:
+
+  ```
+  CREATE TABLE ... (id int GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY -1) ...)
+  ERROR:  START value (100) cannot be greater than MAXVALUE (-1)
+  ```
+
+  A descending sequence defaults its `MAXVALUE` to `-1`, so a descending
+  identity needs an explicit one — and `Identity` has no field for it. **A
+  negative increment is therefore not expressible on PostgreSQL from this
+  model at all**: the `CREATE TABLE` is refused outright, loudly, inside the
+  plan's transaction.
+
+  Where the bound *is* supplied, the direction matters exactly as one would
+  fear — measured, `RESTART WITH 101` against `MAXVALUE 100` is refused, and
+  the next insert then collides with the pinned row, while `RESTART WITH 99`
+  (min − 1, the right direction) works.
+
+  **Decision.** PostgreSQL's `validate` refuses a negative increment outright,
+  naming the `MAXVALUE` the model cannot carry. That is worth more than
+  teaching the restart formula to count downwards: it makes the ascending
+  assumption **unrepresentable** rather than merely documented, which is the
+  house preference (CLAUDE.md, "prefer making a failure *unrepresentable* over
+  handling it"). If `Identity` ever grows a bound, this refusal is the thing to
+  revisit, and the measured direction rule above is what it should be replaced
+  with.
 - **The declaration should be discouraged, not merely supported.** ADR-0004
   already says an identity primary key "hands out different values per
   environment, so declaring rows by id would be a lie by default". PostgreSQL
