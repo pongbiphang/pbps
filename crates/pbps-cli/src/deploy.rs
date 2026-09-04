@@ -1237,25 +1237,151 @@ pub fn cmd_plan_db(
     Ok(())
 }
 
+/// What the operator asked `apply` to do, as typed.
+pub struct ApplyRequest<'a> {
+    pub plan_path: &'a std::path::Path,
+    pub approved_checksum: &'a str,
+    pub allow: &'a std::collections::BTreeSet<pbps_model::RiskClass>,
+    pub staged: bool,
+    pub resume: bool,
+}
+
+/// How an attempt on an identified artifact ended.
+///
+/// The three outcomes are one type so that [`cmd_apply`] has one place to
+/// report them: every path out of [`apply_identified`] arrives here, and the
+/// `on_apply_attempt` hook fires from that one place. Earlier the failure hook
+/// was called at each site that could fail after the lock, and the refusals
+/// before it — a stale `--checksum`, an unapproved risk — returned past the
+/// hook entirely, so the audit sink advertised as seeing every attempt never
+/// saw the rejected artifact.
+enum Attempt {
+    /// Nothing to do; not an attempt in the hook's sense.
+    Empty,
+    /// The plan ran and its ledger entry is durable. `released` is the lock
+    /// cleanup, reported separately because a failed DELETE of the lock row
+    /// cannot turn committed DDL plus its success row into a failed deployment.
+    Applied {
+        entry: i64,
+        released: Result<bool, pbps_db::DbError>,
+    },
+    /// The plan was run under the lock and did not complete. The lock cleanup
+    /// travels with the error so the caller can warn about it.
+    Failed {
+        error: anyhow::Error,
+        released: Result<bool, pbps_db::DbError>,
+    },
+}
+
 /// `pbps apply` — run an approved plan (SPEC §7.3, §7.5).
 pub fn cmd_apply(
     project: &Project,
     target: &Target,
-    plan_path: &std::path::Path,
-    approved_checksum: &str,
-    allow: &std::collections::BTreeSet<pbps_model::RiskClass>,
-    staged: bool,
-    resume: bool,
+    request: &ApplyRequest<'_>,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "apply")?;
     let dialect = crate::dialect(project)?;
     let operator = crate::operator(project.root());
+    let plan_path = request.plan_path;
 
+    // Before this point there is no artifact to report on: the attempt event
+    // carries a checksum, and a file that cannot be read or is not a plan has
+    // none. From `plan_checksum` on, every outcome is an attempt on this
+    // artifact against this environment, and the hook sees all of them.
     let raw = std::fs::read_to_string(plan_path)
         .with_context(|| format!("cannot read `{}`", plan_path.display()))?;
     let plan: pbps_model::SavedPlan = serde_json::from_str(&raw)
         .with_context(|| format!("`{}` is not a pbps plan", plan_path.display()))?;
     let plan_checksum = plan.checksum();
+
+    let attempt = apply_identified(
+        project,
+        target,
+        request,
+        &plan,
+        &plan_checksum,
+        dialect.as_ref(),
+        &operator,
+    );
+    let (error, released) = match attempt {
+        Ok(Attempt::Empty) => return Ok(()),
+        Ok(Attempt::Applied { entry, released }) => {
+            println!(
+                "Applied {} change(s) to `{}`{}; recorded as entry #{entry}.",
+                plan.changes.changes.len(),
+                target.label,
+                if request.staged { " (staged)" } else { "" }
+            );
+            // Preserve the original public hook contract: successful applies
+            // receive the exact approved plan JSON. Attempt events use their
+            // own key so existing success-only integrations cannot be invoked
+            // on a failure or misread an unrelated payload shape.
+            if let Some(hook) = &project.config.hooks.on_apply {
+                crate::hooks::run(hook, &raw, "on_apply");
+            }
+            if let Some(hook) = &project.config.hooks.on_apply_attempt {
+                crate::hooks::run_apply_attempt(
+                    hook,
+                    plan_path,
+                    &plan_checksum,
+                    &target.label,
+                    Some(entry),
+                    None,
+                );
+            }
+            // Report the deployment before surfacing cleanup. The lock may
+            // need an operator to clear it, but retrying this already-recorded
+            // plan would be the wrong response.
+            released?;
+            return Ok(());
+        }
+        Ok(Attempt::Failed { error, released }) => (error, Some(released)),
+        // Refused before the lock was taken, or the connection or the lock
+        // itself failed: still an attempt on this artifact, with no lock to
+        // clean up.
+        Err(error) => (error, None),
+    };
+    if let Some(hook) = &project.config.hooks.on_apply_attempt {
+        let message = error.to_string();
+        crate::hooks::run_apply_attempt(
+            hook,
+            plan_path,
+            &plan_checksum,
+            &target.label,
+            None,
+            Some(&message),
+        );
+    }
+    // After the hook, so the payload it receives is the deployment's error
+    // alone; before the return, because a lock this run could not clear is
+    // the first thing the next run will hit.
+    if let Some(released) = &released {
+        warn_unreleased(&target.label, released);
+    }
+    Err(error)
+}
+
+/// Everything `apply` does once it knows which artifact it is holding.
+///
+/// Returns through [`Attempt`] or through `Err`, and nothing else: the caller
+/// turns both into the attempt event, so a refusal added here later cannot
+/// bypass the hook by construction.
+fn apply_identified(
+    project: &Project,
+    target: &Target,
+    request: &ApplyRequest<'_>,
+    plan: &pbps_model::SavedPlan,
+    plan_checksum: &str,
+    dialect: &dyn pbps_dialect::Dialect,
+    operator: &str,
+) -> anyhow::Result<Attempt> {
+    let ApplyRequest {
+        plan_path,
+        approved_checksum,
+        allow,
+        staged,
+        resume,
+    } = *request;
 
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         bail!(
@@ -1294,7 +1420,7 @@ pub fn cmd_apply(
             dialect.name()
         );
     }
-    crate::validate_saved_plan(&plan, dialect.as_ref())?;
+    crate::validate_saved_plan(plan, dialect)?;
     // The mode lives in the file because that is what the gate approved; the
     // flag exists so that the CI configuration says out loud which kind of
     // deployment this is. A disagreement between them is somebody's mistake,
@@ -1315,7 +1441,7 @@ pub fn cmd_apply(
 
     if plan.changes.is_empty() {
         println!("The plan is empty; nothing to apply.");
-        return Ok(());
+        return Ok(Attempt::Empty);
     }
 
     // The gate. It can be this coarse precisely because the checksum pins the
@@ -1338,7 +1464,7 @@ pub fn cmd_apply(
         );
     }
 
-    let statements = crate::statements(&plan.changes, dialect.as_ref())?;
+    let statements = crate::statements(&plan.changes, dialect)?;
     // Only for a transactional plan. A staged one exists *because* its
     // statement cannot run inside a transaction (ADR-0003): `plan --db
     // --staged` accepts it deliberately, and rejecting it here would leave
@@ -1354,21 +1480,21 @@ pub fn cmd_apply(
     let deployment = Deployment {
         project,
         target,
-        plan: &plan,
-        plan_checksum: &plan_checksum,
+        plan,
+        plan_checksum,
         statements: &statements,
         rename_targets: &targets,
-        dialect: dialect.as_ref(),
-        operator: &operator,
+        dialect,
+        operator,
     };
 
-    let execution = db::runtime()?.block_on(async {
+    let (result, released) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
         // have been answered about a database that is already moving.
-        pbps_mssql::state::lock(&mut conn, &operator).await?;
+        pbps_mssql::state::lock(&mut conn, operator).await?;
         let result = if staged {
             apply_staged_under_lock(&mut conn, &deployment, resume).await
         } else {
@@ -1381,80 +1507,12 @@ pub fn cmd_apply(
         // blocks the very pipeline that would fix it.
         let released = pbps_mssql::state::unlock(&mut conn).await;
         Ok::<_, anyhow::Error>((result, released))
-    });
+    })?;
 
-    // Connection and lock failures happen before there is an apply result, but
-    // they are still failed attempts for the hook. Once there is a result,
-    // keep it separate from cleanup: a failed DELETE of the lock row cannot
-    // turn committed DDL plus its success-ledger row into a failed deployment.
-    let (outcome, released) = match execution {
-        Ok(pair) => pair,
-        Err(error) => {
-            if let Some(hook) = &project.config.hooks.on_apply_attempt {
-                let message = error.to_string();
-                crate::hooks::run_apply_attempt(
-                    hook,
-                    plan_path,
-                    &plan_checksum,
-                    &target.label,
-                    None,
-                    Some(&message),
-                );
-            }
-            return Err(error);
-        }
-    };
-
-    match outcome {
-        Ok(recorded) => {
-            println!(
-                "Applied {} change(s) to `{}`{}; recorded as entry #{recorded}.",
-                plan.changes.changes.len(),
-                target.label,
-                if staged { " (staged)" } else { "" }
-            );
-            // Preserve the original public hook contract: successful applies
-            // receive the exact approved plan JSON. Attempt events use their
-            // own key so existing success-only integrations cannot be invoked
-            // on a failure or misread an unrelated payload shape.
-            if let Some(hook) = &project.config.hooks.on_apply {
-                crate::hooks::run(hook, &raw, "on_apply");
-            }
-            if let Some(hook) = &project.config.hooks.on_apply_attempt {
-                crate::hooks::run_apply_attempt(
-                    hook,
-                    plan_path,
-                    &plan_checksum,
-                    &target.label,
-                    Some(recorded),
-                    None,
-                );
-            }
-            // Report the deployment before surfacing cleanup. The lock may
-            // need an operator to clear it, but retrying this already-recorded
-            // plan would be the wrong response.
-            released?;
-            Ok(())
-        }
-        Err(error) => {
-            if let Some(hook) = &project.config.hooks.on_apply_attempt {
-                let message = error.to_string();
-                crate::hooks::run_apply_attempt(
-                    hook,
-                    plan_path,
-                    &plan_checksum,
-                    &target.label,
-                    None,
-                    Some(&message),
-                );
-            }
-            // After the hook, so the payload it receives is the deployment's
-            // error alone; before the return, because a lock this run could not
-            // clear is the first thing the next run will hit.
-            warn_unreleased(&target.label, &released);
-            Err(error)
-        }
-    }
+    Ok(match result {
+        Ok(entry) => Attempt::Applied { entry, released },
+        Err(error) => Attempt::Failed { error, released },
+    })
 }
 
 /// Best-effort audit row for an apply that did not complete. The schema and ids

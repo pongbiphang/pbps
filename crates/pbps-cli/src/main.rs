@@ -720,11 +720,13 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_apply(
                 &project,
                 &target,
-                &plan,
-                &checksum,
-                &allow.into_iter().collect(),
-                staged,
-                resume,
+                &deploy::ApplyRequest {
+                    plan_path: &plan,
+                    approved_checksum: &checksum,
+                    allow: &allow.into_iter().collect(),
+                    staged,
+                    resume,
+                },
             )
         }
         Command::Doctor { target, format } => {

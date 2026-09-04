@@ -1215,6 +1215,121 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
     );
 }
 
+/// `on_apply_attempt` is the append-only audit fan-out of SPEC 8.1, so it has
+/// to see the attempts that were *refused* as well as the ones that ran: a
+/// stale `--checksum` is exactly the event an audit sink exists to record.
+/// Once the file has been read as a plan there is an artifact to report on,
+/// and every refusal after that point is an attempt against it; before that
+/// point there is no checksum, so nothing is reported.
+#[test]
+fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
+    let d = Demo::new("refused-attempt-hook");
+    let hook_out = d.dir.join("apply-hook.json");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nhooks:\n  on_apply_attempt: \"cat > {}\"\n",
+            hook_out.display()
+        ),
+    )
+    .unwrap();
+    d.table(ONE_COLUMN);
+    d.run(&["plan"]);
+    d.commit();
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  b: {type: int}\n");
+    let plan = d.dir.join("preview.json");
+    d.run(&["plan", "--out", plan.to_str().unwrap()]);
+    let checksum = plan_checksum(&plan);
+    // A port nothing listens on: none of these may reach a connection, and one
+    // that tried would fail instantly rather than waiting out a timeout.
+    const NOWHERE: &str = "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p";
+
+    let hook = |what: &str| -> serde_json::Value {
+        let raw = std::fs::read_to_string(&hook_out)
+            .unwrap_or_else(|e| panic!("{what}: the attempt hook did not run: {e}"));
+        std::fs::remove_file(&hook_out).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+
+    // The finding's case: the artifact is fine, the approval is not.
+    let stale = d.run(&[
+        "apply",
+        "--db",
+        NOWHERE,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+    assert_eq!(code(&stale), 1);
+    assert!(
+        stderr(&stale).contains("no longer matches the artifact approved"),
+        "{}",
+        stderr(&stale)
+    );
+    let event = hook("stale checksum");
+    assert_eq!(event["outcome"], "failure", "{event}");
+    assert_eq!(event["event"], "apply", "{event}");
+    assert_eq!(
+        event["checksum"], checksum,
+        "the event carries the artifact's checksum, not the one typed: {event}"
+    );
+    assert_eq!(event["plan_path"], plan.to_str().unwrap(), "{event}");
+    assert!(
+        event["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no longer matches the artifact approved")),
+        "{event}"
+    );
+    assert!(event.get("ledger_entry").is_none(), "{event}");
+
+    // A refusal further down the same path — the preview check — reports too,
+    // which is what makes this a property of the path and not of one check.
+    let preview = d.run(&[
+        "apply",
+        "--db",
+        NOWHERE,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&preview), 1);
+    assert!(stderr(&preview).contains("preview"), "{}", stderr(&preview));
+    let event = hook("preview refusal");
+    assert_eq!(event["outcome"], "failure", "{event}");
+    assert!(
+        event["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("preview")),
+        "{event}"
+    );
+
+    // Before the file is a plan there is no artifact and no checksum, so there
+    // is nothing for the event to be about.
+    let not_a_plan = d.dir.join("not-a-plan.json");
+    std::fs::write(&not_a_plan, "{\"version\": \"a string\"}\n").unwrap();
+    let unreadable = d.run(&[
+        "apply",
+        "--db",
+        NOWHERE,
+        "--plan",
+        not_a_plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&unreadable), 1);
+    assert!(
+        stderr(&unreadable).contains("is not a pbps plan"),
+        "{}",
+        stderr(&unreadable)
+    );
+    assert!(
+        !hook_out.exists(),
+        "a file that is not a plan has no checksum to report an attempt on"
+    );
+}
+
 // ---- Phase 3.5: the module model (ADR-0002) ----
 
 impl Demo {

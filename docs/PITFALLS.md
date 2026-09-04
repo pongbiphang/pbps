@@ -53,6 +53,14 @@ point, refusals typed `Result<Infallible>` so an edit cannot fall through one,
 and `Location.file` as a `String` so an unspellable path cannot break
 serialization.
 
+The `on_apply_attempt` hook had the same shape one layer down: the failure
+event was emitted at each site that could fail after the lock, and the
+refusals before it — a stale `--checksum`, a preview, an unapproved risk —
+returned past it, so the audit sink advertised as seeing every attempt never
+saw the rejected artifact. Same repair: everything after the plan is
+identified lives in one function whose only exits are a typed outcome or an
+error, and the hook fires from the one place both arrive.
+
 ### 3. A failure routed to the wrong person
 
 The three exit codes are the feature (decision 34). Both directions have been
