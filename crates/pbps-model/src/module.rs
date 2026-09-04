@@ -194,9 +194,13 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
         /// also close the identifier.
         Ident(char, bool),
         Line,
-        /// Carrying how many characters have been consumed, so that the `*` of
-        /// the opener cannot also close it (`/*/`).
-        Block(usize),
+        /// SQL Server block comments nest. `depth` tracks the unmatched
+        /// openers; `seen` prevents an opener's `*` from also closing it in
+        /// the overlapping spelling `/*/`.
+        Block {
+            depth: usize,
+            seen: usize,
+        },
     }
     let mut out = String::with_capacity(definition.len());
     let mut at = At::Code;
@@ -248,11 +252,26 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
                 }
                 blank(&mut out, ch);
             }
-            At::Block(seen) => {
+            At::Block { depth, seen } => {
                 at = if ch == '/' && seen >= 2 && bytes[i - 1] == b'*' {
-                    At::Code
+                    if depth == 1 {
+                        At::Code
+                    } else {
+                        At::Block {
+                            depth: depth - 1,
+                            seen: 2,
+                        }
+                    }
+                } else if ch == '/' && next == Some(b'*') {
+                    At::Block {
+                        depth: depth + 1,
+                        seen: 0,
+                    }
                 } else {
-                    At::Block(seen + 1)
+                    At::Block {
+                        depth,
+                        seen: seen + 1,
+                    }
                 };
                 blank(&mut out, ch);
             }
@@ -262,7 +281,7 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
                     blank(&mut out, ch);
                 }
                 ('/', Some(b'*')) => {
-                    at = At::Block(0);
+                    at = At::Block { depth: 1, seen: 0 };
                     blank(&mut out, ch);
                 }
                 ('\'', _) => {
@@ -678,6 +697,7 @@ mod tests {
         for definition in [
             "SELECT 1 -- superseded by dbo.active_customer",
             "/* see dbo.active_customer */ SELECT 1",
+            "SELECT 1 /* outer /* nested */ dbo.active_customer */",
             "SELECT 'dbo.active_customer' AS note",
         ] {
             assert!(

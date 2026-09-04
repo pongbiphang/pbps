@@ -357,6 +357,7 @@ mod tests {
             "NEXT VALUE FOR dbo.seq@null",
             "NEXT VALUE FOR dbo.seq#null",
             "NEXT VALUE FOR dbo.序列null",
+            "1 /* outer /* nested */ NULL */",
         ] {
             column.default = Some(default.into());
             assert!(column.has_required_add_value_source(), "{default}");
