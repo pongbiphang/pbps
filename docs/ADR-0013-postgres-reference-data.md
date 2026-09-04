@@ -107,9 +107,15 @@ to avoid.
 
 Two things follow, and the first matters more:
 
-- **The emitter must restart the sequence** after pinned inserts, in the same
-  transaction — **above every key the table holds and above where the sequence
-  already stands**, not merely above what this plan wrote.
+- **The construct is refused on PostgreSQL, and the rest of this bullet is why.**
+  What follows is six measured obstacles in the order they were found, each one
+  the answer to the last — and the decision they arrive at is at the end of the
+  bullet, not here. Nothing in between is a design to implement; every
+  imperative in it was superseded by the next paragraph.
+
+  The first attempt: **restart the sequence** after pinned inserts, in the same
+  transaction — above every key the table holds and above where the sequence
+  already stands, not merely above what this plan wrote.
 
   A first draft of this section said "to the maximum key it wrote plus one", and
   **measured, that is worse than doing nothing**, because it can move the
@@ -225,9 +231,6 @@ Two things follow, and the first matters more:
   other session is already holding. And the table lock does not help, because —
   measured two rounds earlier — `nextval` walks past it, and PostgreSQL offers
   no lock that does not.
-
-  The advance stops pbps from issuing 5 again; it cannot un-issue the 5 the
-  other session is already holding.
 
   **And two more obstacles finish this off, both measured.** The advance is
   itself outside the transaction the whole apply depends on:
@@ -616,9 +619,9 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | Nothing structural; §2 adds a statement to the emitter's identity path, §3 adds a connect-time session pin |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2) — and §3 adds a connect-time session pin and a project search path |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
-| `validate` | Two rules: an identity-keyed `data:` block warns (§2); a key collision names the collation that decided it (§5) |
+| `validate` | Two rules: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward; a key collision names the collation that decided it (§5) |
 
 ## Limits
 

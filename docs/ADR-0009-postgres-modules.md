@@ -387,10 +387,19 @@ is now true. ADR-0005 shipped, and its implementation note 9 already decides
 this exact case: *"A target this plan drops and creates again is granted from
 nothing … every declared permission on it is a `GRANT` after the `CREATE`."*
 
-So the decision is: **on PostgreSQL, a module change that `CREATE OR REPLACE`
-cannot express is emitted as drop + create, and the declared grants on that
-module are re-emitted after it**, by the machinery ADR-0005 built. The residual
-loss is named rather than hidden:
+So the decision is: **on PostgreSQL, a module change is emitted as drop +
+create, and the declared grants on that module are re-emitted after it**, by the
+machinery ADR-0005 built.
+
+An earlier version of this sentence said "a module change that `CREATE OR
+REPLACE` cannot express", and the qualifier did not survive: *which* changes it
+cannot express turns out to be unknowable at plan time without executing DDL
+somewhere the tool may not execute it, and the sub-section at the end of this
+§3 works that out and lands on **always**. The conditional is removed here
+rather than left for a reader to reconcile — two forms of one decision in one
+section is how an implementer ends up writing the cheaper one.
+
+The residual loss is named rather than hidden:
 
 - A grant to a **declared** role comes back. Measured behaviour, existing code
   path, and it is the case the tool is for.
