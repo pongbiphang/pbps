@@ -974,3 +974,25 @@ SPEC is in sync with all of these.
     child matching one column of a two-column key is counted. That
     over-counts, which refuses a delete that might have been fine; the
     direction that under-counts is the one that loses rows.
+117. **An inserted row carries the defaults of the columns it omits, and the
+    pre-delete probe reads a defaulted write as an arrival.** 112 counted
+    the rows a plan puts onto a parent it deletes, by the values the plan
+    spells; a column an insert omits, or an update sets to `DEFAULT`, is
+    written at the column's default, which the plan did not spell — and a
+    default that names the doomed parent was an arrival the probe never
+    saw, so the cascade took the declared row and apply recorded it. The
+    differ now writes the omitted columns' defaults into `InsertRow`
+    (`defaults`, absent from older plans and read as empty), `Cell::Default`
+    already carried the update's, and the probe renders a literal default
+    as the expression the catalog spells it in, for the engine to compare
+    like any other value. A default that is not a literal (`NEXT VALUE
+    FOR`, `NEWID()`) has no value before it runs, and is the one arrival no
+    probe can ask about; `NULL` references no row.
+118. **A declared role's name is checked against every database principal
+    before a connected plan or a bootstrap is written.** The managed set
+    knows the roles, and a role named like an existing *user* or
+    application role looked free — SQL Server keeps users, roles and
+    application roles in one namespace, and the `CREATE ROLE` failed after
+    the tables and rows ordered before it had run. `sys.database_principals`
+    of every type but `R` is read once, and a taken name is refused with
+    the principal's kind, before anything runs.

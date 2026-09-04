@@ -2259,9 +2259,29 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 key_column: "id".to_owned(),
                 identity_key: true,
                 key: RowKey::from("9"),
+                defaults: Default::default(),
                 row: [("status_code".to_owned(), text(code))]
                     .into_iter()
                     .collect::<Row>(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    // The same insert with the column left to its default: the plan carries
+    // the default, and the engine compares it like any spelled value
+    // (DECISIONS 117).
+    let insert_defaulted = |default: &str| pbps_model::ChangeSet {
+        changes: vec![
+            moved.changes[0].clone(),
+            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                identity_key: true,
+                key: RowKey::from("9"),
+                defaults: [("status_code".to_owned(), default.to_owned())]
+                    .into_iter()
+                    .collect(),
+                row: Row::default(),
             }),
             moved.changes[1].clone(),
         ],
@@ -2271,6 +2291,21 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             insert_onto("old"),
             1,
             "an inserted child pointing at `old` is counted, though it is not there yet",
+        ),
+        (
+            insert_defaulted("('old')"),
+            1,
+            "a child left to a default of `old` lands on the row being deleted",
+        ),
+        (
+            insert_defaulted("(N'OLD')"),
+            1,
+            "the engine reads the default, spelling and all",
+        ),
+        (
+            insert_defaulted("('new')"),
+            0,
+            "a default naming another parent blocks nothing",
         ),
         // The engine decides which spellings are one key here too.
         (

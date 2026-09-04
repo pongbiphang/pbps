@@ -5149,6 +5149,93 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
     });
 }
 
+/// Users, roles and application roles share one namespace in SQL Server; a
+/// role declared under a user's name looked free to the managed set and
+/// `CREATE ROLE` failed after everything ordered before it had run. Refused
+/// before anything runs, by `bootstrap` and by `plan --db`, with the
+/// principal's kind (DECISIONS 118). Only the engine knows who holds a name.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_role_named_like_a_user_is_refused_before_anything_runs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_rolename_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+    sql("CREATE USER shadow WITHOUT LOGIN;");
+
+    let d = Demo::new("rolename-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    let role_file = d.dir.join("schema").join("roles").join("shadow.yml");
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Bootstrap: refused before the table goes in, naming the user.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Without the role the project bootstraps; declared afterwards, the
+    // role is refused by the connected plan the same way.
+    std::fs::remove_file(&role_file).unwrap();
+    let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// A dropped role's members are listed at plan time so a reviewer sees who
 /// loses the role, and membership is each environment's own — so a member
 /// added between `plan --db` and `apply` is invisible to the checksum. The

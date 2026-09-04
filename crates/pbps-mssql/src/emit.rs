@@ -119,6 +119,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             identity_key,
             key,
             row,
+            ..
         } => insert_row(table, key_column, *identity_key, key, row),
 
         Change::UpdateRow {
@@ -1405,6 +1406,7 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("new"),
+            defaults: Default::default(),
             row: row(&[("label", Value::Text("New".to_owned()))]),
         });
         assert_eq!(
@@ -1423,6 +1425,7 @@ mod tests {
             key_column: "id".to_owned(),
             identity_key: true,
             key: RowKey::from("7"),
+            defaults: Default::default(),
             row: row(&[("label", Value::Text("Seven".to_owned()))]),
         });
         assert_eq!(
@@ -1444,6 +1447,7 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
             row: Row::default(),
         });
         assert!(!sql[0].contains("IDENTITY_INSERT"), "{sql:?}");
@@ -1459,6 +1463,7 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
             row: Row::default(),
         });
         assert!(sql[0].contains("([code])"), "{sql:?}");
@@ -1647,6 +1652,7 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("o'brien"),
+            defaults: Default::default(),
             row: row(&[(
                 "label",
                 Value::Text("'); DROP TABLE [dbo].[t]; --".to_owned()),
@@ -1676,6 +1682,7 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
             row: row(&[
                 ("flag", Value::Bool(true)),
                 ("n", Value::Int(-7)),
@@ -1712,6 +1719,7 @@ mod tests {
                 key_column: "code".to_owned(),
                 identity_key: false,
                 key: RowKey::from("a"),
+                defaults: Default::default(),
                 row: Row::default(),
             },
             Change::DeleteRow {

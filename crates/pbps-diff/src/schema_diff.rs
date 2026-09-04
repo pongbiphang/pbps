@@ -170,6 +170,7 @@ pub fn diff_partial(
                             identity_key,
                             key: key.clone(),
                             row: row.clone(),
+                            defaults: omitted_defaults(&table, &pk.columns[0], row),
                         });
                     }
                 }
@@ -584,6 +585,7 @@ fn diff_data(
                 identity_key,
                 key: key.clone(),
                 row: row.clone(),
+                defaults: omitted_defaults(declared, &key_column, row),
             }),
             Some(before) => {
                 // Only the columns that differ. An UPDATE restating a column
@@ -964,9 +966,61 @@ fn order_key(c: &Change) -> u8 {
         Change::SetDataMode { .. } => 15,
     }
 }
+/// The defaults an inserted row is left to: every column the row omits, the
+/// key aside, that the table gives a default. An `IDENTITY` column is the
+/// engine's own and never one of these (DECISIONS 94, 117).
+fn omitted_defaults(
+    table: &Table,
+    key_column: &str,
+    row: &pbps_model::Row,
+) -> BTreeMap<String, String> {
+    table
+        .columns
+        .iter()
+        .filter(|(c, spec)| {
+            c.as_str() != key_column && !row.0.contains_key(*c) && spec.identity.is_none()
+        })
+        .filter_map(|(c, spec)| spec.default.clone().map(|d| (c.clone(), d)))
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
+    use super::omitted_defaults;
+
+    /// The key is never one of them, an identity column is the engine's,
+    /// and a column the row spells needs no default; every other defaulted
+    /// column the row omits travels with the insert (DECISIONS 117).
+    #[test]
+    fn an_inserted_row_carries_the_defaults_of_the_columns_it_omits() {
+        use pbps_model::{Column, ColumnType, Row, Table, Value};
+        use std::str::FromStr;
+        let mut t = Table::default();
+        let mut col = |name: &str, ty: &str, default: Option<&str>, identity: bool| {
+            let mut c = Column::new(ColumnType::from_str(ty).unwrap());
+            c.default = default.map(str::to_owned);
+            if identity {
+                c.identity = Some(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                });
+            }
+            t.columns.insert(name.to_owned(), c);
+        };
+        col("id", "int", Some("(1)"), false);
+        col("status_code", "varchar(10)", Some("('old')"), false);
+        col("label", "nvarchar(50)", Some("N'x'"), false);
+        col("rank", "int", None, false);
+        col("seq", "int", Some("(0)"), true);
+        let mut row = Row::default();
+        row.0.insert("label".into(), Value::Text("spelled".into()));
+        let d = omitted_defaults(&t, "id", &row);
+        assert_eq!(
+            d.into_iter().collect::<Vec<_>>(),
+            [("status_code".to_owned(), "('old')".to_owned())]
+        );
+    }
     use super::*;
     use crate::identity::Context;
     use indexmap::IndexMap;

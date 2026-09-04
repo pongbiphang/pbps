@@ -237,6 +237,11 @@ Decisions taken during implementation that this document did not anticipate:
     know.** A role-only project that never ran `pbps plan` bootstrapped
     nothing and recorded the empty state as the whole one; every declared
     role, like every table, needs its uid first (DECISIONS 109).
+17. **A declared role's name has to be free of every principal.** Users,
+    roles and application roles share one namespace; `plan --db` and
+    `bootstrap` read the non-role principals and refuse a taken name with
+    the principal's kind, before a `CREATE ROLE` could fail after the
+    changes ordered before it (DECISIONS 118).
 
 ## Placement
 

@@ -105,8 +105,12 @@ struct Moved {
     /// here instead, with the engine deciding whether the value and the
     /// deleted key are one key, exactly as it decides for `updated`.
     ///
-    /// A column an insert omits is not here: its value is the column's own
-    /// default, which lives in the catalog and not in the plan.
+    /// A column an insert omits, or an update sets to `DEFAULT`, arrives at
+    /// the column's default — which the plan carries (`InsertRow::defaults`,
+    /// `Cell::Default`) and which, when it is a literal, is rendered for the
+    /// engine to compare like any other value. A default that is not a
+    /// literal (`NEXT VALUE FOR`, `NEWID()`) has no value before it runs
+    /// and is the one arrival no probe can ask about (DECISIONS 117).
     arriving: BTreeMap<String, BTreeMap<RowKey, Arrival>>,
 }
 
@@ -119,6 +123,37 @@ struct Moved {
 enum Arrival {
     Inserted(String),
     Updated(String),
+    /// An insert that omits the column, arriving at its literal default —
+    /// carried as the expression the catalog spells it in (`(1)`,
+    /// `('old')`), rendered as is for the engine to compare.
+    InsertedAtDefault(String),
+    /// An update to `DEFAULT`, the same.
+    UpdatedToDefault(String),
+}
+
+impl Arrival {
+    /// The SQL the engine compares against the deleted key: a literal for a
+    /// declared value, the default expression itself for a defaulted one.
+    fn sql(&self) -> String {
+        match self {
+            Arrival::Inserted(v) | Arrival::Updated(v) => literal(v),
+            Arrival::InsertedAtDefault(e) | Arrival::UpdatedToDefault(e) => format!("({e})"),
+        }
+    }
+
+    const fn inserted(&self) -> bool {
+        matches!(self, Arrival::Inserted(_) | Arrival::InsertedAtDefault(_))
+    }
+}
+
+/// A default the engine can compare without running anything: a literal
+/// (the line 80 drew), and not `NULL`, which references no row.
+fn constant_default(default: &str) -> Option<&str> {
+    let mut d = default.trim();
+    while d.len() >= 2 && d.starts_with('(') && d.ends_with(')') {
+        d = d[1..d.len() - 1].trim();
+    }
+    (crate::rows::is_constant(d) && !d.eq_ignore_ascii_case("null")).then_some(d)
 }
 
 impl AsStored {
@@ -158,6 +193,13 @@ impl AsStored {
                                 .entry(column.clone())
                                 .or_default()
                                 .insert(key.clone(), Arrival::Updated(value));
+                        } else if let Cell::Default(d) = after
+                            && let Some(expr) = constant_default(d)
+                        {
+                            moved.arriving.entry(column.clone()).or_default().insert(
+                                key.clone(),
+                                Arrival::UpdatedToDefault(expr.to_owned()),
+                            );
                         }
                         moved
                             .updated
@@ -171,10 +213,19 @@ impl AsStored {
                     key_column,
                     key,
                     row,
+                    defaults,
                     ..
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
+                    for (column, default) in defaults {
+                        if let Some(expr) = constant_default(default) {
+                            moved.arriving.entry(column.clone()).or_default().insert(
+                                key.clone(),
+                                Arrival::InsertedAtDefault(expr.to_owned()),
+                            );
+                        }
+                    }
                     for (column, value) in &row.0 {
                         let text = match value {
                             Value::Text(t) => t.clone(),
@@ -573,40 +624,36 @@ fn delete_probe(
             let column_sql = quote(&stored_column.name)?;
             let mut pieces = Vec::new();
             for (child_key, arrival) in rows {
-                let value = match arrival {
-                    Arrival::Inserted(v) => {
-                        // Nothing stored to double-count: the row is either
-                        // arriving on the deleted row or it is not.
-                        pieces.push(literal(&format!(
-                            " + (CASE WHEN EXISTS (SELECT 1 FROM {parent} WHERE "
-                        )));
-                        v
-                    }
-                    Arrival::Updated(v) => {
-                        // The row exists, so it may already be inside the
-                        // count: only one that is *not* on the parent now is
-                        // arriving. A NULL foreign key is not on it either,
-                        // and `NULL NOT IN (...)` is unknown, so it is named.
-                        pieces.push(literal(&format!(
-                            " + (SELECT COUNT(*) FROM {child_sql} WHERE {key_sql} = {} AND \
-                             ({column_sql} IS NULL OR {column_sql} NOT IN (SELECT ",
-                            literal(child_key.as_str())
-                        )));
-                        pieces.push("QUOTENAME(rc.name)".to_owned());
-                        pieces.push(literal(&format!(
-                            " FROM {parent} WHERE {this_row})) AND EXISTS (SELECT 1 FROM \
-                             {parent} WHERE "
-                        )));
-                        v
-                    }
-                };
+                if arrival.inserted() {
+                    // Nothing stored to double-count: the row is either
+                    // arriving on the deleted row or it is not.
+                    pieces.push(literal(&format!(
+                        " + (CASE WHEN EXISTS (SELECT 1 FROM {parent} WHERE "
+                    )));
+                } else {
+                    // The row exists, so it may already be inside the
+                    // count: only one that is *not* on the parent now is
+                    // arriving. A NULL foreign key is not on it either,
+                    // and `NULL NOT IN (...)` is unknown, so it is named.
+                    pieces.push(literal(&format!(
+                        " + (SELECT COUNT(*) FROM {child_sql} WHERE {key_sql} = {} AND \
+                         ({column_sql} IS NULL OR {column_sql} NOT IN (SELECT ",
+                        literal(child_key.as_str())
+                    )));
+                    pieces.push("QUOTENAME(rc.name)".to_owned());
+                    pieces.push(literal(&format!(
+                        " FROM {parent} WHERE {this_row})) AND EXISTS (SELECT 1 FROM \
+                         {parent} WHERE "
+                    )));
+                }
                 pieces.push("QUOTENAME(rc.name)".to_owned());
                 pieces.push(literal(&format!(
                     " = {} AND {this_row}{}",
-                    literal(value),
-                    match arrival {
-                        Arrival::Inserted(_) => ") THEN 1 ELSE 0 END)",
-                        Arrival::Updated(_) => "))",
+                    arrival.sql(),
+                    if arrival.inserted() {
+                        ") THEN 1 ELSE 0 END)"
+                    } else {
+                        "))"
                     }
                 )));
             }
@@ -1058,6 +1105,65 @@ mod tests {
         );
         assert!(p[0].description.contains("dbo.status"), "{:?}", p[0]);
         assert!(p[0].description.contains("`old`"), "{:?}", p[0]);
+    }
+
+    /// A write the plan does not spell arrives at the column's default: an
+    /// insert that omits the column, an update to `DEFAULT`. A literal one
+    /// is rendered for the engine to compare; one that is not a literal, or
+    /// `NULL`, is no arrival (DECISIONS 117).
+    #[test]
+    fn a_defaulted_write_onto_the_deleted_parent_is_an_arrival() {
+        use pbps_model::Cell;
+        let delete = Change::DeleteRow {
+            table: tname("dbo.status"),
+            key_column: "code".into(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+        };
+        let insert = |default: &str| Change::InsertRow {
+            table: tname("dbo.kind"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: RowKey::from("9"),
+            row: pbps_model::Row::default(),
+            defaults: [("status_code".to_owned(), default.to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let sql_of = |cs: &ChangeSet| probes(cs)[0].sql.clone();
+
+        let sql = sql_of(&plan(vec![insert("('old')"), delete.clone()]));
+        assert!(
+            sql.contains("CASE WHEN EXISTS (SELECT 1 FROM") && sql.contains("= (''old'') AND"),
+            "the literal default is what the engine compares: {sql}"
+        );
+        // Not a literal: nothing to compare before it runs. NULL: no row.
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(NULL)"] {
+            let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
+            assert!(!sql.contains("CASE WHEN EXISTS"), "{default}: {sql}");
+        }
+
+        // An update to DEFAULT, the same way.
+        let update = Change::UpdateRow {
+            table: tname("dbo.kind"),
+            key_column: "id".into(),
+            key: RowKey::from("7"),
+            columns: [(
+                "status_code".to_owned(),
+                (
+                    Cell::Value(pbps_model::Value::Text("new".into())),
+                    Cell::Default("('old')".into()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let sql = sql_of(&plan(vec![update, delete]));
+        assert!(sql.contains("= (''old'') AND"), "{sql}");
+        assert!(
+            sql.contains("NOT IN (SELECT"),
+            "an update may already be counted: {sql}"
+        );
     }
 
     /// The live test's own shape: the child moves to a new parent in the same

@@ -313,6 +313,16 @@ pub enum Change {
         identity_key: bool,
         key: RowKey,
         row: Row,
+        /// The default of every column the row omits and the table gives
+        /// one, by column. An omitted column is inserted at its default
+        /// (ADR-0004), and the pre-delete probe has to know what that is: a
+        /// default that names a parent row this plan deletes is a row
+        /// arriving on it, and the probe cannot see the arrival without this
+        /// (DECISIONS 117). Carried for the reason `key_column` is: apply
+        /// has the plan and nothing else. Absent from older plans, which is
+        /// an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        defaults: BTreeMap<String, String>,
     },
     /// The columns that differ, never the whole row: an `UPDATE` restating a
     /// column that did not change would overwrite a value the declaration and

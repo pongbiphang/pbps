@@ -293,6 +293,31 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// compared, but a role cannot be dropped while it has members, and a plan
 /// that removes them has to say whom. A nested role is a member like any
 /// user and comes back the same way.
+/// Every database principal that is not a role, by name, with the catalog's
+/// own word for what it is (`SQL_USER`, `APPLICATION_ROLE`, ...). Users,
+/// roles and application roles share one namespace, and a `CREATE ROLE` on
+/// a name a user holds fails after everything ordered before it has run —
+/// so a declared role's name is checked against these before a connected
+/// plan is written (DECISIONS 118).
+pub async fn principal_names(conn: &mut Conn) -> Result<BTreeMap<String, String>, DbError> {
+    const PRINCIPALS: &str = "\
+SELECT p.name, p.type_desc
+  FROM sys.database_principals p
+ WHERE p.type <> 'R'
+ ORDER BY p.name;";
+    let mut out = BTreeMap::new();
+    for row in conn.query(PRINCIPALS).await? {
+        out.insert(
+            get::<&str>(&row, "name")?.to_owned(),
+            get::<&str>(&row, "type_desc")?
+                .trim()
+                .to_ascii_lowercase()
+                .replace('_', " "),
+        );
+    }
+    Ok(out)
+}
+
 /// The classes a database principal can own: the catalog view that records
 /// the owner, and the `SELECT` arm that spells each owned securable the way
 /// T-SQL names it (`SCHEMA::sales`, `ROLE::auditors`, `MESSAGE TYPE::m`).

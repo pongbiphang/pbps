@@ -236,7 +236,10 @@ Decisions taken during implementation that this document did not anticipate:
    for. Rows the same plan updates or deletes are left out of the count, so a
    child moved to a new parent in the same revision does not refuse the plan
    that the ordering was designed to make acceptable; an over-exclusion fails
-   loudly in the transaction instead.
+   loudly in the transaction instead. A row the plan puts onto the parent by a defaulted
+   write — an insert that omits the column, an update to `DEFAULT` — is an
+   arrival too: the plan carries the omitted columns' defaults, and a
+   literal one is rendered for the engine to compare (117).
 
 The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
 the read-back, the drift on rows, the `ensure` read staying inside its keys,

@@ -185,6 +185,37 @@ fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     out
 }
 
+/// Refuses, before anything is written, a role name another database
+/// principal holds: users, roles and application roles share one namespace,
+/// and `CREATE ROLE` on a taken name fails after everything ordered before
+/// it has run (DECISIONS 118).
+async fn refuse_taken_role_names(
+    conn: &mut Conn,
+    roles: &[&str],
+    label: &str,
+) -> anyhow::Result<()> {
+    if roles.is_empty() {
+        return Ok(());
+    }
+    let held = pbps_mssql::catalog::principal_names(conn)
+        .await
+        .context("cannot read the database principals")?;
+    let taken: Vec<String> = roles
+        .iter()
+        .filter_map(|name| held.get(*name).map(|kind| format!("`{name}` is a {kind}")))
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "a declared role's name is already held in `{label}`: {}.\n\
+         Users, roles and application roles share one namespace, and `CREATE ROLE` would be \
+         refused after everything before it had run. Rename the role, or rename or drop the \
+         principal by hand.",
+        taken.join(", ")
+    );
+}
+
 /// Refuses a declaration whose text the engine would not read back as
 /// written, before anything is written (DECISIONS 101).
 ///
@@ -947,6 +978,11 @@ pub fn cmd_bootstrap(
             &BTreeMap::new(),
         )
         .await?;
+        // Every declared role is created here, and a user of the same name
+        // would refuse the `CREATE ROLE` after the tables went in
+        // (DECISIONS 118).
+        let declared_roles: Vec<&str> = loaded.schema.roles.keys().map(String::as_str).collect();
+        refuse_taken_role_names(&mut conn, &declared_roles, &target.label).await?;
         // Modules count as much as tables here. `CREATE OR ALTER` would not fail
         // on a view that is already there — it would quietly replace it, with no
         // plan, no risk classification and no approval, which is the opposite of
@@ -1282,6 +1318,24 @@ pub fn cmd_plan_db(
                 over_aliases.join("\n")
             );
         }
+
+        // A role this plan creates needs its name free of every principal,
+        // not only of the roles the managed set knows: users, roles and
+        // application roles share one namespace, and `CREATE ROLE` on a name
+        // a user holds fails after everything ordered before it has run
+        // (DECISIONS 118).
+        let created: Vec<&str> = cs
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::CreateRole { name, .. } = &p.change {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        refuse_taken_role_names(&mut conn, &created, &target.label).await?;
 
         // A role this plan drops still has this environment's members, which
         // the engine will not drop it over. They are read here and written
