@@ -5067,3 +5067,152 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
 
     db.drop().await;
 }
+
+/// A plan that repairs the data and *then* adds the foreign key is a plan the
+/// engine accepts, and the probe must agree with it (DECISIONS 151).
+///
+/// The probe reads the tables before a statement has run, and
+/// `AddForeignKey` sorts after every row change — so a probe built from what
+/// is stored answers about a state that will not exist. Only a live server can
+/// settle both halves at once: that the query the probe now writes runs, and
+/// that its count is the number of rows the `ALTER TABLE ... ADD CONSTRAINT`
+/// actually refuses when the plan's own row changes have gone first.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
+    use pbps_dialect::Dialect;
+    use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
+
+    let mut db = TestDb::create("fkprobe").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.region (code varchar(10) NOT NULL CONSTRAINT pk_region PRIMARY KEY);
+             CREATE TABLE dbo.customer (
+                 code varchar(10) NOT NULL CONSTRAINT pk_customer PRIMARY KEY,
+                 region_code varchar(10) NULL
+             );
+             INSERT INTO dbo.region VALUES ('here');
+             INSERT INTO dbo.customer VALUES
+                 ('stays',    'here'),
+                 ('arriving', 'eu'),
+                 ('repaired', 'nowhere'),
+                 ('doomed',   'nowhere'),
+                 ('exempt',   NULL);",
+        )
+        .await
+        .expect("seed");
+
+    let fk = Change::AddForeignKey {
+        table: TableName::new("dbo", "customer"),
+        name: "fk_customer_region".into(),
+        constraint: Box::new(pbps_model::ForeignKey {
+            columns: vec!["region_code".into()],
+            references_table: TableName::new("dbo", "region"),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        }),
+    };
+    let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+
+    // The three repairs the plan makes before the constraint is created: the
+    // missing parent arrives, one orphan is pointed at it, and one goes.
+    let repairs = vec![
+        PlannedChange::new(Change::InsertRow {
+            table: TableName::new("dbo", "region"),
+            key_column: "code".into(),
+            identity_key: false,
+            key: RowKey::from("eu"),
+            row: pbps_model::Row::default(),
+            defaults: Default::default(),
+            types: Default::default(),
+        }),
+        PlannedChange::new(Change::UpdateRow {
+            table: TableName::new("dbo", "customer"),
+            key_column: "code".into(),
+            key: RowKey::from("repaired"),
+            columns: [("region_code".to_owned(), (text("nowhere"), text("here")))]
+                .into_iter()
+                .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        }),
+        PlannedChange::new(Change::DeleteRow {
+            table: TableName::new("dbo", "customer"),
+            key_column: "code".into(),
+            key: RowKey::from("doomed"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        }),
+    ];
+
+    async fn count(conn: &mut Conn, cs: &ChangeSet) -> i32 {
+        let probes = Mssql.preflight(cs);
+        let probe = probes
+            .iter()
+            .find(|p| p.description.contains("parent"))
+            .unwrap_or_else(|| panic!("no foreign-key probe in {probes:?}"));
+        let rows = conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
+        rows[0].try_get_at(0).unwrap().unwrap()
+    }
+
+    // The constraint alone, against the data as it stands: three orphans.
+    // `exempt` is NULL and the rule lets it through.
+    let alone = ChangeSet {
+        changes: vec![PlannedChange::new(fk.clone())],
+    };
+    assert_eq!(count(&mut db.conn, &alone).await, 3);
+
+    // The same constraint in the plan that repairs the data first: none. This
+    // is the count that used to be 3, refusing a plan the engine accepts.
+    let mut whole = repairs.clone();
+    whole.push(PlannedChange::new(fk.clone()));
+    let whole = ChangeSet { changes: whole };
+    assert_eq!(
+        count(&mut db.conn, &whole).await,
+        0,
+        "a plan that repairs its own orphans must not be refused"
+    );
+
+    // And the engine agrees, which is the only thing that settles it: run the
+    // plan's own statements in order and the constraint is created.
+    apply(&mut db.conn, &whole).await;
+    assert_eq!(count(&mut db.conn, &alone).await, 0, "the data is repaired");
+
+    // The other direction, on the repaired table: a child row the plan itself
+    // inserts, pointing nowhere, is counted — where a probe reading only what
+    // is stored sees an empty table's worth of nothing.
+    db.conn
+        .execute("ALTER TABLE dbo.customer DROP CONSTRAINT fk_customer_region;")
+        .await
+        .expect("drop the constraint");
+    let orphan_arriving = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::InsertRow {
+                table: TableName::new("dbo", "customer"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from("newcomer"),
+                row: [("region_code".to_owned(), Value::Text("mars".into()))]
+                    .into_iter()
+                    .collect(),
+                defaults: Default::default(),
+                types: Default::default(),
+            }),
+            PlannedChange::new(fk),
+        ],
+    };
+    assert_eq!(
+        count(&mut db.conn, &orphan_arriving).await,
+        1,
+        "a row the plan inserts with no parent is one the constraint refuses"
+    );
+
+    db.drop().await;
+}

@@ -932,6 +932,13 @@ SPEC is in sync with all of these.
     the engine refuses inside the transaction and the plan rolls back. The
     delete is the one whose failure is silent, which is why it is the one
     that has to look forward.
+
+    **The sweep asked one question and there were two; see 151.** "Can a probe
+    *miss* a violation" is answered above. "Can a probe *report* one the plan
+    is about to remove" was never asked, and `AddForeignKey` answers it
+    badly: it sorts after every row change, so a plan that supplies the
+    missing parent rows or repairs the orphaned children is refused for the
+    very violation it was written to remove.
 113. **A revision `--since` or `--base` cannot resolve is refused, not read
     as an empty history.** One case is not an error: `HEAD` in a repository
     with no commits, which genuinely has no previous version. Every other
@@ -1606,4 +1613,47 @@ SPEC is in sync with all of these.
     declared table: a change landing inside the apply's own transaction,
     between the two reads, which is the window exactly. With the comparison
     reverted, `apply` reports success and records it.
+
+151. **The new foreign key is probed against the rows the plan will leave,
+    not the ones it finds.** `AddForeignKey` sorts at 11 and the row changes
+    at 9 and 10, so the probe — which runs before statement one — was
+    answering about a table that will not exist in that shape by the time the
+    constraint is created. Two faults, and the first is the one that matters:
+    a plan that inserts the parent rows its children need, or repairs the
+    orphans by update or delete, was **refused for the violation it was
+    written to remove**. Measured: five customers, three of them orphaned, and
+    a plan that adds the missing region, points one orphan at an existing one
+    and deletes the third — the probe counted 3 and the engine, run in plan
+    order, created the constraint without complaint. There is no workaround
+    but splitting one revision into two deployments. The second fault is the
+    mirror: a child row the plan itself inserts with no parent was counted by
+    nothing, so under `apply --staged` the insert commits and the constraint
+    then fails, with the environment left half-changed.
+    112's sweep did not see either, because it asked only whether a probe
+    could *miss* a violation and answered that for this one correctly: inside
+    a transaction the engine's refusal is loud and total. A false refusal is
+    not loud — it is a plan that never runs.
+    The fix asks the engine for the arithmetic rather than doing it here.
+    `rows_after` builds each side of the comparison as a derived table: what
+    is stored, minus the rows this plan deletes and the ones it rewrites *in
+    the key's own columns*, union what it writes — a literal row per insert,
+    and per rewriting update a row taking the changed cells from the plan and
+    the rest from the table. Both sides go through it, so the parent's rows
+    include the ones the plan inserts and exclude the ones it deletes, and a
+    table this plan creates simply has no stored branch. That last case was
+    unprobed before and is ADR-0004's own flow: create the parent, insert its
+    rows, add the key that references them.
+    A row is dropped from the comparison where the plan writes a value the
+    probe cannot evaluate into one of the key's columns — a default that is
+    not a literal, which has no value before it runs (117). That is the
+    direction every other probe leans, and here it is the safe one: the engine
+    refuses such a row loudly inside the transaction, where a guess could
+    refuse a plan that is perfectly good.
+    **Still not counted, and deliberately:** a parent row this plan deletes is
+    excluded from the parent side, so a child left pointing at it *is* now
+    reported — but a parent row an `UpdateRow` moves *off* a referenced value
+    is not, because a foreign key may reference a `UNIQUE` rather than the
+    primary key and an update can write those columns. The probe stays
+    over-permissive there, which is 112's accepted mode for this probe: the
+    engine refuses, loudly, inside the transaction.
 

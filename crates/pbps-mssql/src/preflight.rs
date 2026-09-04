@@ -446,39 +446,46 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             name,
             constraint,
         } => {
-            let Some((child_table, child_columns)) =
-                stored_columns(names, table, &constraint.columns)
+            // Both sides as the plan will leave them, not as they stand:
+            // `AddForeignKey` sorts after every row change, so a plan that
+            // supplies the missing parent rows, or repairs the orphaned
+            // children, is a plan this constraint will accept (DECISIONS 151).
+            let Some(child) = rows_after(
+                names,
+                table,
+                &constraint.columns,
+                names.moved.get(table),
+                "c",
+            )?
             else {
                 return Ok(Vec::new());
             };
-            let Some((parent_table, parent_columns)) = stored_columns(
+            let Some(parent) = rows_after(
                 names,
                 &constraint.references_table,
                 &constraint.references_columns,
-            ) else {
+                names.moved.get(&constraint.references_table),
+                "p",
+            )?
+            else {
                 return Ok(Vec::new());
             };
 
             // A row with any NULL in the key is exempt from the constraint
             // (MATCH SIMPLE, which is what SQL Server implements), so excluding
             // them is not leniency — it is the rule.
-            let not_null: Vec<String> = child_columns
-                .iter()
-                .map(|c| Ok(format!("c.{} IS NOT NULL", quote(c)?)))
-                .collect::<Result<_, DialectError>>()?;
-            let join: Vec<String> = child_columns
-                .iter()
-                .zip(&parent_columns)
-                .map(|(child, parent)| Ok(format!("p.{} = c.{}", quote(parent)?, quote(child)?)))
-                .collect::<Result<_, DialectError>>()?;
+            let not_null: Vec<String> = (0..constraint.columns.len())
+                .map(|i| format!("r.k{i} IS NOT NULL"))
+                .collect();
+            let join: Vec<String> = (0..constraint.columns.len())
+                .map(|i| format!("q.k{i} = r.k{i}"))
+                .collect();
 
             Ok(vec![Probe::new(
                 format!("rows with no matching parent for the new foreign key {name}"),
                 format!(
-                    "SELECT COUNT(*) AS n FROM {} AS c\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM {} AS p WHERE {});",
-                    qualified(&child_table)?,
+                    "SELECT COUNT(*) AS n FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {});",
                     not_null.join("\n   AND "),
-                    qualified(&parent_table)?,
                     join.join(" AND ")
                 ),
             )])
@@ -1097,6 +1104,152 @@ fn unprobeable_probe(
     )))
 }
 
+/// One table's rows in `columns`, as the plan will have left them by the time
+/// the change that asks runs — a derived table whose columns are `k0`..`kn`.
+///
+/// `AddForeignKey` sorts after every row change (`order_key`), so a probe
+/// built from what is stored answers about a table that no longer exists in
+/// that shape: a plan that inserts the missing parent rows, or repairs the
+/// orphaned children, is refused for a violation it was written to remove,
+/// and a child row the plan itself inserts is not counted at all. Both were
+/// invisible to DECISIONS 112's sweep, which asked only whether a probe could
+/// *miss* a violation (DECISIONS 151).
+///
+/// The engine does the arithmetic. What is stored, minus the rows this plan
+/// deletes and the ones it rewrites in these very columns, union what it
+/// writes: a literal row per insert, and per rewriting update a row that
+/// takes the changed cells from the plan and the rest from the table.
+///
+/// `None` where there is nothing to select from — a table this plan creates
+/// that declares no rows — because an empty `UNION ALL` is not a query. A
+/// created table with declared rows is fine, and is the ADR-0004 flow: create
+/// the parent, insert its rows, add the key that references them.
+///
+/// A single row is dropped where the plan writes a value the probe cannot
+/// evaluate into one of `columns` — a default that is not a literal, which
+/// has no value before it runs (117). That is the same direction every other
+/// probe leans: the engine refuses such a row loudly inside the transaction,
+/// where a guess here could refuse a plan that is perfectly good.
+fn rows_after(
+    names: &AsStored,
+    table: &TableName,
+    columns: &[String],
+    moved: Option<&Moved>,
+    alias: &str,
+) -> Result<Option<String>, DialectError> {
+    let mut branches = Vec::new();
+
+    // What the table already holds, where it already exists.
+    if let Some((stored, stored_columns)) = stored_columns(names, table, columns) {
+        let selected: Vec<String> = stored_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Ok(format!("{alias}.{} AS k{i}", quote(c)?)))
+            .collect::<Result<_, DialectError>>()?;
+        let mut sql = format!(
+            "SELECT {} FROM {} AS {alias}",
+            selected.join(", "),
+            qualified(&stored)?
+        );
+        // Minus the rows this plan takes away or moves within these columns:
+        // both run first, so counting them is counting a state that will not
+        // be there. A row the plan rewrites comes back below, as it will be.
+        if let Some(m) = moved {
+            // A set, so the list is sorted and a key named by both halves is
+            // named once: serialization is deterministic here as everywhere.
+            let gone: BTreeSet<String> = m
+                .deleted
+                .iter()
+                .chain(
+                    m.updated
+                        .iter()
+                        .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
+                        .map(|(key, _)| key),
+                )
+                .map(|k| literal(k.as_str()))
+                .collect();
+            if !gone.is_empty() {
+                let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                    return Ok(None);
+                };
+                sql.push_str(&format!(
+                    " WHERE {alias}.{} NOT IN ({})",
+                    quote(&key_column.name)?,
+                    gone.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        branches.push(sql);
+    }
+
+    // And what this plan puts there.
+    if let Some(m) = moved {
+        let unprobeable = |column: &String, key: &RowKey| {
+            m.unprobeable
+                .get(column)
+                .is_some_and(|rows| rows.contains(key))
+        };
+        for (key, cells) in &m.inserted {
+            // Every column of the key spelled outright: an insert names the
+            // whole row, and a column it omits arrives at NULL — which is a
+            // row the constraint exempts, not one it refuses.
+            let mut values = Vec::new();
+            for column in columns {
+                match cells.get(column) {
+                    Some(sql) => values.push(sql.clone()),
+                    None if unprobeable(column, key) => {
+                        values.clear();
+                        break;
+                    }
+                    None => values.push("NULL".to_owned()),
+                }
+            }
+            if !values.is_empty() {
+                branches.push(format!("SELECT {}", values.join(", ")));
+            }
+        }
+        for (key, cells) in &m.updated {
+            if !cells.keys().any(|c| columns.contains(c)) {
+                continue;
+            }
+            // The cells this update writes, and the table's own for the rest:
+            // an update names only what changes, and the columns it leaves
+            // alone are still part of the key.
+            let Some((stored, stored_columns)) = stored_columns(names, table, columns) else {
+                continue;
+            };
+            let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                continue;
+            };
+            let mut values = Vec::new();
+            for (column, stored_column) in columns.iter().zip(&stored_columns) {
+                match cells.get(column) {
+                    Some(Some(sql)) => values.push(sql.clone()),
+                    Some(None) if unprobeable(column, key) => {
+                        values.clear();
+                        break;
+                    }
+                    // Set to NULL: exempt, and spelled so rather than read
+                    // from the row it is about to leave.
+                    Some(None) => values.push("NULL".to_owned()),
+                    None => values.push(format!("{alias}.{}", quote(stored_column)?)),
+                }
+            }
+            if !values.is_empty() {
+                branches.push(format!(
+                    "SELECT {} FROM {} AS {alias} WHERE {alias}.{} = {}",
+                    values.join(", "),
+                    qualified(&stored)?,
+                    quote(&key_column.name)?,
+                    literal(key.as_str())
+                ));
+            }
+        }
+    }
+
+    Ok((!branches.is_empty()).then(|| branches.join("\n UNION ALL ")))
+}
+
 /// The table and columns as the database currently names them, or `None` when
 /// the table does not exist yet.
 fn stored_columns(
@@ -1411,7 +1564,128 @@ mod tests {
         assert!(sql[0].contains("[dbo].[region] AS p"), "{sql:?}");
         // A NULL key is exempt from the constraint, so it must be exempt from
         // the probe too, or every optional relationship reports false orphans.
-        assert!(sql[0].contains("c.[region_id] IS NOT NULL"), "{sql:?}");
+        assert!(sql[0].contains("r.k0 IS NOT NULL"), "{sql:?}");
+        // A plan with no row changes asks about the two tables and nothing
+        // else: the shape below costs nothing where there is nothing to add.
+        assert!(
+            sql[0].contains("SELECT c.[region_id] AS k0 FROM [dbo].[customer] AS c\n) AS r"),
+            "{sql:?}"
+        );
+        assert!(!sql[0].contains("UNION ALL"), "{sql:?}");
+    }
+
+    /// The fault both halves of the review found: `AddForeignKey` sorts after
+    /// every row change, so a probe built from what is stored refuses a plan
+    /// that supplies the parent row the children need (DECISIONS 151).
+    #[test]
+    fn a_new_foreign_key_counts_the_parent_rows_this_plan_inserts() {
+        let sql = probes(&plan(vec![
+            Change::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "region_id".into(),
+                identity_key: false,
+                key: RowKey::from("eu"),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        // The parent side is what is there plus what arrives, so a child
+        // already pointing at `eu` is not an orphan.
+        assert!(sql[0].contains("UNION ALL SELECT N'eu'"), "{sql:?}");
+    }
+
+    /// The other half: an orphan this same plan repairs or removes must not be
+    /// counted against the constraint that will be created after it.
+    #[test]
+    fn a_new_foreign_key_ignores_the_child_rows_this_plan_repairs() {
+        let deleted = Change::DeleteRow {
+            table: tname("dbo.customer"),
+            key_column: "code".into(),
+            key: RowKey::from("gone"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        let repaired = Change::UpdateRow {
+            table: tname("dbo.customer"),
+            key_column: "code".into(),
+            key: RowKey::from("fixed"),
+            columns: [(
+                "region_id".to_owned(),
+                (
+                    Cell::Value(Value::Text("nowhere".into())),
+                    Cell::Value(Value::Text("eu".into())),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        // And one that leaves the key alone: it stays in the stored scan,
+        // because the plan does nothing to where it points.
+        let elsewhere = Change::UpdateRow {
+            table: tname("dbo.customer"),
+            key_column: "code".into(),
+            key: RowKey::from("untouched"),
+            columns: [(
+                "note".to_owned(),
+                (
+                    Cell::Value(Value::Text("a".into())),
+                    Cell::Value(Value::Text("b".into())),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        let sql = probes(&plan(vec![deleted, repaired, elsewhere, fk()]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect::<Vec<_>>();
+        let fk_sql = sql
+            .iter()
+            .find(|s| s.contains("k0"))
+            .unwrap_or_else(|| panic!("{sql:?}"));
+        // Both the deleted row and the repaired one leave the stored scan...
+        assert!(
+            fk_sql.contains("WHERE c.[code] NOT IN (N'fixed', N'gone')"),
+            "{fk_sql}"
+        );
+        // ...and the repaired one comes back as the plan will leave it.
+        assert!(
+            fk_sql.contains(
+                "UNION ALL SELECT N'eu' FROM [dbo].[customer] AS c WHERE c.[code] = N'fixed'"
+            ),
+            "{fk_sql}"
+        );
+        // The row whose key the plan does not touch is neither excluded nor
+        // restated: it is counted exactly once, out of the table.
+        assert!(!fk_sql.contains("N'untouched'"), "{fk_sql}");
+    }
+
+    fn fk() -> Change {
+        Change::AddForeignKey {
+            table: tname("dbo.customer"),
+            name: "fk_customer_region".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["region_id".into()],
+                references_table: tname("dbo.region"),
+                references_columns: vec!["region_id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        }
     }
 
     #[test]
