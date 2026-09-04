@@ -152,6 +152,74 @@ async fn baseline_state(
     Ok((scoped, comparable))
 }
 
+/// The same two projections for a staged apply, which needs a third
+/// difference: a checkpoint watches every module the plan *names*, including
+/// ones it has yet to create (DECISIONS 164), while the checksum has to be
+/// taken over exactly the managed set the plan was pinned to or no plan would
+/// validate at all. Two cuts of one read, not two reads.
+///
+/// It was two reads, with the preflight probes and the resume checks running
+/// between them. Anything another session changed in that window was already
+/// in the second read, so it became the baseline every later checkpoint was
+/// measured against — never reported, and finally recorded as clean by the
+/// closing ordinary snapshot, which is the state `verify` compares against
+/// ever after. [`baseline_state`] states the rule this broke: two reads ask
+/// the engine the same thing twice and can get two answers, which is the very
+/// thing the comparison exists to detect (DECISIONS 174).
+#[allow(clippy::too_many_arguments)]
+async fn staged_baseline(
+    conn: &mut Conn,
+    ids: &IdsFile,
+    checked: &BTreeSet<ObjectName>,
+    watched: &BTreeSet<ObjectName>,
+    unmanaged: pbps_config::Unmanaged,
+    checked_scopes: &DataScopes,
+    recorded: &Schema,
+    watched_scopes: &DataScopes,
+) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
+    let pulled = pull(conn).await?;
+    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+    // Over the *watched* set, which contains the checked one: a module this
+    // plan is about to write that the catalog cannot read back is a
+    // limitation, and it is only in the wider set. The two reads this
+    // replaces each refused over their own set, so refusing over the union is
+    // what keeps that (491edd9, DECISIONS 174).
+    debug_assert!(checked.is_subset(watched));
+    refuse_managed_limitations(&managed_limitations(&pulled, ids, watched))?;
+
+    let mut scoped = cut(&pulled, ids, checked, &unreadable, unmanaged)?;
+    // The watch cut is the one the row read is taken against, because it is
+    // the wider of the two: a module the plan creates is in it and not in the
+    // checksum's, and no table is in either alone. `Unmanaged::Ignore`
+    // because the policy has already been applied, by the cut above — running
+    // it twice would report the same object twice.
+    let watching = cut(
+        &pulled,
+        ids,
+        watched,
+        &unreadable,
+        pbps_config::Unmanaged::Ignore,
+    )?;
+    let rows = pbps_mssql::catalog::read_rows(
+        conn,
+        &watching.schema,
+        &rows_to_read(&pinned_scopes(checked_scopes, watched_scopes)),
+    )
+    .await
+    .context("cannot read the declared rows back")?;
+
+    // Spelled two ways for the reason `baseline_state` gives: the checksum
+    // under the recorded state's spelling of a cell at its default, the
+    // comparison the way the checkpoint read that follows it will be.
+    let previous = watching
+        .schema
+        .with_observed_rows(&rows, watched_scopes, &Schema::default())?;
+    scoped.schema = scoped
+        .schema
+        .with_observed_rows(&rows, checked_scopes, recorded)?;
+    Ok((scoped, previous))
+}
+
 /// Introspects, cuts the result down to the managed set, reads the rows of
 /// every table in `read`, and reports whatever the read itself could not
 /// express.
@@ -172,15 +240,45 @@ async fn managed_state_full(
     unmanaged: pbps_config::Unmanaged,
     read: &BTreeMap<TableName, RowScope>,
 ) -> anyhow::Result<Managed> {
+    let pulled = pull(conn).await?;
+    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+    let limitations = managed_limitations(&pulled, ids, modules);
+    let scoped = cut(&pulled, ids, modules, &unreadable, unmanaged)?;
+    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, read)
+        .await
+        .context("cannot read the declared rows back")?;
+    Ok(Managed {
+        scoped,
+        limitations,
+        unreadable,
+        rows,
+    })
+}
+
+/// The catalog, read once.
+///
+/// Split out so a caller that needs two *cuts* of one database state can take
+/// them from one read. Two reads would ask the engine the same thing twice
+/// and could get two answers, which is the very thing a movement comparison
+/// exists to detect (DECISIONS 174).
+async fn pull(conn: &mut Conn) -> anyhow::Result<pbps_mssql::introspect::Pulled> {
     let pulled = pbps_mssql::catalog::introspect(conn)
         .await
         .context("cannot read the database catalog")?;
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
     }
-    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
-    let limitations = managed_limitations(&pulled, ids, modules);
+    Ok(pulled)
+}
 
+/// One cut of a pulled catalog down to a managed set. Pure.
+fn cut(
+    pulled: &pbps_mssql::introspect::Pulled,
+    ids: &IdsFile,
+    modules: &BTreeSet<ObjectName>,
+    unreadable: &[(ObjectName, String)],
+    unmanaged: pbps_config::Unmanaged,
+) -> anyhow::Result<pbps_diff::Scoped> {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     // A managed role's grant WITH GRANT OPTION is wider than the plain grant
     // the declarations can spell, and was left out of the role's set rather
@@ -193,16 +291,8 @@ async fn managed_state_full(
             scoped.unexpressible.push(what.clone());
         }
     }
-    report_unmanaged(&scoped, &unreadable, modules, unmanaged)?;
-    let rows = pbps_mssql::catalog::read_rows(conn, &scoped.schema, read)
-        .await
-        .context("cannot read the declared rows back")?;
-    Ok(Managed {
-        scoped,
-        limitations,
-        unreadable,
-        rows,
-    })
+    report_unmanaged(&scoped, unreadable, modules, unmanaged)?;
+    Ok(scoped)
 }
 
 /// The modules the declarations name and the rows they declare, for the
@@ -3421,7 +3511,11 @@ async fn apply_staged_under_lock(
         );
     };
 
-    let start = if resume {
+    // Both branches read once and hand back what they validated: the
+    // statement to start at, and the state the checkpoints are measured
+    // against. Returned together so there is no way to reach the loop with a
+    // baseline from some other read (DECISIONS 174).
+    let (start, mut previous) = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
             (Some(p), StateKind::Staged | StateKind::Failed) => p.clone(),
             _ => bail!(
@@ -3449,15 +3543,21 @@ async fn apply_staged_under_lock(
         // paused would pass unseen into the closing entry.
         let after_modules = modules_after(&entry.snapshot, &plan.changes, Settled::SoFar);
         let at_checkpoint = &entry.snapshot.ids;
-        let scoped = managed_state(
+        // The state the checkpoints to come are measured against comes out of
+        // *this* read — the one the comparison below validates — and not out
+        // of a second one taken after these checks (DECISIONS 174).
+        let (scoped, watching) = staged_baseline(
             conn,
             at_checkpoint,
+            &after_modules,
             &after_modules,
             project.config.unmanaged,
             &entry.snapshot.schema.data_scopes(),
             &entry.snapshot.schema,
+            &scopes_at(plan, at_checkpoint),
         )
         .await?;
+
         let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
         let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, at_checkpoint);
         if live != checkpoint {
@@ -3509,7 +3609,7 @@ async fn apply_staged_under_lock(
                 statements.len()
             );
         }
-        progress.completed
+        (progress.completed, watching)
     } else {
         if entry.snapshot.staged.is_some() {
             bail!(
@@ -3524,18 +3624,25 @@ async fn apply_staged_under_lock(
         }
         let recorded_ids = entry.snapshot.ids.clone();
         let recorded_modules = managed_modules(Some(&entry.snapshot), None);
-        let scoped = managed_state(
+        // Two cuts of one read: the checksum over the managed set the plan was
+        // pinned to, and beside it the state the checkpoints are measured
+        // against, which watches every module the plan names as well
+        // (DECISIONS 174).
+        let (scoped, watching) = staged_baseline(
             conn,
             &recorded_ids,
             &recorded_modules,
+            &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             project.config.unmanaged,
             &pinned_scopes(
                 &entry.snapshot.schema.data_scopes(),
                 &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
             ),
             &entry.snapshot.schema,
+            &scopes_at(plan, &recorded_ids),
         )
         .await?;
+
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
         if live != plan.baseline.checksum {
             bail!(
@@ -3554,7 +3661,7 @@ async fn apply_staged_under_lock(
         // those names have already moved — a probe answered about the wrong
         // object is worse than one that was not asked.
         preflight(conn, dialect, plan, rename_targets).await?;
-        0
+        (0, watching)
     };
 
     let total = statements.len();
@@ -3574,16 +3681,6 @@ async fn apply_staged_under_lock(
     // so an edit that landed between two statements was carried into every
     // later read and finally into the closing ordinary snapshot, which is the
     // state `verify` measures against ever after (DECISIONS 159).
-    let mut previous = managed_state(
-        conn,
-        &live_ids,
-        &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
-        pbps_config::Unmanaged::Ignore,
-        &scopes_at(plan, &live_ids),
-        &Schema::default(),
-    )
-    .await?
-    .schema;
     println!(
         "Applying {} statement(s) without a transaction...",
         total - start

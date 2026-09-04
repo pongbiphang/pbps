@@ -2295,3 +2295,46 @@ SPEC is in sync with all of these.
     (SPEC §7.1), and it is an add. Asking the risk would make one added column
     both sides of the pattern and fire the rule on it alone — which is why the
     named arms in that match are worth the length they cost.
+
+174. **One read for the staged baseline, and a probe over the rows its own
+    statement will meet.**
+    **The read.** [`baseline_state`] already carried the rule in its own doc —
+    "one read and two projections, never two reads: two reads would ask the
+    engine the same thing twice and could get two answers, which is the very
+    thing the comparison exists to detect" — and the staged path took two.
+    Between them ran the preflight probes and, on a resume, the role checks.
+    Anything another session changed in that window was already in the second
+    read, so it became the baseline every later checkpoint was measured
+    against: never reported, and finally written down by the closing ordinary
+    snapshot as this plan's own result, which is the state `verify` compares
+    against ever after.
+    A staged apply needs a third difference the transactional one does not: a
+    checkpoint watches every module the plan *names*, including ones it has
+    yet to create (164), while the checksum must be taken over exactly the
+    managed set the plan was pinned to or no plan would validate at all. So
+    `staged_baseline` takes two *cuts* of one read rather than one cut of two.
+    `pull` and `cut` were split out for it, and the two branches now hand the
+    baseline back beside the statement to start at, so there is no way to
+    reach the loop with a baseline from some other read.
+    Note what the refactor nearly dropped: each of the two reads refused
+    `managed_limitations` over its own module set, and the wider one is what
+    catches a module this plan is about to write that the catalog cannot read
+    back (491edd9). One read refuses over the union, which is the same thing —
+    and a `debug_assert` records that the union is the watched set.
+    **The probe.** `order_key` runs every row change (9, 10) before every
+    constraint a plan adds (11), and `AddCheck`'s probe counted the rows
+    standing now. A plan that deletes its own violations and then tightens was
+    refused for violations that will be gone; a plan that writes violating
+    rows was told there were none. The ordering is what draws the boundary,
+    and it is worth stating: **only a probe whose statement sorts after the
+    row changes has this problem.** `AlterColumnType`, `AlterColumnNullability`
+    and `AddColumn` all sort before them (6-8), so reading the current table
+    is exactly right for those. At 11 with `AddCheck` sit `AddUnique` and
+    `SetPrimaryKey`, which have it too.
+    The check's own fix cannot be the foreign key's. `rows_after` builds the
+    rows a plan will leave *for a named column list*, because a foreign key's
+    columns are the constraint; a check is an arbitrary predicate over columns
+    the plan does not carry, and the expression is deliberately never
+    rewritten. So: minus the rows it deletes, which is exact — and no answer
+    at all where it inserts or updates, which is what an unspellable row gets
+    everywhere else (117, 165, 171).

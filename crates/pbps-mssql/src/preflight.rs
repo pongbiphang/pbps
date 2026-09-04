@@ -491,8 +491,20 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             let Some(stored) = names.table(table) else {
                 return Ok(Vec::new());
             };
-            Ok(vec![Probe::new(
-                format!("rows that violate the new check {name}"),
+            // The rows the statement will meet, not the rows standing now.
+            // `order_key` runs every row change (9, 10) before every
+            // constraint this plan adds (11), which is what makes the two
+            // different (DECISIONS 174).
+            let moved = names.moved.get(table);
+            // A row this plan writes cannot be spelled against an arbitrary
+            // predicate: evaluating it needs every column of the row, and the
+            // plan carries only the ones it sets. Unlike a foreign key, whose
+            // columns *are* the constraint, so `rows_after` can build them.
+            // No answer, as everywhere else one cannot be given.
+            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty()) {
+                return Ok(Vec::new());
+            }
+            let mut sql = format!(
                 // A CHECK rejects a row only when its predicate is FALSE;
                 // UNKNOWN passes. `WHERE NOT (expr)` has exactly that
                 // behaviour, so the count matches what the engine will refuse.
@@ -501,11 +513,31 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 // text by substitution is how a tool that promised never to
                 // parse SQL starts parsing it badly. Such a probe fails to run
                 // and is reported as unchecked, which is honest.
-                format!(
-                    "SELECT COUNT(*) AS n FROM {} WHERE NOT ({});",
-                    qualified(&stored)?,
-                    constraint.expression
-                ),
+                "SELECT COUNT(*) AS n FROM {} WHERE NOT ({})",
+                qualified(&stored)?,
+                constraint.expression
+            );
+            // Minus the rows it deletes: they will not be there to violate
+            // anything, and counting them refused a plan that cleans up after
+            // itself before tightening.
+            if let Some(m) = moved
+                && !m.deleted.is_empty()
+            {
+                let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                    return Ok(Vec::new());
+                };
+                let gone: BTreeSet<String> =
+                    m.deleted.iter().map(|k| literal(k.as_str())).collect();
+                sql.push_str(&format!(
+                    " AND {} NOT IN ({})",
+                    quote(&key_column.name)?,
+                    gone.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            sql.push(';');
+            Ok(vec![Probe::new(
+                format!("rows that violate the new check {name}"),
+                sql,
             )])
         }
 
@@ -2224,6 +2256,90 @@ mod tests {
             !sql.iter().any(|s| s.contains("k0")),
             "a partial relation is not an answer: {sql:?}"
         );
+    }
+
+    /// `order_key` runs every row change (9, 10) before every constraint
+    /// this plan adds (11), so the rows an `ADD CHECK` will meet are not the
+    /// rows standing now. Counting the current ones blocked a plan that
+    /// deletes its own violations first, and said nothing about the rows the
+    /// plan is about to write (DECISIONS 174).
+    #[test]
+    fn a_check_is_probed_over_the_rows_its_statement_will_meet() {
+        let check = Change::AddCheck {
+            table: tname("dbo.customer"),
+            name: "ck_positive".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "[amount] >= 0".into(),
+            },
+        };
+        let sql = |changes: Vec<Change>| {
+            probes(&plan(changes))
+                .into_iter()
+                .filter(|p| p.description.contains("ck_positive"))
+                .map(|p| p.sql)
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing writes rows here: the table as it stands is the table the
+        // statement will meet.
+        let s = sql(vec![check.clone()]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(
+            s[0].contains("FROM [dbo].[customer] WHERE NOT ([amount] >= 0);"),
+            "{s:?}"
+        );
+
+        // A row this plan deletes will not be there to violate anything.
+        let s = sql(vec![
+            Change::DeleteRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                key: RowKey::from("bad"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                row: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+            },
+            check.clone(),
+        ]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].contains("[code] NOT IN (N'bad')"), "{s:?}");
+
+        // A row it writes cannot be spelled against an arbitrary predicate:
+        // the probe would need every column of the row, and the plan carries
+        // only the ones it sets. No answer, as everywhere else one cannot be
+        // given.
+        for writing in [
+            Change::InsertRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from("new"),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            },
+            Change::UpdateRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                columns: [(
+                    "amount".to_owned(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Int(1)),
+                        pbps_model::Cell::Value(pbps_model::Value::Int(2)),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                unchanged: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+            },
+        ] {
+            let s = sql(vec![writing, check.clone()]);
+            assert!(s.is_empty(), "no answer is the honest one: {s:?}");
+        }
     }
 
     /// A probe runs before the first statement, so a column this plan is
