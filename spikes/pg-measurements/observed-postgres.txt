@@ -72,8 +72,8 @@ R12 | RESTART at min(keys)-1, the direction the sequence counts | accepted / acc
 R13 | a backslash-escaped quote inside an E-string | standard_conforming_strings=on, E'it\'s  here' is 10 characters: it's  here
 A26 | a SECURITY DEFINER function before a rebuild | owner=m_owner secdef=true acl=NULL
 A27 | the same function after the deployment account rebuilds it | owner=postgres secdef=true acl=NULL — so the ACL check cannot see the change
-R14 | the lock held after only reading max(id) | AccessShareLock — which does not block INSERT
-R15 | the lock held once the RESTART runs | AccessExclusiveLock, AccessShareLock — taken too late to close the window
+R14 | the lock held after only reading max(id) | AccessShareLock
+R15 | the lock held once the RESTART runs | AccessExclusiveLock, AccessShareLock
 A28 | options a view carries outside its definition | reloptions: security_invoker=true, security_barrier=true / pg_get_viewdef shows: SELECT id, a FROM opt_t;
 A29 | those options after CREATE OR REPLACE | accepted, reloptions: NULL — lost
 A30 | those options after a drop-and-create rebuild | reloptions: NULL — lost

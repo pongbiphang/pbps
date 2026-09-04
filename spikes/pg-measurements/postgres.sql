@@ -376,12 +376,12 @@ SELECT max(id) FROM m.lockseq;
 SELECT 'R14', 'the lock held after only reading max(id)',
        coalesce((SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
                  WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid()), '(none)')
-       || ' — which does not block INSERT';
+       ;   -- what that lock permits is argued in the ADR, not observed here
 ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2;
 SELECT 'R15', 'the lock held once the RESTART runs',
        (SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
         WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid())
-       || ' — taken too late to close the window';
+       ;   -- likewise: the ordering is the observation, the window is the argument
 COMMIT;
 
 -- -------------------------------------- the fifth 2026-09-05 review round

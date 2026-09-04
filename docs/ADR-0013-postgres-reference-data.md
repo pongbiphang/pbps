@@ -139,10 +139,15 @@ Two things follow, and the first matters more:
 
   ```
   BEGIN;
-  SELECT max(id) FROM m.lockseq;        -- AccessShareLock: does not block INSERT
-  ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2;
-                                        -- AccessExclusiveLock: taken too late
+  SELECT max(id) FROM m.lockseq;                        -- AccessShareLock
+  ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2; -- AccessExclusiveLock
   ```
+
+  The lock *modes* are measured; that `AccessShareLock` does not conflict with
+  the `RowExclusiveLock` an `INSERT` takes is PostgreSQL's documented conflict
+  table, which is reasoning and is marked as such. The two together are the
+  window: nothing the read holds keeps another session out, and the lock that
+  would is taken only when the restart runs.
 
   A concurrent transaction can allocate and commit the next key in that window,
   and the restart then points at a key that already exists. So the emitter takes
