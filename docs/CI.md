@@ -20,9 +20,16 @@ Three exit codes, one meaning each, across the commands a pipeline gates on —
 
 | Code | Means | A pipeline should |
 |---|---|---|
-| `0` | success, nothing to report | continue |
-| `2` | a **finding** — the command ran, and the answer is bad news | fail the job, and show the finding |
+| `0` | the command ran and found **no error** — it may still have reported warnings or notes | continue, but read the findings |
+| `2` | at least one **error** finding — the command ran, and the answer is bad news | fail the job, and show the finding |
 | `1` | a **tool failure** — the command could not answer at all | fail the job, and page whoever owns the pipeline |
+
+`0` is not "nothing to report": only an *error* finding moves the code. Measured
+— `validate` on a project whose declared rows exceed `max_data_rows` exits `0`
+with a `schema.data-large` **warning**, and an offline `plan` against an empty
+baseline exits `0` with `baseline.empty`. Both are things a reviewer should see.
+A pipeline that routes findings rather than only gating on them should read
+`--format json` on every run, not just on the failing ones.
 
 The split matters because the two failures have different owners: a `2` from
 `pbps validate` belongs to the author of the change, and a `1` from
@@ -89,7 +96,8 @@ has no `url:` field for the same reason.
 |---|---|---|
 | `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true`. An **environment** secret / **protected** variable — see "Who can reach the credential" |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
-| `APPROVED_PLAN_SHA256` | `apply --checksum` | not a secret; it is the approval, supplied by whoever approved |
+| `PBPS_PROD_URL` on `monitoring` | `verify`, `status` | the drift watch's copy. `verify` reads and writes nothing, so this one is a **read-only** account |
+| the plan's SHA-256 | `apply --checksum` | not a secret; it is the approval. A `workflow_dispatch` input on GitHub, a manual-job variable on GitLab — supplied by whoever approved, at the moment they approve |
 
 `pbps doctor --env prod` is the one command to run first: it answers whether
 that account can actually deploy — reachability, edition, the minimum
@@ -136,9 +144,15 @@ on:
   pull_request:
   push:
     tags: ['prod-v*']
+  workflow_dispatch:            # the approver starts the apply, carrying their approval
+    inputs:
+      plan_run: { description: 'Run ID of the plan job for this tag', required: true }
+      checksum: { description: 'SHA-256 printed by pbps explain', required: true }
+      allow:    { description: 'Risk classes approved, comma-separated; empty for none' }
 
 permissions:
   contents: read
+  actions: read                 # to download the plan artifact from that run
 
 jobs:
   # ---- the merge-request layer: offline, no database, no secrets ----
@@ -206,15 +220,15 @@ jobs:
             plan.json
             plan.sql
 
-  # ---- the gate: `environment:` is what makes GitHub ask a human ----
+  # ---- the gate: the approver dispatches this, and `environment:` still asks ----
   apply:
-    needs: plan
-    if: startsWith(github.ref, 'refs/tags/prod-v')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: production        # configure required reviewers on this environment
     env:
       PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
     steps:
+      # Dispatch from the same `prod-v*` tag the plan was computed on.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
@@ -222,14 +236,23 @@ jobs:
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v4
-        with: { name: plan }
+        with:
+          name: plan
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: apply exactly the approved artifact
+        env:
+          # Through the environment, never interpolated into the script: an
+          # input is text somebody typed.
+          CHECKSUM: ${{ inputs.checksum }}
+          ALLOW: ${{ inputs.allow }}
         run: |
-          pbps apply --env prod \
-            --plan plan.json \
-            --checksum "${{ vars.APPROVED_PLAN_SHA256 }}" \
-            --allow rename,narrowing
+          set -- --env prod --plan plan.json --checksum "$CHECKSUM"
+          # `--allow ""` is rejected — "unknown risk class ``" — so the flag
+          # goes in only when the approver named a class.
+          if [ -n "$ALLOW" ]; then set -- "$@" --allow "$ALLOW"; fi
+          pbps apply "$@"
 ```
 
 ### Who can reach the credential
@@ -255,6 +278,11 @@ of them is optional:
   is what starts all of this; without that rule the two settings above only
   decide *which job* gets the credential, never *who* set it running.
 
+The drift watch is the fourth setting, and the easiest one to get wrong: a
+scheduled run references no deployment environment, so it receives nothing from
+either of them. It has an environment of its own (`monitoring`) holding a
+read-only account — see "Drift watch".
+
 `production-plan` has no required reviewers on purpose. Putting them there would
 ask a human to approve before the plan exists — before there is a checksum to
 approve — which is the thing this pipeline exists to avoid.
@@ -278,28 +306,22 @@ Two things about the `apply` job are load-bearing:
   only that a file equals itself — so the value has to come from the approver.
 
   GitHub's `environment:` gate approves *the run*, not the artifact, and gives
-  the reviewer nowhere to type a value. Two honest ways to close that:
+  the reviewer nowhere to type a value. So the apply is **dispatched by the
+  approver**, who pastes what `explain` printed: the value travels with the
+  approval rather than beside it, and the environment's required reviewers
+  still stand behind it.
 
-  ```yaml
-  # (a) the approver dispatches the deployment and pastes what `explain` printed
-  on:
-    workflow_dispatch:
-      inputs:
-        checksum: { description: 'SHA-256 from pbps explain', required: true }
-        allow:    { description: 'Risk classes approved', default: '' }
-  # ...then: --checksum "${{ inputs.checksum }}" --allow "${{ inputs.allow }}"
-  ```
+  A repository configuration variable — `--checksum "${{ vars.APPROVED_PLAN_SHA256 }}"`,
+  recorded by the reviewer while the job waits — is **not** offered here, and
+  the reason is not taste. A run reads repository-level variables when it is
+  queued, not when a waiting job resumes
+  ([GitHub docs](https://docs.github.com/en/actions/reference/workflows-and-actions/variables#configuration-variable-precedence)),
+  so the first deployment would apply with an empty checksum and every later
+  one with the value from the deployment before it. A gate that fails that way
+  is worse than no gate: it looks like one.
 
-  ```yaml
-  # (b) the reviewer records it as a repository variable before approving,
-  #     and the environment gate stops the job until they have.
-  #     --checksum "${{ vars.APPROVED_PLAN_SHA256 }}"
-  ```
-
-  (a) is the better shape: the value travels with the approval instead of
-  beside it. The job below shows (b) because it is the smaller diff from a
-  pipeline that already exists — swap it once the flow is familiar. GitLab
-  needs neither, since a manual job takes variables at start time.
+  GitLab needs none of this, since a manual job takes its variables at start
+  time.
 - **`--allow` names the risk classes that were approved.** It is the gate, and
   the list belongs in the pipeline only if this environment genuinely accepts
   those classes every time; otherwise let the approver supply it too.
@@ -391,6 +413,10 @@ on:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    # Its own environment, holding its own copy of the credential: the
+    # deployment environments release nothing to a scheduled run, and this job
+    # only ever reads. See "Who can reach the credential".
+    environment: monitoring
     env:
       PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
     steps:
@@ -402,6 +428,14 @@ jobs:
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
       - run: pbps verify --env prod --format json
 ```
+
+A scheduled run references no deployment environment, so it is released
+nothing by `production-plan` or `production` — a credential kept only there
+would leave `PBPS_PROD_URL` empty and every drift check failing as
+unconfigured rather than reporting drift. Hence `monitoring`, and it is the
+right place for a **read-only account**: `verify` reads the catalog and the
+ledger and writes nothing, so the watch that runs every hour unattended need
+not hold a credential that could deploy.
 
 `verify` exits `2` on drift, which fails the job. The `on_drift` hook has
 already delivered by then — a webhook, a chat message, a ticket; its command
