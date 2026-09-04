@@ -8847,3 +8847,122 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
         conn.execute(RESET).await.unwrap();
     });
 }
+
+/// A plan that renames a table a role is granted on still applies.
+///
+/// Only a live server settles it: SQL Server carries an object-level grant
+/// across `sp_rename`, so the permission is the same permission afterwards
+/// under a different name, and the differ emits no grant change at all. The
+/// post-apply movement guard compares the recorded state with the read-back,
+/// and comparing grant targets by name alone read that one grant as two — and
+/// refused every rename of a granted table (DECISIONS 157).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_grantrename_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("grantrename-live");
+    d.table("table: dbo.old\ncolumns:\n  code: {type: varchar(20), nullable: false}\n");
+    std::fs::write(
+        d.dir.join("schema/app.yml"),
+        "role: app\ngrants:\n  dbo.old: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The rename, with the grant following it in the declarations exactly as
+    // the engine will follow it in the catalog.
+    d.table(
+        "table: dbo.new\nrenamed_from: dbo.old\ncolumns:\n  code: {type: varchar(20), nullable: false}\n",
+    );
+    std::fs::write(
+        d.dir.join("schema/app.yml"),
+        "role: app\ngrants:\n  dbo.new: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "OUT:{}ERR:{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    let plan = d.dir.join("rename.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The differ has nothing to say about the grant: the engine moves it, so
+    // the rename is the whole plan. Read off the artifact rather than the
+    // printed summary, which mentions the target's name.
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(
+        matches!(
+            saved.changes.changes.as_slice(),
+            [one] if matches!(one.change, pbps_model::Change::RenameTable { .. })
+        ),
+        "the rename alone is the plan: {:?}",
+        saved.changes
+    );
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a rename of a granted table must apply: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // And the grant really did travel, which is the engine fact the guard
+    // now depends on.
+    let held: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.database_permissions p \
+                 JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id \
+                 WHERE r.name = 'app' AND p.class = 1 \
+                   AND OBJECT_NAME(p.major_id) = 'new' AND p.permission_name = 'SELECT';",
+            )
+            .await
+            .expect("count");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(held, 1, "the grant follows the rename");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}

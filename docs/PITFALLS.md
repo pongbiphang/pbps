@@ -111,6 +111,14 @@ Both shapes have the same tell: a change that makes something *less* checked,
 justified entirely by an argument about accuracy. Write down what the removed
 check was for before removing it.
 
+The mirror runs in the post-apply movement guard, three rounds in a row: "can
+this guard miss a change" was asked and answered each time, and "can this
+guard invent one" was not. It ended up refusing every rename of a granted
+table, because a rename is visible from three sides — the table's two names,
+the role's two names, and the grant *target* — and the first two were paired
+while the third was not (DECISIONS 157). **A guard has two failure directions
+and a sweep down one of them is half a sweep.**
+
 ## Reasoning loses to measurement
 
 Three times the natural, obviously-correct answer was wrong, and only a real

@@ -1083,14 +1083,50 @@ fn refuse_unplanned_movement(
         }
     }
     compare("", &before.modules, &after.modules, named, &mut moved);
+    // The baseline's grants, spelled the way the read-back will spell them.
+    // Measured: SQL Server carries a grant across `sp_rename`, so a plan that
+    // renames a granted table changes no permission and the differ emits no
+    // grant change at all — the role is untouched. Compared by name alone,
+    // the one grant read as two and every such rename was refused
+    // (DECISIONS 157).
+    let before_roles: BTreeMap<String, pbps_model::Role> = before
+        .roles
+        .iter()
+        .map(|(name, role)| {
+            let grants = role
+                .grants
+                .iter()
+                .map(|(target, held)| {
+                    let target = match target {
+                        pbps_model::GrantTarget::Object(object) => pbps_model::GrantTarget::Object(
+                            renamed
+                                .get(object)
+                                .copied()
+                                .cloned()
+                                .unwrap_or_else(|| object.clone()),
+                        ),
+                        schema => schema.clone(),
+                    };
+                    (target, held.clone())
+                })
+                .collect();
+            (
+                name.clone(),
+                pbps_model::Role {
+                    description: role.description.clone(),
+                    grants,
+                },
+            )
+        })
+        .collect();
     let named_role = |n: &String| roles.contains(n.as_str());
-    compare("role ", &before.roles, &after.roles, named_role, &mut moved);
+    compare("role ", &before_roles, &after.roles, named_role, &mut moved);
     // And the same for a role the plan does name: exempt down to the
     // permissions it moves, and no further. A plan that adds one grant is not
     // answerable for the rest of the role's set, and nothing else in the run
     // speaks for them — the statements grant and revoke what they were asked
     // to and say nothing about what they left alone (DECISIONS 156).
-    for (name, was) in &before.roles {
+    for (name, was) in &before_roles {
         if !named_role(name) {
             // Already compared whole, grants included.
             continue;
@@ -3641,6 +3677,58 @@ mod tests {
             })],
         };
         refuse(&revoking, &before, &schema(&[])).expect("the plan's own revoke");
+    }
+
+    /// A grant on a table this plan renames is the same grant afterwards, under
+    /// the name the table now has. Measured on SQL Server 2025: `sp_rename`
+    /// carries the permission to the new name, so nothing about the role
+    /// changed and the differ emits no grant change — leaving the role
+    /// untouched, and the comparison reading one grant as two (DECISIONS 157).
+    #[test]
+    fn a_grant_follows_the_table_this_plan_renames() {
+        use pbps_model::{GrantTarget, Permission};
+        let granted_on = |table: &str| {
+            let mut grants = BTreeMap::new();
+            grants.insert(
+                GrantTarget::Object(table.parse().unwrap()),
+                [Permission::Select].into_iter().collect::<BTreeSet<_>>(),
+            );
+            let mut s = Schema::default();
+            s.tables
+                .insert(table.parse().unwrap(), pbps_model::Table::default());
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let rename = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.old".parse().unwrap(),
+                    to: "dbo.new".parse().unwrap(),
+                },
+            )],
+        };
+        refuse_unplanned_movement(
+            &rename,
+            &granted_on("dbo.old"),
+            &granted_on("dbo.new"),
+            "prod",
+        )
+        .expect("the grant moved with the table, which is not movement");
+
+        // And the guard still bites underneath the forwarding: the same rename
+        // with the grant actually gone is movement, not bookkeeping.
+        let mut robbed = granted_on("dbo.new");
+        robbed.roles.get_mut("app").unwrap().grants.clear();
+        let e = refuse_unplanned_movement(&rename, &granted_on("dbo.old"), &robbed, "prod")
+            .expect_err("the grant is gone");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
     /// Both ends of a rename are the plan's business. The recorded state knows

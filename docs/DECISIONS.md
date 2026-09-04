@@ -1757,3 +1757,25 @@ SPEC is in sync with all of these.
     for. The unit of a plan's responsibility is what its statements name — a
     row, a permission on a target — never the container those live in.
 
+157. **A grant target is spelled the way the plan will leave it, before the
+    roles are compared.** Measured on SQL Server 2025: `sp_rename` carries an
+    object-level grant to the new name — `GRANT SELECT ON dbo.rn_old` reads
+    back as a grant on `rn_new` with nothing else changed. So a plan that
+    renames a granted table changes no permission, `diff_roles` emits no grant
+    change, and the role is not one any change names.
+    Which is exactly why 150's comparison broke on it. The role went down the
+    *untouched* path and was compared whole, with the baseline holding
+    `dbo.old` and the read-back holding `dbo.new` — one grant read as two, and
+    **every rename of a granted table refused and rolled back**. A guard
+    written to catch someone else's change invented one of its own, which is
+    the worse direction of the two.
+    So the baseline's grants are re-keyed through the plan's renames before
+    either comparison — the whole-role one and 156's per-target one. The
+    planned grants need no such treatment: `order_key` puts renames first, so
+    a `Grant` or `Revoke` beside one already names the object as it will be.
+    **The sweep this missed.** 150 paired both ends of a table rename and 156
+    paired both ends of a role rename, because an object is one object under
+    two names. A grant *target* is a third place the same rename shows up, and
+    naming the first two made it look done. When a rename can be seen from
+    three sides, fixing two of them is not fixing it.
+
