@@ -170,8 +170,8 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     // project root is the one directory that is always there (DECISIONS 166).
     let prefix = relative_to(root)?;
     Ok((
-        under(&prefix, &config.schema_dir),
-        under(&prefix, &config.ids_file),
+        under(&prefix, &config.schema_dir)?,
+        under(&prefix, &config.ids_file)?,
     ))
 }
 
@@ -181,20 +181,40 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
 /// `.` is the project root itself, which is the prefix alone — and at the
 /// repository root that is the empty pathspec, which every caller here already
 /// treats as "everything".
-fn under(prefix: &str, path: &Path) -> String {
-    let mut parts: Vec<&str> = prefix.split('/').collect();
+fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
+    use std::path::Component;
+
+    let mut parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
     for component in path.components() {
-        if let std::path::Component::Normal(part) = component
-            && let Some(part) = part.to_str()
-        {
-            parts.push(part);
+        match component {
+            Component::CurDir => {}
+            // Resolved against the prefix, not dropped. A project in a
+            // subdirectory may quite reasonably have kept its declarations
+            // beside it — `../shared/schema` — and silently discarding the
+            // `..` pointed the read at `<project>/shared/schema`, a path the
+            // repository does not have. `plan --base` and `validate --since`
+            // then read an empty baseline and called every object new
+            // (DECISIONS 167).
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    anyhow::bail!(
+                        "`{}` reaches outside the repository, and git has no name for it",
+                        path.display()
+                    );
+                }
+            }
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => parts.push(part),
+                None => anyhow::bail!("`{}` is not valid UTF-8", path.display()),
+            },
+            // An absolute path is not repo-relative and never can be.
+            Component::RootDir | Component::Prefix(_) => anyhow::bail!(
+                "`{}` is an absolute path; paths in `pbps.yml` are relative to the project",
+                path.display()
+            ),
         }
     }
-    parts
-        .into_iter()
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect::<Vec<_>>()
-        .join("/")
+    Ok(parts.join("/"))
 }
 
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
@@ -505,6 +525,30 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A path an old revision configured, as git names it. The `..` case is
+    /// the one that matters: a project in a subdirectory may keep its
+    /// declarations beside it, and dropping the `..` pointed the read at a
+    /// path the repository does not have (DECISIONS 167).
+    #[test]
+    fn a_configured_path_is_composed_against_the_project_prefix() {
+        let under = |prefix: &str, path: &str| super::under(prefix, Path::new(path));
+        assert_eq!(under("apps/db", "schema").unwrap(), "apps/db/schema");
+        assert_eq!(under("apps/db", "./schema").unwrap(), "apps/db/schema");
+        assert_eq!(
+            under("apps/db", "../shared/schema").unwrap(),
+            "apps/shared/schema"
+        );
+        assert_eq!(under("apps/db", "../../schema").unwrap(), "schema");
+        // `schema_dir: .` is the project root, which at the repository root is
+        // the empty pathspec every caller here reads as "everything".
+        assert_eq!(under("apps/db", ".").unwrap(), "apps/db");
+        assert_eq!(under("", "schema").unwrap(), "schema");
+        assert_eq!(under("", ".").unwrap(), "");
+        // And the two that have no repo-relative name at all.
+        assert!(under("apps", "../../outside").is_err());
+        assert!(under("apps", "/etc/passwd").is_err());
+    }
     use super::*;
     use pbps_model::{Column, ColumnType, Schema, Table};
     use std::str::FromStr;

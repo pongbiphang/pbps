@@ -2062,3 +2062,33 @@ SPEC is in sync with all of these.
     a path that only history has; the whole point of `paths_at` is that those
     are different.
 
+167. **Three refinements of 166, and one of them is a gate that should never
+    have been there.**
+    **By definition, not by name.** The constraint and index comparison asked
+    whether each name was on both sides. A constraint dropped and recreated
+    under the same name with a different body is on both sides, and the test
+    called that unchanged. Compared by value now — which predicts nothing,
+    since both values come from a read-back, exactly as the columns beside
+    them already did.
+    **At every read, not the last one.** The shape comparison was gated on
+    `Settled::Whole` out of caution, and the caution was misplaced twice over.
+    It compares two read-backs over what the plan does not move, so it needs
+    no part of the plan to have run — and each checkpoint's read becomes
+    `previous`, so a change that landed before an earlier checkpoint was baked
+    into the baseline of every comparison after it. The final `Whole` read
+    then measured the contaminated shape against itself. `Settled` is for the
+    checks that ask what the plan *achieved*; it was never for the ones that
+    ask what moved.
+    **`..` is resolved, not dropped.** 166 composed a historical path from the
+    project's own prefix and kept only `Normal` components, so a project in a
+    subdirectory whose old revision said `schema_dir: ../shared/schema` got
+    `<project>/shared/schema` — a path the repository does not have, read as an
+    empty baseline, every object new. Resolved against the prefix now, with a
+    path that reaches past the repository root, or an absolute one, refused by
+    name rather than silently turned into something else.
+    The middle one is worth keeping in view: **a guard added "to be safe" cost
+    a check and created a way for one contaminated read to poison every read
+    after it.** Caution about a comparison is not free, and after eight rounds
+    of this guard being wrong in both directions the question to ask of every
+    condition on it is which of the two it is protecting against.
+

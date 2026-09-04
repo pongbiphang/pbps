@@ -1146,9 +1146,14 @@ fn refuse_unplanned_movement(
         // alterations achieved is still not checked: that *would* need the
         // stored form, and the column and constraint names it adds or removes
         // are held to being present or absent instead.
-        if settled == Settled::Whole
-            && let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name))
-        {
+        //
+        // At every read, not only the settled one. Everything this plan will
+        // move is excluded below whether or not its statement has run, so
+        // nothing here needs the plan to be finished — and gating it on the
+        // last read meant a change that landed before an earlier checkpoint
+        // went into `previous`, after which the final comparison measured the
+        // contaminated shape against itself (DECISIONS 167).
+        if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
             let no_columns = BTreeSet::new();
             let moved_columns = columns.get(now_name).unwrap_or(&no_columns);
             let no_names = BTreeSet::new();
@@ -1168,36 +1173,44 @@ fn refuse_unplanned_movement(
             if !keys.contains(now_name) && was.primary_key != now.primary_key {
                 moved.push(format!("{now_name} has a different primary key"));
             }
-            let mut named = |kind: &str, a: BTreeSet<&String>, b: BTreeSet<&String>| {
-                for name in a.union(&b) {
-                    if !moved_constraints.contains(name.as_str())
-                        && a.contains(name) != b.contains(name)
-                    {
-                        moved.push(format!(
-                            "{now_name} {kind} `{name}` is not as the plan left it"
-                        ));
-                    }
-                }
-            };
-            named(
+            // By definition, not by name. A constraint dropped and recreated
+            // under the same name with a different body is present on both
+            // sides, and a membership test called that unchanged
+            // (DECISIONS 167). Both values come from a read-back, so comparing
+            // them predicts nothing — the same reason the columns above can be
+            // compared outright.
+            let skip = moved_constraints;
+            named_alike(
+                now_name,
                 "unique",
-                was.unique.keys().collect(),
-                now.unique.keys().collect(),
+                &was.unique,
+                &now.unique,
+                skip,
+                &mut moved,
             );
-            named(
+            named_alike(
+                now_name,
                 "foreign key",
-                was.foreign_keys.keys().collect(),
-                now.foreign_keys.keys().collect(),
+                &was.foreign_keys,
+                &now.foreign_keys,
+                skip,
+                &mut moved,
             );
-            named(
+            named_alike(
+                now_name,
                 "check",
-                was.checks.keys().collect(),
-                now.checks.keys().collect(),
+                &was.checks,
+                &now.checks,
+                skip,
+                &mut moved,
             );
-            named(
+            named_alike(
+                now_name,
                 "index",
-                was.indexes.keys().collect(),
-                now.indexes.keys().collect(),
+                &was.indexes,
+                &now.indexes,
+                skip,
+                &mut moved,
             );
         }
         // Dropped, or outside the row scope on one side: there is no pair of
@@ -1522,6 +1535,35 @@ fn refuse_unplanned_movement(
          `verify` would call it clean. `pbps verify` shows what moved; then apply again.",
         moved.join("\n  ")
     );
+}
+
+/// One kind of named thing on a table — its unique constraints, foreign keys,
+/// checks or indexes — compared by definition over the names the plan leaves
+/// alone.
+///
+/// A free function because it is generic over the value, which a closure
+/// cannot be, and because comparing by name alone was the bug: a constraint
+/// dropped and recreated under one name with a different body is present on
+/// both sides (DECISIONS 167).
+fn named_alike<V: PartialEq>(
+    table: &TableName,
+    kind: &str,
+    was: &BTreeMap<String, V>,
+    now: &BTreeMap<String, V>,
+    skip: &BTreeSet<&str>,
+    moved: &mut Vec<String>,
+) {
+    let names: BTreeSet<&String> = was.keys().chain(now.keys()).collect();
+    for name in names {
+        if skip.contains(name.as_str()) {
+            continue;
+        }
+        if was.get(name) != now.get(name) {
+            moved.push(format!(
+                "{table} {kind} `{name}` is not as the plan left it"
+            ));
+        }
+    }
 }
 
 /// One namespace of the two states, compared over the names the plan leaves
@@ -4295,6 +4337,41 @@ mod tests {
             refuse_unplanned_movement(&widening, &before, &retyped_other, "prod", Settled::Whole)
                 .expect_err("a column nobody planned");
         assert!(format!("{e:#}").contains("`other`"), "{e:#}");
+
+        // A constraint dropped and recreated under the same name with a
+        // different body is present on both sides; only its definition says
+        // so (DECISIONS 167).
+        let mut rebuilt = table("nvarchar(50)", Some("ix_note"));
+        rebuilt
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .get_mut("ix_note")
+            .unwrap()
+            .unique = true;
+        let e = refuse_unplanned_movement(
+            &widening,
+            &table("nvarchar(50)", Some("ix_note")),
+            &rebuilt,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the index came back different");
+        assert!(format!("{e:#}").contains("ix_note"), "{e:#}");
+
+        // And the shape is compared at every read, not only the settled one:
+        // a checkpoint that blessed a change became `previous`, after which
+        // the final comparison measured the contaminated shape against itself.
+        let e = refuse_unplanned_movement(
+            &widening,
+            &before,
+            &table("nvarchar(50)", Some("ix_rogue")),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("mid-run is still a read");
+        assert!(format!("{e:#}").contains("ix_rogue"), "{e:#}");
 
         // The plan's own index change is exempt, both ways round.
         let adding = pbps_model::ChangeSet {
