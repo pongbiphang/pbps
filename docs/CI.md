@@ -15,7 +15,9 @@ now out of date, noted in "Credentials" below.
 
 ## The contract a pipeline branches on
 
-Three exit codes, one meaning each, the same across every read-only command:
+Three exit codes, one meaning each, the same across every read-only command a
+pipeline gates on — `validate`, `fmt --check`, `plan`, `verify`, `doctor`,
+`explain`:
 
 | Code | Means | A pipeline should |
 |---|---|---|
@@ -26,6 +28,15 @@ Three exit codes, one meaning each, the same across every read-only command:
 The split matters because the two failures have different owners: a `2` from
 `pbps validate` belongs to the author of the change, and a `1` from
 `pbps verify` usually means the database was unreachable, which does not.
+
+**`pbps status` is the exception, and it is not an accident.** It reports every
+configured environment in one pass — including ones that are drifted,
+unreachable or mid-deployment — and exits `0` with all of that in the report,
+because one unreachable database must not cost the operator the other five
+lines. Measured: an unreachable environment gives exit `0`, `"result": "ok"`,
+and an `environment.unreachable` warning in the findings. So never branch a
+pipeline on `status`'s exit code: read its JSON, or use `verify`, which is the
+command whose answer *is* a gate.
 
 Verified by running them: `validate` on a clean project exits `0`, on a
 declaration with an unknown type `2`, and outside any project `1`;
@@ -61,7 +72,7 @@ has no `url:` field for the same reason.
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `snapshot`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true` |
+| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true` |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
 | `APPROVED_PLAN_SHA256` | `apply --checksum` | not a secret; it is the approval, supplied by whoever approved |
 
@@ -199,9 +210,17 @@ jobs:
             --plan plan.json \
             --checksum "${{ vars.APPROVED_PLAN_SHA256 }}" \
             --allow rename,narrowing
-      - name: record the new state
-        run: pbps snapshot --env prod
 ```
+
+There is deliberately **no recording step after `apply`**. `apply` reads the
+database back and records that state itself, with the checksum of the plan it
+applied. Measured on a real deployment: `apply` writes entry #2 (`apply`,
+checksum `56297bd9dc3e`), and a `pbps snapshot --env prod` after it writes
+entry #3 — kind `apply`, **checksum `(none)`**. Every deployment would be in
+the ledger twice, the newest entry would be the one no plan produced, and a
+transient failure in that step would fail a job whose deployment had already
+committed. `snapshot` is for adopting a state nobody planned, not for
+confirming one that was.
 
 Two things about the `apply` job are load-bearing:
 
@@ -243,7 +262,7 @@ Two things about the `apply` job are load-bearing:
 `.gitlab-ci.yml`:
 
 ```yaml
-stages: [check, plan, apply, record]
+stages: [check, plan, apply]
 
 default:
   image: rust:1-bookworm
@@ -296,14 +315,6 @@ apply:prod:
     - pbps apply --env prod --plan plan.json
         --checksum "$APPROVED_PLAN_SHA256"
         --allow rename,narrowing
-
-record:prod:
-  stage: record
-  needs: ['apply:prod']
-  rules:
-    - if: $CI_COMMIT_TAG =~ /^prod-v/
-  script:
-    - pbps snapshot --env prod
 ```
 
 `PBPS_PROD_URL` is a masked, protected CI/CD variable; `APPROVED_PLAN_SHA256`
@@ -339,7 +350,9 @@ already delivered by then — a webhook, a chat message, a ticket; its command
 decides (SPEC §13.5). The scheduler is your CI and the delivery is your webhook.
 
 `pbps status --format json` is the same idea across every configured
-environment at once: last apply, git sha, drift state, last verified.
+environment at once: last apply, git sha, drift state, last verified. It is a
+report and not a gate — it exits `0` whatever it finds (see the contract
+above), so a watch built on it reads the JSON.
 
 ## Things that will bite
 
