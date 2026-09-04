@@ -1808,3 +1808,37 @@ SPEC is in sync with all of these.
     handle renames" but "for each kind of change, what does it alter that no
     change of its own describes".
 
+159. **A staged apply cannot roll back, so it stops instead — and `status`
+    records rather than returns.** Two findings, one sentence apart in kind:
+    a guard that was scoped away, and a check that ended the function.
+    **`apply --staged`.** 147 and 150 both said staged runs were not covered
+    "for the reason 147 gives" — no transaction, so nothing to roll back and a
+    refusal at the end would only strand the environment. That reasoning was
+    about *refusing*, and it answered a question nobody asked. Nothing in a
+    staged run compared one read with the last, so an edit that landed between
+    two statements went into that checkpoint, into every later read, and
+    finally into the closing ordinary snapshot — which is the state `verify`
+    measures against ever after. Measured through the CLI: a trigger writing
+    into an undeclared-by-this-plan table during the one statement of a staged
+    plan, and the run reports `Applied 1 change(s) ... recorded as entry #3`.
+    Each checkpoint is now compared with the read before it, over everything
+    the plan does not touch, and the run **records the checkpoint and then
+    stops**. Recording first is the point: the statement has committed, and a
+    refusal that skipped the checkpoint would lose the record of it, which is
+    the one thing a resume needs to be true. The closing read is compared the
+    same way before the ordinary entry is written, so the last window is
+    covered too and the environment is left on its checkpoint —
+    `refuse_mid_deployment` then makes every other command say so.
+    The exempt set is what the *whole* plan touches, not the statement just
+    run. It is the conservative direction, and this guard has been wrong four
+    times in the other one (152 to 158): what it costs is a change to an
+    object a later statement will touch, what it buys is that no correct
+    staged apply is ever stopped by it.
+    **`status`.** An unexpressible permission ended the function, so the row
+    checksum, the limitations inventory and the unmanaged inventory below it
+    never ran: one screen reported the permission and hid every other problem
+    the environment had. Recorded and carried now, like the rest. The trunk
+    had already made this correction twice on its own paths; this one came
+    through the merge with the early return intact, which is its own lesson
+    about resolving a conflict by keeping "our" side.
+

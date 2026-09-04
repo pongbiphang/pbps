@@ -321,11 +321,15 @@ async fn one(
         .filter(|(role, _)| recorded_ids.roles.values().any(|managed| managed == role))
         .map(|(_, what)| what.as_str())
         .collect();
+    // Recorded and carried, never returned on. An unexpressible permission is
+    // drift, and so is a row that moved, a fact the projection could not hold,
+    // or an object `unmanaged: error` refuses — each established
+    // independently, and none of them able to erase the others. Returning here
+    // hid every one of the checks below behind whichever came first
+    // (DECISIONS 159).
     if !unexpressible.is_empty() {
         record_drift(&mut row, entry.id, name);
-        let so_far = row.detail.take().unwrap_or_default();
-        row.detail = Some(format!("{so_far}; {}", unexpressible.join("; ")));
-        return row;
+        record_status_issue(&mut row, "drift", unexpressible.join("; "));
     }
     // The rows too, under the recorded scope, as `verify` reads them. A read
     // that fails is reported as the failure it is, never as "no drift".

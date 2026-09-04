@@ -3073,6 +3073,27 @@ async fn apply_staged_under_lock(
     // on a resume — and each statement moves it, using what the emitter said
     // that statement does (`Statement::renames`).
     let mut live_ids = entry.snapshot.ids.clone();
+    // The state each checkpoint is measured against, read in the shape a
+    // checkpoint is read in so the two compare like with like — the newest
+    // entry's own schema is spelled by whichever command wrote it, and a cell
+    // at its default has three spellings (`ObservedRow`).
+    //
+    // A staged run cannot roll back, so it cannot refuse its way out of a
+    // change somebody else makes underneath it (147, 150). What it can do is
+    // notice: nothing else in the run compares one checkpoint with the last,
+    // so an edit that landed between two statements was carried into every
+    // later read and finally into the closing ordinary snapshot, which is the
+    // state `verify` measures against ever after (DECISIONS 159).
+    let mut previous = managed_state(
+        conn,
+        &live_ids,
+        &modules_after(&entry.snapshot, &plan.changes),
+        pbps_config::Unmanaged::Ignore,
+        &scopes_at(plan, &live_ids),
+        &Schema::default(),
+    )
+    .await?
+    .schema;
     println!(
         "Applying {} statement(s) without a transaction...",
         total - start
@@ -3136,8 +3157,23 @@ async fn apply_staged_under_lock(
             total,
             last_statement: stmt.sql.clone(),
         });
+        let recorded = checkpoint.schema.clone();
         let id = pbps_mssql::state::record(conn, &checkpoint).await?;
         println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
+        // The checkpoint is written *first*, and then the run stops. It says
+        // what the database holds, which is the one thing a resume needs to be
+        // true — refusing before writing it would lose the record of a
+        // statement that has already committed, which is what checkpoints are
+        // for. Stopping is the whole remedy a staged run has.
+        staged_movement(
+            &plan.changes,
+            &previous,
+            &recorded,
+            &target.label,
+            i + 1,
+            total,
+        )?;
+        previous = recorded;
     }
 
     // The closing entry is an ordinary apply with no staged marker: its absence
@@ -3152,6 +3188,19 @@ async fn apply_staged_under_lock(
         &Schema::default(),
     )
     .await?;
+    // And the last window of all: between the final checkpoint and this read.
+    // Refused *before* the ordinary entry is written, because that entry is
+    // what says the deployment finished — leaving the environment on its last
+    // checkpoint is the honest answer, and `refuse_mid_deployment` then makes
+    // every other command say so.
+    staged_movement(
+        &plan.changes,
+        &previous,
+        &after.schema,
+        &target.label,
+        total,
+        total,
+    )?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -3162,6 +3211,32 @@ async fn apply_staged_under_lock(
     snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+}
+
+/// The movement check a staged run can make: each read compared with the one
+/// before it, over everything this plan does not touch.
+///
+/// Exempting what the *whole* plan touches rather than only the statement just
+/// run is deliberate. It is the conservative direction — an object a later
+/// statement will change is simply not compared yet — and this guard has been
+/// wrong four times in the other one, inventing movement rather than missing
+/// it (152 to 158). What it costs is a change to an object the plan touches
+/// later; what it buys is that no correct staged apply is ever stopped by it.
+fn staged_movement(
+    changes: &pbps_model::ChangeSet,
+    before: &Schema,
+    after: &Schema,
+    label: &str,
+    completed: usize,
+    total: usize,
+) -> anyhow::Result<()> {
+    refuse_unplanned_movement(changes, before, after, label).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}
+
+             {completed} of {total} statement(s) completed and the ledger records them; a              staged apply runs outside a transaction, so nothing was rolled back. The              checkpoint holds the database as it stands, this change included — resuming              accepts it. `pbps verify` shows what it is."
+        )
+    })
 }
 
 /// Refuses to act on an environment that is half-way through a staged apply.

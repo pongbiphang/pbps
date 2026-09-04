@@ -8966,3 +8966,116 @@ fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
             .await;
     });
 }
+
+/// A staged apply notices a change that lands between two of its reads.
+///
+/// It cannot roll back — that is what `--staged` is for — so the remedy is to
+/// record the checkpoint and stop, rather than carry the change into every
+/// later read and finally into the closing ordinary snapshot, which is what
+/// `verify` measures against ever after (DECISIONS 159).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_stagedmove_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("stagedmove-live");
+    let rows = |rows: &str| {
+        format!(
+            "table: dbo.t\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n\
+             primary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n{rows}"
+        )
+    };
+    d.table(&rows("    first: {}\n"));
+    std::fs::write(
+        d.dir.join("schema/dbo.other.yml"),
+        "table: dbo.other\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_other, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    kept: {}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // Wound up to go off inside the one statement the staged plan runs, and
+    // aimed at a table the plan never mentions.
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; INSERT INTO dbo.other (code) VALUES (''rogue'');');");
+
+    // One logical change, which is all `--staged` accepts.
+    d.table(&rows("    first: {}\n    second: {}\n"));
+    d.commit();
+    let plan = d.dir.join("staged.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--staged",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the run must stop: {err}");
+    assert!(err.contains("dbo.other"), "it must name what moved: {err}");
+    assert!(
+        err.contains("nothing was rolled back") || err.contains("staged apply runs outside"),
+        "and say that nothing was undone: {err}"
+    );
+
+    // The statement did commit and the checkpoint records it — that is what a
+    // checkpoint is for — but the environment is left mid-deployment rather
+    // than blessed as a finished apply.
+    let o = d.run(&["status", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let states: Vec<&str> = v["environments"]
+        .as_array()
+        .map(|envs| envs.iter().filter_map(|e| e["state"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        states.contains(&"staged") || stdout(&o).contains("staged"),
+        "the environment is mid-deployment: {}",
+        stdout(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
