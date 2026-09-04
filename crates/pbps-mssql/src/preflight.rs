@@ -73,6 +73,12 @@ struct AsStored {
     /// as still pointing at it (see [`delete_probe`]) — and a row the plan
     /// merely touches elsewhere must.
     moved: BTreeMap<TableName, Moved>,
+    /// The foreign keys this plan takes away before the deletes run: a
+    /// `DropForeignKey`, and every key into the table a `DropTable` removes.
+    /// Both sort before `DeleteRow` (`order_key`), so counting a child
+    /// through a constraint that will be gone refuses a delete the engine
+    /// would have accepted (DECISIONS 128).
+    removed: BTreeSet<Removed>,
 }
 
 /// The rows of one table a plan writes, as the pre-delete probe has to see
@@ -135,6 +141,15 @@ struct Moved {
     unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
 }
 
+/// A foreign key this plan removes before its deletes run: the constraint,
+/// under the table that holds it. Both are named as the database has them —
+/// a dropped constraint is one the base side read from the catalog.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Removed {
+    table: TableName,
+    constraint: Option<String>,
+}
+
 /// The SQL the engine compares a written cell by: the literal, or `None` for
 /// what it cannot compare before the write runs.
 fn written(value: &Value) -> Option<String> {
@@ -184,6 +199,21 @@ impl AsStored {
                 }
                 Change::CreateTable { name, .. } => {
                     this.created.insert(name.clone());
+                }
+                // Both run before the deletes, so a child counted through
+                // either would refuse a delete that will be valid by then.
+                Change::DropForeignKey { table, name } => {
+                    this.removed.insert(Removed {
+                        table: table.clone(),
+                        constraint: Some(name.clone()),
+                    });
+                }
+                Change::DropTable { name, .. } => {
+                    this.removed.insert(Removed {
+                        table: name.clone(),
+                        // Every key the table holds goes with it.
+                        constraint: None,
+                    });
                 }
                 Change::UpdateRow {
                     table,
@@ -257,8 +287,7 @@ impl AsStored {
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
                 // it would quietly query the wrong object.
-                Change::DropTable { .. }
-                | Change::AddColumn { .. }
+                Change::AddColumn { .. }
                 | Change::DropColumn { .. }
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
@@ -268,7 +297,6 @@ impl AsStored {
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
@@ -717,31 +745,148 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE N'' END", arrivals.join(" "))
     };
+    // The keys this plan takes away first are left out of the catalog read
+    // altogether: by the time the delete runs the constraint is gone, and a
+    // child counted through it refuses a delete the engine would accept.
+    // Named with its table, because two schemas may each hold a constraint
+    // of the same name (DECISIONS 128).
+    let mut gone = Vec::new();
+    for removed in &names.removed {
+        let table = names.table(&removed.table).unwrap_or(removed.table.clone());
+        let of_table = format!(
+            "s.name = {} AND t.name = {}",
+            literal(&table.schema),
+            literal(&table.name)
+        );
+        gone.push(match &removed.constraint {
+            Some(constraint) => {
+                format!("AND NOT ({of_table} AND fk.name = {})", literal(constraint))
+            }
+            None => format!("AND NOT ({of_table})"),
+        });
+    }
+    let gone = gone.join("\n                            ");
 
-    // The statements are built in a derived table and aggregated outside it:
-    // the fragments carry subqueries over the key's columns, and an aggregate's
-    // argument may not (Msg 130).
     Ok(Probe::new(
         format!(
             "rows in other tables that still reference {table} row `{key}`, which its delete \
              would orphan or cascade into"
         ),
         format!(
-            "DECLARE @n int = 0, @sql nvarchar(max);\n\
-             SELECT @sql = STRING_AGG(CONVERT(nvarchar(max), x.stmt), N' ')\n\
-               FROM (SELECT N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
-                     + {} + {} + N')' + {exclusion} + N')' + {arrival} + N';' AS stmt\n\
-                       FROM sys.foreign_keys fk\n\
-                       JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
-                       JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
-                      WHERE fk.referenced_object_id = OBJECT_ID({})) AS x;\n\
-             IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {}, @n = @n OUTPUT;\n\
-             SELECT @n AS n;",
-            literal(&format!(" AS ch WHERE EXISTS ({parent_row}")),
-            tuple(STORED),
-            literal(&parent),
-            literal(key.as_str())
+            "{}\nSELECT @n AS n;",
+            counting_statement(&Referencing {
+                parent: &parent,
+                parent_row: &parent_row,
+                key: &literal(key.as_str()),
+                // The probe only reads; the delete's own guard is the
+                // one that has to keep what it counted (see
+                // [`still_referenced`]).
+                hint: "",
+                gone: &gone,
+                exclusion: &exclusion,
+                arrival: &arrival,
+            })
         ),
+    ))
+}
+
+/// The parts of one "rows referencing this parent row" statement that differ
+/// between the probe and the delete's own guard.
+struct Referencing<'a> {
+    /// The parent table, quoted and qualified.
+    parent: &'a str,
+    /// `SELECT 1 FROM <parent> AS p WHERE p.<key column> = @key`.
+    parent_row: &'a str,
+    /// The key of the row being deleted, as a T-SQL literal.
+    key: &'a str,
+    /// A table hint for the child scan, or `""`.
+    hint: &'a str,
+    /// Catalog filters that leave keys out of the read entirely.
+    gone: &'a str,
+    /// Per-child-table SQL excluding rows the plan itself moves, or `N''`.
+    exclusion: &'a str,
+    /// Per-child-table SQL adding rows the plan puts onto the parent, or `N''`.
+    arrival: &'a str,
+}
+
+/// Counts, into `@n`, the rows of every table with a foreign key into the
+/// parent whose key tuple is the deleted row's.
+///
+/// The statements are built in a derived table and aggregated outside it: the
+/// fragments carry subqueries over the key's columns, and an aggregate's
+/// argument may not (Msg 130). Nothing user-written reaches the dynamic text —
+/// names come from the catalog through `QUOTENAME`, and the key is a bound
+/// parameter.
+fn counting_statement(r: &Referencing<'_>) -> String {
+    let Referencing {
+        parent,
+        parent_row,
+        key,
+        hint,
+        gone,
+        exclusion,
+        arrival,
+    } = r;
+    format!(
+        "DECLARE @n int = 0, @sql nvarchar(max);\n\
+         SELECT @sql = STRING_AGG(CONVERT(nvarchar(max), x.stmt), N' ')\n\
+           FROM (SELECT N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
+                 + {} + {} + N')' + {exclusion} + N')' + {arrival} + N';' AS stmt\n\
+                   FROM sys.foreign_keys fk\n\
+                   JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
+                   JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
+                  WHERE fk.referenced_object_id = OBJECT_ID({})\n\
+                        {gone}) AS x;\n\
+         IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {key}, @n = @n OUTPUT;",
+        literal(&format!(" AS ch{hint} WHERE EXISTS ({parent_row}")),
+        tuple(STORED),
+        literal(parent),
+    )
+}
+
+/// The guard a row delete carries: the same count, taken inside the delete's
+/// own transaction under range locks it keeps until that transaction ends, so
+/// that a child row committed between the preflight probe and the delete
+/// cannot be cascaded away unseen (DECISIONS 129).
+///
+/// It is not the probe: by the time this runs, every insert, update and child
+/// delete of the plan has run (`order_key`), so *any* row still referencing
+/// the parent is one the probe did not account for. The probe stays where it
+/// is — it reports the number before anything runs, which is what a human
+/// approves; this refuses what changed underneath it.
+pub(crate) fn still_referenced(
+    table: &TableName,
+    key_column: &str,
+    key: &RowKey,
+) -> Result<String, DialectError> {
+    let parent = qualified(table)?;
+    let parent_row = format!(
+        "SELECT 1 FROM {parent} AS p WHERE p.{} = @key",
+        quote(key_column)?
+    );
+    Ok(format!(
+        "{}\nIF @n > 0 THROW 50000, {}, 1;",
+        counting_statement(&Referencing {
+            parent: &parent,
+            parent_row: &parent_row,
+            key: &literal(key.as_str()),
+            // Serializable range locks over exactly the child rows this
+            // asks about, held to the end of the transaction: an insert or
+            // an update moving a row into the range waits for the delete
+            // instead of racing it.
+            hint: " WITH (HOLDLOCK)",
+            // Both belong to a plan the probe reads whole; here the plan has
+            // already run, and a row referencing the parent now is a row
+            // nobody accounted for.
+            gone: "",
+            exclusion: "N\'\'",
+            arrival: "N\'\'",
+        }),
+        literal(&format!(
+            "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
+             checked; the delete would orphan or cascade into them. Nothing was applied. \
+             Plan again."
+        ))
     ))
 }
 

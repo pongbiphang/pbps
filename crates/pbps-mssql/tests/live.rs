@@ -2215,6 +2215,65 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .unwrap();
     assert_eq!(n, 1, "kind 7 still points at `old`");
 
+    // A foreign key this plan takes away first is not a reason to refuse the
+    // delete: `DropForeignKey` and `DropTable` both sort before `DeleteRow`,
+    // so by the time the delete runs the constraint is gone and the child
+    // row references nothing (DECISIONS 128).
+    for (removal, why) in [
+        (
+            pbps_model::Change::DropForeignKey {
+                table: TableName::new("dbo", "kind"),
+                name: "fk_kind_status".to_owned(),
+            },
+            "the constraint this plan drops first counts nothing",
+        ),
+        (
+            pbps_model::Change::DropTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: TableName::new("dbo", "kind"),
+            },
+            "nor does a key held by a table this plan drops first",
+        ),
+    ] {
+        let cs = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(removal), delete.clone()],
+        };
+        let probe = probe_for(&cs);
+        let n: i32 = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "{why}");
+    }
+    // A different constraint of the same name on another table leaves this
+    // one counted: the exclusion names the table too.
+    let elsewhere = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
+                table: TableName::new("other", "kind"),
+                name: "fk_kind_status".to_owned(),
+            }),
+            delete.clone(),
+        ],
+    };
+    let probe = probe_for(&elsewhere);
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "another table's constraint of the same name is not this one"
+    );
+
     let moved = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
@@ -2727,6 +2786,131 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .await
         .expect_err("rows without a key cannot be read");
     assert!(err.to_string().contains("dbo.status"), "{err}");
+
+    db.drop().await;
+}
+
+/// The preflight probe counts before the first statement; the delete runs
+/// later. A child row committed in between was, until the delete carried a
+/// guard of its own, taken silently by `ON DELETE CASCADE` — and the closing
+/// snapshot then recorded the damage as a success (DECISIONS 129).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
+    use pbps_model::RowKey;
+
+    let mut db = TestDb::create("late_child").await;
+    for sql in [
+        "CREATE TABLE dbo.status (code varchar(10) NOT NULL CONSTRAINT pk_status PRIMARY KEY);",
+        "CREATE TABLE dbo.kind (\n\
+             id int NOT NULL CONSTRAINT pk_kind PRIMARY KEY,\n\
+             status_code varchar(10) NULL CONSTRAINT fk_kind_status\n\
+                 REFERENCES dbo.status (code) ON DELETE CASCADE\n\
+         );",
+        "INSERT INTO dbo.status (code) VALUES ('old');",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let delete = pbps_model::Change::DeleteRow {
+        table: TableName::new("dbo", "status"),
+        key_column: "code".to_owned(),
+        key: RowKey::from("old"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+    };
+    let cs = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(delete.clone())],
+    };
+
+    // The probe, run where `apply` runs it: nothing references the row.
+    let probe = Mssql
+        .preflight(&cs)
+        .into_iter()
+        .find(|p| p.description.contains("row `old`"))
+        .expect("the delete carries a probe");
+    let n: i32 = db.conn.query(&probe.sql).await.expect("probe")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "the probe sees no child, and the plan is approved");
+
+    // Another connection, as an application would: a child row arrives and
+    // commits between the probe and the delete.
+    let mut other = Conn::connect(&conn_str()).await.expect("second connection");
+    other
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    other
+        .execute("INSERT INTO dbo.kind (id, status_code) VALUES (1, 'old');")
+        .await
+        .expect("a child arrives after the probe");
+
+    let stmts = Mssql.emit(&delete, Default::default()).expect("emit");
+    assert_eq!(stmts.len(), 1);
+    let err = db
+        .conn
+        .execute(&stmts[0].sql)
+        .await
+        .expect_err("the delete refuses what the probe never saw");
+    assert!(
+        err.to_string()
+            .contains("arrived after this plan was checked"),
+        "{err}"
+    );
+
+    let count = |sql: &'static str| async {
+        let mut c = Conn::connect(&conn_str()).await.expect("connect");
+        c.execute(&format!("USE [{}];", db.name))
+            .await
+            .expect("use");
+        let n: i32 = c.query(sql).await.expect("count")[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        n
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM dbo.kind;").await,
+        1,
+        "the child is still there, not cascaded away"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM dbo.status WHERE code = 'old';").await,
+        1,
+        "and so is the row the delete was about"
+    );
+    // The failed guard leaves no transaction open on the connection: a
+    // staged apply runs each statement outside one, and an abandoned
+    // `BEGIN TRANSACTION` would hold its locks until the process ended.
+    let open: i32 = db
+        .conn
+        .query("SELECT @@TRANCOUNT;")
+        .await
+        .expect("trancount")[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(open, 0, "the CATCH rolled its own transaction back");
+
+    // With the child gone the same statement runs, so the guard refuses only
+    // what it has to.
+    other
+        .execute("DELETE FROM dbo.kind;")
+        .await
+        .expect("take the child away");
+    db.conn
+        .execute(&stmts[0].sql)
+        .await
+        .expect("nothing references the row now");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM dbo.status WHERE code = 'old';").await,
+        0,
+        "the delete went through"
+    );
 
     db.drop().await;
 }

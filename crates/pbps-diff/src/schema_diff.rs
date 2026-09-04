@@ -278,10 +278,12 @@ pub fn diff_partial(
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
     let data_rank = rank_of_tables(&pbps_model::data::insertion_order(declared.schema));
+    // Roles that are dropped together are ordered parent before member.
+    let role_rank = member_depth(&planned);
     planned.sort_by_key(|p| {
         (
             order_key(&p.change),
-            dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank),
+            dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank),
             p.change.subject(),
             format!("{:?}", p.change),
         )
@@ -682,6 +684,53 @@ fn rank_of(order: &[ObjectName]) -> BTreeMap<ObjectName, usize> {
         .collect()
 }
 
+/// How deep among the roles this plan drops each dropped role sits: a role
+/// no other dropped role holds is 0, and each membership step adds one.
+///
+/// A connected plan removes a dropped role's members by name before its
+/// `DROP ROLE`, and the engine refuses `ALTER ROLE [z] DROP MEMBER [a]` once
+/// `a` is gone — measured, along with the fact that dropping `a` while it is
+/// a member of `z` succeeds and takes the membership with it. So a role
+/// holding another dropped role has to go *first*, and with every drop at
+/// rank 0 the order was left to the name tiebreaker: dropping `a` before `z`
+/// rolled the whole apply back (DECISIONS 127).
+///
+/// Wildcarded deliberately: no change other than a role drop can put a role
+/// into this order, and one added later could not without also being a drop.
+///
+/// Membership among roles cannot be cyclic, and the walk is bounded by the
+/// number of drops regardless, so a catalog that somehow held a cycle costs
+/// a wrong order rather than a hang.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
+    let dropped: BTreeMap<&str, &[String]> = planned
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropRole { name, members, .. } => Some((name.as_str(), members.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let mut depth: BTreeMap<String, usize> = dropped.keys().map(|n| ((*n).to_owned(), 0)).collect();
+    for _ in 0..dropped.len() {
+        let mut moved = false;
+        for (holder, members) in &dropped {
+            let above = depth[*holder];
+            for member in *members {
+                if let Some(d) = depth.get_mut(member)
+                    && *d <= above
+                {
+                    *d = above + 1;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    depth
+}
+
 /// Where a change sorts *within* its ordering class.
 ///
 /// Modules and reference rows both have a dependency order among themselves;
@@ -693,6 +742,7 @@ fn dependency_rank(
     create_rank: &BTreeMap<ObjectName, usize>,
     drop_rank: &BTreeMap<ObjectName, usize>,
     data_rank: &BTreeMap<TableName, usize>,
+    role_rank: &BTreeMap<String, usize>,
 ) -> isize {
     match change {
         Change::CreateModule { name, .. } | Change::AlterModule { name, .. } => {
@@ -725,10 +775,12 @@ fn dependency_rank(
             data_rank.get(table).map_or(0, |r| *r as isize)
         }
         Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
-        // Roles depend on nothing among themselves; a grant's target is
+        // Two roles dropped together are ordered by membership: see
+        // [`member_depth`].
+        Change::DropRole { name, .. } => role_rank.get(name).map_or(0, |r| *r as isize),
+        // The rest depend on nothing among themselves; a grant's target is
         // ordered by the class of the change, not by rank.
         Change::CreateRole { .. }
-        | Change::DropRole { .. }
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. } => 0,
@@ -2817,5 +2869,35 @@ mod tests {
             matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
             "a named key is compared in full: {changes:?}"
         );
+    }
+
+    /// A role that holds another dropped role has to be dropped first: its
+    /// membership cleanup names a principal the other drop would have taken
+    /// away, and the engine refuses that by name.
+    #[test]
+    fn a_role_holding_another_dropped_role_is_dropped_before_it() {
+        use pbps_model::{Change, PlannedChange};
+        let drop = |name: &str, members: &[&str]| {
+            PlannedChange::new(Change::DropRole {
+                uid: "r_aaaaaa".parse().unwrap(),
+                name: name.to_owned(),
+                members: members.iter().map(|m| (*m).to_owned()).collect(),
+            })
+        };
+        // `a` is a member of `z`, and `z` of `top`: the name tiebreaker alone
+        // would emit them a, top, z — every one of them wrong.
+        let planned = vec![drop("a", &[]), drop("z", &["a"]), drop("top", &["z"])];
+        let depth = super::member_depth(&planned);
+        assert_eq!(depth["top"], 0);
+        assert_eq!(depth["z"], 1);
+        assert_eq!(depth["a"], 2);
+
+        // A member that is not itself dropped is nobody's rank, and a plan
+        // whose roles hold none of each other keeps the order it had.
+        let flat = vec![drop("a", &["some_user"]), drop("z", &[])];
+        let depth = super::member_depth(&flat);
+        assert_eq!(depth["a"], 0);
+        assert_eq!(depth["z"], 0);
+        assert!(!depth.contains_key("some_user"));
     }
 }

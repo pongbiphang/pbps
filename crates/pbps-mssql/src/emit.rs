@@ -139,7 +139,26 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key,
             ..
         } => one(format!(
-            "DELETE FROM {} WHERE {} = {};\n{}",
+            // The guard and the delete are one transaction of their own: a
+            // staged apply runs each statement outside one (SPEC 7.5), and
+            // the range locks the guard takes would then be released before
+            // the delete they exist to protect. Inside the transactional
+            // apply this nests, where `COMMIT` only decrements the count and
+            // the outer transaction still decides everything. The `CATCH`
+            // rolls back and rethrows, so a staged run never leaves the
+            // connection holding an open transaction (DECISIONS 129).
+            "BEGIN TRANSACTION;\n\
+             BEGIN TRY\n\
+             {}\n\
+             DELETE FROM {} WHERE {} = {};\n\
+             {}\n\
+             COMMIT TRANSACTION;\n\
+             END TRY\n\
+             BEGIN CATCH\n\
+             IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n\
+             THROW;\n\
+             END CATCH",
+            crate::preflight::still_referenced(table, key_column, key)?,
             qualified(table)?,
             quote(key_column)?,
             row_key(key),
@@ -1728,14 +1747,27 @@ mod tests {
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
         });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        assert!(
+            sql.contains("DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"),
+            "{sql}"
+        );
         // And held to the row's existence: one gone already is a baseline
         // this plan was not reviewed against.
-        assert_eq!(
-            sql,
-            [format!(
-                "DELETE FROM [dbo].[order_status] WHERE [code] = N'old';\n{}",
-                stale("dbo.order_status", "old")
-            )]
+        assert!(sql.contains(&stale("dbo.order_status", "old")), "{sql}");
+        // And to nothing referencing it *now*: the preflight probe counted
+        // before the plan ran, and this keeps what it counted (DECISIONS 129).
+        assert!(
+            sql.contains("WITH (HOLDLOCK)") && sql.contains("IF @n > 0 THROW"),
+            "{sql}"
+        );
+        // The guard and the delete stand or fall together even where the
+        // apply runs statements outside a transaction.
+        assert!(sql.starts_with("BEGIN TRANSACTION;\nBEGIN TRY\n"), "{sql}");
+        assert!(
+            sql.contains("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;"),
+            "{sql}"
         );
     }
 

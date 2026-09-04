@@ -344,6 +344,8 @@ fn key_type_changes_over_aliases(
     cs: &pbps_model::ChangeSet,
     declared_live: &Schema,
     rows: &pbps_model::ObservedRows,
+    final_ids: &IdsFile,
+    live_ids: &IdsFile,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for p in &cs.changes {
@@ -353,7 +355,12 @@ fn key_type_changes_over_aliases(
         else {
             continue;
         };
-        let Some(table) = declared_live.tables.get(&column.table) else {
+        // The change names the table as this plan leaves it; both collections
+        // below are keyed by the name the database has now. A table renamed
+        // in the same revision was looked up under its new name in neither,
+        // and the guard passed a key-type change it exists to refuse.
+        let live = live_name(&column.table, final_ids, live_ids);
+        let Some(table) = declared_live.tables.get(&live) else {
             continue;
         };
         let is_key = table
@@ -364,7 +371,7 @@ fn key_type_changes_over_aliases(
             continue;
         }
         let aliased: Vec<String> = rows
-            .get(&column.table)
+            .get(&live)
             .map(|t| {
                 t.aliases
                     .iter()
@@ -449,30 +456,30 @@ fn tables_under(schema: &Schema, final_ids: &IdsFile, live_ids: &IdsFile) -> Sch
     out.tables = schema
         .tables
         .iter()
-        .map(|(final_name, table)| {
-            let now = final_ids
-                .table_uid(final_name)
-                .and_then(|uid| live_ids.tables.get(uid))
-                .cloned()
-                .unwrap_or_else(|| final_name.clone());
-            (now, table.clone())
-        })
+        .map(|(final_name, table)| (live_name(final_name, final_ids, live_ids), table.clone()))
         .collect();
     out
+}
+
+/// The name the database has for the table this plan calls `final_name` —
+/// the same one for everything this plan does not rename.
+///
+/// Everything keyed by the live names (the declarations re-keyed by
+/// [`tables_under`], the rows read back, the scopes) has to be looked up
+/// through this, and a change's own table name is always the *final* one.
+fn live_name(final_name: &TableName, final_ids: &IdsFile, live_ids: &IdsFile) -> TableName {
+    final_ids
+        .table_uid(final_name)
+        .and_then(|uid| live_ids.tables.get(uid))
+        .cloned()
+        .unwrap_or_else(|| final_name.clone())
 }
 
 /// [`scopes_at`] on its parts: `data` keyed by the names `final_ids` gives
 /// each table, re-keyed by the names `live_ids` gives the same uids.
 fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> DataScopes {
     data.iter()
-        .map(|(final_name, scope)| {
-            let now = final_ids
-                .table_uid(final_name)
-                .and_then(|uid| live_ids.tables.get(uid))
-                .cloned()
-                .unwrap_or_else(|| final_name.clone());
-            (now, scope.clone())
-        })
+        .map(|(final_name, scope)| (live_name(final_name, final_ids, live_ids), scope.clone()))
         .collect()
 }
 
@@ -1378,7 +1385,13 @@ pub fn cmd_plan_db(
         // The keys were matched to the rows under the type the key column has
         // now (71); a plan that changes that type would carry the mapping
         // into a type that does not make it (DECISIONS 108).
-        let over_aliases = key_type_changes_over_aliases(&cs, &declared_live, &managed.rows);
+        let over_aliases = key_type_changes_over_aliases(
+            &cs,
+            &declared_live,
+            &managed.rows,
+            &resolved.ids,
+            &recorded_ids,
+        );
         if !over_aliases.is_empty() {
             bail!(
                 "{}\n\
@@ -2622,7 +2635,9 @@ mod tests {
             .insert(pbps_model::RowKey::from("2"), pbps_model::RowKey::from("2"));
         rows.insert(table.clone(), observed);
 
-        let found = key_type_changes_over_aliases(&cs, &declared, &rows);
+        // No rename in play: the plan's name is the database's name.
+        let same = IdsFile::default();
+        let found = key_type_changes_over_aliases(&cs, &declared, &rows, &same, &same);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("`01` (stored as `1`)"), "{}", found[0]);
         assert!(
@@ -2636,12 +2651,65 @@ mod tests {
         let other = ChangeSet {
             changes: vec![change("label")],
         };
-        assert!(key_type_changes_over_aliases(&other, &declared, &rows).is_empty());
+        assert!(key_type_changes_over_aliases(&other, &declared, &rows, &same, &same).is_empty());
         rows.get_mut(&table)
             .unwrap()
             .aliases
             .remove(&pbps_model::RowKey::from("01"));
-        assert!(key_type_changes_over_aliases(&cs, &declared, &rows).is_empty());
+        assert!(key_type_changes_over_aliases(&cs, &declared, &rows, &same, &same).is_empty());
+    }
+
+    /// The change names the table as the plan leaves it; the declarations and
+    /// the rows are keyed by the name the database has now. A rename in the
+    /// same revision made both lookups miss, and the guard let the key-type
+    /// change through.
+    #[test]
+    fn a_table_renamed_by_the_same_plan_is_still_checked_for_aliased_keys() {
+        use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, PlannedChange};
+        use std::str::FromStr;
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let after: TableName = "dbo.customer".parse().unwrap();
+        let before: TableName = "dbo.client".parse().unwrap();
+        let mut final_ids = IdsFile::default();
+        final_ids.tables.insert(uid.clone(), after.clone());
+        let mut live_ids = IdsFile::default();
+        live_ids.tables.insert(uid, before.clone());
+
+        let mut t = pbps_model::Table::default();
+        t.columns.insert(
+            "id".into(),
+            pbps_model::Column::new(ColumnType::from_str("varchar(10)").unwrap()).not_null(),
+        );
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        // Keyed by the live name, as `tables_under` leaves it.
+        let mut declared = Schema::default();
+        declared.tables.insert(before.clone(), t);
+
+        let mut rows = pbps_model::ObservedRows::new();
+        let mut observed = pbps_model::ObservedTable::default();
+        observed.aliases.insert(
+            pbps_model::RowKey::from("01"),
+            pbps_model::RowKey::from("1"),
+        );
+        rows.insert(before, observed);
+
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                // The plan's own name for it: the one after the rename.
+                column: ColumnRef::new(after, "id"),
+                from: ColumnType::from_str("int").unwrap(),
+                to: ColumnType::from_str("varchar(10)").unwrap(),
+                from_nullable: false,
+                to_nullable: false,
+            })],
+        };
+        let found = key_type_changes_over_aliases(&cs, &declared, &rows, &final_ids, &live_ids);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("`01` (stored as `1`)"), "{}", found[0]);
     }
 
     /// Counted off the emitter's statements: every member before statement

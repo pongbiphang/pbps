@@ -1109,3 +1109,51 @@ SPEC is in sync with all of these.
     each parsed target was first written in and refuses the second by both
     spellings, the way a column named twice is refused; merging the two
     lists would hide a declaration that says two different things.
+127. **Roles dropped together are dropped parent before member.** A connected
+    plan removes a dropped role's members by name before its `DROP ROLE`, and
+    every `DropRole` sorted at the same rank — so the order fell to the name
+    tiebreaker. Dropping member role `a` before parent role `z` left `ALTER
+    ROLE [z] DROP MEMBER [a]` naming a principal that was already gone, and
+    the engine refuses that by name: an otherwise valid transactional apply
+    rolled back in full. Measured on a live server rather than reasoned: the
+    `DROP MEMBER` after the member is gone fails, while dropping a role that
+    is a *member* of another succeeds and takes the membership with it. The
+    rank is the depth among the dropped roles alone, so a chain of three is
+    ordered too, and a member the plan does not drop contributes nothing.
+128. **The pre-delete probe ignores the foreign keys the plan removes first.**
+    `DropForeignKey` and `DropTable` both sort before `DeleteRow`
+    (`order_key`), so a plan that drops a constraint and then deletes a row
+    it pointed at is one the engine accepts — but the probe read the catalog
+    as it stands *before* statement one, counted the child rows through a
+    constraint that would be gone, and refused the plan. The constraints and
+    tables the plan removes are now left out of the catalog read altogether.
+    Each is named with its table, because two schemas may each hold a
+    constraint of one name; a table this plan also renames is named as the
+    catalog has it now, because the probe runs before the rename does.
+129. **A row delete carries its own guard, under locks it keeps.** The probe
+    counts before the first statement and the delete runs later; a child row
+    committed in between was taken silently by `ON DELETE CASCADE`, after
+    which the closing snapshot recorded the damaged state as a success. The
+    delete now re-counts, inside its own transaction and with `HOLDLOCK` on
+    the child scans, and throws if anything references the row. By then every
+    insert, update and child delete of the plan has run, so *any* remaining
+    reference is one the probe did not account for and the guard needs none
+    of the plan's exclusions. Measured: with the guard's transaction open, a
+    concurrent insert of a child row blocks until the delete commits, so the
+    window the probe left is closed rather than narrowed.
+
+    The guard and the delete are wrapped in a transaction of their own,
+    because a staged apply runs each statement outside one (SPEC §7.5) and
+    the range locks would otherwise be released before the delete they
+    protect. Inside the transactional apply it merely nests. The `CATCH`
+    rolls back and rethrows, so a failed guard never leaves a staged run
+    holding an open transaction.
+130. **The key-alias guard resolves the plan's table name through the
+    identities first.** `AlterColumnType` names the table as the plan leaves
+    it, while the declarations and the rows read back are keyed by the name
+    the database has now (`tables_under`). A table renamed in the same
+    revision was found in neither, so a key column changing from `int` to
+    `varchar` while a declared key `01` stood for a stored `1` passed the
+    guard that exists to refuse exactly that. The mapping both collections
+    were built through is now a named function, and the guard goes through
+    it.
