@@ -223,13 +223,16 @@ jobs:
             plan.json
             plan.sql
 
-  # ---- the gate: the approver dispatches this, and `environment:` still asks ----
-  apply:
+  # ---- what the approver reads, before the gate opens ----
+  #      No environment, so no credential: this job only assembles the facts.
+  prepare:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    environment: production        # configure required reviewers on this environment
     env:
-      PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN_RUN: ${{ inputs.plan_run }}
+      CHECKSUM: ${{ inputs.checksum }}
+      ALLOW: ${{ inputs.allow }}
     steps:
       # Dispatch from the same `prod-v*` tag the plan was computed on.
       - uses: actions/checkout@v4
@@ -243,6 +246,54 @@ jobs:
       # checksum and the live baseline — not which commit produced the plan.
       # Two tags planned against the same baseline are both applyable, so the
       # artifact is bound to the tag being dispatched before it is fetched.
+      - name: the plan must be this tag's
+        run: |
+          plan_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PLAN_RUN" --jq .head_sha)
+          if [ "$plan_sha" != "$GITHUB_SHA" ]; then
+            echo "run $PLAN_RUN planned $plan_sha; this dispatch is at $GITHUB_SHA" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Anyone with write access can dispatch, and the reviewer approving the
+      # run is not always that person. So what they are approving is put in
+      # front of them rather than left in the inputs panel.
+      - name: say what this deployment is
+        run: |
+          {
+            echo "## Deploying \`$GITHUB_REF_NAME\`"
+            echo
+            echo "- checksum supplied: \`$CHECKSUM\`"
+            echo "- risk classes allowed: \`${ALLOW:-none}\`"
+            echo "- plan from run: $PLAN_RUN"
+            echo
+            echo '~~~'                 # a tilde fence: this file is Markdown too
+            pbps explain --plan plan.json
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- the gate: `environment:` is what makes GitHub ask a human ----
+  apply:
+    needs: prepare
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production        # configure required reviewers on this environment
+    env:
+      PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p pbps-cli
+      - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      # The same binding again, because this job is the one holding the
+      # credential and `needs:` only orders jobs — it does not carry a check.
       - name: the plan must be this tag's
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -315,10 +366,31 @@ approve — which is the thing this pipeline exists to avoid.
 The dispatch inputs are part of that boundary too. `apply` pins the artifact by
 its checksum and the live baseline; it does not care which commit produced the
 plan, so two `prod-v*` tags planned against the same baseline are both
-applyable and an approval meant for one could run the other's plan. The apply
-job therefore refuses a `plan_run` whose `head_sha` is not the ref being
-dispatched, before it downloads anything — the reviewer approving a run should
-not have to read its inputs to know which tag they are deploying.
+applyable and an approval meant for one could run the other's plan. Both jobs
+therefore refuse a `plan_run` whose `head_sha` is not the ref being dispatched,
+before anything is downloaded — in `prepare` so the run fails early, and again
+in `apply`, because `needs:` orders jobs and carries no check of its own.
+
+**Whoever dispatches is not necessarily whoever approves.** GitHub lets anyone
+with write access start a `workflow_dispatch` run
+([docs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow#running-a-workflow)),
+and the environment's reviewers are then asked to approve a job whose inputs —
+the plan, the checksum, the risk classes — somebody else chose. There is no
+setting that narrows dispatch to the reviewer set, so the reviewer *is* the
+control, and the pipeline's job is to make their approval an informed one
+rather than a click.
+
+That is what `prepare` is for. It holds no credential and touches no database;
+it verifies the binding, downloads the artifact, and writes the deployment into
+the run summary the approver is already looking at: the tag, the checksum that
+was supplied, the risk classes that were named, and `pbps explain` on the
+artifact itself — which prints the plan's *own* checksum, its changes and its
+risks. A supplied checksum that does not match the plan is then visible before
+anyone approves, rather than being discovered by `apply` afterwards.
+
+Approving without reading that summary is the residual risk, and no YAML
+closes it. An organisation that cannot accept it should move the apply into a
+repository whose write access *is* the releaser set.
 
 There is deliberately **no recording step after `apply`**. `apply` reads the
 database back and records that state itself, with the checksum of the plan it
