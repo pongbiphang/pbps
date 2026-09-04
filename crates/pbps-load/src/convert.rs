@@ -56,12 +56,18 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
     let mut errs = Vec::new();
     let mut intents = Vec::new();
 
-    let name = dto.role.value.trim().to_owned();
+    // Verbatim, and `trim()` only to ask whether there is a name at all.
+    // Measured: SQL Server stores `CREATE ROLE [ app_pad ]` with its padding,
+    // `needs_quotes` refuses any scalar that is not its own `trim()` so `pull`
+    // writes it back quoted, and YAML hands it here intact — trimming it made
+    // a freshly pulled project name a role the database does not have, while
+    // the ids file named the one it does (DECISIONS 177).
+    let name = dto.role.value.clone();
     // A dot is not refused: a role is not in a schema, but `[app.reader]`
     // is a legal principal name, the emitter quotes it, and `pull` writes
     // it back as it is — refusing it here made a freshly pulled project
     // fail to load.
-    if name.is_empty() {
+    if name.trim().is_empty() {
         errs.push(LoadError::semantic(
             src,
             to_span(&dto.role.defined),
@@ -71,8 +77,10 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
     }
 
     if let Some(from) = &dto.renamed_from {
-        let from = from.value.trim().to_owned();
-        if !name.is_empty() {
+        // The same, for the same reason: this names a role the database has,
+        // and a trimmed one asks it to rename a principal that is not there.
+        let from = from.value.clone();
+        if !name.trim().is_empty() {
             intents.push(Intent::RenameRole {
                 from,
                 to: name.clone(),

@@ -2402,3 +2402,29 @@ SPEC is in sync with all of these.
     managed module the catalog could not read back is missing from the second
     and is still ours (491edd9); testing against what came back would have
     excused exactly the case that commit exists for.
+
+177. **A name is kept as the database spells it; `trim()` asks whether there
+    is one, and nothing more.**
+    Measured on SQL Server 2025: `CREATE ROLE [ app_pad ]` stores the padding,
+    and so does `[trail ]`. `needs_quotes` refuses any scalar that is not its
+    own `trim()`, so `pull` writes such a name back quoted and YAML hands it
+    to the loader intact — where `convert_role` trimmed it. A freshly pulled
+    project therefore named a role the database does not have while the ids
+    file named the one it does, which reads as an ambiguous replacement rather
+    than a clean plan, and `init --from` fails its staged round trip. The
+    `renamed_from` beside it had the same trim and the worse consequence: it
+    names a principal the database *has*, and trimmed it renames one that is
+    not there.
+    Both keep the scalar now, with `trim()` used only for "is there a name at
+    all". Swept: `TableName::from_str` and `ObjectName::from_str` never
+    trimmed, so a padded table or module name already round-trips, and `seq`
+    renders every element through `scalar`, so `columns: [" c "]` does too.
+    **One asymmetry is left, and deliberately.** A foreign key's target is one
+    composite scalar — `dbo.region(region_id)`, the column names joined with
+    `", "` inside it — so a padded column name there is indistinguishable from
+    the separator's own whitespace. The same column survives in `columns:` and
+    does not in `references:`. Fixing it is a *format* change, not a stray
+    trim: either the separator stops taking a space (which reinterprets every
+    file already written) or the composite grows a quoting rule of its own.
+    That is a decision, not a bug fix, and it is recorded here rather than
+    made in passing.

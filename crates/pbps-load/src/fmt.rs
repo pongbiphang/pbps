@@ -399,6 +399,51 @@ mod tests {
         out
     }
 
+    /// Measured on SQL Server 2025: `CREATE ROLE [ app_pad ]` stores the name
+    /// with its padding, and `pull` writes it back quoted, because
+    /// `needs_quotes` refuses any scalar that is not its own `trim()`. The
+    /// loader then trimmed it, so a freshly pulled project named a role the
+    /// database does not have while the ids file named the one it does — an
+    /// ambiguous replacement rather than a clean plan (DECISIONS 177).
+    #[test]
+    fn a_role_name_keeps_the_whitespace_the_database_gave_it() {
+        for name in [" app_pad ", "trail ", " lead"] {
+            let out = render_role(name, &pbps_model::Role::default(), &[]);
+            let back = crate::load_role_str(Path::new("r.yml"), &out)
+                .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+            assert_eq!(back.name, name, "output:\n{out}");
+        }
+
+        // The rename intent names the *old* spelling, and it is the same kind
+        // of name: trimmed, it would ask the database to rename a role that is
+        // not there.
+        let out = render_role(
+            "kept",
+            &pbps_model::Role::default(),
+            &[pbps_model::Intent::RenameRole {
+                from: " was ".into(),
+                to: "kept".into(),
+            }],
+        );
+        let back = crate::load_role_str(Path::new("r.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+        assert_eq!(
+            back.intents,
+            [pbps_model::Intent::RenameRole {
+                from: " was ".into(),
+                to: "kept".into(),
+            }],
+            "output:\n{out}"
+        );
+
+        // A name that is nothing but whitespace is still no name.
+        let out = render_role("   ", &pbps_model::Role::default(), &[]);
+        assert!(
+            crate::load_role_str(Path::new("r.yml"), &out).is_err(),
+            "output:\n{out}"
+        );
+    }
+
     /// The definition is SQL, and SQL is exactly the kind of text YAML quoting
     /// mangles: a `#`, a `:` or a leading `-` in the wrong place would come
     /// back as something else. A literal block keeps it verbatim.
