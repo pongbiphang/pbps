@@ -165,7 +165,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0          # `plan --since` needs history, not a shallow clone
+      # `toolchain:` is named rather than left to the action's default, which
+      # is its own ref — so pinning this to a commit SHA (below) would
+      # otherwise ask for a Rust toolchain by that SHA and fail.
       - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: stable }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
@@ -204,8 +208,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No third-party action in a job that will hold the credential: the
+      # runner's own stable toolchain builds it. See "Who can reach the
+      # credential" — step scoping is not containment once something has
+      # written to the workspace this binary is built from.
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
 
@@ -241,8 +247,10 @@ jobs:
       # Dispatch from the same `prod-v*` tag the plan was computed on.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No third-party action in a job that will hold the credential: the
+      # runner's own stable toolchain builds it. See "Who can reach the
+      # credential" — step scoping is not containment once something has
+      # written to the workspace this binary is built from.
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
 
@@ -302,8 +310,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No third-party action in a job that will hold the credential: the
+      # runner's own stable toolchain builds it. See "Who can reach the
+      # credential" — step scoping is not containment once something has
+      # written to the workspace this binary is built from.
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
 
@@ -376,21 +386,33 @@ either of them. It has an environment of its own (`monitoring`) holding a
 read-only account — see "Drift watch".
 
 **The credential is on steps, never on jobs.** A job-level `env:` reaches every
-step in the job, so writing it there would hand the connection string to
-`actions/checkout`, the toolchain installer, the cache action and every build
-script `cargo` runs — none of which needs a database. In these pipelines it
-appears on exactly four steps: `doctor`, `verify` and the connected `plan`, and
-the `apply` itself. `explain` is offline and does not get it either.
+step in the job, so writing it there hands the connection string to everything
+that checks out, installs, caches and builds — none of which needs a database.
+Here it appears on exactly four steps: `doctor`, `verify` and the connected
+`plan`, and the `apply` itself. `explain` is offline and does not get it, and
+`prepare` holds none of it at all.
 
-**Pin every third-party action to a full commit SHA** before this goes near a
-production credential ([GitHub's hardening guide](https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)).
-A tag is a mutable pointer: `@v4` is whatever that ref points at on the day the
-job runs. The examples here carry tags so that they run as pasted and stay
-readable, which is exactly the trade this file otherwise refuses to make — so
-it is called out rather than hidden. Step-scoping the credential is what limits
-the damage in the meantime: a compromised action in these jobs no longer has
-the connection string in its environment. It can still touch the workspace the
-build runs from, which is the reason to pin as well as to scope.
+**Step scoping is not containment, though**, and it would be dishonest to
+present it as one. Everything in a job shares a workspace: an action that runs
+*before* those steps can change the checked-out source or the binary they are
+about to execute, and the credential then reaches the attacker's code by being
+handed to it legitimately. Scoping decides who is told the secret; it says
+nothing about what runs.
+
+So the jobs that hold the credential **run no third-party action at all**. They
+check out, build with the runner's own stable toolchain, and move artifacts —
+nothing else. The toolchain and cache actions stay in the merge-request job,
+which holds no secret and builds pull-request code anyway.
+
+**Pin what remains to a full commit SHA** before this goes near production
+([GitHub's hardening guide](https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)):
+`@v4` is a mutable pointer, and even a first-party action is a moving target
+under a tag. The examples carry tags so they run as pasted — the one concession
+of that kind in this file, stated here rather than left to be discovered, and
+narrowed by the paragraph above to the actions that never meet the credential.
+When you pin `dtolnay/rust-toolchain`, name the toolchain as well: its
+`toolchain` input defaults to the action's own ref, so a SHA pin without
+`with: { toolchain: stable }` asks for a Rust toolchain by that SHA.
 
 `production-plan` has no required reviewers on purpose. Putting them there would
 ask a human to approve before the plan exists — before there is a checksum to
@@ -602,8 +624,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No third-party action in a job that will hold the credential: the
+      # runner's own stable toolchain builds it. See "Who can reach the
+      # credential" — step scoping is not containment once something has
+      # written to the workspace this binary is built from.
       - run: cargo build --release --locked -p pbps-cli
       - run: echo "$PWD/target/release" >> "$GITHUB_PATH"
       - env: { PBPS_PROD_URL: "${{ secrets.PBPS_PROD_URL }}" }
