@@ -32,11 +32,69 @@ use crate::rules;
 #[serde(deny_unknown_fields)]
 pub struct Policies {
     /// Rule id to its setting.
+    ///
+    /// A map in Rust, a closed list of keys in the editor schema: see
+    /// [`rules_schema`]. `BTreeMap<String, _>` derives to "any key", which
+    /// blessed `naming.tabel` in the editor and left the typo to be found by
+    /// `pbps validate` — the opposite of what a generated schema is for
+    /// (DECISIONS 172).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "rules_schema")]
     pub rules: BTreeMap<String, RuleSetting>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppress: Vec<Suppression>,
+}
+
+/// The catalogue as JSON Schema `enum` members.
+fn rule_ids() -> Vec<serde_json::Value> {
+    rules::RULES.iter().map(|r| r.id.into()).collect()
+}
+
+/// `rules:`, keyed by the catalogue rather than by any string at all.
+///
+/// Written out rather than derived because the derive has no way to know the
+/// keys are closed, and `pbps validate` refusing a typo is not a substitute:
+/// an editor that autocompletes and validates against this file is the whole
+/// point of publishing it (SPEC §14.1), and one that accepts a misspelt rule
+/// id is worse than none — it says the file is right (DECISIONS 172).
+///
+/// Each key carries the catalogue's own sentence about the rule, so an editor
+/// shows what it checks and what it takes without a second description to
+/// keep in step.
+fn rules_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let setting = generator.subschema_for::<RuleSetting>();
+    let mut properties = serde_json::Map::new();
+    for rule in &rules::RULES {
+        let mut entry = serde_json::Value::from(setting.clone());
+        let about = match rule.params {
+            [] => format!("Checks {}.", rule.about),
+            params => format!("Checks {}. Takes {}.", rule.about, params.join(", ")),
+        };
+        if let Some(o) = entry.as_object_mut() {
+            o.insert("description".to_owned(), about.into());
+        }
+        properties.insert(rule.id.to_owned(), entry);
+    }
+    schemars::Schema::try_from(serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+    }))
+    .expect("an object is a schema")
+}
+
+/// One rule id: the same closed list, in the place a suppression names one.
+///
+/// The same shape as [`rules_schema`] and swept with it — a suppression of
+/// `naming.tabel` suppresses nothing, and `check` refuses it for exactly that
+/// reason (DECISIONS 172).
+fn rule_id_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::Schema::try_from(serde_json::json!({
+        "type": "string",
+        "enum": rule_ids(),
+    }))
+    .expect("an object is a schema")
 }
 
 /// `error` / `warning` / `note` / `off`, or the detailed form.
@@ -92,6 +150,7 @@ pub struct RuleConfig {
 )]
 #[serde(deny_unknown_fields)]
 pub struct Suppression {
+    #[schemars(schema_with = "rule_id_schema")]
     pub rule: String,
 
     /// The object it applies to (`dbo.customer`, `role app_reader`). Absent

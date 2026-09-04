@@ -186,11 +186,51 @@
       "type": "object",
       "properties": {
         "rules": {
-          "description": "Rule id to its setting.",
+          "description": "Rule id to its setting.\n\nA map in Rust, a closed list of keys in the editor schema: see\n[`rules_schema`]. `BTreeMap<String, _>` derives to \"any key\", which\nblessed `naming.tabel` in the editor and left the typo to be found by\n`pbps validate` — the opposite of what a generated schema is for\n(DECISIONS 172).",
           "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/RuleSetting"
-          }
+          "properties": {
+            "naming.table": {
+              "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "naming.column": {
+              "description": "Checks a column's name matches `pattern`. Takes pattern.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "naming.index": {
+              "description": "Checks an index's name matches `pattern`. Takes pattern.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "naming.constraint": {
+              "description": "Checks a named constraint (primary key, unique, foreign key, check) matches `pattern`. Takes pattern.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "data.max-rows": {
+              "description": "Checks a `data:` block declares at most `rows` rows — past that it stops looking like reference data (ADR-0004). Takes rows.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "column.no-deprecated-type": {
+              "description": "Checks a column does not use a type the engine has deprecated (text, ntext, image).",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "change.expand-contract": {
+              "description": "Checks one revision does not both add and drop or narrow in the same table, which usually wants expand/contract staging (SPEC §13.3).",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "change.narrowing-on-data": {
+              "description": "Checks a type narrowing depends on the data already stored; the pre-flight probe measures it at apply time.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "grant.widen": {
+              "description": "Checks a grant widens what a role can do (ADR-0005), for a project that wants the label at a severity of its own.",
+              "$ref": "#/$defs/RuleSetting"
+            },
+            "change.window": {
+              "description": "Checks a connected plan is computed inside an allowed change window: `offset` (`+08:00`) and `allow` (`mon-fri 09:00-17:00`, ...). Takes offset, allow.",
+              "$ref": "#/$defs/RuleSetting"
+            }
+          },
+          "additionalProperties": false
         },
         "suppress": {
           "type": "array",
@@ -264,7 +304,19 @@
       "type": "object",
       "properties": {
         "rule": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "naming.table",
+            "naming.column",
+            "naming.index",
+            "naming.constraint",
+            "data.max-rows",
+            "column.no-deprecated-type",
+            "change.expand-contract",
+            "change.narrowing-on-data",
+            "grant.widen",
+            "change.window"
+          ]
         },
         "on": {
           "description": "The object it applies to (`dbo.customer`, `role app_reader`). Absent\nmeans the whole project.",
@@ -292,6 +344,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 4,
+  "x-pbps-schema-version": 5,
   "x-pbps-tool-version": "0.0.0"
 }

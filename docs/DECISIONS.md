@@ -2225,3 +2225,32 @@ SPEC is in sync with all of these.
     The live test is the point of this entry. Every claim above is a claim
     about the engine, and a unit test can only confirm that the SQL says what
     I think it says — which it did, while the engine refused it.
+
+172. **The editor schema spells the rule catalogue, because a schema that
+    blesses what the loader refuses is worse than no schema.**
+    `policies.rules` is a `BTreeMap<String, RuleSetting>`, and the derive turns
+    that into `additionalProperties: {$ref: RuleSetting}` — any key at all. So
+    an editor completing and validating against the published schema accepted
+    `naming.tabel`, marked the file correct, and left the typo for
+    `pbps validate` to find later. The catalogue is closed *on purpose*
+    (`rules.rs`: "a typo in `policies:` is refused by name rather than
+    silently configuring nothing"), which is exactly the knowledge the schema
+    was throwing away.
+    This is the rule `integration.rs` already states about `deny_unknown_fields`
+    — "a schema that made it optional would let an editor bless a file the
+    loader rejects, worse than shipping none" — applied to keys instead of
+    fields. `rules_schema` writes the ten ids out of `rules::RULES`, with
+    `additionalProperties: false` and each key carrying the catalogue's own
+    sentence, so there is still one list and not two. Swept: a suppression's
+    `rule` is the same closed set and gets the same treatment, because
+    suppressing a rule that does not exist suppresses nothing.
+    **Not swept into severity, deliberately.** `severity` and the bare-word
+    form are also a closed set to the loader — but `Severity::from_str` trims
+    and lowercases, so a JSON Schema `enum` of the four words would refuse
+    `Error`, which the loader accepts. A schema *stricter* than the loader is
+    the mirror image of the bug above, not a further fix of it: it reports a
+    valid file as wrong. Both halves of "the schema is the loader" have to
+    hold, and only the ids can state it exactly — `rules::rule` compares with
+    `==`.
+    `SCHEMA_VERSION` goes to 5 for the reason it exists: an editor notices, in
+    the way that matters most to it.

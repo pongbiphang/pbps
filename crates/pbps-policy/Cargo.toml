@@ -15,8 +15,10 @@ schemars.workspace = true
 # than `regex`: the same syntax for what a naming rule needs, a fraction of
 # the dependency tree, and this binary gets audited.
 regex-lite.workspace = true
-
-[dev-dependencies]
+# Only to build the editor schema's rule catalogue by hand: `schemars` states
+# a schema as JSON, and the closed list of rule ids has to be spelled from
+# `rules::RULES` rather than derived from a `BTreeMap<String, _>`, which would
+# accept any key (DECISIONS 172).
 serde_json.workspace = true
 
 [lints]
