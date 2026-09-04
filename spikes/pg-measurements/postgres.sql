@@ -861,6 +861,30 @@ SELECT 'R63', 'is a trigger a lockable relation of its own?',
        CASE WHEN to_regclass('m.tg_audit') IS NULL THEN 'no — its lock is the parent table''s'
             ELSE 'yes' END;
 
+-- ----------------------------- the twenty-sixth 2026-09-05 review round
+
+CREATE FUNCTION m.pn_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.pn_caller() RETURNS int AS $$ BEGIN RETURN m.pn_f(a => 1); END $$ LANGUAGE plpgsql;
+SELECT 'A57', 'a named-notation caller before its callee is rebuilt',
+       m.accepts('SELECT m.pn_caller()');
+DROP FUNCTION m.pn_f(int);
+CREATE FUNCTION m.pn_f(x int) RETURNS int AS $$ SELECT x * 2 $$ LANGUAGE sql;
+SELECT 'A58', 'the identity after renaming only the parameter',
+       (SELECT oid::regprocedure::text FROM pg_proc WHERE oid = 'm.pn_f(int)'::regprocedure)
+       || ' — unchanged';
+SELECT 'A59', 'and the same caller now',
+       m.accepts('SELECT m.pn_caller()');
+
+SET TimeZone = 'UTC';
+SET timezone_abbreviations = 'Default';
+SELECT 'R64', 'a quoted timestamptz with an abbreviation, under Default',
+       ('2026-01-15 12:00:00 CST'::timestamptz)::text;
+SET timezone_abbreviations = 'Australia';
+SELECT 'R65', 'the same literal under Australia',
+       ('2026-01-15 12:00:00 CST'::timestamptz)::text
+       || ' — the same approved value, a different instant';
+RESET timezone_abbreviations; RESET TimeZone;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

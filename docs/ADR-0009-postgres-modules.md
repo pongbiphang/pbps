@@ -968,16 +968,27 @@ Two things follow, and neither is a new mechanism:
   SELECT m.dep_plpgsql()   refused: function m.dep_f(integer) does not exist
   ```
 
-  A signature change is the case that bites: a rebuild that restores the same
-  identity leaves opaque callers working, and one that changes it breaks them at
-  their next call, in someone else's code, after a deployment that verified
-  clean. §1 makes the signature part of the declared identity, so **pbps knows
-  exactly when a plan crosses that line** — which is what makes a narrower rule
-  possible instead of a blanket one.
+  A signature change is the obvious case that bites — the caller is looking for
+  an identity that no longer exists. **But an unchanged identity is not safety**,
+  and a first version of this decision assumed it was. **Measured**, renaming a
+  *parameter* keeps `mm.f(integer)` exactly as it was and still breaks a caller
+  that used named notation:
 
-  **Decision.** When a plan changes or removes a routine's identity, the
-  catalog's edges are supplemented by ADR-0002's existing device: a **best-effort
-  identifier scan** — that ADR already permits scanning definition text for the
+  ```
+  before the rebuild:                       mm.caller() = 2
+  the identity is:                          mm.f(integer)
+  after rebuilding f(a int) as f(x int):    still mm.f(integer)
+  and the caller:  refused: function mm.f(a => integer) does not exist
+  ```
+
+  A changed return type under the same identity does the same to a caller that
+  depends on the old one. Both live inside the opaque `definition`, so pbps
+  cannot tell them from a harmless edit — which means the trigger for the scan
+  cannot be "the identity changed".
+
+  **Decision.** When a plan rebuilds a routine whose opaque declaration changed
+  **at all** — identity or body — the catalog's edges are supplemented by
+  ADR-0002's existing device: a **best-effort identifier scan** — that ADR already permits scanning definition text for the
   names of managed objects, "no SQL semantics", for ordering — extended to the
   bodies the catalog holds.
 
@@ -996,8 +1007,8 @@ Two things follow, and neither is a new mechanism:
   its next call. Scheduling another rebuild preserves exactly the failure it was
   meant to prevent.
 
-  So: when a plan changes or removes a routine's identity and the scan finds a
-  **managed** caller whose declaration this plan does not also change,
+  So: when a plan rebuilds a routine whose declaration changed and the scan finds
+  a **managed** caller whose declaration this plan does not also change,
   `plan --db` refuses and names both. The remedy is the user's, because only the
   user can say what the caller should now call — which is the same division of
   labour as rename and drop intent. Callers found **outside** the managed set are

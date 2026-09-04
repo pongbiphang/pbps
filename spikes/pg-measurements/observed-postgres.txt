@@ -151,3 +151,8 @@ R60 | a row lock on its pg_proc entry | accepted — and measured with two sessi
 R61 | a trigger's enabled state after DISABLE | tgenabled = D
 R62 | the same trigger after a drop-and-create rebuild | tgenabled = O — the disable is gone
 R63 | is a trigger a lockable relation of its own? | no — its lock is the parent table's
+A57 | a named-notation caller before its callee is rebuilt | accepted
+A58 | the identity after renaming only the parameter | pn_f(integer) — unchanged
+A59 | and the same caller now | refused: function m.pn_f(a => integer) does not exist
+R64 | a quoted timestamptz with an abbreviation, under Default | 2026-01-15 18:00:00+00
+R65 | the same literal under Australia | 2026-01-15 02:30:00+00 — the same approved value, a different instant

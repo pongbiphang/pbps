@@ -473,6 +473,7 @@ Named, because a decision about a set has to say what is in it:
 | `DateStyle` | `2026-09-05` or `05/09/2026` |
 | `IntervalStyle` | `1 day 02:00:00` or `1 2:00:00` |
 | `TimeZone` | the text of an unchanged `timestamptz` moves with it |
+| `timezone_abbreviations` | **measured**, `'2026-01-15 12:00:00 CST'` is `2026-01-15 18:00:00+00` under `Default` and `2026-01-15 02:30:00+00` under `Australia` — fifteen and a half hours apart, from a dictionary `TimeZone` does not cover. ADR-0004 permits a quoted `timestamptz`, so one approved plan would store two different instants |
 | `extra_float_digits` | **measured**, one stored `double precision` renders three ways: `0.123456789012346` at `0`, `0.12345678901234568` at `3`, `0.123456789012` at `-3` — and ADR-0004 permits a quoted non-integer value, so a `real` or `double precision` cell compares differently between a plan and a `verify` run by a role with another default |
 
 `extra_float_digits` was in an earlier version of this list and fell out when the
