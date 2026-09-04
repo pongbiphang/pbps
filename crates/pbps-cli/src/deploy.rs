@@ -108,7 +108,7 @@ async fn managed_state_full(
         .filter(|limitation| managed_tables.contains(&limitation.table))
         .map(|limitation| limitation.detail.clone())
         .collect();
-    report_unmanaged(&scoped, unmanaged)?;
+    report_unmanaged(&scoped, &unreadable, modules, unmanaged)?;
     Ok(Managed {
         scoped,
         limitations,
@@ -217,20 +217,44 @@ fn managed_modules(
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
-/// Applies the `unmanaged:` policy of SPEC §8.2 to what fell outside the scope.
-fn report_unmanaged(
+/// Names every representable or unreadable catalog object outside the managed
+/// set, for applying the `unmanaged:` policy of SPEC §8.2.
+fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
-    policy: pbps_config::Unmanaged,
-) -> anyhow::Result<()> {
-    if scoped.unmanaged.is_empty() && scoped.unmanaged_modules.is_empty() {
-        return Ok(());
-    }
-    let names: Vec<String> = scoped
+    unreadable: &[(pbps_model::ObjectName, String)],
+    managed_modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+) -> Vec<String> {
+    scoped
         .unmanaged
         .iter()
         .chain(&scoped.unmanaged_modules)
         .map(ToString::to_string)
-        .collect();
+        // Unreadable modules are absent from `scoped.schema`, but they are
+        // still catalog objects. If their name is outside the supplied module
+        // set, the unmanaged policy applies exactly as it does to a readable
+        // module. Without this half, encryption was an accidental escape from
+        // `unmanaged: error`.
+        .chain(
+            unreadable
+                .iter()
+                .filter(|(name, _)| !managed_modules.contains(name))
+                .map(|(_, description)| description.clone()),
+        )
+        .collect()
+}
+
+/// Applies the `unmanaged:` policy to both representable and unreadable
+/// catalog objects outside the managed set.
+fn report_unmanaged(
+    scoped: &pbps_diff::Scoped,
+    unreadable: &[(pbps_model::ObjectName, String)],
+    managed_modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    policy: pbps_config::Unmanaged,
+) -> anyhow::Result<()> {
+    let names = unmanaged_objects(scoped, unreadable, managed_modules);
+    if names.is_empty() {
+        return Ok(());
+    }
     match policy {
         pbps_config::Unmanaged::Ignore => {}
         pbps_config::Unmanaged::Warn => eprintln!(
@@ -349,22 +373,20 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
-        if project.config.unmanaged == pbps_config::Unmanaged::Error
-            && (!scoped.unmanaged.is_empty() || !scoped.unmanaged_modules.is_empty())
-        {
-            let names: Vec<String> = scoped
-                .unmanaged
-                .iter()
-                .chain(&scoped.unmanaged_modules)
-                .map(ToString::to_string)
-                .collect();
+        let unmanaged = unmanaged_objects(&scoped, &managed.unreadable, &recorded_modules);
+        if project.config.unmanaged == pbps_config::Unmanaged::Error && !unmanaged.is_empty() {
             unexpressible.push(format!(
                 "`unmanaged: error` rejects {} object(s) outside the managed set: {}",
-                names.len(),
-                names.join(", ")
+                unmanaged.len(),
+                unmanaged.join(", ")
             ));
         } else if project.config.unmanaged == pbps_config::Unmanaged::Warn {
-            report_unmanaged(&scoped, pbps_config::Unmanaged::Warn)?;
+            report_unmanaged(
+                &scoped,
+                &managed.unreadable,
+                &recorded_modules,
+                pbps_config::Unmanaged::Warn,
+            )?;
         }
 
         Ok(pbps_model::DriftReport {
@@ -954,7 +976,12 @@ pub fn cmd_plan_db(
         for_policy
             .unmanaged_modules
             .retain(|m| !loaded.schema.modules.contains_key(m));
-        report_unmanaged(&for_policy, project.config.unmanaged)?;
+        report_unmanaged(
+            &for_policy,
+            &managed.unreadable,
+            &recorded_modules,
+            project.config.unmanaged,
+        )?;
 
         // The plan is computed against the environment *as queried*, so the
         // queried state had better be the recorded one. When it is not, the
@@ -1303,22 +1330,47 @@ async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow
             return;
         }
     };
-    let mut failed = current;
-    failed.kind = StateKind::Failed;
-    failed.operator = d.operator.to_owned();
-    failed.git_sha = d
-        .plan
-        .git_sha
-        .clone()
-        .or_else(|| db::git_sha(d.project.root()));
-    failed.plan_checksum = Some(d.plan_checksum.to_owned());
-    failed.reason = Some(error.to_string().chars().take(1000).collect());
+    let failed = failed_apply_snapshot(
+        current,
+        d.operator,
+        d.plan
+            .git_sha
+            .clone()
+            .or_else(|| db::git_sha(d.project.root())),
+        d.plan_checksum,
+        error,
+    );
     match pbps_mssql::state::record(conn, &failed).await {
         Ok(id) => eprintln!("Apply failure recorded as ledger entry #{id}."),
         Err(audit_error) => {
             eprintln!("warning: the failed apply could not be added to the ledger: {audit_error}")
         }
     }
+}
+
+/// Turns the newest trustworthy state into a failed-attempt audit row.
+///
+/// An unfinished staged state belongs to the plan that produced its progress.
+/// A later attempt with another plan may fail before running anything, but it
+/// must not relabel that checkpoint with the attempted plan's checksum or git
+/// revision: doing so could let the next `--resume` skip statements from the
+/// wrong artifact. The operator and reason still describe the failed attempt.
+fn failed_apply_snapshot(
+    mut current: StateSnapshot,
+    operator: &str,
+    attempted_git_sha: Option<String>,
+    attempted_plan_checksum: &str,
+    error: &anyhow::Error,
+) -> StateSnapshot {
+    let is_staged_checkpoint = current.staged.is_some();
+    current.kind = StateKind::Failed;
+    current.operator = operator.to_owned();
+    if !is_staged_checkpoint {
+        current.git_sha = attempted_git_sha;
+        current.plan_checksum = Some(attempted_plan_checksum.to_owned());
+    }
+    current.reason = Some(error.to_string().chars().take(1000).collect());
+    current
 }
 
 /// Everything one `apply` carries from its command body into the locked section.

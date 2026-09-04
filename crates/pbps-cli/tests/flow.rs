@@ -5533,3 +5533,233 @@ fn status_reports_the_unmanaged_error_policy() {
         .unwrap();
     });
 }
+
+/// A module can be present in `sys.objects` while SQL Server withholds its
+/// definition. It is still an unmanaged object, so encryption must not turn
+/// `unmanaged: error` into an accidental allow-list escape.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn verify_rejects_an_unreadable_unmanaged_module() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("verify-unreadable-unmanaged");
+    d.table("table: dbo.pbps_unreadable_policy\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_unreadable_policy_secret', N'P') IS NOT NULL \
+                 DROP PROCEDURE dbo.pbps_unreadable_policy_secret;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_unreadable_policy', N'U') IS NOT NULL \
+                 DROP TABLE dbo.pbps_unreadable_policy;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        conn.execute("CREATE TABLE dbo.pbps_unreadable_policy (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+    // Adopt the managed table before introducing the policy violation.
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\nunmanaged: error\n").unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "CREATE PROCEDURE dbo.pbps_unreadable_policy_secret WITH ENCRYPTION AS SELECT 1;",
+        )
+        .await
+        .unwrap();
+    });
+
+    let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(code(&verify), FINDING, "{report}");
+    assert!(
+        report["data"]["unexpressible"]
+            .as_array()
+            .is_some_and(
+                |items| items.iter().any(|item| item.as_str().is_some_and(|s| {
+                    s.contains("unmanaged: error") && s.contains("pbps_unreadable_policy_secret")
+                }))
+            ),
+        "{report}"
+    );
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "DROP PROCEDURE dbo.pbps_unreadable_policy_secret; \
+             DROP TABLE dbo.pbps_unreadable_policy; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// Rejecting plan B while plan A is interrupted must leave A's checkpoint
+/// identity intact. Otherwise a second B attempt can pass the checksum check
+/// and use A's progress as its own resume offset.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("resume-checksum-audit");
+    d.table("table: dbo.pbps_resume_checksum\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_plan_b', N'V') IS NOT NULL DROP VIEW dbo.pbps_plan_b;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_resume_checksum', N'U') IS NOT NULL \
+                 DROP TABLE dbo.pbps_resume_checksum;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        conn.execute("CREATE TABLE dbo.pbps_resume_checksum (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    let interrupted_checksum = "a".repeat(64);
+    let checkpoint = rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        let mut checkpoint = latest.snapshot;
+        checkpoint.kind = pbps_model::StateKind::Staged;
+        checkpoint.git_sha = Some("plan-a-revision".into());
+        checkpoint.plan_checksum = Some(interrupted_checksum.clone());
+        checkpoint.staged = Some(pbps_model::StagedProgress {
+            completed: 1,
+            total: 2,
+            last_statement: "plan A statement 1".into(),
+        });
+        pbps_mssql::state::record(&mut conn, &checkpoint)
+            .await
+            .unwrap();
+        checkpoint
+    });
+
+    let plan_path = d.dir.join("plan-b.json");
+    let plan_b = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        "mssql",
+        "2026-09-04T00:00:00Z",
+        pbps_model::PlanBaseline {
+            description: "interrupted checkpoint".into(),
+            checksum: pbps_model::state_checksum(&checkpoint.schema, &checkpoint.ids),
+        },
+        pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateModule {
+                    name: "dbo.pbps_plan_b".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        on: None,
+                        definition: "SELECT 1 AS id".into(),
+                    }),
+                },
+            )],
+        },
+        checkpoint.ids.clone(),
+    )
+    .staged();
+    std::fs::write(&plan_path, serde_json::to_string_pretty(&plan_b).unwrap()).unwrap();
+    let attempted_checksum = plan_b.checksum();
+    assert_ne!(attempted_checksum, interrupted_checksum);
+
+    for _ in 0..2 {
+        let applied = d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--checksum",
+            &attempted_checksum,
+            "--staged",
+            "--resume",
+        ]);
+        assert_eq!(code(&applied), 1, "{}", stdout(&applied));
+        assert!(
+            stderr(&applied).contains("different plan"),
+            "{}",
+            stderr(&applied)
+        );
+
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+            assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
+            assert_eq!(
+                latest.snapshot.plan_checksum.as_deref(),
+                Some(interrupted_checksum.as_str())
+            );
+            assert_eq!(latest.snapshot.git_sha.as_deref(), Some("plan-a-revision"));
+            let progress = latest.snapshot.staged.as_ref().unwrap();
+            assert_eq!((progress.completed, progress.total), (1, 2));
+        });
+    }
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
+        assert!(
+            !pulled
+                .schema
+                .modules
+                .contains_key(&"dbo.pbps_plan_b".parse().unwrap())
+        );
+        conn.execute(
+            "DROP TABLE dbo.pbps_resume_checksum; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
