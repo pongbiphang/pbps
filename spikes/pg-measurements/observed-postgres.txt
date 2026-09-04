@@ -115,3 +115,6 @@ A42 | DROP FUNCTION with a managed check constraint on it | refused: cannot drop
 A43 | DROP FUNCTION with a column default on it | refused: cannot drop function fdep(integer) because other objects depend on it
 A44 | DROP FUNCTION with a generated column on it | refused: cannot drop function fdep(integer) because other objects depend on it
 A45 | DROP FUNCTION with an expression index on it | refused: cannot drop function fdep(integer) because other objects depend on it
+R39 | a sequence advance after the transaction that made it rolled back | last_value 5 — the advance survived
+R40 | nextval on a CYCLE sequence, six calls | 8, 9, 10, 1, 2, 3 — not monotonic, so "advance until past the maximum" never ends
+R41 | what the catalog says about that sequence | cycle=true min=1 max=10 — detectable, though Identity records only seed and increment

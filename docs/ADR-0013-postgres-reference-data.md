@@ -226,14 +226,72 @@ Two things follow, and the first matters more:
   measured two rounds earlier — `nextval` walks past it, and PostgreSQL offers
   no lock that does not.
 
-  **So the honest statement is a precondition, not a guarantee: pinning keys
-  into an identity column is safe only while nothing else is allocating from
-  that sequence.** `validate`'s rule on an identity-keyed `data:` block says so
-  in those words rather than warning vaguely — the block is safe at bootstrap
-  and during a quiesced window, and unsafe against a live writer, which is a
-  thing an operator can actually check. ADR-0004 already discourages declaring
-  rows by an identity key; this is the third independent reason, and the only
-  one the tool cannot engineer away.
+  The advance stops pbps from issuing 5 again; it cannot un-issue the 5 the
+  other session is already holding.
+
+  **And two more obstacles finish this off, both measured.** The advance is
+  itself outside the transaction the whole apply depends on:
+
+  ```
+  BEGIN; five nextvals; ROLLBACK;
+      last_value = 5 — the advance is still there
+  ```
+
+  A sequence is non-transactional — the property this design was *relying* on
+  for monotonicity — so a plan that fails at a later statement rolls back the
+  pinned rows and the state entry and **leaves the advance behind**. SPEC §7.5
+  promises the environment is unchanged after a failed apply; it would not be,
+  and each retry would consume another range.
+
+  And the loop is not guaranteed to terminate. On a sequence someone has
+  altered to `CYCLE`, `nextval` is not monotonic at all:
+
+  ```
+  a CYCLE sequence with MAXVALUE 10, starting at 8:  8, 9, 10, 1, 2, 3
+  ```
+
+  If the table holds the maximum, "advance until past every key in use" walks
+  for ever over values already taken. `pg_sequence` exposes `seqcycle`, `seqmin`
+  and `seqmax`, so this is detectable — and `Identity` records only a seed and
+  an increment, so it is not otherwise refused.
+
+  ### The decision: refuse an identity-keyed `data:` block on PostgreSQL
+
+  That is six independent obstacles on one feature, every one of them measured
+  on this branch:
+
+  | | |
+  |---|---|
+  | 1 | a pinned insert does not advance the sequence |
+  | 2 | no lock conflicts with `nextval`, and a sequence cannot be locked at all |
+  | 3 | `setval` cannot be made atomic with the read that chooses its argument |
+  | 4 | an allocation already handed out cannot be recalled, so the operation needs quiescence |
+  | 5 | the advance survives a rollback, so a failed apply leaves the environment changed |
+  | 6 | a `CYCLE` sequence makes the advance non-monotonic and non-terminating |
+
+  Four rounds of this document tried to engineer around 1–4 and each fix was
+  correct about the hazard in front of it. What 5 and 6 make plain is that the
+  feature does not fit inside the promises the tool is built on: §7.5's
+  all-or-nothing, and a plan whose effects are exactly what a reviewer approved.
+  A construct that requires the application to be quiesced and leaves debris
+  after a rollback is not a construct this tool can offer, however carefully the
+  statements are ordered.
+
+  **So `validate` refuses a `data:` block whose key is an identity column on
+  PostgreSQL**, naming the sequence and pointing at the two ways forward: declare
+  the rows by a natural key, or place them outside pbps and `pbps baseline` —
+  which is the escape hatch ADR-0004 already names for the analogous case of a
+  key that has to change.
+
+  ADR-0004 says an identity primary key "hands out different values per
+  environment, so declaring rows by id would be a lie by default". On this engine
+  that stops being a stylistic objection and becomes a mechanical one, and the
+  house preference decides the rest: **prefer making a failure unrepresentable
+  over handling it.** Refusing removes all six at once — no advance, no loop, no
+  lock, no precondition an operator has to remember.
+
+  The rest of this bullet is kept because it is the case for the refusal, not a
+  design still to be built.
 
   Widening the step first — `ALTER SEQUENCE … INCREMENT BY <gap>`, one `nextval`,
   then restore — makes the common case a single call, and **measured**, it is

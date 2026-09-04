@@ -633,6 +633,24 @@ CREATE INDEX ix_fdep ON m.d_idx (m.fdep(v));
 SELECT 'A45', 'DROP FUNCTION with an expression index on it',
        m.accepts('DROP FUNCTION m.fdep(int)');
 
+-- ------------------------------- the fourteenth 2026-09-05 review round
+
+CREATE SEQUENCE m.roll;
+BEGIN;
+SELECT nextval('m.roll') FROM generate_series(1,5) \gset r_
+ROLLBACK;
+SELECT 'R39', 'a sequence advance after the transaction that made it rolled back',
+       'last_value ' || (SELECT last_value::text FROM m.roll) || ' — the advance survived';
+
+CREATE SEQUENCE m.cyc START 8 MINVALUE 1 MAXVALUE 10 CYCLE;
+SELECT 'R40', 'nextval on a CYCLE sequence, six calls',
+       (SELECT string_agg(nextval('m.cyc')::text, ', ') FROM generate_series(1,6))
+       || ' — not monotonic, so "advance until past the maximum" never ends';
+SELECT 'R41', 'what the catalog says about that sequence',
+       'cycle=' || seqcycle::text || ' min=' || seqmin::text || ' max=' || seqmax::text
+       || ' — detectable, though Identity records only seed and increment'
+FROM pg_sequence WHERE seqrelid = 'm.cyc'::regclass;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
