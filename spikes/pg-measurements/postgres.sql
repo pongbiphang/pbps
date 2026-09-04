@@ -1127,6 +1127,42 @@ SELECT 'R99', 'now(), under READ ONLY', :'r4';
 SELECT 'R100', 'the sequence after the read-only probe',
        'last_value ' || (SELECT last_value::text FROM m.pseq);
 
+-- -------------------------- the thirty-seventh 2026-09-05 review round
+
+-- The recorded write path is a proxy for the binding, and the proxy is not the
+-- property: a new same-named object earlier on an unchanged path moves it.
+CREATE SCHEMA xa; CREATE SCHEMA xb;
+CREATE FUNCTION xb.helper() RETURNS text AS $$SELECT 'xb'$$ LANGUAGE sql;
+SET search_path = m, xa, xb;
+CREATE VIEW m.xv AS SELECT helper() AS who;
+CREATE FUNCTION m.xf() RETURNS text AS $$ BEGIN RETURN helper(); END $$ LANGUAGE plpgsql;
+SELECT 'R101', 'a view created under (xa, xb) while only xb.helper() exists',
+       (SELECT who FROM m.xv);
+SELECT 'R102', 'the same declaration through an opaque plpgsql body', m.xf();
+CREATE FUNCTION xa.helper() RETURNS text AS $$SELECT 'xa'$$ LANGUAGE sql;
+SELECT 'R103', 'the view after xa.helper() appears, path string unchanged',
+       (SELECT who FROM m.xv);
+DISCARD PLANS;
+SELECT 'R104', 'the plpgsql body after the same, with cached plans discarded', m.xf();
+CREATE VIEW m.xv2 AS SELECT helper() AS who;
+SELECT 'R105', 'a bootstrap of the same view declaration, same path',
+       (SELECT who FROM m.xv2);
+SELECT 'R106', 'what the catalog records about the view''s binding',
+  (SELECT string_agg(n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE r.ev_class = 'm.xv'::regclass AND d.refclassid = 'pg_proc'::regclass);
+SELECT 'R107', 'and about the opaque body''s',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'm.xf()'::regprocedure AND d.refclassid = 'pg_proc'::regclass), 'nothing');
+SET search_path = m;
+DROP SCHEMA xa CASCADE; DROP SCHEMA xb CASCADE;
+
+-- Four types ADR-0013's own rules name, absent from ADR-0012's closed catalogue.
+SELECT 'R108', 'text / date / bytea / timestamptz, read back',
+  format_type('text'::regtype, NULL) || ' / ' || format_type('date'::regtype, NULL) || ' / ' ||
+  format_type('bytea'::regtype, NULL) || ' / ' || format_type('timestamptz'::regtype, NULL);
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

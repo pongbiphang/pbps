@@ -27,7 +27,7 @@ named as an open question rather than asserted.
 
 ## 1. The catalogue: what the engine spells back
 
-**Measured.** Twenty-nine declared spellings and what `format_type` returns:
+**Measured.** Thirty-four declared spellings and what `format_type` returns:
 
 | Declared | Read back | | Declared | Read back |
 |---|---|---|---|---|
@@ -40,6 +40,7 @@ named as an open question rather than asserted.
 | `float`, `float8`, `double precision` | `double precision` | | `timestamp` | `timestamp without time zone` |
 | `float(1)`, `float(24)` | **`real`** | | `interval`, `json`, `jsonb`, `uuid` | unchanged |
 | `float(25)`, `float(53)` | **`double precision`** | | `serial` | **`integer`** + an owned sequence |
+| `text`, `date`, `bytea` | unchanged | | `timestamptz`, `timestamp with time zone` | `timestamp with time zone` |
 | | | | `text[]` | unchanged by the catalog, and **unloadable** — see below |
 
 Two of these are traps rather than aliases:
@@ -51,6 +52,20 @@ Two of these are traps rather than aliases:
   Amendment 3 states the contract this violates ("`normalize_type`'s output is
   what introspection reads back"), and ADR-0009 refuses it at load time with
   `GENERATED … AS IDENTITY` named as the replacement.
+
+Those last four were missing from a first version of this table, and a closed
+catalogue that omits `text` and `date` rejects most schemas anybody would
+write. They were not an oversight of measurement — they are the types
+[ADR-0013](ADR-0013-postgres-reference-data.md) spends whole decisions on:
+`date` and `timestamptz` are on its offline refusal list, `text` and `bytea`
+are the two whose rendering it makes setting-independent. The list was recalled
+rather than derived, which is the failure §1 of that document names about its
+own refusal list one round earlier.
+
+So the derivation rule, which is worth more than the five rows: **the catalogue
+must admit every type the other ADRs' rules name.** A rule about `bytea`
+columns in a dialect that cannot declare one is not implementable, and that is
+checkable by reading, without remembering anything.
 
 **Decision.** The catalogue is closed, as the SQL Server one is, and normalizes
 to the catalog's own spelling — `integer`, not `int`; `character varying`, not

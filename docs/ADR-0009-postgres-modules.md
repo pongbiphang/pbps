@@ -29,7 +29,7 @@ The verdict, up front:
 | The schema-bound ordering problem is one deferred corner case | **It is the common case** |
 
 Four model changes — a map key and **three** fields in the state snapshot: the
-declared module text (§2.2), the write path an object was created under
+declared module text (§2.2), the **binding** an object resolved at creation
 ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) and the declared
 **expressions** — `Column::default`, `CheckConstraint::expression`,
 `Index::filter` (ADR-0013 §4) — and one bargain that lapses. The bargain is affordable only because ADR-0005 has since
@@ -1122,7 +1122,7 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 | `Schema::modules` keyed by `ModuleId` instead of `ObjectName` | One key type; every dialect-agnostic user of it goes through the map |
 | `GrantTarget::Object` must be able to name a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
 | The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
-| The state snapshot also keeps the **write path** each managed object was created under ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. The path's order decides which schema an unqualified name binds to — measured, for any expression parsed at creation, not only for a module — so it is an input to the declaration's meaning. Scoped to what the model can declare: module bodies, `Column::default`, `CheckConstraint::expression`, `Index::filter` |
+| The state snapshot also keeps **what each managed object bound to** at creation ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. Which schema an unqualified name resolved to is an input to the declaration's meaning — measured, for any expression parsed at creation, not only for a module. The *binding*, not the path string: a new same-named object earlier on an unchanged path moves one and not the other. Scoped to what the model can declare: module bodies, `Column::default`, `CheckConstraint::expression`, `Index::filter` |
 | And those **declared expressions** beside the ones read back (ADR-0013 §4) | A third field. All three are compared as text and PostgreSQL respells all three — `'unnamed'` comes back `'unnamed'::text`, `label <> 'none'` comes back `((label <> 'none'::text))` — so without it every connected plan re-emits `AlterColumnDefault`, revalidates every check and rebuilds every filtered index, for ever |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
@@ -1134,8 +1134,9 @@ identity), the differ, `docs`, the policy engine — is unchanged.
 **The abstraction holds, with one correction to what that costs.** The first
 draft of this document claimed the whole bill was one map key. It is one map key
 *and three fields in the state snapshot* — what was declared, because §2.2's
-convergence argument was wrong; the path it was created under, because ADR-0013
-§3 made that path part of what a declaration means; and the declared
+convergence argument was wrong; what it bound to, because ADR-0013
+§3 made what an unqualified name resolves to part of what a declaration means;
+and the declared
 expressions, because ADR-0013 §4 found the same permanent restatement wherever
 the differ compares an expression as text — defaults, checks and index filters
 alike. All three are one fact wearing three hats:

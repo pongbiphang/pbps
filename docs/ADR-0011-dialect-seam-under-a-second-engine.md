@@ -15,10 +15,11 @@ for the **model**, and the answer is no — a map key, an enum, and **three**
 fields in the state snapshot. No field is decoration: without the **declared
 text** the differ compares a hand-written definition with a deparsed one and
 rebuilds every view and `BEGIN ATOMIC` routine on every plan
-([ADR-0009](ADR-0009-postgres-modules.md) §2.2); without the **write path** a
-project reordering its configured schemas leaves an existing environment binding
-an unqualified reference differently from a bootstrap of the same revision, with
-nothing to expose the divergence
+([ADR-0009](ADR-0009-postgres-modules.md) §2.2); without the **recorded
+binding** an existing environment resolves an unqualified reference differently
+from a bootstrap of the same revision — because the project reordered its
+schemas, or merely because a same-named object appeared earlier on an unchanged
+one — with nothing to expose the divergence
 ([ADR-0013](ADR-0013-postgres-reference-data.md) §3); and without the **declared
 expressions** — defaults, check expressions and index filters, all of which
 PostgreSQL respells — the differ's text comparisons re-emit

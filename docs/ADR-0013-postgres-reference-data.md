@@ -948,12 +948,56 @@ reads deterministic would have made them depend on the declarations.
   a rule past what the model can represent is the same mistake as writing it
   around one example — one round apart, in opposite directions.
 
-  The state snapshot therefore records the write path beside the declared text
-  it already keeps (§2.2 of
-  [ADR-0009](ADR-0009-postgres-modules.md)), for each of those, and an object
-  whose recorded path differs from the project's current one is rebuilt: the
-  path is an input to the declaration's meaning, so a change to it is a change
-  to the object.** One global list ordered by anything else is
+  The state snapshot therefore records what each of those bound to, beside the
+  declared text it already keeps (§2.2 of
+  [ADR-0009](ADR-0009-postgres-modules.md)), and an object that would bind
+  differently today is rebuilt.
+
+  **What it records is the binding, not the path.** A first version of this rule
+  compared the recorded path string, and the path is a proxy for the property
+  that matters. **Measured**, a same-named object appearing *earlier* on an
+  unchanged path moves the binding without moving the string:
+
+  ```
+  a view created under (xa, xb) while only xb.helper() exists:  xb
+  the view after xa.helper() appears, path string unchanged:    xb
+  a bootstrap of the same view declaration, same path:          xa
+  ```
+
+  Nothing exposes that: the declaration is unchanged, so the differ is silent,
+  and both sides of the drift comparison read the same live object. The
+  comparison the rule needs is available, though — PostgreSQL records the
+  resolution it made:
+
+  ```
+  what the catalog records about the view's binding:  xb.helper
+  ```
+
+  So the state stores the resolved bindings, and a rebuild follows when the set
+  the current path resolves to differs from the set recorded. A changed path
+  string is then one way to reach that conclusion rather than the definition of
+  it. This is the fifth instance on this branch of the shape ADR-0009 collects:
+  **a rule built on a cheap proxy for the real property** — and the first where
+  the proxy was introduced by a fix for an earlier instance of the same shape.
+
+  **For an opaque body there is no such record, and the divergence runs the
+  other way.** A `plpgsql` function re-resolves its unqualified names when it
+  runs, so it does not keep the old binding — it silently acquires the new one,
+  in a deployed environment, with no plan and no drift report:
+
+  ```
+  the same declaration through an opaque plpgsql body:           xb
+  the same body after xa.helper() appears (plans discarded):     xa
+  what the catalog records about the opaque body's binding:      nothing
+  ```
+
+  Nothing pbps can store fixes that, because the resolution has not happened
+  yet at the time there is anything to store. This is the second thing §3's
+  `ALTER FUNCTION … SET search_path` recommendation buys, and it promotes that
+  recommendation from advice to **the only construct that makes an opaque
+  body's meaning stable**. pbps still does not add one unasked — it would be
+  configuration nobody declared — so this is stated as a known gap, and it is
+  the honest limit of the whole write-path decision.** One global list ordered by anything else is
   unsafe the moment two managed schemas hold the same name — **measured**, a
   view in `m_b` created under a path ordered `(m_a, m_b)` binds to `m_a.t`:
 
@@ -1121,7 +1165,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 |---|---|
 | `pbps-model` | Nothing |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with two restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **and the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`. A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. The state records that write path for module bodies **and for the three verbatim expressions the model holds** — `Column::default`, `CheckConstraint::expression`, `Index::filter`. Generated columns and expression indexes are unmanaged and out of it |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |

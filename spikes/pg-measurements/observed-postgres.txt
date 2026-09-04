@@ -197,3 +197,11 @@ R97 | a volatile function that writes, under READ ONLY | refused: cannot execute
 R98 | a volatile function that only computes, under READ ONLY | accepted
 R99 | now(), under READ ONLY | accepted
 R100 | the sequence after the read-only probe | last_value 1
+R101 | a view created under (xa, xb) while only xb.helper() exists | xb
+R102 | the same declaration through an opaque plpgsql body | xb
+R103 | the view after xa.helper() appears, path string unchanged | xb
+R104 | the plpgsql body after the same, with cached plans discarded | xa
+R105 | a bootstrap of the same view declaration, same path | xa
+R106 | what the catalog records about the view's binding | xb.helper
+R107 | and about the opaque body's | nothing
+R108 | text / date / bytea / timestamptz, read back | text / date / bytea / timestamp with time zone
