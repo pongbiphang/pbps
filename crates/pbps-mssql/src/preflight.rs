@@ -454,7 +454,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         } => match names.column(column) {
             Some(stored) => Ok(vec![null_probe(
                 column,
-                &stored.table,
+                &qualified(&stored.table)?,
                 &quote(&stored.name)?,
             )?]),
             None => Ok(Vec::new()),
@@ -475,7 +475,11 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // A type change folds a nullability change into itself (§12), so it
             // has to carry that change's probe too.
             if *from_nullable && !*to_nullable {
-                out.push(null_probe(column, &stored.table, &quote(&stored.name)?)?);
+                out.push(null_probe(
+                    column,
+                    &qualified(&stored.table)?,
+                    &quote(&stored.name)?,
+                )?);
             }
             if types::change_risk(from, to).risk_class().is_some() {
                 out.extend(conversion_probe(column, &stored, to)?);
@@ -545,45 +549,49 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             table,
             name,
             constraint,
-        } => match stored_columns(names, table, &constraint.columns) {
-            Some((stored, columns)) => match varying(names, table, &constraint.columns, &columns) {
-                Some(varying) => Ok(vec![duplicate_probe(
-                    &stored,
-                    &varying,
-                    &format!("rows that would collide under the new unique constraint {name}"),
-                )?]),
-                None => Ok(Vec::new()),
-            },
-            None => Ok(Vec::new()),
-        },
+        } => {
+            let Some(rows) = rows_after(
+                names,
+                table,
+                &constraint.columns,
+                names.moved.get(table),
+                "c",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![duplicate_probe(
+                &format!("(\n{rows}\n) AS r"),
+                &keys(constraint.columns.len()),
+                &format!("rows that would collide under the new unique constraint {name}"),
+            )?])
+        }
 
         Change::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
         } => {
-            let Some((stored, columns)) = stored_columns(names, table, &pk.columns) else {
+            // The same relation the unique above is built over, and for the
+            // same reason: a primary key sorts after every row change, so the
+            // rows it will meet are the ones the plan leaves (DECISIONS 175).
+            // It subsumes 171's substitution of a column this plan adds —
+            // `rows_after` spells one, and a derived table's column can be
+            // grouped by where a bare constant cannot.
+            let Some(rows) = rows_after(names, table, &pk.columns, names.moved.get(table), "c")?
+            else {
                 return Ok(Vec::new());
             };
+            let from = format!("(\n{rows}\n) AS r");
             let mut out = Vec::new();
-            for (declared, current) in pk.columns.iter().zip(&columns) {
-                let declared = table.column(declared);
-                // A column this plan adds is not there to be read: what every
-                // stored row will hold in it stands in its place, and where
-                // that is unknowable there is no probe rather than a wrong one
-                // (DECISIONS 171).
-                let Some(reads) = names.reads(&declared, quote(current)?) else {
-                    continue;
-                };
-                out.push(null_probe(&declared, &stored, &reads)?);
+            for (i, declared) in pk.columns.iter().enumerate() {
+                out.push(null_probe(&table.column(declared), &from, &format!("r.k{i}"))?);
             }
-            if let Some(varying) = varying(names, table, &pk.columns, &columns) {
-                out.push(duplicate_probe(
-                    &stored,
-                    &varying,
-                    "rows that would collide under the new primary key",
-                )?);
-            }
+            out.push(duplicate_probe(
+                &from,
+                &keys(pk.columns.len()),
+                "rows that would collide under the new primary key",
+            )?);
             Ok(out)
         }
 
@@ -1500,30 +1508,9 @@ fn rows_after(
     Ok(Some(format!("SELECT {} WHERE 1 = 0", empty.join(", "))))
 }
 
-/// The columns of a key that a row already in the table can still vary in.
-///
-/// `None` where one of them is a column this plan adds with a value no probe
-/// can evaluate: the grouping cannot be reasoned about at all then, and no
-/// probe is the honest answer (DECISIONS 171).
-fn varying(
-    names: &AsStored,
-    table: &TableName,
-    declared: &[String],
-    stored: &[String],
-) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    for (declared, stored) in declared.iter().zip(stored) {
-        let declared = table.column(declared);
-        // Present, unmoved by this plan: the only kind a stored row varies in.
-        if names.added.contains_key(&declared) {
-            // Present but constant, or unknowable: `reads` is what tells the
-            // two apart, and only the second means "no probe".
-            names.reads(&declared, String::new())?;
-        } else {
-            out.push(stored.clone());
-        }
-    }
-    Some(out)
+/// `r.k0 .. r.kn`: the columns [`rows_after`] names its relation's with.
+fn keys(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("r.k{i}")).collect()
 }
 
 /// The table and columns as the database currently names them, or `None` when
@@ -1572,44 +1559,23 @@ fn schema_probe(role: &str, schema: &str) -> Probe {
 /// (`AsStored::reads`). Measured: `NULL IS NULL` counts every row and
 /// `(N'yy') IS NULL` counts none, which is what those two additions leave
 /// behind (DECISIONS 171).
-fn null_probe(column: &ColumnRef, table: &TableName, reads: &str) -> Result<Probe, DialectError> {
+fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Result<Probe, DialectError> {
     Ok(Probe::new(
         format!("existing NULLs in {column}, which NOT NULL would reject"),
-        format!(
-            "SELECT COUNT(*) AS n FROM {} WHERE {reads} IS NULL;",
-            qualified(table)?
-        ),
+        format!("SELECT COUNT(*) AS n FROM {from} WHERE {reads} IS NULL;"),
     ))
 }
 
-/// `columns` are the constraint's columns a stored row can still *vary* in.
-///
-/// A column this plan adds holds one value in every row already there, so it
-/// groups nothing and is left out — grouping by `(a, k)` where every row
-/// shares `k` is grouping by `(a)`. It cannot simply be substituted:
-/// measured, `GROUP BY NULL` is `Msg 164, Each GROUP BY expression must
-/// contain at least one column that is not an outer reference`. With none
-/// left, every row is in one group and any two of them collide
-/// (DECISIONS 171).
+/// `from` is the relation the constraint's statement will meet and `columns`
+/// are its key expressions within it — for a key a plan adds, the derived
+/// table [`rows_after`] builds, because `order_key` runs every row change
+/// before every constraint (DECISIONS 175).
 fn duplicate_probe(
-    table: &TableName,
+    from: &str,
     columns: &[String],
     description: &str,
 ) -> Result<Probe, DialectError> {
-    if columns.is_empty() {
-        return Ok(Probe::new(
-            description,
-            format!(
-                "SELECT CASE WHEN COUNT(*) > 1 THEN COUNT(*) ELSE 0 END AS n FROM {};",
-                qualified(table)?
-            ),
-        ));
-    }
-    let list = columns
-        .iter()
-        .map(|c| quote(c))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(", ");
+    let list = columns.join(", ");
     Ok(Probe::new(
         description,
         // The rows, not the groups: "3 duplicate groups" makes an operator do
@@ -1617,9 +1583,7 @@ fn duplicate_probe(
         // treats NULLs as equal, which is also how SQL Server's UNIQUE treats
         // them, so the count matches what the engine will refuse.
         format!(
-            "SELECT ISNULL(SUM(c), 0) AS n FROM (\n    SELECT COUNT(*) AS c FROM {}\n     GROUP BY {} HAVING COUNT(*) > 1) AS dup;",
-            qualified(table)?,
-            list
+            "SELECT ISNULL(SUM(c), 0) AS n FROM (\n    SELECT COUNT(*) AS c FROM {from}\n     GROUP BY {list} HAVING COUNT(*) > 1) AS dup;"
         ),
     ))
 }
@@ -1913,7 +1877,13 @@ mod tests {
             },
         });
         assert_eq!(sql.len(), 1);
-        assert!(sql[0].contains("GROUP BY [email], [tenant]"), "{sql:?}");
+        // Over the relation the statement will meet, keyed `k0`, `k1` — the
+        // same derived table the foreign key probe is built on (175).
+        assert!(
+            sql[0].contains("SELECT c.[email] AS k0, c.[tenant] AS k1 FROM [dbo].[customer] AS c"),
+            "{sql:?}"
+        );
+        assert!(sql[0].contains("GROUP BY r.k0, r.k1"), "{sql:?}");
         assert!(sql[0].contains("HAVING COUNT(*) > 1"), "{sql:?}");
         // The rows, not the groups.
         assert!(sql[0].contains("SUM(c)"), "{sql:?}");
@@ -2258,6 +2228,59 @@ mod tests {
         );
     }
 
+    /// The two siblings of the check probe, at the same rank in `order_key`
+    /// and with the same staleness — and the opposite fix, because their
+    /// columns *are* the constraint, so `rows_after` can build the relation
+    /// the statement will meet instead of giving no answer (DECISIONS 175).
+    #[test]
+    fn a_key_is_probed_over_the_rows_its_statement_will_meet() {
+        let unique = Change::AddUnique {
+            table: tname("dbo.customer"),
+            name: "uq_code".into(),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec!["code".into()],
+            },
+        };
+        let delete = Change::DeleteRow {
+            table: tname("dbo.customer"),
+            key_column: "code".into(),
+            key: RowKey::from("dup"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+        };
+        let sql = |changes: Vec<Change>| {
+            probes(&plan(changes))
+                .into_iter()
+                .filter(|p| p.description.contains("collide"))
+                .map(|p| p.sql)
+                .collect::<Vec<_>>()
+        };
+
+        // The row this plan deletes is not one the constraint will meet.
+        let s = sql(vec![delete.clone(), unique.clone()]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].contains("NOT IN (N'dup')"), "{s:?}");
+
+        // And a row it inserts is: unlike a check, a unique constraint's
+        // columns are named, so the planned row can be spelled and counted.
+        let s = sql(vec![
+            Change::InsertRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from("new"),
+                row: Default::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            },
+            unique,
+        ]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].contains("N'new'"), "the planned row is in it: {s:?}");
+    }
+
     /// `order_key` runs every row change (9, 10) before every constraint
     /// this plan adds (11), so the rows an `ADD CHECK` will meet are not the
     /// rows standing now. Counting the current ones blocked a plan that
@@ -2428,19 +2451,21 @@ mod tests {
             },
         };
 
-        // Nothing left to group by: every stored row shares the one value, so
-        // any two of them collide. `GROUP BY NULL` is not the way to say that
-        // — measured, it is Msg 164.
+        // Every stored row shares the one value the `ALTER` will put there,
+        // so any two of them collide. Spelled inside the derived table
+        // `rows_after` builds, whose `k0` is a column and can be grouped by —
+        // a bare constant cannot: measured, `GROUP BY NULL` is Msg 164 (175).
         let s = probes(&plan(vec![add(true, None), unique.clone()]))
             .into_iter()
             .map(|p| p.sql)
             .collect::<Vec<_>>();
         assert!(
-            s.iter()
-                .any(|s| s.contains("CASE WHEN COUNT(*) > 1 THEN COUNT(*) ELSE 0 END AS n")),
+            s.iter().any(|s| s.contains(
+                "SELECT TRY_CONVERT(varchar(10), NULL) AS k0 FROM [dbo].[customer] AS c"
+            )),
             "{s:?}"
         );
-        assert!(!s.iter().any(|s| s.contains("GROUP BY")), "{s:?}");
+        assert!(s.iter().any(|s| s.contains("GROUP BY r.k0")), "{s:?}");
 
         // And no answer where the value itself is unknowable.
         let s = probes(&plan(vec![
@@ -2515,8 +2540,14 @@ mod tests {
             }),
         });
         assert_eq!(sql.len(), 2, "{sql:?}");
-        assert!(sql[0].contains("[id] IS NULL"), "{sql:?}");
-        assert!(sql[1].contains("GROUP BY [id]"), "{sql:?}");
+        assert!(sql[0].contains("r.k0 IS NULL"), "{sql:?}");
+        assert!(sql[1].contains("GROUP BY r.k0"), "{sql:?}");
+        for one in &sql {
+            assert!(
+                one.contains("SELECT c.[id] AS k0 FROM [dbo].[customer] AS c"),
+                "{sql:?}"
+            );
+        }
     }
 
     /// Named rather than left to be discovered: these carry no data question a
@@ -3071,29 +3102,57 @@ mod tests {
         assert!(p[0].sql.contains("[dbo].[client]"), "{:?}", p[0]);
     }
 
-    /// A table this plan creates is empty, so nothing in it can violate
-    /// anything — and probing it would only produce "invalid object name",
-    /// which reads like a failure rather than the non-question it is.
+    /// A table this plan creates was not probed at all, because naming it
+    /// would only produce "invalid object name". That reason went when the key
+    /// probes moved onto `rows_after`, which spells the rows the plan
+    /// declares and, where it declares none, the typed empty relation — the
+    /// same thing 164 established for the foreign key: "none" is an answer
+    /// rather than the absence of one (DECISIONS 175).
     #[test]
-    fn a_table_created_by_this_plan_is_not_probed() {
+    fn a_key_on_a_table_this_plan_creates_is_probed_over_the_rows_it_declares() {
         let mut table = pbps_model::Table::default();
         table
             .columns
             .insert("id".into(), pbps_model::Column::new(ty("int")));
-        let cs = plan(vec![
-            Change::CreateTable {
-                uid: uid("t_aaaaaa"),
-                name: tname("dbo.brand_new"),
-                table: Box::new(table),
+        let unique = Change::AddUnique {
+            table: tname("dbo.brand_new"),
+            name: "uq".into(),
+            constraint: UniqueConstraint {
+                columns: vec!["id".into()],
             },
-            Change::AddUnique {
-                table: tname("dbo.brand_new"),
-                name: "uq".into(),
-                constraint: UniqueConstraint {
-                    columns: vec!["id".into()],
-                },
-            },
-        ]);
-        assert!(probes(&cs).is_empty());
+        };
+        let create = Change::CreateTable {
+            uid: uid("t_aaaaaa"),
+            name: tname("dbo.brand_new"),
+            table: Box::new(table),
+        };
+        let row = |key: &str, id: i64| Change::InsertRow {
+            table: tname("dbo.brand_new"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: RowKey::from(key),
+            row: pbps_model::Row(
+                [("id".to_owned(), pbps_model::Value::Int(id))]
+                    .into_iter()
+                    .collect(),
+            ),
+            defaults: Default::default(),
+            types: Default::default(),
+        };
+
+        // No rows declared: an empty table collides with nothing, and saying
+        // so costs one round trip and never names the table.
+        let p = probes(&plan(vec![create.clone(), unique.clone()]));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].sql.contains("WHERE 1 = 0"), "{:?}", p[0].sql);
+        assert!(!p[0].sql.contains("brand_new"), "{:?}", p[0].sql);
+
+        // Two declared rows under one key: the constraint would refuse them,
+        // and `order_key` inserts before it adds — so the probe can say so
+        // before anything runs.
+        let p = probes(&plan(vec![create, row("a", 1), row("b", 1), unique]));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].sql.contains("GROUP BY r.k0"), "{:?}", p[0].sql);
+        assert_eq!(p[0].sql.matches("AS k0").count(), 2, "{:?}", p[0].sql);
     }
 }

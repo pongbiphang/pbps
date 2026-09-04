@@ -2338,3 +2338,36 @@ SPEC is in sync with all of these.
     rewritten. So: minus the rows it deletes, which is exact — and no answer
     at all where it inserts or updates, which is what an unspellable row gets
     everywhere else (117, 165, 171).
+
+175. **The key probes moved onto the relation the foreign key probe already
+    used — and it subsumed 171's substitution.**
+    174 named the shape and fixed one of the three: `AddCheck`, `AddUnique`
+    and `SetPrimaryKey` all sort after the row changes, and all three read the
+    table as it stands. The check could only subtract its deletes, because its
+    predicate is arbitrary. These two are the opposite case: a unique
+    constraint's columns *are* the constraint, exactly as a foreign key's are,
+    so `rows_after` — stored rows minus the deleted and rewritten, union the
+    planned ones — is already the relation their statements will meet
+    (DECISIONS 151, 164, 165, 171). They group over that now, keyed `k0..kn`
+    like the foreign key probe.
+    Two things fell out of it, both improvements nobody asked for.
+    **171's special case disappeared.** Probing a key over a column this plan
+    adds had needed a substitution — the column's post-`ALTER` value in place
+    of a read, and dropped from the `GROUP BY` because `GROUP BY NULL` is
+    `Msg 164`. Inside a derived table it is a *column*, `k0`, which groups
+    like any other; `rows_after` already spells added columns (171), so the
+    general mechanism covers the special case and the substitution machinery
+    is gone.
+    **A table this plan creates is probed now**, where it was skipped
+    entirely. That skip's stated reason — "probing it would only produce
+    invalid object name" — was true of a probe that named the table and is
+    not true of one built from `rows_after`, which spells the declared rows,
+    or the typed empty relation where there are none. It is 164's argument one
+    constraint over: "none" is an answer rather than the absence of one. A
+    plan creating a table with two rows under one unique key is now refused
+    before it runs rather than at `ADD CONSTRAINT`.
+    That is worth naming as its own lesson, because a test encoded the old
+    reason and had to be rewritten rather than repaired: **when a guard's
+    reason goes, the test that pins it is testing the reason, not the
+    property.** The right move was to state the better property, not to keep
+    the old assertion alive.

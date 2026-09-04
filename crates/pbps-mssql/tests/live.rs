@@ -1004,6 +1004,76 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
 
+/// `order_key` runs every row change before every constraint a plan adds, so
+/// the rows a `UNIQUE` or a `PRIMARY KEY` will meet are the ones the plan
+/// leaves. Counting the rows standing now refused a plan that deletes its own
+/// duplicate first (DECISIONS 175).
+///
+/// Live because the fix is a claim about what this engine counts: the probes
+/// now group over a derived table that subtracts the plan's deletes and unions
+/// its inserts, and only a real server can say the number that comes back is
+/// the number `ADD CONSTRAINT` would refuse.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
+    use pbps_dialect::Dialect;
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("keyafter").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.customer (code varchar(20) NOT NULL, email nvarchar(255) NULL);
+             INSERT INTO dbo.customer VALUES ('keep', 'a@example.com'), ('dup', 'a@example.com');",
+        )
+        .await
+        .expect("create");
+
+    let unique = PlannedChange::new(Change::AddUnique {
+        table: TableName::new("dbo", "customer"),
+        name: "uq_email".into(),
+        constraint: UniqueConstraint {
+            columns: vec!["email".into()],
+        },
+    });
+    let delete = PlannedChange::new(Change::DeleteRow {
+        table: TableName::new("dbo", "customer"),
+        key_column: "code".into(),
+        key: pbps_model::RowKey::from("dup"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+    });
+
+    let count = |changes: Vec<PlannedChange>| {
+        let cs = ChangeSet { changes };
+        Mssql
+            .preflight(&cs)
+            .into_iter()
+            .find(|p| p.description.contains("collide"))
+            .map(|p| p.sql)
+    };
+    let standing = count(vec![unique.clone()]).expect("a probe");
+    let after_delete = count(vec![delete, unique]).expect("a probe");
+
+    let mut counted = Vec::new();
+    for sql in [&standing, &after_delete] {
+        let rows = db
+            .conn
+            .query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{sql}\n{e}"));
+        counted.push(rows[0].try_get_at::<i32>(0).unwrap().unwrap());
+    }
+    let (now, left) = (counted[0], counted[1]);
+    db.drop().await;
+
+    // Two rows share an address today, and the engine would refuse both.
+    assert_eq!(now, 2, "{standing}");
+    // The plan deletes one of them first, and then there is nothing to refuse.
+    assert_eq!(left, 0, "{after_delete}");
+}
+
 /// A probe runs before the first statement, so a column the same plan is
 /// *adding* is not there to be read — and every probe over one was
 /// `Msg 207, Invalid column name`, which the runner reports as unchecked and

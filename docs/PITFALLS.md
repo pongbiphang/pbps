@@ -174,6 +174,8 @@ was written; only the side reading it can (decision 67).
 
 ## A probe reads a state that is not there yet
 
+Two forms, and `order_key` decides which probes have the second.
+
 Every probe runs **before the first statement**, so it may only name what the
 catalog holds *now*. `AsStored` exists for that and translates renames — but a
 column the plan **adds** is a state the probe cannot read at all, and
@@ -195,6 +197,23 @@ default no probe can evaluate reads as no answer at all. Substituting is not
 always literal: `GROUP BY NULL` is `Msg 164` — a constant groups nothing, so
 it leaves the `GROUP BY` list instead, and an empty list means every row is in
 one group.
+
+**The other form: the rows.** A probe attached to a change that sorts *after*
+the row changes is not asking about the table the statement will meet. Row
+changes are ranks 9 and 10; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
+`AddForeignKey` and `AddIndex` are all 11. So a plan that deletes its own
+violations and then tightens was refused for violations that will be gone, and
+one that writes violating rows was told there were none. `AlterColumnType`,
+`AlterColumnNullability` and `AddColumn` sort at 6-8, before the rows, so
+reading the current table is exactly right for those — **the rank is the
+test**, not the intuition that "a probe should see the future".
+
+The fix is not one fix. Where the constraint's columns are *named* — a unique,
+a primary key, a foreign key — `rows_after` builds the relation the plan will
+leave and the probe groups over that. A check is an arbitrary predicate over
+columns the plan does not carry, and its expression is deliberately never
+rewritten, so it can only subtract the rows the plan deletes and give no
+answer at all where the plan inserts or updates.
 
 ## An exclusion wider than its reason
 
