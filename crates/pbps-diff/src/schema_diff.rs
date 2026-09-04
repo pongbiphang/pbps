@@ -593,6 +593,7 @@ fn diff_data(
                 // and the database already agree on, and would make plan.sql
                 // claim a change that is not one.
                 let mut columns = BTreeMap::new();
+                let mut types = BTreeMap::new();
                 for (column, spec) in &declared.columns {
                     // The key lives in the map key, not in either row, so it
                     // has nothing to compare — and resolving it through the
@@ -619,6 +620,16 @@ fn diff_data(
                     };
                     let d = cell(row, column, Some(spec));
                     if b != d {
+                        // The base column's type, so the emitter can compare
+                        // the `before` by the rendering that read it
+                        // (DECISIONS 122). A column the base lacks has no
+                        // recorded cell to hold the update to.
+                        if let Some(base_spec) = base_name_of
+                            .get(column)
+                            .and_then(|base_column| base.columns.get(base_column))
+                        {
+                            types.insert(column.clone(), base_spec.ty.clone());
+                        }
                         columns.insert(column.clone(), (b, d));
                     }
                 }
@@ -628,6 +639,7 @@ fn diff_data(
                         key_column: key_column.clone(),
                         key: key.clone(),
                         columns,
+                        types,
                     });
                 }
             }

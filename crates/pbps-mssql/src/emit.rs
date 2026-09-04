@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ForeignKey, GrantTarget, Index, Module, ModuleKind, ObjectName,
-    Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
+    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleKind,
+    ObjectName, Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
     UniqueConstraint, Value,
 };
 
@@ -127,18 +127,23 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key_column,
             key,
             columns,
-        } => update_row(table, key_column, key, columns),
+            types,
+        } => update_row(table, key_column, key, columns, types),
 
+        // The row's content is not carried (the pinned baseline holds it),
+        // so the delete holds the row to its existence: a row already gone
+        // is a baseline this plan was not reviewed against (DECISIONS 122).
         Change::DeleteRow {
             table,
             key_column,
             key,
             ..
         } => one(format!(
-            "DELETE FROM {} WHERE {} = {};",
+            "DELETE FROM {} WHERE {} = {};\n{}",
             qualified(table)?,
             quote(key_column)?,
-            row_key(key)
+            row_key(key),
+            exactly_one_row(table, key)
         )),
 
         // The mode is a property of the declaration, not of the database: it
@@ -524,21 +529,58 @@ fn insert_row(
     }
 }
 
+/// One `UPDATE`, holding the row to what the plan recorded.
+///
+/// The plan was reviewed against a recorded state, and the checksum pins
+/// that state up to the moment `apply` reads it — not to the moment this
+/// statement runs. A row changed or deleted in between would be overwritten,
+/// or missed with the statement still counting as success, and the read-back
+/// would record the result as if the reviewed plan had done it. So each
+/// `before` cell the base holds goes into the predicate, compared by the very
+/// rendering that read it (`rows::read_expr`, the column's type's), and the
+/// statement throws unless exactly one row was updated (DECISIONS 122). A
+/// `before` at a default is compared as the read-back compared it, and only
+/// where the read-back did — a literal default on a type with `=`; a default
+/// the engine would have to run has no value to hold the row to.
 fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
     columns: &BTreeMap<String, (Cell, Cell)>,
+    types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
     let mut sets = Vec::with_capacity(columns.len());
-    for (column, (_, to)) in columns {
+    let mut recorded = Vec::new();
+    for (column, (from, to)) in columns {
+        let quoted = quote(column)?;
         // `DEFAULT` is the keyword: it asks the engine to evaluate the
         // column's default, which is the one thing a literal cannot say.
         let rhs = match to {
             Cell::Value(v) => value_literal(v),
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
-        sets.push(format!("{} = {}", quote(column)?, rhs));
+        sets.push(format!("{quoted} = {rhs}"));
+        let Some(ty) = types.get(column) else {
+            continue;
+        };
+        match from {
+            Cell::Value(Value::Null) => recorded.push(format!("{quoted} IS NULL")),
+            // Binary, so a change of case alone is a change: the drift check
+            // compares the recorded text the same way.
+            Cell::Value(v) => recorded.push(format!(
+                "{} = {} COLLATE Latin1_General_BIN2",
+                crate::rows::read_expr(&quoted, &ty.base),
+                literal(&recorded_text(v))
+            )),
+            Cell::Default(d)
+                if crate::rows::comparable(&ty.base) && crate::rows::is_constant(d) =>
+            {
+                recorded.push(format!(
+                    "({quoted} = ({d}) OR ({quoted} IS NULL AND ({d}) IS NULL))"
+                ));
+            }
+            Cell::Default(_) => {}
+        }
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -549,13 +591,44 @@ fn update_row(
             message: format!("{table}: a row update with no changed column"),
         });
     }
-    one(format!(
-        "UPDATE {} SET {} WHERE {} = {};",
+    let mut sql = format!(
+        "UPDATE {} SET {} WHERE {} = {}",
         qualified(table)?,
         sets.join(", "),
         quote(key_column)?,
         row_key(key)
-    ))
+    );
+    for r in &recorded {
+        sql.push_str(" AND ");
+        sql.push_str(r);
+    }
+    sql.push_str(";\n");
+    sql.push_str(&exactly_one_row(table, key));
+    one(sql)
+}
+
+/// A recorded cell as the read-back's text: what `rows::value_of` decoded.
+fn recorded_text(v: &Value) -> String {
+    match v {
+        Value::Text(t) => t.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => (if *b { "1" } else { "0" }).to_owned(),
+        Value::Null => "NULL".to_owned(),
+    }
+}
+
+/// The check after a row's `UPDATE` or `DELETE`: the statement reached one
+/// row, the one the plan recorded. In the same batch, because `@@ROWCOUNT`
+/// is the last statement's. Measured with an `AFTER` trigger on the table:
+/// the count is the statement's own, not the trigger's.
+fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
+    format!(
+        "IF @@ROWCOUNT <> 1 THROW 50000, {}, 1;",
+        literal(&format!(
+            "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
+             plan was made. Plan again."
+        ))
+    )
 }
 
 fn one(sql: String) -> Sql {
@@ -1472,6 +1545,7 @@ mod tests {
     #[test]
     fn an_update_restates_only_the_changed_columns() {
         let sql = sql_of(&Change::UpdateRow {
+            types: Default::default(),
             table: tname("dbo.order_status"),
             key_column: "code".to_owned(),
             key: RowKey::from("new"),
@@ -1485,10 +1559,117 @@ mod tests {
             .into_iter()
             .collect(),
         });
+        // No type carried (an older plan): the key alone holds the row, and
+        // the count still has to be one.
         assert_eq!(
             sql,
-            ["UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';"]
+            [format!(
+                "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}",
+                stale("dbo.order_status", "new")
+            )]
         );
+    }
+
+    /// The check every row `UPDATE` and `DELETE` ends with (DECISIONS 122).
+    fn stale(table: &str, key: &str) -> String {
+        format!(
+            "IF @@ROWCOUNT <> 1 THROW 50000, N'{table} row `{key}` is not as the plan recorded \
+             it: changed or deleted since the plan was made. Plan again.', 1;"
+        )
+    }
+
+    /// The plan is reviewed against a recorded state, and the checksum pins
+    /// it only up to the moment `apply` reads it. Each recorded cell goes
+    /// into the predicate, compared by the rendering that read it — the
+    /// column's type's — and a NULL as `IS NULL`; a literal default as the
+    /// read-back compared it; a default the engine would have to run, a
+    /// type without `=`, and a column the base does not have hold nothing.
+    #[test]
+    fn an_update_holds_the_row_to_what_the_plan_recorded() {
+        let cell = |from: Cell, to: Cell| (from, to);
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [
+                ("label".to_owned(), cell(text("Old"), text("New"))),
+                (
+                    "since".to_owned(),
+                    cell(text("2026-09-03"), text("2026-09-04")),
+                ),
+                (
+                    "flag".to_owned(),
+                    cell(
+                        Cell::Value(Value::Bool(true)),
+                        Cell::Value(Value::Bool(false)),
+                    ),
+                ),
+                (
+                    "rank".to_owned(),
+                    cell(Cell::Value(Value::Null), Cell::Value(Value::Int(2))),
+                ),
+                (
+                    "sort".to_owned(),
+                    cell(
+                        Cell::Default("((0))".to_owned()),
+                        Cell::Value(Value::Int(3)),
+                    ),
+                ),
+                (
+                    "stamp".to_owned(),
+                    cell(Cell::Default("(getdate())".to_owned()), text("x")),
+                ),
+                (
+                    "doc".to_owned(),
+                    cell(Cell::Default("('')".to_owned()), text("<a/>")),
+                ),
+                (
+                    "added".to_owned(),
+                    cell(Cell::Value(Value::Null), text("y")),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("since", "date"),
+                ("flag", "bit"),
+                ("rank", "int"),
+                ("sort", "int"),
+                ("stamp", "datetime2"),
+                ("doc", "xml"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), t.parse::<ColumnType>().unwrap()))
+            .collect(),
+        });
+        let sql = &sql[0];
+        let (update, check) = sql.split_once('\n').expect("two statements");
+        assert_eq!(check, stale("dbo.t", "a"));
+        assert!(
+            update.starts_with(
+                "UPDATE [dbo].[t] SET [added] = N'y', [doc] = N'<a/>', [flag] = N'false', \
+                 [label] = N'New', [rank] = 2, [since] = N'2026-09-04', [sort] = 3, \
+                 [stamp] = N'x' WHERE [code] = N'a'"
+            ),
+            "{update}"
+        );
+        for held in [
+            // The rendering that read it, and a change of case is a change.
+            " AND CONVERT(nvarchar(max), [label]) = N'Old' COLLATE Latin1_General_BIN2",
+            " AND CONVERT(nvarchar(max), [since], 126) = N'2026-09-03' COLLATE Latin1_General_BIN2",
+            " AND CONVERT(nvarchar(max), [flag]) = N'1' COLLATE Latin1_General_BIN2",
+            " AND [rank] IS NULL",
+            " AND ([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
+        ] {
+            assert!(update.contains(held), "{held}\n{update}");
+        }
+        for not_held in ["[stamp] =", "[doc] =", "[added] IS NULL"] {
+            let after_where = update.split_once(" WHERE ").unwrap().1;
+            assert!(!after_where.contains(not_held), "{not_held}\n{update}");
+        }
+        assert!(update.ends_with(';'), "{update}");
     }
 
     /// An omitted column means the declared default, and only the keyword can
@@ -1498,6 +1679,7 @@ mod tests {
     #[test]
     fn an_update_to_the_default_says_default_not_null() {
         let sql = sql_of(&Change::UpdateRow {
+            types: Default::default(),
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
             key: RowKey::from("a"),
@@ -1510,7 +1692,10 @@ mod tests {
         });
         assert_eq!(
             sql,
-            ["UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"]
+            [format!(
+                "UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';\n{}",
+                stale("dbo.t", "a")
+            )]
         );
         assert!(!sql[0].contains("NULL"), "{sql:?}");
     }
@@ -1523,6 +1708,7 @@ mod tests {
         assert!(
             emit(
                 &Change::UpdateRow {
+                    types: Default::default(),
                     table: tname("dbo.t"),
                     key_column: "code".to_owned(),
                     key: RowKey::from("a"),
@@ -1542,9 +1728,14 @@ mod tests {
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
         });
+        // And held to the row's existence: one gone already is a baseline
+        // this plan was not reviewed against.
         assert_eq!(
             sql,
-            ["DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"]
+            [format!(
+                "DELETE FROM [dbo].[order_status] WHERE [code] = N'old';\n{}",
+                stale("dbo.order_status", "old")
+            )]
         );
     }
 

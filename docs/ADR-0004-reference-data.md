@@ -243,6 +243,15 @@ Decisions taken during implementation that this document did not anticipate:
    foreign key is compared as one tuple, which the engine assembles from
    the constraint's columns at run time; the rows the plan writes are
    compared the same way, by their whole tuple after the write (121).
+7. **A row `UPDATE` holds the row to what the plan recorded, and a row
+   `UPDATE` or `DELETE` has to reach exactly one row.** The checksum pins the
+   recorded state up to the moment `apply` reads it, not to the moment each
+   statement runs. `UpdateRow` carries each updated column's type in the base
+   state, the emitter compares every recorded cell by the rendering that read
+   it, under a binary collation, and both statements throw unless
+   `@@ROWCOUNT` is one — so a row changed or deleted in between names itself
+   and rolls the plan back, instead of being overwritten or missed and then
+   recorded as applied (122).
 
 The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
 the read-back, the drift on rows, the `ensure` read staying inside its keys,

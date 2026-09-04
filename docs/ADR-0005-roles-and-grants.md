@@ -245,7 +245,10 @@ Decisions taken during implementation that this document did not anticipate:
     the statement could fail after the changes ordered before it. `apply`
     asks again before statement one and on a staged resume, for the names
     its remaining statements still need, since a principal created in
-    between is invisible to the checksum (DECISIONS 118, 119).
+    between is invisible to the checksum (DECISIONS 118, 119). The names
+    the plan needs free are compared with one another the same way first:
+    `Reader` beside `reader` holds nothing in the catalog and fails at the
+    second `CREATE ROLE` (DECISIONS 123).
 
 ## Placement
 

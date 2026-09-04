@@ -503,7 +503,7 @@ pub fn decode_alias(name: &TableName, row: &pbps_db::Row) -> Result<(RowKey, Row
 /// fixed-width `char` is trimmed because the engine itself ignores the padding
 /// when it compares — `'ab' = 'ab   '` — and a declaration should not have to
 /// count spaces to agree with it.
-fn read_expr(quoted: &str, base: &str) -> String {
+pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
     match base {
         "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
             format!("CONVERT(nvarchar(max), {quoted}, 126)")
@@ -575,7 +575,7 @@ pub fn is_constant(default: &str) -> bool {
 
 /// Whether `=` is defined on the type. Where it is not, the default is not
 /// asked about and the cell is taken as at its default (module docs).
-fn comparable(base: &str) -> bool {
+pub(crate) fn comparable(base: &str) -> bool {
     !matches!(
         base,
         "xml" | "geometry" | "geography" | "text" | "ntext" | "image"

@@ -80,6 +80,22 @@ async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
     }
 }
 
+/// The same, in one transaction the way `apply` runs a plan: the engine's
+/// refusal comes back with the statement, and nothing before it stays.
+async fn try_apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Result<(), String> {
+    conn.begin().await.expect("begin");
+    for p in &cs.changes {
+        for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
+            if let Err(e) = conn.execute(&stmt.sql).await {
+                conn.rollback().await.expect("rollback");
+                return Err(format!("{}\n{e}", stmt.sql));
+            }
+        }
+    }
+    conn.commit().await.expect("commit");
+    Ok(())
+}
+
 /// The declared side normalized the way introspection reports it, so the two
 /// can be compared with `==`.
 fn normalized(schema: &Schema) -> Schema {
@@ -1857,7 +1873,64 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         ]),
     });
     let next_ids = mint_ids(&next, &ids, &[]);
-    apply(&mut db.conn, &plan(&declared, &ids, &next, &next_ids)).await;
+    let second = plan(&declared, &ids, &next, &next_ids);
+
+    // The plan holds each row to what it recorded (DECISIONS 122): `new`
+    // was `New` when the plan was made, and a hand edit in between — the
+    // checksum pins the state only up to the moment `apply` reads it — is
+    // met by the statement, which names the row and rolls the plan back.
+    // A change of case alone is a change, as it is to the drift check.
+    for edited in ["Fresh", "NEW"] {
+        db.conn
+            .execute(&format!(
+                "UPDATE dbo.status SET label = N'{edited}' WHERE code = 'new';"
+            ))
+            .await
+            .expect("a hand edit after the plan");
+        let err = try_apply(&mut db.conn, &second)
+            .await
+            .expect_err("the row is not as the plan recorded it");
+        assert!(
+            err.contains("dbo.status row `new` is not as the plan recorded it"),
+            "{err}"
+        );
+        assert_eq!(
+            count(
+                &mut db.conn,
+                "SELECT COUNT(*) FROM dbo.status WHERE code = 'old';"
+            )
+            .await,
+            1,
+            "nothing of the plan stays after the refusal"
+        );
+    }
+    // A row deleted in between, the same way: a `DELETE` is held to the
+    // row's existence.
+    db.conn
+        .execute("UPDATE dbo.status SET label = N'New' WHERE code = 'new';")
+        .await
+        .expect("the edit undone");
+    let ghost = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::DeleteRow {
+                table: TableName::new("dbo", "status"),
+                key_column: "code".to_owned(),
+                key: RowKey::from("ghost"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        )],
+    };
+    let err = try_apply(&mut db.conn, &ghost)
+        .await
+        .expect_err("a row already gone is a baseline the plan was not reviewed against");
+    assert!(
+        err.contains("dbo.status row `ghost` is not as the plan recorded it"),
+        "{err}"
+    );
+    // As recorded, the plan goes through.
+    try_apply(&mut db.conn, &second)
+        .await
+        .expect("the rows are as the plan recorded them");
 
     assert_eq!(
         count(
@@ -2145,6 +2218,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let moved = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2179,6 +2253,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let same_key = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2219,6 +2294,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("7"),
@@ -2346,6 +2422,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         changes: vec![
             moved.changes[0].clone(),
             pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+                types: Default::default(),
                 table: TableName::new("dbo", "kind"),
                 key_column: "id".to_owned(),
                 key: RowKey::from("42"),
@@ -2468,6 +2545,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     }
     let pair_update = |id: &str, cells: &[(&str, Value)]| {
         pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+            types: Default::default(),
             table: TableName::new("dbo", "pair_child"),
             key_column: "id".to_owned(),
             key: RowKey::from(id),

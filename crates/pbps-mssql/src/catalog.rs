@@ -357,6 +357,42 @@ pub async fn principals_holding(
     Ok(out)
 }
 
+/// Among `names`, the pairs the database reads as one name — `Reader` and
+/// `reader` under a case-insensitive collation — each as `(earlier, later)`
+/// in the order given. A plan that creates both passes every check against
+/// the catalog, and the second `CREATE ROLE` fails after everything before
+/// it has run (DECISIONS 123).
+pub async fn names_alike(
+    conn: &mut Conn,
+    names: &[&str],
+) -> Result<Vec<(String, String)>, DbError> {
+    if names.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Numbered, so a name is not paired with itself and each pair comes once.
+    let sql = format!(
+        "SELECT a.name AS earlier, b.name AS later
+           FROM (VALUES {values}) AS a(i, name)
+           JOIN (VALUES {values}) AS b(i, name)
+             ON a.i < b.i AND a.name = b.name COLLATE DATABASE_DEFAULT
+          ORDER BY a.i, b.i;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        out.push((
+            get::<&str>(&row, "earlier")?.to_owned(),
+            get::<&str>(&row, "later")?.to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
 /// The classes a database principal can own: the catalog view that records
 /// the owner, and the `SELECT` arm that spells each owned securable the way
 /// T-SQL names it (`SCHEMA::sales`, `ROLE::auditors`, `MESSAGE TYPE::m`).

@@ -205,6 +205,26 @@ async fn refuse_taken_role_names(
     }
     let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
     let vacated: Vec<&str> = vacated.iter().map(String::as_str).collect();
+    // The wanted names against one another first: two declared roles the
+    // database reads as one name pass every check against the catalog, and
+    // the second `CREATE ROLE` fails after everything before it has run
+    // (DECISIONS 123).
+    let alike = pbps_mssql::catalog::names_alike(conn, &wanted)
+        .await
+        .context("cannot compare the declared role names")?;
+    if !alike.is_empty() {
+        let pairs: Vec<String> = alike
+            .iter()
+            .map(|(earlier, later)| format!("`{earlier}` and `{later}`"))
+            .collect();
+        bail!(
+            "two declared roles are one name to this database: {}.\n\
+             Names are compared the way this database compares them, and the second \
+             `CREATE ROLE` or `ALTER ROLE ... WITH NAME` would be refused after everything \
+             before it had run. Rename one of them.",
+            pairs.join(", ")
+        );
+    }
     let held = pbps_mssql::catalog::principals_holding(conn, &wanted, &vacated)
         .await
         .context("cannot read the database principals")?;

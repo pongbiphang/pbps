@@ -5194,6 +5194,47 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
+    // Two declared roles the database reads as one name pass every check
+    // against the catalog — nothing holds either yet — and the second
+    // `CREATE ROLE` would fail after the tables went in. The engine says
+    // which names are one (DECISIONS 123).
+    let pair = |d: &Demo| {
+        for role in ["Reader", "reader"] {
+            std::fs::write(
+                d.dir
+                    .join("schema")
+                    .join("roles")
+                    .join(format!("{role}.yml")),
+                format!("role: {role}\ngrants:\n  dbo.customer: [select]\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(code(&d.run(&["plan"])), 0);
+    };
+    let unpair = |d: &Demo| {
+        for role in ["Reader", "reader"] {
+            std::fs::remove_file(
+                d.dir
+                    .join("schema")
+                    .join("roles")
+                    .join(format!("{role}.yml")),
+            )
+            .unwrap();
+            let o = d.run(&["drop-role", role, "--reason", "never created"]);
+            assert_eq!(code(&o), 0, "{}", stderr(&o));
+        }
+    };
+    pair(&d);
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    unpair(&d);
+
     // Bootstrap: refused before the table goes in, naming the user.
     let o = d.run(&["bootstrap", "--db", &connection]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
@@ -5237,6 +5278,19 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     std::fs::remove_file(&role_file).unwrap();
     let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The pair, by the connected plan: the same refusal, before any plan is
+    // written.
+    pair(&d);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    unpair(&d);
 
     // And in another case: `Shadow` is `shadow` to this database, which is
     // the engine's call under its collation, not a string comparison's

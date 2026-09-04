@@ -1035,3 +1035,43 @@ SPEC is in sync with all of these.
     The fragments now carry subqueries, so each statement is built in a
     derived table and aggregated outside it: an aggregate's argument may not
     hold one.
+122. **A row `UPDATE` holds the row to what the plan recorded, and a row
+    `UPDATE` or `DELETE` has to reach exactly one row.** The plan is reviewed
+    against a recorded state, and the checksum pins that state up to the
+    moment `apply` reads it — not to the moment each statement runs. A row
+    another session changed or deleted in between was overwritten by the
+    `UPDATE`, or missed by it with the statement counting as success, and
+    the read-back then recorded the result as if the reviewed plan had done
+    it. The differ now writes each updated column's type in the base state
+    into `UpdateRow` (`types`, absent from older plans and read as empty,
+    which holds the key alone), and the emitter puts each recorded cell into
+    the predicate, compared by the very rendering that read it
+    (`rows::read_expr`, chosen by that type) under a binary collation, so a
+    change of case alone is a change, as it is to the drift check; a NULL
+    as `IS NULL`; a cell at a literal default as the read-back compared it,
+    and only where the read-back did — a default the engine would have to
+    run, and a type without `=`, hold nothing, as in 117 and 94. A column
+    the base does not have is not compared: its `before` is what this plan's
+    `AddColumn` leaves there, which the engine may fill from the default.
+    Both statements end in `IF @@ROWCOUNT <> 1 THROW`, in the same batch,
+    so the transaction rolls back with the row named; a `DELETE` carries no
+    recorded content (the pinned baseline holds it) and is held to the row's
+    existence. Measured with an `AFTER` trigger on the table: `@@ROWCOUNT`
+    after the statement is the statement's own. Holding the baseline read
+    and the DML under one serializable transaction would close the same
+    window for structure too, and is the shape to reach for if the row
+    predicate ever proves too narrow; it reorganises every apply path, and
+    the predicate is what the reviewed plan actually asserts.
+123. **The names a plan's remaining statements need free are compared with
+    one another, not only with the catalog.** 119 asked the engine which
+    existing principal holds each wanted name; two declared roles the
+    database reads as one name — `Reader` and `reader` under a
+    case-insensitive collation — held nothing in the catalog, passed, and
+    the second `CREATE ROLE` failed after everything before it had run,
+    committed under a staged apply. The wanted names go to the engine
+    numbered, joined to themselves under `COLLATE DATABASE_DEFAULT` on
+    `a.i < b.i`, and any pair refuses the plan by name before the catalog
+    is asked. Declared tables and modules have the same latent shape —
+    `dbo.Foo` beside `dbo.foo` — but it predates this phase and is not
+    engine-checked anywhere yet; it is recorded here rather than fixed in a
+    review round.

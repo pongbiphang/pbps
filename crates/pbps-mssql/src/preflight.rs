@@ -171,6 +171,7 @@ impl AsStored {
                     key_column,
                     key,
                     columns,
+                    ..
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
@@ -1208,6 +1209,7 @@ mod tests {
 
         // An update to DEFAULT, the same way.
         let update = Change::UpdateRow {
+            types: Default::default(),
             table: tname("dbo.kind"),
             key_column: "id".into(),
             key: RowKey::from("7"),
@@ -1242,6 +1244,7 @@ mod tests {
     fn a_composite_foreign_key_is_matched_as_one_tuple() {
         use pbps_model::{Cell, Value};
         let update = |key: &str, cells: &[(&str, Value)]| Change::UpdateRow {
+            types: Default::default(),
             table: tname("dbo.pair_child"),
             key_column: "id".into(),
             key: RowKey::from(key),
@@ -1318,6 +1321,7 @@ mod tests {
     fn a_child_row_the_plan_moves_is_not_counted_against_the_delete() {
         let cs = plan(vec![
             Change::UpdateRow {
+                types: Default::default(),
                 table: tname("dbo.kind"),
                 key_column: "id".into(),
                 key: RowKey::from("7"),
@@ -1377,6 +1381,7 @@ mod tests {
     fn a_child_row_updated_elsewhere_is_still_counted_against_the_delete() {
         let cs = plan(vec![
             Change::UpdateRow {
+                types: Default::default(),
                 table: tname("dbo.kind"),
                 key_column: "id".into(),
                 key: RowKey::from("7"),
