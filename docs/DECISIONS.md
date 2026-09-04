@@ -932,3 +932,20 @@ SPEC is in sync with all of these.
     the engine refuses inside the transaction and the plan rolls back. The
     delete is the one whose failure is silent, which is why it is the one
     that has to look forward.
+113. **A revision `--since` or `--base` cannot resolve is refused, not read
+    as an empty history.** One case is not an error: `HEAD` in a repository
+    with no commits, which genuinely has no previous version. Every other
+    unresolvable revision is a name somebody got wrong, and the empty
+    baseline is the loudest possible wrong answer to it — `plan` proposes
+    creating the entire schema, and `--since` marks every object changed, so
+    a gradual-adoption policy fails declarations nobody has touched. Both
+    `load_from_git` and `schema_at` swallowed every `rev-parse` failure
+    alike; `schema_at`'s own comment already described the distinction the
+    code did not make.
+114. **`pull` refuses to write when `data.max-rows` is `error`.** 111 made
+    `pull` read the rule instead of the field but kept only the row count,
+    so a project that had set the rule to `error` still got a warning and
+    the files — which the very next `validate` rejects. The severity travels
+    with the count now, and at `error` nothing is written at all: refusing
+    before the write is the difference between "no files" and "files you
+    must now delete by hand".

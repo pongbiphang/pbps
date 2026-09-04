@@ -5876,6 +5876,42 @@ fn validate_since_reads_the_revision_from_the_repository_root() {
     assert!(messages[0].contains("NewTable"), "{v}");
 }
 
+/// A revision `--since` cannot resolve is a mistake, not an empty history.
+///
+/// Read as empty it is the loudest possible wrong answer: `changed_subjects`
+/// marks every object changed, so a gradual-adoption rule fails declarations
+/// nobody touched, and `plan` proposes creating the entire schema. The one
+/// unresolvable revision that *is* the empty baseline is `HEAD` in a
+/// repository with no commits.
+#[test]
+fn an_unknown_revision_is_refused_rather_than_read_as_empty() {
+    let d = Demo::new("since-unknown");
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    // Before the first commit HEAD does not resolve either, and that one is
+    // the empty baseline: a repository with no previous version.
+    assert_eq!(
+        code(&d.run(&["plan"])),
+        0,
+        "an unborn HEAD is still the empty baseline"
+    );
+    d.commit();
+
+    for args in [
+        vec!["validate", "--since", "no-such-rev"],
+        vec!["plan", "--since", "no-such-rev"],
+    ] {
+        let o = d.run(&args);
+        let msg = format!("{}{}", stdout(&o), stderr(&o));
+        assert_ne!(code(&o), 0, "{args:?} must not succeed: {msg}");
+        assert!(msg.contains("no-such-rev"), "{args:?}: {msg}");
+        assert!(msg.contains("not a revision"), "{args:?}: {msg}");
+    }
+
+    // The revision that does exist still works, and says nothing changed.
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 #[test]
 fn validate_since_evaluates_only_what_changed() {
     let d = Demo::new("policysince");

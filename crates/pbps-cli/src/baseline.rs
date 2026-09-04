@@ -100,6 +100,40 @@ fn in_git_repo(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--show-toplevel"]).is_ok()
 }
 
+/// Whether `rev` names a commit in the repository at `root`.
+fn resolves(root: &Path, rev: &str) -> bool {
+    git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_ok()
+}
+
+/// Called only for a `rev` that does not resolve: `Ok(())` when that is the
+/// empty-baseline case, an error when it is a name somebody got wrong.
+///
+/// Absent, empty and unreadable are three different things. A repository
+/// with no commits has no previous version, so `HEAD` not resolving there
+/// means every declaration is genuinely new. Any other unresolvable
+/// revision is a mistake, and the empty baseline is the loudest possible
+/// wrong answer to it: `plan` proposes creating the entire schema, and
+/// `--since` marks every object changed, so gradual-adoption policies fail
+/// declarations nobody has touched (DECISIONS 113).
+fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
+    if rev != "HEAD" || resolves(root, "HEAD") {
+        anyhow::bail!(
+            "`{rev}` is not a revision this repository has.\n\
+             Name one that exists, or leave it out to compare against `HEAD`."
+        );
+    }
+    Ok(())
+}
+
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
@@ -110,18 +144,11 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
     // A brand-new repo has no commits, so HEAD does not resolve. That is not an
     // error, it just means there is no previous version yet: fall back to an empty
-    // baseline and say so.
-    if git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .is_err()
-    {
+    // baseline and say so. A revision that does not resolve for any *other*
+    // reason is refused rather than read as empty — `--since` and `--base` both
+    // arrive here carrying whatever the user typed (113).
+    if !resolves(root, rev) {
+        refuse_unknown_revision(root, rev)?;
         return Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
@@ -284,20 +311,11 @@ pub fn changed_subjects(
 pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Schema> {
     let root = &project.root;
     // A revision that does not exist yet is the empty schema, the same answer
-    // `load_from_git` gives for the identities; anything else git refuses is
-    // an error, not "no declarations" — an unreadable tree read as an empty
-    // one would call every table new.
-    if git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .is_err()
-    {
+    // `load_from_git` gives; anything else git refuses is an error, not "no
+    // declarations" — an unreadable tree read as an empty one would call
+    // every table new (113). The comment said so before the code did.
+    if !resolves(root, rev) {
+        refuse_unknown_revision(root, rev)?;
         return Ok(pbps_model::Schema::default());
     }
     let dir_rel = relative_to(&project.schema_dir())?;

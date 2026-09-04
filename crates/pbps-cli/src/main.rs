@@ -1026,17 +1026,39 @@ fn cmd_pull(
     // handed files the next `validate` rejects (DECISIONS 111). A problem in
     // the block itself is `validate`'s to report; the rule is read as the
     // project wrote it either way.
-    if let Some(max_rows) =
+    if let Some((severity, max_rows)) =
         data_row_limit(&project.config.policies(), &policy_context(project, true))
     {
-        for (name, table) in &pulled.schema.tables {
-            if let Some(d) = &table.data
-                && d.rows.len() > max_rows
-            {
+        let over: Vec<String> = pulled
+            .schema
+            .tables
+            .iter()
+            .filter_map(|(name, table)| {
+                let d = table.data.as_ref()?;
+                (d.rows.len() > max_rows)
+                    .then(|| format!("{name}: {} rows, above {max_rows}", d.rows.len()))
+            })
+            .collect();
+        if !over.is_empty() {
+            // At `error` the files are not written at all. `validate` would
+            // reject what this command had just produced, and a pull that
+            // leaves the project failing its own rules has handed over
+            // nothing usable — refusing before the write is the difference
+            // between "no files" and "files you must now delete by hand"
+            // (DECISIONS 114).
+            if severity == pbps_policy::Severity::Error {
+                anyhow::bail!(
+                    "these tables hold more rows than `data.max-rows` allows, and the rule is \
+                     `error` in pbps.yml:\n  {}\n\
+                     Nothing was written. Pull without `--data`, raise the rule's `rows`, or \
+                     lower its severity.",
+                    over.join("\n  ")
+                );
+            }
+            for line in &over {
                 eprintln!(
-                    "warning: {name}: {} rows is above `data.max-rows` ({max_rows}) — this does \
-                     not look like reference data",
-                    d.rows.len()
+                    "{severity}: {line} — this does not look like reference data, and every plan \
+                     from here on compares it row by row"
                 );
             }
         }
@@ -1149,17 +1171,23 @@ fn cmd_pull(
     Ok(())
 }
 
-/// The row count above which a `data:` block is worth a word, or `None` when
-/// the project has turned the rule off.
+/// How the project reads `data.max-rows`: the severity it gave the rule and
+/// the row count above which a `data:` block trips it, or `None` when it has
+/// turned the rule off.
 ///
-/// One reading of `data.max-rows` for `pull` and for `validate` alike:
-/// `max_data_rows` is only the rule's default parameter, so asking the field
-/// instead of the rule made `pull` warn about files `validate` accepts, and
-/// (with a lowered threshold) hand over files the next `validate` rejects.
-fn data_row_limit(policies: &pbps_policy::Policies, ctx: &pbps_policy::Context) -> Option<usize> {
+/// One reading of the rule for `pull` and for `validate` alike. Both halves
+/// are needed: `max_data_rows` is only the rule's default parameter, so
+/// asking the field instead of the rule made `pull` warn about files
+/// `validate` accepts and (with a lowered threshold) hand over files the next
+/// `validate` rejects; and dropping the severity made it warn where the
+/// project said `error`.
+fn data_row_limit(
+    policies: &pbps_policy::Policies,
+    ctx: &pbps_policy::Context,
+) -> Option<(pbps_policy::Severity, usize)> {
     let rule = policies.effective(pbps_policy::rules::DATA_MAX_ROWS);
-    rule.severity?;
-    Some(rule.config.rows.unwrap_or(ctx.max_rows))
+    let severity = rule.severity?;
+    Some((severity, rule.config.rows.unwrap_or(ctx.max_rows)))
 }
 
 /// What the policy rules need besides the block (ADR-0008).
@@ -2436,6 +2464,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// `pull` draws its size line from the rule, not from the field that is
     /// only the rule's default: raising the threshold, lowering it and
@@ -2455,10 +2484,12 @@ mod tests {
             p
         };
 
-        // No block: the project's own default, which is what `ctx` carries.
+        let warning = pbps_policy::Severity::Warning;
+        // No block: the rule's own default severity, and the project's own
+        // row count, which is what `ctx` carries.
         assert_eq!(
             data_row_limit(&pbps_policy::Policies::default(), &ctx),
-            Some(500)
+            Some((warning, 500))
         );
         // The rule's parameter wins over that default, up and down alike.
         assert_eq!(
@@ -2466,14 +2497,14 @@ mod tests {
                 &policies(r#"{"rules": {"data.max-rows": {"rows": 5000}}}"#),
                 &ctx
             ),
-            Some(5000)
+            Some((warning, 5000))
         );
         assert_eq!(
             data_row_limit(
                 &policies(r#"{"rules": {"data.max-rows": {"rows": 10}}}"#),
                 &ctx
             ),
-            Some(10)
+            Some((warning, 10))
         );
         // Off is off: no threshold, so no line.
         assert_eq!(
@@ -2484,16 +2515,24 @@ mod tests {
             data_row_limit(&policies(r#"{"rules": {"data.max-rows": "off"}}"#), &ctx),
             None
         );
-        // A severity the project chose is still on, and keeps the default.
+        // The severity the project chose travels with the count: at `error`
+        // the caller refuses instead of warning, so dropping it here wrote out
+        // files the next `validate` rejects.
         assert_eq!(
             data_row_limit(
                 &policies(r#"{"rules": {"data.max-rows": {"severity": "error"}}}"#),
                 &ctx
             ),
-            Some(500)
+            Some((pbps_policy::Severity::Error, 500))
+        );
+        assert_eq!(
+            data_row_limit(
+                &policies(r#"{"rules": {"data.max-rows": {"severity": "note", "rows": 7}}}"#),
+                &ctx
+            ),
+            Some((pbps_policy::Severity::Note, 7))
         );
     }
-    use super::*;
 
     #[test]
     fn civil_from_days_matches_known_dates() {
