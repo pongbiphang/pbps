@@ -532,6 +532,33 @@ pub enum RowAfter<'a> {
     Gone,
 }
 
+/// Which of a table's named parts a change is about.
+///
+/// The kind travels with the name because the engine keeps indexes and
+/// constraints in **separate namespaces**: a table may hold an index `x` and a
+/// check `x` at once, and a skip set keyed by the bare name let a planned
+/// change to one exempt the other from every comparison (DECISIONS 168).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Part {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    Check,
+    Index,
+}
+
+/// One named part of a table, and what this plan leaves there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartChange<'a> {
+    pub table: &'a TableName,
+    pub part: Part,
+    /// `None` for the primary key, which the model keeps in a field of its own
+    /// rather than one of the named maps, and which a declaration need not
+    /// name at all (61).
+    pub name: Option<&'a str>,
+    pub after: Presence,
+}
+
 /// Whether a name is there once this plan has run.
 ///
 /// For the caller that has to check a plan did what it said: a `CREATE` that
@@ -1030,6 +1057,61 @@ impl Change {
         }
     }
 
+    /// Which columns this change leaves standing, and which it leaves empty.
+    ///
+    /// Existence only, for the reason [`Change::tables_after`] gives: a
+    /// column's *shape* comes back from the catalog in the engine's spelling,
+    /// and holding it to the declaration would refuse valid applies. Whether
+    /// the column is there has no such ambiguity — and nothing else says so,
+    /// since the shape comparison excludes exactly the columns this plan
+    /// moves (DECISIONS 168).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn columns_after(&self) -> Vec<(ColumnRef, Presence)> {
+        match self {
+            Change::AddColumn { table, name, .. } => {
+                vec![(table.column(name), Presence::Present)]
+            }
+            Change::DropColumn { column, .. } => vec![(column.clone(), Presence::Absent)],
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![
+                (table.column(from), Presence::Absent),
+                (table.column(to), Presence::Present),
+            ],
+            // Still there afterwards, whatever else changed about it.
+            Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. }
+            | Change::AlterColumnDefault { column, .. }
+            | Change::SetColumnDeprecated { column, .. } => {
+                vec![(column.clone(), Presence::Present)]
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
     /// The named constraints and indexes this change adds or removes, under
     /// the table they sit on, and whether the primary key is among them.
     ///
@@ -1043,17 +1125,49 @@ impl Change {
     /// own rather than the constraint maps, and a declaration may not name it
     /// at all (61).
     // Exhaustive rather than a wildcard, as every accessor here is.
-    pub fn constraints(&self) -> Option<(&TableName, Option<&str>)> {
+    pub fn constraints(&self) -> Option<PartChange<'_>> {
+        let it = |table, part, name, after| {
+            Some(PartChange {
+                table,
+                part,
+                name,
+                after,
+            })
+        };
         match self {
-            Change::SetPrimaryKey { table, .. } => Some((table, None)),
-            Change::AddUnique { table, name, .. }
-            | Change::DropUnique { table, name, .. }
-            | Change::AddForeignKey { table, name, .. }
-            | Change::DropForeignKey { table, name, .. }
-            | Change::AddCheck { table, name, .. }
-            | Change::DropCheck { table, name, .. }
-            | Change::AddIndex { table, name, .. }
-            | Change::DropIndex { table, name, .. } => Some((table, Some(name))),
+            Change::SetPrimaryKey { table, to, .. } => it(
+                table,
+                Part::PrimaryKey,
+                None,
+                match to {
+                    Some(_) => Presence::Present,
+                    None => Presence::Absent,
+                },
+            ),
+            Change::AddUnique { table, name, .. } => {
+                it(table, Part::Unique, Some(name), Presence::Present)
+            }
+            Change::DropUnique { table, name, .. } => {
+                it(table, Part::Unique, Some(name), Presence::Absent)
+            }
+            Change::AddForeignKey { table, name, .. } => {
+                it(table, Part::ForeignKey, Some(name), Presence::Present)
+            }
+            Change::DropForeignKey { table, name, .. } => {
+                it(table, Part::ForeignKey, Some(name), Presence::Absent)
+            }
+            Change::AddCheck { table, name, .. } => {
+                it(table, Part::Check, Some(name), Presence::Present)
+            }
+            Change::DropCheck { table, name, .. } => {
+                it(table, Part::Check, Some(name), Presence::Absent)
+            }
+            Change::AddIndex { table, name, .. } => {
+                it(table, Part::Index, Some(name), Presence::Present)
+            }
+            Change::DropIndex { table, name, .. } => {
+                it(table, Part::Index, Some(name), Presence::Absent)
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }

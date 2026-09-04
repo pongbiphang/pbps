@@ -2092,3 +2092,31 @@ SPEC is in sync with all of these.
     of this guard being wrong in both directions the question to ask of every
     condition on it is which of the two it is protecting against.
 
+168. **What the plan does to a table's parts is checked, the skip set knows
+    which namespace it is in, and a failed read does not unfind what was
+    already found.**
+    **The parts.** 166 excluded the columns and constraints this plan moves
+    from the shape comparison, which is right, and left nothing else saying
+    what became of them — `tables_after` answers for the table, not its
+    contents. So a column added and dropped again before the checkpoint read
+    was recorded as the plan's own result. `columns_after` and the `Presence`
+    on `PartChange` name the outcome now, and it is existence only, for the
+    reason 166 gives about shape: what a column *is* comes back in the
+    engine's spelling and holding it to the declaration would refuse valid
+    applies; whether it is there has no such ambiguity.
+    This is 160's lesson for the third time — an exemption is only correct
+    where something else does the checking — and it is worth saying plainly
+    that the pattern is now known: **every time this guard excludes something,
+    the next question is what checks it instead.**
+    **The namespace.** Indexes and constraints are separate namespaces to SQL
+    Server: a table may hold an index `x` and a check `x` at once. The skip
+    set was keyed by the bare name, so planning a change to either exempted
+    both from every comparison. `Part` travels with the name now.
+    **The read.** `status` assigned `state` and `detail` directly on the two
+    row-read failure paths, which overwrote an unexpressible permission the
+    introspection above had already established. It was known independently of
+    that read, and a read that fails does not unfind it. Both go through
+    `record_unreachable`, like every other outcome on that path. Swept: the
+    only remaining direct assignments are inside the recorders themselves and
+    on a row that has just been built, where there is nothing to preserve.
+

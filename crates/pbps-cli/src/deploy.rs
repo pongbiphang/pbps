@@ -1065,7 +1065,11 @@ fn refuse_unplanned_movement(
     // primary key it sets. Everything else on a touched table then answers for
     // itself, instead of one index change exempting the whole shape
     // (DECISIONS 166).
-    let mut constraints: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    // Keyed by the *kind* as well as the name: indexes and constraints are
+    // separate namespaces to the engine, so a table can hold an index `x` and
+    // a check `x`, and a set of bare names let a planned change to one exempt
+    // the other from every comparison (DECISIONS 168).
+    let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
     for p in &changes.changes {
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
@@ -1087,13 +1091,16 @@ fn refuse_unplanned_movement(
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
         }
-        if let Some((table, name)) = p.change.constraints() {
-            match name {
+        if let Some(part) = p.change.constraints() {
+            match part.name {
                 Some(name) => {
-                    constraints.entry(table).or_default().insert(name);
+                    constraints
+                        .entry(part.table)
+                        .or_default()
+                        .insert((part.part, name));
                 }
                 None => {
-                    keys.insert(table);
+                    keys.insert(part.table);
                 }
             }
         }
@@ -1157,7 +1164,7 @@ fn refuse_unplanned_movement(
             let no_columns = BTreeSet::new();
             let moved_columns = columns.get(now_name).unwrap_or(&no_columns);
             let no_names = BTreeSet::new();
-            let moved_constraints = constraints.get(now_name).unwrap_or(&no_names);
+            let moved_parts = constraints.get(now_name).unwrap_or(&no_names);
             let held = |c: &String| !moved_columns.contains(c);
             for column in was.columns.keys().chain(now.columns.keys()) {
                 if !held(column) {
@@ -1179,39 +1186,24 @@ fn refuse_unplanned_movement(
             // (DECISIONS 167). Both values come from a read-back, so comparing
             // them predicts nothing — the same reason the columns above can be
             // compared outright.
-            let skip = moved_constraints;
+            // One call per kind: the value is what has to be compared, and a
+            // closure cannot be generic over it (DECISIONS 167). The kind
+            // travels with the name because the engine keeps indexes and
+            // constraints in separate namespaces (DECISIONS 168).
+            use pbps_model::Part;
+            let (n, s, m) = (now_name, moved_parts, &mut moved);
+            named_alike(n, Part::Unique, "unique", &was.unique, &now.unique, s, m);
             named_alike(
-                now_name,
-                "unique",
-                &was.unique,
-                &now.unique,
-                skip,
-                &mut moved,
-            );
-            named_alike(
-                now_name,
+                n,
+                Part::ForeignKey,
                 "foreign key",
                 &was.foreign_keys,
                 &now.foreign_keys,
-                skip,
-                &mut moved,
+                s,
+                m,
             );
-            named_alike(
-                now_name,
-                "check",
-                &was.checks,
-                &now.checks,
-                skip,
-                &mut moved,
-            );
-            named_alike(
-                now_name,
-                "index",
-                &was.indexes,
-                &now.indexes,
-                skip,
-                &mut moved,
-            );
+            named_alike(n, Part::Check, "check", &was.checks, &now.checks, s, m);
+            named_alike(n, Part::Index, "index", &was.indexes, &now.indexes, s, m);
         }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
@@ -1373,6 +1365,64 @@ fn refuse_unplanned_movement(
                 (pbps_model::Presence::Absent, true) => {
                     moved.push(format!("{name} is still there, and this plan removes it"))
                 }
+                _ => {}
+            }
+        }
+        // And the parts of a table this plan changes. Nothing else says what
+        // became of them: the shape comparison excludes exactly these, and the
+        // table check above answers only for the table itself — so a column
+        // added and dropped again before the checkpoint read was recorded as
+        // the plan's own result (DECISIONS 168). Existence only, for the
+        // reason 166 gives about a table's shape.
+        let mut expected_columns: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence> =
+            BTreeMap::new();
+        let mut expected_parts: Vec<pbps_model::PartChange<'_>> = Vec::new();
+        for p in &changes.changes {
+            expected_columns.extend(p.change.columns_after());
+            expected_parts.extend(p.change.constraints());
+        }
+        for (column, expected) in expected_columns {
+            let Some(table) = after.tables.get(&column.table) else {
+                // The table itself is gone or renamed; its own check answers.
+                continue;
+            };
+            match (expected, table.columns.contains_key(&column.name)) {
+                (pbps_model::Presence::Present, false) => moved.push(format!(
+                    "{} column `{}` is not there, and this plan writes it",
+                    column.table, column.name
+                )),
+                (pbps_model::Presence::Absent, true) => moved.push(format!(
+                    "{} column `{}` is still there, and this plan removes it",
+                    column.table, column.name
+                )),
+                _ => {}
+            }
+        }
+        for part in expected_parts {
+            let Some(table) = after.tables.get(part.table) else {
+                continue;
+            };
+            let (kind, there) = match (part.part, part.name) {
+                (pbps_model::Part::PrimaryKey, _) => ("primary key", table.primary_key.is_some()),
+                (pbps_model::Part::Unique, Some(n)) => ("unique", table.unique.contains_key(n)),
+                (pbps_model::Part::ForeignKey, Some(n)) => {
+                    ("foreign key", table.foreign_keys.contains_key(n))
+                }
+                (pbps_model::Part::Check, Some(n)) => ("check", table.checks.contains_key(n)),
+                (pbps_model::Part::Index, Some(n)) => ("index", table.indexes.contains_key(n)),
+                // Only the primary key is nameless, and it is matched above.
+                (_, None) => continue,
+            };
+            let name = part.name.unwrap_or("");
+            match (part.after, there) {
+                (pbps_model::Presence::Present, false) => moved.push(format!(
+                    "{} {kind} `{name}` is not there, and this plan writes it",
+                    part.table
+                )),
+                (pbps_model::Presence::Absent, true) => moved.push(format!(
+                    "{} {kind} `{name}` is still there, and this plan removes it",
+                    part.table
+                )),
                 _ => {}
             }
         }
@@ -1547,15 +1597,16 @@ fn refuse_unplanned_movement(
 /// both sides (DECISIONS 167).
 fn named_alike<V: PartialEq>(
     table: &TableName,
+    part: pbps_model::Part,
     kind: &str,
     was: &BTreeMap<String, V>,
     now: &BTreeMap<String, V>,
-    skip: &BTreeSet<&str>,
+    skip: &BTreeSet<(pbps_model::Part, &str)>,
     moved: &mut Vec<String>,
 ) {
     let names: BTreeSet<&String> = was.keys().chain(now.keys()).collect();
     for name in names {
-        if skip.contains(name.as_str()) {
+        if skip.contains(&(part, name.as_str())) {
             continue;
         }
         if was.get(name) != now.get(name) {
@@ -4399,8 +4450,43 @@ mod tests {
             Settled::Whole,
         )
         .expect("the index this plan adds");
-    }
 
+        // What the plan does to a table's parts is checked too. Nothing else
+        // says so: the shape comparison excludes exactly these, and the table
+        // check answers only for the table (DECISIONS 168).
+        let e = refuse_unplanned_movement(
+            &adding,
+            &table("nvarchar(50)", None),
+            &table("nvarchar(50)", None),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the index this plan adds is not there");
+        assert!(format!("{e:#}").contains("ix_note"), "{e:#}");
+
+        // And an index and a check may share a name — separate namespaces to
+        // the engine — so a planned change to one must not exempt the other.
+        let mut with_check = table("nvarchar(50)", Some("ix_note"));
+        let put_check = |s: &mut Schema, expression: &str| {
+            s.tables
+                .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+                .unwrap()
+                .checks
+                .insert(
+                    "ix_note".to_owned(),
+                    pbps_model::CheckConstraint {
+                        expression: expression.to_owned(),
+                    },
+                );
+        };
+        put_check(&mut with_check, "note IS NOT NULL");
+        let mut check_moved = table("nvarchar(50)", Some("ix_note"));
+        put_check(&mut check_moved, "note <> N''");
+        let e =
+            refuse_unplanned_movement(&adding, &with_check, &check_moved, "prod", Settled::Whole)
+                .expect_err("the check shares a name with the planned index, and is not it");
+        assert!(format!("{e:#}").contains("check `ix_note`"), "{e:#}");
+    }
     /// A row the plan writes is held to the cells it spelled, once every
     /// statement has run. Its own statement stops speaking at its commit, and
     /// a staged run leaves the row loose from then until the checkpoint read
@@ -4961,7 +5047,7 @@ mod tests {
     fn a_column_this_plan_changes_is_not_compared_row_by_row() {
         use pbps_model::{Cell, DataMode, RowKey, TableData, Value};
         let table = |cells: &[(&str, &str)]| {
-            let t = pbps_model::Table {
+            let mut t = pbps_model::Table {
                 data: Some(TableData {
                     mode: DataMode::Exact,
                     rows: [(
@@ -4976,6 +5062,16 @@ mod tests {
                 }),
                 ..Default::default()
             };
+            // The columns too: a rename is checked for having happened as
+            // well as for re-keying the row (DECISIONS 168), and a table
+            // whose rows name columns it does not have is not a state any
+            // read produces.
+            for (column, _) in cells {
+                t.columns.insert(
+                    (*column).to_owned(),
+                    pbps_model::Column::new("nvarchar(50)".parse().unwrap()),
+                );
+            }
             let mut s = Schema::default();
             s.tables.insert("dbo.t".parse().unwrap(), t);
             s

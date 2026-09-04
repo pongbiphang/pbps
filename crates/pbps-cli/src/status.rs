@@ -341,8 +341,15 @@ async fn one(
     let rows = match pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read).await {
         Ok(rows) => rows,
         Err(e) => {
-            row.state = "unreachable";
-            row.detail = Some(format!("the declared rows could not be read back: {e}"));
+            // Through the helper, which keeps what was already established.
+            // Assigning here dropped an unexpressible permission the
+            // introspection above had already found: it was known
+            // independently of this read, and a read that failed does not
+            // unfind it (DECISIONS 168).
+            record_unreachable(
+                &mut row,
+                format!("the declared rows could not be read back: {e}"),
+            );
             return row;
         }
     };
@@ -358,8 +365,10 @@ async fn one(
         // compared against the database, which is the same answer as a read
         // that failed, never "no drift".
         Err(e) => {
-            row.state = "unreachable";
-            row.detail = Some(format!("the recorded rows cannot be compared: {e}"));
+            record_unreachable(
+                &mut row,
+                format!("the recorded rows cannot be compared: {e}"),
+            );
             return row;
         }
     };
