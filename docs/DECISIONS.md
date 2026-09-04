@@ -2033,3 +2033,32 @@ SPEC is in sync with all of these.
     to be classified before it is acted on — which is this file's oldest
     entry, and it keeps needing to be applied one level further in.
 
+166. **A touched table answers for the shape the plan leaves alone, and a
+    historical path is composed rather than asked about.**
+    **The shape.** 161 checked a touched table's *existence* and stopped
+    there, on the reasoning that holding it to its declared shape would refuse
+    valid applies — the engine's stored form is the one that compares equal on
+    the next drift check (SPEC §8.2), and the declaration is not it. That
+    reasoning is sound and it answers a question nobody asked. The comparison
+    that matters is not declaration against read-back; it is **the recorded
+    state against the read-back**, both already in the stored form, over
+    everything this plan does not move. So a touched table's columns,
+    constraints and indexes are compared entry by entry now, minus the ones
+    the plan names — the same narrowing its rows got in 153 and its role's
+    grants in 156, one level up. Nothing here predicts anything.
+    What the plan's own alterations *achieved* is still not checked, and that
+    is the part which would need the stored form: a retyped column is
+    compared by nobody, and the column and constraint names the plan adds or
+    removes are held to being present or absent instead. Third time this
+    distinction has had to be drawn — 162 for rows, 165 for their cells — and
+    it is the same one: predict nothing, compare two reads.
+    **The path.** 155 read a revision's own `schema_dir` and then converted it
+    with `relative_to`, which answers by running git *inside the path's own
+    parent*. A revision that kept its declarations in `legacy/schema`, since
+    removed, has no such parent — `fatal: cannot change to '.../legacy'`, and
+    `plan` and `validate --since` failed outright instead of reading the old
+    tree. Composed from the project root's own prefix now, which is the one
+    directory that is always there. The first fix asked the working tree about
+    a path that only history has; the whole point of `paths_at` is that those
+    are different.
+

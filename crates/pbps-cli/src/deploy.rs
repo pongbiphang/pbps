@@ -1061,6 +1061,12 @@ fn refuse_unplanned_movement(
     // dropped table takes its grants with it (DECISIONS 158).
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
     let mut gone: BTreeSet<&TableName> = BTreeSet::new();
+    // The constraints and indexes this plan moves, and the tables whose
+    // primary key it sets. Everything else on a touched table then answers for
+    // itself, instead of one index change exempting the whole shape
+    // (DECISIONS 166).
+    let mut constraints: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    let mut keys: BTreeSet<&TableName> = BTreeSet::new();
     for p in &changes.changes {
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             renamed.insert(from, to);
@@ -1080,6 +1086,16 @@ fn refuse_unplanned_movement(
         }
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
+        }
+        if let Some((table, name)) = p.change.constraints() {
+            match name {
+                Some(name) => {
+                    constraints.entry(table).or_default().insert(name);
+                }
+                None => {
+                    keys.insert(table);
+                }
+            }
         }
         if let Some(dropped) = p.change.drops() {
             gone.insert(dropped);
@@ -1122,6 +1138,68 @@ fn refuse_unplanned_movement(
             continue;
         }
         let now_name = renamed.get(name).copied().unwrap_or(name);
+        // The table's *shape*, entry by entry, over everything this plan does
+        // not move. Its own columns and constraints are compared between two
+        // read-backs — never against the declaration — so nothing here depends
+        // on predicting the engine's stored form, which is why the whole table
+        // could stop being exempt (DECISIONS 166). What the plan's own
+        // alterations achieved is still not checked: that *would* need the
+        // stored form, and the column and constraint names it adds or removes
+        // are held to being present or absent instead.
+        if settled == Settled::Whole
+            && let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name))
+        {
+            let no_columns = BTreeSet::new();
+            let moved_columns = columns.get(now_name).unwrap_or(&no_columns);
+            let no_names = BTreeSet::new();
+            let moved_constraints = constraints.get(now_name).unwrap_or(&no_names);
+            let held = |c: &String| !moved_columns.contains(c);
+            for column in was.columns.keys().chain(now.columns.keys()) {
+                if !held(column) {
+                    continue;
+                }
+                if was.columns.get(column) != now.columns.get(column) {
+                    moved.push(format!(
+                        "{now_name} column `{column}` is not what the plan was approved over, \
+                         and no change of this plan moves it"
+                    ));
+                }
+            }
+            if !keys.contains(now_name) && was.primary_key != now.primary_key {
+                moved.push(format!("{now_name} has a different primary key"));
+            }
+            let mut named = |kind: &str, a: BTreeSet<&String>, b: BTreeSet<&String>| {
+                for name in a.union(&b) {
+                    if !moved_constraints.contains(name.as_str())
+                        && a.contains(name) != b.contains(name)
+                    {
+                        moved.push(format!(
+                            "{now_name} {kind} `{name}` is not as the plan left it"
+                        ));
+                    }
+                }
+            };
+            named(
+                "unique",
+                was.unique.keys().collect(),
+                now.unique.keys().collect(),
+            );
+            named(
+                "foreign key",
+                was.foreign_keys.keys().collect(),
+                now.foreign_keys.keys().collect(),
+            );
+            named(
+                "check",
+                was.checks.keys().collect(),
+                now.checks.keys().collect(),
+            );
+            named(
+                "index",
+                was.indexes.keys().collect(),
+                now.indexes.keys().collect(),
+            );
+        }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
         let (Some(was_rows), Some(now_rows)) = (
@@ -4133,6 +4211,117 @@ mod tests {
         let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A touched table is exempt down to the columns and constraints the plan
+    /// moves, and no further — the same narrowing its rows got, one level up
+    /// (DECISIONS 166).
+    #[test]
+    fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
+        let table = |note: &str, index: Option<&str>| {
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "note".to_owned(),
+                pbps_model::Column::new(note.parse().unwrap()),
+            );
+            t.columns.insert(
+                "other".to_owned(),
+                pbps_model::Column::new("int".parse().unwrap()),
+            );
+            if let Some(name) = index {
+                t.indexes.insert(
+                    name.to_owned(),
+                    pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            name: "note".to_owned(),
+                            descending: false,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                    },
+                );
+            }
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        // The plan widens `note`, and nothing else.
+        let widening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.t.note".parse().unwrap(),
+                    from: "nvarchar(50)".parse().unwrap(),
+                    to: "nvarchar(100)".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: true,
+                },
+            )],
+        };
+        let before = table("nvarchar(50)", None);
+        refuse_unplanned_movement(
+            &widening,
+            &before,
+            &table("nvarchar(100)", None),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the column this plan retypes is its own business");
+
+        // An index that arrived on the same table is not.
+        let e = refuse_unplanned_movement(
+            &widening,
+            &before,
+            &table("nvarchar(100)", Some("ix_rogue")),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("an index nobody planned");
+        assert!(format!("{e:#}").contains("ix_rogue"), "{e:#}");
+
+        // And so is another column changing underneath it.
+        let mut retyped_other = table("nvarchar(100)", None);
+        retyped_other
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .columns
+            .insert(
+                "other".to_owned(),
+                pbps_model::Column::new("bigint".parse().unwrap()),
+            );
+        let e =
+            refuse_unplanned_movement(&widening, &before, &retyped_other, "prod", Settled::Whole)
+                .expect_err("a column nobody planned");
+        assert!(format!("{e:#}").contains("`other`"), "{e:#}");
+
+        // The plan's own index change is exempt, both ways round.
+        let adding = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AddIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".to_owned(),
+                    index: Box::new(pbps_model::Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            name: "note".to_owned(),
+                            descending: false,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                    }),
+                },
+            )],
+        };
+        refuse_unplanned_movement(
+            &adding,
+            &table("nvarchar(50)", None),
+            &table("nvarchar(50)", Some("ix_note")),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the index this plan adds");
     }
 
     /// A row the plan writes is held to the cells it spelled, once every

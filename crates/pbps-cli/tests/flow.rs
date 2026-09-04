@@ -7244,19 +7244,32 @@ fn a_policy_refusal_leaves_the_identity_file_alone() {
 #[test]
 fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
     let d = Demo::new("movedpaths");
-    // The first revision keeps its declarations in `schema/` — the default.
-    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n");
+    // The first revision keeps its declarations *nested*, which is the shape
+    // that matters below: when the whole `legacy/` tree is gone, a path
+    // conversion that asks git about the historical directory has to run it
+    // inside a parent that does not exist either (DECISIONS 166).
+    std::fs::create_dir_all(d.dir.join("legacy/schema")).unwrap();
+    std::fs::write(
+        d.dir.join("legacy/schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: legacy/schema\nids_file: legacy/ids.json\n",
+    )
+    .unwrap();
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
     // The second moves them, and says so in its own `pbps.yml`.
     std::fs::create_dir_all(d.dir.join("db/tables")).unwrap();
     std::fs::rename(
-        d.dir.join("schema/dbo.t.yml"),
+        d.dir.join("legacy/schema/dbo.t.yml"),
         d.dir.join("db/tables/dbo.t.yml"),
     )
     .unwrap();
-    std::fs::rename(d.dir.join("schema.ids.json"), d.dir.join("db/ids.json")).unwrap();
+    std::fs::rename(d.dir.join("legacy/ids.json"), d.dir.join("db/ids.json")).unwrap();
     std::fs::write(
         d.dir.join("pbps.yml"),
         "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n",
@@ -7277,6 +7290,19 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
         "the previous revision has declarations, at its own path: {}",
         stderr(&o)
     );
+
+    // Even when the old tree is gone from the working copy entirely — parent
+    // directory and all, which is what makes the git question unanswerable.
+    std::fs::remove_dir_all(d.dir.join("legacy")).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the old declarations directory is gone from the working tree: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("create table"), "{}", stdout(&o));
 
     // And `--since` agrees: nothing about `dbo.t` changed, so a rule that
     // would fail it is not evaluated against it.

@@ -1030,6 +1030,55 @@ impl Change {
         }
     }
 
+    /// The named constraints and indexes this change adds or removes, under
+    /// the table they sit on, and whether the primary key is among them.
+    ///
+    /// For a caller comparing a touched table's *shape* across an apply. Its
+    /// columns and constraints are compared entry by entry between the two
+    /// reads, so the ones this plan moves have to be left out — and everything
+    /// else on the table then answers for itself, instead of the whole table
+    /// being exempt because one index changed (DECISIONS 166).
+    ///
+    /// The primary key is `Named(None)`: the model keeps it in a field of its
+    /// own rather than the constraint maps, and a declaration may not name it
+    /// at all (61).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn constraints(&self) -> Option<(&TableName, Option<&str>)> {
+        match self {
+            Change::SetPrimaryKey { table, .. } => Some((table, None)),
+            Change::AddUnique { table, name, .. }
+            | Change::DropUnique { table, name, .. }
+            | Change::AddForeignKey { table, name, .. }
+            | Change::DropForeignKey { table, name, .. }
+            | Change::AddCheck { table, name, .. }
+            | Change::DropCheck { table, name, .. }
+            | Change::AddIndex { table, name, .. }
+            | Change::DropIndex { table, name, .. } => Some((table, Some(name))),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
     /// The same for roles. A role with no grants is invisible to every other
     /// comparison here — its whole state is its name — so without this a
     /// `CREATE ROLE` that another session undid was recorded as success.

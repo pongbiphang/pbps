@@ -163,9 +163,38 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     let config = pbps_config::Config::parse(&text, &project.config_file())
         .map_err(|e| anyhow::anyhow!("`{config_rel}` at `{rev}` does not parse: {e}"))?;
     // The config's paths are relative to the project root; git's are relative
-    // to the repo root, and `relative_to` is what knows the difference.
-    let under = |path: &std::path::Path| relative_to(&root.join(path));
-    Ok((under(&config.schema_dir)?, under(&config.ids_file)?))
+    // to the repo root. Composed from the *root's* prefix rather than asked of
+    // each path, because a path an old revision used may not exist in the
+    // working tree at all — `legacy/schema` after a move to `schema` — and
+    // `relative_to` answers by running git inside the path's own parent. The
+    // project root is the one directory that is always there (DECISIONS 166).
+    let prefix = relative_to(root)?;
+    Ok((
+        under(&prefix, &config.schema_dir),
+        under(&prefix, &config.ids_file),
+    ))
+}
+
+/// A path the config states, relative to the project root, as the path git
+/// wants: relative to the repository root, with `/` separators.
+///
+/// `.` is the project root itself, which is the prefix alone — and at the
+/// repository root that is the empty pathspec, which every caller here already
+/// treats as "everything".
+fn under(prefix: &str, path: &Path) -> String {
+    let mut parts: Vec<&str> = prefix.split('/').collect();
+    for component in path.components() {
+        if let std::path::Component::Normal(part) = component
+            && let Some(part) = part.to_str()
+        {
+            parts.push(part);
+        }
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
