@@ -633,14 +633,38 @@ brings the object's state to exactly what it recorded — emitting what is missi
 where to look for what will appear, and the plan says so, because a `REVOKE`
 nobody can explain is worse than one the artifact predicted.
 
-**And `apply` asks again before statement one.** The revoke list is computed
-from `pg_default_acl` at plan time, and `pg_default_acl` is not part of the
-schema the checksum is taken over — so a default grant added in the window
-between planning and applying makes the approved list stale, the replacement
-inherits access no statement removes, and the managed-role comparison still
-reports clean because the grantee is not a managed role. The preflight compares
-the live default-ACL state with what the plan assumed and refuses on any
-difference.
+**And `apply` asks again before statement one — which shortens the window and
+does not close it.** The revoke list is computed from `pg_default_acl` at plan
+time, and `pg_default_acl` is not part of the schema the checksum is taken over,
+so a default grant added between planning and applying makes the approved list
+stale: the replacement inherits access no statement removes, and the
+managed-role comparison still reports clean because the grantee is not a managed
+role. A preflight comparing the live default-ACL state with what the plan
+assumed catches that, and **measured, an entry added after the preflight and
+before the `CREATE` still lands** — nothing locks that catalog, and the
+transaction's later statements read it fresh:
+
+```
+session A (the apply):  BEGIN; preflight sees 0 default-ACL entries; ...
+session B, meanwhile:   ALTER DEFAULT PRIVILEGES FOR ROLE dp_deploy
+                            IN SCHEMA dp GRANT SELECT ON TABLES TO dp_bystander;
+session A continues:    CREATE VIEW dp.v ...
+    the view this transaction created has acl=
+        {dp_deploy=arwdDxtm/dp_deploy, dp_bystander=r/dp_deploy}
+after commit:           dp_bystander can select the view: true
+```
+
+So the preflight is necessary and is not the check that makes this safe.
+**The check that does is a postcondition: after each `CREATE`, and before the
+transaction commits, the plan asserts the object's ACL is exactly what it
+intended.** Anything else aborts the transaction, and §7.5's all-or-nothing then
+makes the whole apply a no-op rather than a silent widening.
+
+That is the same shape the row writes already use — a statement-level
+postcondition rather than a precondition — and it is the right shape for the
+same reason: a precondition can only describe the world before the statement,
+and what this design needs to be true is a fact *about the statement's own
+result*.
 
 That is not a new mechanism: ADR-0005 note 13 already has `apply` re-asking
 about a dropped role's members for exactly this reason — *"the members listed at
@@ -651,11 +675,12 @@ not cover has to be re-asked at apply time.**
 
 Two consequences worth naming, because they follow from the rule rather than
 from any one row: **the enumeration is `plan --db`'s work, not the emitter's**,
-since only a connection can see what an object carries; and **a rebuild is
-expensive in a way `CREATE OR REPLACE` is not**, so §3's preference for the
-replace path is a safety preference and not only a cheapness one — except for
-`reloptions`, where measurement showed the replace path is no safer, which is
-the reason to distrust the whole intuition.
+since only a connection can see what an object carries; and **it runs on every
+module edit**, because this section's sub-section below concludes that every
+edit on this engine is a rebuild. The intuition that a replace would have been
+the cheap safe path did not survive its own measurement — `CREATE OR REPLACE`
+drops `reloptions` too — which is the reason the enumeration is not optional
+for some edits and mandatory for others.
 
 ### How the plan knows a rebuild is needed
 

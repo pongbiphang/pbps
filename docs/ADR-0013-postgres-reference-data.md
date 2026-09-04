@@ -371,10 +371,13 @@ Two things follow, and the first matters more:
   shape*. Where the shape cannot be honoured, the refusal is the answer; where
   it can, it has to be computed from the declaration rather than from the
   maximum.
-- **The declaration should be discouraged, not merely supported.** ADR-0004
-  already says an identity primary key "hands out different values per
-  environment, so declaring rows by id would be a lie by default". PostgreSQL
-  adds a second reason. `validate` should carry a rule at `warn` naming both.
+- **The declaration is refused on this engine, not merely discouraged.**
+  ADR-0004 already says an identity primary key "hands out different values per
+  environment, so declaring rows by id would be a lie by default". This was the
+  second reason, and by the end of this bullet there are six — which is where
+  `validate` stops warning and refuses. The rule is stated at the decision that
+  concludes this bullet; it is named here so that a reader who stops at this
+  paragraph does not leave with the weaker version.
 
 **And the contrast, measured**, because if SQL Server behaved the same way this
 would be a live bug in shipped code rather than a Phase 5 note. It does not:

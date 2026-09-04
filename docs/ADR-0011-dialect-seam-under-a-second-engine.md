@@ -190,9 +190,14 @@ relation `we"ird` — which is `quote_ident`'s job, not the signature's),
 
 One item is executor work rather than a trait change, and is recorded so it is
 not mistaken for "nothing to do": on PostgreSQL a rename rewrites the stored
-definition of every view that referenced the renamed object, so `apply` must
-re-read managed modules after a plan containing a rename, or the closing state
-records definitions the database no longer has (ADR-0009 §2).
+definition of every view that referenced the renamed object. An earlier version
+of this paragraph concluded that `apply` should therefore re-read managed
+modules after such a plan. [ADR-0009](ADR-0009-postgres-modules.md) §2 has since
+rejected that as blessing a divergence — the environment would then hold a
+definition the declarations can no longer produce — and requires the dependent
+modules to be **rebuilt from their declarations** instead. Re-reading survives
+only for the modules a plan does not rebuild, so their recorded read-back
+matches the live one.
 
 ## Ruled out
 

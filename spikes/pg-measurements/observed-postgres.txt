@@ -121,3 +121,5 @@ R41 | what the catalog says about that sequence | cycle=true min=1 max=10 — de
 A46 | the target owner's CREATE on the containing schema | true — the prerequisite ALTER ... OWNER TO checks
 A47 | the same after REVOKE CREATE | false — an object may still be validly owned by it
 A48 | membership granted WITH SET FALSE | set_option=false — membership without the right to assume it
+A49 | default-ACL entries a preflight would see at BEGIN | 1
+A50 | and what the same transaction sees a statement later | 2 — the catalog read is not pinned to the preflight

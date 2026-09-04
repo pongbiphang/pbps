@@ -305,8 +305,9 @@ state nor the intent to reach it.
 A first draft of this paragraph concluded that pbps therefore "will not undo it".
 **Measured, that is false**, because a revocation is not a row in the ACL — it is
 the *absence* of the engine's default — and [ADR-0009](ADR-0009-postgres-modules.md)
-§3 rebuilds a function by drop + create whenever `CREATE OR REPLACE` cannot
-express the change:
+§3 rebuilds a function by drop + create — on that engine, *every* module edit
+does, because which edits a replace could express is not knowable without
+parsing or executing DDL:
 
 ```
 REVOKE EXECUTE ON FUNCTION w.f(int) FROM PUBLIC;  -> {postgres=X/postgres}

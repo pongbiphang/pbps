@@ -670,8 +670,27 @@ SELECT 'A48', 'membership granted WITH SET FALSE',
        'set_option=' || set_option::text || ' — membership without the right to assume it'
 FROM pg_auth_members WHERE roleid='m_ow_owner'::regrole AND member='m_ow_deploy'::regrole;
 
+-- ------------------------------- the seventeenth 2026-09-05 review round
+-- The interleaving itself needs two sessions and is quoted in ADR-0009; what
+-- one connection can show is that nothing locks pg_default_acl and that a
+-- statement later in the same transaction reads it fresh.
+
+CREATE ROLE m_dp_owner;
+CREATE ROLE m_dp_by;
+GRANT CREATE, USAGE ON SCHEMA m TO m_dp_owner;
+CREATE TABLE m.dp2_t (id int PRIMARY KEY);
+BEGIN;
+SELECT 'A49', 'default-ACL entries a preflight would see at BEGIN',
+       count(*)::text FROM pg_default_acl WHERE defaclnamespace = 'm'::regnamespace;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_dp_owner IN SCHEMA m GRANT SELECT ON TABLES TO m_dp_by;
+SELECT 'A50', 'and what the same transaction sees a statement later',
+       count(*)::text || ' — the catalog read is not pinned to the preflight'
+FROM pg_default_acl WHERE defaclnamespace = 'm'::regnamespace;
+COMMIT;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_dp_owner IN SCHEMA m REVOKE SELECT ON TABLES FROM m_dp_by;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
-DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander; DROP OWNED BY m_ow_owner; DROP OWNED BY m_ow_deploy;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander, m_ow_owner, m_ow_deploy;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander; DROP OWNED BY m_ow_owner; DROP OWNED BY m_ow_deploy; DROP OWNED BY m_dp_owner; DROP OWNED BY m_dp_by;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander, m_ow_owner, m_ow_deploy, m_dp_owner, m_dp_by;
