@@ -85,3 +85,13 @@ R18 | an unqualified reference inside a definition, search_path empty | refused:
 R19 | the same definition with the object's own schema on the path | accepted
 A33 | a view column default, and where it lives | pg_attrdef: 'from the view default'::text / pg_get_viewdef shows: SELECT id, a FROM sp_t;
 A34 | that default after a drop-and-create rebuild | gone
+R20 | locking a sequence with LOCK TABLE | refused: cannot lock relation "lockable_id_seq"
+R21 | locking the sequence's row with FOR UPDATE | refused: cannot lock rows in sequence "lockable_id_seq"
+R22 | setval(GREATEST(target, nextval)) with the sequence behind the target | returned 101
+R23 | the same call after another allocation pushed it past the target | sequence had reached 103, setval(GREATEST(101, nextval)) returned 104 — it did not go back
+R24 | a plain literal with a backslash-quote, standard_conforming_strings=on | refused: syntax error at or near "s"
+R25 | the same literal with standard_conforming_strings=off | one literal of length 10
+R26 | pg_get_viewdef with an empty search_path | SELECT id, a FROM m.sp2;
+R27 | pg_get_viewdef with the object's schema on the path | SELECT id, a FROM sp2;
+R28 | an unqualified function from another schema, path = the object's schema only | refused: function helper(integer) does not exist
+R29 | the same definition with that other schema on the path | accepted

@@ -452,6 +452,63 @@ SELECT 'A34', 'that default after a drop-and-create rebuild',
        coalesce((SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='m.uv'::regclass),
                 'gone');
 
+-- ----------------------------------- the seventh 2026-09-05 review round
+
+CREATE TABLE m.lockable (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+SELECT 'R20', 'locking a sequence with LOCK TABLE',
+       m.accepts('LOCK TABLE ' || pg_get_serial_sequence('m.lockable','id') || ' IN ACCESS EXCLUSIVE MODE');
+SELECT 'R21', 'locking the sequence''s row with FOR UPDATE',
+       m.accepts('SELECT last_value FROM ' || pg_get_serial_sequence('m.lockable','id') || ' FOR UPDATE');
+
+-- Since no lock conflicts with nextval, the restart must be a write that cannot
+-- move the sequence backwards, whatever another session did in the meantime.
+CREATE TABLE m.never_lower (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.never_lower (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'pinned');
+SELECT 'R22', 'setval(GREATEST(target, nextval)) with the sequence behind the target',
+       'returned ' || setval(pg_get_serial_sequence('m.never_lower','id'),
+                             GREATEST(101, nextval(pg_get_serial_sequence('m.never_lower','id'))))::text;
+SELECT nextval(pg_get_serial_sequence('m.never_lower','id')) \gset n1_
+SELECT nextval(pg_get_serial_sequence('m.never_lower','id')) \gset n2_
+SELECT 'R23', 'the same call after another allocation pushed it past the target',
+       'sequence had reached ' || :'n2_nextval'
+       || ', setval(GREATEST(101, nextval)) returned '
+       || setval(pg_get_serial_sequence('m.never_lower','id'),
+                 GREATEST(101, nextval(pg_get_serial_sequence('m.never_lower','id'))))::text
+       || ' — it did not go back';
+
+CREATE FUNCTION m.scs() RETURNS text AS $fn$
+DECLARE n int;
+BEGIN
+  EXECUTE 'SELECT length(' || chr(39) || 'it' || chr(92) || chr(39) || 's  here' || chr(39) || ')' INTO n;
+  RETURN 'one literal of length ' || n::text;
+EXCEPTION WHEN others THEN RETURN 'refused: ' || split_part(SQLERRM, E'\n', 1);
+END $fn$ LANGUAGE plpgsql;
+SET standard_conforming_strings = on;
+SELECT 'R24', 'a plain literal with a backslash-quote, standard_conforming_strings=on', m.scs();
+SET standard_conforming_strings = off;
+SELECT 'R25', 'the same literal with standard_conforming_strings=off', m.scs();
+SET standard_conforming_strings = on;
+
+CREATE TABLE m.sp2 (id int PRIMARY KEY, a text);
+CREATE VIEW m.sp2v AS SELECT id, a FROM m.sp2;
+SET search_path = '';
+SELECT 'R26', 'pg_get_viewdef with an empty search_path',
+       trim(both from regexp_replace(pg_get_viewdef('m.sp2v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'R27', 'pg_get_viewdef with the object''s schema on the path',
+       trim(both from regexp_replace(pg_get_viewdef('m.sp2v'::regclass, true), E'[\n ]+',' ','g'));
+
+CREATE SCHEMA m_ext;
+CREATE FUNCTION m_ext.helper(a int) RETURNS int AS $$ SELECT a * 2; $$ LANGUAGE sql;
+SET search_path = m;
+SELECT 'R28', 'an unqualified function from another schema, path = the object''s schema only',
+       m.accepts('CREATE VIEW m.uses AS SELECT id, helper(id) AS h FROM m.sp2');
+SET search_path = m, m_ext;
+SELECT 'R29', 'the same definition with that other schema on the path',
+       m.accepts('CREATE VIEW m.uses AS SELECT id, helper(id) AS h FROM m.sp2');
+SET search_path = m;
+DROP SCHEMA m_ext CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

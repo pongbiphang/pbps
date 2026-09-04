@@ -149,13 +149,58 @@ Two things follow, and the first matters more:
   window: nothing the read holds keeps another session out, and the lock that
   would is taken only when the restart runs.
 
-  A concurrent transaction can allocate and commit the next key in that window,
-  and the restart then points at a key that already exists. So the emitter takes
-  the exclusive lock **first** — before reading either value — and holds it
-  through the restart, which is one statement in front of the two it already
-  emits. The window is small and the failure it produces is a duplicate key in
-  the application, which is precisely the failure this whole section exists to
-  prevent.
+  So the emitter takes an exclusive table lock **first**, before reading either
+  value. **Measured**, with `LOCK TABLE … IN EXCLUSIVE MODE` held by another
+  session, an ordinary `INSERT` blocks until it times out. That closes the
+  ordinary path.
+
+  **It does not close the other one, and no lock does.** A session can call
+  `nextval()` on the identity's sequence directly, and — **measured** — that
+  needs nothing the table lock holds:
+
+  ```
+  -- while another session holds LOCK TABLE z.t IN EXCLUSIVE MODE:
+  INSERT INTO z.t (v) VALUES ('via INSERT');   ERROR: canceling statement due to lock timeout
+  SELECT nextval('z.t_id_seq');                 2
+  ```
+
+  and there is nothing to escalate to, because PostgreSQL refuses to lock a
+  sequence at all:
+
+  ```
+  LOCK TABLE m.lockable_id_seq IN ACCESS EXCLUSIVE MODE;
+      refused: cannot lock relation "lockable_id_seq"
+  SELECT last_value FROM m.lockable_id_seq FOR UPDATE;
+      refused: cannot lock rows in sequence "lockable_id_seq"
+  ```
+
+  `nextval` is non-transactional by design; that is the property the whole
+  sequence mechanism is built on, and it is not something a caller may opt out
+  of. **So the race cannot be closed by exclusion, and a design that says
+  "take a lock that conflicts with allocation" is prescribing something the
+  engine does not offer.**
+
+  **Decision: make the write unable to do harm instead of making it exclusive.**
+  A `nextval` only ever moves a sequence forward, so the only damage pbps can do
+  is move it *backwards*. That is expressible atomically:
+
+  ```sql
+  SELECT setval(seq, GREATEST(<target>, nextval(seq)));
+  ```
+
+  **Measured**, in both directions that matter — with the sequence behind the
+  target it lands on the target, and after another session has pushed it past
+  the target it does **not** go back:
+
+  ```
+  sequence behind the target:              setval returned 101
+  another session had reached 103:         setval returned 104 — it did not go back
+  ```
+
+  It burns one value, which costs nothing, and it is correct without holding
+  anything. The table lock stays — it makes the table's own maximum stable while
+  the target is computed — but it is no longer load-bearing for the sequence
+  half.
 
 - **And `+ 1` assumes the identity counts upwards, which the model does not.**
   `Identity` is `{ seed: i64, increment: i64 }` and the only rule on it refuses
@@ -259,10 +304,28 @@ change rebuilds a table.
 
 **Decision.** The PostgreSQL connection pins its session on every connect —
 `bytea_output`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `TimeZone`
-— and does it in `pbps-postgres`, not in `pbps-db`, because *which* settings
-matter is dialect knowledge. The values a plan writes and the values it reads
-back then live in one space, which is what ADR-0004 requires and what "fixed
-CONVERT styles" achieves on the other engine.
+and **`standard_conforming_strings`** — and does it in `pbps-postgres`, not in
+`pbps-db`, because *which* settings matter is dialect knowledge. The values a
+plan writes and the values it reads back then live in one space, which is what
+ADR-0004 requires and what "fixed CONVERT styles" achieves on the other engine.
+
+The last of those is not about rendering at all; it is
+[ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md)'s scanner reaching
+into this list. That amendment fixes PostgreSQL's plain-string rule as
+doubled-quotes-only, which is right **only while `standard_conforming_strings`
+is `on`**. **Measured**, on a target where it is `off`, the same text is one
+literal:
+
+```
+standard_conforming_strings=on  -> refused: syntax error at or near "s"
+standard_conforming_strings=off -> one literal of length 10
+```
+
+So a definition containing `'it\'s  here'` would execute as one literal while
+the normalizer closed it at the escaped quote and folded the data whitespace —
+the silent no-plan failure of ADR-0011 Amendment 2, arriving through a session
+setting rather than through a missing delimiter. Pinning it `on` is what makes
+that amendment's rule true.
 
 **`search_path` is pinned too, and for a different reason — but it is not pinned
 to nothing.** Every name pbps *emits* is schema-qualified, so the statements it
@@ -284,14 +347,44 @@ or a default expression is legal, common, and exactly the sort of text ADR-0002
 promised to keep opaque. Emptying the path makes pbps refuse declarations the
 engine would accept.
 
-**Decision.** The path is set **per statement, to the schema of the object being
-created** — deterministic, never inherited from the role, and equal to what the
-author of that definition would have had in front of them. That keeps the
-property the pin was for (nothing depends on an operator's session) without
-inventing a restriction on definitions the tool has declined to read. Refusing
-unqualified definitions outright is the alternative and is worse: it is a
-parsing rule enforced by an engine error, applied to text §8.2 says pbps does
-not read.
+**But the object's own schema is not enough either**, and a second draft that
+said so was wrong for the mirror reason. **Measured**, a view in one schema
+calling an unqualified function installed in another — the ordinary shape of an
+extension in `public` — is refused under a path of only its own schema:
+
+```
+search_path = m           ->  refused: function helper(integer) does not exist
+search_path = m, m_ext    ->  accepted
+```
+
+PostgreSQL would accept that declaration under the project's normal path. pbps
+overriding it turns a working schema into one the tool refuses, which is the
+same imposition as emptying the path, one notch smaller.
+
+**And the path decides what introspection *reads*, not only what DDL resolves.**
+**Measured**, `pg_get_viewdef` qualifies or omits according to the current path:
+
+```
+search_path = ''   ->  SELECT id, a FROM m.sp2;
+search_path = m    ->  SELECT id, a FROM sp2;
+```
+
+A snapshot taken under one path and a `verify` run under another therefore
+compare two spellings of the same view and report drift that is not there. This
+is the same fact that made an early draft of `A17` in
+`spikes/pg-measurements` read wrong, which is a reasonable warning about how
+easy it is to miss.
+
+**Decision.** The search path is **a project setting** — declared once in
+`pbps.yml`, defaulting to the schemas the project manages — and
+`pbps-postgres` applies **that same path** on every connection, for emitted DDL
+and for every introspection read alike. Deterministic, never inherited from the
+role, identical between the write and the read, and wide enough that a
+declaration PostgreSQL accepts is not refused by the tool.
+
+Refusing unqualified definitions outright is the alternative and is worse: it is
+a parsing rule enforced by an engine error, applied to exactly the text §8.2
+says pbps does not read.
 
 ## 4. A default comes back with a cast welded on
 
