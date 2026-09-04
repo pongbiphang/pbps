@@ -104,3 +104,7 @@ A36 | so a rebuild of an object whose old ACL was NULL | old acl NULL passes an 
 R34 | a catalog query with an empty search_path | 1 row(s) from pg_class — pg_catalog stays reachable
 R35 | deparse under an empty path is fully qualified | SELECT id, a FROM m.dp_t;
 R36 | the same view deparsed under the project path | SELECT id, a FROM dp_t;
+R37 | a view in m_b created under a path ordered (m_a, m_b) | binds to schema m_a, and its stored definition is only: SELECT id, marker FROM t;
+R38 | the same view with its own schema first | binds to schema m_b
+A37 | what a table rename leaves in the view's stored definition | SELECT id, full_name FROM m.clnt;
+A38 | recreating that view from the unchanged declaration text | refused: relation "m.cust" does not exist

@@ -423,9 +423,23 @@ reads deterministic would have made them depend on the declarations.
   qualify every name, which is the spelling a snapshot should hold. `pg_catalog`
   stays reachable with an empty path (measured: the catalog query answers), so
   introspection itself is unaffected.
-- **Writes use the project path** — declared in `pbps.yml`, defaulting to the
-  schemas the project manages, wide enough that a definition PostgreSQL accepts
-  is not refused by the tool.
+- **Writes use a path built per statement: the object's own schema first, then
+  the project's configured extras.** One global list ordered by anything else is
+  unsafe the moment two managed schemas hold the same name — **measured**, a
+  view in `m_b` created under a path ordered `(m_a, m_b)` binds to `m_a.t`:
+
+  ```
+  a view in m_b created under (m_a, m_b): binds to schema m_a,
+      and its stored definition is only: SELECT id, marker FROM t;
+  the same view with its own schema first: binds to schema m_b
+  ```
+
+  The stored definition records `FROM t` either way, so nothing in the text says
+  which table it caught, and the wrong one is a silent answer rather than an
+  error. Putting the module's own schema first makes the unqualified
+  same-schema reference — the case the previous round was about — resolve to the
+  schema the author was writing in, and leaves the configured extras (an
+  extension in `public`, say) reachable behind it.
 
 Deterministic on both sides, never inherited from the role, and the read side no
 longer moves when the project's shape does. The snapshot therefore always holds

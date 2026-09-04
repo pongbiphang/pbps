@@ -282,12 +282,34 @@ by pbps changes the deparsed text of every view that references the renamed
 object. Renaming `app.customer` to `app.client` rewrote the view's own stored
 definition; renaming a column produced `name AS full_name` inside it. So on
 PostgreSQL a table rename silently edits objects that are not in the plan.
-`apply` must re-read every managed module after a plan containing a rename, or
-the closing state records definitions the database no longer has and the next
-`verify` reports drift the tool itself caused. SQL Server has the mirror
-problem (the definition goes *stale* rather than following), which ADR-0002
-already handles by impact analysis; the fix here is different and has to be
-built.
+A first version of this paragraph concluded that `apply` should therefore
+re-read every managed module after a rename, so the closing state matches what
+the database holds. **That prevents drift by blessing a divergence**, which is
+worse: the environment now says one thing, the declarations say another, and
+after the fix in §2.2 nothing compares them. **Measured:**
+
+```
+after the rename the catalog says:  SELECT id, full_name FROM m.clnt;
+recreating from the unchanged declaration text:
+    refused: relation "m.cust" does not exist
+```
+
+The declarations are supposed to be the authority. `bootstrap` reads them — it
+is the disaster-recovery path — and it now fails, *because* the tool decided the
+engine's rewrite was the truth.
+
+**Decision: a rename is a table change like any other, so §4 applies to it.**
+The dependent managed modules are rebuilt from their **declarations**, in the
+same plan. If a declaration still names the old table the `CREATE` fails,
+loudly, inside the plan's transaction, with nothing left behind — the correct
+outcome, because that declaration is wrong and only the user can fix it. If it
+was updated, the environment and the declarations agree again, which is what a
+rename in this tool is supposed to mean.
+
+Re-reading is still needed for the modules that are *not* rebuilt, so the
+recorded read-back matches the live one; it is no longer the whole answer. SQL
+Server has the mirror problem — the definition goes *stale* rather than
+following — which ADR-0002 handles by impact analysis.
 
 ## 3. `CREATE OR ALTER` was buying grant preservation. PostgreSQL will not sell it
 
@@ -581,16 +603,21 @@ not a preflight; it is a small unreviewed apply.
   throwaway and explicitly isolated, which is what it was built for, and the
   answer is recorded in the plan — so the artifact the approver reads says which
   shape will run and why.
-- **Without one, the plan says the shape is unresolved**, carries both
-  possibilities and the rebuild's refusal conditions, and `apply` resolves it
-  inside its own transaction — where a savepoint attempt is legitimate, because
-  an apply is *meant* to mutate and the reviewer has approved a plan that names
-  both outcomes.
+- **Without one, `plan --db` refuses to produce an applyable plan for that
+  module**, and names a rehearsal target as what it needs.
 
-The reviewer loses some precision in the second case and loses nothing they were
-entitled to: the gate approves a plan that says "replace, or rebuild under these
-conditions", and the rebuild's ACL, owner and options refusals still stand in
-front of it.
+A first version of this decision let the plan carry both possibilities and had
+`apply` choose. That is not a smaller compromise; it is the guardrail. SPEC §7.3:
+*"The checksum pins 'the plan approved at the deployment gate' to 'what actually
+runs'"*, and *"what gets approved is exactly the plan approved at the deployment
+gate"*. Replace and rebuild are not two spellings of one change — one of them
+drops the object and drags this section's whole ACL, owner, options and defaults
+restoration behind it. A checksum over "one of these two" pins nothing a
+reviewer read.
+
+Refusing is friction, and it is the friction this project exists to charge:
+§9.3's dev database is cheap, `plan --dev` already exists, and the alternative is
+an approval that does not mean what §7.3 says approvals mean.
 
 An offline `plan` has nobody to ask at all and says so, which is what §9.1
 already means by "anything computed offline is a preview".

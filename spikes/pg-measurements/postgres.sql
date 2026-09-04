@@ -569,6 +569,36 @@ SELECT 'R36', 'the same view deparsed under the project path',
 
 ALTER DEFAULT PRIVILEGES FOR ROLE m_deploy IN SCHEMA m REVOKE SELECT ON TABLES FROM m_bystander;
 
+-- ------------------------------------- the tenth 2026-09-05 review round
+
+CREATE SCHEMA m_a; CREATE SCHEMA m_b;
+CREATE TABLE m_a.t (id int PRIMARY KEY, marker text);
+CREATE TABLE m_b.t (id int PRIMARY KEY, marker text);
+INSERT INTO m_a.t VALUES (1, 'schema m_a');
+INSERT INTO m_b.t VALUES (1, 'schema m_b');
+SET search_path = m_a, m_b;
+CREATE VIEW m_b.v AS SELECT id, marker FROM t;
+SELECT 'R37', 'a view in m_b created under a path ordered (m_a, m_b)',
+       'binds to ' || (SELECT marker FROM m_b.v)
+       || ', and its stored definition is only: '
+       || trim(both from regexp_replace(pg_get_viewdef('m_b.v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m_b, m_a;
+CREATE VIEW m_b.v2 AS SELECT id, marker FROM t;
+SELECT 'R38', 'the same view with its own schema first',
+       'binds to ' || (SELECT marker FROM m_b.v2);
+SET search_path = m;
+DROP SCHEMA m_a CASCADE; DROP SCHEMA m_b CASCADE;
+
+CREATE TABLE m.cust (id int PRIMARY KEY, full_name text);
+CREATE VIEW m.act AS SELECT id, full_name FROM m.cust;
+ALTER TABLE m.cust RENAME TO clnt;
+SET search_path = '';
+SELECT 'A37', 'what a table rename leaves in the view''s stored definition',
+       trim(both from regexp_replace(pg_get_viewdef('m.act'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'A38', 'recreating that view from the unchanged declaration text',
+       m.accepts('CREATE VIEW m.rebuilt AS SELECT id, full_name FROM m.cust');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
