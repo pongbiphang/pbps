@@ -821,6 +821,18 @@ fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> 
 /// Both ends of a rename count as touched, since the same object is one name
 /// before and another after; a created object is absent on one side and a
 /// dropped one on the other, and both are named by the change that does it.
+///
+/// A touched *table* is not exempt down to its rows, though — only down to
+/// the rows this plan names. An `AFTER` trigger on a declared table reaches
+/// the table's *other* rows from inside the very statement that writes the
+/// one the plan asked for, and the statement's own postcondition speaks for
+/// that row alone (132, 136, 143). Exempting the whole table let the trigger's
+/// collateral write be recorded as the plan's result (DECISIONS 153).
+///
+/// The table's *shape* stays exempt where the plan names it: a plan that
+/// alters a column is meant to change the table, and a concurrent DDL on the
+/// same table has to wait for the schema lock this plan's own statements
+/// hold. Rows are what a trigger can move while the apply is running.
 fn refuse_unplanned_movement(
     changes: &pbps_model::ChangeSet,
     before: &Schema,
@@ -834,9 +846,63 @@ fn refuse_unplanned_movement(
         roles.extend(p.change.roles());
     }
 
+    // The rows this plan writes, under the name it gives their table, and the
+    // old name too where it renames one — the two states are keyed by
+    // different names across a rename.
+    let mut renamed: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
+    for p in &changes.changes {
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            renamed.insert(from, to);
+        }
+        if let Some((table, key)) = p.change.row() {
+            written.entry(table).or_default().insert(key);
+        }
+    }
+
     let mut moved = Vec::new();
     let named = |n: &TableName| objects.contains(n);
     compare("", &before.tables, &after.tables, named, &mut moved);
+    for (name, was) in &before.tables {
+        if !named(name) {
+            // Already compared whole, rows included.
+            continue;
+        }
+        let now_name = renamed.get(name).copied().unwrap_or(name);
+        // Created, dropped, or outside the row scope on one side: there is no
+        // pair of row sets to compare, and "absent" is not "empty".
+        let (Some(was_rows), Some(now_rows)) = (
+            was.data.as_ref(),
+            after.tables.get(now_name).and_then(|t| t.data.as_ref()),
+        ) else {
+            continue;
+        };
+        let empty = BTreeSet::new();
+        let plans = written.get(now_name).unwrap_or(&empty);
+        for (key, row) in &was_rows.rows {
+            if plans.contains(key) {
+                continue;
+            }
+            match now_rows.rows.get(key) {
+                Some(after_row) if after_row == row => {}
+                Some(_) => moved.push(format!(
+                    "{now_name} row `{key}` is not what the plan was approved over, \
+                     and no change of this plan writes it"
+                )),
+                None => moved.push(format!(
+                    "{now_name} row `{key}` is gone, and no change of this plan deletes it"
+                )),
+            }
+        }
+        for key in now_rows.rows.keys() {
+            if plans.contains(key) || was_rows.rows.contains_key(key) {
+                continue;
+            }
+            moved.push(format!(
+                "{now_name} row `{key}` is there, and no change of this plan inserts it"
+            ));
+        }
+    }
     compare("", &before.modules, &after.modules, named, &mut moved);
     compare(
         "role ",

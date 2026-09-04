@@ -1657,3 +1657,75 @@ SPEC is in sync with all of these.
     over-permissive there, which is 112's accepted mode for this probe: the
     engine refuses, loudly, inside the transaction.
 
+152. **A probe that unions rows names its columns and states their type.**
+    151 built each side of the new-foreign-key probe as a `UNION ALL` of what
+    is stored and what the plan writes, and left both to the engine's
+    defaults. Both defaults are wrong, and each fails in the direction that
+    hides it.
+    **Names.** A derived table takes its column names from whichever branch
+    comes first, and for a table this plan *creates* the first branch is a
+    literal projection — which has none. Measured: `Msg 8155, No column name
+    was specified for column 1 of 'r'`. `preflight` reports a probe that
+    errors as *unchecked* and `apply` proceeds, so the case 151 was proudest
+    of adding — ADR-0004's create the parent, insert its rows, add the key —
+    was the one case it silently never checked. Every branch is aliased now,
+    not just the first, so no reordering can bring it back.
+    **Types.** `UNION ALL` reconciles its branches by data-type precedence.
+    Measured: a child column of `int` beside a planned `N'01'` makes the
+    literal integer `1`, which matched a parent holding `'1'`; the probe
+    counted none, and `ALTER TABLE ... ADD CONSTRAINT` then failed, because
+    once the column is `varchar` the two are different values. Every branch
+    is projected through the type the column will have when the constraint is
+    created, for the columns this plan gives a type to — one it retypes, one
+    it adds, every column of a table it creates. A column it leaves alone
+    already holds its final type, and the engine coerces a literal to it the
+    same way the `INSERT` will.
+    `TRY_CONVERT`, not `CONVERT`: a stored value the new type cannot hold
+    makes `CONVERT` throw, and a probe that throws is the *unchecked* silence
+    above. Such a row cannot survive the `AlterColumnType` either, and it is
+    that change's own conversion probe which counts it and names the column.
+
+153. **A table the plan touches is exempt down to the rows the plan names, and
+    no further.** 150 compared everything no change of the plan named, and
+    exempted a named table whole. An `AFTER` trigger on a declared table
+    reaches that table's *other* rows from inside the very statement that
+    writes the one the plan asked for — and the statement's postcondition
+    speaks for that row alone (132, 136, 143). So the one place a trigger can
+    reach was the one place the comparison did not look: the apply committed,
+    recorded the trigger's rewrite as its own result, and `verify` called it
+    clean. Measured through the CLI with a trigger that rewrites another row
+    of the table being inserted into; with the exemption in place the apply
+    reports success and records entry #2.
+    The table's *shape* stays exempt where the plan names it: altering a
+    column is what the plan is for, and a concurrent DDL on the same table
+    has to wait for the schema lock this plan's own statements hold. Rows are
+    what something can move while the apply is running.
+
+154. **A plan a policy refuses writes nothing, the identity file included.**
+    ADR-0008 says an `error` refuses to produce the plan before any file is
+    written, and the code said so too — in a comment above the policy gate,
+    with `write_ids` a hundred lines *higher*. So a revision that minted a uid
+    and then failed a rule left `pbps.ids.json` changed for a plan that does
+    not exist, and the next run compared against identities no reviewed plan
+    ever used. The `--check` branch stays where it is, since it writes
+    nothing and answers a different question; only the write moves, past the
+    gate.
+
+155. **A baseline is read at the paths its own revision used.** `schema_dir`
+    and `ids_file` are configuration, so a revision that moves the
+    declarations records the move in its own `pbps.yml` — and both readers of
+    a historical tree asked git for *today's* paths. The listing then comes
+    back empty and the identity file missing, which is the shape this project
+    keeps paying for: absent read as "nothing there". `plan` calls it an empty
+    baseline and proposes creating the whole schema; `validate --since` calls
+    every table and role changed, so a gradual-adoption policy fails
+    declarations nobody has touched.
+    `paths_at` reads `pbps.yml` at the revision and returns that revision's
+    two paths. A revision with no `pbps.yml` falls back to today's, which is
+    an answer and not a guess — the project did not exist then, so nothing it
+    holds is at any path. One that *is* there and does not parse is an error;
+    reading past it would silently be this bug again.
+    Both readers, not one. `schema_at` held a second copy of the same path
+    resolution, and fixing `load_from_git` alone left `--since` reading the
+    wrong tree while `plan` read the right one.
+

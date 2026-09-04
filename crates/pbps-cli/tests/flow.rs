@@ -6655,11 +6655,12 @@ fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
         "table: dbo.t
 columns:
   code: {type: varchar(20), nullable: false}
+  note: {type: nvarchar(50)}
 primary_key: {name: pk_t, columns: [code]}
 data:
   mode: exact
   rows:
-    first: {}
+    first: {note: kept}
 ",
     );
     std::fs::write(
@@ -6685,6 +6686,12 @@ data:
     // The other session, wound up to go off in the middle of the apply.
     // Through `EXEC`, because `CREATE TRIGGER` has to be first in its batch
     // and this connection has just said `USE`.
+    //
+    // It writes into a *different* declared table, and below the same test
+    // runs again with a trigger that writes another row of the *same* table —
+    // the shape a whole-table exemption would let through, since the
+    // statement's own postcondition speaks only for the row the plan named
+    // (DECISIONS 153).
     sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
          SET NOCOUNT ON; INSERT INTO dbo.other (code) VALUES (''rogue'');');");
 
@@ -6694,12 +6701,13 @@ data:
         "table: dbo.t
 columns:
   code: {type: varchar(20), nullable: false}
+  note: {type: nvarchar(50)}
 primary_key: {name: pk_t, columns: [code]}
 data:
   mode: exact
   rows:
-    first: {}
-    second: {}
+    first: {note: kept}
+    second: {note: new}
 ",
     );
     d.commit();
@@ -6759,6 +6767,42 @@ data:
         stderr(&o)
     );
 
+    // The same again, with the trigger reaching a different row of the table
+    // the plan *is* writing to. The plan names `dbo.t`, so exempting the
+    // table would exempt this; the row it corrupts is one no statement of the
+    // plan speaks for.
+    sql("DROP TRIGGER dbo.trg_t;");
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; UPDATE dbo.t SET note = N''corrupted'' WHERE code = ''first'';');");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("row `first`"),
+        "the refusal must name the row the trigger reached: {err}"
+    );
+    assert_eq!(rows("dbo.t"), 1, "the plan's insert must have rolled back");
+    let untouched: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query("SELECT COUNT(*) FROM dbo.t WHERE code = 'first' AND note = N'kept';")
+            .await
+            .expect("count");
+        r[0].try_get_at(0).unwrap().unwrap()
+    });
+    assert_eq!(
+        untouched, 1,
+        "the trigger's write must have rolled back too"
+    );
+
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
         let _ = c
@@ -6768,4 +6812,122 @@ data:
             ))
             .await;
     });
+}
+
+/// A plan a policy refuses writes nothing at all — the identity file included.
+///
+/// ADR-0008 says an `error` refuses to produce the plan before any file is
+/// written, and the identity file is a file. Minting a uid and then refusing
+/// left the identity file changed for a plan that does not exist, so the next
+/// run compared against identities no reviewed plan ever used (DECISIONS 154).
+#[test]
+fn a_policy_refusal_leaves_the_identity_file_alone() {
+    let d = Demo::new("policyids");
+    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+
+    // One revision that both narrows a column — which the rule below refuses —
+    // and adds a table, which is what mints a new uid.
+    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(50)}\n");
+    std::fs::write(
+        d.dir.join("schema/dbo.u.yml"),
+        "table: dbo.u\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.narrowing-on-data: error\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.narrowing-on-data" && f["severity"] == "error"),
+        "{v}"
+    );
+
+    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused plan must leave the identity file as it found it"
+    );
+    assert!(!after.contains("dbo.u"), "{after}");
+
+    // And with the rule at its default the same revision goes through, so the
+    // guard above is about the refusal and not about the write being broken.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(after.contains("dbo.u"), "{after}");
+}
+
+/// A revision that moved `schema_dir` is read at the paths *it* used.
+///
+/// The historical tree is listed at today's `schema_dir` and the identity file
+/// read from today's `ids_file`, so a revision that kept them elsewhere read
+/// as an empty baseline: `plan` proposes creating the whole schema, and
+/// `validate --since` marks every object changed — failing a gradual-adoption
+/// policy on declarations nobody touched (DECISIONS 155).
+#[test]
+fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
+    let d = Demo::new("movedpaths");
+    // The first revision keeps its declarations in `schema/` — the default.
+    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The second moves them, and says so in its own `pbps.yml`.
+    std::fs::create_dir_all(d.dir.join("db/tables")).unwrap();
+    std::fs::rename(
+        d.dir.join("schema/dbo.t.yml"),
+        d.dir.join("db/tables/dbo.t.yml"),
+    )
+    .unwrap();
+    std::fs::rename(d.dir.join("schema.ids.json"), d.dir.join("db/ids.json")).unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n",
+    )
+    .unwrap();
+
+    // Against the previous revision, the only change is where the files live —
+    // which is not a schema change at all.
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stdout(&o).contains("create table"),
+        "moving the files is not creating the schema: {}",
+        stdout(&o)
+    );
+    assert!(
+        !stderr(&o).contains("the baseline is empty"),
+        "the previous revision has declarations, at its own path: {}",
+        stderr(&o)
+    );
+
+    // And `--since` agrees: nothing about `dbo.t` changed, so a rule that
+    // would fail it is not evaluated against it.
+    d.commit();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n\
+         policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^x_\"}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--since", "HEAD~1"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a table the revision did not touch must not be judged: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
 }

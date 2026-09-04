@@ -627,6 +627,54 @@ impl Change {
         self.table().into_iter().chain(far_end)
     }
 
+    /// The declared row this change writes, where it writes one: the table it
+    /// is in, under the name the plan gives that table, and its key.
+    ///
+    /// A caller comparing a state before an apply with the state after it
+    /// needs this to tell the rows the plan is answerable for from the ones it
+    /// is not. The plan's own statements hold the first kind to what they
+    /// wrote (132, 136, 143); nothing else in a run speaks for the second, and
+    /// an `AFTER` trigger reaches them from inside the very statement that
+    /// writes a row the plan *did* name.
+    // Exhaustive rather than a wildcard: a change added later that writes a
+    // declared row has to be named here, or the row it writes would be
+    // compared against a state it was never part of.
+    pub fn row(&self) -> Option<(&TableName, &RowKey)> {
+        match self {
+            Change::InsertRow { table, key, .. }
+            | Change::UpdateRow { table, key, .. }
+            | Change::DeleteRow { table, key, .. } => Some((table, key)),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
     /// Every role name this change reaches, both ends of a rename included,
     /// for the reason [`Change::objects`] gives. Empty for every change that
     /// is not about a principal.

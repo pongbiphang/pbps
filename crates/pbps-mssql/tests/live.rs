@@ -5214,5 +5214,112 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         "a row the plan inserts with no parent is one the constraint refuses"
     );
 
+    // A parent this plan *creates*: the probe has no stored branch to take
+    // its column names from, so a literal projection comes first. Unnamed, the
+    // engine refuses the whole probe (Msg 8155) and preflight reports it as
+    // unchecked — which under `apply --staged` means the table and its rows
+    // commit before the constraint fails (DECISIONS 152).
+    let mut lookup = Table::default();
+    lookup
+        .columns
+        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+    let to_a_new_parent = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::CreateTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: TableName::new("dbo", "tier"),
+                table: Box::new(lookup),
+            }),
+            PlannedChange::new(Change::InsertRow {
+                table: TableName::new("dbo", "tier"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from("here"),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            }),
+            PlannedChange::new(Change::AddForeignKey {
+                table: TableName::new("dbo", "customer"),
+                name: "fk_customer_tier".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["region_code".into()],
+                    references_table: TableName::new("dbo", "tier"),
+                    references_columns: vec!["code".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                }),
+            }),
+        ],
+    };
+    // It runs at all, which is the half only the engine can settle, and it
+    // counts correctly: `stays` and `repaired` both hold `here`, which the
+    // plan inserts into the new table, `exempt` is NULL — and `arriving`
+    // still holds `eu`, which the new table will not have.
+    assert_eq!(count(&mut db.conn, &to_a_new_parent).await, 1);
+
+    // And the type half, in the direction that makes the probe *pass* a plan
+    // the engine refuses. The child column is `int` holding `1`; the plan
+    // retypes it to `varchar` and moves the row to `01`, against a parent
+    // holding `'1'`. As `int` the two are one value; as `varchar` they are
+    // not, and it is the `varchar` the constraint will compare. Left to
+    // `UNION ALL`'s own type precedence the planned `N'01'` becomes integer
+    // `1`, the probe counts none, and the `ALTER TABLE ... ADD CONSTRAINT`
+    // then fails (DECISIONS 152).
+    db.conn
+        .execute(
+            "DELETE FROM dbo.customer;\n\
+             DELETE FROM dbo.region;\n\
+             ALTER TABLE dbo.customer ALTER COLUMN region_code int;\n\
+             INSERT INTO dbo.region VALUES ('1');\n\
+             INSERT INTO dbo.customer VALUES ('typed', 1);",
+        )
+        .await
+        .expect("a key the two types spell differently");
+    let retyping = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::AlterColumnType {
+                uid: "c_bbbbbb".parse().unwrap(),
+                column: "dbo.customer.region_code".parse().unwrap(),
+                from: ty("int"),
+                to: ty("varchar(10)"),
+                from_nullable: true,
+                to_nullable: true,
+            }),
+            PlannedChange::new(Change::UpdateRow {
+                table: TableName::new("dbo", "customer"),
+                key_column: "code".into(),
+                key: RowKey::from("typed"),
+                columns: [("region_code".to_owned(), (text("1"), text("01")))]
+                    .into_iter()
+                    .collect(),
+                unchanged: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+            }),
+            PlannedChange::new(Change::AddForeignKey {
+                table: TableName::new("dbo", "customer"),
+                name: "fk_customer_region2".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["region_code".into()],
+                    references_table: TableName::new("dbo", "region"),
+                    references_columns: vec!["code".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                }),
+            }),
+        ],
+    };
+    assert_eq!(
+        count(&mut db.conn, &retyping).await,
+        1,
+        "`01` is not `1` in the type the column will have"
+    );
+    // And the engine agrees, which is what makes the count the right one.
+    let err = try_apply(&mut db.conn, &retyping)
+        .await
+        .expect_err("the constraint cannot be created over this row");
+    assert!(err.contains("fk_customer_region2"), "{err}");
+
     db.drop().await;
 }

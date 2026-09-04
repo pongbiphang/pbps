@@ -2024,41 +2024,31 @@ fn cmd_plan(
         }
     };
 
-    if res.ids != ids {
-        if check {
-            let message = format!(
-                "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
-                project.ids_file().display()
+    if res.ids != ids && check {
+        let message = format!(
+            "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
+            project.ids_file().display()
+        );
+        if json {
+            let report = output::Report::new(
+                "plan",
+                vec![
+                    output::Finding::error("identity.stale", message)
+                        .at(project.ids_file(), None)
+                        .remedy("pbps plan"),
+                ],
+                None::<PlanData>,
             );
-            if json {
-                let report = output::Report::new(
-                    "plan",
-                    vec![
-                        output::Finding::error("identity.stale", message)
-                            .at(project.ids_file(), None)
-                            .remedy("pbps plan"),
-                    ],
-                    None::<PlanData>,
-                );
-                return report.emit_json();
-            }
-            return Err(Found::new(message).into());
+            return report.emit_json();
         }
-        // The identity file is the artifact `plan` exists to maintain — it is
-        // what the MR reviews and what every later comparison matches by uid
-        // — so failing to write it is as much a failure of the command as
-        // failing to write `--out`. Those two were wrapped a commit earlier;
-        // this one, the more important of the three, was not.
-        output::or_unanswerable(
-            "plan",
-            json,
-            "identity.unwritable",
-            write_ids(project, &res.ids),
-        )?;
-        if !json {
-            println!("updated {}", project.ids_file().display());
-        }
+        return Err(Found::new(message).into());
     }
+    // The write itself waits for the policy gate below. `error` refuses the
+    // plan "before any file is written" (ADR-0008), and the identity file is a
+    // file: minting a uid and then refusing left `pbps.ids.json` changed for a
+    // plan that does not exist, so the next run compared against identities no
+    // reviewed plan ever used (DECISIONS 154).
+    let ids_to_write = (res.ids != ids).then(|| res.ids.clone());
 
     // plan never rewrites the user's YAML (SPEC §6.2), so without this line
     // nothing tells the author that the annotations they just had absorbed are now
@@ -2158,6 +2148,23 @@ fn cmd_plan(
     let policy = attach_policy_findings(&mut cs, project, false);
     let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
     findings.extend(policy);
+
+    // Now that the plan is known to be one this project allows. The identity
+    // file is the artifact `plan` exists to maintain — it is what the MR
+    // reviews and what every later comparison matches by uid — so failing to
+    // write it is as much a failure of the command as failing to write
+    // `--out`.
+    if let Some(minted) = ids_to_write.filter(|_| !refused) {
+        output::or_unanswerable(
+            "plan",
+            json,
+            "identity.unwritable",
+            write_ids(project, &minted),
+        )?;
+        if !json {
+            println!("updated {}", project.ids_file().display());
+        }
+    }
 
     if !json {
         println!("Baseline: {}", base.description);

@@ -73,6 +73,21 @@ struct AsStored {
     /// as still pointing at it (see [`delete_probe`]) — and a row the plan
     /// merely touches elsewhere must.
     moved: BTreeMap<TableName, Moved>,
+    /// The type each column will have once this plan's column changes have
+    /// run, for the columns whose type it decides: one it retypes, one it
+    /// adds, and every column of a table it creates.
+    ///
+    /// A probe that unions stored rows with the rows the plan writes has to
+    /// say what type the result is in, or `UNION ALL` decides by data-type
+    /// precedence and decides wrong: measured, an `int` stored branch beside
+    /// a planned `N'01'` makes the literal integer `1`, which matched a
+    /// parent holding `'1'` and let the engine refuse the constraint the
+    /// probe had just passed (DECISIONS 152).
+    ///
+    /// Only the columns this plan gives a type to. One it leaves alone
+    /// already holds its final type, and the engine coerces a literal to it
+    /// the same way the `INSERT` will.
+    types: BTreeMap<ColumnRef, ColumnType>,
     /// The foreign keys this plan takes away before the deletes run: a
     /// `DropForeignKey`, and every key into the table a `DropTable` removes.
     /// Both sort before `DeleteRow` (`order_key`), so counting a child
@@ -197,8 +212,22 @@ impl AsStored {
                 } => {
                     this.columns.insert(table.column(to), from.clone());
                 }
-                Change::CreateTable { name, .. } => {
+                Change::CreateTable { name, table, .. } => {
                     this.created.insert(name.clone());
+                    for (column, spec) in &table.columns {
+                        this.types.insert(name.column(column), spec.ty.clone());
+                    }
+                }
+                Change::AddColumn {
+                    table,
+                    name,
+                    column,
+                    ..
+                } => {
+                    this.types.insert(table.column(name), column.ty.clone());
+                }
+                Change::AlterColumnType { column, to, .. } => {
+                    this.types.insert(column.clone(), to.clone());
                 }
                 // Both run before the deletes, so a child counted through
                 // either would refuse a delete that will be valid by then.
@@ -287,9 +316,7 @@ impl AsStored {
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
                 // it would quietly query the wrong object.
-                Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::AlterColumnType { .. }
+                Change::DropColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::SetColumnDeprecated { .. }
@@ -1125,6 +1152,17 @@ fn unprobeable_probe(
 /// created table with declared rows is fine, and is the ADR-0004 flow: create
 /// the parent, insert its rows, add the key that references them.
 ///
+/// Every branch names its columns and states their type, and neither is
+/// decoration (DECISIONS 152). **Names**, because the outer query selects
+/// `k0`..`kn` from this and a derived table takes its names from whichever
+/// branch comes first — for a table this plan creates, that is a literal
+/// projection, and SQL Server refuses the whole probe for a column with no
+/// name. **Types**, because `UNION ALL` reconciles its branches by data-type
+/// precedence: an `int` stored branch turns a planned `N'01'` into `1`, which
+/// then matched a parent holding `'1'` and passed a probe the engine went on
+/// to refuse. Only the columns this plan gives a type to are converted; one it
+/// leaves alone already holds its final type.
+///
 /// A single row is dropped where the plan writes a value the probe cannot
 /// evaluate into one of `columns` — a default that is not a literal, which
 /// has no value before it runs (117). That is the same direction every other
@@ -1138,13 +1176,40 @@ fn rows_after(
     alias: &str,
 ) -> Result<Option<String>, DialectError> {
     let mut branches = Vec::new();
+    // One column of one branch: named `k{i}` so the derived table has names
+    // whichever branch comes first, and converted to the type the column will
+    // have when the constraint is created, where this plan decides that type.
+    let projected = |i: usize, column: &String, sql: String| {
+        let ty = names.types.get(&table.column(column));
+        // `TRY_CONVERT`, not `CONVERT`: a stored value the new type cannot
+        // hold makes `CONVERT` throw, and a probe that throws is reported as
+        // *unchecked* and the apply proceeds — the silence DECISIONS 124 is
+        // about. Such a row cannot survive the `AlterColumnType` either, and
+        // it is that change's own conversion probe which counts it and names
+        // the column. Here it reads as NULL, which the constraint exempts.
+        let value = match ty {
+            Some(ty) => format!(
+                "TRY_CONVERT({}, {sql})",
+                types::normalize(ty).unwrap_or_else(|_| ty.clone())
+            ),
+            None => sql,
+        };
+        format!("{value} AS k{i}")
+    };
 
     // What the table already holds, where it already exists.
     if let Some((stored, stored_columns)) = stored_columns(names, table, columns) {
         let selected: Vec<String> = stored_columns
             .iter()
+            .zip(columns)
             .enumerate()
-            .map(|(i, c)| Ok(format!("{alias}.{} AS k{i}", quote(c)?)))
+            .map(|(i, (stored_column, column))| {
+                Ok(projected(
+                    i,
+                    column,
+                    format!("{alias}.{}", quote(stored_column)?),
+                ))
+            })
             .collect::<Result<_, DialectError>>()?;
         let mut sql = format!(
             "SELECT {} FROM {} AS {alias}",
@@ -1194,14 +1259,14 @@ fn rows_after(
             // whole row, and a column it omits arrives at NULL — which is a
             // row the constraint exempts, not one it refuses.
             let mut values = Vec::new();
-            for column in columns {
+            for (i, column) in columns.iter().enumerate() {
                 match cells.get(column) {
-                    Some(sql) => values.push(sql.clone()),
+                    Some(sql) => values.push(projected(i, column, sql.clone())),
                     None if unprobeable(column, key) => {
                         values.clear();
                         break;
                     }
-                    None => values.push("NULL".to_owned()),
+                    None => values.push(projected(i, column, "NULL".to_owned())),
                 }
             }
             if !values.is_empty() {
@@ -1222,17 +1287,21 @@ fn rows_after(
                 continue;
             };
             let mut values = Vec::new();
-            for (column, stored_column) in columns.iter().zip(&stored_columns) {
+            for (i, (column, stored_column)) in columns.iter().zip(&stored_columns).enumerate() {
                 match cells.get(column) {
-                    Some(Some(sql)) => values.push(sql.clone()),
+                    Some(Some(sql)) => values.push(projected(i, column, sql.clone())),
                     Some(None) if unprobeable(column, key) => {
                         values.clear();
                         break;
                     }
                     // Set to NULL: exempt, and spelled so rather than read
                     // from the row it is about to leave.
-                    Some(None) => values.push("NULL".to_owned()),
-                    None => values.push(format!("{alias}.{}", quote(stored_column)?)),
+                    Some(None) => values.push(projected(i, column, "NULL".to_owned())),
+                    None => values.push(projected(
+                        i,
+                        column,
+                        format!("{alias}.{}", quote(stored_column)?),
+                    )),
                 }
             }
             if !values.is_empty() {
@@ -1665,13 +1734,116 @@ mod tests {
         // ...and the repaired one comes back as the plan will leave it.
         assert!(
             fk_sql.contains(
-                "UNION ALL SELECT N'eu' FROM [dbo].[customer] AS c WHERE c.[code] = N'fixed'"
+                "UNION ALL SELECT N'eu' AS k0 FROM [dbo].[customer] AS c WHERE c.[code] = N'fixed'"
             ),
             "{fk_sql}"
         );
         // The row whose key the plan does not touch is neither excluded nor
         // restated: it is counted exactly once, out of the table.
         assert!(!fk_sql.contains("N'untouched'"), "{fk_sql}");
+    }
+
+    /// Every branch names its columns, or the derived table has none to give
+    /// the outer query. A table this plan creates has no stored branch at all,
+    /// so a literal projection comes first and SQL Server refuses the whole
+    /// probe: `Msg 8155, No column name was specified for column 1 of 'r'`,
+    /// which `preflight` then reports as unchecked (DECISIONS 152).
+    #[test]
+    fn a_foreign_key_to_a_table_this_plan_creates_names_its_literal_columns() {
+        let mut region = pbps_model::Table::default();
+        region.columns.insert(
+            "region_id".to_owned(),
+            pbps_model::Column::new(ty("varchar(10)")),
+        );
+        let sql = probes(&plan(vec![
+            Change::CreateTable {
+                uid: uid("t_bbbbbb"),
+                name: tname("dbo.region"),
+                table: Box::new(region),
+            },
+            Change::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "region_id".into(),
+                identity_key: false,
+                key: RowKey::from("eu"),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        let fk_sql = sql
+            .iter()
+            .find(|s| s.contains("k0"))
+            .unwrap_or_else(|| panic!("{sql:?}"));
+        // The parent side is literals only, and each one is named.
+        assert!(
+            fk_sql.contains("SELECT TRY_CONVERT(varchar(10), N'eu') AS k0\n) AS q"),
+            "{fk_sql}"
+        );
+        assert!(!fk_sql.contains("[dbo].[region] AS p"), "{fk_sql}");
+    }
+
+    /// And states their type. `UNION ALL` reconciles branches by data-type
+    /// precedence, so an `int` stored branch beside a planned `N'01'` makes
+    /// the literal `1` — which matches a parent holding `'1'` and passes a
+    /// probe the engine then refuses (DECISIONS 152).
+    #[test]
+    fn a_retyped_foreign_key_column_is_projected_through_the_type_it_will_have() {
+        let sql = probes(&plan(vec![
+            Change::AlterColumnType {
+                uid: uid("c_bbbbbb"),
+                column: cref("dbo.customer.region_id"),
+                from: ty("int"),
+                to: ty("varchar(10)"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            Change::UpdateRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                key: RowKey::from("moved"),
+                columns: [(
+                    "region_id".to_owned(),
+                    (
+                        Cell::Value(Value::Text("1".into())),
+                        Cell::Value(Value::Text("01".into())),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                unchanged: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        let fk_sql = sql
+            .iter()
+            .find(|s| s.contains("k0"))
+            .unwrap_or_else(|| panic!("{sql:?}"));
+        // Both sides of the union in the type the column will hold, so `01`
+        // stays `01`.
+        assert!(
+            fk_sql.contains("SELECT TRY_CONVERT(varchar(10), c.[region_id]) AS k0"),
+            "{fk_sql}"
+        );
+        assert!(
+            fk_sql.contains("UNION ALL SELECT TRY_CONVERT(varchar(10), N'01') AS k0"),
+            "{fk_sql}"
+        );
+        // The parent's own column is not retyped by this plan, so it is left
+        // as it stands: it already holds its final type.
+        assert!(
+            fk_sql.contains("SELECT p.[region_id] AS k0 FROM [dbo].[region] AS p"),
+            "{fk_sql}"
+        );
     }
 
     fn fk() -> Change {

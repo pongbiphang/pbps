@@ -224,7 +224,7 @@ ledger or the permission checks.
 
 ## Tests that pass for the wrong reason
 
-Eight so far, every one invisible in a green run. **Assert the specific failure,
+Nine so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 - A plan fixture that failed at deserialization instead of at the emitter.
@@ -236,6 +236,11 @@ not merely that something failed.**
   it checked is required for an unrelated reason.
 - A non-UTF-8 path test built on a **preview** plan, for which `explain`
   correctly prints no approval command at all.
+- A GraphQL page read as a whole answer: `reviewThreads(first: 100)` on a PR
+  with 105 threads returned `hasNextPage: true` and I reported "no new
+  findings" from the truncated page. Not code, but the same shape as every
+  entry in section 1, and the reason this bullet is here: **a paginated read
+  that does not check `hasNextPage` is an absence, not an emptiness.**
 - A format-version test asserting `json.contains(r#""version":1"#)` on a
   serialized state snapshot — which embeds an ids file whose own version is 1.
   It matched the *nested* field and went on passing through the bumps to 2, 3

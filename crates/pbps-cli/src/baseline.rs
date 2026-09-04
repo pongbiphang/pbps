@@ -134,6 +134,40 @@ fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where this project kept its declarations and its identity file *at* `rev`.
+///
+/// A revision that moved `schema_dir` or `ids_file` recorded the move in its
+/// own `pbps.yml`, and reading its tree at today's paths looks for the
+/// declarations somewhere they have never been: the listing comes back empty
+/// and the identity file missing, so every object reads as new. `plan` calls
+/// that "the baseline is empty" and warns; `validate --since` calls every
+/// table and role changed, and a gradual-adoption policy then fails
+/// declarations nobody has touched (DECISIONS 155).
+///
+/// Falling back to today's paths where that revision has no `pbps.yml` is the
+/// right answer and not a guess: the project did not exist yet, so nothing it
+/// holds is at any path. A `pbps.yml` that is *there* and does not parse is an
+/// error — reading past it would silently be the bug this exists to fix.
+fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
+    let root = &project.root;
+    let here = || {
+        Ok::<_, anyhow::Error>((
+            relative_to(&project.schema_dir())?,
+            relative_to(&project.ids_file())?,
+        ))
+    };
+    let config_rel = relative_to(&project.config_file())?;
+    let Ok(text) = git(root, &["show", &format!("{rev}:{config_rel}")]) else {
+        return here();
+    };
+    let config = pbps_config::Config::parse(&text, &project.config_file())
+        .map_err(|e| anyhow::anyhow!("`{config_rel}` at `{rev}` does not parse: {e}"))?;
+    // The config's paths are relative to the project root; git's are relative
+    // to the repo root, and `relative_to` is what knows the difference.
+    let under = |path: &std::path::Path| relative_to(&root.join(path));
+    Ok((under(&config.schema_dir)?, under(&config.ids_file)?))
+}
+
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
@@ -160,9 +194,10 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         });
     }
 
-    // git paths are relative to the repo root, whereas the declarations directory
-    // is relative to the project root.
-    let rel = relative_to(&project.schema_dir())?;
+    // git paths are relative to the repo root, whereas the declarations
+    // directory is relative to the project root — and it is *that* revision's
+    // directory, not today's, or a revision that moved it reads as empty.
+    let (rel, ids_rel) = paths_at(project, rev)?;
 
     // `--full-tree` because git resolves an `ls-tree` pathspec against the
     // current directory, while `<rev>:<path>` below resolves against the repo
@@ -224,8 +259,9 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     }
 
     // The identity file must come from the same revision: using the current one as
-    // the baseline would hide renames.
-    let ids = ids_at(project, rev)?;
+    // the baseline would hide renames. Under that revision's own path, for the
+    // reason `paths_at` gives.
+    let ids = ids_from(&project.root, rev, &ids_rel)?;
 
     Ok(Baseline {
         schema,
@@ -241,8 +277,13 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 /// Empty when that revision has none — a first run — which is the right
 /// answer rather than a failure: everything is new against it.
 pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<IdsFile> {
-    let root = &project.root;
-    let ids_rel = relative_to(&project.ids_file())?;
+    let (_, ids_rel) = paths_at(project, rev)?;
+    ids_from(&project.root, rev, &ids_rel)
+}
+
+/// The identity file at `rev`, under a path already resolved for that
+/// revision.
+fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<IdsFile> {
     match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}")),
@@ -318,7 +359,10 @@ pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Sch
         refuse_unknown_revision(root, rev)?;
         return Ok(pbps_model::Schema::default());
     }
-    let dir_rel = relative_to(&project.schema_dir())?;
+    // That revision's own declarations directory, for the reason `paths_at`
+    // gives — this is the second reader of a historical tree, and both have to
+    // ask the same question of it.
+    let (dir_rel, _) = paths_at(project, rev)?;
     // `--full-tree` and the empty-path rule for the same reasons as in
     // `load_from_git`: git resolves the pathspec against the current
     // directory, so a project in a subdirectory listed nothing here and
