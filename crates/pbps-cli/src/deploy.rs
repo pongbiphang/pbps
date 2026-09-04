@@ -86,7 +86,6 @@ async fn managed_state_full(
     // A module pbps cannot read is not a module it can leave to chance: it is
     // inside the managed set by name and outside it in fact, so the next plan
     // would propose creating one that is already there.
-    let mut unreadable = Vec::new();
     for m in &pulled.unmanaged_modules {
         let Ok(name) = m.name.parse::<pbps_model::ObjectName>() else {
             continue;
@@ -97,8 +96,8 @@ async fn managed_state_full(
                 m.kind, m.name, m.why
             );
         }
-        unreadable.push((name, format!("{} {} ({})", m.kind, m.name, m.why)));
     }
+    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
     let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
@@ -217,9 +216,26 @@ fn managed_modules(
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
+/// Converts the dialect's unreadable-module inventory into the common name and
+/// description form used by connected commands.
+pub(crate) fn unreadable_modules(
+    modules: &[pbps_mssql::introspect::UnmanagedModule],
+) -> Vec<(pbps_model::ObjectName, String)> {
+    modules
+        .iter()
+        .filter_map(|module| {
+            let name = module.name.parse::<pbps_model::ObjectName>().ok()?;
+            Some((
+                name,
+                format!("{} {} ({})", module.kind, module.name, module.why),
+            ))
+        })
+        .collect()
+}
+
 /// Names every representable or unreadable catalog object outside the managed
 /// set, for applying the `unmanaged:` policy of SPEC §8.2.
-fn unmanaged_objects(
+pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_model::ObjectName, String)],
     managed_modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
@@ -373,21 +389,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
-        let unmanaged = unmanaged_objects(&scoped, &managed.unreadable, &recorded_modules);
-        if project.config.unmanaged == pbps_config::Unmanaged::Error && !unmanaged.is_empty() {
-            unexpressible.push(format!(
-                "`unmanaged: error` rejects {} object(s) outside the managed set: {}",
-                unmanaged.len(),
-                unmanaged.join(", ")
-            ));
-        } else if project.config.unmanaged == pbps_config::Unmanaged::Warn {
-            report_unmanaged(
-                &scoped,
-                &managed.unreadable,
-                &recorded_modules,
-                pbps_config::Unmanaged::Warn,
-            )?;
-        }
+        // Unmanaged objects are outside the drift scope by definition. Apply
+        // their policy as its own verdict so `unmanaged: error` reaches the
+        // `state.unmanaged-refused` handler below and never fires `on_drift`.
+        report_unmanaged(
+            &scoped,
+            &managed.unreadable,
+            &recorded_modules,
+            project.config.unmanaged,
+        )?;
 
         Ok(pbps_model::DriftReport {
             version: pbps_model::drift::CURRENT_VERSION,
@@ -1256,7 +1266,7 @@ pub fn cmd_apply(
         operator: &operator,
     };
 
-    let outcome = db::runtime()?.block_on(async {
+    let execution = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
 
         // The lock comes first, before the checks and not after them: a
@@ -1274,10 +1284,30 @@ pub fn cmd_apply(
         // Released whatever happened. A lock left behind by a failed apply
         // blocks the very pipeline that would fix it.
         let released = pbps_mssql::state::unlock(&mut conn).await;
-        let recorded = result?;
-        released?;
-        Ok::<i64, anyhow::Error>(recorded)
+        Ok::<_, anyhow::Error>((result, released))
     });
+
+    // Connection and lock failures happen before there is an apply result, but
+    // they are still failed attempts for the hook. Once there is a result,
+    // keep it separate from cleanup: a failed DELETE of the lock row cannot
+    // turn committed DDL plus its success-ledger row into a failed deployment.
+    let (outcome, released) = match execution {
+        Ok(pair) => pair,
+        Err(error) => {
+            if let Some(hook) = &project.config.hooks.on_apply {
+                let message = error.to_string();
+                crate::hooks::run_apply(
+                    hook,
+                    plan_path,
+                    &plan_checksum,
+                    &target.label,
+                    None,
+                    Some(&message),
+                );
+            }
+            return Err(error);
+        }
+    };
 
     match outcome {
         Ok(recorded) => {
@@ -1297,6 +1327,10 @@ pub fn cmd_apply(
                     None,
                 );
             }
+            // Report the deployment before surfacing cleanup. The lock may
+            // need an operator to clear it, but retrying this already-recorded
+            // plan would be the wrong response.
+            released?;
             Ok(())
         }
         Err(error) => {

@@ -340,15 +340,10 @@ async fn one(
         );
     }
 
-    if unmanaged != pbps_config::Unmanaged::Ignore
-        && (!scoped.unmanaged.is_empty() || !scoped.unmanaged_modules.is_empty())
-    {
-        let names: Vec<String> = scoped
-            .unmanaged
-            .iter()
-            .chain(&scoped.unmanaged_modules)
-            .map(ToString::to_string)
-            .collect();
+    let unreadable = crate::deploy::unreadable_modules(&pulled.unmanaged_modules);
+    let unmanaged_objects =
+        crate::deploy::unmanaged_objects(&scoped, &unreadable, &recorded_modules);
+    if unmanaged != pbps_config::Unmanaged::Ignore && !unmanaged_objects.is_empty() {
         record_status_issue(
             &mut row,
             if unmanaged == pbps_config::Unmanaged::Error {
@@ -363,8 +358,8 @@ async fn one(
                 } else {
                     "warn"
                 },
-                names.len(),
-                names.join(", ")
+                unmanaged_objects.len(),
+                unmanaged_objects.join(", ")
             ),
         );
     }

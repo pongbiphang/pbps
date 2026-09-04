@@ -5536,16 +5536,19 @@ fn status_reports_the_unmanaged_error_policy() {
 
 /// A module can be present in `sys.objects` while SQL Server withholds its
 /// definition. It is still an unmanaged object, so encryption must not turn
-/// `unmanaged: error` into an accidental allow-list escape.
+/// `unmanaged: error` into an accidental allow-list escape in either estate
+/// report. The policy is not drift and therefore must not fire `on_drift`.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
-fn verify_rejects_an_unreadable_unmanaged_module() {
+fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let d = Demo::new("verify-unreadable-unmanaged");
+    let env = format!("PBPS_UNREADABLE_POLICY_{}", std::process::id());
+    let drift_hook = d.dir.join("drift-hook.json");
     d.table("table: dbo.pbps_unreadable_policy\ncolumns:\n  id: {type: int, nullable: false}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
 
@@ -5582,7 +5585,15 @@ fn verify_rejects_an_unreadable_unmanaged_module() {
         code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
         0
     );
-    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\nunmanaged: error\n").unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nunmanaged: error\nenvironments:\n  test:\n    url_env: {env}\n\
+             hooks:\n  on_drift: \"cat > {}\"\n",
+            drift_hook.display()
+        ),
+    )
+    .unwrap();
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         conn.execute(
@@ -5596,15 +5607,40 @@ fn verify_rejects_an_unreadable_unmanaged_module() {
     let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
     assert_eq!(code(&verify), FINDING, "{report}");
     assert!(
-        report["data"]["unexpressible"]
+        report["findings"]
             .as_array()
-            .is_some_and(
-                |items| items.iter().any(|item| item.as_str().is_some_and(|s| {
-                    s.contains("unmanaged: error") && s.contains("pbps_unreadable_policy_secret")
-                }))
-            ),
+            .is_some_and(|items| items.iter().any(|item| {
+                item["id"] == "state.unmanaged-refused"
+                    && item["message"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("pbps_unreadable_policy_secret"))
+            })),
         "{report}"
     );
+    assert!(
+        report.get("data").is_none(),
+        "policy is not drift: {report}"
+    );
+    assert!(!drift_hook.exists(), "a policy refusal fired on_drift");
+
+    let status = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&env, &connection)
+        .output()
+        .unwrap();
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(report["data"][0]["state"], "policy", "{report}");
+    assert!(report["findings"].as_array().is_some_and(|findings| {
+        findings.iter().any(|finding| {
+            finding["id"] == "state.unmanaged-refused"
+                && finding["message"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("pbps_unreadable_policy_secret"))
+        })
+    }));
 
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
@@ -5757,6 +5793,128 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         );
         conn.execute(
             "DROP TABLE dbo.pbps_resume_checksum; \
+             DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// DDL and the success row commit before lock cleanup. If DELETE on the lock
+/// table fails, the command must surface that cleanup problem while still
+/// emitting the successful apply event with its ledger id.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn an_unlock_failure_does_not_relabel_a_successful_apply() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("unlock-after-success");
+    let hook_out = d.dir.join("apply-hook.json");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "dialect: mssql\nunmanaged: ignore\nhooks:\n  on_apply: \"cat > {}\"\n",
+            hook_out.display()
+        ),
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_unlock_success\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_block_unlock', N'TR') IS NOT NULL \
+                 DROP TRIGGER dbo.pbps_block_unlock;",
+            )
+            .await;
+        let _ = pbps_mssql::state::unlock(&mut conn).await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.pbps_unlock_success', N'U') IS NOT NULL \
+                 DROP TABLE dbo.pbps_unlock_success;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
+            )
+            .await;
+        conn.execute("CREATE TABLE dbo.pbps_unlock_success (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    d.table(
+        "table: dbo.pbps_unlock_success\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: nvarchar(20)}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("unlock-success.json");
+    let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    let checksum = plan_checksum(&plan);
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER dbo.pbps_block_unlock ON dbo.__pbps_lock INSTEAD OF DELETE AS \
+             BEGIN THROW 51000, 'unlock denied by test', 1; END;",
+        )
+        .await
+        .unwrap();
+    });
+
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&applied), 1, "cleanup should still fail");
+    assert!(stdout(&applied).contains("Applied 1 change(s)"));
+    assert!(stderr(&applied).contains("unlock denied by test"));
+
+    let hook: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_out).unwrap()).unwrap();
+    assert_eq!(hook["outcome"], "success", "{hook}");
+    assert!(hook["ledger_entry"].is_number(), "{hook}");
+    assert!(hook.get("error").is_none(), "{hook}");
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Apply);
+        assert_eq!(hook["ledger_entry"], latest.id);
+        let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
+        assert!(
+            pulled.schema.tables[&"dbo.pbps_unlock_success".parse().unwrap()]
+                .columns
+                .contains_key("note")
+        );
+
+        conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
+            .await
+            .unwrap();
+        assert!(pbps_mssql::state::unlock(&mut conn).await.unwrap());
+        conn.execute(
+            "DROP TABLE dbo.pbps_unlock_success; \
              DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
         )
         .await
