@@ -955,6 +955,36 @@ SELECT 'R72', 'a nested block comment',
        (SELECT /* a /* b */ c */ 1)::text
        || ' — it nests, and measured separately, so does T-SQL';
 
+-- --------------------------- the thirty-first 2026-09-05 review round
+
+CREATE TABLE m.canon_w (id int, d date);
+PREPARE m_ins(int, text) AS INSERT INTO m.canon_w VALUES ($1, $2::date);
+SET DateStyle = 'ISO, MDY';
+EXECUTE m_ins(1, '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+EXECUTE m_ins(2, '01/02/2026');
+RESET DateStyle;
+SELECT 'R73', 'the same text bound as a parameter, under two DateStyles',
+       (SELECT string_agg(d::text, ', ' ORDER BY id) FROM m.canon_w)
+       || ' — binding does not canonicalize';
+DELETE FROM m.canon_w;
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.canon_w VALUES (1, DATE '2026-01-02');
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.canon_w VALUES (2, DATE '2026-01-02');
+RESET DateStyle;
+SELECT 'R74', 'a literal the engine has already resolved, under the same two',
+       (SELECT string_agg(d::text, ', ' ORDER BY id) FROM m.canon_w)
+       || ' — this is what the plan bakes in';
+
+SET DateStyle = 'ISO, MDY';
+SELECT 'R75', 'a default whose cast happens at evaluation, under MDY',
+       (('01/02/2026'::text)::date)::text;
+SET DateStyle = 'ISO, DMY';
+SELECT 'R76', 'the same expression under DMY',
+       (('01/02/2026'::text)::date)::text || ' — so the probe must use the write''s environment';
+RESET DateStyle;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

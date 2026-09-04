@@ -169,3 +169,7 @@ A65 | and recreating that caller with its stale reference | refused: function m.
 R70 | one row rendered under the canonical values | 2026-01-02 | P1DT2H | \x0102 | 0.12345678901234568 | 0.12345678 | 2026-01-15 12:00:00+00
 R71 | and whether the floats survive that text | double precision: true, real: true
 R72 | a nested block comment | 1 — it nests, and measured separately, so does T-SQL
+R73 | the same text bound as a parameter, under two DateStyles | 2026-01-02, 2026-02-01 — binding does not canonicalize
+R74 | a literal the engine has already resolved, under the same two | 2026-01-02, 2026-01-02 — this is what the plan bakes in
+R75 | a default whose cast happens at evaluation, under MDY | 2026-01-02
+R76 | the same expression under DMY | 2026-02-01 — so the probe must use the write's environment

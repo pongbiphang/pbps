@@ -422,11 +422,59 @@ change rebuilds a table.
 pinned on the session, and not wrapped around the writes at all.**
 
 - **Reads** — the reference-data read-back and the catalog reads that return
-  value text — run inside the canonical scope, set and restored. A read executes
-  no user code, so the scope reaches nothing but the rendering it is for.
-- **Writes** carry their canonicalization *in the values themselves*: the DML
-  pbps emits renders each value as an unambiguous typed literal, or binds it as
-  a parameter. **No session setting is changed around a write.**
+  value text — run inside the canonical scope, set and restored, **except the
+  default probe**, which is below.
+- **Writes** carry their canonicalization *in the values themselves*, and the
+  canonical form is produced **by the engine, at plan time, and baked into the
+  artifact**. **No session setting is changed around a write.**
+
+  A first version of this said "an unambiguous typed literal, or bound as a
+  parameter", and neither is canonicalization. The model keeps a quoted value as
+  `Value::Text`, "exactly what was written … keep it verbatim, never parse it"
+  (`crates/pbps-model/src/data.rs`), so the emitter renders the same characters
+  either way and PostgreSQL's type input function reads them under whatever
+  `DateStyle` the target has. **Measured**, binding changes nothing:
+
+  ```
+  the same text bound as a parameter, under two DateStyles:
+      2026-01-02, 2026-02-01
+  ```
+
+  What *is* setting-independent is a literal the engine has already resolved —
+  **measured**:
+
+  ```
+  DATE '2026-01-02' under two DateStyles:  2026-01-02, 2026-01-02
+  ```
+
+  So `plan --db` asks the engine to convert each declared value to its canonical
+  form under the canonical settings and writes **that** into the plan. The
+  engine does the parsing, which is §8.2's own rule; the model still never
+  parses; and the artifact says exactly what will run, which is what §7.3
+  requires of it. An offline `plan` has nobody to ask and therefore cannot
+  produce applyable reference-data DML for a lexically ambiguous value — the
+  same shape as everything else §9.1 calls a preview.
+- **The default probe is a read that executes code, and runs under the write's
+  environment.** §4 evaluates an omitted cell's default server-side to decide
+  whether it round-trips omitted. **Measured**, an expression whose cast happens
+  at evaluation sees the session it is evaluated in:
+
+  ```
+  ('01/02/2026'::text)::date under MDY:  2026-01-02
+  the same expression under DMY:         2026-02-01
+  ```
+
+  Evaluating it inside the canonical read scope — or under the empty read path,
+  where an unqualified call in it would not resolve at all — would have the
+  probe observe a value the write will never produce, and report a phantom
+  update or fail a plan that is fine. So the probe runs under the settings the
+  *write* will run under, and only its returned representation is canonicalized.
+
+  This is the exception that shows the read/write split was drawn on the wrong
+  property: it is not that reads are safe and writes are not, but that **any
+  statement which executes the user's code has to run in the user's
+  environment**.
+
 - **Opaque DDL** runs under whatever the operator's database has — **with one
   explicit exception, `standard_conforming_strings = on`**, set and restored
   around it. That exception was stated two rounds earlier and dropped when this
@@ -850,7 +898,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all: the canonical settings (with their values, §3) are set and restored around the **reads** that render values, the **writes** carry their canonicalization in the values themselves as unambiguous typed literals or bound parameters, and opaque DDL runs under whatever the operator's database has. A scope around a write would also be a scope around every trigger that write fires |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code; and **opaque DDL** runs under the operator's settings **with one restored exception, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true. A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
