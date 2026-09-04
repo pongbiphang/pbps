@@ -6862,6 +6862,51 @@ fn an_unknown_revision_is_refused_rather_than_read_as_empty() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// `git ls-tree --name-only` C-quotes any path outside ASCII with
+/// `core.quotePath` at its default — measured: `schéma/dbo.t.yml` comes back
+/// as `"sch\303\251ma/dbo.t.yml"`, and `git show <rev>:<that>` answers
+/// `fatal: path ... does not exist`. So every historical read of a
+/// declaration under such a path failed, on a repository that is perfectly
+/// well formed (DECISIONS 180).
+#[test]
+fn a_declaration_under_a_non_ascii_path_is_readable_at_a_revision() {
+    let d = Demo::new("unicodepath");
+    std::fs::remove_file(d.dir.join("schema/dbo.t.yml")).ok();
+    let file = d.dir.join("schema").join("dbo.té.yml");
+    std::fs::write(&file, "table: dbo.te\ncolumns:\n  id: {type: int}\n").unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Something has to have changed, or neither command reads the old tree
+    // at all and the bug hides behind the short circuit.
+    std::fs::write(
+        &file,
+        "table: dbo.te\ncolumns:\n  id: {type: int}\n  note: {type: nvarchar(50)}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    // The baseline is that revision's declarations. Skipped, it is *empty* —
+    // and an empty baseline is not an error: the plan reports every table as
+    // newly created and exits 0, which is the silence this codebase exists to
+    // refuse (absent, empty and unreadable are three different things).
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(!out.contains("baseline is empty"), "{out}");
+    assert!(!out.contains("0 objects"), "{out}");
+    // The revision holds the table, so the plan against it is the one column
+    // that was added — not a `CREATE TABLE`.
+    assert!(out.contains("note"), "{out}");
+    assert!(!out.contains("create table"), "{out}");
+
+    // And `validate --since` copies the same listing out to a scratch
+    // directory: the second reader, and it had the same bug. Skipped there,
+    // the revision looks empty and every object reads as changed.
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 #[test]
 fn validate_since_evaluates_only_what_changed() {
     let d = Demo::new("policysince");

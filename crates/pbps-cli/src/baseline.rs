@@ -217,6 +217,47 @@ fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
     Ok(parts.join("/"))
 }
 
+/// The paths one revision's tree holds under `rel`, as git spells them.
+///
+/// `-z`, because `--name-only` alone renders any path outside ASCII in C
+/// quoting with `core.quotePath` at its default — measured:
+/// `schema/dbo.té.yml` comes back as `"schema/dbo.t\303\251.yml"`, quotes
+/// and all. The failure that caused was silent, which is the part worth
+/// remembering: the quoted form does not end in `.yml`, so the filter below
+/// skipped the file, the revision read as **empty**, and `plan` reported
+/// every table as newly created and exited 0. Absent, empty and unreadable
+/// are three different things (DECISIONS 180).
+///
+/// Split on NUL and never trimmed: a path is what the tree spells it, the
+/// same rule names follow (177, 178).
+fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> {
+    // `--full-tree` because git resolves an `ls-tree` pathspec against the
+    // current directory, while `<rev>:<path>` resolves against the repo
+    // root. Without it a project in a subdirectory lists nothing, and — since
+    // the identity file is still found — the plan comes back as "no changes"
+    // against a baseline that holds no tables at all.
+    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", "-z", rev];
+    // `schema_dir: .` puts the declarations at the repo root, where the
+    // relative path is empty — and an empty pathspec is an error, not
+    // "everything". The whole tree is what "everything" looks like as
+    // arguments.
+    if !rel.is_empty() {
+        args.push("--");
+        args.push(rel);
+    }
+    let listing = git(root, &args).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read `{}` at `{rev}`: {e}",
+            if rel.is_empty() { "." } else { rel }
+        )
+    })?;
+    Ok(listing
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
@@ -248,30 +289,13 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     // directory, not today's, or a revision that moved it reads as empty.
     let (rel, ids_rel) = paths_at(project, rev)?;
 
-    // `--full-tree` because git resolves an `ls-tree` pathspec against the
-    // current directory, while `<rev>:<path>` below resolves against the repo
-    // root. Without it a project in a subdirectory lists nothing, and — since
-    // the identity file is still found — the plan comes back as "no changes"
-    // against a baseline that holds no tables at all.
-    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", rev];
-    // `schema_dir: .` puts the declarations at the repo root, where the relative
-    // path is empty — and an empty pathspec is an error, not "everything". The
-    // whole tree is what "everything" looks like as arguments.
-    if !rel.is_empty() {
-        args.push("--");
-        args.push(&rel);
-    }
-    let listing = git(root, &args).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read `{}` at `{rev}`: {e}",
-            if rel.is_empty() { "." } else { &rel }
-        )
-    })?;
+    let listing = tree_paths(root, rev, &rel)?;
 
     let mut schema = Schema::default();
     let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
-    for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for path in &listing {
+        let path = path.as_str();
         if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
             continue;
         }
@@ -412,21 +436,10 @@ pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Sch
     // gives — this is the second reader of a historical tree, and both have to
     // ask the same question of it.
     let (dir_rel, _) = paths_at(project, rev)?;
-    // `--full-tree` and the empty-path rule for the same reasons as in
-    // `load_from_git`: git resolves the pathspec against the current
-    // directory, so a project in a subdirectory listed nothing here and
-    // `--since` called every table changed.
-    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", rev];
-    if !dir_rel.is_empty() {
-        args.push("--");
-        args.push(&dir_rel);
-    }
-    let listing = git(root, &args).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read `{}` at `{rev}`: {e}",
-            if dir_rel.is_empty() { "." } else { &dir_rel }
-        )
-    })?;
+    // The same listing `load_from_git` takes, through the same function: the
+    // two readers of a historical tree have to ask git the same question, and
+    // written twice they had the same bug twice (DECISIONS 180).
+    let listing = tree_paths(root, rev, &dir_rel)?;
     let scratch = std::env::temp_dir().join(format!(
         "pbps-since-{}-{}",
         std::process::id(),
@@ -438,7 +451,8 @@ pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Sch
     std::fs::create_dir_all(&scratch)
         .with_context(|| format!("cannot create `{}`", scratch.display()))?;
     let result = (|| {
-        for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        for path in &listing {
+            let path = path.as_str();
             if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
                 continue;
             }

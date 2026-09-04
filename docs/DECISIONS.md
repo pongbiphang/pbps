@@ -2470,3 +2470,22 @@ SPEC is in sync with all of these.
     at the default, while one the engine could not evaluate (`NEWID()`) comes
     back carrying its value. Presence there disproves nothing, and demanding a
     value this change cannot name would refuse a valid apply (117, 165).
+
+180. **A historical tree is listed with `-z`, and the bug it hid was silence
+    rather than an error.** `git ls-tree --name-only` applies `core.quotePath`,
+    which is on by default: measured, `schema/dbo.té.yml` comes back as
+    `"schema/dbo.t\303\251.yml"`, quotes included, and `git show` on that
+    answers `fatal: path ... does not exist`.
+    That error is not what happened. The quoted form does not end in `.yml`,
+    so the extension filter skipped the file before anything tried to read it,
+    and the revision read as **empty**: `plan` printed "Baseline: git HEAD (0
+    objects)", warned that everything would be listed as newly created, and
+    exited 0. A repository that is perfectly well formed produced a plan
+    against nothing. This is the shape CLAUDE.md names — absent, empty and
+    unreadable are three different things, only one is good news — and it is
+    worth recording that the first test I wrote for it *passed*, because it
+    asserted an exit code. The bug had no exit code.
+    Both readers of a historical tree go through one `tree_paths` now, for the
+    reason the two role-name filters did: written twice, they had the same bug
+    twice. It splits on NUL and never trims, which is the same rule 177 and
+    178 established for names — a path is what the tree spells it.

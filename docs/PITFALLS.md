@@ -271,6 +271,22 @@ Every one was found by testing rather than reasoning. The allowlist is the risky
 half of that function; the placeholder is the safe half. **Reach for the
 placeholder early, not as a last resort.**
 
+## git renders a path outside ASCII in C quoting
+
+`ls-tree --name-only`, and every other porcelain-ish path output, applies
+`core.quotePath` — on by default. `schema/dbo.té.yml` comes back as
+`"schema/dbo.t\303\251.yml"`, **quotes included**, and `git show <rev>:<that>`
+answers `fatal: path ... does not exist`.
+
+The failure was not that error, though, which is the part worth keeping. The
+quoted form does not end in `.yml`, so the extension filter skipped the file,
+the revision read as **empty**, and `plan` announced "Baseline: git HEAD (0
+objects)" and exited 0 — every table newly created, against a repository that
+was perfectly well formed. Absent, empty and unreadable are three different
+things, and a test that asserts an exit code cannot tell them apart.
+
+`-z` and split on NUL. Never `lines()`, never `trim()`.
+
 ## A path in a command is spelled with `to_str`, never `display()`
 
 On Unix a filename is bytes. `display()` substitutes U+FFFD, which `shell_arg`
