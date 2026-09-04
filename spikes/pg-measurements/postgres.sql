@@ -689,6 +689,25 @@ FROM pg_default_acl WHERE defaclnamespace = 'm'::regnamespace;
 COMMIT;
 ALTER DEFAULT PRIVILEGES FOR ROLE m_dp_owner IN SCHEMA m REVOKE SELECT ON TABLES FROM m_dp_by;
 
+-- -------------------------------- the eighteenth 2026-09-05 review round
+
+CREATE FUNCTION m.dep_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.dep_plpgsql() RETURNS int AS $$ BEGIN RETURN m.dep_f(1); END $$ LANGUAGE plpgsql;
+CREATE FUNCTION m.dep_sqlstr() RETURNS int AS $$ SELECT m.dep_f(1) $$ LANGUAGE sql;
+CREATE FUNCTION m.dep_atomic() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT m.dep_f(1); END;
+SELECT 'A51', 'which of three callers pg_depend records an edge for',
+       coalesce((SELECT string_agg(DISTINCT d.objid::regprocedure::text, ', ') FROM pg_depend d
+                 WHERE d.refobjid = 'm.dep_f(int)'::regprocedure
+                   AND d.deptype = 'n' AND d.classid = 'pg_proc'::regclass), 'none')
+       || ' — the plpgsql and string-literal bodies record nothing';
+DROP FUNCTION m.dep_atomic();
+SELECT 'A52', 'dropping the function with only opaque callers left',
+       m.accepts('DROP FUNCTION m.dep_f(int)');
+SELECT 'A53', 'creating it again under a new signature',
+       m.accepts('CREATE FUNCTION m.dep_f(a int, b int) RETURNS int AS $q$ SELECT a + b $q$ LANGUAGE sql');
+SELECT 'A54', 'and calling the plpgsql caller after that apply committed',
+       m.accepts('SELECT m.dep_plpgsql()');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

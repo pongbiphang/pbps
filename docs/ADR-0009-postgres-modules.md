@@ -834,6 +834,56 @@ Two things follow, and neither is a new mechanism:
   narrowly — §3's was over the object's *attributes* and missed three, this one
   is over its *dependents* and missed four. The rule stated there covers both if
   it is read as it is written: **enumerate from the catalog, not from memory.**
+
+  ### And the catalog does not know every caller
+
+  That rule has a limit, and it is sharp. **Measured**, `pg_depend` records an
+  edge for a caller only when the calling body was parsed at creation time:
+
+  ```
+  three callers of m.dep_f(int), written three ways:
+      pg_depend records an edge for  dep_atomic()   -- BEGIN ATOMIC
+      the plpgsql body and the SQL string-literal body record nothing
+  ```
+
+  So with the recording caller removed, the whole rebuild goes through and the
+  failure lands somewhere else entirely:
+
+  ```
+  DROP FUNCTION m.dep_f(int)                                      accepted
+  CREATE FUNCTION m.dep_f(a int, b int) ...                       accepted
+  -- the apply commits, and verify has nothing to report
+  SELECT m.dep_plpgsql()   refused: function m.dep_f(integer) does not exist
+  ```
+
+  A signature change is the case that bites: a rebuild that restores the same
+  identity leaves opaque callers working, and one that changes it breaks them at
+  their next call, in someone else's code, after a deployment that verified
+  clean. §1 makes the signature part of the declared identity, so **pbps knows
+  exactly when a plan crosses that line** — which is what makes a narrower rule
+  possible instead of a blanket one.
+
+  **Decision.** When a plan changes or removes a routine's identity, the
+  catalog's edges are supplemented by ADR-0002's existing device: a **best-effort
+  identifier scan** — that ADR already permits scanning definition text for the
+  names of managed objects, "no SQL semantics", for ordering — extended to the
+  bodies the catalog holds. Managed callers it finds are rebuilt with the rest;
+  callers it finds outside the managed set are **reported, not refused**, and
+  `depends_on:` remains the explicit escape hatch for what a scan cannot see.
+
+  Reported rather than refused, deliberately: the scan matches a *name*, and
+  with overloading a name is not an identity, so it over-approximates. A
+  refusal on a heuristic that cries wolf is a refusal people learn to work
+  around, and this project has enough real refusals to spend that credit on.
+
+  **The residual is the engine's, and it is stated rather than engineered
+  away:** a call assembled by dynamic SQL is invisible to `pg_depend`, to the
+  scan, and to any analysis short of running the code. What *does* remove the
+  hazard is writing SQL-language routines in standard syntax — **measured**, a
+  `BEGIN ATOMIC` body is the one of the three that records its dependency — and
+  that is worth saying in the PostgreSQL documentation as a recommendation with
+  a reason, rather than leaving each project to discover it the way this
+  document did.
 - **`DROP ... CASCADE` is refused outright.** It is the shortest path and it
   destroys objects nobody reviewed. The guardrail is SPEC 14.3's, and this is a
   new instance of it: the plan names every object it drops, or it does not drop.
