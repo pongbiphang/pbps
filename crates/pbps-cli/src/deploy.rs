@@ -32,8 +32,11 @@ use crate::db::{self, Target};
 /// by name and outside the scoped schema in fact.
 pub struct Managed {
     pub scoped: pbps_diff::Scoped,
-    /// Catalog facts attached to managed tables that the model cannot express.
-    /// They are drift findings, never ignorable warnings.
+    /// Catalog facts inside the managed set that the projection could not
+    /// express: an unsupported feature on a managed table, or a module the set
+    /// names that introspection cannot read back. They are drift findings,
+    /// never ignorable warnings, and no recorder accepts a schema that has any
+    /// (see [`managed_limitations`]).
     pub limitations: Vec<String>,
     /// Every module in the database that introspection cannot express, by name,
     /// with the reason already rendered.
@@ -91,33 +94,49 @@ async fn managed_state_full(
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
     }
-    // A module pbps cannot read is not a module it can leave to chance: it is
-    // inside the managed set by name and outside it in fact, so the next plan
-    // would propose creating one that is already there.
-    for m in &pulled.unmanaged_modules {
-        if modules.contains(&m.name) {
-            eprintln!(
-                "warning: {} {} is declared, but {}; it is left alone",
-                m.kind, m.name, m.why
-            );
-        }
-    }
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+    let limitations = managed_limitations(&pulled, ids, modules);
 
     let scoped = pbps_diff::scope(&pulled.schema, ids, modules);
-    let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
-    let limitations = pulled
-        .limitations
-        .iter()
-        .filter(|limitation| managed_tables.contains(&limitation.table))
-        .map(|limitation| limitation.detail.clone())
-        .collect();
     report_unmanaged(&scoped, &unreadable, modules, unmanaged)?;
     Ok(Managed {
         scoped,
         limitations,
         unreadable,
     })
+}
+
+/// Every fact inside the managed set that the catalog projection could not
+/// express: an unsupported feature on a managed table, or a module the set
+/// names whose definition introspection cannot read back.
+///
+/// The second half is what keeps a recorded scope honest. [`managed_modules`]
+/// rebuilds the set from the recorded schema's keys, so a name that schema does
+/// not hold is a name every later command forgets. Left as a warning, a
+/// declared encrypted procedure was exempted from `unmanaged: error` by the
+/// `baseline` that recorded it and refused as an undeclared object by the
+/// first `verify` after — a policy violation on a database nothing had touched.
+/// A module pbps cannot read is inside the managed set by name and outside it
+/// in fact; that is a partial schema, and the recorders already refuse one.
+pub(crate) fn managed_limitations(
+    pulled: &pbps_mssql::introspect::Pulled,
+    ids: &IdsFile,
+    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+) -> Vec<String> {
+    let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
+    pulled
+        .limitations
+        .iter()
+        .filter(|limitation| managed_tables.contains(&limitation.table))
+        .map(|limitation| limitation.detail.clone())
+        .chain(
+            pulled
+                .unmanaged_modules
+                .iter()
+                .filter(|m| modules.contains(&m.name))
+                .map(|m| format!("{} {} is in the managed set, but {}", m.kind, m.name, m.why)),
+        )
+        .collect()
 }
 
 /// The modules a plan leaves the environment holding.
@@ -195,6 +214,11 @@ fn dependency_hints_for_schema(
 /// this environment has moved since it was recorded, so the recorded state's
 /// modules are the set; everything that plans or records asks what the state
 /// should be, so the declarations count too.
+///
+/// The recorded set is the recorded schema's keys and nothing more. That is
+/// sound only because no recorder writes a snapshot whose managed set names a
+/// module the schema does not hold — [`managed_limitations`] turns such a
+/// module into a refusal before `record` is reached.
 fn managed_modules(
     recorded: Option<&pbps_model::StateSnapshot>,
     declared: Option<&pbps_model::Schema>,
@@ -207,6 +231,22 @@ fn managed_modules(
         set.extend(s.modules.keys().cloned());
     }
     set
+}
+
+/// Says so when the deployment lock could not be released after a command that
+/// had already failed.
+///
+/// The command's own error is what the caller returns — a cleanup failure must
+/// not replace the reason the deployment stopped — but dropping the unlock
+/// result on that path left `__pbps_lock` held with no word about it, and the
+/// retry that should have fixed the environment failed as "locked" instead.
+fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbError>) {
+    if let Err(e) = released {
+        eprintln!(
+            "warning: the deployment lock on `{label}` was not released: {e}\n\
+             Release it with `pbps unlock` before the next attempt."
+        );
+    }
 }
 
 /// The `unmanaged: error` policy, refused.
@@ -606,7 +646,13 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         }
         .await;
         let released = pbps_mssql::state::unlock(&mut conn).await;
-        let (id, tables) = result?;
+        let (id, tables) = match result {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                warn_unreleased(&target.label, &released);
+                return Err(error);
+            }
+        };
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
             target.label, tables
@@ -647,7 +693,13 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
         }
         .await;
         let released = pbps_mssql::state::unlock(&mut conn).await;
-        let (id, tables) = result?;
+        let (id, tables) = match result {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                warn_unreleased(&target.label, &released);
+                return Err(error);
+            }
+        };
         println!(
             "Baselined `{}` as entry #{id}: {} table(s) are now the starting point.",
             target.label, tables
@@ -809,7 +861,13 @@ pub fn cmd_bootstrap(
             record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
         }
         let unlocked = pbps_mssql::state::unlock(&mut conn).await;
-        let (id, snapshot) = result?;
+        let (id, snapshot) = match result {
+            Ok(built) => built,
+            Err(error) => {
+                warn_unreleased(&target.label, &unlocked);
+                return Err(error);
+            }
+        };
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
             target.label,
@@ -1390,6 +1448,10 @@ pub fn cmd_apply(
                     Some(&message),
                 );
             }
+            // After the hook, so the payload it receives is the deployment's
+            // error alone; before the return, because a lock this run could not
+            // clear is the first thing the next run will hit.
+            warn_unreleased(&target.label, &released);
             Err(error)
         }
     }
@@ -2047,4 +2109,96 @@ async fn finish_transaction<T>(conn: &mut Conn, result: anyhow::Result<T>) -> an
 fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> StateSnapshot {
     snapshot.git_sha = db::git_sha(root);
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_mssql::introspect::{IntrospectionLimitation, Pulled, UnmanagedModule};
+
+    fn pulled() -> Pulled {
+        Pulled {
+            schema: Schema::default(),
+            warnings: Vec::new(),
+            limitations: vec![
+                IntrospectionLimitation {
+                    table: "dbo.managed".parse().unwrap(),
+                    detail: "dbo.managed has a computed column".into(),
+                },
+                IntrospectionLimitation {
+                    table: "dbo.theirs".parse().unwrap(),
+                    detail: "dbo.theirs has a computed column".into(),
+                },
+            ],
+            unmanaged_modules: vec![
+                UnmanagedModule {
+                    kind: "procedure",
+                    name: "dbo.declared_secret".parse().unwrap(),
+                    why: "its definition cannot be read back".into(),
+                },
+                UnmanagedModule {
+                    kind: "procedure",
+                    name: "dbo.stray_secret".parse().unwrap(),
+                    why: "its definition cannot be read back".into(),
+                },
+            ],
+        }
+    }
+
+    fn ids() -> IdsFile {
+        let mut ids = IdsFile::default();
+        ids.tables.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.managed", 0),
+            "dbo.managed".parse().unwrap(),
+        );
+        ids
+    }
+
+    /// A module the managed set names and the catalog cannot read is a
+    /// limitation of the projection, exactly as an unsupported feature on a
+    /// managed table is. Reported as a warning instead, `baseline` recorded a
+    /// schema without it, and the scope rebuilt from that schema then treated
+    /// the same module as undeclared.
+    #[test]
+    fn a_module_in_the_managed_set_that_cannot_be_read_back_is_a_limitation() {
+        let modules = std::iter::once("dbo.declared_secret".parse().unwrap()).collect();
+        let found = managed_limitations(&pulled(), &ids(), &modules);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0], "dbo.managed has a computed column");
+        assert!(
+            found[1].contains("procedure dbo.declared_secret is in the managed set")
+                && found[1].contains("cannot be read back"),
+            "{found:?}"
+        );
+    }
+
+    /// The other direction: an unreadable module outside the set is the
+    /// unmanaged policy's business (see [`unmanaged_objects`]), not a
+    /// limitation — and a limitation on somebody else's table is neither.
+    #[test]
+    fn objects_outside_the_managed_set_are_not_limitations() {
+        let found = managed_limitations(&pulled(), &ids(), &Default::default());
+        assert_eq!(found, ["dbo.managed has a computed column"]);
+
+        let found = managed_limitations(&pulled(), &IdsFile::default(), &Default::default());
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The two inventories partition the unreadable modules: whichever set a
+    /// module falls outside, one of them names it, so an encrypted module can
+    /// never be silent in a command that consults both.
+    #[test]
+    fn every_unreadable_module_is_either_a_limitation_or_unmanaged() {
+        let pulled = pulled();
+        let modules = std::iter::once("dbo.declared_secret".parse().unwrap()).collect();
+        let scoped = pbps_diff::scope(&pulled.schema, &IdsFile::default(), &modules);
+        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+
+        let limited = managed_limitations(&pulled, &IdsFile::default(), &modules);
+        let unmanaged = unmanaged_objects(&scoped, &unreadable, &modules);
+        assert!(limited.iter().any(|l| l.contains("dbo.declared_secret")));
+        assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
+        assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
+        assert!(!unmanaged.iter().any(|u| u.contains("dbo.declared_secret")));
+    }
 }

@@ -6200,3 +6200,343 @@ fn durable_record_commands_report_success_before_an_unlock_failure() {
         .unwrap();
     });
 }
+
+/// A declared module the catalog cannot read back is a partial schema inside
+/// the managed set, and the recorders refuse it the way they refuse a computed
+/// column on a managed table. Recorded as a warning instead, the declaration
+/// exempted the module from `unmanaged: error` for the `baseline` alone: the
+/// snapshot's schema did not hold it, the scope every later command rebuilds
+/// from that schema forgot it, and the first `verify` refused an untouched
+/// database as a policy violation.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("declared-unreadable");
+    let env = format!("PBPS_DECLARED_UNREADABLE_{}", std::process::id());
+    let config = |unmanaged: &str| {
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: mssql\nunmanaged: {unmanaged}\nenvironments:\n  test:\n    url_env: {env}\n"),
+        )
+        .unwrap();
+    };
+    config("error");
+    d.table("table: dbo.pbps_declared_unreadable\ncolumns:\n  id: {type: int, nullable: false}\n");
+    d.module(
+        "secret.yml",
+        "procedure: dbo.pbps_declared_secret\ndefinition: AS SELECT 1\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    const RESET: &str = "IF OBJECT_ID(N'dbo.pbps_declared_secret', N'P') IS NOT NULL \
+         DROP PROCEDURE dbo.pbps_declared_secret; \
+         IF OBJECT_ID(N'dbo.pbps_declared_later', N'P') IS NOT NULL \
+         DROP PROCEDURE dbo.pbps_declared_later; \
+         IF OBJECT_ID(N'dbo.pbps_declared_unreadable', N'U') IS NOT NULL \
+         DROP TABLE dbo.pbps_declared_unreadable; \
+         IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
+         IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(RESET).await.unwrap();
+        conn.execute(
+            "CREATE TABLE dbo.pbps_declared_unreadable (id int NOT NULL); \
+             EXEC('CREATE PROCEDURE dbo.pbps_declared_secret WITH ENCRYPTION AS SELECT 1;');",
+        )
+        .await
+        .unwrap();
+    });
+
+    // Both recorders refuse, name the module and the reason, write no ledger
+    // entry, and leave no lock behind.
+    for args in [
+        vec!["baseline", "--db", connection.as_str(), "--reason", "adopt"],
+        vec!["snapshot", "--db", connection.as_str(), "--force"],
+    ] {
+        let refused = d.run(&args);
+        assert_eq!(code(&refused), 1, "{args:?}: {}", stderr(&refused));
+        let err = stderr(&refused);
+        assert!(
+            err.contains("cannot be represented")
+                && err.contains("procedure dbo.pbps_declared_secret is in the managed set")
+                && err.contains("WITH ENCRYPTION"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("not declared"), "{args:?}: {err}");
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            assert!(
+                pbps_mssql::state::latest(&mut conn)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{args:?} recorded a partial schema"
+            );
+            assert!(
+                pbps_mssql::state::lock_holder(&mut conn)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{args:?} left the lock held"
+            );
+        });
+    }
+
+    // Without the declaration the module is simply unmanaged, and a baseline
+    // taken under `warn` stays consistent with every command after it: the
+    // module is a note in `verify`, never a refusal.
+    std::fs::remove_file(d.dir.join("schema/secret.yml")).unwrap();
+    config("warn");
+    let baselined = d.run(&["baseline", "--db", &connection, "--reason", "adopt"]);
+    assert_eq!(code(&baselined), 0, "{}", stderr(&baselined));
+    let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(code(&verify), 0, "{report}");
+    let ids: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["state.unmanaged"], "{report}");
+    assert!(
+        report["findings"][0]["message"]
+            .as_str()
+            .is_some_and(|s| s.contains("pbps_declared_secret")),
+        "{report}"
+    );
+
+    // The one way a recorded module can become unreadable: it was readable
+    // when recorded and somebody encrypted it by hand since. That is drift the
+    // differ cannot phrase, and both `verify` and `status` have to say so.
+    d.module(
+        "later.yml",
+        "procedure: dbo.pbps_declared_later\ndefinition: AS SELECT 2\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("later.json");
+    let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    let checksum = plan_checksum(&plan);
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+    let clean = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&clean), 0, "{}", stderr(&clean));
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(
+            "EXEC('ALTER PROCEDURE dbo.pbps_declared_later WITH ENCRYPTION AS SELECT 2;');",
+        )
+        .await
+        .unwrap();
+    });
+    let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verify)).unwrap();
+    assert_eq!(code(&verify), FINDING, "{report}");
+    assert!(
+        report["findings"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["id"] == "state.drift-unexpressible"
+                    && item["message"].as_str().is_some_and(|s| {
+                        s.contains("procedure dbo.pbps_declared_later is in the managed set")
+                    })
+            })
+        }),
+        "{report}"
+    );
+    let status = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env(&env, &connection)
+        .output()
+        .unwrap();
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(report["data"][0]["state"], "drift", "{report}");
+    assert!(
+        stdout(&status).contains("procedure dbo.pbps_declared_later is in the managed set"),
+        "{report}"
+    );
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(RESET).await.unwrap();
+    });
+}
+
+/// A failed command releases the lock it took, and when that release fails
+/// too the operator has to hear about it: the command's own error stays the
+/// error, but a `__pbps_lock` row nobody mentioned makes the next attempt fail
+/// as "locked" with nothing to explain why. Every command that takes the lock
+/// has this failure path, so every one is exercised.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn an_unreleased_lock_after_a_failed_command_is_reported() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("unlock-after-failure");
+    let hook_out = d.dir.join("apply-hook.json");
+    let config = |unmanaged: &str| {
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!(
+                "dialect: mssql\nunmanaged: {unmanaged}\nhooks:\n  on_apply_attempt: \"cat > {}\"\n",
+                hook_out.display()
+            ),
+        )
+        .unwrap();
+    };
+    config("ignore");
+    d.table("table: dbo.pbps_unlock_failure\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    const BLOCK_UNLOCK: &str = "CREATE TRIGGER dbo.pbps_block_unlock ON dbo.__pbps_lock INSTEAD OF DELETE AS \
+         BEGIN THROW 51000, 'unlock denied by test', 1; END;";
+    const RESET: &str = "IF OBJECT_ID(N'dbo.pbps_block_unlock', N'TR') IS NOT NULL \
+         DROP TRIGGER dbo.pbps_block_unlock; \
+         IF OBJECT_ID(N'dbo.pbps_unlock_failure', N'U') IS NOT NULL \
+         DROP TABLE dbo.pbps_unlock_failure; \
+         IF OBJECT_ID(N'dbo.pbps_unlock_stray', N'U') IS NOT NULL \
+         DROP TABLE dbo.pbps_unlock_stray; \
+         IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
+         IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(RESET).await.unwrap();
+        conn.execute("CREATE TABLE dbo.pbps_unlock_failure (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    d.table(
+        "table: dbo.pbps_unlock_failure\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: nvarchar(20)}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("unlock-failure.json");
+    let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    let checksum = plan_checksum(&plan);
+
+    // The database moves after the plan was approved, and the lock row can no
+    // longer be deleted. Each command below fails for its own reason first,
+    // then fails to release.
+    let block = || {
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            conn.execute(BLOCK_UNLOCK).await.unwrap();
+        })
+    };
+    let clear = || {
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
+                .await
+                .unwrap();
+            assert!(
+                pbps_mssql::state::unlock(&mut conn).await.unwrap(),
+                "the failed command should have left the lock held"
+            );
+        })
+    };
+    let assert_reported = |what: &str, out: &Output, own_error: &str| {
+        assert_eq!(code(out), 1, "{what}: {}", stderr(out));
+        let err = stderr(out);
+        assert!(err.contains(own_error), "{what} lost its own error: {err}");
+        assert!(
+            err.contains("was not released")
+                && err.contains("unlock denied by test")
+                && err.contains("pbps unlock"),
+            "{what} hid the unreleased lock: {err}"
+        );
+    };
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("ALTER TABLE dbo.pbps_unlock_failure ADD drifted int NULL;")
+            .await
+            .unwrap();
+    });
+    block();
+    let applied = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_reported(
+        "apply",
+        &applied,
+        "is no longer the database this plan was computed against",
+    );
+    // The hook sees the deployment's failure, not the cleanup's.
+    let hook: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_out).unwrap()).unwrap();
+    assert_eq!(hook["outcome"], "failure", "{hook}");
+    let hook_error = hook["error"].as_str().unwrap();
+    assert!(
+        hook_error.contains("no longer the database") && !hook_error.contains("unlock denied"),
+        "{hook}"
+    );
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
+        assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
+    });
+    clear();
+
+    block();
+    let snapshotted = d.run(&["snapshot", "--db", &connection]);
+    assert_reported("snapshot", &snapshotted, "differs from the state recorded");
+    clear();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute("CREATE TABLE dbo.pbps_unlock_stray (id int NOT NULL);")
+            .await
+            .unwrap();
+    });
+    config("error");
+    block();
+    let baselined = d.run(&["baseline", "--db", &connection, "--reason", "test"]);
+    assert_reported("baseline", &baselined, "are not declared");
+    clear();
+
+    config("ignore");
+    block();
+    let bootstrapped = d.run(&["bootstrap", "--db", &connection]);
+    assert_reported("bootstrap", &bootstrapped, "already has");
+    clear();
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(RESET).await.unwrap();
+    });
+}

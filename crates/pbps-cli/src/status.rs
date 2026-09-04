@@ -316,13 +316,10 @@ async fn one(
         record_drift(&mut row, entry.id, name);
     }
 
-    let managed_tables: std::collections::BTreeSet<_> = recorded_ids.tables.values().collect();
-    let limitations: Vec<&str> = pulled
-        .limitations
-        .iter()
-        .filter(|limitation| managed_tables.contains(&limitation.table))
-        .map(|limitation| limitation.detail.as_str())
-        .collect();
+    // The same inventory `verify` reports as unexpressible drift, including a
+    // recorded module the catalog can no longer read back: one screen must not
+    // call an environment clean where the other calls it drifted.
+    let limitations = crate::deploy::managed_limitations(&pulled, &recorded_ids, &recorded_modules);
     if !limitations.is_empty() {
         record_status_issue(
             &mut row,

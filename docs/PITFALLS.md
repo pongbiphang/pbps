@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Sixteen instances so far. **Absent, empty and unreadable are three different
+Eighteen instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -29,6 +29,15 @@ things, and only one of them is good news.**
   and `explain`.
 - A lock table the caller has **no permission to read**: metadata visibility
   makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock".
+- A declared module the catalog **cannot read back** reduced to a warning. The
+  recorder went ahead, the snapshot's schema could not hold the module, the
+  scope every later command rebuilds from that schema forgot it, and the first
+  `verify` refused an untouched database as a policy violation. It is a partial
+  schema inside the managed set, and the recorders now refuse it as one.
+- An unlock failure **after a command had already failed** dropped on the floor:
+  `apply` reported its own error and left `__pbps_lock` held with no word about
+  it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`
+  and `bootstrap`; the success path had been fixed one round earlier.
 
 ### 2. Failures escaping the one-envelope contract
 
