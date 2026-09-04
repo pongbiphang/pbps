@@ -182,25 +182,50 @@ Two things follow, and the first matters more:
 
   **Decision: make the write unable to do harm instead of making it exclusive.**
   A `nextval` only ever moves a sequence forward, so the only damage pbps can do
-  is move it *backwards*. That is expressible atomically:
+  is move it *backwards*.
 
-  ```sql
-  SELECT setval(seq, GREATEST(<target>, nextval(seq)));
-  ```
-
-  **Measured**, in both directions that matter — with the sequence behind the
-  target it lands on the target, and after another session has pushed it past
-  the target it does **not** go back:
+  A first version of this paragraph proposed
+  `setval(seq, GREATEST(<target>, nextval(seq)))` and called it atomic. **It is
+  not, and measured, it produces exactly the duplicate this section exists to
+  prevent** — `nextval` and `setval` are two operations, and one allocation
+  between them is enough:
 
   ```
-  sequence behind the target:              setval returned 101
-  another session had reached 103:         setval returned 104 — it did not go back
+  sequence stands at 104
+  inner nextval returns          105
+  another session then allocates 106
+  setval(GREATEST(101, 105))     105     -- writes the inner value back
+  the next caller receives       106     -- which the other session already holds
   ```
 
-  It burns one value, which costs nothing, and it is correct without holding
-  anything. The table lock stays — it makes the table's own maximum stable while
-  the target is computed — but it is no longer load-bearing for the sequence
-  half.
+  The lesson is narrow and worth keeping: `GREATEST` made the expression *look*
+  monotonic, and monotonicity has to be a property of every step, not of the
+  value being written.
+
+  **So: never `setval`. Advance with `nextval` until the value is past every key
+  in use.** Every operation then moves the sequence forward and nothing can
+  lower it, so no interleaving produces a duplicate — the worst a concurrent
+  allocator can do is finish the advance sooner. The work is bounded by the gap,
+  which for a reference-data table is the handful of rows the declarations pin.
+
+  Widening the step first — `ALTER SEQUENCE … INCREMENT BY <gap>`, one `nextval`,
+  then restore — makes the common case a single call, and **measured**, it is
+  safe to combine with the rule because `ALTER SEQUENCE` does not move
+  `last_value` in either direction:
+
+  ```
+  before ALTER: last_value 101
+  after  ALTER: last_value 101 — nothing was lowered
+  ```
+
+  It is an optimisation and not the primitive, because it has a corner:
+  **measured**, on a sequence that has never been called (`is_called = false`)
+  the first `nextval` returns the start value and ignores the widened
+  increment — `first nextval 1, second 101`. A loop that checks the value it
+  received is what makes the rule true; the widened step only makes it quick.
+
+  The table lock stays — it makes the table's own maximum stable while the
+  target is computed — but it is no longer load-bearing for the sequence half.
 
 - **And `+ 1` assumes the identity counts upwards, which the model does not.**
   `Identity` is `{ seed: i64, increment: i64 }` and the only rule on it refuses

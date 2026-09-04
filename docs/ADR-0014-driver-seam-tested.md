@@ -51,8 +51,30 @@ the first time.
 
 ## The verdict
 
-**The seam holds. It costs one signature, and it makes one false statement in
-CLAUDE.md visible.**
+**The seam holds for the question this spike asked, which is narrower than the
+one Phase 5 needs to answer.**
+
+The spike *replaced* one driver with another behind the same shape. Phase 5 has
+to *keep both*, selected per project — and that is not the same test. Measured
+by reading the code rather than by running it: `crates/pbps-cli/src/db.rs`'s
+`connect` returns the concrete `pbps_db::Conn`, and **21 functions in
+`pbps-mssql` take `&mut Conn` concretely**. A `tokio-postgres` client cannot
+appear behind that shape without an enum, a trait, a duplicated connected path,
+or generics spread across those call sites. None of that is large, and none of
+it is the "one signature" this document first claimed.
+
+So the honest verdict is in two parts:
+
+- **What the spike proves:** the seam's *shape* — `Row`, `FromColumn`, `Param`,
+  the four query and execute methods, the transaction framing — absorbs a
+  fundamentally different driver without changing a caller. That was the part
+  most at risk, and it held.
+- **What it does not prove:** that two drivers coexist. The concrete `Conn` at
+  the CLI boundary is the seam's untested half, and the cost of the second
+  dialect includes making that boundary polymorphic.
+
+With that correction, **it costs one signature *plus* a decision at the CLI
+boundary, and it makes one false statement in CLAUDE.md visible.**
 
 | Seam point | Second driver |
 |---|---|
@@ -160,10 +182,12 @@ This is the part of ADR-0007's claim that was most at risk and it held.
 
 ## Ruled out
 
-- **Making `Conn` a trait** with per-driver implementations. Premature with one
-  real driver and one spike: the useful abstraction is the one drawn from two
-  implementations that both exist, which is ADR-0007's own "the data-driven
-  extraction waits for the second dialect", applied to itself.
+- **Deciding *how* `Conn` becomes polymorphic** — enum, trait, or generics.
+  Premature with one real driver and one spike: the useful abstraction is the
+  one drawn from two implementations that both exist, which is ADR-0007's own
+  "the data-driven extraction waits for the second dialect", applied to itself.
+  What is *not* deferred, and what this document got wrong the first time, is
+  that the boundary has to change at all.
 - **Re-exporting the driver's types** to avoid `FromColumn` and `Param`. The
   spike is the argument against it: those two are what let a second driver be a
   change to one crate.

@@ -531,19 +531,36 @@ COMMIT;                                  -- 2 rows, both committed
 A failed statement dooms a PostgreSQL transaction, but `ROLLBACK TO SAVEPOINT`
 un-dooms it: the attempt is recoverable and the surrounding work survives.
 
-**Decision.** `plan --db` asks — it has a connection, which is the whole
-difference between the two planning layers (§7.3) — attempting the replace
-inside a savepoint it always rolls back, and **records the answer in the plan**.
-The artifact the approver reads therefore says which shape will run and why,
-rather than leaving it to be discovered at apply time. Nothing is parsed and
-nothing is guessed; the engine is asked, which is §8.2's rule applied to a
-question about SQL rather than about a value.
+**But the target is the wrong place to ask.** A first version of this decision
+had `plan --db` attempt the replace inside a savepoint on the environment being
+planned against. Rolling back a savepoint undoes the catalog change and nothing
+else: the attempt still takes DDL locks on a live object, and it still fires
+`ddl_command_start` event triggers, whose side effects — a `nextval`, a row in
+an audit table, a notification — are not transactional and do not roll back.
+That turns `plan` into a command that can block a production workload and
+advance application state, and `plan` is a read-only command in every other
+respect (§9.1). A planning step that mutates the thing it is planning against is
+not a preflight; it is a small unreviewed apply.
 
-An offline `plan` has nobody to ask. It emits the replace — the cheaper and
-non-destructive of the two — and says the shape is unresolved, which is what
-§9.1 already means by "anything computed offline is a preview". The refusal
-above still stands in front of the rebuild, so the preview cannot become a
-silent rebuild later.
+**Decision.** The question is asked where DDL is free:
+
+- **With a dev database (§9.3), the rehearsal answers it.** That engine is
+  throwaway and explicitly isolated, which is what it was built for, and the
+  answer is recorded in the plan — so the artifact the approver reads says which
+  shape will run and why.
+- **Without one, the plan says the shape is unresolved**, carries both
+  possibilities and the rebuild's refusal conditions, and `apply` resolves it
+  inside its own transaction — where a savepoint attempt is legitimate, because
+  an apply is *meant* to mutate and the reviewer has approved a plan that names
+  both outcomes.
+
+The reviewer loses some precision in the second case and loses nothing they were
+entitled to: the gate approves a plan that says "replace, or rebuild under these
+conditions", and the rebuild's ACL, owner and options refusals still stand in
+front of it.
+
+An offline `plan` has nobody to ask at all and says so, which is what §9.1
+already means by "anything computed offline is a preview".
 
 ## 4. The dependency refusal is the common case, not the corner
 

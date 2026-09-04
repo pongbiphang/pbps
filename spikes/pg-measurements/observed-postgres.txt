@@ -95,3 +95,7 @@ R26 | pg_get_viewdef with an empty search_path | SELECT id, a FROM m.sp2;
 R27 | pg_get_viewdef with the object's schema on the path | SELECT id, a FROM sp2;
 R28 | an unqualified function from another schema, path = the object's schema only | refused: function helper(integer) does not exist
 R29 | the same definition with that other schema on the path | accepted
+R30 | setval(GREATEST(target, nextval)) interleaved with one other allocation | inner nextval 105, another session took 106, setval wrote 105, next caller receives 106 — already issued
+R31 | a widened INCREMENT on a sequence never called | first nextval 1, second 101 — the increment does not apply to the first call
+R32 | ALTER SEQUENCE INCREMENT BY does not move last_value | last_value 101
+R33 | and after restoring the increment | last_value 101 — nothing was lowered

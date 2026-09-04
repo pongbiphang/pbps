@@ -509,6 +509,36 @@ SELECT 'R29', 'the same definition with that other schema on the path',
 SET search_path = m;
 DROP SCHEMA m_ext CASCADE;
 
+-- ------------------------------------ the eighth 2026-09-05 review round
+
+CREATE TABLE m.race (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.race (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'pinned');
+SELECT setval(pg_get_serial_sequence('m.race','id'), 104) \gset seed_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset inner_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset other_
+SELECT setval(pg_get_serial_sequence('m.race','id'), GREATEST(101, :inner_nextval)) \gset wrote_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset after_
+SELECT 'R30', 'setval(GREATEST(target, nextval)) interleaved with one other allocation',
+       'inner nextval ' || :'inner_nextval'
+       || ', another session took ' || :'other_nextval'
+       || ', setval wrote ' || :'wrote_setval'
+       || ', next caller receives ' || :'after_nextval'
+       || CASE WHEN :after_nextval = :other_nextval THEN ' — already issued' ELSE ' — no collision' END;
+
+CREATE SEQUENCE m.fresh_seq;
+ALTER SEQUENCE m.fresh_seq INCREMENT BY 100;
+SELECT nextval('m.fresh_seq') \gset f1_
+SELECT nextval('m.fresh_seq') \gset f2_
+SELECT 'R31', 'a widened INCREMENT on a sequence never called',
+       'first nextval ' || :'f1_nextval' || ', second ' || :'f2_nextval'
+       || ' — the increment does not apply to the first call';
+
+SELECT 'R32', 'ALTER SEQUENCE INCREMENT BY does not move last_value',
+       (SELECT 'last_value ' || last_value::text FROM m.fresh_seq) AS before_alter;
+ALTER SEQUENCE m.fresh_seq INCREMENT BY 1;
+SELECT 'R33', 'and after restoring the increment',
+       (SELECT 'last_value ' || last_value::text || ' — nothing was lowered' FROM m.fresh_seq);
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
