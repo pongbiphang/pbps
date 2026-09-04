@@ -5372,6 +5372,39 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
+    // A permission the declarations cannot hold is drift to `verify`, and
+    // was "ok" to `status`, whose checksum is computed from the schema the
+    // permission is carried beside, not in (DECISIONS 125). Both commands
+    // now say drift, with the permission named.
+    let var = format!("PBPS_STATUS_ROLE_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    let status = || {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["status", "--format", "json"])
+            .env(&var, &connection)
+            .output()
+            .unwrap()
+    };
+    let v: serde_json::Value = serde_json::from_str(&stdout(&status())).unwrap();
+    assert_eq!(v["data"][0]["state"], "ok", "{v}");
+    sql("GRANT SELECT ON dbo.customer TO auditor WITH GRANT OPTION;");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&status())).unwrap();
+    assert_eq!(v["data"][0]["state"], "drift", "{v}");
+    assert!(
+        v["data"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("auditor") && d.contains("GRANT OPTION")),
+        "{v}"
+    );
+
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
         c.execute(&format!(

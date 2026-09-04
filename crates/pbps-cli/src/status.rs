@@ -285,6 +285,23 @@ async fn one(connection: &str, name: &str, checked_at: &str) -> EnvStatus {
     let recorded_modules: std::collections::BTreeSet<_> =
         entry.snapshot.schema.modules.keys().cloned().collect();
     let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
+    // A permission on a managed role that the declarations cannot hold is
+    // drift to `verify` and stops every command that would record a state;
+    // it lives beside the schema, not in it, so the checksum below cannot
+    // see it. The same filter `verify` applies: an unmanaged role's grants
+    // are its own business (DECISIONS 95, 125).
+    let unexpressible: Vec<&str> = pulled
+        .unexpressible
+        .iter()
+        .filter(|(role, _)| recorded_ids.roles.values().any(|managed| managed == role))
+        .map(|(_, what)| what.as_str())
+        .collect();
+    if !unexpressible.is_empty() {
+        record_drift(&mut row, entry.id, name);
+        let so_far = row.detail.take().unwrap_or_default();
+        row.detail = Some(format!("{so_far}; {}", unexpressible.join("; ")));
+        return row;
+    }
     // The rows too, under the recorded scope, as `verify` reads them. A read
     // that fails is reported as the failure it is, never as "no drift".
     let recorded_data = entry.snapshot.schema.data_scopes();

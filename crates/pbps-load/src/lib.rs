@@ -729,6 +729,34 @@ indexes:
         assert!(errs[0].to_string().contains("grant target"), "{errs:?}");
     }
 
+    /// Two spellings of one target are one map key once parsed, and the
+    /// map kept whichever came last: `select` on `SCHEMA::app` vanished
+    /// behind `execute` on `schema::app`, and the next connected plan
+    /// revoked it (DECISIONS 126).
+    #[test]
+    fn two_spellings_of_one_grant_target_are_refused_not_merged() {
+        for (a, b) in [
+            ("SCHEMA::app", "schema::app"),
+            ("schema:: app", "schema::app"),
+            ("dbo.customer", " dbo.customer "),
+        ] {
+            let text = format!("role: r\ngrants:\n  \"{a}\": [select]\n  \"{b}\": [execute]\n");
+            let errs = load_file_str(Path::new("r.yml"), &text).unwrap_err();
+            let rendered = render(&errs);
+            assert!(
+                rendered.contains("name the same grant target"),
+                "{a} / {b}: {rendered}"
+            );
+        }
+        // One spelling, twice, is the YAML duplicate the parser refuses.
+        let errs = load_file_str(
+            Path::new("r.yml"),
+            "role: r\ngrants:\n  dbo.t: [select]\n  dbo.t: [execute]\n",
+        )
+        .unwrap_err();
+        assert!(render(&errs).contains("duplicate"), "{}", render(&errs));
+    }
+
     #[test]
     fn two_files_declaring_one_role_are_refused_but_a_role_may_share_a_tables_word() {
         let dir = std::env::temp_dir().join(format!("pbps-load-roles-{}", std::process::id()));

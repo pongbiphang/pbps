@@ -242,7 +242,10 @@ Decisions taken during implementation that this document did not anticipate:
    literal one is rendered for the engine to compare (117). A composite
    foreign key is compared as one tuple, which the engine assembles from
    the constraint's columns at run time; the rows the plan writes are
-   compared the same way, by their whole tuple after the write (121).
+   compared the same way, by their whole tuple after the write (121). A
+   write left to a default that is not a literal cannot be counted at all,
+   and is refused by a second, counting probe where a foreign key to the
+   table spans the column (124).
 7. **A row `UPDATE` holds the row to what the plan recorded, and a row
    `UPDATE` or `DELETE` has to reach exactly one row.** The checksum pins the
    recorded state up to the moment `apply` reads it, not to the moment each

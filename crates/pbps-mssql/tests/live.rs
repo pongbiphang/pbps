@@ -2407,6 +2407,70 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         assert_eq!(n, want, "{why}");
     }
 
+    // A default the probe cannot evaluate — not a literal, though it may
+    // well be the deleted key — was treated as no arrival, and the cascade
+    // took the child. Refused now where the catalog says a foreign key to
+    // the table spans the column, by a second probe (DECISIONS 124); a
+    // column no key spans is nobody's business.
+    let refusal_for = |cs: &pbps_model::ChangeSet| {
+        Mssql
+            .preflight(cs)
+            .into_iter()
+            .find(|p| p.description.contains("cannot evaluate"))
+    };
+    let unprobeable = insert_defaulted("(CONVERT(varchar(20), 'old'))");
+    let probe = refusal_for(&unprobeable).expect("the write is refused, not dropped");
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "fk_kind_status spans status_code: {}",
+        probe.description
+    );
+    assert!(
+        probe.description.contains("status_code (row `9`)"),
+        "{}",
+        probe.description
+    );
+    let elsewhere = pbps_model::ChangeSet {
+        changes: vec![
+            moved.changes[0].clone(),
+            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+                table: TableName::new("dbo", "kind"),
+                key_column: "id".to_owned(),
+                identity_key: true,
+                key: RowKey::from("9"),
+                defaults: [("note".to_owned(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
+                    .into_iter()
+                    .collect(),
+                row: [("status_code".to_owned(), text("new"))]
+                    .into_iter()
+                    .collect::<Row>(),
+            }),
+            moved.changes[1].clone(),
+        ],
+    };
+    let probe = refusal_for(&elsewhere).expect("asked, since the plan cannot know the keys");
+    let n: i32 = db
+        .conn
+        .query(&probe.sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+        .try_get_at(0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "no key spans `note`");
+    assert!(
+        refusal_for(&insert_defaulted("(NULL)")).is_none(),
+        "NULL names no row"
+    );
+
     // The same shape through an update: a stored row pointing elsewhere that
     // this plan moves *onto* `old`. Found by sweeping the insert case, not
     // reported.

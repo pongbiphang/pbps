@@ -125,6 +125,14 @@ struct Moved {
     /// literal (`NEXT VALUE FOR`, `NEWID()`) has no value before it runs
     /// and is the one arrival no probe can ask about (DECISIONS 117).
     inserted: BTreeMap<RowKey, BTreeMap<String, String>>,
+    /// Column -> the rows this plan writes to a default the probe cannot
+    /// evaluate: one that is not a literal (`CONVERT(int, 1)`, `NEXT VALUE
+    /// FOR`), left by an insert that omits the column or set by an update to
+    /// `DEFAULT`. No arrival can be counted for such a write, and treating it
+    /// as absent let a default that names the deleted row arrive unseen —
+    /// so where the catalog says a foreign key to the deleted row spans the
+    /// column, the write is refused instead (DECISIONS 124).
+    unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
 }
 
 /// The SQL the engine compares a written cell by: the literal, or `None` for
@@ -143,11 +151,22 @@ fn written(value: &Value) -> Option<String> {
 /// A default the engine can compare without running anything: a literal
 /// (the line 80 drew), and not `NULL`, which references no row.
 fn constant_default(default: &str) -> Option<&str> {
+    let d = unwrapped(default);
+    (crate::rows::is_constant(d) && !d.eq_ignore_ascii_case("null")).then_some(d)
+}
+
+/// `NULL` under any number of parentheses: a default that references no
+/// row, and so is neither an arrival nor a write the probe has to refuse.
+fn is_null_default(default: &str) -> bool {
+    unwrapped(default).eq_ignore_ascii_case("null")
+}
+
+fn unwrapped(default: &str) -> &str {
     let mut d = default.trim();
     while d.len() >= 2 && d.starts_with('(') && d.ends_with(')') {
         d = d[1..d.len() - 1].trim();
     }
-    (crate::rows::is_constant(d) && !d.eq_ignore_ascii_case("null")).then_some(d)
+    d
 }
 
 impl AsStored {
@@ -179,7 +198,17 @@ impl AsStored {
                     for (column, (_, after)) in columns {
                         let sql = match after {
                             Cell::Value(v) => written(v),
-                            Cell::Default(d) => constant_default(d).map(|e| format!("({e})")),
+                            Cell::Default(d) => {
+                                let constant = constant_default(d);
+                                if constant.is_none() && !is_null_default(d) {
+                                    moved
+                                        .unprobeable
+                                        .entry(column.clone())
+                                        .or_default()
+                                        .insert(key.clone());
+                                }
+                                constant.map(|e| format!("({e})"))
+                            }
                         };
                         updated.insert(column.clone(), sql);
                     }
@@ -201,6 +230,12 @@ impl AsStored {
                     for (column, default) in defaults {
                         if let Some(expr) = constant_default(default) {
                             inserted.insert(column.clone(), format!("({expr})"));
+                        } else if !is_null_default(default) {
+                            moved
+                                .unprobeable
+                                .entry(column.clone())
+                                .or_default()
+                                .insert(key.clone());
                         }
                     }
                     for (column, value) in &row.0 {
@@ -465,7 +500,19 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             key,
             ..
         } => match names.column(&table.column(key_column)) {
-            Some(stored) => Ok(vec![delete_probe(table, key, &stored, names)?]),
+            Some(stored) => {
+                let mut probes = vec![delete_probe(table, key, &stored, names)?];
+                // And, per table this plan writes to a default the probe
+                // cannot evaluate, the refusal where a foreign key to this
+                // table spans such a column (124). After the count, so a
+                // reader meets the rows first.
+                for (child, moved) in &names.moved {
+                    if let Some(p) = unprobeable_probe(table, key, &stored, child, moved, names)? {
+                        probes.push(p);
+                    }
+                }
+                Ok(probes)
+            }
             None => Ok(Vec::new()),
         },
     }
@@ -770,6 +817,67 @@ fn guarded(
         "CASE {arms}WHEN {} THEN {fragment} ELSE N'' END",
         touches(comparable.keys())
     )
+}
+
+/// A write this plan leaves to a default the probe cannot evaluate, on a
+/// column that a foreign key to the deleted row's table spans. No arrival
+/// can be counted for it, and treating it as absent let a default naming
+/// the deleted row arrive unseen, for `ON DELETE CASCADE` to take the
+/// declared child (DECISIONS 124). Refused by count — a probe that errors
+/// is "unchecked" to `apply`, which then proceeds — with the columns and
+/// rows named, and the remedy: spell the value.
+///
+/// Every foreign key from the child to the parent table, not only the ones
+/// to the deleted key: which key of the parent the default names is exactly
+/// what cannot be evaluated here.
+fn unprobeable_probe(
+    table: &TableName,
+    key: &RowKey,
+    stored: &ColumnRef,
+    child: &TableName,
+    moved: &Moved,
+    names: &AsStored,
+) -> Result<Option<Probe>, DialectError> {
+    let Some(stored_child) = names.table(child) else {
+        return Ok(None);
+    };
+    let mut columns = Vec::new();
+    let mut described = Vec::new();
+    for (column, rows) in &moved.unprobeable {
+        let Some(stored_column) = names.column(&child.column(column)) else {
+            continue;
+        };
+        columns.push(literal(&stored_column.name));
+        let rows: Vec<String> = rows.iter().map(|r| format!("`{r}`")).collect();
+        described.push(format!(
+            "{column} (row{} {})",
+            if rows.len() == 1 { "" } else { "s" },
+            rows.join(", ")
+        ));
+    }
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Probe::new(
+        format!(
+            "foreign-key column(s) of {child} that reference {table} and that this plan writes to \
+             a default the probe cannot evaluate, which may be row `{key}` being deleted: {}; \
+             spell the value",
+            described.join(", ")
+        ),
+        format!(
+            "SELECT COUNT(*) AS n\n  \
+               FROM sys.foreign_keys fk\n  \
+               JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n  \
+               JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n \
+              WHERE fk.referenced_object_id = OBJECT_ID({})\n   \
+                AND fk.parent_object_id = OBJECT_ID({})\n   \
+                AND c.name IN ({});",
+            literal(&qualified(&stored.table)?),
+            literal(&qualified(&stored_child)?),
+            columns.join(", ")
+        ),
+    )))
 }
 
 /// The table and columns as the database currently names them, or `None` when
@@ -1198,7 +1306,7 @@ mod tests {
         // Not a literal: nothing to compare before it runs. NULL: no row.
         // The key is still written, so a key spanning it is asked about,
         // and one spanning `status_code` is not.
-        for default in ["(NEXT VALUE FOR [dbo].[s])", "(NULL)"] {
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))", "(NULL)"] {
             let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
             assert!(!sql.contains("N'status_code'"), "{default}: {sql}");
             assert!(
@@ -1206,6 +1314,37 @@ mod tests {
                 "{default}: {sql}"
             );
         }
+        // A default the probe cannot evaluate may name the deleted row, so
+        // where a foreign key to the table spans the column the write is
+        // refused, by a second probe that counts such columns (124). `NULL`
+        // names no row and needs none.
+        for default in ["(NEXT VALUE FOR [dbo].[s])", "(CONVERT(int, 1))"] {
+            let p = probes(&plan(vec![insert(default), delete.clone()]));
+            assert_eq!(p.len(), 2, "{default}: {p:?}");
+            assert!(
+                p[1].description.contains(
+                    "foreign-key column(s) of dbo.kind that reference dbo.status and that this \
+                     plan writes to a default the probe cannot evaluate, which may be row `old` \
+                     being deleted: status_code (row `9`); spell the value"
+                ),
+                "{}",
+                p[1].description
+            );
+            assert!(
+                p[1].sql
+                    .contains("fk.referenced_object_id = OBJECT_ID(N'[dbo].[status]')")
+                    && p[1]
+                        .sql
+                        .contains("fk.parent_object_id = OBJECT_ID(N'[dbo].[kind]')")
+                    && p[1].sql.contains("c.name IN (N'status_code')"),
+                "{}",
+                p[1].sql
+            );
+        }
+        assert_eq!(
+            probes(&plan(vec![insert("(NULL)"), delete.clone()])).len(),
+            1
+        );
 
         // An update to DEFAULT, the same way.
         let update = Change::UpdateRow {

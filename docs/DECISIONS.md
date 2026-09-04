@@ -1075,3 +1075,37 @@ SPEC is in sync with all of these.
     `dbo.Foo` beside `dbo.foo` — but it predates this phase and is not
     engine-checked anywhere yet; it is recorded here rather than fixed in a
     review round.
+124. **A write left to a default the probe cannot evaluate, on a column a
+    foreign key to the deleted row's table spans, is refused.** 117 counted
+    a literal default as an arrival and called a default that is not a
+    literal "the one arrival no probe can ask about", and treated it as
+    absent: `CONVERT(int, 1)` is deterministic, may well be the deleted
+    key, and the cascade took the declared child while apply recorded
+    success. Which key of the parent such a default names cannot be
+    evaluated before it runs, so the write is refused instead — where the
+    catalog says a foreign key from the child to the parent table spans the
+    column. The refusal is a second probe that *counts* those columns, with
+    the columns and rows in its description and the remedy (spell the
+    value): a probe that errors is "unchecked" to `apply`, which then
+    proceeds, so a `THROW` would have been a refusal nobody heard. `NULL`
+    under any parentheses names no row and is neither an arrival nor
+    refused. An `IDENTITY` column a child insert omits is the engine's to
+    assign and is not in `defaults`; a foreign key on it to the deleted row
+    is not refused here, and is noted rather than pretended away.
+125. **`status` reports a permission the declarations cannot hold as drift,
+    as `verify` does.** 95 and 105 carried such a permission beside the
+    schema, not in it, so `verify` could report it and every command that
+    records a state could refuse it — and `status`, which computes the
+    same checksum from the same schema, could not see it: a `DENY` on a
+    managed role read "ok" on the status screen and "drift" from `verify`.
+    `status` now applies `verify`'s own filter (a managed role's, not an
+    unmanaged one's) to what introspection could not express, and records
+    drift with the permission named, before the checksum it cannot enter.
+126. **Two spellings of one grant target in a role file are refused, not
+    merged.** `SCHEMA::dbo` and `schema::dbo`, or a target with
+    surrounding whitespace, parse to one `GrantTarget`, and the map kept
+    whichever the loader met last: the other's permissions were gone, and
+    the next connected plan revoked them. The loader remembers the spelling
+    each parsed target was first written in and refuses the second by both
+    spellings, the way a column named twice is refused; merging the two
+    lists would hide a declaration that says two different things.

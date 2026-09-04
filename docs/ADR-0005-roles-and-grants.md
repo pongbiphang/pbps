@@ -249,6 +249,15 @@ Decisions taken during implementation that this document did not anticipate:
     the plan needs free are compared with one another the same way first:
     `Reader` beside `reader` holds nothing in the catalog and fails at the
     second `CREATE ROLE` (DECISIONS 123).
+18. **Two spellings of one grant target in a role file are refused.**
+    `SCHEMA::dbo` and `schema::dbo` parse to one target, and the map kept
+    whichever came last, with the other's permissions gone; the loader
+    refuses the second by both spellings, as it refuses a column named twice
+    (DECISIONS 126).
+19. **`status` reports a permission the declarations cannot hold as drift,
+    with the permission named**, under the same managed-role filter `verify`
+    applies: the permission is carried beside the schema the checksum is
+    computed from, so the checksum alone read it as clean (DECISIONS 125).
 
 ## Placement
 

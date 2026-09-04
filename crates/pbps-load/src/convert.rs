@@ -84,7 +84,13 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
         description: dto.description,
         grants: Default::default(),
     };
+    // The spelling each parsed target was first written in: `SCHEMA::dbo`
+    // and `schema::dbo` are one target, and the map would keep whichever
+    // came last — with the other's permissions gone, and the next connected
+    // plan revoking them (DECISIONS 126).
+    let mut spelled: std::collections::BTreeMap<GrantTarget, &str> = Default::default();
     for (target, permissions) in &dto.grants {
+        let written = target.as_str();
         let target = match GrantTarget::from_str(target) {
             Ok(t) => t,
             Err(e) => {
@@ -100,6 +106,18 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
                 continue;
             }
         };
+        if let Some(first) = spelled.insert(target.clone(), written) {
+            errs.push(
+                LoadError::semantic(
+                    src,
+                    to_span(&dto.role.defined),
+                    format!("`{written}` and `{first}` name the same grant target"),
+                    "listed twice",
+                )
+                .with_help("keep one entry per target, with every permission in its list"),
+            );
+            continue;
+        }
         if permissions.is_empty() {
             errs.push(LoadError::semantic(
                 src,
