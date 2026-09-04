@@ -1548,3 +1548,62 @@ SPEC is in sync with all of these.
     invisible — the column no longer holds what would tell them apart. The
     baseline checksum still covers it up to the moment `apply` reads the
     state.
+
+150. **What `apply` records has to be the baseline plus the plan, and the
+    part of that the tool can check exactly is everything the plan does not
+    touch.** 147 moved the read-back inside the transaction, which closed the
+    window after the commit. The window *before* the statements was still
+    open: the pinned checksum is answered at the top of `apply_under_lock`,
+    and between that answer and the read-back sit `refuse_unexpressible`, the
+    whole of `preflight` — many round trips — and the statements themselves.
+    A session that revokes a grant the declarations still hold, or edits a
+    declared row of a table this plan never mentions, in that window is taken
+    in by the read-back and written down as this plan's own result: `apply`
+    reports success, `verify` is clean against it ever after, and only the
+    next connected plan proposes the declaration back.
+    Neither of the obvious repairs works. Opening the transaction earlier
+    moves nothing: SQL Server's metadata reads are read-committed whatever the
+    isolation level, so membership in a transaction is not what keeps another
+    session out, and raising the isolation level to hold catalog locks for the
+    length of a deployment is a cure worse than the disease. Comparing the
+    read-back against "the plan applied to the baseline" is not available
+    either — computing that is exactly what the read-back exists to avoid,
+    since only the engine's stored form compares equal on the next drift check
+    (SPEC §8.2).
+    What *is* exact needs no dialect knowledge at all: **for every managed
+    object no change of this plan names, the state after is the state before.**
+    `refuse_unplanned_movement` compares the two, over tables, modules and
+    roles, and the apply's own transaction rolls back on a difference. The
+    objects the plan does name are exempt because changing them is the point,
+    and they are held by the plan's own preconditions and postconditions (132,
+    136, 143) and by the locks its statements take. Both ends of a rename
+    count as named — the recorded state knows the object by one name and the
+    read-back by the other, and a comparison that took one end would read
+    every rename as a table vanishing and another appearing.
+    Two reads, one question. The baseline is read once and projected twice
+    (`baseline_state`): the checksum under the recorded state's spelling and
+    the pinned union of scopes, because that is what the plan pinned (98); the
+    comparison under the plan's scopes with no reference at all, which is
+    exactly how the read-back will be projected. Projecting them differently
+    is the false-refusal trap — a cell at its default has three spellings
+    (`ObservedRow`) and an `ensure` block that drops a key reads fewer rows
+    than the recorded scope, so two views taken under two questions differ
+    without anything having moved. Reading the engine twice would be worse
+    still: it would ask the same thing twice and could get two answers, which
+    is the very thing being detected.
+    `refuse_unexpressible` runs on the read-back too, for the same reason it
+    runs on every state a command writes down (110): a `WITH GRANT OPTION`
+    that arrives mid-apply is as unrecordable as one that was there at the
+    start.
+    **`apply --staged` is not covered, for the reason 147 gives.** It runs
+    each statement outside a transaction on purpose, so there is nothing to
+    roll back and a refusal at the end would only strand the environment
+    mid-deployment. Its guards remain the per-statement postconditions, the
+    checkpoint written after each statement, and the drift check every
+    `--resume` makes against that checkpoint.
+    The race cannot be staged through two sessions in a test, so the live case
+    uses an `AFTER INSERT` trigger that writes a row into a *different*
+    declared table: a change landing inside the apply's own transaction,
+    between the two reads, which is the window exactly. With the comparison
+    reverted, `apply` reports success and records it.
+

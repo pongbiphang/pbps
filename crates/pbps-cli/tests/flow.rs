@@ -6612,3 +6612,160 @@ fn validate_since_evaluates_only_what_changed() {
     assert_eq!(messages.len(), 1, "{v}");
     assert!(messages[0].contains("OldTable"), "{v}");
 }
+
+/// `apply` records the database read back, not the plan applied to the old
+/// state — so a change another session makes while the plan is running would
+/// be written down as this plan's own result, and every later `verify` would
+/// call it clean (DECISIONS 150).
+///
+/// Staged with an `AFTER INSERT` trigger, because that is the one shape a test
+/// can time exactly: it fires inside the apply's own transaction, between the
+/// baseline read and the read-back, which is precisely the window. What it
+/// does — putting a row into a *different* declared table — is something no
+/// statement of the plan asks for, and nothing else in the run would notice:
+/// the pinned checksum was answered before the statements, and the per-row
+/// postconditions only speak for the rows the plan itself writes.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_during_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("apply-during");
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    first: {}
+",
+    );
+    std::fs::write(
+        d.dir.join("schema/dbo.other.yml"),
+        "table: dbo.other
+columns:
+  code: {type: varchar(20), nullable: false}
+primary_key: {name: pk_other, columns: [code]}
+data:
+  mode: exact
+  rows:
+    kept: {}
+",
+    )
+    .unwrap();
+    // Offline first, to mint the identities `bootstrap` insists on.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["verify", "--db", &connection])), 0);
+
+    // The other session, wound up to go off in the middle of the apply.
+    // Through `EXEC`, because `CREATE TRIGGER` has to be first in its batch
+    // and this connection has just said `USE`.
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; INSERT INTO dbo.other (code) VALUES (''rogue'');');");
+
+    // A revision that touches `dbo.t` and says nothing at all about
+    // `dbo.other`.
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    first: {}
+    second: {}
+",
+    );
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("dbo.other"),
+        "the refusal must name what moved: {err}"
+    );
+    assert!(err.contains("rolled back"), "{err}");
+
+    // And nothing of the plan stayed: not its own row, and not the trigger's.
+    let rows = |table: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let r = c
+                .query(&format!("SELECT COUNT(*) FROM {table};"))
+                .await
+                .expect("count");
+            r[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    assert_eq!(rows("dbo.t"), 1, "the plan's insert must have rolled back");
+    assert_eq!(rows("dbo.other"), 1, "the trigger's row must have gone too");
+    // The ledger says what it said before — the apply recorded nothing, so
+    // the environment still matches the state bootstrap wrote — and the
+    // declarations still ask for the row a plan would put there. Both halves
+    // matter: a recorded state is what `verify` measures against, and had the
+    // read-back been written down, this environment would have been declared
+    // clean against a table holding a row nobody declared.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the recorded state must be untouched: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(
+        stdout(&o).contains("row second"),
+        "the plan is still to be applied: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}

@@ -577,6 +577,99 @@ impl Change {
         })
     }
 
+    /// Every name in the tables-and-modules namespace this change reaches:
+    /// the one [`Change::table`] gives, plus the far end of a rename, which
+    /// is a second name the same object answers to across one plan.
+    ///
+    /// For a caller asking "did this plan touch that object", both ends have
+    /// to be in the answer: the recorded state knows a renamed table by its
+    /// old name and the plan's result knows it by its new one, and an object
+    /// present under one name and absent under the other is exactly what a
+    /// rename looks like from the outside.
+    // Exhaustive rather than a wildcard, for the reason the body gives: a
+    // change added later that moves an object's name has to be named here, or
+    // a caller asking what this plan touched would be told about one end of it
+    // and left to bless whatever happened at the other.
+    pub fn objects(&self) -> impl Iterator<Item = &TableName> {
+        let far_end = match self {
+            Change::RenameTable { to, .. } => Some(to),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        };
+        self.table().into_iter().chain(far_end)
+    }
+
+    /// Every role name this change reaches, both ends of a rename included,
+    /// for the reason [`Change::objects`] gives. Empty for every change that
+    /// is not about a principal.
+    // Exhaustive rather than a wildcard: a change added later that names a
+    // role has to be classified here, or a caller asking what this plan
+    // touched would be told "nothing" about it.
+    pub fn roles(&self) -> impl Iterator<Item = &str> {
+        let (one, two) = match self {
+            Change::CreateRole { name, .. }
+            | Change::DropRole { name, .. }
+            | Change::Grant { role: name, .. }
+            | Change::Revoke { role: name, .. } => (Some(name.as_str()), None),
+            Change::RenameRole { from, to, .. } => (Some(from.as_str()), Some(to.as_str())),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. } => (None, None),
+        };
+        one.into_iter().chain(two)
+    }
+
     /// The module this change acts on, if it is a module change at all.
     pub fn module_name(&self) -> Option<&ObjectName> {
         match self {

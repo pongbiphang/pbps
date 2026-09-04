@@ -81,6 +81,49 @@ async fn managed_state(
     Ok(scoped)
 }
 
+/// The baseline an `apply` measures itself against, projected twice out of one
+/// read.
+///
+/// The two projections answer two different questions and cannot be one.
+/// The **checksum** has to be taken under the recorded state's spelling of a
+/// cell at its default ([`pbps_model::ObservedRow`]) and under the union of
+/// the recorded and declared scopes, because that is what the plan pinned
+/// (DECISIONS 98). The **comparison** made after the statements is against a
+/// read-back that has neither: `apply` records what it just wrote, from the
+/// plan's scope and with no recorded state to spell it. So the second view is
+/// projected exactly the way that read-back will be — the plan's scopes, no
+/// reference — and any difference between the two is then a change, not a
+/// difference of question.
+///
+/// One read and two projections, never two reads: two reads would ask the
+/// engine the same thing twice and could get two answers, which is the very
+/// thing the comparison exists to detect.
+async fn baseline_state(
+    conn: &mut Conn,
+    ids: &IdsFile,
+    modules: &BTreeSet<ObjectName>,
+    unmanaged: pbps_config::Unmanaged,
+    scopes: &DataScopes,
+    recorded: &Schema,
+    as_the_apply_reads_it: &DataScopes,
+) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
+    let read: BTreeMap<TableName, RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let managed = managed_state_full(conn, ids, modules, unmanaged, &read).await?;
+    let comparable = managed.scoped.schema.clone().with_observed_rows(
+        &managed.rows,
+        as_the_apply_reads_it,
+        &Schema::default(),
+    )?;
+    let mut scoped = managed.scoped;
+    scoped.schema = scoped
+        .schema
+        .with_observed_rows(&managed.rows, scopes, recorded)?;
+    Ok((scoped, comparable))
+}
+
 /// Introspects, cuts the result down to the managed set, reads the rows of
 /// every table in `read`, and reports whatever the read itself could not
 /// express.
@@ -753,6 +796,104 @@ fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> 
          Resolve it by hand, then {then}.",
         scoped.unexpressible.join("\n  ")
     );
+}
+
+/// Refuses a state that moved while the plan was running, and not by the plan.
+///
+/// `apply` reads the baseline before the statements and reads the state back
+/// after them, and it is the second read it records (SPEC §8.2, DECISIONS
+/// 147). Between the two, another session can change something this plan
+/// never mentions — revoke a grant the declarations still hold, edit a
+/// declared row of a table the plan does not touch — and the read-back takes
+/// it in as if the plan had produced it. `apply` then reports success,
+/// `verify` is clean against the newly blessed change, and only the next
+/// connected plan proposes the declaration back. The pinned checksum does not
+/// reach it: it is read before the statements, and this happens after.
+///
+/// Locking every managed object for the length of an apply is not on offer,
+/// and moving the checksum later only moves the window. What is exact is the
+/// half of the question the tool can answer with no dialect knowledge at all:
+/// **for every object this plan does not touch, the state after is the state
+/// before.** The objects it does touch are held by the plan's own
+/// preconditions and postconditions (132, 136, 143) and by the locks its own
+/// statements take (DECISIONS 150).
+///
+/// Both ends of a rename count as touched, since the same object is one name
+/// before and another after; a created object is absent on one side and a
+/// dropped one on the other, and both are named by the change that does it.
+fn refuse_unplanned_movement(
+    changes: &pbps_model::ChangeSet,
+    before: &Schema,
+    after: &Schema,
+    label: &str,
+) -> anyhow::Result<()> {
+    let mut objects: BTreeSet<&TableName> = BTreeSet::new();
+    let mut roles: BTreeSet<&str> = BTreeSet::new();
+    for p in &changes.changes {
+        objects.extend(p.change.objects());
+        roles.extend(p.change.roles());
+    }
+
+    let mut moved = Vec::new();
+    let named = |n: &TableName| objects.contains(n);
+    compare("", &before.tables, &after.tables, named, &mut moved);
+    compare("", &before.modules, &after.modules, named, &mut moved);
+    compare(
+        "role ",
+        &before.roles,
+        &after.roles,
+        |n: &String| roles.contains(n.as_str()),
+        &mut moved,
+    );
+    if moved.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` moved while this plan was running, and not because of it:\n  {}\n\
+         Nothing has been applied — the transaction was rolled back. The state `apply` \
+         records is the database read back, so another session's change committed during \
+         the run would have been written down as this plan's own result, and every later \
+         `verify` would call it clean. `pbps verify` shows what moved; then apply again.",
+        moved.join("\n  ")
+    );
+}
+
+/// One namespace of the two states, compared over the names the plan leaves
+/// alone. Generic over the key so tables, modules and roles get the same
+/// answer from the same code: three near-identical loops is three places for
+/// one of them to stop being written.
+fn compare<K, V>(
+    kind: &str,
+    before: &BTreeMap<K, V>,
+    after: &BTreeMap<K, V>,
+    touched: impl Fn(&K) -> bool,
+    moved: &mut Vec<String>,
+) where
+    K: Ord + std::fmt::Display,
+    V: PartialEq,
+{
+    for (name, was) in before {
+        if touched(name) {
+            continue;
+        }
+        match after.get(name) {
+            Some(now) if now == was => {}
+            Some(_) => moved.push(format!(
+                "{kind}{name} is not what the plan was approved over"
+            )),
+            None => moved.push(format!(
+                "{kind}{name} is gone, and no change of this plan drops it"
+            )),
+        }
+    }
+    for name in after.keys() {
+        if touched(name) || before.contains_key(name) {
+            continue;
+        }
+        moved.push(format!(
+            "{kind}{name} is there, and no change of this plan creates it"
+        ));
+    }
 }
 
 /// `pbps verify` — the drift check (SPEC §8.2).
@@ -1966,16 +2107,18 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     refuse_mid_deployment(&entry, &target.label)?;
     let recorded_ids = entry.snapshot.ids.clone();
     let recorded_modules = managed_modules(Some(&entry.snapshot), None);
-    let scoped = managed_state(
+    // The scopes the closing read-back will use, expressed in the names the
+    // database has *now* — the second projection is compared against that
+    // read, so it has to ask it the same question.
+    let planned_scopes = scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids);
+    let (scoped, before) = baseline_state(
         conn,
         &recorded_ids,
         &recorded_modules,
         project.config.unmanaged,
-        &pinned_scopes(
-            &entry.snapshot.schema.data_scopes(),
-            &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
-        ),
+        &pinned_scopes(&entry.snapshot.schema.data_scopes(), &planned_scopes),
         &entry.snapshot.schema,
+        &planned_scopes,
     )
     .await?;
 
@@ -2026,6 +2169,23 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     )
     .await;
     let after = rolling_back(conn, read).await?;
+    // Everything this plan does not touch has to be what the baseline held.
+    // The read above is what gets recorded, so a change another session made
+    // between the two reads would otherwise be blessed as this plan's result
+    // (DECISIONS 150). Inside the transaction, so a refusal costs the run and
+    // nothing else. And the same rule the recording commands follow: a
+    // permission the declarations cannot express stops a state being written
+    // down, whether it was there at the start or arrived during the run (110).
+    rolling_back(
+        conn,
+        refuse_unplanned_movement(&plan.changes, &before, &after.schema, &target.label),
+    )
+    .await?;
+    rolling_back(
+        conn,
+        refuse_unexpressible(&after, &target.label, "apply again"),
+    )
+    .await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -2726,6 +2886,140 @@ mod tests {
             // The remedy names the command the operator actually ran.
             assert!(msg.contains(then), "{msg}");
         }
+    }
+
+    /// The guard that keeps `apply` from recording somebody else's change as
+    /// its own: everything the plan does not touch has to come back the way
+    /// the baseline had it, and everything it does touch is exempt because
+    /// changing it is the whole point (DECISIONS 150).
+    #[test]
+    fn a_change_no_statement_of_this_plan_makes_refuses_the_apply() {
+        fn table(ty: &str) -> pbps_model::Table {
+            let mut t = pbps_model::Table::default();
+            t.columns
+                .insert("c".to_owned(), pbps_model::Column::new(ty.parse().unwrap()));
+            t
+        }
+        let dbo = || pbps_model::GrantTarget::Schema("dbo".to_owned());
+        fn role(held: &[pbps_model::Permission]) -> pbps_model::Role {
+            let mut grants = BTreeMap::new();
+            if !held.is_empty() {
+                grants.insert(
+                    pbps_model::GrantTarget::Schema("dbo".to_owned()),
+                    held.iter().copied().collect(),
+                );
+            }
+            pbps_model::Role {
+                description: None,
+                grants,
+            }
+        }
+        let schema = |cols: &str, held: &[pbps_model::Permission]| {
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), table(cols));
+            s.roles.insert("app".to_owned(), role(held));
+            s
+        };
+        let changes = |c: Vec<pbps_model::Change>| pbps_model::ChangeSet {
+            changes: c.into_iter().map(pbps_model::PlannedChange::new).collect(),
+        };
+        let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(cs, before, after, "prod").map_err(|e| format!("{e:#}"))
+        };
+
+        let before = schema("int", &[pbps_model::Permission::Select]);
+        // Nothing moved: the plan may be empty and the apply still records.
+        refuse(&changes(vec![]), &before, &before).expect("nothing moved");
+
+        // A grant revoked by another session while the plan ran. The plan
+        // never mentions the role, so nothing else would ever notice: the
+        // read-back records the revocation and the next `verify` is clean.
+        let robbed = schema("int", &[]);
+        let e = refuse(&changes(vec![]), &before, &robbed).expect_err("the role moved");
+        assert!(e.contains("role app"), "{e}");
+        assert!(e.contains("rolled back"), "{e}");
+
+        // The same change, when it *is* this plan's: a plan that revokes the
+        // grant must not be refused for having revoked it.
+        let planned = changes(vec![pbps_model::Change::Revoke {
+            role: "app".to_owned(),
+            target: dbo(),
+            permissions: [pbps_model::Permission::Select].into_iter().collect(),
+        }]);
+        refuse(&planned, &before, &robbed).expect("the plan's own change");
+
+        // A table retyped behind the plan's back, and the same retype planned.
+        let retyped = schema("bigint", &[pbps_model::Permission::Select]);
+        let e = refuse(&changes(vec![]), &before, &retyped).expect_err("the table moved");
+        assert!(e.contains("dbo.t"), "{e}");
+        let planned = changes(vec![pbps_model::Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("dbo.t".parse().unwrap(), "c"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+        }]);
+        refuse(&planned, &before, &retyped).expect("the plan's own change");
+
+        // Appearing and vanishing are movements too, and neither reads as
+        // "nothing there": a table dropped by somebody else is not the same
+        // answer as a table this plan drops.
+        let mut gone = before.clone();
+        gone.tables.remove(&"dbo.t".parse::<TableName>().unwrap());
+        let e = refuse(&changes(vec![]), &before, &gone).expect_err("the table went");
+        assert!(e.contains("dbo.t is gone"), "{e}");
+        let e = refuse(&changes(vec![]), &gone, &before).expect_err("the table arrived");
+        assert!(e.contains("dbo.t is there"), "{e}");
+    }
+
+    /// Both ends of a rename are the plan's business. The recorded state knows
+    /// the object by its old name and the read-back by its new one, so a
+    /// comparison that took only one end would see the rename itself as a
+    /// table vanishing and another appearing — and refuse every rename.
+    #[test]
+    fn a_rename_exempts_the_name_at_each_end() {
+        let mut before = Schema::default();
+        before
+            .tables
+            .insert("dbo.old".parse().unwrap(), pbps_model::Table::default());
+        before.roles.insert(
+            "was".to_owned(),
+            pbps_model::Role {
+                description: None,
+                grants: Default::default(),
+            },
+        );
+        let mut after = Schema::default();
+        after
+            .tables
+            .insert("dbo.new".parse().unwrap(), pbps_model::Table::default());
+        after.roles.insert(
+            "now".to_owned(),
+            pbps_model::Role {
+                description: None,
+                grants: Default::default(),
+            },
+        );
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let cs = pbps_model::ChangeSet {
+            changes: [
+                pbps_model::Change::RenameTable {
+                    uid: uid.clone(),
+                    from: "dbo.old".parse().unwrap(),
+                    to: "dbo.new".parse().unwrap(),
+                },
+                pbps_model::Change::RenameRole {
+                    uid,
+                    from: "was".to_owned(),
+                    to: "now".to_owned(),
+                },
+            ]
+            .into_iter()
+            .map(pbps_model::PlannedChange::new)
+            .collect(),
+        };
+        refuse_unplanned_movement(&cs, &before, &after, "prod").expect("a rename is not movement");
     }
 
     /// A renamed table's declaration is found under the name the database
