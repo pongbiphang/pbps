@@ -334,8 +334,15 @@ mod tests {
 
     #[test]
     fn version_is_written_and_checked() {
-        let json = serde_json::to_string(&IdsFile::default()).unwrap();
-        assert!(json.contains(r#""version":1"#));
+        // The parsed field, not a substring: a literal version in an
+        // assertion is one nothing updates when the constant moves, and a
+        // nested `version` elsewhere in the document would answer for it.
+        let json: serde_json::Value = serde_json::to_value(IdsFile::default()).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
+            "{json}"
+        );
 
         let mut f = sample();
         f.version = 99;

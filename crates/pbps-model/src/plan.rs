@@ -54,6 +54,15 @@ use crate::schema::Schema;
 /// postconditions. That is the exact failure this number exists to prevent.
 /// One bump covers all six: they arrived in one release cycle, and a version
 /// per guard would invalidate saved plans six times over for one story.
+///
+/// Still 4 for `DeleteRow`'s `after_types` and for `types` now naming a
+/// retyped column as well (DECISIONS 149): version 4 has never shipped, so
+/// this is the same cycle those six guards arrived in, and a version nobody
+/// can hold a plan from is not one a reader has to tell apart. What the pair
+/// *means* is why it could not be a silent addition: a version 4 reader
+/// without it would take `types` for the type the column has now, and hold a
+/// retyped cell to the old type's spelling of a value the engine has already
+/// converted — refusing every such delete. It refuses the file instead.
 pub const CURRENT_VERSION: u32 = 4;
 
 /// Where a plan came from, and therefore whether it may be applied.
@@ -394,12 +403,17 @@ mod tests {
     /// than misread.
     #[test]
     fn the_format_version_is_written() {
-        let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(
-            json.contains(&format!(r#""version":{CURRENT_VERSION}"#)),
+        // The parsed field, not a substring: a plan embeds an `IdsFile`,
+        // whose own `version` would answer a `contains` the day the two
+        // constants meet.
+        let json: serde_json::Value =
+            serde_json::to_value(plan_over(ChangeSet::default())).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
             "{json}"
         );
-        assert!(json.contains(r#""origin":"database""#), "{json}");
+        assert_eq!(json["origin"], serde_json::json!("database"), "{json}");
     }
 
     /// The mode is part of the pinned artifact: a plan approved as staged must

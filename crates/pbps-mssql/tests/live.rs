@@ -1919,6 +1919,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: std::collections::BTreeMap::new(),
                 types: std::collections::BTreeMap::new(),
+                after_types: Default::default(),
             },
         )],
     };
@@ -2204,6 +2205,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         cause: pbps_model::change::DeleteCause::Undeclared,
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
+        after_types: Default::default(),
     });
     let alone = pbps_model::ChangeSet {
         changes: vec![delete.clone()],
@@ -2878,6 +2880,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
         cause: pbps_model::change::DeleteCause::Undeclared,
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
+        after_types: Default::default(),
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
@@ -2966,6 +2969,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
         ]
         .into_iter()
         .collect(),
+        after_types: Default::default(),
     };
     let sql = Mssql.emit(&delete, Default::default()).expect("emit")[0]
         .sql
@@ -3059,6 +3063,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         cause: pbps_model::change::DeleteCause::Undeclared,
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
+        after_types: Default::default(),
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
@@ -3406,6 +3411,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         cause: pbps_model::change::DeleteCause::Undeclared,
         row: std::collections::BTreeMap::new(),
         types: std::collections::BTreeMap::new(),
+        after_types: Default::default(),
     };
     let sql_of = |change: &pbps_model::Change| {
         let stmts = Mssql.emit(change, Default::default()).expect("emit");
@@ -4879,4 +4885,185 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     let _ = master
         .execute(&format!("USE master; DROP LOGIN [{login}];"))
         .await;
+}
+
+/// A revision that retypes a column *and* changes one of its declared rows
+/// still holds that row to what the plan recorded (DECISIONS 149).
+///
+/// Only a live server can answer this. `AlterColumnType` sorts before every
+/// row change, so by the time the `UPDATE` or `DELETE` runs the column holds
+/// the value the engine converted, and the recorded text is the old type's
+/// spelling of it. 146 read that as "neither type can compare it" and dropped
+/// the predicate — which dropped the stale-row guard on exactly the cell a
+/// concurrent session is most likely to have moved. The predicate now asks the
+/// engine to run the same conversion on the recorded text, and what has to be
+/// measured is that the answer matches for an untouched row and does not for
+/// an edited one, across the renderings that carry a style.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+
+    fn rows(rows: &[(&str, &[(&str, Value)])]) -> std::collections::BTreeMap<RowKey, Row> {
+        rows.iter()
+            .map(|(k, cells)| {
+                (
+                    RowKey::from(*k),
+                    cells
+                        .iter()
+                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .collect::<Row>(),
+                )
+            })
+            .collect()
+    }
+    let text = |s: &str| Value::Text(s.to_owned());
+
+    // `pct` is `decimal(5,2)` and `since` a `varchar(10)`: two renderings that
+    // need a style to come back, and two conversions that lose something.
+    let table = |pct: &str, since: &str, rs: &[(&str, &[(&str, Value)])]| {
+        let mut t = Table::default();
+        t.columns
+            .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+        t.columns.insert("pct".to_owned(), Column::new(ty(pct)));
+        t.columns.insert("since".to_owned(), Column::new(ty(since)));
+        t.columns
+            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: rows(rs),
+        });
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "t"), t);
+        s
+    };
+
+    let first = table(
+        "decimal(5,2)",
+        "varchar(10)",
+        &[
+            (
+                "keep",
+                &[
+                    ("pct", text("1.50")),
+                    ("since", text("2026-09-03")),
+                    ("note", text("first")),
+                ],
+            ),
+            (
+                "drop",
+                &[
+                    ("pct", text("2.75")),
+                    ("since", text("2026-09-01")),
+                    ("note", text("doomed")),
+                ],
+            ),
+        ],
+    );
+    let ids = mint_ids(&first, &IdsFile::default(), &[]);
+
+    let mut db = TestDb::create("retyped_row").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &first, &ids),
+    )
+    .await;
+
+    // The second revision does all three at once: retype both columns, change
+    // `keep`'s note, and stop declaring `drop`.
+    let second = table(
+        "int",
+        "date",
+        &[(
+            "keep",
+            &[
+                ("pct", text("1")),
+                ("since", text("2026-09-03")),
+                ("note", text("second")),
+            ],
+        )],
+    );
+    let second_ids = mint_ids(&second, &ids, &[]);
+    let changes = plan(&first, &ids, &second, &second_ids);
+
+    async fn one(conn: &mut Conn, sql: &str) -> i32 {
+        let rows = conn
+            .query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected:\n{sql}\n{e}"));
+        rows[0].try_get_at(0).unwrap().unwrap()
+    }
+
+    // A cell another session moves after the plan was read, on the column the
+    // plan retypes, in the row the plan updates and in the row it deletes.
+    // Under 146 both went through: the `ALTER` converted the new value and the
+    // row change overwrote or removed it with nothing saying so.
+    for (key, column, edit) in [
+        ("keep", "pct", "pct = 9.25"),
+        ("keep", "since", "since = '2026-01-01'"),
+        ("drop", "pct", "pct = 9.25"),
+        ("drop", "since", "since = '2026-01-01'"),
+    ] {
+        db.conn
+            .execute(&format!("UPDATE dbo.t SET {edit} WHERE code = '{key}';"))
+            .await
+            .expect("a hand edit after the plan");
+        let err = try_apply(&mut db.conn, &changes)
+            .await
+            .expect_err("the row is not as the plan recorded it");
+        assert!(
+            err.contains(&format!("dbo.t row `{key}` is not as the plan recorded it")),
+            "a {column} edit under a retyped column was not seen:\n{err}"
+        );
+        assert_eq!(
+            one(
+                &mut db.conn,
+                "SELECT COUNT(*) FROM dbo.t WHERE code = 'drop';"
+            )
+            .await,
+            1,
+            "nothing of the plan stays after the refusal"
+        );
+        // Put it back the way the plan recorded it, in the type the column
+        // still has, so the next case starts from the reviewed baseline.
+        db.conn
+            .execute(
+                "UPDATE dbo.t SET pct = 1.50, since = '2026-09-03' WHERE code = 'keep';\n\
+                 UPDATE dbo.t SET pct = 2.75, since = '2026-09-01' WHERE code = 'drop';",
+            )
+            .await
+            .expect("the edits undone");
+    }
+
+    // And with the rows as the plan recorded them, the same plan goes through:
+    // the conversion the predicate asks for is the one the `ALTER` ran, so an
+    // untouched row still matches after it.
+    try_apply(&mut db.conn, &changes)
+        .await
+        .expect("the rows are as the plan recorded them");
+    assert_eq!(
+        one(
+            &mut db.conn,
+            "SELECT COUNT(*) FROM dbo.t WHERE code = 'keep' AND pct = 1 \
+             AND since = '2026-09-03' AND note = N'second';"
+        )
+        .await,
+        1,
+        "the update must have run against the converted row"
+    );
+    assert_eq!(
+        one(
+            &mut db.conn,
+            "SELECT COUNT(*) FROM dbo.t WHERE code = 'drop';"
+        )
+        .await,
+        0,
+        "the undeclared row must have been deleted"
+    );
+
+    db.drop().await;
 }

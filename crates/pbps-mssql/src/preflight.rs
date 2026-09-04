@@ -1474,6 +1474,7 @@ mod tests {
             cause: pbps_model::change::DeleteCause::Undeclared,
             row: BTreeMap::new(),
             types: BTreeMap::new(),
+            after_types: Default::default(),
         }]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -1529,6 +1530,7 @@ mod tests {
             cause: pbps_model::change::DeleteCause::Undeclared,
             row: BTreeMap::new(),
             types: BTreeMap::new(),
+            after_types: Default::default(),
         };
         let insert = |default: &str| Change::InsertRow {
             table: tname("dbo.kind"),
@@ -1666,6 +1668,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ]);
         let p = probes(&cs);
@@ -1736,6 +1739,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ]);
         let p = probes(&cs);
@@ -1800,6 +1804,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -1808,6 +1813,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ]);
         let p = probes(&cs);
@@ -1849,6 +1855,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ]);
         let p = probes(&cs);
@@ -1882,6 +1889,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ]);
         assert!(probes(&cs).is_empty());

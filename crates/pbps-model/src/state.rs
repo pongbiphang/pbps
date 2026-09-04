@@ -313,6 +313,11 @@ mod tests {
         assert!(snap.matches(&schema_with("nvarchar(255)")));
     }
 
+    /// Asserted on the parsed document, not on a substring of it. A snapshot
+    /// embeds an [`IdsFile`], which carries a `version` of its own, so
+    /// `contains(r#""version":1"#)` went on passing after this format was
+    /// bumped to 2, 3 and 4 — matching the nested field every time and
+    /// checking nothing about the snapshot's own.
     #[test]
     fn version_is_recorded() {
         let snap = StateSnapshot::new(
@@ -321,9 +326,13 @@ mod tests {
             IdsFile::default(),
             "leon",
         );
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains(r#""version":1"#));
-        assert!(json.contains(r#""kind":"baseline""#));
+        let json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
+            "{json}"
+        );
+        assert_eq!(json["kind"], serde_json::json!("baseline"), "{json}");
     }
 
     /// The ledger writes `kind` into a column of its own so `status` can filter

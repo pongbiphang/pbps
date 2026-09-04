@@ -1454,6 +1454,11 @@ SPEC is in sync with all of these.
     `decimal(5,2)` to `decimal(9,4)` renders `1.50` as `1.5000`, so a widening
     within one base type is no safer than a change of base.
 
+    **Superseded by 149.** The reasoning above is right about every direct
+    comparison and wrong about the conclusion: the conversion the engine
+    performed *is* expressible, just not as "the recorded text in the new
+    type". Carrying no type dropped the stale-row guard with the comparison.
+
 147. **The read-back and the ledger entry are inside the apply's own
     transaction.** What `apply` records is the database read back, not the
     plan applied to the old state (SPEC §8.2) — and that read used to happen
@@ -1502,3 +1507,44 @@ SPEC is in sync with all of these.
     scratch database was built from the previous revision too. Only the table
     and the key column travel: every other declared value reaches the engine
     as a converted literal, under no name at all.
+
+149. **A retyped column carries both of its types, and the engine converts
+    between them.** 146 read "neither type can compare this cell" as "hold it
+    to nothing", and that dropped more than a comparison: the precondition on
+    a row write is also the *stale-row* guard (122, 136, 143). A revision that
+    retypes a column and changes one of that table's declared rows therefore
+    updated or deleted the row without checking it at all — and that is the
+    cell most likely to have moved, since a column being retyped is a column
+    somebody is working on. Another session edits it after the plan's read;
+    `AlterColumnType` converts whatever it now holds; the `UPDATE` overwrites
+    it or the `DELETE` removes it, `@@ROWCOUNT` is 1, and the apply records
+    the loss as its own result.
+    What 146 ruled out was converting the recorded text straight into the new
+    type — correctly: `CONVERT(int, N'1.50')` is Msg 245, and the value the
+    column holds came from a `decimal(5,2)`, not from that text. What it did
+    not try is the two-step the engine itself took: the recorded text back
+    into the type that *rendered* it, and then the conversion the `ALTER` ran.
+    So `UpdateRow` and `DeleteRow` carry the pair — `types` the type the text
+    was read in, `after_types` the type the column has when the statement runs
+    — and the emitter writes
+    `read_expr(col, now) = read_expr(TRY_CONVERT(now, TRY_CONVERT(read, N'…')), now)`.
+    The tool computes no conversion; it asks for the one already performed.
+    Measured on SQL Server 2025, across every rendering that carries a style:
+    `decimal(5,2)`→`int` (`1.50`→`1`, truncating, and `TRY_CONVERT` truncates
+    identically), `varchar(10)`→`date` under style 126, `varbinary`→`binary`
+    under style 1, `char(10)`↔`varchar(10)` with the padding both sides agree
+    on, `float`→`decimal` under style 3 and `money`→`decimal` under style 2.
+    Every untouched row matched; a row edited to `9.25` beforehand did not,
+    and the apply rolled back naming the row.
+    `TRY_CONVERT`, not `CONVERT`: a recorded value the new type cannot hold
+    means the cell is not what the plan recorded, and "the row is not as the
+    plan recorded it" is a better answer than a conversion error raised from
+    inside the write. A type with no comparison at either end — `xml`, `text`,
+    the spatial types — still holds nothing, which is 146's answer kept for
+    the case it was actually right about.
+    **One thing no predicate can see**, and it is named rather than left to be
+    discovered: an edit the conversion erases. `1.50` and `1.99` are both `1`
+    once the column is `int`, so a session that moved the cell between them is
+    invisible — the column no longer holds what would tell them apart. The
+    baseline checksum still covers it up to the moment `apply` reads the
+    state.

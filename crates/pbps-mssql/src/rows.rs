@@ -59,7 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::DbError;
 use pbps_dialect::DialectError;
-use pbps_model::{ObservedRow, Row, RowKey, RowScope, Table, TableName, Value};
+use pbps_model::{ColumnType, ObservedRow, Row, RowKey, RowScope, Table, TableName, Value};
 
 use crate::emit::qualified;
 use crate::ident::{literal, quote};
@@ -587,6 +587,38 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
         "geometry" | "geography" | "hierarchyid" => format!("{quoted}.ToString()"),
         "char" | "nchar" => format!("RTRIM({quoted})"),
         _ => format!("CONVERT(nvarchar(max), {quoted})"),
+    }
+}
+
+/// The expression that turns text [`read_expr`] produced back into a value of
+/// the type it was read from — `read_expr`'s inverse, and only ever used as
+/// its inverse.
+///
+/// It exists so a cell can be held to what the plan recorded across a column
+/// this same plan retypes. The recorded text is the *old* type's spelling and
+/// the column now holds the value the `ALTER` converted, so neither spelling
+/// compares with the other: what does compare is the recorded text put back
+/// through the old type and then converted the way the engine converted the
+/// column (DECISIONS 149). The tool never computes that conversion — it asks
+/// the engine for it.
+///
+/// Each style is the one `read_expr` wrote with, because parsing has to undo
+/// exactly what rendering did: `126` for the date and time types, `1` for the
+/// `0x` form of binary. The rest need none — `CONVERT` reads the 17-digit
+/// float form and the four-decimal money form without being told, and a
+/// `char` re-pads to its own width, which is what the column holds anyway.
+///
+/// `TRY_CONVERT`, not `CONVERT`: a recorded text the target type cannot hold
+/// means the cell is not what the plan recorded, and the caller's own
+/// "the row is not as the plan recorded it" is a better answer than the
+/// engine's conversion error (Msg 245).
+pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> String {
+    match ty.base.as_str() {
+        "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
+            format!("TRY_CONVERT({ty}, {literal}, 126)")
+        }
+        "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
+        _ => format!("TRY_CONVERT({ty}, {literal})"),
     }
 }
 

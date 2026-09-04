@@ -150,6 +150,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key,
             row,
             types,
+            after_types,
             ..
         } => {
             // Keyed *and* held to the row the plan recorded. The checksum
@@ -162,7 +163,11 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // (DECISIONS 143).
             let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
             for (column, cell) in row {
-                predicates.extend(recorded_cell(column, cell, types.get(column))?);
+                predicates.extend(recorded_cell(
+                    column,
+                    cell,
+                    Held::of(types.get(column), after_types.get(column)),
+                )?);
             }
             one(atomically(&format!(
                 // The guard, the delete and the checks after it are one
@@ -563,7 +568,11 @@ fn insert_row(
     // compares as the engine compares, which is the check it always had.
     let mut cells = Vec::new();
     for (column, v) in row.columns() {
-        let held = recorded_cell(column, &Cell::Value(v.clone()), types.get(column))?;
+        let held = recorded_cell(
+            column,
+            &Cell::Value(v.clone()),
+            types.get(column).map(Held::same),
+        )?;
         cells.push(match (held, v) {
             (Some(held), _) => held,
             (None, Value::Null) => format!("{} IS NULL", quote(column)?),
@@ -586,7 +595,7 @@ fn insert_row(
             continue;
         }
         cells.extend(match defaults.get(column) {
-            Some(default) => defaulted_cell(column, default, Some(ty))?,
+            Some(default) => defaulted_cell(column, default, Some(Held::same(ty)))?,
             None => Some(format!("{} IS NULL", quote(column)?)),
         });
     }
@@ -652,8 +661,17 @@ fn update_row(
     // the column has once this plan's column changes have run, which sort
     // before the row changes. Two lookups rather than one, so neither check
     // can quietly borrow the other's type (DECISIONS 140).
-    let before_ty = |column: &String| types.get(column);
-    let after_ty = |column: &String| after_types.get(column).or_else(|| types.get(column));
+    // The precondition reads a cell by the type the recorded state held it in
+    // *and* the type the column has by the time the `UPDATE` runs, which are
+    // two types where this plan retypes the column (DECISIONS 149). The
+    // postcondition asks only what the row holds afterwards, which is one.
+    let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
+    let after_ty = |column: &String| {
+        after_types
+            .get(column)
+            .or_else(|| types.get(column))
+            .map(Held::same)
+    };
     let mut sets = Vec::with_capacity(columns.len());
     let mut recorded = Vec::new();
     for (column, (from, to)) in columns {
@@ -726,21 +744,140 @@ fn update_row(
 fn recorded_cell(
     column: &str,
     cell: &Cell,
-    ty: Option<&ColumnType>,
+    ty: Option<Held<'_>>,
 ) -> Result<Option<String>, DialectError> {
     let quoted = quote(column)?;
     let Some(ty) = ty else {
         return Ok(None);
     };
+    let now = ty.now();
     Ok(match cell {
+        // A NULL converts to a NULL whatever the two types are, so the one
+        // predicate covers a retyped column as it covers any other.
         Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
-        Cell::Value(v) => Some(format!(
-            "{} = {} COLLATE Latin1_General_BIN2",
-            crate::rows::read_expr(&quoted, &ty.base),
-            literal(&recorded_text(v))
-        )),
+        Cell::Value(v) => {
+            let recorded = literal(&recorded_text(v));
+            let Some(expected) = ty.as_stored(&recorded) else {
+                return Ok(None);
+            };
+            Some(format!(
+                "{} = {} COLLATE Latin1_General_BIN2",
+                crate::rows::read_expr(&quoted, &now.base),
+                expected
+            ))
+        }
         Cell::Default(d) => defaulted_cell(column, d, Some(ty))?,
     })
+}
+
+/// The two types one recorded cell is measured by: `read` is the type whose
+/// rendering produced the recorded text, and `now` the type the column has
+/// when the statement runs. They are the same type for every column this plan
+/// leaves alone, and differ only where it retypes one — whose
+/// `AlterColumnType` sorts before every row change (DECISIONS 149).
+///
+/// A pair rather than two arguments because the two are the same type and
+/// transposing them compiles: `read` and `now` the wrong way round would
+/// hold a row to the conversion run backwards, which fails on exactly the
+/// rows that are *not* stale.
+#[derive(Clone, Copy)]
+struct Held<'a> {
+    read: &'a ColumnType,
+    now: Option<&'a ColumnType>,
+}
+
+impl<'a> Held<'a> {
+    /// Recorded and held by one type: nothing about the column changes here.
+    fn same(ty: &'a ColumnType) -> Self {
+        Held {
+            read: ty,
+            now: None,
+        }
+    }
+
+    /// Recorded by `read`, held by `now` where this plan gives it a different
+    /// one. `None` is not "no type" — it is "the same one".
+    fn of(read: Option<&'a ColumnType>, now: Option<&'a ColumnType>) -> Option<Self> {
+        let read = read?;
+        Some(Held {
+            read,
+            now: now.filter(|n| *n != read),
+        })
+    }
+
+    /// Whether this plan retypes the column between the read and the write.
+    fn retyped(self) -> bool {
+        self.now.is_some()
+    }
+
+    /// The type the recorded text was rendered in, normalized for spelling.
+    fn read(self) -> ColumnType {
+        normalized(self.read)
+    }
+
+    /// The type the column has when the statement runs.
+    fn now(self) -> ColumnType {
+        normalized(self.now.unwrap_or(self.read))
+    }
+
+    /// Whether a retyped column can be held at all: `xml`, `text` and the
+    /// spatial types have no comparison to give, so asking either end for one
+    /// would be an error rather than a false answer — the same reason
+    /// [`defaulted_cell`] asks first. An unretyped column needs nothing of
+    /// its type but the rendering, and never comes here.
+    fn comparable(self) -> bool {
+        crate::rows::comparable(&self.read().base) && crate::rows::comparable(&self.now().base)
+    }
+
+    /// `value`, an expression of the type the cell was recorded in, as the
+    /// column holds it now.
+    ///
+    /// For everything this plan leaves alone that is `value` itself. For a
+    /// column it retypes it is the conversion the `AlterColumnType` already
+    /// ran, asked of the engine rather than computed here: the tool has no
+    /// business knowing that a `decimal(5,2)` holding `1.50` becomes `1`.
+    /// `TRY_CONVERT` so that a recorded value the new type cannot hold reads
+    /// as "not what the plan recorded" rather than raising Msg 245 from
+    /// inside the write.
+    fn converted(self, value: &str) -> String {
+        match self.retyped() {
+            false => value.to_owned(),
+            true => format!("TRY_CONVERT({}, {value})", self.now()),
+        }
+    }
+
+    /// The recorded text as the column stores it now, rendered the way the
+    /// read-back renders that column — the right-hand side of the predicate.
+    ///
+    /// Where nothing was retyped this is the recorded text itself: the text
+    /// *is* what the rendering produced. Where the column was retyped, the
+    /// text goes back through the old type with the style that wrote it and
+    /// then through the conversion above.
+    ///
+    /// One thing it cannot see, and no predicate could: an edit the
+    /// conversion erases. Measured — a cell moved from `1.50` to `1.99`
+    /// before a `decimal(5,2)` becomes `int` reads back as `1` either way,
+    /// and the column no longer holds what would tell them apart.
+    fn as_stored(self, recorded: &str) -> Option<String> {
+        if !self.retyped() {
+            return Some(recorded.to_owned());
+        }
+        if !self.comparable() {
+            return None;
+        }
+        let now = self.now();
+        Some(crate::rows::read_expr(
+            &self.converted(&crate::rows::from_text(recorded, &self.read())),
+            &now.base,
+        ))
+    }
+}
+
+/// A type spelled the way this dialect spells it, falling back to the spelling
+/// the plan carries. A type the dialect cannot parse has already stopped the
+/// plan elsewhere; here it would only cost the comparison.
+fn normalized(ty: &ColumnType) -> ColumnType {
+    crate::types::normalize(ty).unwrap_or_else(|_| ty.clone())
 }
 
 /// A recorded cell as the read-back's text: what `rows::value_of` decoded.
@@ -813,22 +950,28 @@ fn atomically(body: &str) -> String {
 fn defaulted_cell(
     column: &str,
     default: &str,
-    ty: Option<&ColumnType>,
+    ty: Option<Held<'_>>,
 ) -> Result<Option<String>, DialectError> {
     let quoted = quote(column)?;
     let Some(ty) = ty else {
         return Ok(None);
     };
-    let ty = crate::types::normalize(ty).unwrap_or_else(|_| ty.clone());
-    if !crate::rows::comparable(&ty.base) || !crate::rows::is_constant(default) {
+    if !ty.comparable() || !crate::rows::is_constant(default) {
         return Ok(None);
     }
+    let (read, now) = (ty.read(), ty.now());
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
         "({} = {} COLLATE Latin1_General_BIN2 OR ({quoted} IS NULL AND ({default}) IS NULL))",
-        crate::rows::read_expr(&quoted, &ty.base),
-        crate::rows::read_expr(&format!("CONVERT({ty}, {default})"), &ty.base),
+        crate::rows::read_expr(&quoted, &now.base),
+        // The default converted to the type the column had when the row was
+        // written, and then — where this plan retypes it — the way the
+        // `ALTER` converted the column itself.
+        crate::rows::read_expr(
+            &ty.converted(&format!("CONVERT({read}, {default})")),
+            &now.base
+        ),
     )))
 }
 
@@ -2182,11 +2325,19 @@ mod tests {
             wrote.contains("CONVERT(nvarchar(max), [added]) = N'y' COLLATE Latin1_General_BIN2"),
             "{wrote}"
         );
-        // A retyped column is read by the base type before and the declared
-        // type after: `varchar` plainly, `date` in style 126.
+        // A retyped column is held by both of its types before the write:
+        // the recorded text goes back through `varchar(10)`, which is what
+        // rendered it, and then through the conversion the `ALTER` ran, and
+        // both sides are read in style 126 because that is how a `date`
+        // reads back. Comparing the recorded text against the column
+        // directly — either side's rendering, one type — is what
+        // DECISIONS 146 could not make work and 149 stopped attempting.
         assert!(
             precondition.contains(
-                "CONVERT(nvarchar(max), [since]) = N'2026-09-03' COLLATE Latin1_General_BIN2"
+                "CONVERT(nvarchar(max), [since], 126) = \
+                 CONVERT(nvarchar(max), TRY_CONVERT(date, \
+                 TRY_CONVERT(varchar(10), N'2026-09-03')), 126) \
+                 COLLATE Latin1_General_BIN2"
             ),
             "{update}"
         );
@@ -2286,6 +2437,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            after_types: Default::default(),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
@@ -2311,6 +2463,7 @@ mod tests {
             cause: pbps_model::change::DeleteCause::Undeclared,
             row: BTreeMap::new(),
             types: BTreeMap::new(),
+            after_types: Default::default(),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
@@ -2531,6 +2684,7 @@ mod tests {
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 row: BTreeMap::new(),
                 types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ] {
             assert!(!takes_online(&c), "{c:?}");

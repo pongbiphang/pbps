@@ -373,6 +373,14 @@ pub enum Change {
         /// have is absent: its `before` is what this plan's `AddColumn`
         /// leaves there, not a recorded cell. Absent from older plans,
         /// which is an empty map.
+        ///
+        /// A column this plan *retypes* is here too, paired with its entry in
+        /// `after_types`: the recorded text is the old type's spelling of a
+        /// value the `AlterColumnType` has since converted, so the two
+        /// together say "recorded in this type, held in that one" and the
+        /// emitter asks the engine for the same conversion. Leaving it out
+        /// dropped the precondition for exactly the cell most likely to be
+        /// contended (DECISIONS 149).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
         /// The type each column has *once this plan has run*, where that is
@@ -426,6 +434,17 @@ pub enum Change {
         /// not held, exactly as in an update.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
+        /// The type each of those columns has *when the `DELETE` runs*, where
+        /// that is not the type in `types`: a column this plan retypes, whose
+        /// `AlterColumnType` sorts before every row change. The recorded text
+        /// is the old type's spelling and the column now holds the converted
+        /// value, so the predicate converts the recorded text the same way
+        /// rather than comparing two spellings of one value — or, as before
+        /// this pair existed, holding the row to nothing at all
+        /// (DECISIONS 149). Only the entries that differ; the emitter falls
+        /// back to `types`. Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        after_types: BTreeMap<String, ColumnType>,
     },
     /// `exact` <-> `ensure`. It emits no SQL by itself — the row changes it
     /// implies are separate entries — but it is a change to the declaration
