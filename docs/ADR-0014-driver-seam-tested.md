@@ -130,12 +130,19 @@ This is the part of ADR-0007's claim that was most at risk and it held.
 
 ## What this says about the two open decisions
 
-- **Open question 10, the `tiberius` → `tiberius-ng` move.** That change is
-  strictly smaller than this spike: same driver API, same crate, no new error
-  type, no connection future. The spike took an afternoon. SPEC already says
-  "what is left is a decision, not an unknown"; this adds a measured floor under
-  how expensive being wrong would be, which was ADR-0007's stated reason for
-  building the seam in the first place.
+- **Open question 10, which is now the return trip.** The move *to*
+  `tiberius-ng` has been taken — `9fe1289` switched the `package` and emptied
+  `deny.toml`'s `ignore` list — and what open question 10 holds today is the
+  move **back** to upstream `tiberius`, gated on a release newer than 0.12.3
+  whose `rustls` feature resolves `rustls >= 0.23`, with `cargo deny check`
+  passing on an empty `ignore` and the §11.5 live suite green.
+
+  This spike bounds that return, and bounds it generously. Going back is the
+  same driver API, the same error type and no connection future; the spike
+  changed a *different* driver, hit two seam points, and still took an
+  afternoon. So the standing cost of being wrong about a driver is smaller than
+  the one thing anybody has actually measured — which is what ADR-0007 built the
+  seam to make true, and it is worth having a number rather than a hope.
 - **ADBC is unaffected.** It was refused on source availability and
   distribution, not on the seam, and nothing here touches that.
 
