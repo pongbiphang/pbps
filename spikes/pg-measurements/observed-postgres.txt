@@ -23,7 +23,7 @@ B1 | a table grant without schema USAGE reads as held | true (schema USAGE: fals
 B2 | and the read actually succeeds | refused: permission denied for schema m
 B3 | GRANT ON ALL TABLES covers a table created afterwards | true for an existing table, false for a later one
 B4 | ALTER DEFAULT PRIVILEGES is keyed to the creating role | true for the named role, false for another
-B5 | a role is visible from every database in the cluster | roles live in pg_authid, which is cluster-wide: 1 row in pg_roles
+B5 | a role created in another database, seen from this one | connected to m_other, pg_roles rows for m_reader: 1
 B6 | DROP ROLE while the role merely holds a grant | refused: role "m_reader" cannot be dropped because some objects depend on it
 B7 | a fresh function's ACL | NULL (the built-in default applies)
 B8 | GRANT ALTER | refused: unrecognized privilege type "alter"
@@ -79,3 +79,9 @@ A29 | those options after CREATE OR REPLACE | accepted, reloptions: NULL — los
 A30 | those options after a drop-and-create rebuild | reloptions: NULL — lost
 A31 | a reader querying the view while security_invoker=true | refused: permission denied for table opt_t
 A32 | the same reader after a rebuild dropped the option | accepted
+R16 | the keys a step-2 generator owns | 1, 3, 5, 7, 9, 11
+R17 | the same generator after restarting at max(keys)+1 | 1, 3, 5, 7, 9, 11, 13, 14, 16 — it has crossed onto the even series
+R18 | an unqualified reference inside a definition, search_path empty | refused: relation "sp_t" does not exist
+R19 | the same definition with the object's own schema on the path | accepted
+A33 | a view column default, and where it lives | pg_attrdef: 'from the view default'::text / pg_get_viewdef shows: SELECT id, a FROM sp_t;
+A34 | that default after a drop-and-create rebuild | gone

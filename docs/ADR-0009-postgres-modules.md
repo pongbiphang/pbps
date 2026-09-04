@@ -453,6 +453,59 @@ options**, and until it exists this sits beside `PUBLIC`
 ([ADR-0010](ADR-0010-postgres-privileges.md) §5) as a named gap rather than a
 solved problem.
 
+### The rule these three are instances of
+
+Three review rounds each found the same shape one attribute further out — the
+ACL, then the owner, then `reloptions` — and a fourth found the next one:
+**measured**, a view column default set with
+`ALTER VIEW … ALTER COLUMN … SET DEFAULT` lives in `pg_attrdef`, is absent from
+`pg_get_viewdef`, and does not survive a rebuild:
+
+```
+pg_attrdef:            'from the view default'::text
+pg_get_viewdef shows:  SELECT id, a FROM sp_t;
+after a rebuild:       gone
+```
+
+An updatable view then silently stops supplying that value, and inserts that
+omit the column fail or write something else — while `verify` reports nothing,
+because nothing compares `pg_attrdef` either.
+
+Patching a fourth attribute into a list of three would be the wrong repair, so
+the rule is stated instead of the list:
+
+> **A `DROP` takes with it everything the catalog attached to the object, and
+> `Module::definition` describes almost none of it.** Before a rebuild — one the
+> user's edit forced, or one §4 synthesized — the connected plan enumerates what
+> the catalog holds for that object, carries each item into the statements it
+> writes, and refuses when it cannot carry one.
+
+What that enumeration covers today, each measured on this branch:
+
+| Attribute | Where it lives | Lost by |
+|---|---|---|
+| grants | `relacl` / `proacl` | drop + create |
+| a revocation from `PUBLIC` | the *absence* of the default ACL | drop + create |
+| owner, and with it `SECURITY DEFINER`'s meaning | `relowner` / `proowner` | drop + create |
+| `security_invoker`, `security_barrier`, `check_option` | `pg_class.reloptions` | drop + create **and `CREATE OR REPLACE`** |
+| view column defaults | `pg_attrdef` | drop + create |
+
+The table is evidence, not the specification — it is what has been measured, and
+the next attribute nobody has looked for is exactly as dangerous as these were.
+The specification is the paragraph above it: **enumerate from the catalog, not
+from memory.** A dialect that implements the list rather than the rule will be
+wrong again the moment PostgreSQL attaches something else, and every instance so
+far has failed in the same direction — access silently widened, verification
+silently clean.
+
+Two consequences worth naming, because they follow from the rule rather than
+from any one row: **the enumeration is `plan --db`'s work, not the emitter's**,
+since only a connection can see what an object carries; and **a rebuild is
+expensive in a way `CREATE OR REPLACE` is not**, so §3's preference for the
+replace path is a safety preference and not only a cheapness one — except for
+`reloptions`, where measurement showed the replace path is no safer, which is
+the reason to distrust the whole intuition.
+
 ### How the plan knows a rebuild is needed
 
 The paragraph above conditions drop + create on "what `CREATE OR REPLACE`

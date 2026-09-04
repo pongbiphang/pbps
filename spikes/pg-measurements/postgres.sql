@@ -148,9 +148,15 @@ SELECT 'B4', 'ALTER DEFAULT PRIVILEGES is keyed to the creating role',
        has_table_privilege('m_all','m.by_a','SELECT')::text || ' for the named role, '
        || has_table_privilege('m_all','m.by_b','SELECT')::text || ' for another';
 
-SELECT 'B5', 'a role is visible from every database in the cluster',
-       'roles live in pg_authid, which is cluster-wide: '
-       || (SELECT count(*)::text FROM pg_roles WHERE rolname = 'm_reader') || ' row in pg_roles';
+CREATE DATABASE m_other;
+\connect m_other
+SELECT 'B5', 'a role created in another database, seen from this one',
+       'connected to ' || current_database()
+       || ', pg_roles rows for m_reader: '
+       || (SELECT count(*)::text FROM pg_roles WHERE rolname = 'm_reader');
+\connect postgres
+SET search_path = m;
+DROP DATABASE m_other;
 SELECT 'B6', 'DROP ROLE while the role merely holds a grant', m.accepts('DROP ROLE m_reader');
 SELECT 'B7', 'a fresh function''s ACL',
        coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.customer(int)'::regprocedure), 'NULL (the built-in default applies)');
@@ -413,6 +419,38 @@ GRANT SELECT ON m.opt_v TO m_sreader;
 SELECT 'A32', 'the same reader after a rebuild dropped the option',
        m.accepts('SET ROLE m_sreader; SELECT * FROM m.opt_v; RESET ROLE');
 RESET ROLE;
+
+-- -------------------------------------- the sixth 2026-09-05 review round
+
+CREATE TABLE m.step (id int GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 2) PRIMARY KEY, v text);
+INSERT INTO m.step (v) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f');
+SELECT 'R16', 'the keys a step-2 generator owns',
+       (SELECT string_agg(id::text, ', ' ORDER BY id) FROM m.step);
+INSERT INTO m.step (id, v) OVERRIDING SYSTEM VALUE VALUES (13, 'a pinned row');
+ALTER TABLE m.step ALTER COLUMN id RESTART WITH 14;   -- max(keys) + 1
+INSERT INTO m.step (v) VALUES ('after'), ('and again');
+SELECT 'R17', 'the same generator after restarting at max(keys)+1',
+       (SELECT string_agg(id::text, ', ' ORDER BY id) FROM m.step)
+       || ' — it has crossed onto the even series';
+
+CREATE TABLE m.sp_t (id int PRIMARY KEY, a text);
+SET search_path = '';
+SELECT 'R18', 'an unqualified reference inside a definition, search_path empty',
+       m.accepts('CREATE VIEW m.sp_v AS SELECT id, a FROM sp_t');
+SET search_path = m;
+SELECT 'R19', 'the same definition with the object''s own schema on the path',
+       m.accepts('CREATE VIEW m.sp_v AS SELECT id, a FROM sp_t');
+
+CREATE VIEW m.uv AS SELECT id, a FROM m.sp_t;
+ALTER VIEW m.uv ALTER COLUMN a SET DEFAULT 'from the view default';
+SELECT 'A33', 'a view column default, and where it lives',
+       'pg_attrdef: ' || (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='m.uv'::regclass)
+       || ' / pg_get_viewdef shows: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.uv'::regclass, true), E'[\n ]+', ' ', 'g'));
+DROP VIEW m.uv; CREATE VIEW m.uv AS SELECT id, a FROM m.sp_t;
+SELECT 'A34', 'that default after a drop-and-create rebuild',
+       coalesce((SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='m.uv'::regclass),
+                'gone');
 
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;

@@ -184,6 +184,30 @@ Two things follow, and the first matters more:
   handling it"). If `Identity` ever grows a bound, this refusal is the thing to
   revisit, and the measured direction rule above is what it should be replaced
   with.
+
+- **`+ 1` is wrong for a second reason, which the refusal above does not cover:
+  the step need not be one.** `identity: [1, 2]` is an ordinary declaration,
+  positive and so not refused, and it is how a deployment partitions a key space
+  between writers. **Measured**, the restart lands the generator in somebody
+  else's half:
+
+  ```
+  the keys a step-2 generator owns:  1, 3, 5, 7, 9, 11
+  -- a declared row is pinned at 13, and the plan restarts at max(keys) + 1 = 14
+  keys now: 1, 3, 5, 7, 9, 11, 13, 14, 16   — it has crossed onto the even series
+  ```
+
+  Every key from then on belongs to the other writer, and the collision arrives
+  whenever that writer next allocates. So the restart point is not
+  `max(…) + 1` but **the next value in the generator's own series at or past
+  every key in use** — the declared `seed` and `increment` decide it, and the
+  sequence's current value is one of the inputs rather than the answer.
+
+  The three corrections in this bullet and the two above it have one cause:
+  `+ 1` treated the sequence as a counter when it is a *series with a declared
+  shape*. Where the shape cannot be honoured, the refusal is the answer; where
+  it can, it has to be computed from the declaration rather than from the
+  maximum.
 - **The declaration should be discouraged, not merely supported.** ADR-0004
   already says an identity primary key "hands out different values per
   environment, so declaring rows by id would be a lie by default". PostgreSQL
@@ -235,11 +259,34 @@ matter is dialect knowledge. The values a plan writes and the values it reads
 back then live in one space, which is what ADR-0004 requires and what "fixed
 CONVERT styles" achieves on the other engine.
 
-**`search_path` is pinned too, and for a different reason.** Every name pbps
-emits is schema-qualified, so it needs no search path — but a `search_path` an
-operator left pointing at their own schema silently changes which object an
-*unqualified* name in a default expression or a function body resolves to. Pin
-it to something empty and explicit rather than inheriting whatever the role has.
+**`search_path` is pinned too, and for a different reason — but it is not pinned
+to nothing.** Every name pbps *emits* is schema-qualified, so the statements it
+writes need no search path, and a `search_path` an operator left pointing at
+their own schema would silently change which object an unqualified name resolves
+to. A first draft concluded from that: pin it empty.
+
+**Measured, empty breaks ordinary declarations**, because the names inside a
+definition are the user's and this tool does not parse them:
+
+```
+search_path = ''  ->  CREATE VIEW m.sp_v AS SELECT id, a FROM sp_t
+                      refused: relation "sp_t" does not exist
+search_path = m   ->  accepted
+```
+
+An unqualified same-schema reference in a view body, a `BEGIN ATOMIC` function
+or a default expression is legal, common, and exactly the sort of text ADR-0002
+promised to keep opaque. Emptying the path makes pbps refuse declarations the
+engine would accept.
+
+**Decision.** The path is set **per statement, to the schema of the object being
+created** — deterministic, never inherited from the role, and equal to what the
+author of that definition would have had in front of them. That keeps the
+property the pin was for (nothing depends on an operator's session) without
+inventing a restriction on definitions the tool has declined to read. Refusing
+unqualified definitions outright is the alternative and is worse: it is a
+parsing rule enforced by an engine error, applied to text §8.2 says pbps does
+not read.
 
 ## 4. A default comes back with a cast welded on
 
