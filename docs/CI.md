@@ -117,7 +117,10 @@ permissions:
 jobs:
   # ---- the merge-request layer: offline, no database, no secrets ----
   check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      PBPS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,10 +135,10 @@ jobs:
       - name: declarations are valid
         run: pbps validate
       - name: no unresolved rename or drop intent
-        run: pbps plan --check          # fails only on missing intent; the rest is automatic
+        run: pbps plan --check --since "$PBPS_BASE_SHA"
 
       - name: preview for the reviewer
-        run: pbps plan --out preview.json --sql preview.sql
+        run: pbps plan --since "$PBPS_BASE_SHA" --out preview.json --sql preview.sql
       - uses: actions/upload-artifact@v4
         with:
           name: preview
@@ -258,11 +261,13 @@ variables:
 # ---- the merge-request layer ----
 check:
   stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - pbps fmt --check
     - pbps validate
-    - pbps plan --check
-    - pbps plan --out preview.json --sql preview.sql
+    - pbps plan --check --since "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    - pbps plan --since "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --out preview.json --sql preview.sql
   artifacts:
     paths: [preview.sql, preview.json]
     expire_in: 1 week
@@ -338,8 +343,8 @@ environment at once: last apply, git sha, drift state, last verified.
 
 ## Things that will bite
 
-- **Shallow clones.** `plan --since`, `validate --since` and the default
-  `HEAD` baseline all read git history. `fetch-depth: 0` / `GIT_DEPTH: 0`.
+- **Shallow clones.** `plan --since <base>` needs that base revision in the
+  checkout. Use `fetch-depth: 0` / `GIT_DEPTH: 0`.
 - **`--no-input` is global and safe to add everywhere.** It declines prompts and
   can never answer one — no flag may supply rename or drop intent (SPEC 14.3) —
   so it only ever makes a run more conservative. A non-interactive runner
