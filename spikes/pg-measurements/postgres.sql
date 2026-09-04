@@ -1003,6 +1003,17 @@ INSERT INTO m.ndk VALUES ('New');
 SELECT 'R79', 'inserting ''new'' beside ''New'' under the case-sensitive one',
        m.accepts('INSERT INTO m.ndk VALUES (''new'')');
 
+-- -------------------------- the thirty-third 2026-09-05 review round
+
+SET TimeZone = 'UTC';
+SET timezone_abbreviations = 'Default';
+SELECT 'R80', 'a quoted timetz with an abbreviation, under Default',
+       ('12:00 CST'::timetz)::text;
+SET timezone_abbreviations = 'Australia';
+SELECT 'R81', 'the same literal under Australia',
+       ('12:00 CST'::timetz)::text || ' — timetz belongs on the offline refusal list too';
+RESET timezone_abbreviations; RESET TimeZone;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

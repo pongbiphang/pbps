@@ -28,8 +28,10 @@ The verdict, up front:
 | `CREATE OR ALTER` avoids drop + create, and so preserves grants | **Not for sale.** PostgreSQL's replace can only *append* view columns |
 | The schema-bound ordering problem is one deferred corner case | **It is the common case** |
 
-Two model changes — a map key and a field in the state snapshot — and one
-bargain that lapses. The bargain is affordable only because ADR-0005 has since
+Three model changes — a map key and **two** fields in the state snapshot, the
+declared text (§2.2) and the write path a module was created under
+([ADR-0013](ADR-0013-postgres-reference-data.md) §3) — and one bargain that
+lapses. The bargain is affordable only because ADR-0005 has since
 shipped (§3). Both model changes are small; what is not small is that the
 signature is normalized by *routine* rules rather than column rules (§1), and
 that the state has to keep what was declared as well as what came back (§2),
@@ -1067,8 +1069,17 @@ Two things follow, and neither is a new mechanism:
 
   **So the exemption is: a SQL-language caller is excluded from the refusal only
   when this plan actually recreates it**, because then the engine performs the
-  check. An unchanged one is refused like a PL/pgSQL one, and PL/pgSQL and
-  dynamic SQL are refused either way, since nothing validates them at all.
+  check — which is a reason to **suppress the heuristic report**, not a reason to
+  refuse anything.
+
+  Reading this paragraph as a refusal rule is what the decision above already
+  rejects: a scan hit is a name, and a legitimate caller of `f(text)` must not
+  block a rebuild of `f(integer)`. So the whole of it sits under that rule —
+  **refuse only on an established dependency** (`pg_depend`, or a declared
+  `depends_on:`); **report** a name match; and where the plan recreates a
+  SQL-language caller, the engine's own check makes even the report unnecessary,
+  because a stale reference in one fails loudly at `CREATE`. PL/pgSQL and
+  dynamic SQL keep the report, since nothing validates them at all.
 
   That is the fourth time in this section a rule has been attached to something
   easy to see — the identity, the caller's declaration changing, the body's

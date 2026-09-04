@@ -463,13 +463,22 @@ pinned on the session, and not wrapped around the writes at all.**
   a bootstrap script creates the very triggers it would then fire.
 
   So the rule is **decided by the column's declared type, which is knowable
-  offline**: a quoted value on a `date`, `time`, `timestamp`, `timestamptz`,
-  `interval`, `real` or `double precision` column is refused by an offline
-  `bootstrap --sql`, naming the connected form as the way to get a script that
+  offline**: a quoted value on a `date`, `time`, **`timetz`**, `timestamp`,
+  `timestamptz`, `interval`, `real` or `double precision` column is refused by an
+  offline `bootstrap --sql`, naming the connected form as the way to get a script that
   includes rows. Every other value renders as before. That costs the DR script
   its reference data for those columns specifically, and saying so is better
   than emitting a script that stores January in one environment and February in
   another.
+
+  `timetz` was missing from a first version of that list, and it is not a
+  rounding error: **measured**, `'12:00 CST'::timetz` is `12:00:00-06` under the
+  `Default` abbreviation dictionary and `12:00:00+09:30` under `Australia` — a
+  timezone-bearing value whose meaning moves with a setting `TimeZone` does not
+  cover. The list is derived from *which types read text through a
+  setting-sensitive input function*, and it is worth deriving it that way rather
+  than recalling it, since the catalogue of §1 in
+  [ADR-0012](ADR-0012-postgres-type-catalogue.md) is where the answer lives.
 - **The default probe is a read that executes code, and runs under the write's
   environment.** §4 evaluates an omitted cell's default server-side to decide
   whether it round-trips omitted. **Measured**, an expression whose cast happens
