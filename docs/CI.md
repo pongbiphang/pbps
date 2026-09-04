@@ -345,6 +345,11 @@ environment at once: last apply, git sha, drift state, last verified.
 
 - **Shallow clones.** `plan --since <base>` needs that base revision in the
   checkout. Use `fetch-depth: 0` / `GIT_DEPTH: 0`.
+- **The base SHA only exists inside a review pipeline.** That is why the check
+  job is gated on the event (`if:` / `rules:` above). Outside one the variable
+  is empty, and an empty `--since` is not refused: it plans against an empty
+  baseline, so every table reads as newly created. It exits `0` with a warning,
+  which is exactly the kind of green a pipeline should never be built on.
 - **`--no-input` is global and safe to add everywhere.** It declines prompts and
   can never answer one — no flag may supply rename or drop intent (SPEC 14.3) —
   so it only ever makes a run more conservative. A non-interactive runner
