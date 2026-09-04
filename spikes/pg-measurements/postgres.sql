@@ -613,6 +613,26 @@ WHERE n.nspname = 'm' AND NOT t.tgisinternal;
 SELECT 'A40', 'DROP TRIGGER without naming the table', m.accepts('DROP TRIGGER audit');
 SELECT 'A41', 'DROP TRIGGER naming the table', m.accepts('DROP TRIGGER audit ON m.orders');
 
+-- -------------------------------- the thirteenth 2026-09-05 review round
+
+CREATE FUNCTION m.fdep(a int) RETURNS int IMMUTABLE AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE TABLE m.d_chk (id int PRIMARY KEY, v int CHECK (m.fdep(v) > 0));
+SELECT 'A42', 'DROP FUNCTION with a managed check constraint on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_chk;
+CREATE TABLE m.d_def (id int PRIMARY KEY, v int DEFAULT m.fdep(1));
+SELECT 'A43', 'DROP FUNCTION with a column default on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_def;
+CREATE TABLE m.d_gen (id int PRIMARY KEY, v int, g int GENERATED ALWAYS AS (m.fdep(v)) STORED);
+SELECT 'A44', 'DROP FUNCTION with a generated column on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_gen;
+CREATE TABLE m.d_idx (id int PRIMARY KEY, v int);
+CREATE INDEX ix_fdep ON m.d_idx (m.fdep(v));
+SELECT 'A45', 'DROP FUNCTION with an expression index on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

@@ -111,3 +111,7 @@ A38 | recreating that view from the unchanged declaration text | refused: relati
 A39 | two triggers of the same name in one schema | customers.audit, orders.audit
 A40 | DROP TRIGGER without naming the table | refused: syntax error at end of input
 A41 | DROP TRIGGER naming the table | accepted
+A42 | DROP FUNCTION with a managed check constraint on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A43 | DROP FUNCTION with a column default on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A44 | DROP FUNCTION with a generated column on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A45 | DROP FUNCTION with an expression index on it | refused: cannot drop function fdep(integer) because other objects depend on it

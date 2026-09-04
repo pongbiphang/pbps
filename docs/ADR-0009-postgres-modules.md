@@ -735,6 +735,40 @@ Two things follow, and neither is a new mechanism:
     be recreated from anything the project holds, so dropping it would destroy
     an object with no way back. `plan --db` names it and stops — the same shape
     as ADR-0005 note 10's refusal to drop a role that owns something.
+
+  **And "dependent" does not mean "dependent module".** This paragraph was
+  written about views depending on tables and stayed that shape, which leaves
+  out everything a *table* can hold that depends on a function — and since §3
+  now emits every module change as drop + create, a function edit meets those
+  dependents every time. **Measured**, all four refuse the drop:
+
+  ```
+  DROP FUNCTION with a managed check constraint on it:  refused: cannot drop
+      function fdep(integer) because other objects depend on it
+  ... with a column default on it:                      refused (same)
+  ... with a generated column on it:                    refused (same)
+  ... with an expression index on it:                   refused (same)
+  ```
+
+  A plan that does not account for them is **applyable and predictably fails**,
+  which is the one outcome §7.5 exists to prevent.
+
+  So the enumeration is over **every reverse `pg_depend` edge**, not over
+  modules: the managed ones — a check constraint, a default, a generated column
+  or an index the table declaration holds — are dropped and restored around the
+  rebuild, in the plan where the approver sees them; the unmanaged ones are the
+  refusal above.
+
+  **Their cost has to be visible, because it is not the module's cost.**
+  Restoring a check constraint revalidates the table and rebuilding an index
+  locks it, so a one-line edit to a function can carry a table scan behind it.
+  That belongs in the plan's risk list and in 14.1's estimate, not in a
+  footnote: the reviewer is approving the scan, not just the function.
+
+  This is the second time an enumeration in this document was written too
+  narrowly — §3's was over the object's *attributes* and missed three, this one
+  is over its *dependents* and missed four. The rule stated there covers both if
+  it is read as it is written: **enumerate from the catalog, not from memory.**
 - **`DROP ... CASCADE` is refused outright.** It is the shortest path and it
   destroys objects nobody reviewed. The guardrail is SPEC 14.3's, and this is a
   new instance of it: the plan names every object it drops, or it does not drop.
