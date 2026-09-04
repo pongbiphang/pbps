@@ -6530,6 +6530,82 @@ fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
     });
 }
 
+/// A declared table whose every column is unsupported is left out of the
+/// scoped schema whole (decision 14), so it is present in the database and
+/// absent from the projection. Bootstrap's emptiness check read only the
+/// projection, called the target empty, and ran: the CREATE failed on the
+/// table that was there, and the failure audit then recorded an *empty* state
+/// as the newest one — which the next `verify` under `unmanaged: ignore`
+/// believed. The managed-set limitations are objects too, and count.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn bootstrap_refuses_a_declared_table_the_projection_left_out() {
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("bootstrap-partial");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nunmanaged: ignore\n",
+    )
+    .unwrap();
+    d.table("table: dbo.pbps_boot_partial\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    const RESET: &str = "IF OBJECT_ID(N'dbo.pbps_boot_partial', N'U') IS NOT NULL \
+         DROP TABLE dbo.pbps_boot_partial; \
+         IF TYPE_ID(N'dbo.pbps_boot_udt') IS NOT NULL DROP TYPE dbo.pbps_boot_udt; \
+         IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
+         IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        conn.execute(RESET).await.unwrap();
+        // Its own batch: a type is not visible to the batch that creates it.
+        conn.execute("CREATE TYPE dbo.pbps_boot_udt FROM int;")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE dbo.pbps_boot_partial (c dbo.pbps_boot_udt NULL);")
+            .await
+            .unwrap();
+    });
+
+    let refused = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&refused), 1, "{}", stdout(&refused));
+    let err = stderr(&refused);
+    assert!(
+        err.contains("already has") && err.contains("dbo.pbps_boot_partial"),
+        "{err}"
+    );
+    assert!(
+        err.contains("user-defined type"),
+        "the reason is named: {err}"
+    );
+
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        // Refused before the transaction, so no failure audit — and no empty
+        // "newest state" for a database that is not empty.
+        assert!(
+            pbps_mssql::state::latest(&mut conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "bootstrap ran, failed, and recorded an empty state as the newest"
+        );
+        assert!(
+            pbps_mssql::state::lock_holder(&mut conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "the refusal left the lock held"
+        );
+        conn.execute(RESET).await.unwrap();
+    });
+}
+
 /// A failed command releases the lock it took, and when that release fails
 /// too the operator has to hear about it: the command's own error stays the
 /// error, but a `__pbps_lock` row nobody mentioned makes the next attempt fail

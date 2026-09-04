@@ -798,16 +798,18 @@ pub fn cmd_bootstrap(
             // existing managed set would fail halfway through on the first
             // CREATE and leave a partly built schema unless the transaction
             // catches it. Modules count too: `CREATE OR ALTER` would otherwise
-            // replace one without a plan or approval.
-            let unreadable_declared: Vec<&str> = existing
-                .unreadable
-                .iter()
-                .filter(|(n, _)| declared_modules.contains(n))
-                .map(|(_, why)| why.as_str())
-                .collect();
+            // replace one without a plan or approval. And so does everything
+            // in the managed set that the projection could not express — a
+            // declared module the catalog cannot read back, or a declared
+            // table whose every column is unsupported and which introspection
+            // therefore left out whole. That table is absent from the scoped
+            // schema and present in the database; counting only the scoped
+            // schema called the target empty, the CREATE failed on it, and the
+            // failure audit recorded an empty state as the newest one, which
+            // the next `verify` under `unmanaged: ignore` believed.
             if !existing.scoped.schema.tables.is_empty()
                 || !existing.scoped.schema.modules.is_empty()
-                || !unreadable_declared.is_empty()
+                || !existing.limitations.is_empty()
             {
                 let names: Vec<String> = existing
                     .scoped
@@ -823,7 +825,7 @@ pub fn cmd_bootstrap(
                             .keys()
                             .map(ToString::to_string),
                     )
-                    .chain(unreadable_declared.iter().map(|s| (*s).to_owned()))
+                    .chain(existing.limitations.iter().cloned())
                     .collect();
                 bail!(
                     "`{}` already has {} of the declared object(s): {}.\n\
