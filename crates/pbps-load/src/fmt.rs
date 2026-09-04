@@ -444,6 +444,36 @@ mod tests {
         );
     }
 
+    /// 177 one crate over, and the half my sweep missed: `GrantTarget` trimmed
+    /// too. Measured on SQL Server 2025: `CREATE SCHEMA [ app]` keeps its
+    /// padding, and `pull` renders the target as a quoted `"schema:: app"` —
+    /// so a trimmed reload targets a schema that is not there (DECISIONS 178).
+    #[test]
+    fn a_grant_target_keeps_the_whitespace_the_database_gave_it() {
+        let mut role = pbps_model::Role::default();
+        let one =
+            |p| -> std::collections::BTreeSet<pbps_model::Permission> { [p].into_iter().collect() };
+        role.grants.insert(
+            pbps_model::GrantTarget::Schema(" app".to_owned()),
+            one(pbps_model::Permission::Select),
+        );
+        role.grants.insert(
+            pbps_model::GrantTarget::Object(pbps_model::TableName::new(" app", " t ")),
+            one(pbps_model::Permission::Insert),
+        );
+
+        let out = render_role("r", &role, &[]);
+        let back = crate::load_role_str(Path::new("r.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+        assert_eq!(back.role.grants, role.grants, "output:\n{out}");
+
+        // A target that is nothing but the prefix is still no target.
+        assert!(
+            "schema::   ".parse::<pbps_model::GrantTarget>().is_err(),
+            "an empty schema name"
+        );
+    }
+
     /// The definition is SQL, and SQL is exactly the kind of text YAML quoting
     /// mangles: a `#`, a `:` or a leading `-` in the wrong place would come
     /// back as something else. A literal block keeps it verbatim.

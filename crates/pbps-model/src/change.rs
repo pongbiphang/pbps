@@ -748,12 +748,22 @@ impl Change {
     // declared row has to be named here, or the row it writes would be
     // compared against a state it was never part of.
     pub fn row(&self) -> Option<(&TableName, &RowKey, RowAfter<'_>)> {
-        // Only what the plan writes down. A NULL is skipped for the same
-        // reason a defaulted cell is: the read-back omits a NULL in a column
-        // with no default, so its absence proves nothing either way.
+        // Only what the plan writes down — and a NULL *is* written down. The
+        // read-back omits a NULL in a column with no default, which excuses
+        // its **absence** and nothing else: a value that arrived in its place
+        // is present, and dropping the expectation meant nothing looked. The
+        // caller already skips a cell the read-back does not carry, so
+        // keeping it costs no false refusal and buys the other half
+        // (DECISIONS 179).
+        //
+        // A cell set to `DEFAULT` stays out, and that is not the same case.
+        // Its value is omitted only where the engine *confirmed* it at the
+        // default; one it could not evaluate (`NEWID()`) comes back with its
+        // value, so presence there disproves nothing and demanding a value
+        // this change cannot name would refuse a valid apply (117, 165).
         fn spelled(cell: &Cell) -> Option<&Value> {
             match cell {
-                Cell::Value(Value::Null) | Cell::Default(_) => None,
+                Cell::Default(_) => None,
                 Cell::Value(v) => Some(v),
             }
         }
@@ -764,9 +774,10 @@ impl Change {
                 table,
                 key,
                 RowAfter::Holding(
+                    // Every cell the insert names, NULL included: see
+                    // `spelled` above.
                     row.0
                         .iter()
-                        .filter(|(_, v)| !matches!(v, Value::Null))
                         .map(|(column, v)| (column.as_str(), v))
                         .collect(),
                 ),

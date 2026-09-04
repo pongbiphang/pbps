@@ -5156,6 +5156,100 @@ mod tests {
         .expect("a replacement is a drop and a create, and the create is the net");
     }
 
+    /// A cell the plan writes as an explicit NULL was dropped from the
+    /// expectation entirely, on the argument that the read-back omits a NULL
+    /// in a column with no default. It does — but the argument only excuses
+    /// *absence*. A value that arrived in its place is present, and nothing
+    /// looked (DECISIONS 179).
+    #[test]
+    fn a_cell_this_plan_writes_as_null_is_still_answered_for() {
+        let schema_with = |cell: Option<pbps_model::Value>| {
+            let mut row = pbps_model::Row::default();
+            row.0
+                .insert("code".to_owned(), pbps_model::Value::Text("k".into()));
+            if let Some(v) = cell {
+                row.0.insert("note".to_owned(), v);
+            }
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "code".to_owned(),
+                pbps_model::Column::new("varchar(20)".parse().unwrap()),
+            );
+            t.columns.insert(
+                "note".to_owned(),
+                pbps_model::Column::new("nvarchar(50)".parse().unwrap()),
+            );
+            t.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Exact,
+                rows: [(pbps_model::RowKey::from("k"), row)].into_iter().collect(),
+            });
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let mut written = pbps_model::Row::default();
+        written
+            .0
+            .insert("code".to_owned(), pbps_model::Value::Text("k".into()));
+        written.0.insert("note".to_owned(), pbps_model::Value::Null);
+        let inserting = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::InsertRow {
+                    table: "dbo.t".parse().unwrap(),
+                    key_column: "code".to_owned(),
+                    identity_key: false,
+                    key: pbps_model::RowKey::from("k"),
+                    row: written,
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+            )],
+        };
+        let mut before = schema_with(None);
+        before
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .clear();
+
+        // Absent: a NULL in a column with no default is omitted from the
+        // read-back, so absence still proves nothing.
+        refuse_unplanned_movement(
+            &inserting,
+            &before,
+            &schema_with(None),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("an omitted cell is the NULL this plan wrote");
+
+        // Present and NULL: a column *with* a default reads one back
+        // explicitly, and that is the plan's own result too.
+        refuse_unplanned_movement(
+            &inserting,
+            &before,
+            &schema_with(Some(pbps_model::Value::Null)),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("an explicit NULL is the NULL this plan wrote");
+
+        // Present and something else: somebody wrote it.
+        let e = refuse_unplanned_movement(
+            &inserting,
+            &before,
+            &schema_with(Some(pbps_model::Value::Text("rogue".into()))),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a value nobody planned");
+        assert!(format!("{e:#}").contains("note"), "{e:#}");
+    }
+
     /// The exclusion was per *column*, and its reason covers one *field*. A
     /// plan that retypes a column could not be held to what its type became —
     /// only the engine's stored form says that — but everything else about

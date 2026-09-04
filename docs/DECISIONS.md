@@ -2428,3 +2428,45 @@ SPEC is in sync with all of these.
     file already written) or the composite grows a quoting rule of its own.
     That is a decision, not a bug fix, and it is recorded here rather than
     made in passing.
+
+178. **177 one crate over, and the sweep that missed it.** `GrantTarget`
+    trimmed too — the whole scalar, and again after the `schema::` prefix. I
+    swept `pbps-load` for destructive trims and the name types beside it, and
+    stopped at the crate boundary; the parser that turns a grant's map key
+    into a target lives in `pbps-model`. Measured: `CREATE SCHEMA [ app]`
+    keeps its padding, `pull` renders the key as `"schema:: app"` (quoted,
+    because the `::` makes `needs_quotes` true whatever else is in it), and
+    the reload named a schema the database does not have.
+    **It amends 126.** That entry counted "a target with surrounding
+    whitespace" as a third spelling of one target, beside `SCHEMA::` and
+    `schema::`. The engine says otherwise: `[ app]` and `[app]` are two
+    schemas, and `[ dbo].[t]` and `[dbo].[t]` two tables. So they are not two
+    spellings to refuse but two targets to keep, and the test that pinned the
+    old reading now pins this one. What survives of 126 is its mechanism and
+    the case it was really about: the prefix is case-insensitive, two
+    spellings of it are one key, and the loader still refuses the second
+    rather than letting the map keep whichever came last.
+    The cost is a stray space in a hand-written target no longer being caught
+    by the duplicate check. It is caught later, as a grant on a securable the
+    declarations do not have — which is where a name that does not exist
+    belongs, and 126's message would have been the wrong one for it anyway.
+
+179. **The read-back omitting a NULL excuses its absence, and nothing else.**
+    `Change::row` dropped every cell the plan writes as an explicit NULL from
+    the expectation, because a NULL in a column with no default is omitted
+    from the read-back (`canonical` returns `Ok(None)` and the cell never
+    reaches `cells`). True — and it justifies not *demanding* the cell, which
+    the caller already handles: it skips a column the read-back does not
+    carry. Dropping the expectation instead threw away the other half. A
+    session that wrote a value into that cell between the DML and the
+    checkpoint read left it *present*, and nothing looked; the broad row
+    comparison skips a key the plan names, so that was the only check there
+    was. Keeping the NULL in `RowAfter::Holding` costs no false refusal and
+    catches it, in both shapes — a column with no default omits the cell, and
+    one *with* a default reads the NULL back explicitly (`Ok(Some(Null))`),
+    where the comparison now matches it outright.
+    A cell set to `DEFAULT` stays out, and it is worth saying why it is not
+    the same case: its value is omitted only where the engine *confirmed* it
+    at the default, while one the engine could not evaluate (`NEWID()`) comes
+    back carrying its value. Presence there disproves nothing, and demanding a
+    value this change cannot name would refuse a valid apply (117, 165).

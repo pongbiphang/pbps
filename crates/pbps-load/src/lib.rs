@@ -733,21 +733,34 @@ indexes:
     /// map kept whichever came last: `select` on `SCHEMA::app` vanished
     /// behind `execute` on `schema::app`, and the next connected plan
     /// revoked it (DECISIONS 126).
+    ///
+    /// Only the prefix has two spellings. 126 counted surrounding whitespace
+    /// as a third, and the engine disagrees: measured, `[ app]` and `[app]`
+    /// are two schemas, so those are two targets and the case below asserts
+    /// they both survive (DECISIONS 178).
     #[test]
     fn two_spellings_of_one_grant_target_are_refused_not_merged() {
-        for (a, b) in [
-            ("SCHEMA::app", "schema::app"),
-            ("schema:: app", "schema::app"),
-            ("dbo.customer", " dbo.customer "),
-        ] {
-            let text = format!("role: r\ngrants:\n  \"{a}\": [select]\n  \"{b}\": [execute]\n");
-            let errs = load_file_str(Path::new("r.yml"), &text).unwrap_err();
-            let rendered = render(&errs);
-            assert!(
-                rendered.contains("name the same grant target"),
-                "{a} / {b}: {rendered}"
-            );
-        }
+        // The prefix is the only part with two spellings.
+        let (a, b) = ("SCHEMA::app", "schema::app");
+        let text = format!("role: r\ngrants:\n  \"{a}\": [select]\n  \"{b}\": [execute]\n");
+        let errs = load_file_str(Path::new("r.yml"), &text).unwrap_err();
+        let rendered = render(&errs);
+        assert!(
+            rendered.contains("name the same grant target"),
+            "{a} / {b}: {rendered}"
+        );
+        // And a target whose name differs only by padding is a *different*
+        // securable, so both are kept with their own permissions.
+        let loaded = load_file_str(
+            Path::new("r.yml"),
+            "role: r\ngrants:\n  \"schema:: app\": [select]\n  \"schema::app\": [execute]\n",
+        )
+        .expect("two schemas, not two spellings of one");
+        let LoadedFile::Role(role) = loaded else {
+            panic!("a role file");
+        };
+        assert_eq!(role.role.grants.len(), 2, "{:?}", role.role.grants);
+
         // One spelling, twice, is the YAML duplicate the parser refuses.
         let errs = load_file_str(
             Path::new("r.yml"),

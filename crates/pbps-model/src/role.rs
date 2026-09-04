@@ -85,7 +85,14 @@ impl FromStr for GrantTarget {
     type Err = NameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
+        // Not trimmed, on either side of the prefix. Measured on SQL Server
+        // 2025: `CREATE SCHEMA [ app]` keeps its padding, `pull` renders the
+        // target as a quoted `"schema:: app"`, and a trimmed reload named a
+        // schema the database does not have — the next connected plan then
+        // failing, or touching the wrong securable. A name is what the
+        // database spells it; `trim()` asks whether there is one and nothing
+        // more (DECISIONS 177, 178).
+        //
         // Case-insensitive on the prefix only: `SCHEMA::dbo` is how T-SQL
         // itself writes it, and refusing it would be a style rule pretending
         // to be a parse error.
@@ -96,11 +103,10 @@ impl FromStr for GrantTarget {
             .filter(|p| p.eq_ignore_ascii_case("schema::"))
             .and(s.get(8..))
         {
-            let name = rest.trim();
-            if name.is_empty() {
+            if rest.trim().is_empty() {
                 return Err(NameError::EmptySegment(s.to_owned()));
             }
-            return Ok(GrantTarget::Schema(name.to_owned()));
+            return Ok(GrantTarget::Schema(rest.to_owned()));
         }
         ObjectName::from_str(s).map(GrantTarget::Object)
     }
