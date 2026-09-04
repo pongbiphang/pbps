@@ -635,6 +635,56 @@ pub async fn read_rows(
     Ok(out)
 }
 
+/// How the database spells each of the schema names a declaration grants on:
+/// `None` where it has no schema of that name at all.
+///
+/// A schema has no identity to be matched by (ADR-0002); a grant target names
+/// it as text, and the text is all the differ has. So a declaration that
+/// writes `schema::DBO` where the database says `dbo` is caught by nothing
+/// else: on a case-insensitive database the `GRANT` succeeds, introspection
+/// reads `dbo` back, and every plan from then on revokes one spelling and
+/// grants the other without ever converging (DECISIONS 142).
+///
+/// Absent is left to the caller and to the pre-flight probe, and is not the
+/// same answer as differently spelt: one says create it, the other says write
+/// it the way the database already does.
+pub async fn schema_spellings(
+    conn: &mut Conn,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<String>>, DbError> {
+    let mut out = BTreeMap::new();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let wanted: Vec<&String> = names.iter().collect();
+    // Asked by index, never by name: the answer is the database's spelling,
+    // and matching it back to the requested one by name would be the very
+    // comparison in question.
+    let values: Vec<String> = wanted
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect();
+    let sql = format!(
+        "SELECT v.i, SCHEMA_NAME(SCHEMA_ID(v.n)) AS spelled FROM (VALUES {}) AS v(i, n);",
+        values.join(", ")
+    );
+    for row in &conn.query(&sql).await? {
+        let i: i32 = row.try_get_at(0)?.ok_or_else(|| {
+            DbError::BadRow("the schema spelling query returned a NULL index".to_owned())
+        })?;
+        let spelled: Option<&str> = row.try_get_at(1)?;
+        let Some(name) = usize::try_from(i).ok().and_then(|i| wanted.get(i)) else {
+            return Err(DbError::BadRow(format!(
+                "the schema spelling query returned index {i} for {} name(s)",
+                wanted.len()
+            )));
+        };
+        out.insert((*name).clone(), spelled.map(ToOwned::to_owned));
+    }
+    Ok(out)
+}
+
 /// What the engine says about the declared spellings of every table that
 /// declares rows: the ones it would not read back as written, and the keys
 /// it reads as one row.

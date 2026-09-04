@@ -5149,6 +5149,143 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
     });
 }
 
+/// `plan --db` and `bootstrap` hand statements to a database that is not a
+/// rehearsal, and used to ask none of the questions `validate` asks: a role
+/// granting `execute` on a table reached an applyable plan, and its `GRANT` —
+/// ordered after every table, row and module statement — would fail on a
+/// database those statements had already changed (DECISIONS 141).
+///
+/// Offline on purpose: the refusal happens before the connection is opened,
+/// so the unreachable address in the environment is the assertion. Without
+/// the check the command gets as far as failing to connect.
+#[test]
+fn a_connected_plan_refuses_a_declaration_validate_would_reject() {
+    let d = Demo::new("plan-db-validates");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("app_reader.yml"),
+        "role: app_reader\ngrants:\n  dbo.customer: [execute]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // 127.0.0.1:1 answers nothing; reaching it at all is the failure.
+    let unreachable = "Server=127.0.0.1,1;User Id=sa;Password=no;TrustServerCertificate=true";
+    for command in [
+        vec!["plan", "--db", unreachable],
+        vec!["bootstrap", "--db", unreachable],
+    ] {
+        let o = d.run(&command);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("`execute` does not apply to `dbo.customer`"),
+            "{command:?}: {}",
+            stderr(&o)
+        );
+        assert!(
+            !stderr(&o).contains("127.0.0.1"),
+            "the declarations are refused before anything is connected to: {}",
+            stderr(&o)
+        );
+    }
+}
+
+/// A schema name is the one name in a declaration with no identity behind
+/// it: text on both sides, whether it is a `schema::` grant target or the
+/// schema half of a qualified table name. Declared `schema::DBO` on a
+/// case-insensitive database grants successfully, reads back as `dbo`, and is
+/// revoked and granted again by every plan after — so it is refused before a
+/// plan is written (DECISIONS 142). Only the engine knows how it spells a
+/// schema, and whether it considers the two one name at all.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_schema_name_the_database_spells_differently_is_refused() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_schemacase_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("schemacase-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    let role_file = d.dir.join("schema").join("roles").join("reporting.yml");
+    let role = |target: &str| format!("role: reporting\ngrants:\n  schema::{target}: [select]\n");
+    std::fs::write(&role_file, role("DBO")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`DBO` (granted to role `reporting`) is written `dbo` by the database"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The schema half of a qualified table name is the same text on both
+    // sides, and worse when it disagrees: `DBO.customer` was created as
+    // `dbo.customer`, recorded as a state with no tables in it at all, and
+    // reported as drift by the `verify` that followed the successful
+    // bootstrap. A project of its own, because swapping one declared table
+    // for another inside one is a rename nobody expressed.
+    {
+        let d = Demo::new("schemacase-table-live");
+        d.table(
+            "table: DBO.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+        );
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let o = d.run(&["bootstrap", "--db", &connection]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("`DBO` (the schema of `DBO.customer`) is written `dbo`"),
+            "{}",
+            stderr(&o)
+        );
+    }
+
+    // The database's own spelling is accepted, and — the point of the
+    // refusal — plans again as no change at all.
+    std::fs::write(&role_file, role("dbo")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("No changes."),
+        "the accepted spelling has to converge: {}",
+        stdout(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
 /// Users, roles and application roles share one namespace in SQL Server; a
 /// role declared under a user's name looked free to the managed set and
 /// `CREATE ROLE` failed after everything ordered before it had run. Refused

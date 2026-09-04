@@ -3675,8 +3675,16 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
             "a schema nobody created is the plan's own mistake",
         ),
         ("app", 0, "and one that is there blocks nothing"),
-        // The engine decides what one name is, here as everywhere else.
-        ("APP", 0, "`APP` is `app` to a case-insensitive database"),
+        // The engine decides what one name is, here as everywhere else — and
+        // it also decides how it spells that name. `APP` grants successfully
+        // on a case-insensitive database and reads back as `app`, so a plan
+        // that wrote it would revoke one spelling and grant the other for
+        // ever; the probe counts it (DECISIONS 142).
+        (
+            "APP",
+            1,
+            "`APP` is `app` to this database, and `app` is how it would read back",
+        ),
     ] {
         let cs = grant(schema);
         let probe = Mssql

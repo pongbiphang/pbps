@@ -1108,12 +1108,21 @@ fn stored_columns(
 fn schema_probe(role: &str, schema: &str) -> Probe {
     Probe::new(
         format!(
-            "`{schema}`, the schema this plan grants `{role}` permissions on, missing from the \
-             database — create it, or write the target the way the database spells it"
+            "`{schema}`, the schema this plan grants `{role}` permissions on, is not a schema \
+             this database has by that spelling — create it, or write the target the way the \
+             database spells it"
         ),
+        // Two failures, one count. Absent is the obvious one; spelt otherwise
+        // is the one a case-insensitive database hides, where the GRANT
+        // succeeds and reads back under the database's spelling, so the plan
+        // that emitted it is proposed again for ever. `plan --db` refuses that
+        // before writing the plan (DECISIONS 142); this is the same question
+        // asked again at apply, for a schema created or renamed since.
         format!(
-            "SELECT CASE WHEN SCHEMA_ID({}) IS NULL THEN 1 ELSE 0 END AS n;",
-            literal(schema)
+            "SELECT CASE WHEN SCHEMA_NAME(SCHEMA_ID({name})) IS NULL \
+             OR SCHEMA_NAME(SCHEMA_ID({name})) <> {name} COLLATE Latin1_General_BIN2 \
+             THEN 1 ELSE 0 END AS n;",
+            name = literal(schema)
         ),
     )
 }

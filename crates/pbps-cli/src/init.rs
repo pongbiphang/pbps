@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 use clap::Args;
 use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project, Unmanaged};
-use pbps_dialect::Dialect as _;
 use pbps_model::{IdsFile, Schema};
 
 use crate::{context, db, declaration_file};
@@ -454,29 +453,15 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         if loaded.schema != prepared.schema {
             bail!("the staged declarations do not round-trip to the pulled schema");
         }
+        // The whole list, not the half this function used to enumerate: the
+        // roles and rows a `pull --data` writes are checked by the checks that
+        // own them, and a staged project that `pbps validate` would reject is
+        // one this command must not leave behind (DECISIONS 141).
         let dialect = pbps_mssql::Mssql;
-        let mut dialect_problems = Vec::new();
-        for (name, table) in &loaded.schema.tables {
-            dialect_problems.extend(
-                dialect
-                    .validate_table(name, table)
-                    .into_iter()
-                    .map(|problem| format!("{name}: {problem}")),
-            );
-        }
-        for (name, module) in &loaded.schema.modules {
-            dialect_problems.extend(
-                dialect
-                    .validate_module(name, module)
-                    .into_iter()
-                    .map(|problem| format!("{name}: {problem}")),
-            );
-        }
-        dialect_problems.extend(pbps_model::module::check_names(&loaded.schema));
-        dialect_problems.extend(pbps_model::module::check_dependencies(
-            &loaded.schema,
-            &loaded.hints.module_deps,
-        ));
+        let dialect_problems: Vec<String> = crate::declaration_problems(&loaded, &dialect)
+            .into_iter()
+            .map(|(_, problem)| problem)
+            .collect();
         if !dialect_problems.is_empty() {
             bail!(
                 "the staged declarations are not valid for mssql:\n  {}",

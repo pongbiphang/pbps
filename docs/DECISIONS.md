@@ -1335,3 +1335,49 @@ SPEC is in sync with all of these.
     one map consulted twice, so neither check can quietly borrow the other's
     type. Only the differing entries travel: a plan already carries the whole
     column list once per changed row, and twice is a cost with no reader.
+
+141. **Every command that reads declarations asks the same questions of them.**
+    `validate` checked the dialect, the name collisions, the grant targets and
+    the rows; `init` checked the first two of those against the project it had
+    just staged; and the two commands that hand statements to a database that
+    is not a rehearsal — `plan --db` and `bootstrap` — checked none of them. A
+    role granting `execute` on a table therefore reached an applyable staged
+    plan, and its `GRANT`, which the ordering puts after every table, row and
+    module statement, would fail on a database those statements had already
+    changed. Three enumerations of one list is a shape where the shortest of
+    them is always the one nobody notices, so there is now one:
+    `declaration_problems` returns `(finding id, message)` pairs, `validate`
+    renders them as findings, and the other three refuse. What each command
+    varies is what it does with the answer, never which questions it asks.
+    Offline `plan` is deliberately not among them: its output is a
+    `PlanOrigin::Preview` that `apply` refuses outright, and its companion for
+    "are these valid" is `validate`.
+
+142. **A `schema::` grant target the database spells differently is refused,
+    before a plan is written that could never converge.** Every other name in
+    a declaration is matched by an identity: a table renamed or recased is the
+    same uid, so the two sides agree by construction. A schema has no uid
+    (ADR-0002) and a grant target names it as text, so `schema::DBO` against a
+    database whose schema is `dbo` is compared as text and differs. Measured
+    rather than reasoned: on the case-insensitive test server `GRANT SELECT ON
+    SCHEMA::[DBO]` succeeds, the catalog reports the schema as `dbo`, and the
+    plan immediately after a successful bootstrap proposes `revoke select on
+    schema::dbo` and `grant select on schema::DBO` — for ever, since applying
+    it changes nothing about how it reads back. Case-folding the comparison
+    would be the wrong fix twice over: on a case-sensitive database the two
+    are different schemas, and only the server knows which kind it is. So the
+    server is asked — `SCHEMA_NAME(SCHEMA_ID(N'DBO'))` — and a spelling that
+    is not the one it returns is refused by `plan --db` and `bootstrap`, the
+    sibling of `refuse_misspelt` (101) for the one name with no identity
+    behind it. Absent is a different answer from differently spelt, and keeps
+    its own message: create it, rather than write it as the database does. The
+    pre-flight probe asks the same question again at apply time, for a schema
+    created or renamed since the plan was reviewed.
+
+    The sweep found the worse instance: the schema half of a qualified table
+    name. The table itself is matched by uid, but the *managed set* is scoped
+    by name, so `DBO.customer` on a database whose schema is `dbo` was created
+    as `dbo.customer`, recorded as a state holding no tables at all —
+    "Bootstrapped: 0 table(s) created", reported as success — and named as
+    drift by the `verify` immediately after. Both halves ask the server the
+    same question, so both are refused by the same check.

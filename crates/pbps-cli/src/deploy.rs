@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_config::Project;
 use pbps_db::Conn;
+use pbps_dialect::Dialect;
 use pbps_model::{
     DataScopes, IdsFile, ObjectName, ObservedRows, RowScope, Schema, StateKind, StateSnapshot,
     TableName,
@@ -331,6 +332,89 @@ pub(crate) async fn refuse_misspelt(conn: &mut Conn, schema: &Schema) -> anyhow:
          none; the engine's spelling is the one to write (DECISIONS 101, 106).",
         lines.len(),
         lines.join("\n  ")
+    );
+}
+
+/// Every schema name a declaration spells, and one declaration that spells it
+/// that way — for the message, so the refusal names something the author can
+/// find in a file rather than a bare schema name.
+fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (name, role) in &schema.roles {
+        for target in role.grants.keys() {
+            if let pbps_model::GrantTarget::Schema(s) = target {
+                out.entry(s.clone())
+                    .or_insert_with(|| format!("granted to role `{name}`"));
+            }
+        }
+    }
+    // The schema half of a qualified name is text on both sides too, and the
+    // uid that matches the *table* does not match it: the managed set is
+    // scoped by name, so `DBO.customer` on a database whose schema is `dbo`
+    // is bootstrapped, recorded as a state holding no tables at all, and
+    // reported as drift by the `verify` immediately after.
+    for name in schema.tables.keys() {
+        out.entry(name.schema.clone())
+            .or_insert_with(|| format!("the schema of `{name}`"));
+    }
+    for name in schema.modules.keys() {
+        out.entry(name.schema.clone())
+            .or_insert_with(|| format!("the schema of `{name}`"));
+    }
+    out
+}
+
+/// The declared schema names the database spells differently, one line each.
+///
+/// Absent is not misspelt: `schema::legacy` on a database that has no such
+/// schema is the pre-flight probe's refusal, and that one says to create it.
+fn wrongly_spelt(
+    spelled: &BTreeMap<String, Option<String>>,
+    declared_by: &BTreeMap<String, String>,
+) -> Vec<String> {
+    spelled
+        .iter()
+        .filter_map(|(declared, found)| match found {
+            Some(found) if found != declared => Some(format!(
+                "`{declared}` ({}) is written `{found}` by the database",
+                declared_by.get(declared).map_or("declared", String::as_str)
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refuses a schema name the database spells differently, before a plan is
+/// written that could never converge (DECISIONS 142).
+///
+/// The sibling of `refuse_misspelt`, for the names in a declaration with no
+/// identity behind them. A table is matched by uid, so its own case is
+/// whatever the ids file recorded; the schema it lives in, and the schema a
+/// `schema::` grant names, are text on both sides. On a case-insensitive
+/// database `schema::DBO` grants successfully, reads back as `dbo`, and is
+/// revoked and granted again by every plan after; `DBO.customer` is created
+/// as `dbo.customer` and then falls outside the managed set the state
+/// records by name.
+pub(crate) async fn refuse_wrongly_spelt_schemas(
+    conn: &mut Conn,
+    schema: &Schema,
+) -> anyhow::Result<()> {
+    let declared_by = schemas_declared(schema);
+    let wanted: std::collections::BTreeSet<String> = declared_by.keys().cloned().collect();
+    let spelled = pbps_mssql::catalog::schema_spellings(conn, &wanted)
+        .await
+        .context("cannot ask the engine how it spells the declared schemas")?;
+    let wrong = wrongly_spelt(&spelled, &declared_by);
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} declared schema name(s) the database spells differently:\n  {}\n\
+         The objects would be created, granted and read back under the database's spelling, \
+         so every plan after would disagree with the declaration that produced it; write the \
+         name the way the database does (DECISIONS 142).",
+        wrong.len(),
+        wrong.join("\n  ")
     );
 }
 
@@ -945,6 +1029,33 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
 /// DR runbook or an air-gapped host, and a target executes it. Neither implies
 /// the other — the script is worth having on a machine that cannot reach the
 /// database at all.
+/// Refuses declarations `validate` would reject, before a single statement is
+/// written for a real database (DECISIONS 141).
+///
+/// The commands below hand SQL to a database that is not a rehearsal. A
+/// declaration the dialect refuses — `execute` granted on a table, say — is
+/// not a plan that fails to convert; it is a plan whose *last* statements
+/// fail, and in staged mode the ones before them have already committed.
+fn refuse_invalid_declarations(
+    loaded: &pbps_load::Loaded,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<()> {
+    let problems = crate::declaration_problems(loaded, dialect);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the declarations have {} problem(s) that would reach the database:\n  {}\n\
+         `pbps validate` reports these with their source lines.",
+        problems.len(),
+        problems
+            .iter()
+            .map(|(_, problem)| problem.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
 pub fn cmd_bootstrap(
     project: &Project,
     target: Option<&Target>,
@@ -953,6 +1064,7 @@ pub fn cmd_bootstrap(
     let loaded = crate::load(project)?;
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    refuse_invalid_declarations(&loaded, dialect.as_ref())?;
     let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     // Every declared object needs its identity, not just "some": a role the
@@ -1047,6 +1159,7 @@ pub fn cmd_bootstrap(
         // differently would be recorded as the engine spells it and drift
         // from the declaration on the next plan (DECISIONS 101).
         refuse_misspelt(&mut conn, &loaded.schema).await?;
+        refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let existing = managed_state_full(
             &mut conn,
             &ids,
@@ -1214,6 +1327,7 @@ pub fn cmd_plan_db(
     let loaded = crate::load(project)?;
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    refuse_invalid_declarations(&loaded, dialect.as_ref())?;
     let created_at = crate::now();
 
     let resolved =
@@ -1275,6 +1389,7 @@ pub fn cmd_plan_db(
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
         refuse_misspelt(&mut conn, &loaded.schema).await?;
+        refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -2891,5 +3006,28 @@ mod tests {
             now[&"app.old_customer".parse::<TableName>().unwrap()],
             scope
         );
+    }
+
+    /// A schema target the database spells differently is refused; one it
+    /// does not have at all is the probe's business, and one that agrees is
+    /// nobody's.
+    #[test]
+    fn only_a_schema_the_database_spells_differently_is_reported() {
+        let mut spelled = BTreeMap::new();
+        spelled.insert("DBO".to_owned(), Some("dbo".to_owned()));
+        spelled.insert("sales".to_owned(), Some("sales".to_owned()));
+        spelled.insert("legacy".to_owned(), None);
+        let declared_by = [("DBO".to_owned(), "granted to role `reporting`".to_owned())]
+            .into_iter()
+            .collect();
+
+        let wrong = wrongly_spelt(&spelled, &declared_by);
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert!(wrong[0].contains("`DBO`"), "{wrong:?}");
+        assert!(
+            wrong[0].contains("granted to role `reporting`"),
+            "{wrong:?}"
+        );
+        assert!(wrong[0].contains("`dbo`"), "{wrong:?}");
     }
 }

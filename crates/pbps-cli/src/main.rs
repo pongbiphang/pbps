@@ -1268,6 +1268,71 @@ fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
     })
 }
 
+/// Every declaration problem `validate` reports as an error, as
+/// `(finding id, message)` pairs.
+///
+/// One list, because there were three: `validate` checked the dialect, the
+/// name collisions, the grant targets and the rows; `init` checked the first
+/// two of those on the project it had just staged; and the two commands that
+/// hand statements to a real database — `plan --db` and `bootstrap` — checked
+/// none of them. A role granting `execute` on a table therefore reached a
+/// staged plan, and its `GRANT`, ordered after every table, row and module
+/// statement, failed on a database those statements had already changed.
+/// The questions belong to the declarations, not to the command that reads
+/// them (DECISIONS 141).
+pub(crate) fn declaration_problems(
+    loaded: &pbps_load::Loaded,
+    dialect: &dyn Dialect,
+) -> Vec<(&'static str, String)> {
+    let schema = &loaded.schema;
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    // Three layers, all reported in the same pass: the loader checks shape, the
+    // dialect checks what the engine will refuse (a nullable PK column, an
+    // IDENTITY on nvarchar), and the whole-schema checks below see what no
+    // single declaration can.
+    for (name, table) in &schema.tables {
+        for e in dialect.validate_table(name, table) {
+            out.push(("dialect.rejected", format!("{name}: {e}")));
+        }
+    }
+    for (name, module) in &schema.modules {
+        for e in dialect.validate_module(name, module) {
+            out.push(("dialect.rejected", format!("{name}: {e}")));
+        }
+    }
+    // Two problems only the whole schema can see: a module named after a
+    // table, and a trigger on a table nobody declares. Both would otherwise
+    // surface as an engine error at apply time, on a database that is
+    // already half-changed.
+    for problem in pbps_model::module::check_names(schema) {
+        out.push(("schema.name-collision", problem));
+    }
+    // Roles (ADR-0005): a grant on an object nobody declares is the
+    // foreign-key-target rule applied to permissions.
+    for problem in pbps_model::role::check(schema) {
+        out.push(("schema.grant-target", problem));
+    }
+    for (name, role) in &schema.roles {
+        for e in dialect.validate_role(name, role, schema) {
+            out.push(("dialect.rejected", format!("role {name}: {e}")));
+        }
+    }
+    // And a third: a `depends_on:` naming a module nobody declared. It is
+    // silently a no-op in the ordering, so nothing else would ever say so.
+    for problem in pbps_model::module::check_dependencies(schema, &loaded.hints.module_deps) {
+        out.push(("schema.unknown-dependency", problem));
+    }
+    // Reference data (ADR-0004). Model rules, not engine rules — a row's
+    // key is its identity in every dialect — so they come from the model
+    // rather than from `validate_table`.
+    for (name, table) in &schema.tables {
+        for problem in pbps_model::data::check(name, table) {
+            out.push(("schema.data-invalid", problem));
+        }
+    }
+    out
+}
+
 /// Renders one load error the way a person should see it.
 ///
 /// The loader's own diagnostics already carry the source excerpt and the caret,
@@ -1362,57 +1427,14 @@ pub fn validate_findings(
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the identity file checks below stand alone.
     if let Ok(l) = &loaded {
-        for (name, table) in &l.schema.tables {
-            for e in dialect.validate_table(name, table) {
-                findings.push(output::Finding::error(
-                    "dialect.rejected",
-                    format!("{name}: {e}"),
-                ));
-            }
-        }
-        for (name, module) in &l.schema.modules {
-            for e in dialect.validate_module(name, module) {
-                findings.push(output::Finding::error(
-                    "dialect.rejected",
-                    format!("{name}: {e}"),
-                ));
-            }
-        }
-        // Two problems only the whole schema can see: a module named after a
-        // table, and a trigger on a table nobody declares. Both would otherwise
-        // surface as an engine error at apply time, on a database that is
-        // already half-changed.
-        for problem in pbps_model::module::check_names(&l.schema) {
-            findings.push(output::Finding::error("schema.name-collision", problem));
-        }
-        // Roles (ADR-0005): a grant on an object nobody declares is the
-        // foreign-key-target rule applied to permissions.
-        for problem in pbps_model::role::check(&l.schema) {
-            findings.push(output::Finding::error("schema.grant-target", problem));
-        }
-        for (name, role) in &l.schema.roles {
-            for e in dialect.validate_role(name, role, &l.schema) {
-                findings.push(output::Finding::error(
-                    "dialect.rejected",
-                    format!("role {name}: {e}"),
-                ));
-            }
-        }
-        // And a third: a `depends_on:` naming a module nobody declared. It is
-        // silently a no-op in the ordering, so nothing else would ever say so.
-        for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
-            findings.push(output::Finding::error("schema.unknown-dependency", problem));
-        }
-        // Reference data (ADR-0004). Model rules, not engine rules — a row's
-        // key is its identity in every dialect — so they come from the model
-        // rather than from `validate_table`. The size warning is the
-        // `data.max-rows` policy rule below, with `max_data_rows` as its
-        // default parameter.
-        for (name, table) in &l.schema.tables {
-            for problem in pbps_model::data::check(name, table) {
-                findings.push(output::Finding::error("schema.data-invalid", problem));
-            }
-        }
+        // The same list every command that reads declarations asks for; the
+        // size warning below is the `data.max-rows` policy rule, with
+        // `max_data_rows` as its default parameter.
+        findings.extend(
+            declaration_problems(l, dialect)
+                .into_iter()
+                .map(|(id, problem)| output::Finding::error(id, problem)),
+        );
 
         // The project's own rules (ADR-0008): the declaration point. The block
         // itself is checked first — a misspelled rule id that configured
