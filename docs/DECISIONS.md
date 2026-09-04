@@ -1453,3 +1453,30 @@ SPEC is in sync with all of these.
     column ends up with. The whole type is compared, not just its base:
     `decimal(5,2)` to `decimal(9,4)` renders `1.50` as `1.5000`, so a widening
     within one base type is no safer than a change of base.
+
+147. **The read-back and the ledger entry are inside the apply's own
+    transaction.** What `apply` records is the database read back, not the
+    plan applied to the old state (SPEC §8.2) — and that read used to happen
+    after the commit. Between the two, another session could edit a declared
+    row or a managed role's grants, and the read would take that in and record
+    it as this plan's result: `apply` reporting success, `verify` clean
+    against the newly blessed state, and only the next connected plan
+    proposing the declaration back. The per-statement postconditions (132,
+    136, 143) close the window *inside* each statement; this one is after the
+    last of them.
+    So `run_uncommitted` leaves the transaction open, the read-back and
+    `state::record` run in it, and `commit` is the last thing that happens.
+    Two things fall out. The ledger entry becomes as atomic as the change it
+    describes — before, a failure to write it left an environment changed with
+    nothing saying so — and a failure in the read-back now rolls the
+    statements back rather than leaving them applied and unrecorded. The old
+    `run_in_transaction`, whose whole shape was "commit immediately", is gone
+    rather than left available: it is the misuse this entry is about.
+    `bootstrap` had the same shape and is fixed with it; the lock is still
+    released after the commit, either way.
+    **`apply --staged` keeps the window, by construction.** It runs each
+    statement outside a transaction so that a mid-way failure leaves a
+    resumable checkpoint (ADR-0003 decision 2), and there is no transaction to
+    put its closing read-back in. What guards a staged run is the same set of
+    per-statement postconditions, plus the drift check every `--resume` makes
+    against the checkpoint.

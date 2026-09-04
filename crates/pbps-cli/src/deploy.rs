@@ -1230,30 +1230,42 @@ pub fn cmd_bootstrap(
         }
 
         pbps_mssql::state::lock(&mut conn, &operator).await?;
-        let result = run_in_transaction(&mut conn, &statements).await;
-        let unlocked = pbps_mssql::state::unlock(&mut conn).await;
-        result?;
-        unlocked?;
+        // The read-back and the ledger entry are inside the transaction the
+        // statements ran in, so nothing can be written between the build and
+        // the record of what was built (DECISIONS 147). The lock is released
+        // after the commit either way.
+        let result = async {
+            run_uncommitted(&mut conn, &statements).await?;
 
-        // The state recorded is what the engine actually built, read back — not
-        // what was declared. Expressions come back in the engine's stored form,
-        // and only that form compares equal on the next drift check (SPEC §8.2).
-        // The rows too, under the declared scope: bootstrap inserted them, and
-        // the engine's spelling of each value is what the record has to hold.
-        let built = managed_state(
-            &mut conn,
-            &ids,
-            &declared_modules,
-            project.config.unmanaged,
-            &loaded.schema.data_scopes(),
-            &loaded.schema,
-        )
-        .await?;
-        let snapshot = with_provenance(
-            project.root(),
-            StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
-        );
-        let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
+            // The state recorded is what the engine actually built, read back —
+            // not what was declared. Expressions come back in the engine's
+            // stored form, and only that form compares equal on the next drift
+            // check (SPEC §8.2). The rows too, under the declared scope:
+            // bootstrap inserted them, and the engine's spelling of each value
+            // is what the record has to hold.
+            let read = managed_state(
+                &mut conn,
+                &ids,
+                &declared_modules,
+                project.config.unmanaged,
+                &loaded.schema.data_scopes(),
+                &loaded.schema,
+            )
+            .await;
+            let built = rolling_back(&mut conn, read).await?;
+            let snapshot = with_provenance(
+                project.root(),
+                StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
+            );
+            let recorded = pbps_mssql::state::record(&mut conn, &snapshot).await;
+            let id = rolling_back(&mut conn, recorded).await?;
+            commit(&mut conn).await?;
+            anyhow::Ok((id, snapshot))
+        }
+        .await;
+        let unlocked = pbps_mssql::state::unlock(&mut conn).await;
+        let (id, snapshot) = result?;
+        unlocked?;
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
             target.label,
@@ -1940,13 +1952,18 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     preflight(conn, dialect, plan, rename_targets).await?;
 
     println!("Applying {} statement(s)...", statements.len());
-    run_in_transaction(conn, statements).await?;
+    run_uncommitted(conn, statements).await?;
 
     // What gets recorded is the database read back, not the plan applied to the
     // old state. Expressions come back in the engine's stored form, and only
     // that form compares equal on the next drift check (SPEC §8.2). The rows
     // under the plan's own scope, for the same reason it carries its ids.
-    let after = managed_state(
+    //
+    // Inside the transaction the statements ran in, not after it: a commit
+    // here would open a window for another session to edit a declared row or
+    // a managed role's grants, and this read would take that in and record it
+    // as the plan's own result (DECISIONS 147).
+    let read = managed_state(
         conn,
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes),
@@ -1954,7 +1971,8 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &plan.data,
         &Schema::default(),
     )
-    .await?;
+    .await;
+    let after = rolling_back(conn, read).await?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
         after.schema,
@@ -1966,7 +1984,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     );
     snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
-    Ok(pbps_mssql::state::record(conn, &snapshot).await?)
+    let recorded = pbps_mssql::state::record(conn, &snapshot).await;
+    let id = rolling_back(conn, recorded).await?;
+    commit(conn).await?;
+    Ok(id)
 }
 
 /// A staged apply: one logical change, run statement by statement outside a
@@ -2555,12 +2576,26 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
     )
 }
 
-/// Runs statements as one transaction: all or nothing (SPEC §7.5).
+/// The statements as one transaction: all or nothing (SPEC §7.5), left
+/// **open** for the caller.
 ///
 /// The rollback is attempted on every failure path and its own error is
 /// deliberately not allowed to replace the original one — the statement that
 /// broke is what the operator needs to see.
-pub async fn run_in_transaction(
+///
+/// What follows an apply is the read-back that becomes the recorded state and
+/// the ledger entry that records it, and both belong inside this transaction.
+/// Committing first left a window another session could write in — a declared
+/// row edited, a managed role's grant changed — and the read-back would take
+/// that in and record it as this plan's own result: `apply` reporting success,
+/// `verify` clean against the newly blessed state, and only the next connected
+/// plan proposing the declaration back (DECISIONS 147). It also makes the
+/// ledger entry as atomic as the change it describes, where before a failure
+/// to write it left the environment changed with nothing saying so.
+///
+/// On any failure the transaction is rolled back before the error returns, so
+/// no caller can leave one open.
+async fn run_uncommitted(
     conn: &mut Conn,
     statements: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
@@ -2575,11 +2610,34 @@ pub async fn run_in_transaction(
             ));
         }
     }
+    Ok(())
+}
+
+/// Commits what `run_uncommitted` opened, rolling back if the commit fails.
+async fn commit(conn: &mut Conn) -> anyhow::Result<()> {
     if let Err(e) = conn.commit().await {
         let _ = conn.rollback().await;
         return Err(anyhow::Error::new(e).context("the transaction could not be committed"));
     }
     Ok(())
+}
+
+/// Rolls the open transaction back and returns the error that caused it.
+///
+/// Everything between the statements and the commit is inside the
+/// transaction, so a failure there has to undo the statements too — an apply
+/// whose read-back or ledger entry failed has changed nothing (147).
+async fn rolling_back<T, E: Into<anyhow::Error>>(
+    conn: &mut Conn,
+    result: Result<T, E>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = conn.rollback().await;
+            Err(e.into())
+        }
+    }
 }
 
 /// Stamps a snapshot with where it came from.
