@@ -2444,6 +2444,134 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .await
         .expect("out of the way of the checks below");
 
+    // A foreign key is a tuple. Counted per column, a child on the surviving
+    // parent `(1, 2)` matched the deleted `(1, 1)` by its first column, and
+    // every delete of a row with a composite alternate key was refused
+    // (DECISIONS 121). `(grp, sub)`: old (1, 1), new (1, 2), rogue (2, 1).
+    for sql in [
+        "ALTER TABLE dbo.status ADD grp int NULL, sub int NULL;",
+        "UPDATE dbo.status SET grp = CASE code WHEN 'rogue' THEN 2 ELSE 1 END, \
+         sub = CASE code WHEN 'new' THEN 2 ELSE 1 END;",
+        "ALTER TABLE dbo.status ADD CONSTRAINT uq_status_pair UNIQUE (grp, sub);",
+        "CREATE TABLE dbo.pair_child (\n\
+             id int NOT NULL CONSTRAINT pk_pair_child PRIMARY KEY,\n\
+             grp int NULL,\n\
+             sub int NULL,\n\
+             CONSTRAINT fk_pair_child FOREIGN KEY (grp, sub) REFERENCES dbo.status (grp, sub) \
+         ON DELETE CASCADE\n\
+         );",
+        "INSERT INTO dbo.pair_child (id, grp, sub) VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 1, NULL);",
+    ] {
+        db.conn.execute(sql).await.unwrap_or_else(|e| {
+            panic!("a composite alternate key and children for it:\n{sql}\n{e}")
+        });
+    }
+    let pair_update = |id: &str, cells: &[(&str, Value)]| {
+        pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+            table: TableName::new("dbo", "pair_child"),
+            key_column: "id".to_owned(),
+            key: RowKey::from(id),
+            columns: cells
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        (*c).to_owned(),
+                        (
+                            pbps_model::Cell::Value(Value::Null),
+                            pbps_model::Cell::Value(v.clone()),
+                        ),
+                    )
+                })
+                .collect(),
+        })
+    };
+    let pair_insert = |id: &str, cells: &[(&str, Value)]| {
+        pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+            table: TableName::new("dbo", "pair_child"),
+            key_column: "id".to_owned(),
+            identity_key: false,
+            key: RowKey::from(id),
+            defaults: Default::default(),
+            row: cells
+                .iter()
+                .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                .collect::<Row>(),
+        })
+    };
+    let with = |change: pbps_model::PlannedChange| pbps_model::ChangeSet {
+        changes: vec![moved.changes[0].clone(), change, moved.changes[1].clone()],
+    };
+    let int = Value::Int;
+    for (cs, want, why) in [
+        (
+            pbps_model::ChangeSet {
+                changes: moved.changes.clone(),
+            },
+            1,
+            "pair_child 1 on (1, 1) references `old`; 2 on (1, 2), 3 on (2, 1) and 4 on (1, NULL) do not",
+        ),
+        (
+            with(pair_update("1", &[("sub", int(2))])),
+            0,
+            "pair_child 1 moved to (1, 2) is not counted",
+        ),
+        (
+            with(pair_update("1", &[("grp", int(2)), ("sub", int(1))])),
+            0,
+            "an update setting both columns is one tuple: (2, 1) is `rogue`",
+        ),
+        (
+            with(pair_update("1", &[("sub", Value::Null)])),
+            1,
+            "a cell set to NULL is not compared: the row stays counted",
+        ),
+        (
+            with(pair_update("2", &[("sub", int(1))])),
+            2,
+            "pair_child 2 moved onto (1, 1) is counted beside 1",
+        ),
+        (
+            with(pair_update("3", &[("grp", int(1))])),
+            2,
+            "pair_child 3 moved onto (1, 1) by its first column is counted",
+        ),
+        (
+            with(pair_update("4", &[("sub", int(1))])),
+            2,
+            "pair_child 4 references nothing while `sub` is NULL, and is counted once set onto (1, 1)",
+        ),
+        (
+            with(pair_insert("5", &[("grp", int(1)), ("sub", int(1))])),
+            2,
+            "an inserted child on (1, 1) is counted",
+        ),
+        (
+            with(pair_insert("5", &[("grp", int(1)), ("sub", int(2))])),
+            1,
+            "an inserted child on (1, 2) is not",
+        ),
+        (
+            with(pair_insert("5", &[("grp", int(1))])),
+            1,
+            "an inserted child with `sub` left to NULL references nothing",
+        ),
+    ] {
+        let probe = probe_for(&cs);
+        let n: i32 = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, want, "{why}");
+    }
+    db.conn
+        .execute("DROP TABLE dbo.pair_child;")
+        .await
+        .expect("out of the way of the checks below");
+
     // A table that has lost its key is unreadable, not empty.
     db.conn
         .execute("ALTER TABLE dbo.kind DROP CONSTRAINT fk_kind_status; DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID('dbo.status') AND type = 'PK'); EXEC('ALTER TABLE dbo.status DROP CONSTRAINT ' + @pk);")

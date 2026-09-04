@@ -76,26 +76,39 @@ struct AsStored {
 }
 
 /// The rows of one table a plan writes, as the pre-delete probe has to see
-/// them: which are deleted outright, and which columns each update sets.
+/// them: which are deleted outright, and what each update or insert leaves
+/// in each column it touches.
+///
+/// Per row, not per column: a foreign key is a tuple, and the probe compares
+/// a row's whole tuple against the parent row's (DECISIONS 121). A per-column
+/// record counted a child on the surviving parent `(1, 2)` against deleting
+/// `(1, 1)`, and could not tell an update that sets two columns of one key
+/// from two updates.
 #[derive(Debug, Default)]
 struct Moved {
     key_column: String,
     /// Deleted: gone whatever they referenced.
     deleted: BTreeSet<RowKey>,
-    /// Column set by an update -> the keys of the rows it is set in, with
-    /// the value each is set to (`None` for `DEFAULT` or NULL, which no
-    /// probe can compare). An update that sets the *referencing* column to
-    /// a value that is not the deleted key moves the row off the parent; one
-    /// that sets any other column, or sets it to the same key under another
-    /// spelling (`01` for `1`, `OLD` for `old` under a case-insensitive
-    /// collation), leaves it pointing where it was, and with `ON DELETE
-    /// CASCADE` the engine would then delete it silently. Whether two
-    /// spellings are one key is the engine's call, so the probe asks it.
-    updated: BTreeMap<String, BTreeMap<RowKey, Option<String>>>,
-    /// The mirror of [`Moved::updated`]: column -> the rows this plan puts
-    /// *onto* a parent, with the value each is set to.
+    /// Updated row -> column set by its update -> the value it is set to,
+    /// as the SQL the engine compares (a literal, or the expression the
+    /// catalog spells a literal default in: `(1)`, `('old')`). `None` for
+    /// NULL or a default that is not a literal, which no probe can compare.
     ///
-    /// `COUNT(*) ... WHERE fkcol = @key` sees only what is stored, and a row
+    /// An update that sets a *referencing* column to a value that is not the
+    /// deleted key moves the row off the parent; one that sets any other
+    /// column, or sets it to the same key under another spelling (`01` for
+    /// `1`, `OLD` for `old` under a case-insensitive collation), leaves it
+    /// pointing where it was, and with `ON DELETE CASCADE` the engine would
+    /// then delete it silently. Whether two spellings are one key is the
+    /// engine's call, so the probe asks it. A row that moves *onto* the
+    /// parent is an arrival, counted the same way (see [`Moved::inserted`]).
+    updated: BTreeMap<RowKey, BTreeMap<String, Option<String>>>,
+    /// Inserted row -> column -> the value it arrives with, as the SQL the
+    /// engine compares: spelled by the row, or the literal default of a
+    /// column it omits. A column set to NULL, or left to a default that is
+    /// not a literal, is absent.
+    ///
+    /// `COUNT(*)` over the child sees only what is stored, and a row
     /// arriving on the parent is either not in the table yet (an insert) or
     /// stored somewhere else (an update). Both run before the deletes
     /// (`order_key`), so the probe passes, the insert or update commits, and
@@ -111,38 +124,19 @@ struct Moved {
     /// engine to compare like any other value. A default that is not a
     /// literal (`NEXT VALUE FOR`, `NEWID()`) has no value before it runs
     /// and is the one arrival no probe can ask about (DECISIONS 117).
-    arriving: BTreeMap<String, BTreeMap<RowKey, Arrival>>,
+    inserted: BTreeMap<RowKey, BTreeMap<String, String>>,
 }
 
-/// Where a row arriving on a parent key comes from.
-///
-/// The two need different counting: an insert has no stored row, while an
-/// update has one that the base `COUNT(*)` may already have counted — a row
-/// re-spelled onto the key it is already on must not be reported twice.
-#[derive(Debug)]
-enum Arrival {
-    Inserted(String),
-    Updated(String),
-    /// An insert that omits the column, arriving at its literal default —
-    /// carried as the expression the catalog spells it in (`(1)`,
-    /// `('old')`), rendered as is for the engine to compare.
-    InsertedAtDefault(String),
-    /// An update to `DEFAULT`, the same.
-    UpdatedToDefault(String),
-}
-
-impl Arrival {
-    /// The SQL the engine compares against the deleted key: a literal for a
-    /// declared value, the default expression itself for a defaulted one.
-    fn sql(&self) -> String {
-        match self {
-            Arrival::Inserted(v) | Arrival::Updated(v) => literal(v),
-            Arrival::InsertedAtDefault(e) | Arrival::UpdatedToDefault(e) => format!("({e})"),
-        }
-    }
-
-    const fn inserted(&self) -> bool {
-        matches!(self, Arrival::Inserted(_) | Arrival::InsertedAtDefault(_))
+/// The SQL the engine compares a written cell by: the literal, or `None` for
+/// what it cannot compare before the write runs.
+fn written(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(t) => Some(literal(t)),
+        Value::Int(i) => Some(literal(&i.to_string())),
+        Value::Bool(b) => Some(literal(&b.to_string())),
+        // A NULL foreign key references nothing, so no delete can cascade
+        // into the row through it.
+        Value::Null => None,
     }
 }
 
@@ -180,32 +174,13 @@ impl AsStored {
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
+                    let updated = moved.updated.entry(key.clone()).or_default();
                     for (column, (_, after)) in columns {
-                        let value = match after {
-                            Cell::Value(Value::Text(t)) => Some(t.clone()),
-                            Cell::Value(Value::Int(i)) => Some(i.to_string()),
-                            Cell::Value(Value::Bool(b)) => Some(b.to_string()),
-                            Cell::Value(Value::Null) | Cell::Default(_) => None,
+                        let sql = match after {
+                            Cell::Value(v) => written(v),
+                            Cell::Default(d) => constant_default(d).map(|e| format!("({e})")),
                         };
-                        if let Some(value) = value.clone() {
-                            moved
-                                .arriving
-                                .entry(column.clone())
-                                .or_default()
-                                .insert(key.clone(), Arrival::Updated(value));
-                        } else if let Cell::Default(d) = after
-                            && let Some(expr) = constant_default(d)
-                        {
-                            moved.arriving.entry(column.clone()).or_default().insert(
-                                key.clone(),
-                                Arrival::UpdatedToDefault(expr.to_owned()),
-                            );
-                        }
-                        moved
-                            .updated
-                            .entry(column.clone())
-                            .or_default()
-                            .insert(key.clone(), value);
+                        updated.insert(column.clone(), sql);
                     }
                 }
                 Change::InsertRow {
@@ -218,28 +193,19 @@ impl AsStored {
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
+                    let inserted = moved.inserted.entry(key.clone()).or_default();
+                    // The key is written like any other column, and may be
+                    // one column of a composite foreign key.
+                    inserted.insert(key_column.clone(), literal(key.as_str()));
                     for (column, default) in defaults {
                         if let Some(expr) = constant_default(default) {
-                            moved.arriving.entry(column.clone()).or_default().insert(
-                                key.clone(),
-                                Arrival::InsertedAtDefault(expr.to_owned()),
-                            );
+                            inserted.insert(column.clone(), format!("({expr})"));
                         }
                     }
                     for (column, value) in &row.0 {
-                        let text = match value {
-                            Value::Text(t) => t.clone(),
-                            Value::Int(i) => i.to_string(),
-                            Value::Bool(b) => b.to_string(),
-                            // A NULL foreign key references nothing, so no
-                            // delete can cascade into this row.
-                            Value::Null => continue,
-                        };
-                        moved
-                            .arriving
-                            .entry(column.clone())
-                            .or_default()
-                            .insert(key.clone(), Arrival::Inserted(text));
+                        if let Some(sql) = written(value) {
+                            inserted.insert(column.clone(), sql);
+                        }
                     }
                 }
                 Change::DeleteRow {
@@ -542,25 +508,32 @@ fn delete_probe(
     stored: &ColumnRef,
     names: &AsStored,
 ) -> Result<Probe, DialectError> {
-    // Per referencing table, the keys this plan moves in it — spelled as the
-    // literal list the generated `NOT IN` will carry, under the name the
-    // database has for the table now. Doubled quotes, because the fragment is
-    // itself inside a T-SQL string literal.
+    // One count per foreign key, and a foreign key is a tuple: the child's
+    // columns are compared against the parent row's together, through a
+    // conjunction the engine assembles from `sys.foreign_key_columns` at run
+    // time (`tuple`). One count per *column* — the first cut — matched a child
+    // on the surviving parent `(1, 2)` against deleting `(1, 1)` by its first
+    // column, and refused every such delete (DECISIONS 121).
     //
-    // Which rows count as moved depends on the referencing column, which only
-    // the catalog query knows (`c.name`): a deleted row is gone for every
-    // column, an updated row only for the columns its update sets. A row
-    // updated elsewhere still points at the parent, and is counted.
+    // Per referencing table, the rows this plan moves in it, under the name
+    // the database has for the table now. Doubled quotes throughout, because
+    // each fragment is itself inside a T-SQL string literal. Which columns a
+    // foreign key spans only the catalog knows, so the fragments that depend
+    // on it are guarded at run time (`touches`, `reaches_beyond`): a deleted
+    // row is gone for every key, an updated row is left out only of the keys
+    // its update moves it off, and a row updated elsewhere still points at
+    // the parent, and is counted.
     let parent = qualified(&stored.table)?;
     // The row being deleted, named by the column the *plan* keys it on. Every
     // fragment below that means "this parent row" says so this way, because a
     // foreign key may reference some other unique key of the same row, and
-    // `rc.name` is then not the key column at all (DECISIONS 116).
-    let this_row = format!("{} = @key", quote(&stored.name)?);
-    // A quoted identifier may itself hold a `'` — `quote` escapes `]`, not
-    // quotes — so every fragment carrying one into the generated statement
-    // goes through `literal`, never straight into the outer `N'...'`.
-    let from_this_row = literal(&format!(" FROM {parent} WHERE {this_row})"));
+    // its referenced columns are then not the key column at all (DECISIONS
+    // 116). `p` is the parent and `ch` the child throughout the generated
+    // statement.
+    let parent_row = format!(
+        "SELECT 1 FROM {parent} AS p WHERE p.{} = @key",
+        quote(&stored.name)?
+    );
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
@@ -570,118 +543,119 @@ fn delete_probe(
         let Some(stored_key) = names.column(&child.column(&moved.key_column)) else {
             continue;
         };
-        let key_sql = quote(&stored_key.name)?;
+        let key_sql = format!("ch.{}", quote(&stored_key.name)?);
+        let child_sql = qualified(&stored_child)?;
+        // A column the database does not have yet cannot be in a foreign
+        // key it has; one it names differently is asked about by that name.
+        let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+        // A quoted identifier may itself hold a `'` — `quote` escapes `]`,
+        // not quotes — so every fragment carrying one into the generated
+        // statement goes through `literal`, never straight into the outer
+        // `N'...'`.
+        let mut pieces = Vec::new();
+        let mut terms = Vec::new();
         // Deleted rows are gone whatever they pointed at.
-        let deleted = (!moved.deleted.is_empty()).then(|| {
+        if !moved.deleted.is_empty() {
             let list: Vec<String> = moved.deleted.iter().map(|k| literal(k.as_str())).collect();
-            literal(&format!(" AND {key_sql} NOT IN ({})", list.join(", ")))
-        });
-        let mut per_column = Vec::new();
-        for (column, rows) in &moved.updated {
-            let Some(stored_column) = names.column(&child.column(column)) else {
-                continue;
-            };
-            // The fragment is assembled at run time from literal pieces and
-            // `QUOTENAME(rc.name)`, the referenced column the catalog query
-            // has in hand: an updated row is left out only when the value it
-            // is set to is *not* the deleted key — as the engine compares
-            // them, through the parent table, so `01` and `1` are one key.
-            // A row set to DEFAULT or NULL cannot be compared and is
-            // counted, which is the direction to be wrong in.
-            let mut pieces: Vec<String> = deleted.iter().cloned().collect();
-            for (child_key, after) in rows {
-                let Some(after) = after else {
+            pieces.push(literal(&format!(
+                " AND {key_sql} NOT IN ({})",
+                list.join(", ")
+            )));
+        }
+        for (row_key, columns) in &moved.updated {
+            let mut comparable = BTreeMap::new();
+            let mut uncomparable = BTreeSet::new();
+            for (column, after) in columns {
+                let Some(name) = stored_name(column) else {
                     continue;
                 };
-                pieces.push(literal(&format!(
-                    " AND NOT ({key_sql} = {} AND NOT EXISTS (SELECT 1 FROM {parent} WHERE ",
-                    literal(child_key.as_str())
-                )));
-                pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(&format!(" = {} AND {this_row}))", literal(after))));
+                match after {
+                    Some(sql) => {
+                        comparable.insert(name, sql.clone());
+                    }
+                    None => {
+                        uncomparable.insert(name);
+                    }
+                }
             }
-            let then = if pieces.is_empty() {
-                "N''".to_owned()
-            } else {
-                pieces.join(" + ")
-            };
-            per_column.push(format!(
-                "WHEN c.name = {} THEN {then}",
-                literal(&stored_column.name)
+            if comparable.is_empty() {
+                continue;
+            }
+            // The row's tuple after the update: the value the update sets
+            // where it sets one, the stored cell elsewhere. It is left out
+            // of a key's count only when the engine says that tuple is not
+            // the deleted row's — so `01` and `1` are one key — and counted
+            // for a key the update sets a cell of to something the probe
+            // cannot compare, which is the direction to be wrong in.
+            let after = side(&comparable);
+            let row = literal(row_key.as_str());
+            let excluded = format!(
+                "{} + {} + {}",
+                literal(&format!(
+                    " AND NOT ({key_sql} = {row} AND NOT EXISTS ({parent_row}"
+                )),
+                tuple(&after),
+                literal("))")
+            );
+            pieces.push(guarded(&uncomparable, &comparable, &excluded));
+            // And the same row arriving on the parent, which the count
+            // cannot see (see [`Moved::inserted`]): the row exists, so it
+            // may already be inside the count, and only one that is *not*
+            // on the parent now is arriving. A term added to the count
+            // rather than a clause narrowing it, so a whole parenthesised
+            // expression.
+            let arrived = format!(
+                "{} + {} + {} + {} + {}",
+                literal(&format!(
+                    " + (SELECT COUNT(*) FROM {child_sql} AS ch WHERE {key_sql} = {row} AND \
+                     NOT EXISTS ({parent_row}"
+                )),
+                tuple(STORED),
+                literal(&format!(") AND EXISTS ({parent_row}")),
+                tuple(&after),
+                literal("))")
+            );
+            terms.push(guarded(&uncomparable, &comparable, &arrived));
+        }
+        for columns in moved.inserted.values() {
+            let known: BTreeMap<String, String> = columns
+                .iter()
+                .filter_map(|(column, sql)| stored_name(column).map(|name| (name, sql.clone())))
+                .collect();
+            if known.is_empty() {
+                continue;
+            }
+            // Nothing stored to double-count: the row is either arriving on
+            // the deleted row or it is not. A key spanning a column the
+            // insert leaves to NULL, or to a default that is not a literal,
+            // is not one the probe can ask about (117).
+            let arrived = format!(
+                "{} + {} + {}",
+                literal(&format!(" + (CASE WHEN EXISTS ({parent_row}")),
+                tuple(&side(&known)),
+                literal(") THEN 1 ELSE 0 END)")
+            );
+            terms.push(format!(
+                "CASE WHEN {} THEN N'' ELSE {arrived} END",
+                reaches_beyond(known.keys())
             ));
         }
-        // And, per column, the rows this plan puts *onto* the parent, which
-        // the count above cannot see (see [`Moved::arriving`]). Terms added
-        // to the count rather than clauses narrowing it, so each is a whole
-        // parenthesised expression. `rc.name` is the referenced column, which
-        // only the catalog query knows; everything else is settled here.
-        let child_sql = qualified(&stored_child)?;
-        let mut arrivals_per_column = Vec::new();
-        for (column, rows) in &moved.arriving {
-            let Some(stored_column) = names.column(&child.column(column)) else {
-                continue;
-            };
-            let column_sql = quote(&stored_column.name)?;
-            let mut pieces = Vec::new();
-            for (child_key, arrival) in rows {
-                if arrival.inserted() {
-                    // Nothing stored to double-count: the row is either
-                    // arriving on the deleted row or it is not.
-                    pieces.push(literal(&format!(
-                        " + (CASE WHEN EXISTS (SELECT 1 FROM {parent} WHERE "
-                    )));
-                } else {
-                    // The row exists, so it may already be inside the
-                    // count: only one that is *not* on the parent now is
-                    // arriving. A NULL foreign key is not on it either,
-                    // and `NULL NOT IN (...)` is unknown, so it is named.
-                    pieces.push(literal(&format!(
-                        " + (SELECT COUNT(*) FROM {child_sql} WHERE {key_sql} = {} AND \
-                         ({column_sql} IS NULL OR {column_sql} NOT IN (SELECT ",
-                        literal(child_key.as_str())
-                    )));
-                    pieces.push("QUOTENAME(rc.name)".to_owned());
-                    pieces.push(literal(&format!(
-                        " FROM {parent} WHERE {this_row})) AND EXISTS (SELECT 1 FROM \
-                         {parent} WHERE "
-                    )));
-                }
-                pieces.push("QUOTENAME(rc.name)".to_owned());
-                pieces.push(literal(&format!(
-                    " = {} AND {this_row}{}",
-                    arrival.sql(),
-                    if arrival.inserted() {
-                        ") THEN 1 ELSE 0 END)"
-                    } else {
-                        "))"
-                    }
-                )));
-            }
-            if !pieces.is_empty() {
-                arrivals_per_column.push(format!(
-                    "WHEN c.name = {} THEN {}",
-                    literal(&stored_column.name),
-                    pieces.join(" + ")
-                ));
-            }
-        }
-        let otherwise = deleted.clone().unwrap_or_else(|| "N''".to_owned());
-        let clause = if per_column.is_empty() {
-            otherwise
+        let exclusion = if pieces.is_empty() {
+            "N''".to_owned()
         } else {
-            format!("CASE {} ELSE {otherwise} END", per_column.join(" "))
+            pieces.join(" + ")
         };
         exclusions.push(format!(
-            "WHEN s.name = {} AND t.name = {} THEN {clause}",
+            "WHEN s.name = {} AND t.name = {} THEN {exclusion}",
             literal(&stored_child.schema),
             literal(&stored_child.name),
         ));
-        if !arrivals_per_column.is_empty() {
+        if !terms.is_empty() {
             arrivals.push(format!(
-                "WHEN s.name = {} AND t.name = {} THEN CASE {} ELSE N'' END",
+                "WHEN s.name = {} AND t.name = {} THEN {}",
                 literal(&stored_child.schema),
                 literal(&stored_child.name),
-                arrivals_per_column.join(" ")
+                terms.join(" + ")
             ));
         }
     }
@@ -696,6 +670,9 @@ fn delete_probe(
         format!("CASE {} ELSE N'' END", arrivals.join(" "))
     };
 
+    // The statements are built in a derived table and aggregated outside it:
+    // the fragments carry subqueries over the key's columns, and an aggregate's
+    // argument may not (Msg 130).
     Ok(Probe::new(
         format!(
             "rows in other tables that still reference {table} row `{key}`, which its delete \
@@ -703,23 +680,95 @@ fn delete_probe(
         ),
         format!(
             "DECLARE @n int = 0, @sql nvarchar(max);\n\
-             SELECT @sql = STRING_AGG(CONVERT(nvarchar(max),\n\
-                 N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
-                 + N' WHERE ' + QUOTENAME(c.name) + N' IN (SELECT ' + QUOTENAME(rc.name)\n\
-                 + {from_this_row} + {exclusion} + N')' + {arrival} + N';'), N' ')\n\
-               FROM sys.foreign_keys fk\n\
-               JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n\
-               JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
-               JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
-               JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id\n\
-               JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id\n\
-              WHERE fk.referenced_object_id = OBJECT_ID({});\n\
+             SELECT @sql = STRING_AGG(CONVERT(nvarchar(max), x.stmt), N' ')\n\
+               FROM (SELECT N'SELECT @n += (SELECT COUNT(*) FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)\n\
+                     + {} + {} + N')' + {exclusion} + N')' + {arrival} + N';' AS stmt\n\
+                       FROM sys.foreign_keys fk\n\
+                       JOIN sys.tables t ON t.object_id = fk.parent_object_id\n\
+                       JOIN sys.schemas s ON s.schema_id = t.schema_id\n\
+                      WHERE fk.referenced_object_id = OBJECT_ID({})) AS x;\n\
              IF @sql IS NOT NULL EXEC sp_executesql @sql, N'@key nvarchar(max), @n int OUTPUT', @key = {}, @n = @n OUTPUT;\n\
              SELECT @n AS n;",
+            literal(&format!(" AS ch WHERE EXISTS ({parent_row}")),
+            tuple(STORED),
             literal(&parent),
             literal(key.as_str())
         ),
     ))
+}
+
+/// The columns of the foreign key the generated statement is being built
+/// for (`fk`), with their names on the child side (`c`) and the parent side
+/// (`rc`).
+const KEY_COLUMNS: &str = "FROM sys.foreign_key_columns fkc \
+     JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id \
+     JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+     WHERE fkc.constraint_object_id = fk.object_id";
+
+/// The child's stored cell, as the child side of a column of the key.
+const STORED: &str = "N'ch.' + QUOTENAME(c.name)";
+
+/// The key as a conjunction the engine assembles at run time: ` AND p.<rc>
+/// = <child side>` for each of its columns, where `child_side` is SQL over
+/// `c.name` spelling what the child holds in that column.
+fn tuple(child_side: &str) -> String {
+    format!(
+        "(SELECT STRING_AGG(CONVERT(nvarchar(max), N' AND p.' + QUOTENAME(rc.name) + N' = ' + \
+         {child_side}), N'') {KEY_COLUMNS})"
+    )
+}
+
+/// A row's tuple as the plan writes it: the value written in each column
+/// the plan spells, the stored cell in any other. Spelled for the engine as
+/// a `CASE` over the key's columns.
+fn side(values: &BTreeMap<String, String>) -> String {
+    let whens: Vec<String> = values
+        .iter()
+        .map(|(name, sql)| format!("WHEN {} THEN {}", literal(name), literal(sql)))
+        .collect();
+    format!("CASE c.name {} ELSE {STORED} END", whens.join(" "))
+}
+
+/// Whether the key spans one of `columns`.
+fn touches<'a>(columns: impl Iterator<Item = &'a String>) -> String {
+    let list: Vec<String> = columns.map(|c| literal(c)).collect();
+    if list.is_empty() {
+        return "1 = 0".to_owned();
+    }
+    format!(
+        "EXISTS (SELECT 1 {KEY_COLUMNS} AND c.name IN ({}))",
+        list.join(", ")
+    )
+}
+
+/// Whether the key spans a column outside `columns`.
+fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a String>) -> String {
+    let list: Vec<String> = columns.map(|c| literal(c)).collect();
+    if list.is_empty() {
+        return "1 = 1".to_owned();
+    }
+    format!(
+        "EXISTS (SELECT 1 {KEY_COLUMNS} AND c.name NOT IN ({}))",
+        list.join(", ")
+    )
+}
+
+/// `fragment` for a key the update moves a row along, nothing for one it
+/// does not touch — and nothing, so the row stays counted, for a key it sets
+/// a cell of to something the probe cannot compare.
+fn guarded(
+    uncomparable: &BTreeSet<String>,
+    comparable: &BTreeMap<String, String>,
+    fragment: &str,
+) -> String {
+    let mut arms = String::new();
+    if !uncomparable.is_empty() {
+        arms.push_str(&format!("WHEN {} THEN N'' ", touches(uncomparable.iter())));
+    }
+    format!(
+        "CASE {arms}WHEN {} THEN {fragment} ELSE N'' END",
+        touches(comparable.keys())
+    )
 }
 
 /// The table and columns as the database currently names them, or `None` when
@@ -1082,24 +1131,31 @@ mod tests {
         // the filter that was here dropped a constraint referencing some
         // other unique key out of the query altogether (116).
         assert!(!sql.contains("rc.name = N'code'"), "{sql}");
-        // The child is compared against the referenced column *of the row
-        // being deleted*, which is the same query when that column is the
-        // key.
+        // One count per foreign key, and the child is compared against the
+        // row being deleted column by column, as one tuple the engine
+        // assembles from the key's columns (121).
+        assert!(
+            sql.contains("FROM sys.foreign_keys fk\nJOIN sys.tables t"),
+            "{sql}"
+        );
         assert!(
             sql.contains(
-                "QUOTENAME(c.name) + N' IN (SELECT ' + QUOTENAME(rc.name)\n\
-                 + N' FROM [dbo].[status] WHERE [code] = @key)'"
+                "N' AS ch WHERE EXISTS (SELECT 1 FROM [dbo].[status] AS p WHERE p.[code] = @key' + \
+                 (SELECT STRING_AGG(CONVERT(nvarchar(max), N' AND p.' + QUOTENAME(rc.name) + \
+                 N' = ' + N'ch.' + QUOTENAME(c.name)), N'') FROM sys.foreign_key_columns fkc"
             ),
             "{sql}"
         );
+        assert!(
+            sql.contains("WHERE fkc.constraint_object_id = fk.object_id) + N')'"),
+            "{sql}"
+        );
         assert!(sql.contains("@key = N'old'"), "{sql}");
-        assert!(sql.contains("sys.foreign_keys"), "{sql}");
-        assert!(sql.contains("QUOTENAME"), "{sql}");
         // The deleted row itself is excluded from a self-referencing count: a
         // row pointing at itself is gone with the delete, not orphaned by it.
         assert!(
             sql.contains(
-                "WHEN s.name = N'dbo' AND t.name = N'status' THEN N' AND [code] NOT IN (N''old'')'"
+                "WHEN s.name = N'dbo' AND t.name = N'status' THEN N' AND ch.[code] NOT IN (N''old'')'"
             ),
             "{sql}"
         );
@@ -1134,13 +1190,20 @@ mod tests {
 
         let sql = sql_of(&plan(vec![insert("('old')"), delete.clone()]));
         assert!(
-            sql.contains("CASE WHEN EXISTS (SELECT 1 FROM") && sql.contains("= (''old'') AND"),
+            sql.contains("WHEN N'status_code' THEN N'(''old'')'")
+                && sql.contains(") THEN 1 ELSE 0 END)'"),
             "the literal default is what the engine compares: {sql}"
         );
         // Not a literal: nothing to compare before it runs. NULL: no row.
+        // The key is still written, so a key spanning it is asked about,
+        // and one spanning `status_code` is not.
         for default in ["(NEXT VALUE FOR [dbo].[s])", "(NULL)"] {
             let sql = sql_of(&plan(vec![insert(default), delete.clone()]));
-            assert!(!sql.contains("CASE WHEN EXISTS"), "{default}: {sql}");
+            assert!(!sql.contains("N'status_code'"), "{default}: {sql}");
+            assert!(
+                sql.contains("AND c.name NOT IN (N'id')) THEN N'' ELSE"),
+                "{default}: {sql}"
+            );
         }
 
         // An update to DEFAULT, the same way.
@@ -1159,10 +1222,92 @@ mod tests {
             .collect(),
         };
         let sql = sql_of(&plan(vec![update, delete]));
-        assert!(sql.contains("= (''old'') AND"), "{sql}");
         assert!(
-            sql.contains("NOT IN (SELECT"),
+            sql.contains("WHEN N'status_code' THEN N'(''old'')'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "ch.[id] = N''7'' AND NOT EXISTS (SELECT 1 FROM [dbo].[status] AS p WHERE p.[code] = @key'"
+            ),
             "an update may already be counted: {sql}"
+        );
+    }
+
+    /// A foreign key is a tuple: an update that sets two of its columns is
+    /// compared as one row after the update, a key spanning a column the
+    /// update sets to NULL keeps the row counted, and an insert that leaves
+    /// a column of the key to NULL is not asked about (121).
+    #[test]
+    fn a_composite_foreign_key_is_matched_as_one_tuple() {
+        use pbps_model::{Cell, Value};
+        let update = |key: &str, cells: &[(&str, Value)]| Change::UpdateRow {
+            table: tname("dbo.pair_child"),
+            key_column: "id".into(),
+            key: RowKey::from(key),
+            columns: cells
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        (*c).to_owned(),
+                        (Cell::Value(Value::Null), Cell::Value(v.clone())),
+                    )
+                })
+                .collect(),
+        };
+        let cs = plan(vec![
+            update("1", &[("grp", Value::Int(2)), ("sub", Value::Int(1))]),
+            update("2", &[("grp", Value::Int(1)), ("sub", Value::Null)]),
+            Change::InsertRow {
+                table: tname("dbo.pair_child"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("5"),
+                row: [("grp".to_owned(), Value::Int(1))].into_iter().collect(),
+                defaults: Default::default(),
+            },
+            Change::DeleteRow {
+                table: tname("dbo.status"),
+                key_column: "code".into(),
+                key: RowKey::from("old"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+            },
+        ]);
+        let p = probes(&cs);
+        assert_eq!(p.len(), 1, "{p:?}");
+        let sql = &p[0].sql;
+        // Both cells in one tuple, for a key spanning either column.
+        assert!(
+            sql.contains(
+                "CASE c.name WHEN N'grp' THEN N'N''2''' WHEN N'sub' THEN N'N''1''' \
+                 ELSE N'ch.' + QUOTENAME(c.name) END"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("AND c.name IN (N'grp', N'sub')) THEN N' AND NOT (ch.[id] = N''1''"),
+            "{sql}"
+        );
+        // The NULL is not compared: a key spanning `sub` counts row 2 as it
+        // is, one spanning `grp` alone compares it.
+        assert!(
+            sql.contains(
+                "AND c.name IN (N'sub')) THEN N'' WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("AND c.name IN (N'grp')) THEN N' AND NOT (ch.[id] = N''2''"),
+            "{sql}"
+        );
+        // The insert spells `id` and `grp`; a key reaching `sub` is not asked.
+        assert!(
+            sql.contains("AND c.name NOT IN (N'grp', N'id')) THEN N'' ELSE"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("CASE c.name WHEN N'grp' THEN N'N''1''' WHEN N'id' THEN N'N''5'''"),
+            "{sql}"
         );
     }
 
@@ -1197,18 +1342,28 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         let sql = &p[0].sql;
         // Inside the dynamic text, so the quotes are doubled — and only for
-        // the foreign key on the column the update sets; any other foreign
-        // key from that table still counts the row.
-        assert!(
-            sql.contains("WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN c.name = N'status_code' THEN"),
-            "{sql}"
-        );
-        // The row is left out only if the engine says `new` is not the
-        // deleted key, looked up through the parent table.
+        // a foreign key spanning the column the update sets; any other
+        // foreign key from that table still counts the row.
         assert!(
             sql.contains(
-                "N' AND NOT ([id] = N''7'' AND NOT EXISTS (SELECT 1 FROM [dbo].[status] WHERE ' + \
-                 QUOTENAME(rc.name) + N' = N''new'' AND [code] = @key))'"
+                "WHEN s.name = N'dbo' AND t.name = N'kind' THEN CASE WHEN EXISTS (SELECT 1 FROM \
+                 sys.foreign_key_columns fkc"
+            ),
+            "{sql}"
+        );
+        // The row is left out only if the engine says its tuple after the
+        // update — `new` where the update sets it, the stored cell elsewhere
+        // — is not the deleted row's, looked up through the parent table.
+        assert!(
+            sql.contains(
+                "AND c.name IN (N'status_code')) THEN N' AND NOT (ch.[id] = N''7'' AND NOT EXISTS \
+                 (SELECT 1 FROM [dbo].[status] AS p WHERE p.[code] = @key' + (SELECT STRING_AGG("
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "CASE c.name WHEN N'status_code' THEN N'N''new''' ELSE N'ch.' + QUOTENAME(c.name) END"
             ),
             "{sql}"
         );
@@ -1254,16 +1409,20 @@ mod tests {
             .find(|p| p.description.contains("row `old`"))
             .expect("the status delete carries a probe")
             .sql;
-        // Row 8 is deleted: excluded for every column. Row 7 is excluded
-        // only where `note` is the referencing column, which it never is.
+        // Row 8 is deleted: excluded for every key. Row 7 is excluded only
+        // from a key spanning `note`, which none does.
         assert!(
-            sql.contains("CASE WHEN c.name = N'note' THEN N' AND [id] NOT IN (N''8'')' + N' AND NOT ([id] = N''7''"),
+            sql.contains(
+                "THEN N' AND ch.[id] NOT IN (N''8'')' + CASE WHEN EXISTS (SELECT 1 FROM \
+                 sys.foreign_key_columns fkc"
+            ),
             "{sql}"
         );
         assert!(
-            sql.contains("ELSE N' AND [id] NOT IN (N''8'')' END"),
+            sql.contains("AND c.name IN (N'note')) THEN N' AND NOT (ch.[id] = N''7''"),
             "{sql}"
         );
+        assert!(sql.contains("ELSE N'' END"), "{sql}");
     }
 
     /// The delete names the row's table as the plan does, after any rename in

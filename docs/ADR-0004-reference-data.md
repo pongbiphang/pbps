@@ -239,7 +239,10 @@ Decisions taken during implementation that this document did not anticipate:
    loudly in the transaction instead. A row the plan puts onto the parent by a defaulted
    write — an insert that omits the column, an update to `DEFAULT` — is an
    arrival too: the plan carries the omitted columns' defaults, and a
-   literal one is rendered for the engine to compare (117).
+   literal one is rendered for the engine to compare (117). A composite
+   foreign key is compared as one tuple, which the engine assembles from
+   the constraint's columns at run time; the rows the plan writes are
+   compared the same way, by their whole tuple after the write (121).
 
 The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
 the read-back, the drift on rows, the `ensure` read staying inside its keys,

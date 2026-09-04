@@ -970,10 +970,7 @@ SPEC is in sync with all of these.
     `(SELECT <referenced column> FROM <parent> WHERE <key column> = @key)`,
     which is the same query for the primary-key case.
 
-    A composite foreign key still contributes one count per column, so a
-    child matching one column of a two-column key is counted. That
-    over-counts, which refuses a delete that might have been fine; the
-    direction that under-counts is the one that loses rows.
+    A composite foreign key contributed one count per column until 121.
 117. **An inserted row carries the defaults of the columns it omits, and the
     pre-delete probe reads a defaulted write as an arrival.** 112 counted
     the rows a plan puts onto a parent it deletes, by the values the plan
@@ -1018,3 +1015,23 @@ SPEC is in sync with all of these.
     and narrowed to `data.max-rows`, so the two commands cannot disagree
     again; a block with problems contributes nothing, as it contributes
     nothing to a plan.
+121. **The pre-delete probe matches a composite foreign key as one tuple.**
+    116 kept one count per column of a key, and called the over-count the
+    safe direction: a child on the surviving parent `(1, 2)` matched deleting
+    `(1, 1)` by its first column, so a table with a composite alternate key
+    had every delete refused — a gate nobody can pass is not a gate. The
+    probe now takes one count per constraint, and the engine assembles the
+    comparison from `sys.foreign_key_columns` at run time, `AND p.<referenced>
+    = ch.<referencing>` for each column, so a child is counted only where
+    its whole tuple is the deleted row's. The rows the plan writes are
+    recorded per row rather than per column, and the same tuple is built for
+    them — the value written where the update or insert sets a column, the
+    stored cell elsewhere — so an update that sets two columns of one key is
+    compared as one row after the update, not as two moves, and a row is
+    left out of, or added to, a key's count only where the key spans a
+    column the write sets. A key spanning a column an update sets to NULL,
+    or to a default that is not a literal, keeps the row counted; one
+    spanning a column an insert leaves that way is not asked about (117).
+    The fragments now carry subqueries, so each statement is built in a
+    derived table and aggregated outside it: an aggregate's argument may not
+    hold one.
