@@ -1779,3 +1779,32 @@ SPEC is in sync with all of these.
     naming the first two made it look done. When a rename can be seen from
     three sides, fixing two of them is not fixing it.
 
+158. **Two more sides of the same rename, and one of a drop.** 157 said a
+    rename is visible from three sides and named the third. It was still short
+    by two, and the shape is now unmistakable: **a plan does things to a
+    container, and those things show up somewhere the plan never mentions.**
+    **A column change re-shapes every row of its table.** A row is keyed by
+    column name and each cell reads back in its column's own rendering, so a
+    column this plan renames is under one name in the baseline and another in
+    the read-back, one it adds is in neither, and one it retypes reads back
+    differently. The differ emits only the column change — no row change says
+    anything — so 153's row comparison called every row of that table somebody
+    else's work and rolled back a valid apply. Rows are compared on the columns
+    the plan leaves alone now. Every column-level change counts, not the subset
+    that can be argued to alter a rendering: naming one too many only narrows a
+    comparison, naming one too few refuses a valid plan.
+    **A dropped securable takes its permissions with it.** Measured: a role
+    granted `SELECT` on a table holds nothing once the table is dropped. So
+    `diff_roles` emits no `REVOKE`, the role is named by no change, and 150's
+    whole-role comparison saw the grant vanish and refused. The baseline's
+    grants now lose the ones whose object this plan drops, beside 157's
+    forwarding of the ones it renames — the two belong together and are written
+    together.
+    **The count so far, because it is the point:** four rounds of review on
+    this one guard, and after the first the findings were all in the same
+    direction — the guard inventing movement rather than missing it. Every one
+    was a place the plan's own effect reaches past the object the change names.
+    The check that would have found them without a reviewer is not "did I
+    handle renames" but "for each kind of change, what does it alter that no
+    change of its own describes".
+

@@ -1021,6 +1021,13 @@ fn refuse_unplanned_movement(
     // target in one plan, so the sets are unioned rather than replaced.
     let mut granted: BTreeMap<(&str, &pbps_model::GrantTarget), BTreeSet<&pbps_model::Permission>> =
         BTreeMap::new();
+    // The columns this plan changes, under the table they are on, and the
+    // objects it removes outright. Both are things the plan does to a
+    // *container* that show up somewhere else without any change of its own
+    // saying so: a renamed column re-keys every row of its table, and a
+    // dropped table takes its grants with it (DECISIONS 158).
+    let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+    let mut gone: BTreeSet<&TableName> = BTreeSet::new();
     for p in &changes.changes {
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             renamed.insert(from, to);
@@ -1036,6 +1043,12 @@ fn refuse_unplanned_movement(
                 .entry((role, target))
                 .or_default()
                 .extend(permissions);
+        }
+        for column in p.change.columns() {
+            columns.entry(column.table).or_default().insert(column.name);
+        }
+        if let Some(dropped) = p.change.drops() {
+            gone.insert(dropped);
         }
     }
 
@@ -1058,12 +1071,32 @@ fn refuse_unplanned_movement(
         };
         let empty = BTreeSet::new();
         let plans = written.get(now_name).unwrap_or(&empty);
+        // A row is compared on the columns this plan leaves alone. One it
+        // renames is under one name in the baseline and another in the
+        // read-back; one it adds is in neither; one it retypes reads back in a
+        // different rendering. All three are the plan's own doing, and
+        // comparing the whole row called every one of them somebody else's
+        // (DECISIONS 158).
+        let no_columns = BTreeSet::new();
+        let touched_columns = columns.get(now_name).unwrap_or(&no_columns);
+        // A free function rather than a closure: the borrow of the row has to
+        // outlive the call, and a closure cannot say so.
+        fn held<'a>(
+            row: &'a pbps_model::Row,
+            skip: &BTreeSet<String>,
+        ) -> BTreeMap<&'a String, &'a pbps_model::Value> {
+            row.0
+                .iter()
+                .filter(|(column, _)| !skip.contains(*column))
+                .collect()
+        }
         for (key, row) in &was_rows.rows {
             if plans.contains(key) {
                 continue;
             }
             match now_rows.rows.get(key) {
-                Some(after_row) if after_row == row => {}
+                Some(after_row)
+                    if held(after_row, touched_columns) == held(row, touched_columns) => {}
                 Some(_) => moved.push(format!(
                     "{now_name} row `{key}` is not what the plan was approved over, \
                      and no change of this plan writes it"
@@ -1096,6 +1129,14 @@ fn refuse_unplanned_movement(
             let grants = role
                 .grants
                 .iter()
+                // A grant on an object this plan drops goes with it: the engine
+                // removes a permission with its securable, so `diff_roles`
+                // emits no `REVOKE` and there is nothing left for the read-back
+                // to hold (DECISIONS 158).
+                .filter(|(target, _)| match target {
+                    pbps_model::GrantTarget::Object(object) => !gone.contains(object),
+                    pbps_model::GrantTarget::Schema(_) => true,
+                })
                 .map(|(target, held)| {
                     let target = match target {
                         pbps_model::GrantTarget::Object(object) => pbps_model::GrantTarget::Object(
@@ -3728,6 +3769,115 @@ mod tests {
         robbed.roles.get_mut("app").unwrap().grants.clear();
         let e = refuse_unplanned_movement(&rename, &granted_on("dbo.old"), &robbed, "prod")
             .expect_err("the grant is gone");
+        assert!(format!("{e:#}").contains("role app"), "{e:#}");
+    }
+
+    /// A column change re-shapes every row of its table without any row change
+    /// saying so, and none of that is somebody else's work (DECISIONS 158).
+    #[test]
+    fn a_column_this_plan_changes_is_not_compared_row_by_row() {
+        use pbps_model::{Cell, DataMode, RowKey, TableData, Value};
+        let table = |cells: &[(&str, &str)]| {
+            let t = pbps_model::Table {
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: [(
+                        RowKey::from("k"),
+                        cells
+                            .iter()
+                            .map(|(c, v)| ((*c).to_owned(), Value::Text((*v).to_owned())))
+                            .collect::<pbps_model::Row>(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let renaming = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: "dbo.t".parse().unwrap(),
+                    from: "old".to_owned(),
+                    to: "new".to_owned(),
+                },
+            )],
+        };
+        // The one column is renamed, so the row is keyed differently on each
+        // side. That is the plan's own doing.
+        refuse_unplanned_movement(
+            &renaming,
+            &table(&[("old", "kept"), ("note", "same")]),
+            &table(&[("new", "kept"), ("note", "same")]),
+            "prod",
+        )
+        .expect("a renamed column re-keys the row, which is not movement");
+
+        // And the columns it leaves alone are still compared underneath.
+        let e = refuse_unplanned_movement(
+            &renaming,
+            &table(&[("old", "kept"), ("note", "same")]),
+            &table(&[("new", "kept"), ("note", "rewritten")]),
+            "prod",
+        )
+        .expect_err("the untouched column moved");
+        assert!(format!("{e:#}").contains("row `k`"), "{e:#}");
+        let _ = Cell::Value(Value::Null);
+    }
+
+    /// A securable takes its permissions with it, so a plan that drops a
+    /// granted table emits no `REVOKE` and the grant is simply gone
+    /// (DECISIONS 158).
+    #[test]
+    fn a_grant_on_a_table_this_plan_drops_goes_with_it() {
+        use pbps_model::{GrantTarget, Permission};
+        let mut before = Schema::default();
+        before
+            .tables
+            .insert("dbo.t".parse().unwrap(), pbps_model::Table::default());
+        before.roles.insert(
+            "app".to_owned(),
+            pbps_model::Role {
+                description: None,
+                grants: [(
+                    GrantTarget::Object("dbo.t".parse().unwrap()),
+                    [Permission::Select].into_iter().collect::<BTreeSet<_>>(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let mut after = Schema::default();
+        after.roles.insert(
+            "app".to_owned(),
+            pbps_model::Role {
+                description: None,
+                grants: BTreeMap::new(),
+            },
+        );
+        let dropping = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.t".parse().unwrap(),
+                },
+            )],
+        };
+        refuse_unplanned_movement(&dropping, &before, &after, "prod")
+            .expect("the grant went with the table it was on");
+
+        // A grant on a table the plan does *not* drop still has to be there.
+        let mut before_two = before.clone();
+        before_two.roles.get_mut("app").unwrap().grants.insert(
+            GrantTarget::Schema("dbo".to_owned()),
+            [Permission::Select].into_iter().collect(),
+        );
+        let e = refuse_unplanned_movement(&dropping, &before_two, &after, "prod")
+            .expect_err("the schema grant did not go anywhere");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 

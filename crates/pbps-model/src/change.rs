@@ -675,6 +675,105 @@ impl Change {
         }
     }
 
+    /// Every column this change alters in any way — its name, its type, its
+    /// default, anything.
+    ///
+    /// For a caller comparing a table's rows before and after an apply. A row
+    /// is keyed by column name and each cell reads back in its column's own
+    /// rendering, so a column the plan renames, adds, drops or retypes changes
+    /// the *shape* of every row in the table without any row change saying so.
+    /// Compared whole, those rows all read as somebody else's work
+    /// (DECISIONS 158).
+    ///
+    /// Deliberately every column-level change and not the subset that can be
+    /// argued to alter a rendering: naming one too many only narrows a
+    /// comparison, and naming one too few refuses a valid plan.
+    // Exhaustive rather than a wildcard: a change added later that touches a
+    // column has to be named here, or the rows of its table would be compared
+    // against a shape the plan itself moved.
+    pub fn columns(&self) -> Vec<ColumnRef> {
+        match self {
+            Change::AddColumn { table, name, .. } => vec![table.column(name)],
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![table.column(from), table.column(to)],
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. }
+            | Change::AlterColumnDefault { column, .. }
+            | Change::SetColumnDeprecated { column, .. } => vec![column.clone()],
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// The object this change removes from the database outright, if it
+    /// removes one.
+    ///
+    /// A securable takes its permissions with it — measured: dropping a table
+    /// leaves the role holding none of what it was granted on it — so a plan
+    /// that drops a granted object emits no `REVOKE` and the grant is simply
+    /// not there afterwards. A caller comparing a role's grants across an
+    /// apply has to know that (DECISIONS 158).
+    // Exhaustive rather than a wildcard, for the reason above: a change added
+    // later that removes an object takes grants with it too.
+    pub fn drops(&self) -> Option<&TableName> {
+        match self {
+            Change::DropTable { name, .. } | Change::DropModule { name, .. } => Some(name),
+            Change::CreateTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
     /// The permissions this change writes, where it writes any: the role, the
     /// target they are on, and the set it adds or removes.
     ///
