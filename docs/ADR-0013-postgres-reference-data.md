@@ -740,7 +740,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the rendering settings are `SET LOCAL` around the reads that render values, and the DDL session is left as the operator's database has it |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the canonical settings are `SET LOCAL` around **every statement that carries a value** — the reference-data read-back, the catalog reads that return value text, **and the reference-data DML** — while the session that executes opaque DDL is left as the operator's database has it |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |

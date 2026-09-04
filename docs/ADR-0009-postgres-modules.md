@@ -628,9 +628,37 @@ declared grants never removes it, because there was nothing declared to
 contradict it.
 
 So the enumeration is a **two-sided** obligation in a second sense too: it is
-asserted **immediately before the `DROP`** — that what the plan recorded is
-still what the object carries — and again **after the `CREATE`**, that the
-object now carries exactly that. The first assertion is the one this section
+asserted **before the `DROP`** — that what the plan recorded is still what the
+object carries — and again **after the `CREATE`**, that the object now carries
+exactly that.
+
+**And "before" has to mean "under the object's lock", not "on the preceding
+line".** An assertion and a `DROP` are two statements, so another session can
+commit `ALTER VIEW … SET (security_invoker = true)` between them; the rebuild
+then restores the stale recorded options and the post-create assertion *passes*,
+because it compares against that same stale intent. Two checks agreeing with
+each other is not the same as either being right.
+
+**Measured**, the remedy exists here — a view can be locked, and the lock stops
+the change:
+
+```
+BEGIN; LOCK TABLE jj.v IN ACCESS EXCLUSIVE MODE;   accepted
+-- from another session, while it is held:
+ALTER VIEW jj.v SET (security_invoker = true);
+    ERROR:  canceling statement due to lock timeout
+```
+
+So the plan takes `ACCESS EXCLUSIVE` on the object **before reading the carried
+state** and holds it through the rebuild, which makes the read, the drop, the
+create and both assertions one serialized unit.
+
+Worth setting beside [ADR-0013](ADR-0013-postgres-reference-data.md) §2, where
+the same shape had no such remedy: there the racing operation was `nextval`,
+which takes no lock and against which PostgreSQL offers none, and the answer had
+to be to refuse the construct. Here a lock exists, so the answer is to take it.
+The two are the same question — *can this be serialized?* — with opposite
+answers, and it is the engine that decides which. The first assertion is the one this section
 lacked, and its absence is not hypothetical: `reloptions` are outside the model,
 so a DBA who hardens a view with `security_invoker = true` between `plan --db`
 and `apply` has that setting silently reverted by the rebuild, with the
@@ -935,6 +963,7 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 | `Schema::modules` keyed by `ModuleId` instead of `ObjectName` | One key type; every dialect-agnostic user of it goes through the map |
 | `GrantTarget::Object` must be able to name a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
 | The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
+| The state snapshot also keeps the **write path** each module was created under ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. The path's order decides which schema an unqualified name binds to, so it is an input to the declaration's meaning and a change to it is a change to the module |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
 | `ModuleDeps` keyed by `ModuleId` on **both** sides | Today `BTreeMap<ObjectName, BTreeSet<ObjectName>>`, which cannot say that `app.f(integer)` depends on something while `app.f(text)` does not — two valid declarations would share or overwrite one hint entry, and the ordering it exists to fix would be computed from the wrong graph |
@@ -944,8 +973,9 @@ identity), the differ, `docs`, the policy engine — is unchanged.
 
 **The abstraction holds, with one correction to what that costs.** The first
 draft of this document claimed the whole bill was one map key. It is one map
-key *and a field in the state snapshot*, because §2.2's convergence argument was
-wrong and the fix is to record what was declared. Recording it here rather than
+key *and two fields in the state snapshot* — what was declared, because §2.2's
+convergence argument was wrong, and the path it was created under, because
+ADR-0013 §3 made that path part of what a declaration means. Recording it here rather than
 quietly widening the earlier claim is the point: "we checked" is not the same
 claim as "it held", and a verdict that was revised is worth more than one that
 never moved.

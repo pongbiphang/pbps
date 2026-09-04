@@ -803,6 +803,22 @@ SELECT 'R54', 'a bootstrap of the same declaration under the new order',
 SET search_path = m;
 DROP SCHEMA m_ea CASCADE; DROP SCHEMA m_eb CASCADE;
 
+-- ----------------------------- the twenty-third 2026-09-05 review round
+-- A view, unlike a sequence, can be locked — which is why this race has a
+-- remedy and the one in R20/R21 did not. The blocking half needs two sessions
+-- and is quoted in ADR-0009.
+
+CREATE TABLE m.lk_t (id int PRIMARY KEY);
+CREATE VIEW m.lk_v AS SELECT id FROM m.lk_t;
+SELECT 'R55', 'locking a view with LOCK TABLE',
+       m.accepts('LOCK TABLE m.lk_v IN ACCESS EXCLUSIVE MODE');
+-- Two statements: inside one, the reloptions subquery reads a snapshot older
+-- than the ALTER that m.accepts() runs. Same shape as A14 and R9.
+SELECT m.accepts('ALTER VIEW m.lk_v SET (security_invoker = true)') \gset r56_
+SELECT 'R56', 'and the option a racing session would set',
+       :'r56_accepts' || ', reloptions now: '
+       || coalesce((SELECT array_to_string(reloptions, ',') FROM pg_class WHERE oid='m.lk_v'::regclass), 'NULL');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

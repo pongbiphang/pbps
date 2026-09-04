@@ -142,3 +142,5 @@ R51 | one declared literal inserted under two DateStyles | 1 -> 2026-01-02, 2 ->
 R52 | a view created under extras ordered (m_ea, m_eb) | from m_ea, stored as: SELECT helper() AS who;
 R53 | the same view after the project reorders its extras | from m_ea — unchanged, and nothing rebuilt it
 R54 | a bootstrap of the same declaration under the new order | from m_eb — the environment and a bootstrap now differ
+R55 | locking a view with LOCK TABLE | accepted
+R56 | and the option a racing session would set | accepted, reloptions now: security_invoker=true
