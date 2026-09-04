@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::data::{Cell, DataMode, Row, RowKey};
+use crate::data::{Cell, DataMode, Row, RowKey, Value};
 use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
@@ -515,6 +515,23 @@ pub enum Change {
     },
 }
 
+/// What a row change leaves at its key.
+///
+/// The cells are the ones the plan *spells* — never the ones it leaves to a
+/// default. A read-back omits a cell that is at its column's default
+/// ([`crate::data::cell`]), so a plan value that happens to equal that default
+/// is simply not there to compare, and demanding it would refuse a valid
+/// apply. What is spelled and present must match, and that is exact: a
+/// connected plan is refused outright if the engine reads a declared value
+/// back differently (DECISIONS 101, 165).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowAfter<'a> {
+    /// The row is there, and holds at least these cells.
+    Holding(BTreeMap<&'a str, &'a Value>),
+    /// The row is gone.
+    Gone,
+}
+
 /// Whether a name is there once this plan has run.
 ///
 /// For the caller that has to check a plan did what it said: a `CREATE` that
@@ -682,12 +699,49 @@ impl Change {
     // Exhaustive rather than a wildcard: a change added later that writes a
     // declared row has to be named here, or the row it writes would be
     // compared against a state it was never part of.
-    pub fn row(&self) -> Option<(&TableName, &RowKey, Presence)> {
-        match self {
-            Change::InsertRow { table, key, .. } | Change::UpdateRow { table, key, .. } => {
-                Some((table, key, Presence::Present))
+    pub fn row(&self) -> Option<(&TableName, &RowKey, RowAfter<'_>)> {
+        // Only what the plan writes down. A NULL is skipped for the same
+        // reason a defaulted cell is: the read-back omits a NULL in a column
+        // with no default, so its absence proves nothing either way.
+        fn spelled(cell: &Cell) -> Option<&Value> {
+            match cell {
+                Cell::Value(Value::Null) | Cell::Default(_) => None,
+                Cell::Value(v) => Some(v),
             }
-            Change::DeleteRow { table, key, .. } => Some((table, key, Presence::Absent)),
+        }
+        match self {
+            Change::InsertRow {
+                table, key, row, ..
+            } => Some((
+                table,
+                key,
+                RowAfter::Holding(
+                    row.0
+                        .iter()
+                        .filter(|(_, v)| !matches!(v, Value::Null))
+                        .map(|(column, v)| (column.as_str(), v))
+                        .collect(),
+                ),
+            )),
+            Change::UpdateRow {
+                table,
+                key,
+                columns,
+                unchanged,
+                ..
+            } => Some((
+                table,
+                key,
+                RowAfter::Holding(
+                    columns
+                        .iter()
+                        .map(|(column, (_, to))| (column, to))
+                        .chain(unchanged)
+                        .filter_map(|(column, cell)| spelled(cell).map(|v| (column.as_str(), v)))
+                        .collect(),
+                ),
+            )),
+            Change::DeleteRow { table, key, .. } => Some((table, key, RowAfter::Gone)),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }

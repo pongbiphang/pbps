@@ -1232,14 +1232,31 @@ fn refuse_unplanned_movement(
             let Some(rows) = after.tables.get(table).and_then(|t| t.data.as_ref()) else {
                 continue;
             };
-            match (expected, rows.rows.contains_key(key)) {
-                (pbps_model::Presence::Present, false) => moved.push(format!(
+            match (expected, rows.rows.get(key)) {
+                // Present, and holding what the plan spelled. Only the cells
+                // it spells, and only where the read-back carries them: a cell
+                // at its column's default is omitted from the read-back, so
+                // its absence proves nothing and demanding it would refuse a
+                // valid apply (DECISIONS 165).
+                (pbps_model::RowAfter::Holding(cells), Some(row)) => {
+                    for (column, wrote) in cells {
+                        if let Some(now) = row.get(column)
+                            && now != wrote
+                        {
+                            moved.push(format!(
+                                "{table} row `{key}` does not hold in `{column}` what this plan \
+                                 wrote"
+                            ));
+                        }
+                    }
+                }
+                (pbps_model::RowAfter::Holding(_), None) => moved.push(format!(
                     "{table} row `{key}` is not there, and this plan writes it"
                 )),
-                (pbps_model::Presence::Absent, true) => moved.push(format!(
+                (pbps_model::RowAfter::Gone, Some(_)) => moved.push(format!(
                     "{table} row `{key}` is still there, and this plan deletes it"
                 )),
-                _ => {}
+                (pbps_model::RowAfter::Gone, None) => {}
             }
         }
     }
@@ -4116,6 +4133,74 @@ mod tests {
         let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
             .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// A row the plan writes is held to the cells it spelled, once every
+    /// statement has run. Its own statement stops speaking at its commit, and
+    /// a staged run leaves the row loose from then until the checkpoint read
+    /// (DECISIONS 165).
+    #[test]
+    fn a_row_this_plan_writes_holds_the_cells_it_spelled() {
+        use pbps_model::{DataMode, RowKey, TableData, Value};
+        let holding = |cells: &[(&str, &str)]| {
+            let t = pbps_model::Table {
+                data: Some(TableData {
+                    mode: DataMode::Exact,
+                    rows: [(
+                        RowKey::from("k"),
+                        cells
+                            .iter()
+                            .map(|(c, v)| ((*c).to_owned(), Value::Text((*v).to_owned())))
+                            .collect::<pbps_model::Row>(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let inserting = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::InsertRow {
+                    table: "dbo.t".parse().unwrap(),
+                    key_column: "code".to_owned(),
+                    identity_key: false,
+                    key: RowKey::from("k"),
+                    row: [("note".to_owned(), Value::Text("wrote".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+            )],
+        };
+        let empty = Schema::default();
+        refuse_unplanned_movement(
+            &inserting,
+            &empty,
+            &holding(&[("note", "wrote")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the row holds what the plan wrote");
+        let e = refuse_unplanned_movement(
+            &inserting,
+            &empty,
+            &holding(&[("note", "rewritten")]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("something rewrote the cell after the statement committed");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
+
+        // A cell the read-back does not carry proves nothing: it is at its
+        // column's default, which is where a spelled value equal to that
+        // default also lands. Saying anything here would refuse valid applies.
+        refuse_unplanned_movement(&inserting, &empty, &holding(&[]), "prod", Settled::Whole)
+            .expect("an omitted cell is a cell at its default");
     }
 
     /// A module the plan drops leaves the managed set only once the plan has

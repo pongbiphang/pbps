@@ -2001,3 +2001,35 @@ SPEC is in sync with all of these.
     time in this phase that "no rows to compare" was returned where "no rows"
     was the finding.
 
+165. **The cells a plan spells, and the difference between an empty table and
+    an unspellable one.**
+    **The row contents.** 162 held a planned row to its *presence* and named
+    its contents as a limit, twice, on the grounds that predicting a
+    read-back's spelling is what 149 exists to avoid. Half of that was right
+    and half was an excuse. The unpredictable half is a cell **at its
+    column's default**: the read-back omits it ([`data::cell`]), and a plan
+    value that happens to equal that default lands in the same place — so
+    demanding it would refuse a valid apply. The predictable half is
+    everything else, and it is exact rather than merely likely: `plan --db`
+    refuses a declaration the engine reads back differently (101), and the
+    write itself is held to that rendering (132, 136, 137).
+    So a planned row is now held to the cells the plan spells, **where the
+    read-back carries them**. An omitted cell says nothing; a present one must
+    match. What is still not caught is another session setting such a cell to
+    exactly its column's default, which makes the read-back omit it — named
+    here rather than left to be found, and the smallest limit this comparison
+    has had.
+    **The probe.** 164 turned "no rows to select from" into an empty relation,
+    on the reading that it meant "a table this plan creates that declares
+    none". It also meant a table that declares rows whose key cells no probe
+    can evaluate — a default that is not a literal (117) — and that table will
+    *not* be empty. Called empty, every matching child was counted an orphan
+    and a foreign key the engine would have created was refused. The two are
+    told apart now, and the unspellable case goes back to no answer, which is
+    what every other unprobeable default gets.
+    Both halves are the same mistake in opposite directions: 164 read "no
+    answer" as "empty" and got a false refusal; 162 read "cannot predict all
+    of it" as "cannot predict any of it" and got a missing check. Absence has
+    to be classified before it is acted on — which is this file's oldest
+    entry, and it keeps needing to be applied one level further in.
+

@@ -1194,6 +1194,12 @@ fn rows_after(
     alias: &str,
 ) -> Result<Option<String>, DialectError> {
     let mut branches = Vec::new();
+    // Whether a row the plan writes was dropped because one of the key's cells
+    // is a value no probe can evaluate — a default that is not a literal
+    // (117). It is the difference between "this table will hold no rows" and
+    // "this table will hold rows I cannot spell", and the tail of this
+    // function treats those two very differently (DECISIONS 165).
+    let mut unspellable = false;
     // One column of one branch: named `k{i}` so the derived table has names
     // whichever branch comes first, and converted to the type the column will
     // have when the constraint is created, where this plan decides that type.
@@ -1282,6 +1288,7 @@ fn rows_after(
                     Some(sql) => values.push(projected(i, column, sql.clone())),
                     None if unprobeable(column, key) => {
                         values.clear();
+                        unspellable = true;
                         break;
                     }
                     None => values.push(projected(i, column, "NULL".to_owned())),
@@ -1310,6 +1317,7 @@ fn rows_after(
                     Some(Some(sql)) => values.push(projected(i, column, sql.clone())),
                     Some(None) if unprobeable(column, key) => {
                         values.clear();
+                        unspellable = true;
                         break;
                     }
                     // Set to NULL: exempt, and spelled so rather than read
@@ -1344,6 +1352,16 @@ fn rows_after(
     // new parent was unchecked — and under `apply --staged` the table creation
     // and the row changes before it commit before the constraint fails
     // (DECISIONS 164).
+    //
+    // Only where there was nothing to write, though. A table that declares
+    // rows whose key cells this probe cannot spell will *not* be empty, and
+    // calling it empty counts every matching child as an orphan and refuses a
+    // foreign key the engine would have created (DECISIONS 165). No answer is
+    // the honest one there, as it is everywhere else an unprobeable default
+    // reaches.
+    if unspellable {
+        return Ok(None);
+    }
     //
     // Typed and named like any other branch, so the outer query can compare
     // against it; `WHERE 1 = 0` is what makes it the empty relation. A column
@@ -1961,6 +1979,50 @@ mod tests {
         assert!(
             fk_sql.contains("SELECT p.[region_id] AS k0 FROM [dbo].[region] AS p"),
             "{fk_sql}"
+        );
+    }
+
+    /// A table that declares rows the probe cannot spell is not an empty
+    /// table. Read as one, every matching child counted as an orphan and the
+    /// probe refused a foreign key the engine would have created
+    /// (DECISIONS 165).
+    #[test]
+    fn a_new_parent_whose_rows_cannot_be_spelled_is_not_an_empty_one() {
+        let mut region = pbps_model::Table::default();
+        let mut code = pbps_model::Column::new(ty("varchar(10)"));
+        // A default the probe cannot evaluate: not a literal (117).
+        code.default = Some("CONVERT(varchar(10), 'eu')".to_owned());
+        region.columns.insert("region_id".to_owned(), code);
+        let sql = probes(&plan(vec![
+            Change::CreateTable {
+                uid: uid("t_bbbbbb"),
+                name: tname("dbo.region"),
+                table: Box::new(region),
+            },
+            // The row leaves the key column to that default, so the probe
+            // cannot say what it will hold.
+            Change::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "other".into(),
+                identity_key: false,
+                key: RowKey::from("r1"),
+                row: pbps_model::Row::default(),
+                defaults: [(
+                    "region_id".to_owned(),
+                    "CONVERT(varchar(10), 'eu')".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                types: Default::default(),
+            },
+            fk(),
+        ]))
+        .into_iter()
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        assert!(
+            !sql.iter().any(|s| s.contains("k0")),
+            "no answer is the honest one, not `the parent is empty`: {sql:?}"
         );
     }
 
