@@ -94,10 +94,18 @@ has no `url:` field for the same reason.
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true`. An **environment** secret / **protected** variable — see "Who can reach the credential" |
+| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;UID=u;Password=p;TrustServerCertificate=true`. `UID=` rather than the more usual `User Id=`, because the space would stop GitLab masking it — see below. An **environment** secret / **protected** variable — see "Who can reach the credential" |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
 | `PBPS_PROD_URL` on `monitoring` | `verify`, `status` | the drift watch's copy. `verify` reads and writes nothing, so this one is a **read-only** account |
 | the plan's SHA-256 | `apply --checksum` | not a secret; it is the approval. A `workflow_dispatch` input on GitHub, a manual-job variable on GitLab — supplied by whoever approved, at the moment they approve |
+
+**The connection string has no space in it, on purpose.** `UID=u` is the alias
+for `User Id=u`; both are accepted, and only the first can be masked on GitLab,
+which refuses to mask a value containing whitespace
+([GitLab docs](https://docs.gitlab.com/ci/variables/#mask-a-cicd-variable)).
+An unmaskable production credential is one `echo` away from the job log, and
+the failure is quiet: GitLab stores the variable unmasked rather than refusing
+it. The spelling costs nothing on GitHub, so the table gives one form for both.
 
 `pbps doctor --env prod` is the one command to run first: it answers whether
 that account can actually deploy — reachability, edition, the minimum
