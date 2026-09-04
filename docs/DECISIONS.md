@@ -1203,3 +1203,44 @@ SPEC is in sync with all of these.
     threw would leave the write it rejected committed. `SET IDENTITY_INSERT`
     goes off before the check can throw: it is a session setting, not a
     transactional one, and a rollback would leave it on for the connection.
+133. **A row write is held to the columns it left to their defaults too.** 132
+    checked only the cells a plan spells, so an insert that omits a defaulted
+    column, plus an `AFTER INSERT` trigger that rewrites *that* column,
+    passed: apply recorded the rewritten value, reported success, and every
+    plan after it proposed the row again — the same silence 132 closed, one
+    column over. A column left to a **constant** default is now compared
+    against that default, on the insert as on an update that sets a cell to
+    `DEFAULT`. Anything the engine would have to run to answer — `NEWID()`,
+    `getdate()`, `NEXT VALUE FOR` — is not asked: it has no value before it
+    runs, and asking a sequence would consume one.
+
+    `InsertRow` carries the type of each defaulted column for this, as
+    `UpdateRow` has carried its updated columns' types since 122. The type is
+    what says whether the comparison exists at all — `xml`, `text` and the
+    spatial types have no `=`, and asking for one is an error rather than a
+    false answer. An older plan carries no types and checks nothing here,
+    exactly as an older `UpdateRow` holds the row to its key alone.
+134. **A permission on a schema is probed before the plan runs.** `validate`
+    accepts a schema target it cannot see inside — an external schema has no
+    declared objects — and this tool never creates a schema, so a grant on
+    one the database does not have is a statement the engine refuses. Under
+    `apply --staged` every change before it has committed by then, including
+    the `CREATE ROLE`. The probe counts one for a schema `SCHEMA_ID` cannot
+    find, which lets the engine decide what one name is, here as everywhere
+    else. A `REVOKE` names its securable the same way and is probed the same
+    way. An *object* target needs no probe: it is declared, so it exists or
+    this plan creates it.
+135. **Two declarations whose files differ only in case are refused before
+    either is written.** A case-sensitive database holds `Reader` beside
+    `reader`, and their encoded filenames differ only in case; on a
+    case-insensitive filesystem `pull` wrote the second over the first, with
+    the identity file still naming both — declarations that cannot round-trip
+    to the database, and nothing said. Encoding the case away would fix the
+    write and lose the readable name that makes these files reviewable, so
+    the collision is detected instead, over every declaration a `pull` or an
+    `init` is about to write, before the first one is.
+
+    The refusal is unconditional rather than a property of the filesystem
+    underneath: a declaration is written into git and has to resolve to the
+    same file on every platform that checks the repository out. This is the
+    file-level half of the shape 123 records at the database level.

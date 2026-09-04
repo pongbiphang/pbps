@@ -1087,6 +1087,11 @@ fn cmd_pull(
     let res = pbps_diff::resolve(&pulled.schema, &IdsFile::default(), &[], &context())
         .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
 
+    // Before the first file: two declarations whose names differ only in case
+    // encode to filenames that differ only in case, and a filesystem that
+    // ignores case would keep one of each — the second silently written over
+    // the first, with the identity file naming both (DECISIONS 135).
+    declaration_file::refuse_folded_paths(&declaration_file::paths_of(&dir, &pulled.schema)?)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for (name, table) in &pulled.schema.tables {

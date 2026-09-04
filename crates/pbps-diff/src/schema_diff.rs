@@ -164,13 +164,15 @@ pub fn diff_partial(
                         .get(&pk.columns[0])
                         .is_some_and(|c| c.identity.is_some());
                     for (key, row) in &data.rows {
+                        let (defaults, types) = omitted_defaults(&table, &pk.columns[0], row);
                         changes.push(Change::InsertRow {
                             table: name.clone(),
                             key_column: pk.columns[0].clone(),
                             identity_key,
                             key: key.clone(),
                             row: row.clone(),
-                            defaults: omitted_defaults(&table, &pk.columns[0], row),
+                            defaults,
+                            types,
                         });
                     }
                 }
@@ -581,14 +583,18 @@ fn diff_data(
 
     for (key, row) in &declared_data.rows {
         match base_rows.and_then(|r| r.get(key)) {
-            None => changes.push(Change::InsertRow {
-                table: name.clone(),
-                key_column: key_column.clone(),
-                identity_key,
-                key: key.clone(),
-                row: row.clone(),
-                defaults: omitted_defaults(declared, &key_column, row),
-            }),
+            None => {
+                let (defaults, types) = omitted_defaults(declared, &key_column, row);
+                changes.push(Change::InsertRow {
+                    table: name.clone(),
+                    key_column: key_column.clone(),
+                    identity_key,
+                    key: key.clone(),
+                    row: row.clone(),
+                    defaults,
+                    types,
+                })
+            }
             Some(before) => {
                 // Only the columns that differ. An UPDATE restating a column
                 // that did not change would overwrite a value the declaration
@@ -1037,15 +1043,27 @@ fn omitted_defaults(
     table: &Table,
     key_column: &str,
     row: &pbps_model::Row,
-) -> BTreeMap<String, String> {
-    table
-        .columns
-        .iter()
-        .filter(|(c, spec)| {
-            c.as_str() != key_column && !row.0.contains_key(*c) && spec.identity.is_none()
-        })
+) -> (BTreeMap<String, String>, BTreeMap<String, ColumnType>) {
+    let types = omitted_columns(table, key_column, row)
+        .filter(|(_, spec)| spec.default.is_some())
+        .map(|(c, spec)| (c.clone(), spec.ty.clone()))
+        .collect();
+    let defaults = omitted_columns(table, key_column, row)
         .filter_map(|(c, spec)| spec.default.clone().map(|d| (c.clone(), d)))
-        .collect()
+        .collect();
+    (defaults, types)
+}
+
+/// The columns an insert leaves to the table: not the key, not spelled by
+/// the row, and not an `IDENTITY` column, which is the engine's own.
+fn omitted_columns<'a>(
+    table: &'a Table,
+    key_column: &'a str,
+    row: &'a pbps_model::Row,
+) -> impl Iterator<Item = (&'a String, &'a pbps_model::Column)> {
+    table.columns.iter().filter(move |(c, spec)| {
+        c.as_str() != key_column && !row.0.contains_key(*c) && spec.identity.is_none()
+    })
 }
 
 #[cfg(test)]
@@ -1079,10 +1097,17 @@ mod tests {
         col("seq", "int", Some("(0)"), true);
         let mut row = Row::default();
         row.0.insert("label".into(), Value::Text("spelled".into()));
-        let d = omitted_defaults(&t, "id", &row);
+        let (defaults, types) = omitted_defaults(&t, "id", &row);
         assert_eq!(
-            d.into_iter().collect::<Vec<_>>(),
+            defaults.into_iter().collect::<Vec<_>>(),
             [("status_code".to_owned(), "('old')".to_owned())]
+        );
+        // And the type of each, so the emitter can hold the row to the
+        // default it left the column at (DECISIONS 133). Only the defaulted
+        // ones: a column with nothing to check has nothing to carry.
+        assert_eq!(
+            types.keys().collect::<Vec<_>>(),
+            [&"status_code".to_owned()]
         );
     }
     use super::*;

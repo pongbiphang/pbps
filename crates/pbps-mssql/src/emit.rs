@@ -119,8 +119,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             identity_key,
             key,
             row,
-            ..
-        } => insert_row(table, key_column, *identity_key, key, row),
+            defaults,
+            types,
+        } => insert_row(table, key_column, *identity_key, key, row, defaults, types),
 
         Change::UpdateRow {
             table,
@@ -518,6 +519,8 @@ fn insert_row(
     identity_key: bool,
     key: &RowKey,
     row: &Row,
+    defaults: &BTreeMap<String, String>,
+    types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
     let mut columns = vec![quote(key_column)?];
     let mut values = vec![row_key(key)];
@@ -528,8 +531,7 @@ fn insert_row(
     // What the row must hold afterwards, by the same literals the insert
     // writes: a trigger that deleted it again, or wrote something else,
     // would otherwise be read back and recorded as the plan's own result
-    // (`wrote_the_row`). A column the row leaves to its default has no
-    // value here to check it against.
+    // (`wrote_the_row`).
     let mut cells = Vec::new();
     for (column, v) in row.columns() {
         cells.push(match v {
@@ -538,6 +540,14 @@ fn insert_row(
                 format!("{} = {}", quote(column)?, value_literal(v))
             }
         });
+    }
+    // And the columns the row left to the table: a trigger rewriting one of
+    // those is the same silence, so a *constant* default is compared against
+    // itself. Anything the engine would have to run to answer — `NEWID()`,
+    // `NEXT VALUE FOR` — is not asked: it has no value before it runs, and
+    // asking would consume a sequence value (DECISIONS 133).
+    for (column, default) in defaults {
+        cells.extend(defaulted_cell(column, default, types.get(column))?);
     }
     let wrote = wrote_the_row(table, key, key_column, &cells)?;
     let table = qualified(table)?;
@@ -652,7 +662,9 @@ fn update_row(
                 crate::rows::read_expr(&quoted, &ty.base),
                 literal(&recorded_text(v))
             )),
-            Cell::Default(_) => {}
+            // Set to `DEFAULT`: held to that default where it is a constant,
+            // exactly as the `before` side is (`defaulted_cell`).
+            Cell::Default(d) => cells.extend(defaulted_cell(column, d, Some(ty))?),
         }
     }
     sql.push('\n');
@@ -711,6 +723,34 @@ fn atomically(body: &str) -> String {
          THROW;\n\
          END CATCH"
     )
+}
+
+/// A column left to a default, as a predicate holding it to that default —
+/// or nothing, where there is no answer the engine can give without running
+/// something.
+///
+/// The type decides whether the comparison exists at all: `xml`, `text` and
+/// the spatial types have no `=`, and asking for one is an error rather than
+/// a false answer. A plan made before the types travelled carries none, and
+/// checks nothing here — the same as an older plan's `UpdateRow`.
+fn defaulted_cell(
+    column: &str,
+    default: &str,
+    ty: Option<&ColumnType>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    let base = crate::types::normalize(ty).map_or_else(|_| ty.base.clone(), |t| t.base);
+    if !crate::rows::comparable(&base) || !crate::rows::is_constant(default) {
+        return Ok(None);
+    }
+    // A default of `NULL` references nothing and compares to nothing; both
+    // halves are spelled so the one predicate covers it.
+    Ok(Some(format!(
+        "({quoted} = ({default}) OR ({quoted} IS NULL AND ({default}) IS NULL))"
+    )))
 }
 
 /// What a row write holds itself to once it has run: the row is there, and
@@ -1616,6 +1656,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("new"),
             defaults: Default::default(),
+            types: Default::default(),
             row: row(&[("label", Value::Text("New".to_owned()))]),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
@@ -1639,6 +1680,55 @@ mod tests {
         );
     }
 
+    /// A column the row leaves to the table is checked too, where the default
+    /// is a constant: a trigger rewriting one of those is the same silence as
+    /// a trigger rewriting a spelled cell (DECISIONS 133).
+    #[test]
+    fn an_insert_holds_the_columns_it_left_to_their_defaults() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            identity_key: false,
+            key: RowKey::from("a"),
+            row: row(&[("label", Value::Text("New".to_owned()))]),
+            defaults: [
+                ("sort".to_owned(), "((0))".to_owned()),
+                ("note".to_owned(), "(NULL)".to_owned()),
+                // Nothing the engine has to run is asked about: it has no
+                // value before it runs, and a sequence would be consumed.
+                ("seq".to_owned(), "(NEXT VALUE FOR dbo.s)".to_owned()),
+                ("stamp".to_owned(), "(getdate())".to_owned()),
+                // No `=` exists for the type, so no comparison does either.
+                ("doc".to_owned(), "('<a/>')".to_owned()),
+                // A plan made before the types travelled carries none.
+                ("old".to_owned(), "((1))".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("sort", "int"),
+                ("note", "nvarchar(50)"),
+                ("seq", "int"),
+                ("stamp", "datetime2"),
+                ("doc", "xml"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+        });
+        let sql = &sql[0];
+        for held in [
+            "[label] = N'New'",
+            "([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
+            "([note] = ((NULL)) OR ([note] IS NULL AND ((NULL)) IS NULL))",
+        ] {
+            assert!(sql.contains(held), "{held}\n{sql}");
+        }
+        for absent in ["[seq]", "[stamp]", "[doc]", "[old]"] {
+            assert!(!sql.contains(absent), "{absent}\n{sql}");
+        }
+    }
+
     /// An `IDENTITY` key can only be pinned with the switch on, and the switch
     /// must be off again before the next table's insert: it is a session
     /// setting and at most one table may hold it.
@@ -1650,6 +1740,7 @@ mod tests {
             identity_key: true,
             key: RowKey::from("7"),
             defaults: Default::default(),
+            types: Default::default(),
             row: row(&[("label", Value::Text("Seven".to_owned()))]),
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
@@ -1681,6 +1772,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
+            types: Default::default(),
             row: Row::default(),
         });
         assert!(!sql[0].contains("IDENTITY_INSERT"), "{sql:?}");
@@ -1697,6 +1789,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
+            types: Default::default(),
             row: Row::default(),
         });
         assert!(sql[0].contains("([code])"), "{sql:?}");
@@ -2043,6 +2136,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("o'brien"),
             defaults: Default::default(),
+            types: Default::default(),
             row: row(&[(
                 "label",
                 Value::Text("'); DROP TABLE [dbo].[t]; --".to_owned()),
@@ -2084,6 +2178,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
+            types: Default::default(),
             row: row(&[
                 ("flag", Value::Bool(true)),
                 ("n", Value::Int(-7)),
@@ -2121,6 +2216,7 @@ mod tests {
                 identity_key: false,
                 key: RowKey::from("a"),
                 defaults: Default::default(),
+                types: Default::default(),
                 row: Row::default(),
             },
             Change::DeleteRow {

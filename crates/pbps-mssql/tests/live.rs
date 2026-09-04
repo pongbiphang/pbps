@@ -2395,6 +2395,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 identity_key: true,
                 key: RowKey::from("9"),
                 defaults: Default::default(),
+                types: Default::default(),
                 row: [("status_code".to_owned(), text(code))]
                     .into_iter()
                     .collect::<Row>(),
@@ -2416,6 +2417,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 defaults: [("status_code".to_owned(), default.to_owned())]
                     .into_iter()
                     .collect(),
+                types: Default::default(),
                 row: Row::default(),
             }),
             moved.changes[1].clone(),
@@ -2543,6 +2545,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 defaults: [("note".to_owned(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
                     .into_iter()
                     .collect(),
+                types: Default::default(),
                 row: [("status_code".to_owned(), text("new"))]
                     .into_iter()
                     .collect::<Row>(),
@@ -2728,6 +2731,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             identity_key: false,
             key: RowKey::from(id),
             defaults: Default::default(),
+            types: Default::default(),
             row: cells
                 .iter()
                 .map(|(c, v)| ((*c).to_owned(), v.clone()))
@@ -3117,6 +3121,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         identity_key: false,
         key: RowKey::from(key),
         defaults: Default::default(),
+        types: Default::default(),
         row: [("label".to_owned(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
@@ -3229,12 +3234,66 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .unwrap();
     assert_eq!(open, 0, "the CATCH rolled its own transaction back");
 
-    // And the same for a delete a trigger undoes.
-    // `CREATE TRIGGER` must be the first statement of its batch.
+    // A column the row left to the table is held to that default too: the
+    // trigger rewrites `note`, which the insert never names (DECISIONS 133).
+    db.conn
+        .execute("ALTER TABLE dbo.status ADD note nvarchar(50) NULL CONSTRAINT df_note DEFAULT N'plain';")
+        .await
+        .expect("a defaulted column the insert omits");
     db.conn
         .execute("DROP TRIGGER dbo.undo;")
         .await
-        .expect("take the first trigger off");
+        .expect("take the rewriting trigger off");
+    db.conn
+        .execute(
+            "CREATE TRIGGER dbo.rewrite_note ON dbo.status AFTER INSERT AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET note = N'rewritten'\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+        )
+        .await
+        .expect("a trigger that rewrites a defaulted column");
+    let defaulted = pbps_model::Change::InsertRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        identity_key: false,
+        key: RowKey::from("fourth"),
+        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+            .into_iter()
+            .collect(),
+        types: [("note".to_owned(), ty("nvarchar(50)"))]
+            .into_iter()
+            .collect(),
+        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    };
+    let sql = sql_of(&defaulted);
+    let err = db
+        .conn
+        .execute(&sql)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a rewritten default was taken for the plan's own:\n{sql}"));
+    assert!(
+        err.to_string().contains("is not what this plan wrote"),
+        "{err}"
+    );
+    assert_eq!(
+        label_of("fourth").await,
+        None,
+        "the insert rolled back, default and all"
+    );
+    db.conn
+        .execute("DROP TRIGGER dbo.rewrite_note;")
+        .await
+        .expect("and without the trigger the same insert goes in");
+    db.conn.execute(&sql).await.expect("the ordinary case");
+
+    // And the same for a delete a trigger undoes.
+    // `CREATE TRIGGER` must be the first statement of its batch.
     db.conn
         .execute(
             "CREATE TRIGGER dbo.put_back ON dbo.status AFTER DELETE AS\n\
@@ -3261,6 +3320,71 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         label_of("old").await.as_deref(),
         Some("Ancient"),
         "the row is still there, and still what it was"
+    );
+
+    db.drop().await;
+}
+
+/// `validate` accepts a schema target it cannot see inside, and this tool
+/// never creates a schema — so a grant on one the database does not have is a
+/// statement the engine refuses, with everything before it committed under
+/// `apply --staged` (DECISIONS 134).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_runs() {
+    let mut db = TestDb::create("grantschema").await;
+    db.conn
+        .execute("CREATE SCHEMA app;")
+        .await
+        .expect("one schema that is there");
+
+    let grant = |schema: &str| pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+            role: "reader".to_owned(),
+            target: pbps_model::GrantTarget::Schema(schema.to_owned()),
+            permissions: [pbps_model::Permission::Select].into_iter().collect(),
+        })],
+    };
+    for (schema, want, why) in [
+        (
+            "legacy",
+            1,
+            "a schema nobody created is the plan's own mistake",
+        ),
+        ("app", 0, "and one that is there blocks nothing"),
+        // The engine decides what one name is, here as everywhere else.
+        ("APP", 0, "`APP` is `app` to a case-insensitive database"),
+    ] {
+        let cs = grant(schema);
+        let probe = Mssql
+            .preflight(&cs)
+            .into_iter()
+            .find(|p| p.description.contains(schema))
+            .unwrap_or_else(|| panic!("the grant on `{schema}` carries a probe"));
+        let n: i32 = db
+            .conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected the probe:\n{}\n{e}", probe.sql))[0]
+            .try_get_at(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, want, "{why}");
+    }
+
+    // A revoke names a securable the same way, and fails on a missing one
+    // the same way. An object target is declared, so it exists or this plan
+    // creates it: no probe, and none wanted.
+    let object = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
+            role: "reader".to_owned(),
+            target: pbps_model::GrantTarget::Object(TableName::new("app", "t")),
+            permissions: [pbps_model::Permission::Select].into_iter().collect(),
+        })],
+    };
+    assert!(
+        Mssql.preflight(&object).is_empty(),
+        "an object target carries no probe"
     );
 
     db.drop().await;

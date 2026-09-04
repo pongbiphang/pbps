@@ -323,6 +323,14 @@ pub enum Change {
         /// an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         defaults: BTreeMap<String, String>,
+        /// The type of each column in `defaults`, for the same reason
+        /// `UpdateRow` carries one: the emitter holds the row to what it
+        /// wrote, and a column left to a *constant* default is checked by
+        /// comparing it against that default — which needs the type to know
+        /// the comparison is one the engine allows at all (DECISIONS 133).
+        /// Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        types: BTreeMap<String, ColumnType>,
     },
     /// The columns that differ, never the whole row: an `UPDATE` restating a
     /// column that did not change would overwrite a value the declaration and

@@ -518,9 +518,22 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         // an impossible grant inside the transaction.
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. } => Ok(Vec::new()),
+        | Change::RenameRole { .. } => Ok(Vec::new()),
+
+        // Except for the one thing a permission change can fail on that is
+        // not the permission: the securable. `validate` accepts a schema
+        // target it cannot see inside — an external schema has no declared
+        // objects — and this tool never creates a schema, so a grant on one
+        // the database does not have is a statement the engine refuses.
+        // Under `apply --staged` every change before it has committed by
+        // then (DECISIONS 134). An *object* target needs no probe: it is
+        // declared, so it exists or this plan creates it.
+        Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } => {
+            match target {
+                pbps_model::GrantTarget::Schema(schema) => Ok(vec![schema_probe(role, schema)]),
+                pbps_model::GrantTarget::Object(_) => Ok(Vec::new()),
+            }
+        }
 
         Change::DeleteRow {
             table,
@@ -1090,6 +1103,21 @@ fn stored_columns(
     Some((stored, columns))
 }
 
+/// A schema a permission names, which has to be there before the statement
+/// runs: one, if it is not.
+fn schema_probe(role: &str, schema: &str) -> Probe {
+    Probe::new(
+        format!(
+            "`{schema}`, the schema this plan grants `{role}` permissions on, missing from the \
+             database — create it, or write the target the way the database spells it"
+        ),
+        format!(
+            "SELECT CASE WHEN SCHEMA_ID({}) IS NULL THEN 1 ELSE 0 END AS n;",
+            literal(schema)
+        ),
+    )
+}
+
 /// `column` names it as the plan does — for the message a human reads — and
 /// `stored` as the database does, for the query.
 fn null_probe(column: &ColumnRef, stored: &ColumnRef) -> Result<Probe, DialectError> {
@@ -1489,6 +1517,7 @@ mod tests {
             defaults: [("status_code".to_owned(), default.to_owned())]
                 .into_iter()
                 .collect(),
+            types: Default::default(),
         };
         let sql_of = |cs: &ChangeSet| probes(cs)[0].sql.clone();
 
@@ -1602,6 +1631,7 @@ mod tests {
                 key: RowKey::from("5"),
                 row: [("grp".to_owned(), Value::Int(1))].into_iter().collect(),
                 defaults: Default::default(),
+                types: Default::default(),
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),

@@ -410,6 +410,11 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         std::fs::write(schema_dir.join(GITKEEP), "")
             .with_context(|| format!("cannot stage `{}`", schema_dir.join(GITKEEP).display()))?;
 
+        // Before the first declaration is staged: see `refuse_folded_paths`.
+        declaration_file::refuse_folded_paths(&declaration_file::paths_of(
+            &schema_dir,
+            &prepared.schema,
+        )?)?;
         for (name, table) in &prepared.schema.tables {
             let path = declaration_file::path(&schema_dir, name, None)?;
             std::fs::write(&path, pbps_load::render(name, table, &[], None))
