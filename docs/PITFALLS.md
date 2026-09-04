@@ -5,7 +5,7 @@ shape each one belongs to. The numbered *decisions* live in
 [DECISIONS.md](DECISIONS.md); this file is the record of what went wrong, so the
 same mistake is recognised the second time.
 
-## The four recurring shapes
+## The five recurring shapes
 
 Every one of these was reported, then swept for, then found again somewhere else.
 Treat a new instance as likely rather than surprising.
@@ -73,6 +73,26 @@ rounds**. Every fix was right about the case in front of it:
 | `lock_holder` checks for its own table | removes the reason for the old ordering | only one of its three callers was updated |
 | that check asked `OBJECT_ID` | it is the obvious question | metadata visibility hides the table, so "cannot read" became "no lock" |
 | `REFERENCES` added to the list | a foreign key really needs it | asked only on *managed* schemas, so a foreign key into somebody else's was never checked |
+
+### 5. A sweep that asks one of the two questions
+
+New, and it has produced two findings already. A check can be wrong in two
+directions, and a sweep phrased around one of them clears every instance of
+the other — with a written record saying the ground was covered, which is what
+makes the second direction expensive to find later.
+
+- **Can this probe *miss* a violation?** DECISIONS 112 asked exactly that of
+  every preflight probe and answered it correctly. Nobody asked whether a probe
+  can *report* a violation the plan is about to remove, and `AddForeignKey`
+  refused every plan that repaired its own orphans (151).
+- **Can this comparison be made?** DECISIONS 146 asked that of a cell whose
+  column the plan retypes, answered "by neither type", and carried none — not
+  noticing that the same predicate was also the stale-row guard, so removing it
+  removed a check nobody had asked about (149).
+
+Both shapes have the same tell: a change that makes something *less* checked,
+justified entirely by an argument about accuracy. Write down what the removed
+check was for before removing it.
 
 ## Reasoning loses to measurement
 
@@ -204,7 +224,7 @@ ledger or the permission checks.
 
 ## Tests that pass for the wrong reason
 
-Seven so far, every one invisible in a green run. **Assert the specific failure,
+Eight so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 - A plan fixture that failed at deserialization instead of at the emitter.
@@ -216,9 +236,20 @@ not merely that something failed.**
   it checked is required for an unrelated reason.
 - A non-UTF-8 path test built on a **preview** plan, for which `explain`
   correctly prints no approval command at all.
+- A format-version test asserting `json.contains(r#""version":1"#)` on a
+  serialized state snapshot — which embeds an ids file whose own version is 1.
+  It matched the *nested* field and went on passing through the bumps to 2, 3
+  and 4, checking nothing about the snapshot's own version. **A `contains` over
+  a serialized document is answered by any field that looks like the one you
+  meant.** Assert the parsed field. The same shape was one bump away in the
+  plan and ids tests, and all three were fixed together (DECISIONS 149's
+  commit).
 
 Since these appeared, every fix is reverted and its new test watched to fail
-before the fix is kept. That habit caught three of the seven.
+before the fix is kept. That habit caught three of them. It did not catch
+the version assertion, and could not have: nothing about that test's own
+subject was ever broken, so no revert of a *fix* would have failed it. What
+finds that shape is asserting on the parsed field in the first place.
 
 **Three fixes carry no test at all**, stated in `flow.rs` rather than papered
 over: `pull`'s guard against a failed listing on a real directory, and the
