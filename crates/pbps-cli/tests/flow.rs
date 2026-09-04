@@ -6970,6 +6970,94 @@ fn validate_since_evaluates_only_what_changed() {
     assert!(messages[0].contains("OldTable"), "{v}");
 }
 
+/// A plan that **creates** a table with a foreign key, applied for real.
+///
+/// The gap this fills: no test here ever applied one, and the apply guard got
+/// a created table's shape wrong twice in two commits because of it. The
+/// differ takes the foreign keys out of the `CREATE` payload and emits them
+/// as changes of their own, so the payload alone is not what the table will
+/// hold — and a guard that compares against the payload refuses the plan's
+/// own key (DECISIONS 181, 182).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_created_table_with_a_foreign_key_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_newfk_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("newfk");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A new table that references the one already there, and a second one
+    // that references *it* — a foreign key between two tables this same plan
+    // creates, which is why the differ splits them out at all.
+    std::fs::write(
+        d.dir.join("schema/dbo.child.yml"),
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\nprimary_key: {name: pk_child, columns: [id]}\nforeign_keys:\n  fk_child_t:\n    columns: [t_id]\n    references: dbo.t(id)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.grand.yml"),
+        "table: dbo.grand\ncolumns:\n  id: {type: int, nullable: false}\n  child_id: {type: int}\nprimary_key: {name: pk_grand, columns: [id]}\nforeign_keys:\n  fk_grand_child:\n    columns: [child_id]\n    references: dbo.child(id)\n",
+    )
+    .unwrap();
+    // Offline first, to mint the identities a deployment plan is pinned to.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // A new foreign key is `constraint` risk: it can refuse rows.
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own foreign key must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
 /// `apply` records the database read back, not the plan applied to the old
 /// state — so a change another session makes while the plan is running would
 /// be written down as this plan's own result, and every later `verify` would

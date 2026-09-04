@@ -2517,3 +2517,26 @@ SPEC is in sync with all of these.
     `CREATE` into a change of its own, so at a checkpoint it may legitimately
     not be there yet — while a column nobody declared is somebody else's work
     whenever it appears.
+
+182. **A created table's `CREATE` payload is not everything it will hold.**
+    181 compared a created table's component names against
+    `CreateTable.table`, and that payload has had its foreign keys taken out
+    of it: `diff_partial` does `std::mem::take(&mut table.foreign_keys)` and
+    emits an `AddForeignKey` for each, because they sort after every create —
+    a new table's key may reference another new table. So the expectation read
+    off the payload was empty, and the key the plan itself adds came back as
+    movement: **every created table with a foreign key refused**, one commit
+    after the check was added.
+    The expectation is the payload plus what the plan's own part changes add.
+    Keyed by `Part`, so a future split of a unique, a check or an index needs
+    no second fix; the columns are left to the payload, and that is not an
+    oversight — the differ splits only foreign keys and rows out of a
+    `CREATE`, and rows are not shape.
+    **The real finding is in the test suite.** Nothing in the live CLI flow
+    ever applied a plan that *creates* a table with a foreign key — the word
+    `references` did not appear in `flow.rs` at all — which is why 181 shipped
+    with the mistake and why 40 live tests stayed green over it. The check I
+    reported as retiring the false-refusal risk could not have. A live test
+    applies one now, over two tables the same plan creates so the split is
+    real, and it fails against 181's code. **A guard that has no live plan
+    exercising the shape it guards is not covered by the suite being green.**

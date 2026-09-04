@@ -1238,6 +1238,11 @@ fn refuse_unplanned_movement(
     // They have no baseline entry, so the comparison below cannot reach them
     // any other way (DECISIONS 181).
     let mut created: BTreeMap<&TableName, &pbps_model::Table> = BTreeMap::new();
+    // The parts this plan puts on a table by a change of its own. A created
+    // table's `CREATE` payload is *not* everything it will hold: the differ
+    // takes the foreign keys out of it (`std::mem::take`) and emits each as
+    // its own change, because they sort after every create (DECISIONS 182).
+    let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
     let mut gone: BTreeSet<&TableName> = BTreeSet::new();
@@ -1283,6 +1288,14 @@ fn refuse_unplanned_movement(
                 .insert(field);
         }
         if let Some(part) = p.change.constraints() {
+            if part.after == pbps_model::Presence::Present
+                && let Some(n) = part.name
+            {
+                added_parts
+                    .entry(part.table)
+                    .or_default()
+                    .insert((part.part, n));
+            }
             match part.name {
                 Some(name) => {
                     constraints
@@ -1371,7 +1384,18 @@ fn refuse_unplanned_movement(
             created.get(now_name),
             after.tables.get(now_name),
         ) {
-            let mut named = |kind: &str, was: BTreeSet<&String>, now: BTreeSet<&String>| {
+            let no_parts = BTreeSet::new();
+            let planned = added_parts.get(now_name).unwrap_or(&no_parts);
+            let mut named = |kind: &str,
+                             part: Option<pbps_model::Part>,
+                             was: BTreeSet<&str>,
+                             now: BTreeSet<&str>| {
+                // Plus whatever a change of this plan's own adds to it: the
+                // payload alone is not what the table will hold.
+                let mut was = was;
+                if let Some(part) = part {
+                    was.extend(planned.iter().filter(|(k, _)| *k == part).map(|(_, n)| *n));
+                }
                 for extra in now.difference(&was) {
                     moved.push(format!(
                         "{now_name} {kind} `{extra}` is there, and this plan declares no such \
@@ -1390,30 +1414,38 @@ fn refuse_unplanned_movement(
                     }
                 }
             };
+            // No `Part` for the columns: the differ never splits one out of a
+            // `CREATE`, and `AddColumn` is not emitted for a table this plan
+            // also creates.
             named(
                 "column",
-                declared.columns.keys().collect(),
-                now.columns.keys().collect(),
+                None,
+                declared.columns.keys().map(String::as_str).collect(),
+                now.columns.keys().map(String::as_str).collect(),
             );
             named(
                 "unique",
-                declared.unique.keys().collect(),
-                now.unique.keys().collect(),
+                Some(pbps_model::Part::Unique),
+                declared.unique.keys().map(String::as_str).collect(),
+                now.unique.keys().map(String::as_str).collect(),
             );
             named(
                 "foreign key",
-                declared.foreign_keys.keys().collect(),
-                now.foreign_keys.keys().collect(),
+                Some(pbps_model::Part::ForeignKey),
+                declared.foreign_keys.keys().map(String::as_str).collect(),
+                now.foreign_keys.keys().map(String::as_str).collect(),
             );
             named(
                 "check",
-                declared.checks.keys().collect(),
-                now.checks.keys().collect(),
+                Some(pbps_model::Part::Check),
+                declared.checks.keys().map(String::as_str).collect(),
+                now.checks.keys().map(String::as_str).collect(),
             );
             named(
                 "index",
-                declared.indexes.keys().collect(),
-                now.indexes.keys().collect(),
+                Some(pbps_model::Part::Index),
+                declared.indexes.keys().map(String::as_str).collect(),
+                now.indexes.keys().map(String::as_str).collect(),
             );
             if declared.primary_key.is_none() && now.primary_key.is_some() {
                 moved.push(format!(
@@ -5329,6 +5361,44 @@ mod tests {
         )
         .expect_err("an index nobody planned");
         assert!(format!("{e:#}").contains("ix_rogue"), "{e:#}");
+
+        // A foreign key is *not* in the `CreateTable` payload: `diff_partial`
+        // takes it out with `std::mem::take` and emits an `AddForeignKey` of
+        // its own, because it sorts after every create. Read off the payload
+        // alone the expectation is empty, and the key the plan itself adds
+        // reads as movement — every created table with a foreign key refused
+        // (DECISIONS 182).
+        let fk = pbps_model::ForeignKey {
+            columns: vec!["id".to_owned()],
+            references_table: "dbo.other".parse().unwrap(),
+            references_columns: vec!["id".to_owned()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let with_fk = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(declared()),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
+                    table: "dbo.new".parse().unwrap(),
+                    name: "fk_new".to_owned(),
+                    constraint: Box::new(fk.clone()),
+                }),
+            ],
+        };
+        let mut keyed = declared();
+        keyed.foreign_keys.insert("fk_new".to_owned(), fk);
+        refuse_unplanned_movement(
+            &with_fk,
+            &before,
+            &after_with(keyed),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the foreign key this plan adds to the table it creates");
 
         // And one the CREATE asked for that is not there once it has run.
         let e = refuse_unplanned_movement(

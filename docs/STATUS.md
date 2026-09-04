@@ -49,7 +49,10 @@ inside the test container — `sa` holds `CONTROL` and short-circuits the whole
 permission list, which is how three permission bugs survived the first live
 test — and the reference-data path: the DML, the row read-back, drift on rows,
 the pre-delete probe's dynamic SQL, and the binary end to end through
-`bootstrap`, `verify`, `plan --db`, `apply` and `pull --data`) run
+`bootstrap`, `verify`, `plan --db`, `apply` and `pull --data`; and a plan
+that *creates* a table with a foreign key, applied through the real gate —
+the shape the apply guard got wrong twice because nothing here applied one)
+run
 against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken; the engine is
 pinned by digest there and in CI), or set
