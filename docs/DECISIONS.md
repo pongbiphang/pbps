@@ -2489,3 +2489,31 @@ SPEC is in sync with all of these.
     reason the two role-name filters did: written twice, they had the same bug
     twice. It splits on NUL and never trims, which is the same rule 177 and
     178 established for names — a path is what the tree spells it.
+
+181. **A table this plan creates answers for its shape, by name.** 163 gave a
+    created table a synthetic baseline of *no rows*, so an undeclared row that
+    arrived in one was caught. Its shape had no such baseline: the comparison
+    needs a `before` entry and a created table has none, and `CreateTable`
+    names no column and no part of its own, so `columns_after` and
+    `constraints` answered for nothing either. Between the two, the only thing
+    checked about a table this plan had just created was that it existed. A
+    DDL trigger, or another session between a staged `CREATE TABLE` and its
+    checkpoint, could add a column or an index to it and have that written
+    into the checkpoint as this plan's own result — after which `verify`
+    reported clean for good.
+    **By name, never by value**, and that is the whole reason this is possible
+    at all. What a created column *is* comes back in the engine's spelling —
+    which is why 166 left a touched table's shape alone until it had two reads
+    to compare, and why a created table has never been held to its
+    declaration. A *name* has no such ambiguity: the plan declared these
+    columns and these parts, and a name that is not among them was put there
+    by somebody else. Measured beforehand, because the engine adds names of
+    its own where it can: the index query already excludes
+    `is_primary_key = 1` and `is_unique_constraint = 1`, so the indexes a
+    primary key and a unique constraint create do not come back as indexes and
+    cannot read as unplanned.
+    The missing direction is gated on `Settled::Whole` and the extra one is
+    not, for a reason the two do not share: a foreign key is split out of the
+    `CREATE` into a change of its own, so at a checkpoint it may legitimately
+    not be there yet — while a column nobody declared is somebody else's work
+    whenever it appears.

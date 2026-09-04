@@ -1234,6 +1234,10 @@ fn refuse_unplanned_movement(
     // became, but that column's default, identity and nullability still came
     // back from two reads, and a whole-column exclusion meant nothing
     // compared them (DECISIONS 173).
+    // The tables this plan creates, with the shape the `CREATE` asks for.
+    // They have no baseline entry, so the comparison below cannot reach them
+    // any other way (DECISIONS 181).
+    let mut created: BTreeMap<&TableName, &pbps_model::Table> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
     let mut gone: BTreeSet<&TableName> = BTreeSet::new();
@@ -1291,6 +1295,9 @@ fn refuse_unplanned_movement(
                 }
             }
         }
+        if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
+            created.insert(name, table.as_ref());
+        }
         if let Some(dropped) = p.change.drops() {
             gone.insert(dropped);
         }
@@ -1347,6 +1354,81 @@ fn refuse_unplanned_movement(
         // last read meant a change that landed before an earlier checkpoint
         // went into `previous`, after which the final comparison measured the
         // contaminated shape against itself (DECISIONS 167).
+        // A table this plan creates has no `before` to be compared against, and
+        // `CreateTable` names no column and no part of its own, so nothing
+        // answered for its shape: a DDL trigger, or another session between a
+        // staged `CREATE TABLE` and its checkpoint, could add a column or an
+        // index to it and have that recorded as this plan's result. 163 gave
+        // such a table a synthetic baseline of *no rows* for the same reason;
+        // this is the other half of it (DECISIONS 181).
+        //
+        // By name, never by value. What a created column *is* comes back in
+        // the engine's spelling, and holding it to the declaration would
+        // refuse valid applies — which is why the whole table was exempt
+        // before 166. A name nobody declared is not ambiguous that way.
+        if let (None, Some(declared), Some(now)) = (
+            before.tables.get(name),
+            created.get(now_name),
+            after.tables.get(now_name),
+        ) {
+            let mut named = |kind: &str, was: BTreeSet<&String>, now: BTreeSet<&String>| {
+                for extra in now.difference(&was) {
+                    moved.push(format!(
+                        "{now_name} {kind} `{extra}` is there, and this plan declares no such \
+                         {kind}"
+                    ));
+                }
+                // Only once every statement has run: a foreign key is split
+                // out of the `CREATE` into a change of its own, and at a
+                // checkpoint it may not have been added yet.
+                if settled == Settled::Whole {
+                    for missing in was.difference(&now) {
+                        moved.push(format!(
+                            "{now_name} {kind} `{missing}` is not there, and this plan's \
+                             `CREATE TABLE` declares it"
+                        ));
+                    }
+                }
+            };
+            named(
+                "column",
+                declared.columns.keys().collect(),
+                now.columns.keys().collect(),
+            );
+            named(
+                "unique",
+                declared.unique.keys().collect(),
+                now.unique.keys().collect(),
+            );
+            named(
+                "foreign key",
+                declared.foreign_keys.keys().collect(),
+                now.foreign_keys.keys().collect(),
+            );
+            named(
+                "check",
+                declared.checks.keys().collect(),
+                now.checks.keys().collect(),
+            );
+            named(
+                "index",
+                declared.indexes.keys().collect(),
+                now.indexes.keys().collect(),
+            );
+            if declared.primary_key.is_none() && now.primary_key.is_some() {
+                moved.push(format!(
+                    "{now_name} has a primary key, and this plan declares none"
+                ));
+            }
+            if settled == Settled::Whole
+                && declared.primary_key.is_some()
+                && now.primary_key.is_none()
+            {
+                moved.push(format!(
+                    "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
+                ));
+            }
+        }
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
@@ -5154,6 +5236,110 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// A table this plan creates has no `before` entry, so the shape
+    /// comparison never ran for one — and `CreateTable` names no column and
+    /// no part of its own, so the final checks answered only for the table's
+    /// existence. A DDL trigger, or another session between a staged
+    /// `CREATE TABLE` and its checkpoint, could add a column or an index to
+    /// it and have that recorded as this plan's own result (DECISIONS 181).
+    ///
+    /// By name, never by value: what a created table's columns *are* comes
+    /// back in the engine's spelling, and holding them to the declaration
+    /// would refuse valid applies — the reason the whole table used to be
+    /// exempt (166).
+    #[test]
+    fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
+        let declared = || {
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "id".to_owned(),
+                pbps_model::Column::new("int".parse().unwrap()),
+            );
+            t
+        };
+        let creating = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(declared()),
+                },
+            )],
+        };
+        let after_with = |t: pbps_model::Table| {
+            let mut s = Schema::default();
+            s.tables.insert("dbo.new".parse().unwrap(), t);
+            s
+        };
+        let before = Schema::default();
+
+        // What the plan asked for, in the engine's own spelling of the type.
+        let mut widened = declared();
+        widened.columns.insert(
+            "id".to_owned(),
+            pbps_model::Column::new("bigint".parse().unwrap()),
+        );
+        refuse_unplanned_movement(
+            &creating,
+            &before,
+            &after_with(widened),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("what a created column is comes back from the catalog");
+
+        // A column nobody declared.
+        let mut extra = declared();
+        extra.columns.insert(
+            "sneaky".to_owned(),
+            pbps_model::Column::new("int".parse().unwrap()),
+        );
+        let e = refuse_unplanned_movement(
+            &creating,
+            &before,
+            &after_with(extra),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a column nobody planned");
+        assert!(format!("{e:#}").contains("sneaky"), "{e:#}");
+
+        // An index nobody declared.
+        let mut indexed = declared();
+        indexed.indexes.insert(
+            "ix_rogue".to_owned(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    name: "id".to_owned(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            },
+        );
+        let e = refuse_unplanned_movement(
+            &creating,
+            &before,
+            &after_with(indexed),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("an index nobody planned");
+        assert!(format!("{e:#}").contains("ix_rogue"), "{e:#}");
+
+        // And one the CREATE asked for that is not there once it has run.
+        let e = refuse_unplanned_movement(
+            &creating,
+            &before,
+            &after_with(pbps_model::Table::default()),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the column the CREATE declared");
+        assert!(format!("{e:#}").contains("`id`"), "{e:#}");
     }
 
     /// A cell the plan writes as an explicit NULL was dropped from the
