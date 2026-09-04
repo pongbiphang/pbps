@@ -93,7 +93,8 @@ The cause of both is one line: the scanner opens a quoted region on `'`, `"` or
 `[`. `[` is SQL Server's identifier quote and PostgreSQL's array subscript, and
 `$$`-quoting does not exist in T-SQL at all.
 
-The two failures point opposite ways, and only one of them is survivable:
+These two point opposite ways, and only one of them is survivable — a third,
+found in review and measured below, joins the silent one:
 
 - The subscript case is **noisy**: a reindent inside `a[1 + 2]` reads as a
   changed module and gets restated. §8.2 already accepts that cost ("the cost of
@@ -104,13 +105,42 @@ The two failures point opposite ways, and only one of them is survivable:
   written to prevent on SQL Server, arriving on PostgreSQL through the shared
   default.
 
+And the alphabet is not the whole of it. **Measured**, on the same code, with
+PostgreSQL's escape-string syntax:
+
+| Input | Should |
+|---|---|
+| `SELECT E'it\'s  here'` vs `SELECT E'it\'s here'` | stay different — `\'` does not close an `E'…'` string, so the spacing is data |
+
+```
+two-space and one-space bodies compare equal? true
+```
+
+Both collapse to `SELECT E'it\'s here'`. The scanner closes the literal at the
+backslash-escaped quote, treats `s  here'` as code, and folds the spacing — so
+two function bodies that return **different strings** compare equal and the
+change is never planned. Measured against the engine, `E'it\'s  here'` is one
+ten-character literal `it's  here`, so there is no ambiguity about which answer
+is right. Note that `standard_conforming_strings` is `on` by default, which is
+what makes this specific to `E'…'`: in a plain literal the backslash *is*
+literal and the quote does close.
+
 **Decision.** `normalize_definition` stops being a shared default that any
-dialect inherits. Either it becomes required (each dialect states what quotes
-what), or the shared scanner takes a small description of the engine's quoting
-— `'` always, `"` for PostgreSQL identifiers, `[` for SQL Server identifiers,
-`$tag$` for PostgreSQL — and the *default* implementation is removed so that a
-new dialect cannot silently inherit the wrong one. Prefer the second: the walk
-is genuinely shared, and it is only the alphabet that differs.
+dialect inherits. The shared scanner takes a description of the engine's
+literals, and that description carries **termination rules, not only
+delimiters**:
+
+| | SQL Server | PostgreSQL |
+|---|---|---|
+| identifier quote | `[` … `]` | `"` … `"` |
+| string | `'` … `'`, doubled to escape | `'` … `'`, doubled to escape |
+| — | | `E'` … `'`, **backslash escapes** |
+| — | | `$tag$` … `$tag$`, no escapes at all |
+
+The *default* implementation is removed, so a new dialect cannot silently
+inherit another engine's answer. Two of the three failures on this page came
+from a scanner that was right about one engine, and a table of delimiters alone
+would have fixed only one of them.
 
 The general shape is worth naming, because it is the third time it has appeared
 in this project: **a default implementation that is really one engine's answer

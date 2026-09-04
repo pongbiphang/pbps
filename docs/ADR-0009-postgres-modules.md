@@ -410,13 +410,34 @@ engine, the ordinary case of "retype a column a view selects".
 
 Two things follow, and neither is a new mechanism:
 
-- **The ordering rank must be per-change, not per-family.** A module the plan
-  both edits and whose dependency the plan changes has to be dropped before the
-  table changes and created after them. ADR-0002's brackets ("drops first,
-  creates and alters last") become three ranks, with the middle one populated
-  by exactly the modules whose dependencies this plan touches. On PostgreSQL
-  that set is computable without parsing, from `pg_depend`, at `plan --db`
-  time — which is where ADR-0002's impact machinery already asks its questions.
+- **The ordering rank must be per-change, not per-family** — and reordering
+  alone is not enough. A module the plan both edits and whose dependency the
+  plan changes has to be dropped before the table changes and created after
+  them. ADR-0002's brackets ("drops first, creates and alters last") become
+  three ranks, with the middle one populated by exactly the modules whose
+  dependencies this plan touches. On PostgreSQL that set is computable without
+  parsing, from `pg_depend`, at `plan --db` time — which is where ADR-0002's
+  impact machinery already asks its questions.
+
+  **But the common case has no module change to rank.** A revision that retypes
+  `customer.legacy_code` and leaves the view alone produces exactly one change,
+  and the measured refusal above still fires: the differ emitted nothing for the
+  view, so there is nothing for a rank to move. Ranking only ever reorders
+  changes that exist.
+
+  So `plan --db` must **synthesize** the drop and the create for an unchanged
+  managed dependent, from `pg_depend`, and put them in the plan where the
+  approver can see them — a view being dropped and recreated is not a detail to
+  discover at apply time. Two consequences follow immediately:
+
+  - **A synthesized rebuild destroys the object's grants exactly as an edited
+    one does**, so §3's two-directional ACL refusal stands in front of it too.
+    The rebuild pbps invented is held to the same bar as the rebuild the user
+    asked for.
+  - **An affected dependent that pbps does not manage is a refusal.** It cannot
+    be recreated from anything the project holds, so dropping it would destroy
+    an object with no way back. `plan --db` names it and stops — the same shape
+    as ADR-0005 note 10's refusal to drop a role that owns something.
 - **`DROP ... CASCADE` is refused outright.** It is the shortest path and it
   destroys objects nobody reviewed. The guardrail is SPEC 14.3's, and this is a
   new instance of it: the plan names every object it drops, or it does not drop.

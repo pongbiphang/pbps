@@ -333,6 +333,11 @@ SELECT 'R12', 'RESTART at min(keys)-1, the direction the sequence counts',
        m.accepts('ALTER TABLE m.desc_ok ALTER COLUMN id RESTART WITH 99')
        || ' / ' || m.accepts('INSERT INTO m.desc_ok (v) VALUES (''generated'')');
 
+SELECT 'R13', 'a backslash-escaped quote inside an E-string',
+       'standard_conforming_strings=' || current_setting('standard_conforming_strings')
+       || ', E''it\''s  here'' is ' || length(E'it\'s  here')::text
+       || ' characters: ' || E'it\'s  here';
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

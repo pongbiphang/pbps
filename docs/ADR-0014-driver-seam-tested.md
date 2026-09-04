@@ -88,8 +88,20 @@ tell is the same every time: a neutral name over one engine's answer, in code
 that compiles fine because there is only one engine.**
 
 **Decision.** `server_error_number() -> Option<u32>` becomes
-`server_error_code() -> Option<&str>`. The cost is exactly two files: the
-definition, and its single caller —
+`server_error_code() -> Option<String>` — **owned, not borrowed**. A first draft
+of this ADR proposed `Option<&str>`, and that cannot be implemented on the
+driver it has to keep working for: `tiberius_ng::Error::code()` returns
+`Option<u32>` (`error.rs:78`), so there is no string anywhere in `DbError` for
+the reference to borrow from. The spike had already settled this and the ADR
+disagreed with it — `spikes/pg-driver` returns `Option<String>` and compiles;
+the sentence proposing `&str` did not have to.
+
+`Cow<'_, str>` would also work and buys nothing here: the SQL Server side has to
+allocate either way, and the PostgreSQL side hands back a `&'static str` from
+the driver that is cheap to own. Pick the plain owned form until an allocation
+in an error path is worth a lifetime.
+
+The cost is exactly two files: the definition, and its single caller —
 `crates/pbps-mssql/src/state.rs:250`, which compares against
 `INVALID_OBJECT_NAME` and would compare against `"208"` instead. Measured by
 grep, not estimated: there are two occurrences of the name in the whole
