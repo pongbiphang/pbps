@@ -1480,3 +1480,25 @@ SPEC is in sync with all of these.
     put its closing read-back in. What guards a staged run is the same set of
     per-statement postconditions, plus the drift check every `--resume` makes
     against the checkpoint.
+
+148. **The spelling checks name the catalog's objects, not the plan's.**
+    `refuse_misspelt` runs before a statement of the plan has run, so the
+    database still has the names the *previous* revision left. Almost every
+    query it builds converts a literal and names nothing, but one does: the
+    key column's collation read (131), which is the whole reason two spellings
+    of one key can be caught. Under a renamed table or key column its
+    `OBJECT_ID` found nothing, `@coll` came back NULL, and the comparison fell
+    back to the database's default collation — silently, which is the shape
+    this project keeps paying for: absent read as "nothing to see". Measured
+    on a case-sensitive database with a case-insensitive key column: the
+    correct names report `a` and `A` as one row, the declared names report no
+    conflict at all, and the plan would then hold two inserts the primary key
+    refuses.
+    So the callers pass what the catalog calls each declared table and its key
+    column — `rows::CatalogNames`, built from the two identity files, absent
+    entries meaning "as declared". `plan --db` builds it from the resolved and
+    recorded ids; `bootstrap` passes none, because nothing it declares exists
+    yet; the dev rehearsal builds it from the baseline's ids, since its
+    scratch database was built from the previous revision too. Only the table
+    and the key column travel: every other declared value reaches the engine
+    as a converted literal, under no name at all.

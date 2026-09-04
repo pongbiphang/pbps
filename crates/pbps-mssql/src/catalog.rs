@@ -701,10 +701,13 @@ pub struct Spellings {
 pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
+    at: &crate::rows::CatalogNames,
 ) -> Result<Spellings, crate::rows::RowsError> {
     let mut out = Spellings::default();
+    let as_declared = crate::rows::Catalogued::default();
     for (name, table) in &schema.tables {
-        for q in crate::rows::spelling_queries(name, table)? {
+        let at = at.get(name).unwrap_or(&as_declared);
+        for q in crate::rows::spelling_queries(name, table, at)? {
             let read = |source| crate::rows::RowsError::Read {
                 table: name.clone(),
                 source: Box::new(source),

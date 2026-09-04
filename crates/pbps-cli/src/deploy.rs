@@ -287,6 +287,48 @@ fn role_name_expectations(
     Ok((wanted, vacated))
 }
 
+/// What the catalog calls each declared table and its key column *now*: the
+/// names `live_ids` gives the uids that `final_ids` gives the declarations.
+///
+/// The spelling checks run before the plan does, so a table or key column
+/// this revision renames is still under its old name — and the collation read
+/// inside the collision query, the one part of those checks that names an
+/// object rather than converting a literal, silently found nothing and fell
+/// back to the database's default collation (DECISIONS 148).
+pub(crate) fn catalogued_as(
+    schema: &Schema,
+    final_ids: &IdsFile,
+    live_ids: &IdsFile,
+) -> pbps_mssql::rows::CatalogNames {
+    let mut out = pbps_mssql::rows::CatalogNames::new();
+    for (name, table) in &schema.tables {
+        let live_table = live_name(name, final_ids, live_ids);
+        // Only the key column is named to the catalog; every other column
+        // reaches it as a converted literal, under no name at all.
+        let live_key = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.columns.len() == 1)
+            .map(|pk| pbps_model::ColumnRef::new(name.clone(), pk.columns[0].clone()))
+            .and_then(|r| final_ids.column_uid(&r).cloned())
+            .and_then(|uid| live_ids.columns.get(&uid))
+            .map(|r| r.name.clone());
+        let at = pbps_mssql::rows::Catalogued {
+            table: (live_table != *name).then_some(live_table),
+            key_column: live_key.filter(|c| {
+                table
+                    .primary_key
+                    .as_ref()
+                    .is_none_or(|pk| pk.columns.first() != Some(c))
+            }),
+        };
+        if at != pbps_mssql::rows::Catalogued::default() {
+            out.insert(name.clone(), at);
+        }
+    }
+    out
+}
+
 /// Refuses a declaration whose text the engine would not read back as
 /// written, before anything is written (DECISIONS 101).
 ///
@@ -295,8 +337,12 @@ fn role_name_expectations(
 /// and a text the type cannot read at all comes back as a failed insert —
 /// each a plan that never converges or never applies, and each a question
 /// only the engine answers the same way it will answer at read time.
-pub(crate) async fn refuse_misspelt(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
-    let found = pbps_mssql::catalog::misspelt(conn, schema)
+pub(crate) async fn refuse_misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &pbps_mssql::rows::CatalogNames,
+) -> anyhow::Result<()> {
+    let found = pbps_mssql::catalog::misspelt(conn, schema, at)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     if found.misspelt.is_empty() && found.conflicts.is_empty() {
@@ -1158,7 +1204,9 @@ pub fn cmd_bootstrap(
         // Before the declared rows go in: a spelling the engine reads back
         // differently would be recorded as the engine spells it and drift
         // from the declaration on the next plan (DECISIONS 101).
-        refuse_misspelt(&mut conn, &loaded.schema).await?;
+        // Into an empty database, so nothing is under an older name: the
+        // declared names are the only ones the catalog could have.
+        refuse_misspelt(&mut conn, &loaded.schema, &Default::default()).await?;
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let existing = managed_state_full(
             &mut conn,
@@ -1400,7 +1448,12 @@ pub fn cmd_plan_db(
         // Every declared text, as the engine reads it: a spelling it would
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
-        refuse_misspelt(&mut conn, &loaded.schema).await?;
+        refuse_misspelt(
+            &mut conn,
+            &loaded.schema,
+            &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
+        )
+        .await?;
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
         let managed = managed_state_full(
             &mut conn,

@@ -349,8 +349,31 @@ pub struct SpellingQuery {
 /// table yet. Keys are only checked for that: their spelling is aliased at
 /// read time (71). Integer and bit cells are parsed by the loader and
 /// spelled by the model; only text-kind columns carry a spelling to ask
+/// What the catalog calls a table and its key column *now*, where the plan
+/// about to be checked renames them.
+///
+/// The spelling checks run before a statement of the plan has run, so the
+/// database still has the old names — and the one query here that names an
+/// object rather than converting a literal, the key column's collation, found
+/// nothing under the declared name and fell back to the database default
+/// without saying so. Absent entries mean "as declared", which is right for
+/// every table a plan does not rename and for one it has yet to create
+/// (DECISIONS 148).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Catalogued {
+    pub table: Option<TableName>,
+    pub key_column: Option<String>,
+}
+
+/// Every declared table's catalog names, keyed by the declared table name.
+pub type CatalogNames = std::collections::BTreeMap<TableName, Catalogued>;
+
 /// about.
-pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQuery>, RowsError> {
+pub fn spelling_queries(
+    name: &TableName,
+    table: &Table,
+    at: &Catalogued,
+) -> Result<Vec<SpellingQuery>, RowsError> {
     let Some(data) = &table.data else {
         return Ok(Vec::new());
     };
@@ -369,11 +392,17 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
         })?;
         Ok((ty.base.clone(), ty.to_string()))
     };
-    let qualified_name = crate::emit::qualified(name).map_err(|e| RowsError::Unreadable {
-        table: name.clone(),
-        why: e.to_string(),
-    })?;
-    let key_name = key.clone();
+    // The catalog is asked under the names it has now, not the ones this plan
+    // is about to give it: the collation read below happens before the rename
+    // statement runs (DECISIONS 148).
+    let qualified_name =
+        crate::emit::qualified(at.table.as_ref().unwrap_or(name)).map_err(|e| {
+            RowsError::Unreadable {
+                table: name.clone(),
+                why: e.to_string(),
+            }
+        })?;
+    let key_name = at.key_column.clone().unwrap_or_else(|| key.clone());
     let query = |column: Option<String>,
                  base: &str,
                  ty: String,
@@ -837,7 +866,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         });
-        let qs = spelling_queries(&name(), &t).unwrap();
+        let qs = spelling_queries(&name(), &t, &Catalogued::default()).unwrap();
         let columns: Vec<Option<&str>> = qs.iter().map(|q| q.column.as_deref()).collect();
         assert_eq!(columns, [None, Some("pct"), Some("since")], "{qs:#?}");
         assert_eq!(qs[0].ty, "varchar(10)");
@@ -872,7 +901,11 @@ mod tests {
         );
         // No block, nothing to ask.
         t.data = None;
-        assert!(spelling_queries(&name(), &t).unwrap().is_empty());
+        assert!(
+            spelling_queries(&name(), &t, &Catalogued::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -169,6 +169,7 @@ pub fn rehearse(
         plan,
         declared,
         declared_ids,
+        baseline_ids,
         dialect,
         hints,
     ));
@@ -185,6 +186,7 @@ async fn run(
     plan: &[Statement],
     declared: &Schema,
     declared_ids: &IdsFile,
+    baseline_ids: &IdsFile,
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
@@ -210,6 +212,7 @@ async fn run(
         plan,
         declared,
         declared_ids,
+        baseline_ids,
         dialect,
         hints,
     )
@@ -232,6 +235,7 @@ async fn rehearse_in(
     plan: &[Statement],
     declared: &Schema,
     declared_ids: &IdsFile,
+    baseline_ids: &IdsFile,
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
@@ -240,7 +244,15 @@ async fn rehearse_in(
     // reads differently would fail that comparison without saying which
     // spelling to write. Asked first, as every connected command asks
     // (DECISIONS 101).
-    crate::deploy::refuse_misspelt(conn, declared).await?;
+    // Under the names the rehearsal database has: the baseline was built from
+    // the *previous* revision, so a table or key column this plan renames is
+    // still spelt the old way here too (DECISIONS 148).
+    crate::deploy::refuse_misspelt(
+        conn,
+        declared,
+        &crate::deploy::catalogued_as(declared, declared_ids, baseline_ids),
+    )
+    .await?;
 
     for (i, stmt) in build.iter().enumerate() {
         conn.execute(&stmt.sql).await.map_err(|e| {

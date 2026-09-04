@@ -3226,10 +3226,11 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
     };
 
     let ci = TableName::new("dbo", "ci");
-    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&ci))
-        .await
-        .expect("ask the engine")
-        .conflicts;
+    let conflicts =
+        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&ci), &Default::default())
+            .await
+            .expect("ask the engine")
+            .conflicts;
     assert_eq!(
         conflicts.len(),
         1,
@@ -3238,10 +3239,11 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
     assert_eq!(conflicts[0].table, ci);
 
     let cs = TableName::new("dbo", "cs");
-    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&cs))
-        .await
-        .expect("ask the engine")
-        .conflicts;
+    let conflicts =
+        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&cs), &Default::default())
+            .await
+            .expect("ask the engine")
+            .conflicts;
     assert!(
         conflicts.is_empty(),
         "a case-sensitive column holds both: {conflicts:?}"
@@ -3253,6 +3255,7 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
     let conflicts = pbps_mssql::catalog::misspelt(
         &mut db.conn,
         &declared_with(&TableName::new("dbo", "not_yet")),
+        &Default::default(),
     )
     .await
     .expect("ask the engine")
@@ -3276,15 +3279,66 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         )
         .await
         .expect("a case-sensitive column");
-    let conflicts = pbps_mssql::catalog::misspelt(&mut ci_db.conn, &declared_with(&cs))
-        .await
-        .expect("ask the engine")
-        .conflicts;
+    let conflicts =
+        pbps_mssql::catalog::misspelt(&mut ci_db.conn, &declared_with(&cs), &Default::default())
+            .await
+            .expect("ask the engine")
+            .conflicts;
     assert!(
         conflicts.is_empty(),
         "the column holds `a` and `A` apart, whatever the database does: {conflicts:?}"
     );
     ci_db.drop().await;
+
+    // And under the names the catalog has *now*: the checks run before the
+    // plan does, so a table or key column this revision renames is still
+    // spelt the old way. Asked under the declared names there is no such
+    // table, the collation read finds nothing, and the comparison falls back
+    // to this case-sensitive database's default — letting through two
+    // spellings that the case-insensitive column will refuse as one
+    // (DECISIONS 148).
+    let renamed = TableName::new("dbo", "ci_renamed");
+    let at: pbps_mssql::rows::CatalogNames = [(
+        renamed.clone(),
+        pbps_mssql::rows::Catalogued {
+            table: Some(ci.clone()),
+            key_column: Some("code".to_owned()),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let mut declared_renamed = declared_with(&renamed);
+    let t = declared_renamed
+        .tables
+        .get_mut(&renamed)
+        .expect("the declared table");
+    let held = t.columns.shift_remove("code").expect("the key column");
+    t.columns.insert("key_code".to_owned(), held);
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["key_code".to_owned()],
+    });
+
+    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_renamed, &at)
+        .await
+        .expect("ask the engine")
+        .conflicts;
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the collation is the renamed column's own, read under the name the catalog still has: \
+         {conflicts:?}"
+    );
+    let missed =
+        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_renamed, &Default::default())
+            .await
+            .expect("ask the engine")
+            .conflicts;
+    assert!(
+        missed.is_empty(),
+        "and under the declared names there is no column to read a collation from, so the \
+         database's own answers instead — the miss this mapping exists to close: {missed:?}"
+    );
 
     db.drop().await;
 }
