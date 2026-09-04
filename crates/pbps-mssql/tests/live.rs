@@ -2915,6 +2915,141 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     db.drop().await;
 }
 
+/// Whether two declared keys are one row is the *key column's* question.
+/// The collision query compares `VALUES` literals, which carry the database's
+/// default collation, so a column collated differently was answered about a
+/// collation that is not its own — in one direction refusing two valid keys,
+/// in the other letting two spellings of one row through to a pair of inserts
+/// the primary key refuses (DECISIONS 131).
+#[tokio::test]
+#[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
+async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+
+    let mut db = TestDb::create("keycollation").await;
+    // A case-sensitive database, so the column's collation and the
+    // database's disagree in both directions below.
+    db.conn
+        .execute(&format!(
+            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
+            db.name
+        ))
+        .await
+        .expect("a case-sensitive database");
+    for sql in [
+        // Case-insensitive column in a case-sensitive database: `a` and `A`
+        // are one row here, and the old query said they were two.
+        "CREATE TABLE dbo.ci (\n\
+             code varchar(10) COLLATE Latin1_General_CI_AS NOT NULL CONSTRAINT pk_ci PRIMARY KEY,\n\
+             label nvarchar(50) NOT NULL\n\
+         );",
+        // And one that takes the database's own collation: two rows.
+        "CREATE TABLE dbo.cs (\n\
+             code varchar(10) NOT NULL CONSTRAINT pk_cs PRIMARY KEY,\n\
+             label nvarchar(50) NOT NULL\n\
+         );",
+    ] {
+        db.conn
+            .execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    let declared_with = |name: &TableName| {
+        let mut t = Table::default();
+        t.columns
+            .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+        t.columns.insert(
+            "label".to_owned(),
+            Column::new(ty("nvarchar(50)")).not_null(),
+        );
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: ["a", "A"]
+                .into_iter()
+                .map(|k| {
+                    (
+                        RowKey::from(k),
+                        [("label".to_owned(), Value::Text(format!("row {k}")))]
+                            .into_iter()
+                            .collect::<Row>(),
+                    )
+                })
+                .collect(),
+        });
+        let mut schema = Schema::default();
+        schema.tables.insert(name.clone(), t);
+        schema
+    };
+
+    let ci = TableName::new("dbo", "ci");
+    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&ci))
+        .await
+        .expect("ask the engine")
+        .conflicts;
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "`a` and `A` are one row to a case-insensitive column: {conflicts:?}"
+    );
+    assert_eq!(conflicts[0].table, ci);
+
+    let cs = TableName::new("dbo", "cs");
+    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&cs))
+        .await
+        .expect("ask the engine")
+        .conflicts;
+    assert!(
+        conflicts.is_empty(),
+        "a case-sensitive column holds both: {conflicts:?}"
+    );
+
+    // A table this plan has yet to create has no collation to read, and its
+    // column will be made with the database's — which is this database's
+    // case-sensitive default, so the two keys stand.
+    let conflicts = pbps_mssql::catalog::misspelt(
+        &mut db.conn,
+        &declared_with(&TableName::new("dbo", "not_yet")),
+    )
+    .await
+    .expect("ask the engine")
+    .conflicts;
+    assert!(
+        conflicts.is_empty(),
+        "a table with no column yet answers under the database's collation: {conflicts:?}"
+    );
+
+    // And the other direction, where the old query refused two valid keys:
+    // a case-sensitive column in a database whose default is not.
+    let mut ci_db = TestDb::create("keycollation_ci").await;
+    ci_db
+        .conn
+        .execute(
+            "CREATE TABLE dbo.cs (\n\
+                 code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL\n\
+                     CONSTRAINT pk_cs2 PRIMARY KEY,\n\
+                 label nvarchar(50) NOT NULL\n\
+             );",
+        )
+        .await
+        .expect("a case-sensitive column");
+    let conflicts = pbps_mssql::catalog::misspelt(&mut ci_db.conn, &declared_with(&cs))
+        .await
+        .expect("ask the engine")
+        .conflicts;
+    assert!(
+        conflicts.is_empty(),
+        "the column holds `a` and `A` apart, whatever the database does: {conflicts:?}"
+    );
+    ci_db.drop().await;
+
+    db.drop().await;
+}
+
 /// `money` and `smallmoney` hold four decimal places, and the default
 /// conversion style renders two. Read that way, `1.0001` came back `1.00`:
 /// `pull` wrote a declaration for a value the table does not hold, and

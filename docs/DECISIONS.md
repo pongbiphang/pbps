@@ -1157,3 +1157,21 @@ SPEC is in sync with all of these.
     guard that exists to refuse exactly that. The mapping both collections
     were built through is now a named function, and the guard goes through
     it.
+131. **Two declared keys are compared under the key column's collation, not
+    the database's.** The collision query (106) converts `VALUES` literals
+    and groups them, and a literal carries the *database's* default
+    collation. On a case-sensitive database with a case-insensitive key
+    column, `a` and `A` are one row and the query reported no collision — the
+    plan then emitted two inserts, the second of which the primary key
+    refuses; on a case-insensitive database with a case-sensitive column, two
+    distinct keys were refused as one. The statement now reads the column's
+    own collation from `sys.columns` and collates the grouping by it.
+
+    A collation is a name, not a value, so it cannot be bound and the
+    statement is built around it: only names of letters, digits and `_` are
+    concatenated, which every real collation name is. A table the plan has
+    yet to create has no column to read, and falls back to the database's
+    default — which is the collation its column will be created with, since
+    the emitter writes no `COLLATE`. Nothing outside text has a collation,
+    and `COLLATE` on a number is an error rather than a no-op, so a non-text
+    key keeps the plain query.

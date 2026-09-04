@@ -369,6 +369,11 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
         })?;
         Ok((ty.base.clone(), ty.to_string()))
     };
+    let qualified_name = crate::emit::qualified(name).map_err(|e| RowsError::Unreadable {
+        table: name.clone(),
+        why: e.to_string(),
+    })?;
+    let key_name = key.clone();
     let query = |column: Option<String>,
                  base: &str,
                  ty: String,
@@ -382,12 +387,43 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             .collect::<Vec<_>>()
             .join(", ");
         let collisions = column.is_none().then(|| {
-            format!(
+            let grouped = format!(
                 "SELECT MIN(v.i) AS first, MAX(v.i) AS second, MIN({rendered}) AS canonical\n  \
                  FROM (VALUES {values}) AS v(i, s)\n \
                  WHERE TRY_CONVERT({ty}, v.s) IS NOT NULL\n \
-                 GROUP BY TRY_CONVERT({ty}, v.s)\n\
-                 HAVING COUNT(*) > 1;"
+                 GROUP BY TRY_CONVERT({ty}, v.s)"
+            );
+            let tail = "\nHAVING COUNT(*) > 1;";
+            if ValueKind::of(base) != ValueKind::Text {
+                // Nothing outside text has a collation, and `COLLATE` on a
+                // number is an error rather than a no-op.
+                return format!("{grouped}{tail}");
+            }
+            // Whether two spellings are one key is the *key column's*
+            // question, and a `VALUES` literal carries the database's
+            // default collation instead. On a case-sensitive database with a
+            // case-insensitive key column, `a` and `A` are one row and this
+            // reported no collision — two inserts that fail on the primary
+            // key; the other way round, two distinct keys were refused as
+            // one. The column's own collation is asked for here.
+            //
+            // A collation is a name, not a value, so it cannot be bound and
+            // the statement has to be built around it. Only names of
+            // letters, digits and `_` are concatenated — every real
+            // collation name is one — and a table that does not exist yet
+            // has none, which is right: the emitter writes no `COLLATE`, so
+            // its column will be created with the database's default.
+            format!(
+                "DECLARE @coll sysname = (SELECT c.collation_name FROM sys.columns c\n  \
+                   WHERE c.object_id = OBJECT_ID({}) AND c.name = {}\n    \
+                     AND c.collation_name NOT LIKE N'%[^A-Za-z0-9_]%');\n\
+                 DECLARE @sql nvarchar(max) = {}\n  \
+                   + COALESCE(N' COLLATE ' + @coll, N'') + {};\n\
+                 EXEC sp_executesql @sql;",
+                literal(&qualified_name),
+                literal(&key_name),
+                literal(&grouped),
+                literal(tail),
             )
         });
         SpellingQuery {
