@@ -11,10 +11,14 @@
 
 SPEC §12: *"If Phase 5 forces a large change to `pbps-model`, the Phase 0
 abstraction was drawn in the wrong place."* ADR-0009 and ADR-0010 answer that
-for the **model**, and the answer is no — one map key and one enum. This
-document answers it for the **seam**: the `Dialect` trait and `Statement`, which
-is where a second engine actually lands, and which Phase 0 explicitly claims to
-have validated against PostgreSQL.
+for the **model**, and the answer is no — a map key, an enum, and one field in
+the state snapshot. That third item is not decoration: without it the differ
+compares a hand-written definition with a deparsed one, and every view and
+`BEGIN ATOMIC` routine is rebuilt on every plan
+([ADR-0009](ADR-0009-postgres-modules.md) §2.2). This document answers the same
+question for the **seam**: the `Dialect` trait and `Statement`, which is where a
+second engine actually lands, and which Phase 0 explicitly claims to have
+validated against PostgreSQL.
 
 That claim is written into the crate's own header, as a four-row table of "the
 four most easily missed differences [that] all fit". Three of the four hold. One

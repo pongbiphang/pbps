@@ -421,7 +421,20 @@ change rebuilds a table.
 **Decision: these settings are scoped to the reads, not pinned on the session.**
 `SET LOCAL` around the queries that render values — the reference-data read-back
 and the catalog reads that return value text — and **nothing applied to the
-session that executes DDL**.
+session that executes DDL**. Named, because a decision about a set has to say
+what is in it:
+
+| Setting | Why it is in the read scope |
+|---|---|
+| `bytea_output` | `\x0102` or `\001\002` for one stored value |
+| `DateStyle` | `2026-09-05` or `05/09/2026` |
+| `IntervalStyle` | `1 day 02:00:00` or `1 2:00:00` |
+| `TimeZone` | the text of an unchanged `timestamptz` moves with it |
+| `extra_float_digits` | **measured**, one stored `double precision` renders three ways: `0.123456789012346` at `0`, `0.12345678901234568` at `3`, `0.123456789012` at `-3` — and ADR-0004 permits a quoted non-integer value, so a `real` or `double precision` cell compares differently between a plan and a `verify` run by a role with another default |
+
+`extra_float_digits` was in an earlier version of this list and fell out when the
+decision was rewritten around scope; it is here again because the rewrite was
+about *where* the settings apply, not *which*.
 
 Two earlier versions of this decision got the *presence* of each setting right
 and its *scope* wrong, in opposite directions, and both are measured.
@@ -683,7 +696,8 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2) — and §3 adds a connect-time session pin and a project search path |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the rendering settings are `SET LOCAL` around the reads that render values, and the DDL session is left as the operator's database has it |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
 | `plan --db` | The key-collision check (§5). `cmd_validate` is offline and the collation lives on the live column, which this ADR keeps out of `pbps-model`, so offline `validate` cannot answer it — and under a nondeterministic collation it would answer *wrongly*, accepting keys whose inserts collide. It says it did not check rather than reporting clean (§9.1: offline is a preview) |

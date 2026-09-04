@@ -760,6 +760,19 @@ SELECT 'R47', 'the same row read under America/New_York',
        || (SELECT (t = '2026-01-15 12:00:00+00'::timestamptz)::text FROM m.tzr);
 RESET TimeZone;
 
+-- ----------------------------- the twenty-first 2026-09-05 review round
+
+CREATE TABLE m.fl (d double precision, r real);
+INSERT INTO m.fl VALUES (0.1234567890123456789, 0.12345678);
+SET extra_float_digits = 0;
+SELECT 'R48', 'a stored double rendered at extra_float_digits=0',  (SELECT d::text FROM m.fl);
+SET extra_float_digits = 3;
+SELECT 'R49', 'the same value at extra_float_digits=3',            (SELECT d::text FROM m.fl);
+SET extra_float_digits = -3;
+SELECT 'R50', 'and at extra_float_digits=-3',
+       (SELECT d::text FROM m.fl) || ' — one stored value, three spellings';
+RESET extra_float_digits;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
