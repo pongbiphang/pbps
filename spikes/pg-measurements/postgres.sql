@@ -819,6 +819,27 @@ SELECT 'R56', 'and the option a racing session would set',
        :'r56_accepts' || ', reloptions now: '
        || coalesce((SELECT array_to_string(reloptions, ',') FROM pg_class WHERE oid='m.lk_v'::regclass), 'NULL');
 
+-- ---------------------------- the twenty-fourth 2026-09-05 review round
+
+CREATE TABLE m.sl_t (d date);
+BEGIN;
+SET LOCAL DateStyle = 'ISO, DMY';
+INSERT INTO m.sl_t VALUES ('01/02/2026');
+SELECT 'R57', 'DateStyle after the value-carrying statement SET LOCAL was for',
+       current_setting('DateStyle') || ' — SET LOCAL is transaction-scoped';
+CREATE TABLE m.sl_later (d date DEFAULT '01/02/2026');
+SELECT 'R58', 'a DEFAULT created later in the same transaction',
+       (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.sl_later'::regclass)
+       || ' — the scope leaked into opaque DDL';
+COMMIT;
+
+CREATE FUNCTION m.lockable_fn(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql;
+SELECT 'R59', 'LOCK TABLE on a routine',
+       m.accepts('LOCK TABLE m.lockable_fn IN ACCESS EXCLUSIVE MODE');
+SELECT 'R60', 'a row lock on its pg_proc entry',
+       m.accepts('SELECT oid FROM pg_proc WHERE oid = ''m.lockable_fn(int)''::regprocedure FOR UPDATE')
+       || ' — and measured with two sessions, holding it blocks ALTER FUNCTION (ADR-0009 §3)';
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

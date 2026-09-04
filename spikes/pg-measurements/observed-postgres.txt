@@ -144,3 +144,7 @@ R53 | the same view after the project reorders its extras | from m_ea — unchan
 R54 | a bootstrap of the same declaration under the new order | from m_eb — the environment and a bootstrap now differ
 R55 | locking a view with LOCK TABLE | accepted
 R56 | and the option a racing session would set | accepted, reloptions now: security_invoker=true
+R57 | DateStyle after the value-carrying statement SET LOCAL was for | ISO, DMY — SET LOCAL is transaction-scoped
+R58 | a DEFAULT created later in the same transaction | '2026-02-01'::date — the scope leaked into opaque DDL
+R59 | LOCK TABLE on a routine | refused: relation "m.lockable_fn" does not exist
+R60 | a row lock on its pg_proc entry | accepted — and measured with two sessions, holding it blocks ALTER FUNCTION (ADR-0009 §3)

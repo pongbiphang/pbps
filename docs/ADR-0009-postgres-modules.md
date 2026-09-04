@@ -653,12 +653,43 @@ So the plan takes `ACCESS EXCLUSIVE` on the object **before reading the carried
 state** and holds it through the rebuild, which makes the read, the drop, the
 create and both assertions one serialized unit.
 
+**That works for a view and not for a routine, which is not a relation.**
+**Measured**, `LOCK TABLE` refuses one outright:
+
+```
+LOCK TABLE kk.f IN ACCESS EXCLUSIVE MODE;   refused: relation "kk.f" does not exist
+```
+
+A routine still has a serializing mechanism, and it is a row lock on its catalog
+entry — **measured**, holding one blocks a concurrent `ALTER FUNCTION`:
+
+```
+session A:  BEGIN; SELECT oid FROM pg_proc WHERE oid='kk2.f(int)'::regprocedure FOR UPDATE;
+session B:  ALTER FUNCTION kk2.f(int) OWNER TO kk_other;
+    ERROR:  canceling statement due to lock timeout
+    CONTEXT:  while updating tuple (19,41) in relation "pg_proc"
+```
+
+So the rule is "serialize before reading the carried state", and **the mechanism
+differs by object kind**: `LOCK TABLE … ACCESS EXCLUSIVE` for a relation, a
+`FOR UPDATE` on the `pg_proc` row for a routine.
+
+That second one is worth flagging rather than filing: it locks a system catalog
+row, which is an implementation detail and not an interface PostgreSQL
+documents. It is measured to work on 18.6 and it is exactly the kind of thing a
+major version can change without notice, so the PostgreSQL live suite has to
+assert it per version rather than assume it. If a version ever stops honouring
+it, this section is back where ADR-0013 §2 ended up — refuse the construct —
+and the suite is what would say so.
+
 Worth setting beside [ADR-0013](ADR-0013-postgres-reference-data.md) §2, where
 the same shape had no such remedy: there the racing operation was `nextval`,
 which takes no lock and against which PostgreSQL offers none, and the answer had
-to be to refuse the construct. Here a lock exists, so the answer is to take it.
-The two are the same question — *can this be serialized?* — with opposite
-answers, and it is the engine that decides which. The first assertion is the one this section
+to be to refuse the construct. The same question — *can this be serialized?* —
+now has three answers in this design: **yes, with a relation lock** (a view),
+**yes, with a catalog row lock** (a routine, below), and **no, so refuse** (a
+sequence). It is the engine that decides which, and the only way to find out
+which one applies is to try it against the engine. The first assertion is the one this section
 lacked, and its absence is not hypothetical: `reloptions` are outside the model,
 so a DBA who hardens a view with `security_invoker = true` between `plan --db`
 and `apply` has that setting silently reverted by the rebuild, with the

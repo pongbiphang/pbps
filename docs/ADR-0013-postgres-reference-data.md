@@ -419,10 +419,31 @@ and ADR-0012 §4 already measured a fifth, `TimeZone`, deciding whether a type
 change rebuilds a table.
 
 **Decision: these settings are scoped to the statements that carry *values*, not
-pinned on the session.** `SET LOCAL` around every statement where pbps is
-responsible for a value's text — the reference-data read-back, the catalog reads
-that return value text, **and the reference-data DML** — and **nothing applied
-to the session that executes opaque DDL**.
+pinned on the session.** Set **and restored** around every statement where pbps
+is responsible for a value's text — the reference-data read-back, the catalog
+reads that return value text, **and the reference-data DML** — leaving opaque
+DDL to run under whatever the operator's database has.
+
+**`SET LOCAL` is not enough on its own, because it is transaction-scoped and a
+plan is one transaction.** **Measured**, the setting outlives the statement it
+was meant for, and the differ's own ordering puts a value-carrying statement
+before an opaque one — `InsertRow | UpdateRow => 9` and
+`CreateModule | AlterModule => 12` in `crates/pbps-diff/src/schema_diff.rs`:
+
+```
+BEGIN;
+SET LOCAL DateStyle = 'ISO, DMY';
+INSERT INTO kk.t VALUES ('01/02/2026');
+    -- after the value-carrying statement, DateStyle is still: ISO, DMY
+CREATE TABLE kk.later (d date DEFAULT '01/02/2026');
+    -- stored as '2026-02-01'::date
+```
+
+So a scope that is only opened silently reinterprets every opaque definition
+created after it in the same plan — the exact failure this decision exists to
+prevent, reintroduced by the mechanism chosen to prevent it. **The previous
+value is read and restored around each value-carrying statement**, so the scope
+closes as well as opens.
 
 An earlier version of this decision drew the line at read versus write, and that
 was the wrong line. **Measured**, the same declared literal stores two different
@@ -740,7 +761,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the canonical settings are `SET LOCAL` around **every statement that carries a value** — the reference-data read-back, the catalog reads that return value text, **and the reference-data DML** — while the session that executes opaque DDL is left as the operator's database has it |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin: the canonical settings are set **and restored** around **every statement that carries a value** — the reference-data read-back, the catalog reads that return value text, **and the reference-data DML** — while opaque DDL runs under the settings the operator's database has. `SET LOCAL` alone would not do it: it is transaction-scoped, and a plan is one transaction |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
