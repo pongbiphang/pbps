@@ -896,7 +896,7 @@ async fn record_failed_bootstrap(
         operator,
     );
     failed.git_sha = db::git_sha(root);
-    failed.reason = Some(error.to_string().chars().take(1000).collect());
+    failed.reason = Some(pbps_mssql::state::truncate_reason(&error.to_string()));
     match pbps_mssql::state::record(conn, &failed).await {
         Ok(id) => eprintln!("Bootstrap failure recorded as ledger entry #{id}."),
         Err(audit_error) => eprintln!(
@@ -1568,7 +1568,7 @@ fn failed_apply_snapshot(
         current.git_sha = attempted_git_sha;
         current.plan_checksum = Some(attempted_plan_checksum.to_owned());
     }
-    current.reason = Some(error.to_string().chars().take(1000).collect());
+    current.reason = Some(pbps_mssql::state::truncate_reason(&error.to_string()));
     current
 }
 
