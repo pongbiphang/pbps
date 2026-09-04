@@ -524,6 +524,39 @@ pinned on the session, and not wrapped around the writes at all.**
   statement which executes the user's code has to run in the user's
   environment**.
 
+  **"The write's environment" is a session, and the probe does not run in it.**
+  The probe runs while `plan --db` is connected; the write runs later, from
+  `apply`, on another connection — after an `ALTER ROLE … SET`, from another
+  operator, or over a pooled connection carrying different `PGOPTIONS`.
+  **Measured**, the same INSERT omitting the same column against the same table
+  writes a different value in the two sessions:
+
+  ```
+  a column omitted by an INSERT, in the probing session (MDY):  2026-01-02
+  the same INSERT in another session (DMY):                     2026-02-01
+  ```
+
+  Nothing existing catches that. The plan checksum is
+  `digest_of(SavedPlan)` — SHA-256 over the plan's own typed JSON
+  (`crates/pbps-model/src/plan.rs:266`) — and a session setting is not in the
+  model and must not be, by inviolable constraint 1. So the checksum is
+  structurally the wrong instrument here, and an assertion has to be the right
+  one.
+
+  Two decisions, in the order this project prefers them:
+
+  - **Where the value is knowable, do not depend on the default at all.** A row
+    pbps writes carries the value the engine canonicalized at plan time (§3
+    above) rather than omitting the column and letting `apply`'s session
+    evaluate the default. That makes the divergence unrepresentable instead of
+    detected, which is CLAUDE.md's stated preference and costs nothing here.
+  - **Where it is not** — DECISIONS 117's unprobeable-default path — **the plan
+    records the settings it probed under, and `apply` asserts them before the
+    write**, refusing loudly if they moved. That is the same shape as
+    [ADR-0009](ADR-0009-postgres-modules.md)'s assertions before the `DROP`: the
+    thing the plan reasoned about is checked to still be true at the moment it
+    is acted on.
+
 - **Opaque DDL** runs under whatever the operator's database has — **with one
   explicit exception, `standard_conforming_strings = on`**, set and restored
   around it. That exception was stated two rounds earlier and dropped when this
@@ -838,11 +871,11 @@ reads deterministic would have made them depend on the declarations.
   only when the read path makes qualification necessary — so it is not something
   a comparison can be built on.)
 
-  **And a module is not the only thing PostgreSQL binds at creation.** A column
-  default, a generated column, a check constraint and an expression index are
-  parsed then too, and keep what they resolved against — **measured**, a
-  generated column defined as `tag(v)` answers from `uu_a` for every later row,
-  while a fresh table carrying the same declaration takes the new order:
+  **And a module is not the only thing PostgreSQL binds at creation.** Every
+  expression parsed at creation keeps what it resolved against — **measured** on
+  a generated column, which is the cheapest way to show it: it answers from
+  `uu_a` for every later row, while a fresh table carrying the same declaration
+  takes the new order:
 
   ```
   a generated column created under extras (uu_a, uu_b):    uu_a row 1
@@ -853,12 +886,29 @@ reads deterministic would have made them depend on the declarations.
   Writing the rule around modules was the narrowing this branch has now made
   five times: taking the example in front of me for the shape.
 
+  **The correction to that correction is that the rule cannot be wider than the
+  model.** A first version of this paragraph named generated columns and
+  expression indexes, and pbps can declare neither: `Column` carries
+  `ty`, `nullable`, `default`, `identity`, `description`, `deprecated` and no
+  generated-expression field (`crates/pbps-model/src/schema.rs:103`), and
+  `IndexColumn` is a name and a direction (`schema.rs:278`). Recording a path
+  for an object pbps has no declaration of gives the emitter nothing to rebuild
+  and `bootstrap` nothing to reproduce. The generated column above is
+  **evidence about the engine**, not a managed object.
+
+  So the rule is scoped to the verbatim expressions the model actually holds:
+  **`Column::default`, `CheckConstraint::expression` and `Index::filter`**,
+  alongside module bodies. Generated columns and expression indexes stay
+  unmanaged, and if either is ever declared the rule extends with it. Widening
+  a rule past what the model can represent is the same mistake as writing it
+  around one example — one round apart, in opposite directions.
+
   The state snapshot therefore records the write path beside the declared text
   it already keeps (§2.2 of
-  [ADR-0009](ADR-0009-postgres-modules.md)) — for **every parsed
-  expression-bearing object**, not only modules — and one whose recorded path
-  differs from the project's current one is rebuilt: the path is an input to
-  the declaration's meaning, so a change to it is a change to the object.** One global list ordered by anything else is
+  [ADR-0009](ADR-0009-postgres-modules.md)), for each of those, and an object
+  whose recorded path differs from the project's current one is rebuilt: the
+  path is an input to the declaration's meaning, so a change to it is a change
+  to the object.** One global list ordered by anything else is
   unsafe the moment two managed schemas hold the same name — **measured**, a
   view in `m_b` created under a path ordered `(m_a, m_b)` binds to `m_a.t`:
 
@@ -934,9 +984,27 @@ the permanent restatement §2.2 of
 [ADR-0009](ADR-0009-postgres-modules.md) fixed for module bodies, in the one
 place I did not look for it because §4 was about cells.
 
-So the same fix carries: **the state records the declared default beside the one
-read back**, the differ compares declared-now against declared-at-last-apply,
-and drift compares read-back against read-back. That is a third field in the
+**And the default is not the only expression compared as text.** PostgreSQL
+respells every one of them — **measured**, a declared `label <> 'none'` comes
+back with both parentheses and a cast:
+
+```
+a declared check expression:  CHECK ((label <> 'none'::text))
+a declared index filter:      (label <> 'none'::text)
+```
+
+and `diff_constraints`'s `by_name!` macro
+(`crates/pbps-diff/src/schema_diff.rs:444`) compares the whole
+`CheckConstraint` / `Index` with `!=` and, on a mismatch, pushes a **drop
+followed by an add**. So the cost here is worse than the default case: an
+unchanged check is dropped and revalidated over the whole table on every
+connected plan, and an unchanged filtered index is dropped and rebuilt.
+
+So the same fix carries, and carries to all three: **the state records the
+declared expression beside the one read back** — for `Column::default`,
+`CheckConstraint::expression` and `Index::filter` alike — the differ compares
+declared-now against declared-at-last-apply, and drift compares read-back
+against read-back. That is a third field in the
 snapshot, and it belongs in ADR-0009's tally with the other two — all three exist
 for one reason, which is that PostgreSQL hands back its own spelling of whatever
 it was given.
@@ -1008,9 +1076,10 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 |---|---|
 | `pbps-model` | Nothing |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code; and **opaque DDL** runs under the operator's settings **with one restored exception, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true. A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. The state records that write path for **every parsed expression-bearing object**, not only modules: a generated column keeps its binding too |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. The state records that write path for module bodies **and for the three verbatim expressions the model holds** — `Column::default`, `CheckConstraint::expression`, `Index::filter`. Generated columns and expression indexes are unmanaged and out of it |
+| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
-| A column's structural default | Stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): `schema_diff.rs:385` compares defaults as text, and a declared `'unnamed'` comes back `'unnamed'::text` |
+| A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
 | `plan --db` | The key-collision check (§5). `cmd_validate` is offline and the collation lives on the live column, which this ADR keeps out of `pbps-model`, so offline `validate` cannot answer it — and under a nondeterministic collation it would answer *wrongly*, accepting keys whose inserts collide. It says it did not check rather than reporting clean (§9.1: offline is a preview) |
@@ -1018,13 +1087,17 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 ## Limits
 
 - **Composite keys are still deferred**, as in ADR-0004.
-- **§4's default-comparison finding is not measured against SQL Server.** The
-  differ is shared, `sys.default_constraints.definition` is taken raw
-  (`catalog.rs:189`, no normalizer anywhere in the workspace), and the same
-  comparison runs on both engines — so the same loop may already exist on the
-  shipped dialect. That is a *reasoned* worry, not an observation: nothing here
-  ran it. It wants one live check on SQL Server, and it is the fourth item in
-  this design pass to point at shipped code rather than at Phase 5.
+- **§4's expression-comparison finding is not measured against SQL Server.** The
+  differ is shared, and all three expressions are read raw with no normalizer
+  anywhere in the workspace: `sys.default_constraints.definition`
+  (`catalog.rs:189`), `sys.check_constraints.definition` (`catalog.rs:71`) and
+  `sys.indexes.filter_definition` (`catalog.rs:229`). The same comparisons run
+  on both engines, so the same loops may already exist on the shipped dialect —
+  and the check and filter ones cost a revalidation and an index rebuild per
+  plan, not just a restated `ALTER`. That is a *reasoned* worry, not an
+  observation: nothing here ran it. It wants one live check on SQL Server, and
+  it is the fourth item in this design pass to point at shipped code rather than
+  at Phase 5.
 - **Nondeterministic collations are now measured** (§5), and the flag turned out
   not to mean what this document first assumed.
 - **Everything here is proposed**, and falsifiable by the PostgreSQL live suite.

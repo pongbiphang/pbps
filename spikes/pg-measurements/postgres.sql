@@ -1074,6 +1074,31 @@ SELECT 'R90', 'the decode() form instead, under off',
        :'r' || ', storing ' || (SELECT coalesce(sum(length(b))::text, '0') FROM m.by) || ' byte(s)';
 RESET standard_conforming_strings;
 
+-- -------------------------- the thirty-fifth 2026-09-05 review round
+
+-- The deparse of R1 is not confined to column defaults: every verbatim
+-- expression the model holds comes back respelled.
+CREATE TABLE m.dp (id int, label text);
+ALTER TABLE m.dp ADD CONSTRAINT ck_label CHECK (label <> 'none');
+CREATE INDEX ix_dp ON m.dp (id) WHERE label <> 'none';
+SELECT 'R91', 'how a declared check expression is stored',
+       (SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_label');
+SELECT 'R92', 'how a declared index filter is stored',
+       (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'm.ix_dp'::regclass);
+
+-- The default probe runs in the planning session; the write that relies on it
+-- runs in another. Nothing carries the first session's settings to the second.
+CREATE TABLE m.dflt (id int, when_ date DEFAULT ('01/02/2026'::text)::date);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.dflt (id) VALUES (1);
+SELECT 'R93', 'a column omitted by an INSERT, in the probing session (MDY)',
+       (SELECT when_::text FROM m.dflt WHERE id = 1);
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.dflt (id) VALUES (2);
+SELECT 'R94', 'the same INSERT in another session (DMY)',
+       (SELECT when_::text FROM m.dflt WHERE id = 2);
+RESET DateStyle;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

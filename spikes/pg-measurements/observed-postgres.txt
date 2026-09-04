@@ -187,3 +187,7 @@ R87 | the E-string form instead, under off | length 4
 R88 | the same E-string under on | length 4
 R89 | a two-byte bytea rendered in canonical hex, under off | accepted, storing 3 byte(s)
 R90 | the decode() form instead, under off | accepted, storing 2 byte(s)
+R91 | how a declared check expression is stored | CHECK ((label <> 'none'::text))
+R92 | how a declared index filter is stored | (label <> 'none'::text)
+R93 | a column omitted by an INSERT, in the probing session (MDY) | 2026-01-02
+R94 | the same INSERT in another session (DMY) | 2026-02-01

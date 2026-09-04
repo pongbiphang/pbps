@@ -20,8 +20,10 @@ project reordering its configured schemas leaves an existing environment binding
 an unqualified reference differently from a bootstrap of the same revision, with
 nothing to expose the divergence
 ([ADR-0013](ADR-0013-postgres-reference-data.md) §3); and without the **declared
-column default** the differ's text comparison of defaults re-emits
-`AlterColumnDefault` on every connected plan, for ever (ADR-0013 §4). The three
+expressions** — defaults, check expressions and index filters, all of which
+PostgreSQL respells — the differ's text comparisons re-emit
+`AlterColumnDefault`, revalidate every check and rebuild every filtered index on
+every connected plan, for ever (ADR-0013 §4). The three
 are the same fact: PostgreSQL returns its own spelling, so a declaration has to
 be kept beside what came back. This document answers the same
 question for the **seam**: the `Dialect` trait and `Statement`, which is where a
