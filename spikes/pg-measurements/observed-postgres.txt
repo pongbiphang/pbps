@@ -173,3 +173,6 @@ R73 | the same text bound as a parameter, under two DateStyles | 2026-01-02, 202
 R74 | a literal the engine has already resolved, under the same two | 2026-01-02, 2026-01-02 — this is what the plan bakes in
 R75 | a default whose cast happens at evaluation, under MDY | 2026-01-02
 R76 | the same expression under DMY | 2026-02-01 — so the probe must use the write's environment
+R77 | a nondeterministic collation at default strength | collisdeterministic = false, 'New' = 'new' is false
+R78 | a nondeterministic collation at secondary strength | collisdeterministic = false, 'New' = 'new' is true — the flag is the same, the answer is not
+R79 | inserting 'new' beside 'New' under the case-sensitive one | accepted

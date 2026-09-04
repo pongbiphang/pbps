@@ -454,6 +454,22 @@ pinned on the session, and not wrapped around the writes at all.**
   requires of it. An offline `plan` has nobody to ask and therefore cannot
   produce applyable reference-data DML for a lexically ambiguous value — the
   same shape as everything else §9.1 calls a preview.
+
+  **And `bootstrap --sql` is offline too**, which a first version of this
+  decision did not account for: `cmd_bootstrap` takes its target as an
+  `Option`, so the disaster-recovery script is rendered with no connection at
+  all. It cannot ask the engine, and it must not resolve the ambiguity by
+  wrapping its statements in a settings scope — that is §3's trigger hazard, and
+  a bootstrap script creates the very triggers it would then fire.
+
+  So the rule is **decided by the column's declared type, which is knowable
+  offline**: a quoted value on a `date`, `time`, `timestamp`, `timestamptz`,
+  `interval`, `real` or `double precision` column is refused by an offline
+  `bootstrap --sql`, naming the connected form as the way to get a script that
+  includes rows. Every other value renders as before. That costs the DR script
+  its reference data for those columns specifically, and saying so is better
+  than emitting a script that stores January in one environment and February in
+  another.
 - **The default probe is a read that executes code, and runs under the write's
   environment.** §4 evaluates an omitted cell's default server-side to decide
   whether it round-trips omitted. **Measured**, an expression whose cast happens
@@ -871,11 +887,25 @@ key collisions by the key column's own collation.
 than answered in the model, so PostgreSQL simply returns a different answer.
 Two notes for the implementation:
 
-- PostgreSQL's answer comes from the column's collation and
-  `pg_collation.collisdeterministic`; a **nondeterministic** ICU collation (PG
-  12+) makes `'New'` and `'new'` one row, which is SQL Server's usual behaviour
-  arriving on PostgreSQL as an opt-in. Both answers must be reachable; neither
-  may be assumed.
+- PostgreSQL's answer comes from the column's collation, and **not** from
+  `pg_collation.collisdeterministic`, which an earlier version of this bullet
+  treated as the signal. **Measured**, the flag says nothing about case:
+
+  ```
+  nd_sensitive: collisdeterministic = false, 'New' = 'new' is false
+  nd_ci:        collisdeterministic = false, 'New' = 'new' is true
+  ```
+
+  Nondeterminism disables the bytewise tie-break *after* the provider has
+  compared; the ICU locale and strength decide equality. Under the first of
+  those two, `'New'` and `'new'` are two valid keys — measured, the second
+  insert is accepted — so a rule reading the flag as proof of collision would
+  refuse a perfectly good declaration.
+
+  The connected check therefore **asks the engine about the actual keys**, under
+  the column's own collation, rather than inferring from a property of the
+  collation. That is the same move as everywhere else here: the engine answers
+  questions about the engine.
 - A `data:` block valid on one engine can therefore be refused on the other.
   That is correct — the declaration means "these are distinct rows", and an
   engine that cannot hold them distinct must say so — but it is the first place
@@ -907,8 +937,8 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 ## Limits
 
 - **Composite keys are still deferred**, as in ADR-0004.
-- **Nondeterministic collations were not measured** (§5), only their existence
-  reasoned from the catalog's `collisdeterministic` column.
+- **Nondeterministic collations are now measured** (§5), and the flag turned out
+  not to mean what this document first assumed.
 - **Everything here is proposed**, and falsifiable by the PostgreSQL live suite.
 
 ## Placement

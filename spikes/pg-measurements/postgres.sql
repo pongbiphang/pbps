@@ -985,6 +985,24 @@ SELECT 'R76', 'the same expression under DMY',
        (('01/02/2026'::text)::date)::text || ' — so the probe must use the write''s environment';
 RESET DateStyle;
 
+-- --------------------------- the thirty-second 2026-09-05 review round
+
+CREATE COLLATION m.nd_sensitive (provider = icu, locale = 'und', deterministic = false);
+CREATE COLLATION m.nd_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+SELECT 'R77', 'a nondeterministic collation at default strength',
+       'collisdeterministic = ' || (SELECT collisdeterministic::text FROM pg_collation
+                                    WHERE collname = 'nd_sensitive' AND collnamespace = 'm'::regnamespace)
+       || ', ''New'' = ''new'' is ' || ('New' = 'new' COLLATE m.nd_sensitive)::text;
+SELECT 'R78', 'a nondeterministic collation at secondary strength',
+       'collisdeterministic = ' || (SELECT collisdeterministic::text FROM pg_collation
+                                    WHERE collname = 'nd_ci' AND collnamespace = 'm'::regnamespace)
+       || ', ''New'' = ''new'' is ' || ('New' = 'new' COLLATE m.nd_ci)::text
+       || ' — the flag is the same, the answer is not';
+CREATE TABLE m.ndk (code text COLLATE m.nd_sensitive PRIMARY KEY);
+INSERT INTO m.ndk VALUES ('New');
+SELECT 'R79', 'inserting ''new'' beside ''New'' under the case-sensitive one',
+       m.accepts('INSERT INTO m.ndk VALUES (''new'')');
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

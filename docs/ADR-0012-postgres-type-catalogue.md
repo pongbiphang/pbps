@@ -176,8 +176,21 @@ estimate's first real dataset.** Two facts the dialect can state *statically*,
 from the typed change alone and without reading a single row — so §7.2 is
 untouched:
 
-1. **whether the statement rewrites the table**, from the table above;
+1. **whether the statement rewrites the table** — for the changes where that is
+   a property of the change alone;
 2. **which lock it takes**, measured rather than recalled.
+
+**The first is not always static, and §4 below measures why.** `timestamp` →
+`timestamptz` rewrites or does not depending on the session's `TimeZone`, and
+`ADD COLUMN … DEFAULT` depends on the expression's volatility, which this tool
+does not parse. An estimator implementing "static from the typed change" would
+call both metadata-only and be wrong on a live table.
+
+So the static table covers the context-independent rows only. For the rest the
+estimate answers **`unknown`**, or answers from connected context where there is
+a connection to ask — and `unknown` is a real answer here rather than a gap:
+§4's point is that an estimate which guesses *cheap* is worse than one which
+admits it does not know.
 
 Row counts, and therefore durations, are the connected half and are the
 estimate's business, not this ADR's. What this ADR fixes is that the two facts

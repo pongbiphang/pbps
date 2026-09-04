@@ -1009,7 +1009,21 @@ Two things follow, and neither is a new mechanism:
   meant to prevent.
 
   So: when a plan rebuilds or removes a routine and the scan finds a **managed**
-  caller, `plan --db` refuses and names both. The remedy is the user's, because
+  caller, `plan --db` **reports** it and names both.
+
+  A first version of this said *refuses*, and that rule can never be satisfied.
+  The scan matches a **name**, and with overloading a name is not an identity —
+  this document says so two paragraphs down — so a managed caller of `f(text)`
+  would block every rebuild of `f(integer)`, and editing the caller could not
+  clear the block while it still legitimately mentions `f`. A refusal with no
+  way out is not conservative: it makes valid work impossible and teaches the
+  next person to route around the tool.
+
+  **The line is evidence versus suspicion.** `plan --db` **refuses** where the
+  dependency is established — a `pg_depend` edge, or a `depends_on:` the user
+  declared — and **reports** where it is only a name match, managed or not. The
+  scan's job is to put a candidate in front of a human, which is what it can
+  honestly do; the refusals in this design are for facts, and a name is not one. The remedy is the user's, because
   only the user can say what the caller should now call — which is the same
   division of labour as rename and drop intent.
 
