@@ -191,3 +191,9 @@ R91 | how a declared check expression is stored | CHECK ((label <> 'none'::text)
 R92 | how a declared index filter is stored | (label <> 'none'::text)
 R93 | a column omitted by an INSERT, in the probing session (MDY) | 2026-01-02
 R94 | the same INSERT in another session (DMY) | 2026-02-01
+R95 | probing a nextval() default in a rolled-back planning transaction | returned 1, sequence last_value now 1
+R96 | the same nextval() default under SET TRANSACTION READ ONLY | refused: cannot execute nextval() in a read-only transaction
+R97 | a volatile function that writes, under READ ONLY | refused: cannot execute INSERT in a read-only transaction
+R98 | a volatile function that only computes, under READ ONLY | accepted
+R99 | now(), under READ ONLY | accepted
+R100 | the sequence after the read-only probe | last_value 1

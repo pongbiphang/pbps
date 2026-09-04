@@ -1099,6 +1099,34 @@ SELECT 'R94', 'the same INSERT in another session (DMY)',
        (SELECT when_::text FROM m.dflt WHERE id = 2);
 RESET DateStyle;
 
+-- -------------------------- the thirty-sixth 2026-09-05 review round
+
+-- The probe is a read that executes user code, so planning can move the target.
+CREATE SEQUENCE m.pseq;
+CREATE TABLE m.paudit (n int);
+CREATE FUNCTION m.pwrites() RETURNS int AS $fn$
+BEGIN INSERT INTO m.paudit VALUES (1); RETURN 1; END $fn$ LANGUAGE plpgsql VOLATILE;
+BEGIN;
+SELECT nextval('m.pseq') AS n1 \gset
+ROLLBACK;
+SELECT 'R95', 'probing a nextval() default in a rolled-back planning transaction',
+       'returned ' || :'n1' || ', sequence last_value now ' || (SELECT last_value::text FROM m.pseq);
+
+-- The engine's own guard. It refuses exactly the mutating cases, so pbps needs
+-- no volatility analysis of its own -- and does not lose the harmless ones.
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT m.accepts('SELECT nextval(''m.pseq'')') AS r1 \gset
+SELECT m.accepts('SELECT m.pwrites()') AS r2 \gset
+SELECT m.accepts('SELECT random() IS NOT NULL') AS r3 \gset
+SELECT m.accepts('SELECT now() IS NOT NULL') AS r4 \gset
+ROLLBACK;
+SELECT 'R96', 'the same nextval() default under SET TRANSACTION READ ONLY', :'r1';
+SELECT 'R97', 'a volatile function that writes, under READ ONLY', :'r2';
+SELECT 'R98', 'a volatile function that only computes, under READ ONLY', :'r3';
+SELECT 'R99', 'now(), under READ ONLY', :'r4';
+SELECT 'R100', 'the sequence after the read-only probe',
+       'last_value ' || (SELECT last_value::text FROM m.pseq);
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

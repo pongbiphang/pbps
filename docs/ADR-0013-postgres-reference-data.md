@@ -557,9 +557,54 @@ pinned on the session, and not wrapped around the writes at all.**
     thing the plan reasoned about is checked to still be true at the moment it
     is acted on.
 
-- **Opaque DDL** runs under whatever the operator's database has — **with one
-  explicit exception, `standard_conforming_strings = on`**, set and restored
-  around it. That exception was stated two rounds earlier and dropped when this
+  **And a probe that executes user code can move the target, which planning may
+  not do.** SPEC §9.1 makes `plan` a preview; a default of `nextval(…)` makes it
+  a write. **Measured**, probing one inside a planning transaction that then
+  rolls back leaves the sequence advanced — which is `R39`'s finding arriving
+  from the other direction:
+
+  ```
+  probing a nextval() default in a rolled-back planning transaction:
+      returned 1, sequence last_value now 1
+  ```
+
+  The obvious remedy is to call any default that may run volatile or
+  user-defined code unprobeable. **Measured, that gives away too much**, because
+  the engine already draws the line exactly where it belongs:
+
+  ```
+  nextval() under SET TRANSACTION READ ONLY:                   refused: cannot execute nextval() in a read-only transaction
+  a volatile function that writes, under READ ONLY:            refused: cannot execute INSERT in a read-only transaction
+  a volatile function that only computes, under READ ONLY:     accepted
+  now(), under READ ONLY:                                      accepted
+  the sequence after the read-only probe:                      last_value 1
+  ```
+
+  `random()` and `now()` are volatile and harmless; a blanket volatility rule
+  would refuse the common case to catch the rare one. So: **the probe runs
+  inside `SET TRANSACTION READ ONLY`, and the engine's refusal *is* the
+  definition of unprobeable.** pbps performs no volatility analysis, keeps no
+  list of dangerous functions, and cannot fall behind the engine's — which is
+  §8.2's rule again, one level up: the database is the authority on what its own
+  expression does.
+
+  This is the third decision on this branch that replaces a judgement pbps would
+  have to make with a question the engine answers, and the first one where the
+  judgement had already been drafted and was wrong.
+
+- **Opaque DDL** runs under whatever the operator's database has — **with two
+  explicit exceptions, `standard_conforming_strings = on` and the per-statement
+  write `search_path`**, set and restored around it.
+
+  The second was missing, and the omission contradicted this same section. Opaque
+  DDL is a write: a `CREATE VIEW` or `CREATE FUNCTION` whose body carries an
+  unqualified reference binds it at creation, and under the operator's path it
+  binds to whatever the deployment role happens to see while `bootstrap` binds
+  the same declaration to the project's own schema. That is precisely the silent
+  divergence the write path exists to prevent — measured on a view in `m_b` that
+  caught `m_a.t` — so exempting opaque DDL from it exempted the one kind of
+  statement the rule was written for. A rule with one exception invites a second
+  one nobody re-reads; both are now named in the same sentence. That exception was stated two rounds earlier and dropped when this
   decision was rewritten, which is the second setting to fall out of a list
   during a rewrite about something else. It is not a rendering setting: it
   decides how the *definition text itself* parses, and
@@ -1075,8 +1120,9 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | Nothing |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code; and **opaque DDL** runs under the operator's settings **with one restored exception, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true. A scope around a write would also be a scope around every trigger that write fires |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with two restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **and the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`. A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. The state records that write path for module bodies **and for the three verbatim expressions the model holds** — `Column::default`, `CheckConstraint::expression`, `Index::filter`. Generated columns and expression indexes are unmanaged and out of it |
+| The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
 | A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
@@ -1087,6 +1133,12 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 ## Limits
 
 - **Composite keys are still deferred**, as in ADR-0004.
+- **`READ ONLY` bounds the database, not the world.** It refuses writes to this
+  database's tables and sequences, which is what §3 needs; a default that calls
+  out through `dblink`, raises a `NOTIFY`, or writes a file is not stopped by it
+  and is not stopped by anything else pbps can do short of refusing to probe at
+  all. The guard is exact for the failure that was found and honest about the
+  one it does not cover.
 - **§4's expression-comparison finding is not measured against SQL Server.** The
   differ is shared, and all three expressions are read raw with no normalizer
   anywhere in the workspace: `sys.default_constraints.definition`
