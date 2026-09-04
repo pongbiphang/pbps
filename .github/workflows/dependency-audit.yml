@@ -1,0 +1,39 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - deny.toml
+      - .github/workflows/dependency-audit.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - deny.toml
+      - .github/workflows/dependency-audit.yml
+  schedule:
+    # The advisory database moves on its own. Without a scheduled run, a new
+    # finding against an unchanged dependency would wait for the next change.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Supply chain (SPEC 11.5, open questions 1 and 10). Two of this project's
+  # dependencies are small enough that "is it still maintained, is it still
+  # clean" has to be answered by something other than memory.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
