@@ -353,8 +353,9 @@ Two things about the `apply` job are load-bearing:
   one with the value from the deployment before it. A gate that fails that way
   is worse than no gate: it looks like one.
 
-  GitLab needs none of this, since a manual job takes its variables at start
-  time.
+  GitLab needs none of this *for the checksum*, since a manual job takes its
+  variables at start time — but it needs its own answer to "who may deploy",
+  which is a protected environment; see the GitLab section.
 - **`--allow` names the risk classes that were approved.** It is the gate, and
   the list belongs in the pipeline only if this environment genuinely accepts
   those classes every time; otherwise let the approver supply it too.
@@ -410,6 +411,10 @@ plan:prod:
 apply:prod:
   stage: apply
   needs: ['plan:prod']
+  # `when: manual` decides *when*, never *who*. The environment does that, and
+  # only if `production` is configured as a protected environment with its
+  # deployers named — see below.
+  environment: production
   rules:
     - if: $CI_COMMIT_TAG =~ /^prod-v/
       when: manual                  # the approval gate, not a decision point
@@ -421,6 +426,18 @@ apply:prod:
 
 `PBPS_PROD_URL` is a masked, protected CI/CD variable; `APPROVED_PLAN_SHA256`
 is supplied by the approver when they run the manual job.
+
+**`when: manual` is not an authorization.** It says the job waits for a person;
+it does not say which person. The pipeline is already running on a protected
+tag, so the job holds the protected credential, and the checksum is printed in
+the plan job's own output — so anyone allowed to run manual jobs in that
+pipeline could start the deployment. `environment: production` on the job is
+what makes that answerable, and only once `production` is configured as a
+**protected environment** naming its allowed deployers (and approval rules, if
+you want a second pair of eyes)
+([GitLab docs](https://docs.gitlab.com/ci/jobs/job_control/#protect-manual-jobs)).
+It is the same control the GitHub half gets from `environment:` with required
+reviewers; neither platform gives it for free.
 
 **Protect the `prod-v*` tags as well, in the same setting-up.** A protected
 variable is given only to jobs running on a protected branch or a protected tag
