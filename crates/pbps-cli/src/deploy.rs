@@ -95,10 +95,7 @@ async fn managed_state_full(
     // inside the managed set by name and outside it in fact, so the next plan
     // would propose creating one that is already there.
     for m in &pulled.unmanaged_modules {
-        let Ok(name) = m.name.parse::<pbps_model::ObjectName>() else {
-            continue;
-        };
-        if modules.contains(&name) {
+        if modules.contains(&m.name) {
             eprintln!(
                 "warning: {} {} is declared, but {}; it is left alone",
                 m.kind, m.name, m.why
@@ -231,12 +228,11 @@ pub(crate) fn unreadable_modules(
 ) -> Vec<(pbps_model::ObjectName, String)> {
     modules
         .iter()
-        .filter_map(|module| {
-            let name = module.name.parse::<pbps_model::ObjectName>().ok()?;
-            Some((
-                name,
+        .map(|module| {
+            (
+                module.name.clone(),
                 format!("{} {} ({})", module.kind, module.name, module.why),
-            ))
+            )
         })
         .collect()
 }

@@ -17,7 +17,7 @@
 //! plan the column's destruction on the next run. The caller decides whether the
 //! warnings are acceptable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::DialectError;
 use pbps_model::{
@@ -201,7 +201,10 @@ fn push_limitation(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnmanagedModule {
     pub kind: &'static str,
-    pub name: String,
+    /// Kept structured because a legal quoted identifier can itself contain a
+    /// period. Formatting and parsing it again would turn `[audit.v1]` into an
+    /// apparent third name component and silently lose the inventory entry.
+    pub name: ObjectName,
     /// Why it is not managed, in the operator's words.
     pub why: String,
 }
@@ -601,6 +604,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         );
     }
 
+    let mut clustered_indexes = BTreeSet::new();
     for i in &raw.index_columns {
         let Some(table) = tables.get_mut(&i.object_id) else {
             continue;
@@ -609,10 +613,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             // The model has no clustered-ness; recording the index without it
             // would make bootstrap create a different physical layout.
             let table_name = name_of(i.object_id, &names);
-            if !warnings
-                .iter()
-                .any(|w| w.contains(&format!("index `{}`", i.index_name)))
-            {
+            // One catalog row is returned per index column. Deduplicate those
+            // rows by the owning object as well as the index name: SQL Server
+            // permits two tables to use the same index name.
+            if clustered_indexes.insert((i.object_id, i.index_name.clone())) {
                 push_limitation(
                     &mut warnings,
                     &mut limitations,
@@ -676,7 +680,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut unmanageable = |why: &str| {
             unmanaged_modules.push(UnmanagedModule {
                 kind: m.kind.as_str(),
-                name: name.to_string(),
+                name: name.clone(),
                 why: why.to_owned(),
             });
         };
@@ -965,9 +969,28 @@ mod tests {
     #[test]
     fn clustered_indexes_are_warned_about_and_left_out() {
         let mut raw = one_table_catalog();
-        raw.index_columns.push(RawIndexColumn {
+        raw.tables.push(raw_table(20, "dbo", "archive"));
+        raw.columns.push(raw_column(20, "id", "bigint"));
+        let customer_index = RawIndexColumn {
             object_id: 10,
-            index_name: "cx_customer".into(),
+            index_name: "cx_shared".into(),
+            is_unique: false,
+            is_clustered: true,
+            filter: None,
+            column: "id".into(),
+            is_included: false,
+            is_descending: false,
+        };
+        // Multiple columns of one clustered index produce one limitation.
+        raw.index_columns.push(customer_index.clone());
+        raw.index_columns.push(RawIndexColumn {
+            column: "email".into(),
+            ..customer_index
+        });
+        // The same index name on a different table is a distinct limitation.
+        raw.index_columns.push(RawIndexColumn {
+            object_id: 20,
+            index_name: "cx_shared".into(),
             is_unique: false,
             is_clustered: true,
             filter: None,
@@ -981,11 +1004,17 @@ mod tests {
                 .indexes
                 .is_empty()
         );
-        assert!(p.warnings.iter().any(|w| w.contains("clustered")));
-        assert!(
+        assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
+        assert_eq!(p.limitations.len(), 2, "{:?}", p.limitations);
+        assert_eq!(
             p.limitations
                 .iter()
-                .any(|limitation| limitation.detail.contains("clustered"))
+                .map(|limitation| limitation.table.clone())
+                .collect::<Vec<_>>(),
+            [
+                TableName::new("dbo", "customer"),
+                TableName::new("dbo", "archive")
+            ]
         );
     }
 
@@ -1177,9 +1206,24 @@ mod module_tests {
         assert_eq!(
             p.unmanaged_modules
                 .iter()
-                .map(|m| m.name.as_str())
+                .map(|m| m.name.to_string())
                 .collect::<Vec<_>>(),
-            ["app.aaa", "dbo.zzz"]
+            ["app.aaa".to_owned(), "dbo.zzz".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_module_keeps_a_dotted_identifier_structured() {
+        let p = assemble(&catalog_with(vec![module(
+            "dbo",
+            "audit.v1",
+            ModuleKind::Procedure,
+            None,
+        )]));
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert_eq!(
+            p.unmanaged_modules[0].name,
+            ObjectName::new("dbo", "audit.v1")
         );
     }
 

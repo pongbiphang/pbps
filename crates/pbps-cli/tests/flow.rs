@@ -5614,8 +5614,8 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         let _ = conn
             .execute(
-                "IF OBJECT_ID(N'dbo.pbps_unreadable_policy_secret', N'P') IS NOT NULL \
-                 DROP PROCEDURE dbo.pbps_unreadable_policy_secret;",
+                "IF OBJECT_ID(N'dbo.[pbps_unreadable.policy_secret]', N'P') IS NOT NULL \
+                 DROP PROCEDURE dbo.[pbps_unreadable.policy_secret];",
             )
             .await;
         let _ = conn
@@ -5655,7 +5655,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         conn.execute(
-            "CREATE PROCEDURE dbo.pbps_unreadable_policy_secret WITH ENCRYPTION AS SELECT 1;",
+            "CREATE PROCEDURE dbo.[pbps_unreadable.policy_secret] WITH ENCRYPTION AS SELECT 1;",
         )
         .await
         .unwrap();
@@ -5671,7 +5671,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
                 item["id"] == "state.unmanaged-refused"
                     && item["message"]
                         .as_str()
-                        .is_some_and(|s| s.contains("pbps_unreadable_policy_secret"))
+                        .is_some_and(|s| s.contains("pbps_unreadable.policy_secret"))
             })),
         "{report}"
     );
@@ -5696,14 +5696,14 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
             finding["id"] == "state.unmanaged-refused"
                 && finding["message"]
                     .as_str()
-                    .is_some_and(|s| s.contains("pbps_unreadable_policy_secret"))
+                    .is_some_and(|s| s.contains("pbps_unreadable.policy_secret"))
         })
     }));
 
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         conn.execute(
-            "DROP PROCEDURE dbo.pbps_unreadable_policy_secret; \
+            "DROP PROCEDURE dbo.[pbps_unreadable.policy_secret]; \
              DROP TABLE dbo.pbps_unreadable_policy; \
              DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
         )

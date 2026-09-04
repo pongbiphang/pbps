@@ -456,12 +456,15 @@ async fn pull_reads_every_kind_of_module_back() {
     let trigger = &pulled.schema.modules[&TableName::new("dbo", "tr_t")];
     assert_eq!(trigger.on, Some(TableName::new("dbo", "t")));
 
-    let unmanaged: Vec<&str> = pulled
+    let unmanaged: Vec<String> = pulled
         .unmanaged_modules
         .iter()
-        .map(|m| m.name.as_str())
+        .map(|m| m.name.to_string())
         .collect();
-    assert_eq!(unmanaged, ["dbo.sp_secret", "dbo.v_bound"]);
+    assert_eq!(
+        unmanaged,
+        ["dbo.sp_secret".to_owned(), "dbo.v_bound".to_owned()]
+    );
 
     // The table itself still came through untouched.
     assert!(

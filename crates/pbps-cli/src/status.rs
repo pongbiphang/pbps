@@ -285,31 +285,13 @@ async fn one(
     // `apply` both refuse until it is finished, so a screen that read "ok"
     // would leave them puzzled at the refusal.
     if let Some(progress) = &entry.snapshot.staged {
-        row.state = "staged";
-        // Through `env_arg`, like every other command this tool prints. An
-        // environment name is a YAML map key, so `US West` is a valid one, and
-        // interpolated bare it becomes two arguments — or, with a shell
-        // metacharacter, something that runs. These `detail` strings advertise
-        // commands exactly as the remedies do, and were the one place that
-        // bypassed the helper.
-        let failure = row.detail.take();
-        let mut detail = format!(
-            "a staged apply stopped after {} of {} statement(s); continue it with \
-             `pbps apply --staged --resume --env {} --plan ... --checksum {}`",
+        record_staged(
+            &mut row,
+            name,
             progress.completed,
             progress.total,
-            crate::report::env_arg(name),
-            entry
-                .snapshot
-                .plan_checksum
-                .as_deref()
-                .unwrap_or("<approved-checksum>")
+            entry.snapshot.plan_checksum.as_deref(),
         );
-        if let Some(failure) = failure {
-            detail.push_str(" — ");
-            detail.push_str(&failure);
-        }
-        row.detail = Some(detail);
     }
 
     // The drift verdict is the checksum, computed exactly as `verify` computes
@@ -380,6 +362,38 @@ async fn one(
     row
 }
 
+/// Makes an interrupted staged apply the primary human state while retaining
+/// a failed ledger entry as a separate machine-readable finding.
+fn record_staged(
+    row: &mut EnvStatus,
+    environment: &str,
+    completed: usize,
+    total: usize,
+    checksum: Option<&str>,
+) {
+    let failure = row.detail.take();
+    if row.state == "failed"
+        && let Some(detail) = &failure
+    {
+        record_supplemental_issue(row, "failed", detail);
+    }
+    row.state = "staged";
+
+    // Through `env_arg`, like every other command this tool prints. An
+    // environment name is a YAML map key, so `US West` is valid, and
+    // interpolated bare it becomes multiple arguments or executable syntax.
+    let mut detail = format!(
+        "a staged apply stopped after {completed} of {total} statement(s); continue it with \
+         `pbps apply --staged --resume --env {} --plan ... --checksum {}`",
+        crate::report::env_arg(environment),
+        checksum.unwrap_or("<approved-checksum>")
+    );
+    if let Some(failure) = failure {
+        append_detail(&mut detail, &failure);
+    }
+    row.detail = Some(detail);
+}
+
 /// Adds an independently discovered state issue without hiding a staged apply
 /// or another, more important verdict already on the row.
 fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String) {
@@ -389,13 +403,7 @@ fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String)
         return;
     }
     if row.state != state {
-        match row.issues.iter_mut().find(|issue| issue.state == state) {
-            Some(issue) => append_detail(&mut issue.detail, &detail),
-            None => row.issues.push(StatusIssue {
-                state,
-                detail: detail.clone(),
-            }),
-        }
+        record_supplemental_issue(row, state, &detail);
     }
     let previous = row.detail.take().unwrap_or_default();
     row.detail = Some(if previous.is_empty() {
@@ -403,6 +411,16 @@ fn record_status_issue(row: &mut EnvStatus, state: &'static str, detail: String)
     } else {
         format!("{previous} — {detail}")
     });
+}
+
+fn record_supplemental_issue(row: &mut EnvStatus, state: &'static str, detail: &str) {
+    match row.issues.iter_mut().find(|issue| issue.state == state) {
+        Some(issue) => append_detail(&mut issue.detail, detail),
+        None => row.issues.push(StatusIssue {
+            state,
+            detail: detail.to_owned(),
+        }),
+    }
 }
 
 fn append_detail(existing: &mut String, detail: &str) {
@@ -620,6 +638,20 @@ mod tests {
         assert!(detail.contains("moved since that checkpoint"), "{detail}");
         let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
         assert_eq!(ids, ["state.mid-deployment", "state.drift"]);
+    }
+
+    #[test]
+    fn a_failed_staged_attempt_exposes_both_findings() {
+        let mut r = row("prod", "failed");
+        r.detail = Some("the last deployment attempt failed: denied".into());
+        record_staged(&mut r, "prod", 2, 5, Some("abc123"));
+
+        assert_eq!(r.state, "staged");
+        let detail = r.detail.as_deref().unwrap();
+        assert!(detail.contains("2 of 5"), "{detail}");
+        assert!(detail.contains("attempt failed"), "{detail}");
+        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        assert_eq!(ids, ["state.mid-deployment", "state.failed"]);
     }
 
     #[test]
