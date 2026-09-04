@@ -308,6 +308,12 @@ the suite may run as root **and** runs on Windows.
 
 ## CI
 
+- On Windows, `cmd.exe /C` does not decode the standard argv quoting that
+  `Command::arg` produces. A hook containing an ordinary quoted path reached
+  `cmd` with backslash-escaped quotes and failed before reading its payload.
+  Build that command with Windows `CommandExt::raw_arg`, including the outer
+  quote pair that `/S` removes; do not weaken the hook test by avoiding spaces
+  or quotes in its path.
 - The `live` job's SQL Server service container has crashed at startup twice, on
   two different commits: the failing step is `wait for SQL Server`, both cargo
   steps are **skipped**, and a re-run of the same commit passed both times. Read

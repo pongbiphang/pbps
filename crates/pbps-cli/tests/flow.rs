@@ -1247,7 +1247,9 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
 #[test]
 fn a_refused_artifact_is_still_an_attempt_for_the_hook() {
     let d = Demo::new("refused-attempt-hook");
-    let hook_out = d.dir.join("apply-hook.json");
+    // Keep a space in the path: removing the quotes would otherwise make this
+    // test pass while restoring the `cmd.exe /C` bug it exists to catch.
+    let hook_out = d.dir.join("apply hook.json");
     // This is the one hook test that reaches the Windows CI runner (the
     // others need a live server), and it has been wrong about that runner
     // twice: a double-quoted YAML scalar read the `C:\Users\...` backslashes
