@@ -1729,3 +1729,31 @@ SPEC is in sync with all of these.
     resolution, and fixing `load_from_git` alone left `--since` reading the
     wrong tree while `plan` read the right one.
 
+156. **A role the plan touches is exempt down to the permissions it moves, and
+    no further.** 153 made this correction for a table's rows and left the
+    other half of the model as 150 had it: a role named by any change was
+    exempt whole. So a plan that adds one grant covered every *other*
+    permission that role holds — and nothing in the run speaks for those. The
+    statements grant and revoke what the plan asked for and say nothing about
+    what they left alone; the pinned checksum is answered before they run. A
+    session that revokes the role's unchanged `SELECT` in between therefore
+    had it recorded as this plan's own result, with `verify` clean against the
+    revocation ever after.
+    The comparison now takes each target the role holds permissions on, on
+    either side, subtracts the permissions this plan grants or revokes there,
+    and requires what is left to be equal. `Change::grant` names them, the
+    counterpart of `Change::row` and for the same caller. Both ends of a role
+    rename are paired first: `ALTER ROLE ... WITH NAME` keeps the grants, and
+    the grant changes beside a rename name the role as it will be
+    (`order_key` puts the rename first).
+    Measured through the CLI, on the shape that made it stageable: `REVOKE`
+    runs inside an `AFTER INSERT` trigger. With the whole-role exemption in
+    place, a revision that widens the role while inserting a row reports
+    `Applied 2 change(s) ... recorded as entry #4` and blesses the
+    revocation; with the fix the transaction rolls back naming the role, and
+    the grant the trigger took is back.
+    **The shape, twice now:** an exemption written for "the plan is answerable
+    for this object" is wider than the thing the plan is actually answerable
+    for. The unit of a plan's responsibility is what its statements name — a
+    row, a permission on a target — never the container those live in.
+

@@ -675,6 +675,61 @@ impl Change {
         }
     }
 
+    /// The permissions this change writes, where it writes any: the role, the
+    /// target they are on, and the set it adds or removes.
+    ///
+    /// The counterpart of [`Change::row`] on the other half of the model, and
+    /// for the same caller. A role a plan touches is not a role the plan is
+    /// answerable for *whole*: it grants or revokes some permissions on some
+    /// targets, and every other permission that role holds is one nothing in
+    /// the run speaks for (DECISIONS 156).
+    // Exhaustive rather than a wildcard: a change added later that moves a
+    // permission has to be named here, or the permission it moves would be
+    // compared against a state it was never part of.
+    pub fn grant(&self) -> Option<(&str, &GrantTarget, &BTreeSet<Permission>)> {
+        match self {
+            Change::Grant {
+                role,
+                target,
+                permissions,
+            }
+            | Change::Revoke {
+                role,
+                target,
+                permissions,
+            } => Some((role, target, permissions)),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. } => None,
+        }
+    }
+
     /// Every role name this change reaches, both ends of a rename included,
     /// for the reason [`Change::objects`] gives. Empty for every change that
     /// is not about a principal.

@@ -1014,13 +1014,28 @@ fn refuse_unplanned_movement(
     // old name too where it renames one — the two states are keyed by
     // different names across a rename.
     let mut renamed: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    let mut renamed_roles: BTreeMap<&str, &str> = BTreeMap::new();
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
+    // The permissions this plan moves, keyed by the role it moves them on and
+    // the target they sit on. A role can be both granted and revoked on one
+    // target in one plan, so the sets are unioned rather than replaced.
+    let mut granted: BTreeMap<(&str, &pbps_model::GrantTarget), BTreeSet<&pbps_model::Permission>> =
+        BTreeMap::new();
     for p in &changes.changes {
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             renamed.insert(from, to);
         }
+        if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
+            renamed_roles.insert(from, to);
+        }
         if let Some((table, key)) = p.change.row() {
             written.entry(table).or_default().insert(key);
+        }
+        if let Some((role, target, permissions)) = p.change.grant() {
+            granted
+                .entry((role, target))
+                .or_default()
+                .extend(permissions);
         }
     }
 
@@ -1068,13 +1083,50 @@ fn refuse_unplanned_movement(
         }
     }
     compare("", &before.modules, &after.modules, named, &mut moved);
-    compare(
-        "role ",
-        &before.roles,
-        &after.roles,
-        |n: &String| roles.contains(n.as_str()),
-        &mut moved,
-    );
+    let named_role = |n: &String| roles.contains(n.as_str());
+    compare("role ", &before.roles, &after.roles, named_role, &mut moved);
+    // And the same for a role the plan does name: exempt down to the
+    // permissions it moves, and no further. A plan that adds one grant is not
+    // answerable for the rest of the role's set, and nothing else in the run
+    // speaks for them — the statements grant and revoke what they were asked
+    // to and say nothing about what they left alone (DECISIONS 156).
+    for (name, was) in &before.roles {
+        if !named_role(name) {
+            // Already compared whole, grants included.
+            continue;
+        }
+        // `ALTER ROLE ... WITH NAME` keeps the membership and the grants, so
+        // the two ends of a rename are one role's before and after; the
+        // grant changes beside it name the role as it will be (`order_key`).
+        let now_name = renamed_roles.get(name.as_str()).copied().unwrap_or(name);
+        let Some(now) = after.roles.get(now_name) else {
+            // Created or dropped: named by the change that does it, and there
+            // is no pair of grant sets to compare.
+            continue;
+        };
+        let empty = BTreeSet::new();
+        let targets: BTreeSet<_> = was.grants.keys().chain(now.grants.keys()).collect();
+        for target in targets {
+            let moves = granted.get(&(now_name, target)).unwrap_or(&empty);
+            let held = |grants: &BTreeMap<_, BTreeSet<pbps_model::Permission>>| {
+                grants
+                    .get(target)
+                    .map(|held| {
+                        held.iter()
+                            .filter(|p| !moves.contains(p))
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            if held(&was.grants) != held(&now.grants) {
+                moved.push(format!(
+                    "role {now_name} holds different permissions on {target} than the plan was \
+                     approved over, and no change of this plan moves them"
+                ));
+            }
+        }
+    }
     if moved.is_empty() {
         return Ok(());
     }
@@ -3530,6 +3582,65 @@ mod tests {
         assert!(e.contains("dbo.t is gone"), "{e}");
         let e = refuse(&changes(vec![]), &gone, &before).expect_err("the table arrived");
         assert!(e.contains("dbo.t is there"), "{e}");
+    }
+
+    /// A role the plan touches is exempt down to the permissions it moves, and
+    /// no further. A plan that adds one grant says nothing about the rest of
+    /// the role's set, and neither does any statement it runs — so exempting
+    /// the whole role let a concurrent revoke of an unchanged grant be
+    /// recorded as this plan's own result (DECISIONS 156).
+    #[test]
+    fn a_grant_this_plan_does_not_move_is_still_compared() {
+        use pbps_model::{GrantTarget, Permission};
+        let dbo = || GrantTarget::Schema("dbo".to_owned());
+        let role = |held: &[Permission]| {
+            let mut grants = BTreeMap::new();
+            if !held.is_empty() {
+                grants.insert(dbo(), held.iter().copied().collect());
+            }
+            pbps_model::Role {
+                description: None,
+                grants,
+            }
+        };
+        let schema = |held: &[Permission]| {
+            let mut s = Schema::default();
+            s.roles.insert("app".to_owned(), role(held));
+            s
+        };
+        let plan_granting = |permission: Permission| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                role: "app".to_owned(),
+                target: dbo(),
+                permissions: [permission].into_iter().collect(),
+            })],
+        };
+        let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(cs, before, after, "prod").map_err(|e| format!("{e:#}"))
+        };
+
+        let before = schema(&[Permission::Select]);
+        let after = schema(&[Permission::Select, Permission::Insert]);
+        // The plan's own grant, and nothing else moved.
+        refuse(&plan_granting(Permission::Insert), &before, &after).expect("the plan's own change");
+
+        // The same plan, with `SELECT` revoked underneath it by somebody else.
+        // The role is named by the plan, so a whole-role exemption saw nothing.
+        let robbed = schema(&[Permission::Insert]);
+        let e = refuse(&plan_granting(Permission::Insert), &before, &robbed)
+            .expect_err("the untouched grant moved");
+        assert!(e.contains("role app"), "{e}");
+        assert!(e.contains("schema::dbo"), "{e}");
+
+        // And a revoke the plan *did* ask for is not reported as movement.
+        let revoking = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
+                role: "app".to_owned(),
+                target: dbo(),
+                permissions: [Permission::Select].into_iter().collect(),
+            })],
+        };
+        refuse(&revoking, &before, &schema(&[])).expect("the plan's own revoke");
     }
 
     /// Both ends of a rename are the plan's business. The recorded state knows

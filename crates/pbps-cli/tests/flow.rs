@@ -6988,6 +6988,8 @@ data:
 ",
     )
     .unwrap();
+    let role = |grants: &str| format!("role: app\ngrants:\n  schema::dbo: [{grants}]\n");
+    std::fs::write(d.dir.join("schema/app.yml"), role("select")).unwrap();
     // Offline first, to mint the identities `bootstrap` insists on.
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
@@ -7118,6 +7120,53 @@ data:
         untouched, 1,
         "the trigger's write must have rolled back too"
     );
+
+    // And once more on the other half of the model: a trigger that revokes a
+    // grant the plan leaves alone, on a role the plan *does* touch. Exempting
+    // the whole role saw nothing, exactly as exempting the whole table did
+    // (DECISIONS 156). `REVOKE` inside an `AFTER INSERT` trigger was measured
+    // to work, which is what makes this stageable at all.
+    sql("DROP TRIGGER dbo.trg_t;");
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; REVOKE SELECT ON SCHEMA::dbo TO app;');");
+    // The revision now also widens the role, so the plan names it.
+    std::fs::write(d.dir.join("schema/app.yml"), role("select, insert")).unwrap();
+    d.commit();
+    let plan = d.dir.join("plan2.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("role app"),
+        "the refusal must name the role whose grant moved: {err}"
+    );
+    // Rolled back whole: the grant the trigger took is back, and the grant the
+    // plan wanted to add never landed.
+    let permissions: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.database_permissions p \
+                 JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id \
+                 WHERE r.name = 'app' AND p.permission_name = 'SELECT';",
+            )
+            .await
+            .expect("count");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(permissions, 1, "the trigger's revoke must have rolled back");
 
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
