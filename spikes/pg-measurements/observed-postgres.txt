@@ -178,3 +178,12 @@ R78 | a nondeterministic collation at secondary strength | collisdeterministic =
 R79 | inserting 'new' beside 'New' under the case-sensitive one | accepted
 R80 | a quoted timetz with an abbreviation, under Default | 12:00:00-06
 R81 | the same literal under Australia | 12:00:00+09:30 — timetz belongs on the offline refusal list too
+R82 | a generated column created under extras (uu_a, uu_b) | uu_a row 1
+R83 | a new row in the same table after reordering to (uu_b, uu_a) | uu_a row 2
+R84 | a bootstrap of the same declaration under the new order | uu_b row 1
+R85 | a rendered text value containing a backslash, under on | length 4
+R86 | the same rendered INSERT under off | length 3
+R87 | the E-string form instead, under off | length 4
+R88 | the same E-string under on | length 4
+R89 | a two-byte bytea rendered in canonical hex, under off | accepted, storing 3 byte(s)
+R90 | the decode() form instead, under off | accepted, storing 2 byte(s)

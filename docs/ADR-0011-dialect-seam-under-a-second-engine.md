@@ -11,15 +11,19 @@
 
 SPEC §12: *"If Phase 5 forces a large change to `pbps-model`, the Phase 0
 abstraction was drawn in the wrong place."* ADR-0009 and ADR-0010 answer that
-for the **model**, and the answer is no — a map key, an enum, and **two** fields
-in the state snapshot. Neither field is decoration: without the **declared text**
-the differ compares a hand-written definition with a deparsed one and rebuilds
-every view and `BEGIN ATOMIC` routine on every plan
+for the **model**, and the answer is no — a map key, an enum, and **three**
+fields in the state snapshot. No field is decoration: without the **declared
+text** the differ compares a hand-written definition with a deparsed one and
+rebuilds every view and `BEGIN ATOMIC` routine on every plan
 ([ADR-0009](ADR-0009-postgres-modules.md) §2.2); without the **write path** a
 project reordering its configured schemas leaves an existing environment binding
 an unqualified reference differently from a bootstrap of the same revision, with
 nothing to expose the divergence
-([ADR-0013](ADR-0013-postgres-reference-data.md) §3). This document answers the same
+([ADR-0013](ADR-0013-postgres-reference-data.md) §3); and without the **declared
+column default** the differ's text comparison of defaults re-emits
+`AlterColumnDefault` on every connected plan, for ever (ADR-0013 §4). The three
+are the same fact: PostgreSQL returns its own spelling, so a declaration has to
+be kept beside what came back. This document answers the same
 question for the **seam**: the `Dialect` trait and `Statement`, which is where a
 second engine actually lands, and which Phase 0 explicitly claims to have
 validated against PostgreSQL.

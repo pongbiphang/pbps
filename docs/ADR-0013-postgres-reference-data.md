@@ -471,6 +471,30 @@ pinned on the session, and not wrapped around the writes at all.**
   than emitting a script that stores January in one environment and February in
   another.
 
+  **And a value can depend on a setting the type does not.** Writes take no
+  settings scope (§3), so a rendered value carrying a backslash is read
+  differently under `standard_conforming_strings` — **measured**, the two
+  characters `\n` in a `text` value survive as two under `on` and collapse to one
+  newline under `off`, and a `bytea` in canonical hex is *accepted* under `off`
+  while storing three bytes where two were meant:
+
+  ```
+  'a\nb' under on:                     length 4
+  the same INSERT under off:           length 3
+  E'a\nb' under either:                length 4
+  '\x0102'::bytea under off:  accepted, storing 3 byte(s)
+  decode('0102','hex') under off:      accepted, storing 2 byte(s)
+  ```
+
+  The `bytea` line is the one that matters: no error, no refusal, a different
+  value in the table. Adding these types to the refusal list would be the wrong
+  fix, because the dependency is in **pbps's own rendering**, not in the
+  declaration — so pbps renders a setting-independent literal instead: an
+  `E'…'` form with backslashes doubled (E-strings take backslash escapes under
+  either setting), and `decode('…','hex')` for `bytea`, which contains no
+  backslash at all. That is an encoding rule, not a settings rule, and it is
+  what "the values pbps renders are pbps's responsibility" has to mean.
+
   `timetz` was missing from a first version of that list, and it is not a
   rounding error: **measured**, `'12:00 CST'::timetz` is `12:00:00-06` under the
   `Default` abbreviation dictionary and `12:00:00+09:30` under `Australia` — a
@@ -806,17 +830,35 @@ reads deterministic would have made them depend on the declarations.
   beside the `BEGIN ATOMIC` recommendation, as the second thing a project does
   to make its routines say what they mean.
 
-  For the modules the recording *does* cover, reordering the extras silently
+  For the objects the recording *does* cover, reordering the extras silently
   divides the environment from a `bootstrap` of the same revision, and nothing
   exposes it: the declarations are unchanged,
   so the differ sees nothing, and both sides of the drift comparison read the
   same live object. (The deparsed text does record the resolved binding, but
   only when the read path makes qualification necessary — so it is not something
-  a comparison can be built on.) The state snapshot therefore records the write path
-  beside the declared text it already keeps (§2.2 of
-  [ADR-0009](ADR-0009-postgres-modules.md)), and a module whose recorded path
-  differs from the project's current one is rebuilt — the path is an input to
-  the declaration's meaning, so a change to it is a change to the module.** One global list ordered by anything else is
+  a comparison can be built on.)
+
+  **And a module is not the only thing PostgreSQL binds at creation.** A column
+  default, a generated column, a check constraint and an expression index are
+  parsed then too, and keep what they resolved against — **measured**, a
+  generated column defined as `tag(v)` answers from `uu_a` for every later row,
+  while a fresh table carrying the same declaration takes the new order:
+
+  ```
+  a generated column created under extras (uu_a, uu_b):    uu_a row 1
+  a new row after reordering to (uu_b, uu_a):              uu_a row 2
+  a bootstrap of the same declaration under the new order:  uu_b row 1
+  ```
+
+  Writing the rule around modules was the narrowing this branch has now made
+  five times: taking the example in front of me for the shape.
+
+  The state snapshot therefore records the write path beside the declared text
+  it already keeps (§2.2 of
+  [ADR-0009](ADR-0009-postgres-modules.md)) — for **every parsed
+  expression-bearing object**, not only modules — and one whose recorded path
+  differs from the project's current one is rebuilt: the path is an input to
+  the declaration's meaning, so a change to it is a change to the object.** One global list ordered by anything else is
   unsafe the moment two managed schemas hold the same name — **measured**, a
   view in `m_b` created under a path ordered `(m_a, m_b)` binds to `m_a.t`:
 
@@ -870,6 +912,34 @@ default" path of DECISIONS 117 for the cases where it cannot). That path is
 dialect-agnostic in shape and carries over; what does not carry over is any
 attempt to shortcut it with string equality, which happens to work often enough
 on SQL Server to look like it works.
+
+**And that answer covers the cell, not the column.** The probe decides whether an
+omitted *cell* equals its default; the *structural* default is compared
+somewhere else entirely, and there it is compared as text.
+`crates/pbps-diff/src/schema_diff.rs:385` reads:
+
+```rust
+if base_col.default != col.default {
+    changes.push(Change::AlterColumnDefault { ... });
+}
+```
+
+And the base side *is* introspection: `pbps_model::data::plan_base` opens with
+`let mut base = live.clone()` and only replaces `table.data`, so a connected
+plan's `base_col.default` is whatever the catalog deparsed. With that side
+holding `'unnamed'::text` and the declaration holding `'unnamed'`, **every
+connected plan emits that change again, for ever — including the plan taken
+immediately after a successful apply.** It is
+the permanent restatement §2.2 of
+[ADR-0009](ADR-0009-postgres-modules.md) fixed for module bodies, in the one
+place I did not look for it because §4 was about cells.
+
+So the same fix carries: **the state records the declared default beside the one
+read back**, the differ compares declared-now against declared-at-last-apply,
+and drift compares read-back against read-back. That is a third field in the
+snapshot, and it belongs in ADR-0009's tally with the other two — all three exist
+for one reason, which is that PostgreSQL hands back its own spelling of whatever
+it was given.
 
 ## 5. The row map's identity is the engine's equality, and PostgreSQL answers differently
 
@@ -938,7 +1008,9 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 |---|---|
 | `pbps-model` | Nothing |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code; and **opaque DDL** runs under the operator's settings **with one restored exception, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true. A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. The state records that write path for **every parsed expression-bearing object**, not only modules: a generated column keeps its binding too |
+| Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
+| A column's structural default | Stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): `schema_diff.rs:385` compares defaults as text, and a declared `'unnamed'` comes back `'unnamed'::text` |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
 | `plan --db` | The key-collision check (§5). `cmd_validate` is offline and the collation lives on the live column, which this ADR keeps out of `pbps-model`, so offline `validate` cannot answer it — and under a nondeterministic collation it would answer *wrongly*, accepting keys whose inserts collide. It says it did not check rather than reporting clean (§9.1: offline is a preview) |
@@ -946,6 +1018,13 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 ## Limits
 
 - **Composite keys are still deferred**, as in ADR-0004.
+- **§4's default-comparison finding is not measured against SQL Server.** The
+  differ is shared, `sys.default_constraints.definition` is taken raw
+  (`catalog.rs:189`, no normalizer anywhere in the workspace), and the same
+  comparison runs on both engines — so the same loop may already exist on the
+  shipped dialect. That is a *reasoned* worry, not an observation: nothing here
+  ran it. It wants one live check on SQL Server, and it is the fourth item in
+  this design pass to point at shipped code rather than at Phase 5.
 - **Nondeterministic collations are now measured** (§5), and the flag turned out
   not to mean what this document first assumed.
 - **Everything here is proposed**, and falsifiable by the PostgreSQL live suite.

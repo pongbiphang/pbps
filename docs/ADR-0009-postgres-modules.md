@@ -28,10 +28,10 @@ The verdict, up front:
 | `CREATE OR ALTER` avoids drop + create, and so preserves grants | **Not for sale.** PostgreSQL's replace can only *append* view columns |
 | The schema-bound ordering problem is one deferred corner case | **It is the common case** |
 
-Three model changes — a map key and **two** fields in the state snapshot, the
-declared text (§2.2) and the write path a module was created under
-([ADR-0013](ADR-0013-postgres-reference-data.md) §3) — and one bargain that
-lapses. The bargain is affordable only because ADR-0005 has since
+Four model changes — a map key and **three** fields in the state snapshot: the
+declared module text (§2.2), the write path a parsed expression-bearing object
+was created under ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) and the
+declared column default (ADR-0013 §4) — and one bargain that lapses. The bargain is affordable only because ADR-0005 has since
 shipped (§3). Both model changes are small; what is not small is that the
 signature is normalized by *routine* rules rather than column rules (§1), and
 that the state has to keep what was declared as well as what came back (§2),
@@ -1121,7 +1121,8 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 | `Schema::modules` keyed by `ModuleId` instead of `ObjectName` | One key type; every dialect-agnostic user of it goes through the map |
 | `GrantTarget::Object` must be able to name a function by signature (see [ADR-0010](ADR-0010-postgres-privileges.md)) | The same `ModuleId` |
 | The state snapshot keeps a module's **declared** text beside the read-back (§2.2) | One field, and a state format bump |
-| The state snapshot also keeps the **write path** each module was created under ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. The path's order decides which schema an unqualified name binds to, so it is an input to the declaration's meaning and a change to it is a change to the module |
+| The state snapshot also keeps the **write path** each *parsed expression-bearing object* was created under ([ADR-0013](ADR-0013-postgres-reference-data.md) §3) | A second field in the same bump. The path's order decides which schema an unqualified name binds to — measured, for a generated column as much as for a module — so it is an input to the declaration's meaning |
+| And the **declared column default** beside the one read back (ADR-0013 §4) | A third field. `schema_diff.rs:385` compares defaults as text and PostgreSQL returns `'unnamed'::text` for a declared `'unnamed'`, so without it every connected plan re-emits `AlterColumnDefault` for ever |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
 | `ModuleDeps` keyed by `ModuleId` on **both** sides | Today `BTreeMap<ObjectName, BTreeSet<ObjectName>>`, which cannot say that `app.f(integer)` depends on something while `app.f(text)` does not — two valid declarations would share or overwrite one hint entry, and the ordering it exists to fix would be computed from the wrong graph |
@@ -1130,13 +1131,16 @@ Everything else — `Module`, `ModuleKind`, the ids file (modules still carry no
 identity), the differ, `docs`, the policy engine — is unchanged.
 
 **The abstraction holds, with one correction to what that costs.** The first
-draft of this document claimed the whole bill was one map key. It is one map
-key *and two fields in the state snapshot* — what was declared, because §2.2's
-convergence argument was wrong, and the path it was created under, because
-ADR-0013 §3 made that path part of what a declaration means. Recording it here rather than
-quietly widening the earlier claim is the point: "we checked" is not the same
-claim as "it held", and a verdict that was revised is worth more than one that
-never moved.
+draft of this document claimed the whole bill was one map key. It is one map key
+*and three fields in the state snapshot* — what was declared, because §2.2's
+convergence argument was wrong; the path it was created under, because ADR-0013
+§3 made that path part of what a declaration means; and the declared column
+default, because ADR-0013 §4 found the same permanent restatement in the differ's
+text comparison of defaults. All three are one fact wearing three hats:
+**PostgreSQL hands back its own spelling of whatever it was given**, so anything
+compared against a declaration needs the declaration kept beside it. The count
+rose twice under review, and recording that rather than quietly widening the
+earlier claim is the point: "we checked" is not the same claim as "it held".
 
 ## Ruled out
 

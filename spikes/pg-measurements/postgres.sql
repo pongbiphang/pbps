@@ -1014,6 +1014,66 @@ SELECT 'R81', 'the same literal under Australia',
        ('12:00 CST'::timetz)::text || ' — timetz belongs on the offline refusal list too';
 RESET timezone_abbreviations; RESET TimeZone;
 
+-- -------------------------- the thirty-fourth 2026-09-05 review round
+
+-- A module is not the only thing the write path binds: a generated column is
+-- parsed at creation too, and keeps what it resolved against.
+CREATE SCHEMA uu_a; CREATE SCHEMA uu_b;
+CREATE FUNCTION uu_a.tag(v int) RETURNS text AS $$SELECT 'uu_a row ' || v$$ LANGUAGE sql IMMUTABLE;
+CREATE FUNCTION uu_b.tag(v int) RETURNS text AS $$SELECT 'uu_b row ' || v$$ LANGUAGE sql IMMUTABLE;
+SET search_path = m, uu_a, uu_b;
+CREATE TABLE m.gen (v int, g text GENERATED ALWAYS AS (tag(v)) STORED);
+INSERT INTO m.gen VALUES (1);
+SELECT 'R82', 'a generated column created under extras (uu_a, uu_b)',
+       (SELECT g FROM m.gen WHERE v = 1);
+SET search_path = m, uu_b, uu_a;
+INSERT INTO m.gen VALUES (2);
+SELECT 'R83', 'a new row in the same table after reordering to (uu_b, uu_a)',
+       (SELECT g FROM m.gen WHERE v = 2);
+CREATE TABLE m.gen2 (v int, g text GENERATED ALWAYS AS (tag(v)) STORED);
+INSERT INTO m.gen2 VALUES (1);
+SELECT 'R84', 'a bootstrap of the same declaration under the new order',
+       (SELECT g FROM m.gen2 WHERE v = 1);
+SET search_path = m;
+DROP SCHEMA uu_a CASCADE; DROP SCHEMA uu_b CASCADE;
+
+-- Writes take no settings scope, so the rendering itself has to be
+-- setting-independent. A plain literal is not; an E-string is.
+CREATE TABLE m.bs (t text);
+SET standard_conforming_strings = on;
+INSERT INTO m.bs VALUES ('a\nb');
+SELECT 'R85', 'a rendered text value containing a backslash, under on',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+SET standard_conforming_strings = off;
+INSERT INTO m.bs VALUES ('a\nb');
+SELECT 'R86', 'the same rendered INSERT under off',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+INSERT INTO m.bs VALUES (E'a\\nb');
+SELECT 'R87', 'the E-string form instead, under off',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+RESET standard_conforming_strings;
+INSERT INTO m.bs VALUES (E'a\\nb');
+SELECT 'R88', 'the same E-string under on',
+       'length ' || length((SELECT t FROM m.bs))::text;
+
+-- bytea's canonical hex output starts with a backslash, so it has the same
+-- dependency -- and this one is accepted rather than refused.
+CREATE TABLE m.by (b bytea);
+SET standard_conforming_strings = off;
+-- Two statements, not one: a subquery beside the EXECUTE reads a snapshot
+-- older than the row m.accepts() just wrote.
+SELECT m.accepts('INSERT INTO m.by VALUES (''\x0102''::bytea)') AS r \gset
+SELECT 'R89', 'a two-byte bytea rendered in canonical hex, under off',
+       :'r' || ', storing ' || (SELECT coalesce(sum(length(b))::text, '0') FROM m.by) || ' byte(s)';
+DELETE FROM m.by;
+SELECT m.accepts('INSERT INTO m.by VALUES (decode(''0102'', ''hex''))') AS r \gset
+SELECT 'R90', 'the decode() form instead, under off',
+       :'r' || ', storing ' || (SELECT coalesce(sum(length(b))::text, '0') FROM m.by) || ' byte(s)';
+RESET standard_conforming_strings;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
