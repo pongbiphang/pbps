@@ -3352,6 +3352,90 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("and without the trigger the same insert goes in");
     db.conn.execute(&sql).await.expect("the ordinary case");
 
+    // A rewrite the column's own collation calls equal — the test database
+    // is case-insensitive — is still a rewrite: the row is held by the
+    // rendering that reads it back, under a binary collation, for a spelled
+    // cell and for a defaulted one alike (DECISIONS 137).
+    let collation: String = db
+        .conn
+        .query("SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'));")
+        .await
+        .expect("collation")[0]
+        .try_get_at::<&str>(0)
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert!(
+        collation.contains("_CI_"),
+        "this case needs a case-insensitive database; got {collation}"
+    );
+    let spelled = pbps_model::Change::InsertRow {
+        table: table.clone(),
+        key_column: "code".to_owned(),
+        identity_key: false,
+        key: RowKey::from("sixth"),
+        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+            .into_iter()
+            .collect(),
+        types: [
+            ("label".to_owned(), ty("nvarchar(50)")),
+            ("note".to_owned(), ty("nvarchar(50)")),
+            ("memo".to_owned(), ty("nvarchar(50)")),
+        ]
+        .into_iter()
+        .collect(),
+        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    };
+    let sql = sql_of(&spelled);
+    for (trigger, why) in [
+        (
+            "CREATE TRIGGER dbo.fold_label ON dbo.status AFTER INSERT AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET label = LOWER(label)\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+            "a spelled cell rewritten in case alone",
+        ),
+        (
+            "CREATE TRIGGER dbo.fold_note ON dbo.status AFTER INSERT AS\n\
+             BEGIN\n\
+               SET NOCOUNT ON;\n\
+               UPDATE dbo.status SET note = UPPER(note)\n\
+                WHERE code IN (SELECT code FROM inserted);\n\
+             END;",
+            "a defaulted cell rewritten in case alone",
+        ),
+    ] {
+        db.conn.execute(trigger).await.expect(why);
+        let err = db
+            .conn
+            .execute(&sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{why} was taken for the plan's own:\n{sql}"));
+        assert!(
+            err.to_string().contains("is not what this plan wrote"),
+            "{why}: {err}"
+        );
+        assert_eq!(
+            label_of("sixth").await,
+            None,
+            "{why}: the insert rolled back"
+        );
+        let name = trigger.split_whitespace().nth(2).unwrap();
+        db.conn
+            .execute(&format!("DROP TRIGGER {name};"))
+            .await
+            .expect("take the folding trigger off");
+    }
+    db.conn
+        .execute(&sql)
+        .await
+        .expect("and without a trigger the same insert goes in");
+
     // An update is held to the cells it leaves alone as well, before and
     // after: a trigger rewriting `note`, which the update never sets, and a
     // hand edit to `memo` since the plan was made are both refused

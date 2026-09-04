@@ -323,16 +323,19 @@ pub enum Change {
         /// an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         defaults: BTreeMap<String, String>,
-        /// The type of every column the row omits, the key and an `IDENTITY`
-        /// column aside — the columns in `defaults`, and the ones the table
-        /// gives no default, which the insert leaves at NULL. Carried for the
-        /// same reason `UpdateRow` carries one: the emitter holds the row to
-        /// what it wrote, and a column left to a *constant* default is
-        /// checked by comparing it against that default — which needs the
-        /// type to know the comparison is one the engine allows at all
-        /// (DECISIONS 133) — while a column left to nothing is held to NULL
-        /// (136). Absent from older plans, which is an empty map and holds
-        /// nothing here.
+        /// The type of every non-key column the table has, an `IDENTITY`
+        /// column aside: the ones the row spells, the columns in `defaults`,
+        /// and the ones the table gives no default, which the insert leaves
+        /// at NULL. Carried for the same reason `UpdateRow` carries one: the
+        /// emitter holds the row to what it wrote, by the rendering that
+        /// reads each cell back and under a binary collation, so a rewrite
+        /// the column's own collation would call equal is still a rewrite
+        /// (DECISIONS 137); a column left to a *constant* default is checked
+        /// against that default the same way — which needs the type to know
+        /// the comparison is one the engine allows at all (133) — and a
+        /// column left to nothing is held to NULL (136). Absent from older
+        /// plans, which is an empty map: a spelled cell is then compared as
+        /// the engine compares, and the rest holds nothing.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         types: BTreeMap<String, ColumnType>,
     },

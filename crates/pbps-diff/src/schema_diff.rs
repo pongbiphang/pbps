@@ -1055,15 +1055,20 @@ fn order_key(c: &Change) -> u8 {
 /// key aside, that the table gives a default. An `IDENTITY` column is the
 /// engine's own and never one of these (DECISIONS 94, 117).
 ///
-/// The types cover every omitted column, defaulted or not: a column the
-/// table gives no default is left at NULL, and the emitter holds the row to
-/// that as it holds a defaulted column to its default (DECISIONS 136).
+/// The types cover every non-key column, spelled or omitted: a spelled cell
+/// is held by the rendering that reads it back (DECISIONS 137), a defaulted
+/// one to its default (133), and a column the table gives no default is
+/// left at NULL and held to that (136). An `IDENTITY` column is none of
+/// these.
 fn omitted_defaults(
     table: &Table,
     key_column: &str,
     row: &pbps_model::Row,
 ) -> (BTreeMap<String, String>, BTreeMap<String, ColumnType>) {
-    let types = omitted_columns(table, key_column, row)
+    let types = table
+        .columns
+        .iter()
+        .filter(|(c, spec)| c.as_str() != key_column && spec.identity.is_none())
         .map(|(c, spec)| (c.clone(), spec.ty.clone()))
         .collect();
     let defaults = omitted_columns(table, key_column, row)
@@ -1120,13 +1125,18 @@ mod tests {
             defaults.into_iter().collect::<Vec<_>>(),
             [("status_code".to_owned(), "('old')".to_owned())]
         );
-        // And the type of every omitted column, so the emitter can hold the
-        // row to the default it left the column at (DECISIONS 133) — or to
-        // NULL, where the table gives none (136). Not the key, not the
-        // spelled column, not the identity column.
+        // And the type of every non-key column, so the emitter can hold the
+        // row to the default it left a column at (DECISIONS 133), to NULL
+        // where the table gives none (136), and to a spelled cell by the
+        // rendering that reads it back (137). Not the key, not the identity
+        // column.
         assert_eq!(
             types.keys().collect::<Vec<_>>(),
-            [&"rank".to_owned(), &"status_code".to_owned()]
+            [
+                &"label".to_owned(),
+                &"rank".to_owned(),
+                &"status_code".to_owned()
+            ]
         );
     }
     use super::*;

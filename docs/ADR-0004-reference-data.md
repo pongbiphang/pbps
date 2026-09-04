@@ -263,8 +263,10 @@ Decisions taken during implementation that this document did not anticipate:
    or for a delete is still gone — over the cells the plan spells (132), the
    columns it leaves to a constant default (133), the columns it leaves to
    nothing, held to NULL, and the cells an `UPDATE` does not restate, which
-   `UpdateRow` carries as `unchanged` beside its changed columns (136). A
-   default the engine would have to run is not asked about.
+   `UpdateRow` carries as `unchanged` beside its changed columns (136) —
+   every cell by the rendering that reads it back, under a binary collation,
+   so a rewrite the column's collation would call equal is still one (137).
+   A default the engine would have to run is not asked about.
 
 The live tests cover the whole path: the DML (`reference_data_reaches_the_engine_in_an_order_it_accepts`),
 the read-back, the drift on rows, the `ensure` read staying inside its keys,

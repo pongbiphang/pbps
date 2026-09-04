@@ -1272,3 +1272,18 @@ SPEC is in sync with all of these.
     compared equal — and holding it to NULL would have refused every update
     on the table, since the engine assigned it. The live round-trip caught
     this before the unit tests did: the fixture table has one.
+137. **A row write holds its cells by the rendering that reads them back,
+    under a binary collation — an insert as an update.** 132 held an insert
+    to its spelled cells with the engine's own `=`, which is the column's
+    collation: a trigger folding `New` to `new` on a case-insensitive column,
+    or adding a trailing space, was equal to it, and the read-back then
+    recorded the rewrite as the plan's own — while an update had compared by
+    `read_expr` under `Latin1_General_BIN2` since 122. `InsertRow.types` now
+    names every non-key column, spelled ones included, and the insert's
+    postcondition goes through the same comparison the update's does. A
+    default is compared the same way, on both sides: the default converted
+    to the column's type and then rendered as the column is, so a
+    `'2026-01-01'` default on a `datetime2` column renders as the stored
+    value does and the comparison stays about the value, not about how two
+    types spell it. An older plan carries no type for a spelled cell and
+    compares as it did.

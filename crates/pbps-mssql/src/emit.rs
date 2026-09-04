@@ -529,15 +529,21 @@ fn insert_row(
         columns.push(quote(column)?);
         values.push(value_literal(v));
     }
-    // What the row must hold afterwards, by the same literals the insert
-    // writes: a trigger that deleted it again, or wrote something else,
-    // would otherwise be read back and recorded as the plan's own result
-    // (`wrote_the_row`).
+    // What the row must hold afterwards: a trigger that deleted it again,
+    // or wrote something else, would otherwise be read back and recorded as
+    // the plan's own result (`wrote_the_row`). Each cell by the rendering
+    // that reads it back, under a binary collation, as an update holds its
+    // cells — the column's own collation would call `New` and `new` equal,
+    // and a trailing space nothing, and the read-back would then record the
+    // rewrite (DECISIONS 137). A plan made before the types travelled
+    // compares as the engine compares, which is the check it always had.
     let mut cells = Vec::new();
     for (column, v) in row.columns() {
-        cells.push(match v {
-            Value::Null => format!("{} IS NULL", quote(column)?),
-            v @ (Value::Bool(_) | Value::Int(_) | Value::Text(_)) => {
+        let held = recorded_cell(column, &Cell::Value(v.clone()), types.get(column))?;
+        cells.push(match (held, v) {
+            (Some(held), _) => held,
+            (None, Value::Null) => format!("{} IS NULL", quote(column)?),
+            (None, v @ (Value::Bool(_) | Value::Int(_) | Value::Text(_))) => {
                 format!("{} = {}", quote(column)?, value_literal(v))
             }
         });
@@ -548,9 +554,13 @@ fn insert_row(
     // the insert left there (DECISIONS 133, 136). Anything the engine would
     // have to run to answer — `NEWID()`, `NEXT VALUE FOR` — is not asked: it
     // has no value before it runs, and asking would consume a sequence
-    // value. `types` names every omitted column; a plan made before it
-    // travelled names none, and holds nothing here.
+    // value. `types` names every non-key column, the spelled ones held
+    // above; a plan made before it travelled names none, and holds nothing
+    // here.
     for (column, ty) in types {
+        if row.get(column).is_some() {
+            continue;
+        }
         cells.extend(match defaults.get(column) {
             Some(default) => defaulted_cell(column, default, Some(ty))?,
             None => Some(format!("{} IS NULL", quote(column)?)),
@@ -752,6 +762,12 @@ fn atomically(body: &str) -> String {
 /// the spatial types have no `=`, and asking for one is an error rather than
 /// a false answer. A plan made before the types travelled carries none, and
 /// checks nothing here — the same as an older plan's `UpdateRow`.
+///
+/// Both sides are rendered as the read-back renders the column, and compared
+/// under a binary collation: the default is first converted to the column's
+/// type, so a `'2026-01-01'` default on a `datetime2` column renders as the
+/// stored value does, and then `New` against `new` is a difference the
+/// column's own collation would have hidden (DECISIONS 137).
 fn defaulted_cell(
     column: &str,
     default: &str,
@@ -761,14 +777,16 @@ fn defaulted_cell(
     let Some(ty) = ty else {
         return Ok(None);
     };
-    let base = crate::types::normalize(ty).map_or_else(|_| ty.base.clone(), |t| t.base);
-    if !crate::rows::comparable(&base) || !crate::rows::is_constant(default) {
+    let ty = crate::types::normalize(ty).unwrap_or_else(|_| ty.clone());
+    if !crate::rows::comparable(&ty.base) || !crate::rows::is_constant(default) {
         return Ok(None);
     }
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
-        "({quoted} = ({default}) OR ({quoted} IS NULL AND ({default}) IS NULL))"
+        "({} = {} COLLATE Latin1_General_BIN2 OR ({quoted} IS NULL AND ({default}) IS NULL))",
+        crate::rows::read_expr(&quoted, &ty.base),
+        crate::rows::read_expr(&format!("CONVERT({ty}, {default})"), &ty.base),
     )))
 }
 
@@ -1725,6 +1743,10 @@ mod tests {
             .into_iter()
             .collect(),
             types: [
+                // Spelled: held by the rendering that reads it back, under a
+                // binary collation, so a rewrite the column's collation calls
+                // equal is still a rewrite (DECISIONS 137).
+                ("label", "nvarchar(50)"),
                 ("sort", "int"),
                 ("note", "nvarchar(50)"),
                 ("seq", "int"),
@@ -1742,15 +1764,26 @@ mod tests {
         });
         let sql = &sql[0];
         for held in [
-            "[label] = N'New'",
-            "([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
-            "([note] = ((NULL)) OR ([note] IS NULL AND ((NULL)) IS NULL))",
+            "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
+            // A constant default: both sides rendered as the read-back
+            // renders the column, the default converted to its type first.
+            "(CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
+            "(CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), CONVERT(nvarchar(50), (NULL))) COLLATE Latin1_General_BIN2 OR ([note] IS NULL AND ((NULL)) IS NULL))",
             " AND [rank] IS NULL",
             " AND [body] IS NULL",
         ] {
             assert!(sql.contains(held), "{held}\n{sql}");
         }
-        for absent in ["[seq]", "[stamp]", "[doc]", "[old]"] {
+        // A spelled column is held once, to what was spelled — never also
+        // to NULL as a column the row left out.
+        for absent in [
+            "[seq]",
+            "[stamp]",
+            "[doc]",
+            "[old]",
+            "[label] = N'New'",
+            "[label] IS NULL",
+        ] {
             assert!(!sql.contains(absent), "{absent}\n{sql}");
         }
         // And the insert itself names only what the row spells.
@@ -1971,7 +2004,7 @@ mod tests {
             " AND CONVERT(nvarchar(max), [since], 126) = N'2026-09-03' COLLATE Latin1_General_BIN2",
             " AND CONVERT(nvarchar(max), [flag]) = N'1' COLLATE Latin1_General_BIN2",
             " AND [rank] IS NULL",
-            " AND ([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
+            " AND (CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
         ] {
             assert!(update.contains(held), "{held}\n{update}");
         }
@@ -2034,7 +2067,7 @@ mod tests {
         for held in [
             " AND CONVERT(nvarchar(max), [note]) = N'kept' COLLATE Latin1_General_BIN2",
             " AND [rank] IS NULL",
-            " AND ([sort] = (((0))) OR ([sort] IS NULL AND (((0))) IS NULL))",
+            " AND (CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
         ] {
             assert!(update.contains(held), "{held}\n{update}");
             assert!(wrote.contains(held), "{held}\n{wrote}");
