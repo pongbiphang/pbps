@@ -378,8 +378,44 @@ SELECT 'R15', 'the lock held once the RESTART runs',
        || ' — taken too late to close the window';
 COMMIT;
 
+-- -------------------------------------- the fifth 2026-09-05 review round
+
+CREATE TABLE m.opt_t (id int PRIMARY KEY, a text);
+CREATE VIEW m.opt_v WITH (security_invoker = true, security_barrier = true)
+  AS SELECT id, a FROM m.opt_t;
+SELECT 'A28', 'options a view carries outside its definition',
+       'reloptions: ' || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL')
+       || ' / pg_get_viewdef shows: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.opt_v'::regclass, true), E'[\n ]+', ' ', 'g'));
+SELECT m.accepts('CREATE OR REPLACE VIEW m.opt_v AS SELECT id, a, id AS also FROM m.opt_t') \gset a29_
+SELECT 'A29', 'those options after CREATE OR REPLACE',
+       :'a29_accepts' || ', reloptions: '
+       || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL — lost');
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v AS SELECT id, a FROM m.opt_t;
+SELECT 'A30', 'those options after a drop-and-create rebuild',
+       'reloptions: '
+       || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL — lost');
+
+-- What losing security_invoker actually does to a reader with no rights on the
+-- underlying table.
+CREATE ROLE m_sreader;
+GRANT USAGE ON SCHEMA m TO m_sreader;
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v WITH (security_invoker = true) AS SELECT id, a FROM m.opt_t;
+GRANT SELECT ON m.opt_v TO m_sreader;
+SELECT 'A31', 'a reader querying the view while security_invoker=true',
+       m.accepts('SET ROLE m_sreader; SELECT * FROM m.opt_v; RESET ROLE');
+RESET ROLE;
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v AS SELECT id, a FROM m.opt_t;   -- the rebuild pbps would emit
+GRANT SELECT ON m.opt_v TO m_sreader;
+SELECT 'A32', 'the same reader after a rebuild dropped the option',
+       m.accepts('SET ROLE m_sreader; SELECT * FROM m.opt_v; RESET ROLE');
+RESET ROLE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
-DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner;
-DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader;

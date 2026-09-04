@@ -403,6 +403,56 @@ A `SECURITY DEFINER` module whose owner cannot be preserved is the one case
 where refusing is not merely conservative but the only defensible answer: the
 alternative is a silent privilege escalation that verifies clean.
 
+### And a view carries options that neither the definition nor the ACL holds
+
+Ownership is not the last of them. A view's `security_invoker`,
+`security_barrier` and `check_option` live in `pg_class.reloptions`, and
+`Module::definition` starts after `AS` (ADR-0002), so **measured**, the
+definition cannot show them:
+
+```
+reloptions: security_invoker=true, security_barrier=true
+pg_get_viewdef shows: SELECT id, a FROM opt_t;
+```
+
+**And this one is not confined to the rebuild path.** `CREATE OR REPLACE VIEW`
+— the cheap, grant-preserving path this ADR has been treating as the safe one —
+drops them too:
+
+```
+after CREATE OR REPLACE:   reloptions: NULL — lost
+after drop-and-create:     reloptions: NULL — lost
+```
+
+What that costs, measured end to end with a reader holding `SELECT` on the view
+and nothing on the table beneath it:
+
+```
+while security_invoker=true:            refused: permission denied for table opt_t
+after a rebuild dropped the option:     accepted
+```
+
+The view stops running with the querier's privileges and starts running with its
+owner's, so it hands out rows the reader was previously refused. Nothing
+compares `reloptions`, so `verify` stays clean and no line of the plan mentions
+it.
+
+**Decision.** The connected plan reads `reloptions` alongside the ACL and the
+owner, and re-emits them verbatim in the `WITH (…)` clause of whichever
+statement it writes — replace or create — so the option survives and the plan
+shows it. Where it cannot, it refuses. The option is also reported as
+**unexpressible**, down ADR-0005's existing path: the declarations cannot say
+`security_invoker`, so `pull` and `status` name it rather than implying the
+model covers it.
+
+Preserving something the declarations cannot express is a smaller wrong than
+destroying it, and it is the same trade as `ALTER … OWNER TO` above: pbps is
+carrying the environment's own state across a statement it had to write, not
+inventing a state nobody asked for. **The real fix is a model that can hold view
+options**, and until it exists this sits beside `PUBLIC`
+([ADR-0010](ADR-0010-postgres-privileges.md) §5) as a named gap rather than a
+solved problem.
+
 ### How the plan knows a rebuild is needed
 
 The paragraph above conditions drop + create on "what `CREATE OR REPLACE`
@@ -559,6 +609,12 @@ never moved.
   not to modules.
 - **The deparser-version hazard (§2.3) is unmeasured** and needs two engine
   versions in the live suite.
+- **The model cannot hold a view's options** (§3) — `security_invoker`,
+  `security_barrier`, `check_option`. They are preserved verbatim across the
+  statements pbps writes and reported as unexpressible, which keeps them from
+  being destroyed but not from being changed behind the tool's back. This and
+  `PUBLIC` ([ADR-0010](ADR-0010-postgres-privileges.md) §5) are the two places
+  where PostgreSQL holds security-relevant state the declarations cannot say.
 - **Everything here is proposed.** No PostgreSQL dialect exists; this document
   is a set of decisions taken in advance so that the emitter has something to be
   written against, and each is falsifiable by the live suite that must come with
