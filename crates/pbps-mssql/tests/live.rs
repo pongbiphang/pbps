@@ -5612,3 +5612,100 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
 
     db.drop().await;
 }
+
+/// A managed role granted on more tables than one statement can name. At
+/// two bound slots per object, about a thousand objects crossed the
+/// server's 2,100-parameter limit and the whole permission read failed, so
+/// `doctor` reported `permission.unknown` for an estate it could have
+/// checked. Asked in chunks, every table comes back, none twice, and `sa`
+/// holds `CONTROL` on all of them.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() {
+    let mut db = TestDb::create("doctorchunk").await;
+    const TABLES: usize = 1_100;
+    // One batch per hundred tables: a single batch of 1,100 statements is
+    // slow to parse and says nothing the smaller ones do not.
+    for start in (0..TABLES).step_by(100) {
+        let mut batch = String::new();
+        for i in start..(start + 100).min(TABLES) {
+            batch.push_str(&format!(
+                "CREATE TABLE dbo.[many_{i}] (id int NOT NULL PRIMARY KEY); "
+            ));
+        }
+        db.conn.execute(&batch).await.expect("create tables");
+    }
+    let objects: Vec<pbps_model::ObjectName> = (0..TABLES)
+        .map(|i| pbps_model::ObjectName::new("dbo", format!("many_{i}")))
+        .collect();
+    let targets = pbps_mssql::doctor::GrantTargets {
+        objects: objects.clone(),
+        schemas: vec![],
+        roles: vec![],
+    };
+    let held =
+        pbps_mssql::doctor::permissions(&mut db.conn, &["dbo".to_owned()], &objects, &targets)
+            .await
+            .expect("a list past one statement's worth of parameters must still be read");
+
+    assert_eq!(
+        held.granted_objects.len(),
+        TABLES,
+        "every declared target is asked about"
+    );
+    assert_eq!(
+        held.referenced_objects.len(),
+        TABLES,
+        "and every referenced one"
+    );
+    for o in &objects {
+        assert!(
+            held.granted_objects[o].contains("CONTROL"),
+            "`sa` holds CONTROL on {o}: {:?}",
+            held.granted_objects[o]
+        );
+    }
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| matches!(g.securable, pbps_mssql::doctor::Securable::Object(_))),
+        "no gap on an object `sa` holds everything on: {gaps:?}"
+    );
+
+    db.drop().await;
+}
+
+/// Where the parameter limit really sits, measured. The server says 2,100;
+/// a statement bound through `sp_executesql` spends two of those on its own
+/// `@stmt` and `@params`, so the last count a query may bind is 2,098.
+/// `doctor::MAX_PARAMETERS` cites this test.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_query_may_bind_two_fewer_parameters_than_the_server_names() {
+    let mut db = TestDb::create("paramlimit").await;
+    let probe = |n: usize| {
+        let slots: Vec<String> = (1..=n).map(|i| format!("(@P{i})")).collect();
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM (VALUES {}) AS v(x);",
+            slots.join(", ")
+        );
+        let params: Vec<pbps_db::Param<'static>> =
+            (0..n).map(|_| pbps_db::Param::from("x")).collect();
+        (sql, params)
+    };
+    let (sql, params) = probe(2098);
+    db.conn
+        .query_with(&sql, &params)
+        .await
+        .expect("2,098 bound parameters are accepted");
+    let (sql, params) = probe(2099);
+    let err = db
+        .conn
+        .query_with(&sql, &params)
+        .await
+        .err()
+        .expect("2,099 are refused");
+    assert!(format!("{err}").contains("2100"), "{err}");
+    db.drop().await;
+}
