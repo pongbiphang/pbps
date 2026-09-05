@@ -969,6 +969,47 @@ fn an_offline_plan_spells_a_routine_the_same_way_on_both_sides() {
     );
 }
 
+/// The routine-identity pass re-keys a role's grants too, and two targets
+/// that spell one routine are a collision to report, not a map entry to
+/// overwrite: kept silently, the later permission set would replace the
+/// earlier one, and the next plan would revoke what the declaration grants.
+#[test]
+fn two_grant_targets_that_spell_one_routine_are_a_collision() {
+    let d = Demo::new("validate-grant-spelling");
+    std::fs::write(
+        d.dir.join("schema/app.role.yml"),
+        "role: app\ngrants:\n  dbo.f(int): [execute]\n  dbo.f(integer): [execute]\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("role app"), "{err}");
+    assert!(
+        err.contains("`dbo.f(int)`") && err.contains("`dbo.f(integer)`"),
+        "{err}"
+    );
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        stdout(&o).contains("schema.name-collision"),
+        "{}",
+        stdout(&o)
+    );
+
+    // One spelling is one grant, whatever it is spelled as.
+    std::fs::write(
+        d.dir.join("schema/app.role.yml"),
+        "role: app\ngrants:\n  dbo.f(int): [execute]\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        !stdout(&o).contains("schema.name-collision"),
+        "{}",
+        stdout(&o)
+    );
+}
+
 #[test]
 fn validate_rejects_what_the_engine_would_refuse() {
     let d = Demo::new("validate-dialect");

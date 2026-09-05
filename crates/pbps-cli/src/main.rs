@@ -1354,31 +1354,51 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
         .iter()
         .map(|(id, on)| (spell(id), on.iter().map(&spell).collect()))
         .collect();
-    for role in schema.roles.values_mut() {
-        role.grants = role
-            .grants
-            .iter()
-            .map(|(target, permissions)| {
-                let target = match target {
-                    pbps_model::GrantTarget::Routine(r) => {
-                        match spell(&pbps_model::ModuleId::Routine(r.clone())) {
-                            pbps_model::ModuleId::Routine(spelled) => {
-                                pbps_model::GrantTarget::Routine(spelled)
-                            }
-                            // `spell` maps a routine to a routine; the other
-                            // arms are unreachable rather than meaningful.
-                            other @ (pbps_model::ModuleId::Named(_)
-                            | pbps_model::ModuleId::Trigger { .. }) => {
-                                pbps_model::GrantTarget::Object(other.object_name())
-                            }
+    for (name, role) in schema.roles.iter_mut() {
+        // Two targets that spell one routine are reported, as two modules
+        // are: a map that kept the later permission set would drop the
+        // earlier one, and the next plan would revoke what the declaration
+        // grants. Both spellings are named, since "one of these" is not a
+        // finding anyone can act on.
+        let mut grants: std::collections::BTreeMap<
+            pbps_model::GrantTarget,
+            std::collections::BTreeSet<pbps_model::Permission>,
+        > = std::collections::BTreeMap::new();
+        let mut spelled_from: std::collections::BTreeMap<
+            pbps_model::GrantTarget,
+            &pbps_model::GrantTarget,
+        > = std::collections::BTreeMap::new();
+        for (target, permissions) in &role.grants {
+            let spelled = match target {
+                pbps_model::GrantTarget::Routine(r) => {
+                    match spell(&pbps_model::ModuleId::Routine(r.clone())) {
+                        pbps_model::ModuleId::Routine(spelled) => {
+                            pbps_model::GrantTarget::Routine(spelled)
+                        }
+                        // `spell` maps a routine to a routine; the other
+                        // arms are unreachable rather than meaningful.
+                        other @ (pbps_model::ModuleId::Named(_)
+                        | pbps_model::ModuleId::Trigger { .. }) => {
+                            pbps_model::GrantTarget::Object(other.object_name())
                         }
                     }
-                    other @ (pbps_model::GrantTarget::Object(_)
-                    | pbps_model::GrantTarget::Schema(_)) => other.clone(),
-                };
-                (target, permissions.clone())
-            })
-            .collect();
+                }
+                other @ (pbps_model::GrantTarget::Object(_)
+                | pbps_model::GrantTarget::Schema(_)) => other.clone(),
+            };
+            if let Some(first) = spelled_from.get(&spelled) {
+                problems.push(format!(
+                    "role {name}: `{first}` and `{target}` are one object to {}, which identifies \
+                     a routine by argument type and discards the modifiers: both are `{spelled}`; \
+                     grant it once",
+                    dialect.name()
+                ));
+                continue;
+            }
+            spelled_from.insert(spelled.clone(), target);
+            grants.insert(spelled, permissions.clone());
+        }
+        role.grants = grants;
     }
     problems
 }

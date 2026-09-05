@@ -2930,4 +2930,8 @@ SPEC is in sync with all of these.
     cannot carry is, because a quiet refusal at the snapshot would leave the
     next plan proposing its destruction. Not in `ObjectName::new`: engine
     names arrive there for tables too, whose string form has the same
-    property and is out of this change's scope.
+    property and is out of this change's scope. The same check guards a
+    grant target read back from the catalog: `GrantTarget::Object` on
+    `[dbo].[sales(archive)]` would be read back as a grant on a routine, so
+    the permission is reported as unexpressible, without a target, because
+    the target is exactly what cannot be spelled.

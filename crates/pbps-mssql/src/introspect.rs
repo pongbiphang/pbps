@@ -875,6 +875,32 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 continue;
             }
         };
+        // The target crosses a snapshot as its string form, in which `(`
+        // opens a routine signature; a legal quoted object name may contain
+        // one, and `dbo.sales(archive)` would be read back as a grant on a
+        // routine (DECISIONS 202). Reported without a target, because the
+        // target is exactly what cannot be spelled.
+        if target
+            .to_string()
+            .parse::<pbps_model::GrantTarget>()
+            .as_ref()
+            != Ok(&target)
+        {
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: None,
+                what: format!(
+                    "role {}: {} on [{}].[{}] is on an object whose name contains a period or a \
+                     parenthesis, which a declaration cannot spell; the declarations cannot \
+                     express it",
+                    p.role,
+                    p.permission,
+                    p.schema,
+                    p.object.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
         // Every permission the model cannot hold is left out of the role's
         // set *and* reported as unexpressible, never as a warning alone: a
         // managed role that gained a column-level grant, a DENY, a CONTROL
@@ -1103,6 +1129,50 @@ mod tests {
         assert!(
             p.unexpressible[0].what.contains("dbo.order_seq")
                 && p.unexpressible[0].what.contains("does not model"),
+            "{:?}",
+            p.unexpressible
+        );
+    }
+
+    /// A grant target's string form gives `(` a meaning, and a legal quoted
+    /// object name may contain one: read back, `dbo.sales(archive)` would be
+    /// a grant on a routine, not on the table it was granted on (DECISIONS
+    /// 202). Reported, and left out of the set.
+    #[test]
+    fn a_grant_on_an_object_whose_name_cannot_be_spelled_is_unexpressible() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |object: &str| RawPermission {
+            role: "app_reader".into(),
+            class: 1,
+            class_desc: "OBJECT_OR_COLUMN".into(),
+            permission: "SELECT".into(),
+            state: "G".into(),
+            schema: "dbo".into(),
+            object: Some(object.to_owned()),
+            minor_id: 0,
+        };
+        raw.permissions.push(grant("customer"));
+        raw.permissions.push(grant("sales(archive)"));
+        raw.permissions.push(grant("audit.v1"));
+        let p = assemble(&raw);
+        let targets: Vec<String> = p.schema.roles["app_reader"]
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(targets, ["dbo.customer"], "{:?}", p.unexpressible);
+        assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
+        for u in &p.unexpressible {
+            assert_eq!(u.role, "app_reader");
+            assert!(u.target.is_none(), "{u:?}");
+            assert!(u.what.contains("period or a parenthesis"), "{u:?}");
+        }
+        assert!(
+            p.unexpressible[0].what.contains("[dbo].[sales(archive)]")
+                || p.unexpressible[1].what.contains("[dbo].[sales(archive)]"),
             "{:?}",
             p.unexpressible
         );
