@@ -180,7 +180,14 @@ output spells it (`rename dbo.customer.customer_name full_name`), and passed
 with `-m` because a commit with no message opens an editor, which a
 subprocess with no terminal cannot answer — **measured**: with no editor
 variable set and no terminal, `git commit --only -- a` exited non-zero
-without committing, and the same command with `-m` committed. `--only` takes
+without committing, and the same command with `-m` committed. The commit is
+signed exactly when the shell's would be: the UI passes no `-S` and sets no
+`commit.gpgSign`, since a commit the UI signs differently from the shell is
+the very difference an auditor asks about, and a forced signature fails on a
+machine without a key. The page reads `git log -1 --format=%G? <oid>` and
+shows whether the commit is signed — ADR-0006's "signed commit" is the
+organization's signing policy applied by the user's own configuration, not a
+guarantee this UI adds. `--only` takes
 the named paths from the working tree and leaves whatever the index already
 held staged and uncommitted; the preview the page shows first is `git diff
 HEAD -- <paths>`, which is exactly that content. Every `git` the UI runs
