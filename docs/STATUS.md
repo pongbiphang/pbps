@@ -6,8 +6,10 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
-**Phases 0-3.5 and 3.1 complete** for SQL Server. The test and clippy bar is in
-CLAUDE.md's "Development environment"; counts change too often to record here.
+**Phases 0-4 complete** (0, 1, 2, 3, 3.1, 3.5 and 4) for SQL Server. The test
+and clippy bar is in CLAUDE.md's "Development environment"; counts change too
+often to record here. The copy-pastable pipelines SPEC 14.1 lists as P1 are in
+[CI.md](CI.md).
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
@@ -148,11 +150,25 @@ engine still cannot express an organization's own rules. The reasoning is in
 SPEC 12 and open question 9.
 
 **Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
-abstraction; two collisions are already known to be waiting — PostgreSQL
-identifies a function by name **plus argument types**, so "the name is the
-identity" needs revisiting (ADR-0002), and default and schema privileges do the
-same to ADR-0005. Deferring the dialect does not defer the abstraction: PG stays
-the test applied to every model decision.
+abstraction. Its design is recorded, grounded in measurements taken on a real
+PostgreSQL before any dialect code exists — each ADR's "Limits" section names
+what was not measured, and the PostgreSQL live suite is Phase 5's first
+deliverable:
+[ADR-0009](ADR-0009-postgres-modules.md) (modules — overloading makes the
+identity name plus argument types, which ADR-0002 anticipated),
+[ADR-0010](ADR-0010-postgres-privileges.md) (privileges — the role is not the
+portable unit, the collision ADR-0005 recorded),
+[ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) (the dialect seam:
+what Phase 0 got right, and three amendments),
+[ADR-0012](ADR-0012-postgres-type-catalogue.md) (the type catalogue, and why
+"safe" and "cheap" are different axes),
+[ADR-0013](ADR-0013-postgres-reference-data.md) (reference data — the
+collision ADR-0004 never recorded) and
+[ADR-0014](ADR-0014-driver-seam-tested.md) (what a second driver costs
+`pbps-db`, measured with a spike). Each ADR's "Placement" section says what
+lands with the first PostgreSQL commits and what must land before them; the
+model changes come first, because format is the most expensive thing here to
+change late.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI
