@@ -74,8 +74,11 @@ checksum-pinned, and state lives in the database itself.
 - A P1 in that review: the count resets — back to the loop, as a draft again.
 - No P1: start CI on the PR head, `gh workflow run ci.yml --ref <branch>`, and
   wait for it. CI runs only when started; a push clears the checks.
-- `master` moved before the merge: rebase and start CI again. A rebase that
-  needed conflict resolution goes back to the loop as a draft.
+- `master` moved before the merge: rebase, push the rebased head
+  (`git push --force-with-lease`), and only then start CI again — `gh workflow
+  run --ref` resolves the *remote* branch, so a run dispatched before the push
+  tests the head you just replaced. A rebase that needed conflict resolution
+  goes back to the loop as a draft.
 - Red CI: fix it, push, back to the loop as a draft.
 - Green CI: merge with a merge commit (`gh pr merge --merge`), delete the
   branch, remove the worktree.
@@ -87,7 +90,11 @@ checksum-pinned, and state lives in the database itself.
 ## The issue loop
 
 - One issue at a time. Claim the next only after the current PR is merged.
-- Nothing runs on `master` after a merge: the merged tree is the one CI passed.
+- `ci.yml` runs nothing on `master` after a merge: the merged tree is the one
+  CI passed. The dependency audit is separate and does run on `master` when the
+  merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow —
+  wait for it in that case, and a red audit is the next task, not the next
+  issue.
 - Take the next issue, following "Taking an issue".
 
 ## How to be right here
