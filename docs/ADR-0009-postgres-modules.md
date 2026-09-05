@@ -1219,10 +1219,14 @@ The test SPEC §12 set was "does Phase 5 force a large change". The answer:
 | And those **declared expressions** beside the ones read back (ADR-0013 §4) | A third field. All three are compared as text and PostgreSQL respells all three — `'unnamed'` comes back `'unnamed'::text`, `label <> 'none'` comes back `((label <> 'none'::text))` — so without it every connected plan re-emits `AlterColumnDefault`, revalidates every check and rebuilds every filtered index, for ever |
 | `check_names`' one-namespace rule becomes a dialect question | A trait method; MSSQL keeps today's answer |
 | A dialect hook for routine-identity normalization (§1), and one for "which module kinds overload" | A trait method and a datum |
+| `Module::on` is **removed** | A trigger's table is half of its identity, so it moves into the key. Containers hold names, elements do not — leaving it in `Module` would have let a snapshot say `app.audit` is on `app.orders` in the key and on `app.customers` in the value |
 | `ModuleDeps` keyed by `ModuleId` on **both** sides | Today `BTreeMap<ObjectName, BTreeSet<ObjectName>>`, which cannot say that `app.f(integer)` depends on something while `app.f(text)` does not — two valid declarations would share or overwrite one hint entry, and the ordering it exists to fix would be computed from the wrong graph |
 
-Everything else — `Module`, `ModuleKind`, the ids file (modules still carry no
-identity), the differ, `docs`, the policy engine — is unchanged.
+Everything else — `ModuleKind`, the ids file (modules still carry no
+identity), `docs`, the policy engine — is unchanged. The differ is unchanged in
+*shape* but not in behaviour: keying `diff_modules` by identity makes a trigger
+moved to another table a drop and a create rather than an alter, which is what
+the engine does anyway.
 
 **The abstraction holds, with one correction to what that costs.** The first
 draft of this document claimed the whole bill was one map key. It is one map key

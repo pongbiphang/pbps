@@ -171,7 +171,12 @@ model changes come first, because format is the most expensive thing here to
 change late. The seam preparation the ADRs place *before* the crate has landed
 (DECISIONS 193–195): the server error code is text, the transaction framing is
 the dialect's, the shared definition scanner nests block comments, and the
-dialect crate's header states reasons that hold.
+dialect crate's header states reasons that hold. ADR-0009 §1's model change has
+landed with them (DECISIONS 197–200): a module is keyed by a typed `ModuleId`,
+namespace sharing and overloading are dialect questions, and the state snapshot
+and the saved plan bumped to 6 and 5 — every older snapshot refused, because
+the meaning of the module map changed and a partial reading of it would be a
+silent wrong answer.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

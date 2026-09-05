@@ -328,7 +328,7 @@ async fn one(
 
 fn recorded_modules(
     entry: &pbps_db::LedgerEntry,
-) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+) -> std::collections::BTreeSet<pbps_model::ModuleId> {
     entry.snapshot.schema.modules.keys().cloned().collect()
 }
 

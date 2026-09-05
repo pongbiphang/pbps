@@ -876,7 +876,7 @@ fn cmd_docs(
     out: Option<&std::path::Path>,
     title: &str,
 ) -> anyhow::Result<()> {
-    let loaded = load(project)?;
+    let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids_opt(project)?.unwrap_or_default();
     let rendered = pbps_docs::render(&loaded.schema, &ids, format, title);
 
@@ -1130,11 +1130,11 @@ fn cmd_pull(
     // Modules go into files of their own, named for the kind as well as the
     // object: a view and a table cannot collide in the database, so they must
     // not collide on disk either (ADR-0002).
-    for (name, module) in &pulled.schema.modules {
-        let path = declaration_file::path(&dir, name, Some(module.kind))?;
+    for (id, module) in &pulled.schema.modules {
+        let path = declaration_file::module_path(&dir, id, module.kind)?;
         std::fs::write(
             &path,
-            pbps_load::render_module(name, module, &Default::default()),
+            pbps_load::render_module(id, module, &Default::default()),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
@@ -1285,14 +1285,128 @@ pub(crate) fn load_quiet(
     pbps_load::load_schema_dir(&dir)
 }
 
+/// Every routine identity in the dialect's own spelling of its argument types.
+///
+/// The loader is dialect-free, so `app.f(int, text)` arrives spelled as it was
+/// written; the engine identifies that routine as `app.f(integer,text)`
+/// (ADR-0009 §1, measured), and a key in the declaration's spelling would make
+/// the same object compare unequal to the one read back. The same pass as
+/// column types get, one layer up — and `normalize_routine_arg`, never
+/// `normalize_type`: routine identity discards the modifiers a column keeps.
+///
+/// A type the dialect cannot normalize is left as written, for the reason
+/// `types_as_the_dialect_spells_them` gives: it is already a finding, and
+/// rewriting what a message quotes would name something the file does not.
+///
+/// Two declarations that spell one identity are reported rather than merged:
+/// on an engine that discards type modifiers, `app.f(varchar(10))` and
+/// `app.f(varchar(20))` are one function (ADR-0009 §1, measured; DECISIONS
+/// 199), and a map
+/// that kept the second would leave the first a module nobody plans for.
+/// Returns one message per such pair, and no message otherwise.
+#[must_use]
+fn routine_ids_as_the_dialect_spells_them(
+    loaded: &mut pbps_load::Loaded,
+    dialect: &dyn Dialect,
+) -> Vec<String> {
+    let spell = |id: &pbps_model::ModuleId| -> pbps_model::ModuleId {
+        match id {
+            pbps_model::ModuleId::Routine(r) => {
+                pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
+                    r.name.clone(),
+                    r.args
+                        .iter()
+                        .map(|a| {
+                            dialect
+                                .normalize_routine_arg(a)
+                                .unwrap_or_else(|_| a.clone())
+                        })
+                        .collect(),
+                ))
+            }
+            other @ (pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. }) => {
+                other.clone()
+            }
+        }
+    };
+    let mut problems = Vec::new();
+    let mut modules: std::collections::BTreeMap<pbps_model::ModuleId, pbps_model::Module> =
+        std::collections::BTreeMap::new();
+    let mut spelled_by: std::collections::BTreeMap<pbps_model::ModuleId, pbps_model::ModuleId> =
+        std::collections::BTreeMap::new();
+    for (id, module) in &loaded.schema.modules {
+        let key = spell(id);
+        if let Some(first) = spelled_by.get(&key) {
+            problems.push(format!(
+                "`{first}` and `{id}` are one object to {}, which identifies a routine by \
+                 argument type and discards the modifiers: both are `{key}`",
+                dialect.name()
+            ));
+            continue;
+        }
+        spelled_by.insert(key.clone(), id.clone());
+        modules.insert(key, module.clone());
+    }
+    loaded.schema.modules = modules;
+    loaded.hints.module_deps = loaded
+        .hints
+        .module_deps
+        .iter()
+        .map(|(id, on)| (spell(id), on.iter().map(&spell).collect()))
+        .collect();
+    for role in loaded.schema.roles.values_mut() {
+        role.grants = role
+            .grants
+            .iter()
+            .map(|(target, permissions)| {
+                let target = match target {
+                    pbps_model::GrantTarget::Routine(r) => {
+                        match spell(&pbps_model::ModuleId::Routine(r.clone())) {
+                            pbps_model::ModuleId::Routine(spelled) => {
+                                pbps_model::GrantTarget::Routine(spelled)
+                            }
+                            // `spell` maps a routine to a routine; the other
+                            // arms are unreachable rather than meaningful.
+                            other @ (pbps_model::ModuleId::Named(_)
+                            | pbps_model::ModuleId::Trigger { .. }) => {
+                                pbps_model::GrantTarget::Object(other.object_name())
+                            }
+                        }
+                    }
+                    other @ (pbps_model::GrantTarget::Object(_)
+                    | pbps_model::GrantTarget::Schema(_)) => other.clone(),
+                };
+                (target, permissions.clone())
+            })
+            .collect();
+    }
+    problems
+}
+
 /// Loads the declarations, printing every error in one pass.
-fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
-    load_quiet(project).map_err(|errs| {
+///
+/// Every command that plans, applies or writes files goes through here, and so
+/// through the routine-identity pass: a `Loaded` that the dialect has not
+/// spelled keys a routine as its file wrote it, and the same object read back
+/// from the engine would not match (ADR-0009 §1). The three `load_quiet`
+/// callers in `doctor` skip the pass deliberately — they ask which schemas and
+/// which object names a project mentions, and an argument list is part of
+/// neither answer.
+fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
+    let mut loaded = load_quiet(project).map_err(|errs| {
         for e in &errs {
             print_load_error(e);
         }
         anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
-    })
+    })?;
+    let collisions = routine_ids_as_the_dialect_spells_them(&mut loaded, dialect);
+    if !collisions.is_empty() {
+        for c in &collisions {
+            eprintln!("error: {c}");
+        }
+        anyhow::bail!("the declarations have {} problem(s)", collisions.len());
+    }
+    Ok(loaded)
 }
 
 /// Every declaration problem `validate` reports as an error, as
@@ -1332,6 +1446,13 @@ pub(crate) fn declaration_problems(
     // surface as an engine error at apply time, on a database that is
     // already half-changed.
     for problem in pbps_model::module::check_names(schema) {
+        out.push(("schema.name-collision", problem));
+    }
+    // And the two the model cannot answer: whether a module competes with a
+    // table for its name, and whether a declared signature names an object
+    // this engine can have (ADR-0009 §1). Both are the dialect's, and both
+    // would otherwise surface as an engine error mid-apply.
+    for problem in pbps_dialect::check_module_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
     // Roles (ADR-0005): a grant on an object nobody declares is the
@@ -1461,7 +1582,15 @@ pub fn validate_findings(
     // broken declaration *and* a scrambled identity file together, and the rule
     // everywhere else in this tool is to report every problem in one pass rather
     // than fix-one-run-again.
-    let loaded = load_quiet(project);
+    // Spelled by the dialect here as `load` does it, so that `validate` sees
+    // the identities every other command will: two declarations this engine
+    // reads as one routine are a problem `validate` has to report, not one it
+    // discovers by planning (ADR-0009 §1).
+    let mut loaded = load_quiet(project);
+    let mut collisions = Vec::new();
+    if let Ok(l) = &mut loaded {
+        collisions = routine_ids_as_the_dialect_spells_them(l, dialect);
+    }
     // Identity consistency is validate's job too (SPEC §5.3): two branches each
     // adding a same-named column merge cleanly at the line level — two uids, two
     // lines — so no git conflict flags it, and only a check can.
@@ -1471,6 +1600,11 @@ pub fn validate_findings(
     if let Err(errs) = &loaded {
         findings.extend(errs.iter().map(load_finding));
     }
+    findings.extend(
+        collisions
+            .into_iter()
+            .map(|c| output::Finding::error("schema.name-collision", c)),
+    );
 
     // Three layers, all reported in the same pass: the loader checks shape, the
     // dialect checks what the engine will refuse (a nullable PK column, an
@@ -1729,7 +1863,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).
-                pbps_load::render_module(&m.name, &m.module, &m.depends_on),
+                pbps_load::render_module(&m.id, &m.module, &m.depends_on),
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Table(t) => {
@@ -1847,7 +1981,7 @@ struct FmtData {
 /// Records one intent: re-resolves identity with it, then writes the identity
 /// file back.
 fn cmd_intent(project: &Project, intent: Intent) -> anyhow::Result<()> {
-    let loaded = load(project)?;
+    let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
     let mut intents = loaded.intents;
     intents.push(intent);

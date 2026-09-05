@@ -309,9 +309,9 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
             // nothing from it but the state itself (ADR-0002).
             Ok(pbps_load::LoadedFile::Module(m)) => {
                 if !m.depends_on.is_empty() {
-                    hints.module_deps.insert(m.name.clone(), m.depends_on);
+                    hints.module_deps.insert(m.id.clone(), m.depends_on);
                 }
-                schema.modules.insert(m.name, m.module);
+                schema.modules.insert(m.id, m.module);
                 count += 1;
             }
             // A role's identity is in the ids file at that revision, which the

@@ -81,11 +81,45 @@ pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
+    filename_of(&name.schema, &name.name, kind)
+}
+
+/// The file a module is written to, under its whole identity.
+///
+/// A routine carries its argument types into the filename because they are
+/// part of what it is (ADR-0009 §1): `app.f(integer)` and `app.f(text)` are
+/// two declarations, and one file for both would have `pull` write the second
+/// over the first. `component` percent-encodes the parentheses and commas, so
+/// the name stays one path component.
+pub fn module_path(
+    directory: &Path,
+    id: &pbps_model::ModuleId,
+    kind: ModuleKind,
+) -> anyhow::Result<PathBuf> {
+    let name = id.object_name();
+    let stem = match id.args() {
+        Some(args) => {
+            let spelled: Vec<String> = args.iter().map(ToString::to_string).collect();
+            format!("{}({})", name.name, spelled.join(","))
+        }
+        None => name.name.clone(),
+    };
+    let path = directory.join(filename_of(&name.schema, &stem, Some(kind)));
+    if path.parent() != Some(directory) {
+        bail!(
+            "generated declaration path for `{id}` escaped `{}`",
+            directory.display()
+        );
+    }
+    Ok(path)
+}
+
+fn filename_of(schema: &str, name: &str, kind: Option<ModuleKind>) -> String {
     let kind_suffix = kind.map(|k| format!(".{}", k.as_str())).unwrap_or_default();
     let readable = format!(
         "{}.{}{}.yml",
-        escape_reserved_stem(component(&name.schema)),
-        component(&name.name),
+        escape_reserved_stem(component(schema)),
+        component(name),
         kind_suffix
     );
     // SQL Server identifiers can be long Unicode strings. Percent-encoding all
@@ -96,9 +130,9 @@ fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(name.schema.as_bytes());
+    hasher.update(schema.as_bytes());
     hasher.update([0]);
-    hasher.update(name.name.as_bytes());
+    hasher.update(name.as_bytes());
     hasher.update([0]);
     hasher.update(kind.map(ModuleKind::as_str).unwrap_or("table").as_bytes());
     // `~` is deliberately outside `component`'s safe alphabet (a literal one
@@ -136,10 +170,10 @@ pub fn paths_of(
     for name in schema.tables.keys() {
         out.push((name.to_string(), path(directory, &name.clone(), None)?));
     }
-    for (name, module) in &schema.modules {
+    for (id, module) in &schema.modules {
         out.push((
-            format!("{name} ({})", module.kind.as_str()),
-            path(directory, name, Some(module.kind))?,
+            format!("{id} ({})", module.kind.as_str()),
+            module_path(directory, id, module.kind)?,
         ));
     }
     for name in schema.roles.keys() {

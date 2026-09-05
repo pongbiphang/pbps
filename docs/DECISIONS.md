@@ -2830,3 +2830,65 @@ SPEC is in sync with all of these.
     end. Measured against the live server, the same shape sits in `doctor`,
     whose remedies spell `--env <redacted label>` for a `--db` target; that is a
     separate command and a separate issue, not scope here.
+
+## Phase 5 prep — module identity (ADR-0009 §1)
+
+197. **A module is identified by a typed `ModuleId`, and which fields carry
+    that identity depends on the kind.** `Schema::modules` was keyed by
+    `ObjectName`, which says every module in a schema has a distinct name.
+    Measured on PostgreSQL, that is false twice over: functions and procedures
+    overload, so `app.f(integer)` and `app.f(text)` are two objects with one
+    name; and a trigger's name is unique only within its table, so `audit` on
+    `orders` and `audit` on `customers` are two objects with one name in one
+    schema. `ModuleId` is therefore an enum — `Named(ObjectName)` for a view,
+    `Routine { name, args }`, `Trigger { on, name }` — and the shape of the
+    key is the shape of the identity.
+
+    **The signature is a `Vec<ColumnType>`, not a string.** Two semantically
+    identical schemas must be `==` (the inviolable constraint), and
+    `f(int)`/`f(integer)`/`f( INTEGER )` are one signature spelled three ways.
+    A string key would have made three modules of one. The `Display`/`FromStr`
+    pair exists for the JSON map key and for messages, and parses back to the
+    same value; it is not the identity.
+
+    **The trigger's table lives in the key, not in `Module`.** `Module::on` is
+    removed. Containers hold names, elements do not: with the table in both
+    places a snapshot could say `app.audit` is on `app.orders` in the key and
+    on `app.customers` in the value, and nothing in the type would stop it.
+    Removing the field makes that unrepresentable rather than checked. The
+    declaration file keeps both lines — `trigger:` and `on:` — because that is
+    where a human writes them; the loader folds them into one key and refuses
+    an `on:` on a kind that has no table, or a trigger whose schema disagrees
+    with its table's.
+
+198. **Namespace sharing and overloading are dialect questions, asked of the
+    dialect.** `check_names` refused two modules with one name and a module
+    sharing a table's name, as one rule for every engine. Both halves are
+    engine-specific — on PostgreSQL views share the table namespace and
+    routines do not, and routines overload — and `pbps-model` may not know
+    which engine it is describing. So the rule moves to
+    `pbps_dialect::check_module_names`, over `shares_namespace_with_tables`
+    and `overloads`; `check_names` keeps only what is true of every engine.
+    MSSQL answers as before, so no declaration that was valid becomes invalid.
+
+199. **Routine identity is normalized by its own hook, and a collision is
+    reported rather than merged.** PostgreSQL discards type modifiers when
+    identifying a routine — measured, `f(varchar(10))` and `f(varchar(20))`
+    are one function — which `normalize_type` must not do, because a column's
+    modifier is part of the column. `normalize_routine_arg` is therefore a
+    separate hook, applied to the loaded schema in one CLI pass after loading.
+    When two declarations normalize to one id, the pass reports both and the
+    command bails. Silently keeping the second would have left the first a
+    declared module that no plan ever mentions — absent and unreadable are not
+    the same, and only one of them is good news.
+
+200. **The state snapshot's oldest readable version becomes its current one.**
+    A version 5 snapshot spells a trigger as `app.audit` with its table in a
+    field beside it. This build reads that key as a view and has nowhere to
+    put the table, so "no modules of that shape" would be a *missing* reading
+    presented as a true one — the failure this tool exists to prevent. The
+    meaning of the module map changed, not just its contents, so the snapshot
+    is refused with the remedy (`pbps baseline`) rather than upgraded in
+    place. Cheap because the format numbers are still pre-release and reset at
+    the first tagged release (145). The saved plan goes 4 → 5 for the same
+    change with the same reasoning, and refuses the same way.

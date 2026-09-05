@@ -473,10 +473,19 @@ async fn pull_reads_every_kind_of_module_back() {
     // The body, not the whole CREATE: the prefix is the emitter's, and keeping
     // it would make every declaration compare unequal to the database it came
     // from.
-    let view = &pulled.schema.modules[&TableName::new("dbo", "v_active")];
+    let view =
+        &pulled.schema.modules[&pbps_model::ModuleId::Named(TableName::new("dbo", "v_active"))];
     assert_eq!(view.definition, "SELECT id FROM dbo.t WHERE flag = 1;");
-    let trigger = &pulled.schema.modules[&TableName::new("dbo", "tr_t")];
-    assert_eq!(trigger.on, Some(TableName::new("dbo", "t")));
+    // The trigger's table is its key's, not a field beside it (ADR-0009 §1).
+    let trigger_id = pbps_model::ModuleId::Trigger {
+        on: TableName::new("dbo", "t"),
+        name: "tr_t".to_owned(),
+    };
+    assert!(
+        pulled.schema.modules.contains_key(&trigger_id),
+        "a pulled trigger is keyed by its table: {:?}",
+        pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
 
     let unmanaged: Vec<String> = pulled
         .unmanaged_modules
@@ -541,20 +550,27 @@ async fn a_module_applied_then_read_back_equals_what_was_declared() {
         ),
     ];
     for (name, kind, on, definition) in modules {
+        let name: pbps_model::ObjectName = name.parse().unwrap();
+        let id = match on {
+            Some(table) => pbps_model::ModuleId::Trigger {
+                on: table.parse().unwrap(),
+                name: name.name.clone(),
+            },
+            None => pbps_model::ModuleId::Named(name),
+        };
         declared.modules.insert(
-            name.parse().unwrap(),
+            id,
             pbps_model::Module {
                 kind,
                 description: None,
-                on: on.map(|t| t.parse().unwrap()),
                 definition: definition.to_owned(),
             },
         );
     }
 
     // Apply exactly what the emitter produces, statement by statement.
-    for (name, module) in &declared.modules {
-        let sql = pbps_mssql::emit::module_definition(name, module).expect("emit");
+    for (id, module) in &declared.modules {
+        let sql = pbps_mssql::emit::module_definition(id, module).expect("emit");
         db.conn
             .execute(&sql)
             .await
@@ -576,7 +592,7 @@ async fn a_module_applied_then_read_back_equals_what_was_declared() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let cs = plan(&pulled.schema, &ids, &declared, &ids);
     assert!(
-        cs.changes.iter().all(|c| c.change.module_name().is_none()),
+        cs.changes.iter().all(|c| c.change.module_id().is_none()),
         "no module change should be planned: {:?}",
         cs.changes
     );

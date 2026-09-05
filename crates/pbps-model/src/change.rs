@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::data::{Cell, DataMode, Row, RowKey, Value};
-use crate::module::{Module, ModuleKind, ObjectName};
+use crate::module::{Module, ModuleId, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
@@ -459,18 +459,18 @@ pub enum Change {
     // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
     // is drop + add and the audit trail is git.
     CreateModule {
-        name: ObjectName,
+        id: ModuleId,
         module: Box<Module>,
     },
     /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
     /// create — preserves the permissions granted on the object, which is the
     /// DACPAC pain point this avoids.
     AlterModule {
-        name: ObjectName,
+        id: ModuleId,
         module: Box<Module>,
     },
     DropModule {
-        name: ObjectName,
+        id: ModuleId,
         kind: ModuleKind,
     },
 
@@ -738,19 +738,26 @@ impl Change {
             | Change::Grant { role: name, .. }
             | Change::Revoke { role: name, .. } => format!("role {name}"),
             Change::RenameRole { from, .. } => format!("role {from}"),
-            // Every other change acts on an object with a name.
-            other => other.table().map(ToString::to_string).unwrap_or_default(),
+            // A module says its whole identity: `app.f(integer,text)` and
+            // `app.f(text)` are two objects, and a label that showed `app.f`
+            // for both would group two changes as one.
+            other => match other.module_id() {
+                Some(id) => id.to_string(),
+                None => other.table().map(ToString::to_string).unwrap_or_default(),
+            },
         }
     }
 
-    /// The object this change acts on, or `None` for a change that is not to
-    /// an object in the tables-and-modules namespace at all.
+    /// The **table** this change acts on, or `None` for a change that is not
+    /// to one.
     ///
-    /// For a module change it is the module's own qualified name: tables and
-    /// modules share one namespace, so one type covers both and a plan groups
-    /// by "the thing being changed" either way. A role change has no such
-    /// name — a role is a principal, not an object — and the callers that
-    /// want a label use [`Change::subject`].
+    /// A module change answers `None` here and [`Change::module_id`] instead.
+    /// It used to answer with the module's own qualified name, on the grounds
+    /// that SQL Server keeps tables and modules in one namespace — but a
+    /// module's identity is a [`ModuleId`] now, and only one of its three
+    /// shapes is a plain qualified name (ADR-0009 §1). A caller that wants
+    /// "the object, whichever kind" asks [`Change::object`]; one that wants a
+    /// label asks [`Change::subject`].
     pub fn table(&self) -> Option<&TableName> {
         Some(match self {
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
@@ -775,15 +782,28 @@ impl Change {
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
-            Change::CreateModule { name, .. }
-            | Change::AlterModule { name, .. }
-            | Change::DropModule { name, .. } => name,
-            Change::CreateRole { .. }
+            Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. } => return None,
         })
+    }
+
+    /// The object this change acts on in the tables-and-modules namespace: the
+    /// table, or the module under the name that namespace knows it by.
+    ///
+    /// Owned rather than borrowed because a trigger's qualified name is
+    /// composed — its schema is its table's (ADR-0009 §1) — so there is
+    /// nothing to borrow it from.
+    pub fn object(&self) -> Option<ObjectName> {
+        match self.module_id() {
+            Some(id) => Some(id.object_name()),
+            None => self.table().cloned(),
+        }
     }
 
     /// Every name in the tables-and-modules namespace this change reaches:
@@ -1096,9 +1116,10 @@ impl Change {
     /// apply has to know that (DECISIONS 158).
     // Exhaustive rather than a wildcard, for the reason above: a change added
     // later that removes an object takes grants with it too.
-    pub fn drops(&self) -> Option<&TableName> {
+    pub fn drops(&self) -> Option<ObjectName> {
         match self {
-            Change::DropTable { name, .. } | Change::DropModule { name, .. } => Some(name),
+            Change::DropTable { name, .. } => Some(name.clone()),
+            Change::DropModule { id, .. } => Some(id.object_name()),
             Change::CreateTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
@@ -1552,12 +1573,12 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is: a change
     // added later that leaves a definition standing has to say so, or the
     // read-back would record whatever is there as this plan's own result.
-    pub fn module(&self) -> Option<(&ObjectName, ModuleAfter<'_>)> {
+    pub fn module(&self) -> Option<(&ModuleId, ModuleAfter<'_>)> {
         match self {
-            Change::CreateModule { name, module } | Change::AlterModule { name, module } => {
-                Some((name, ModuleAfter::Standing(module)))
+            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                Some((id, ModuleAfter::Standing(module)))
             }
-            Change::DropModule { name, .. } => Some((name, ModuleAfter::Gone)),
+            Change::DropModule { id, .. } => Some((id, ModuleAfter::Gone)),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1590,11 +1611,11 @@ impl Change {
     }
 
     /// The module this change acts on, if it is a module change at all.
-    pub fn module_name(&self) -> Option<&ObjectName> {
+    pub fn module_id(&self) -> Option<&ModuleId> {
         match self {
-            Change::CreateModule { name, .. }
-            | Change::AlterModule { name, .. }
-            | Change::DropModule { name, .. } => Some(name),
+            Change::CreateModule { id, .. }
+            | Change::AlterModule { id, .. }
+            | Change::DropModule { id, .. } => Some(id),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -2087,7 +2108,6 @@ mod tests {
         crate::module::Module {
             kind: crate::module::ModuleKind::View,
             description: None,
-            on: None,
             definition: "SELECT customer_id FROM dbo.customer".into(),
         }
     }
@@ -2098,15 +2118,15 @@ mod tests {
     #[test]
     fn only_dropping_a_module_is_risky() {
         let create = Change::CreateModule {
-            name: "dbo.active_customer".parse().unwrap(),
+            id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
         };
         let alter = Change::AlterModule {
-            name: "dbo.active_customer".parse().unwrap(),
+            id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
         };
         let drop = Change::DropModule {
-            name: "dbo.active_customer".parse().unwrap(),
+            id: "dbo.active_customer".parse().unwrap(),
             kind: crate::module::ModuleKind::View,
         };
         assert!(create.intrinsic_risks().is_empty());
@@ -2117,18 +2137,39 @@ mod tests {
         );
     }
 
+    /// A module change is not a table change, and says so: `table()` is for
+    /// tables, `module_id()` for modules, and `object()` for the one question
+    /// that spans both — what is this called in the namespace the engine
+    /// keeps it in (ADR-0009 §1).
     #[test]
-    fn a_module_change_reports_its_own_name() {
+    fn a_module_change_reports_its_own_identity_and_no_table() {
         let c = Change::CreateModule {
-            name: "dbo.active_customer".parse().unwrap(),
+            id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
         };
-        assert_eq!(c.table().unwrap().to_string(), "dbo.active_customer");
+        assert!(c.table().is_none());
         assert_eq!(
-            c.module_name().map(ToString::to_string).as_deref(),
+            c.module_id().map(ToString::to_string).as_deref(),
             Some("dbo.active_customer")
         );
-        assert!(add_column().module_name().is_none());
+        assert_eq!(c.object().unwrap().to_string(), "dbo.active_customer");
+        assert_eq!(c.subject(), "dbo.active_customer");
+        assert!(add_column().module_id().is_none());
+
+        // A trigger is named for its table, and a routine carries its
+        // signature into every label a plan shows.
+        let trigger = Change::DropModule {
+            id: "app.orders.audit".parse().unwrap(),
+            kind: crate::module::ModuleKind::Trigger,
+        };
+        assert_eq!(trigger.object().unwrap().to_string(), "app.audit");
+        assert_eq!(trigger.subject(), "app.orders.audit");
+        let routine = Change::DropModule {
+            id: "app.f(integer,text)".parse().unwrap(),
+            kind: crate::module::ModuleKind::Function,
+        };
+        assert_eq!(routine.object().unwrap().to_string(), "app.f");
+        assert_eq!(routine.subject(), "app.f(integer,text)");
     }
 
     /// Every field a change excludes from the shape comparison is a field
@@ -2209,7 +2250,7 @@ mod tests {
     fn module_changes_round_trip_through_json() {
         let cs = ChangeSet {
             changes: vec![PlannedChange::new(Change::CreateModule {
-                name: "dbo.active_customer".parse().unwrap(),
+                id: "dbo.active_customer".parse().unwrap(),
                 module: Box::new(a_view()),
             })],
         };

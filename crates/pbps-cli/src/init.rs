@@ -419,11 +419,11 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
             std::fs::write(&path, pbps_load::render(name, table, &[], None))
                 .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }
-        for (name, module) in &prepared.schema.modules {
-            let path = declaration_file::path(&schema_dir, name, Some(module.kind))?;
+        for (id, module) in &prepared.schema.modules {
+            let path = declaration_file::module_path(&schema_dir, id, module.kind)?;
             std::fs::write(
                 &path,
-                pbps_load::render_module(name, module, &Default::default()),
+                pbps_load::render_module(id, module, &Default::default()),
             )
             .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }

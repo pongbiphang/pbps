@@ -782,15 +782,24 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map(|(s, t)| ObjectName::new(s.clone(), t.clone()))
             .or(on);
 
+        // The identity, which for a trigger is its table and its own name
+        // (ADR-0009 §1). Nothing on this engine overloads, so no read-back
+        // ever carries a signature.
+        let id = match (m.kind, &on) {
+            (pbps_model::ModuleKind::Trigger, Some(table)) => pbps_model::ModuleId::Trigger {
+                on: table.clone(),
+                name: name.name.clone(),
+            },
+            _ => pbps_model::ModuleId::Named(name),
+        };
         schema.modules.insert(
-            name,
+            id,
             Module {
                 kind: m.kind,
                 // A description lives in the declarations, not in the database;
                 // pulling one back is not possible and pretending otherwise
                 // would make every pulled module compare unequal.
                 description: None,
-                on,
                 definition,
             },
         );
@@ -859,7 +868,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // refuse the project `pull` just wrote.
         if let pbps_model::GrantTarget::Object(object) = &target
             && !schema.tables.contains_key(object)
-            && !schema.modules.contains_key(object)
+            && !schema
+                .modules
+                .keys()
+                .any(|id| id.referenced_name().as_ref() == Some(object))
         {
             unexpressible.push(Unexpressible {
                 role: p.role.clone(),
@@ -1458,11 +1470,11 @@ mod module_tests {
         assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
         assert_eq!(p.schema.modules.len(), 2);
         assert_eq!(
-            p.schema.modules[&"dbo.v_active".parse::<ObjectName>().unwrap()].definition,
+            p.schema.modules[&"dbo.v_active".parse::<pbps_model::ModuleId>().unwrap()].definition,
             "SELECT id FROM dbo.customer"
         );
         assert_eq!(
-            p.schema.modules[&"dbo.sp_reprice".parse::<ObjectName>().unwrap()].definition,
+            p.schema.modules[&"dbo.sp_reprice".parse::<pbps_model::ModuleId>().unwrap()].definition,
             "@pct int AS UPDATE dbo.customer SET id = id;"
         );
     }
@@ -1479,9 +1491,12 @@ mod module_tests {
         );
         trg.parent = Some(("dbo".into(), "customer".into()));
         let p = assemble(&catalog_with(vec![trg]));
-        let m = &p.schema.modules[&"dbo.trg_audit".parse::<ObjectName>().unwrap()];
+        // The table is in the key now, not in a field beside it
+        // (ADR-0009 §1).
+        let id: pbps_model::ModuleId = "dbo.customer.trg_audit".parse().unwrap();
+        let m = &p.schema.modules[&id];
         assert_eq!(
-            m.on.as_ref().map(ToString::to_string).as_deref(),
+            id.attached_to().map(ToString::to_string).as_deref(),
             Some("dbo.customer")
         );
         assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");
@@ -1633,14 +1648,21 @@ mod module_tests {
             let module = Module {
                 kind,
                 description: None,
-                on: on.map(|t| t.parse().unwrap()),
                 definition: body.to_owned(),
             };
-            let stored = crate::emit::module_definition(&name, &module).expect("emit");
+            let on: Option<ObjectName> = on.map(|t| t.parse().unwrap());
+            let id = match &on {
+                Some(table) => pbps_model::ModuleId::Trigger {
+                    on: table.clone(),
+                    name: name.name.clone(),
+                },
+                None => pbps_model::ModuleId::Named(name.clone()),
+            };
+            let stored = crate::emit::module_definition(&id, &module).expect("emit");
             let (back_on, back_body) = split_module(kind, &stored, false)
                 .unwrap_or_else(|| panic!("could not split:\n{stored}"));
             assert_eq!(back_body, body, "{kind}");
-            assert_eq!(back_on, module.on, "{kind}");
+            assert_eq!(back_on, on, "{kind}");
         }
     }
 

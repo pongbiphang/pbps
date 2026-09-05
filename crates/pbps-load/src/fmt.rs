@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::{Intent, Module, ObjectName, PrimaryKey, Strategy, Table, TableName};
+use pbps_model::{Intent, Module, ModuleId, ObjectName, PrimaryKey, Strategy, Table, TableName};
 
 /// Renders one table as canonical YAML.
 ///
@@ -214,18 +214,30 @@ fn value(v: &pbps_model::Value) -> String {
 /// `depends_on` is persistent, like `strategy:`: it is an answer about this
 /// project that stays true, so rewriting the file must not lose it.
 pub fn render_module(
-    name: &ObjectName,
+    id: &ModuleId,
     module: &Module,
-    depends_on: &std::collections::BTreeSet<ObjectName>,
+    depends_on: &std::collections::BTreeSet<ModuleId>,
 ) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "{}: {}", module.kind.as_str(), scalar(&name.to_string()));
+    // The file keeps its two lines for a trigger — `trigger: app.audit` and
+    // `on: app.orders` — even though the model folds them into one identity
+    // (ADR-0009 §1). The declaration is what a person reads, and splitting the
+    // table back out is what makes `pull` of a database with a trigger produce
+    // the file that database came from.
+    let (declared, on) = match id {
+        ModuleId::Trigger { on, name } => (
+            ObjectName::new(on.schema.clone(), name.clone()).to_string(),
+            Some(on.to_string()),
+        ),
+        other @ (ModuleId::Named(_) | ModuleId::Routine(_)) => (other.to_string(), None),
+    };
+    let _ = writeln!(s, "{}: {}", module.kind.as_str(), scalar(&declared));
 
     if let Some(d) = &module.description {
         let _ = writeln!(s, "description: {}", scalar(d));
     }
-    if let Some(on) = &module.on {
-        let _ = writeln!(s, "on: {}", scalar(&on.to_string()));
+    if let Some(on) = on.as_deref() {
+        let _ = writeln!(s, "on: {}", scalar(on));
     }
     if !depends_on.is_empty() {
         let names: Vec<String> = depends_on.iter().map(ToString::to_string).collect();
@@ -353,11 +365,10 @@ mod tests {
         let module = pbps_model::Module {
             kind: pbps_model::ModuleKind::View,
             description: None,
-            on: None,
             definition: "SELECT 'first  \nsecond' AS note".into(),
         };
         let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
-        let out = render_module(&name, &module, &Default::default());
+        let out = render_module(&ModuleId::Named(name), &module, &Default::default());
         assert!(out.contains("SELECT 'first  "), "{out}");
 
         let back = crate::load_module_str(Path::new("dbo.v.yml"), &out)
@@ -384,15 +395,15 @@ mod tests {
     fn module_round_trip(yaml: &str) -> String {
         let a = crate::load_module_str(Path::new("m.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render_module(&a.name, &a.module, &a.depends_on);
+        let out = render_module(&a.id, &a.module, &a.depends_on);
         let b = crate::load_module_str(Path::new("m.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
-        assert_eq!(a.name, b.name, "output:\n{out}");
+        assert_eq!(a.id, b.id, "output:\n{out}");
         assert_eq!(a.module, b.module, "output:\n{out}");
         assert_eq!(a.depends_on, b.depends_on, "output:\n{out}");
         assert_eq!(
-            render_module(&b.name, &b.module, &b.depends_on),
+            render_module(&b.id, &b.module, &b.depends_on),
             out,
             "fmt is not idempotent"
         );
@@ -504,6 +515,41 @@ mod tests {
         assert!(
             out.starts_with("trigger: dbo.trg_customer_audit\non: dbo.customer\n"),
             "{out}"
+        );
+    }
+
+    /// A routine's signature is part of its name, so `fmt` writes it back on
+    /// the leading key — and a file already in canonical form is a fixed
+    /// point. `int, text` is canonicalized to `int,text` the way every other
+    /// spelling `fmt` owns is; what the *engine* calls those types is the
+    /// dialect's answer, applied one layer up (ADR-0009 §1).
+    #[test]
+    fn a_routine_keeps_its_signature_through_formatting() {
+        let out = module_round_trip(
+            "function: app.f(int, text)\ndefinition: |-\n  (a integer, b text) RETURNS int AS $$ SELECT 1 $$\n",
+        );
+        // Quoted, because the comma in the signature is one of the
+        // characters that would otherwise change YAML's reading of the line —
+        // the same rule that already quotes a name containing a `:`.
+        assert!(out.starts_with("function: \"app.f(int,text)\"\n"), "{out}");
+        assert!(out.contains("(a integer, b text)"), "{out}");
+
+        // And two overloads keep their own bodies rather than one file
+        // rewriting the other.
+        let other = module_round_trip(
+            "function: app.f(bigint)\ndefinition: |-\n  (a bigint) RETURNS int AS $$ SELECT 2 $$\n",
+        );
+        assert!(other.starts_with("function: app.f(bigint)\n"), "{other}");
+
+        // And a `depends_on:` naming an overload survives the flow sequence
+        // it is written in, which is where an unquoted comma would split one
+        // name into two.
+        let dependent = module_round_trip(
+            "view: app.v\ndepends_on: [\"app.f(int,text)\"]\ndefinition: |-\n  SELECT 1\n",
+        );
+        assert!(
+            dependent.contains("depends_on: [\"app.f(int,text)\"]"),
+            "{dependent}"
         );
     }
 

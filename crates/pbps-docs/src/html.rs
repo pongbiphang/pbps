@@ -105,10 +105,10 @@ fn modules_section(s: &mut String, schema: &Schema) {
             esc(&name.to_string()),
             esc(&name.to_string())
         );
-        let on =
-            m.on.as_ref()
-                .map(|t| format!(" on {}", esc(&t.to_string())))
-                .unwrap_or_default();
+        let on = name
+            .attached_to()
+            .map(|t| format!(" on {}", esc(&t.to_string())))
+            .unwrap_or_default();
         let _ = writeln!(s, "<p class=\"muted\">{}{on}</p>", m.kind);
         if let Some(d) = &m.description {
             let _ = writeln!(s, "<p>{}</p>", esc(d));

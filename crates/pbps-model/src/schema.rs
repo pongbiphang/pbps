@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use indexmap::IndexMap;
 
 use crate::data::TableData;
-use crate::module::{Module, ObjectName};
+use crate::module::{Module, ModuleId};
 use crate::name::TableName;
 use crate::types::ColumnType;
 
@@ -31,6 +31,10 @@ pub struct Schema {
 
     /// Views, procedures, functions and triggers (ADR-0002).
     ///
+    /// Keyed by [`ModuleId`], not by name: what identifies a module depends on
+    /// its kind — a routine by its signature, a trigger by its table
+    /// (ADR-0009 §1).
+    ///
     /// They live in the same [`Schema`] as the tables because they are part of
     /// the desired state and of the drift comparison — but they carry no data,
     /// so they get none of the identity machinery and never appear in the ids
@@ -39,7 +43,7 @@ pub struct Schema {
     /// Defaulted on read: every state snapshot and plan written before modules
     /// existed is a project with no modules, not a broken file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub modules: BTreeMap<ObjectName, Module>,
+    pub modules: BTreeMap<ModuleId, Module>,
 
     /// Database roles and what they are granted (ADR-0005).
     ///

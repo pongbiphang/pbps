@@ -28,7 +28,7 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ObjectName, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
+    ModuleId, ObjectName, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -785,8 +785,8 @@ fn rank_of_tables(order: &[TableName]) -> BTreeMap<TableName, usize> {
         .collect()
 }
 
-/// Position in the dependency order, by name.
-fn rank_of(order: &[ObjectName]) -> BTreeMap<ObjectName, usize> {
+/// Position in the dependency order, by identity.
+fn rank_of(order: &[ModuleId]) -> BTreeMap<ModuleId, usize> {
     order
         .iter()
         .enumerate()
@@ -883,16 +883,16 @@ pub fn order_role_drops(cs: &mut ChangeSet) {
 /// so a dependent goes before the thing it depends on.
 fn dependency_rank(
     change: &Change,
-    create_rank: &BTreeMap<ObjectName, usize>,
-    drop_rank: &BTreeMap<ObjectName, usize>,
+    create_rank: &BTreeMap<ModuleId, usize>,
+    drop_rank: &BTreeMap<ModuleId, usize>,
     data_rank: &BTreeMap<TableName, usize>,
     role_rank: &BTreeMap<String, usize>,
 ) -> isize {
     match change {
-        Change::CreateModule { name, .. } | Change::AlterModule { name, .. } => {
-            create_rank.get(name).map_or(0, |r| *r as isize)
+        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
+            create_rank.get(id).map_or(0, |r| *r as isize)
         }
-        Change::DropModule { name, .. } => -(drop_rank.get(name).map_or(0, |r| *r as isize)),
+        Change::DropModule { id, .. } => -(drop_rank.get(id).map_or(0, |r| *r as isize)),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::RenameTable { .. }
@@ -941,16 +941,7 @@ fn dependency_rank(
 /// the permission with it, and a `REVOKE` that ran after it would fail on an
 /// object that is gone (and one ordered before it would be noise).
 fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
-    let dropped: BTreeSet<ObjectName> = changes
-        .iter()
-        .filter_map(|c| {
-            if let Change::DropTable { name, .. } | Change::DropModule { name, .. } = c {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let dropped: BTreeSet<ObjectName> = changes.iter().filter_map(|c| c.drops()).collect();
     // Base table name -> the name it has after this plan, by uid.
     let renamed: BTreeMap<&TableName, &TableName> = base
         .ids
@@ -965,7 +956,10 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
                 Some(to) => GrantTarget::Object((*to).clone()),
                 None => target.clone(),
             },
-            GrantTarget::Schema(_) => target.clone(),
+            // A routine's identity moves with its name, so a rename of the
+            // object carries the signature with it unchanged: only tables are
+            // renamed by uid here, and a routine is not a table.
+            GrantTarget::Routine(_) | GrantTarget::Schema(_) => target.clone(),
         }
     };
 
@@ -1021,6 +1015,11 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
         for target in targets {
             let target_dropped = match target {
                 GrantTarget::Object(o) => dropped.contains(o),
+                // A routine is dropped under the name its namespace knows,
+                // which is the name without the signature: what the plan
+                // recorded as dropped is the object, and the signature only
+                // said which overload it was.
+                GrantTarget::Routine(r) => dropped.contains(&r.name),
                 GrantTarget::Schema(_) => false,
             };
             // A DROP takes the object's permissions with it. An object this
@@ -1069,19 +1068,25 @@ fn diff_modules(
     dialect: &dyn Dialect,
     changes: &mut Vec<Change>,
 ) {
-    for (name, module) in &declared.modules {
-        match base.modules.get(name) {
+    for (id, module) in &declared.modules {
+        match base.modules.get(id) {
             None => changes.push(Change::CreateModule {
-                name: name.clone(),
+                id: id.clone(),
                 module: Box::new(module.clone()),
             }),
-            Some(before) if before.kind != module.kind || before.on != module.on => {
+            // A trigger moved to another table needs no case of its own any
+            // more: its table is part of its identity, so the move is a key
+            // that is gone and a key that is new, and the two loops here
+            // already spell that as a drop and a create (ADR-0009 §1). What is
+            // left is the kind, which the key does not hold: `CREATE OR ALTER`
+            // cannot turn a view into a procedure.
+            Some(before) if before.kind != module.kind => {
                 changes.push(Change::DropModule {
-                    name: name.clone(),
+                    id: id.clone(),
                     kind: before.kind,
                 });
                 changes.push(Change::CreateModule {
-                    name: name.clone(),
+                    id: id.clone(),
                     module: Box::new(module.clone()),
                 });
             }
@@ -1094,7 +1099,7 @@ fn diff_modules(
                     != dialect.normalize_definition(&module.definition)
                 {
                     changes.push(Change::AlterModule {
-                        name: name.clone(),
+                        id: id.clone(),
                         module: Box::new(module.clone()),
                     });
                 }
@@ -1102,10 +1107,10 @@ fn diff_modules(
         }
     }
 
-    for (name, module) in &base.modules {
-        if !declared.modules.contains_key(name) {
+    for (id, module) in &base.modules {
+        if !declared.modules.contains_key(id) {
             changes.push(Change::DropModule {
-                name: name.clone(),
+                id: id.clone(),
                 kind: module.kind,
             });
         }
@@ -2834,7 +2839,6 @@ mod tests {
         pbps_model::Module {
             kind,
             description: None,
-            on: None,
             definition: definition.to_owned(),
         }
     }
@@ -2909,11 +2913,10 @@ mod tests {
         assert!(cs.risks().is_empty());
     }
 
-    /// `CREATE OR ALTER` cannot turn a view into a procedure, nor move a
-    /// trigger to another table. Planning either as an alteration would fail at
-    /// the statement, halfway through an apply.
+    /// `CREATE OR ALTER` cannot turn a view into a procedure. Planning that as
+    /// an alteration would fail at the statement, halfway through an apply.
     #[test]
-    fn a_changed_kind_or_table_becomes_drop_plus_create() {
+    fn a_changed_kind_becomes_drop_plus_create() {
         let base = with_modules(Schema::default(), &[("dbo.thing", "SELECT 1")]);
         let mut declared = Schema::default();
         declared.modules.insert(
@@ -2924,6 +2927,59 @@ mod tests {
             kinds(&module_diff(&base, &declared)),
             ["DropModule", "CreateModule"]
         );
+    }
+
+    /// A trigger moved to another table needs no case of its own: its table is
+    /// part of its identity (ADR-0009 §1), so the move is one key gone and one
+    /// key new — which is the drop and the create, in that order, from the two
+    /// ordinary loops.
+    #[test]
+    fn a_trigger_moved_to_another_table_is_a_drop_and_a_create() {
+        let trigger = |table: &str| {
+            let mut schema = Schema::default();
+            schema.modules.insert(
+                pbps_model::ModuleId::Trigger {
+                    on: table.parse().unwrap(),
+                    name: "audit".to_owned(),
+                },
+                a_module(pbps_model::ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
+            );
+            schema
+        };
+        let cs = module_diff(&trigger("dbo.orders"), &trigger("dbo.customers"));
+        assert_eq!(kinds(&cs), ["DropModule", "CreateModule"]);
+        let subjects: Vec<String> = cs.changes.iter().map(|p| p.change.subject()).collect();
+        assert_eq!(subjects, ["dbo.orders.audit", "dbo.customers.audit"]);
+
+        // The same trigger on the same table is still an alteration, not a
+        // replacement: nothing about its identity moved.
+        let mut same = trigger("dbo.orders");
+        for m in same.modules.values_mut() {
+            m.definition = "AFTER UPDATE AS SELECT 1".to_owned();
+        }
+        assert_eq!(
+            kinds(&module_diff(&trigger("dbo.orders"), &same)),
+            ["AlterModule"]
+        );
+    }
+
+    /// Two overloads of one function are two objects: a plan that adds the
+    /// second must not read as an alteration of the first.
+    #[test]
+    fn a_second_overload_is_a_create_and_not_an_alteration() {
+        let routine = |spec: &str, body: &str| {
+            let mut schema = Schema::default();
+            schema.modules.insert(
+                spec.parse().unwrap(),
+                a_module(pbps_model::ModuleKind::Function, body),
+            );
+            schema
+        };
+        let mut both = routine("app.f(integer)", "AS 1");
+        both.modules.extend(routine("app.f(text)", "AS 2").modules);
+        let cs = module_diff(&routine("app.f(integer)", "AS 1"), &both);
+        assert_eq!(kinds(&cs), ["CreateModule"]);
+        assert_eq!(cs.changes[0].change.subject(), "app.f(text)");
     }
 
     /// A view over a view has to be created second and dropped first, or the

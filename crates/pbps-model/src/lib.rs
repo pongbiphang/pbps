@@ -50,7 +50,9 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
-pub use module::{Hints, Module, ModuleDeps, ModuleKind, ObjectName};
+pub use module::{
+    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineId,
+};
 pub use name::{ColumnRef, NameError, TableName};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use role::{GrantTarget, Permission, Role};

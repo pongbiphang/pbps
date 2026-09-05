@@ -351,7 +351,7 @@ fn managed_schemas(project: &Project) -> Vec<String> {
         .keys()
         .map(|t| t.schema.clone())
         .collect();
-    out.extend(loaded.schema.modules.keys().map(|m| m.schema.clone()));
+    out.extend(loaded.schema.modules.keys().map(|m| m.schema().to_owned()));
     out.into_iter().collect()
 }
 
@@ -412,6 +412,11 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
             match target {
                 pbps_model::GrantTarget::Object(o) => {
                     objects.insert(format!("{}.{}", o.schema, o.name));
+                }
+                // The engine knows a routine by its bare name; the signature
+                // only says which overload the declaration meant.
+                pbps_model::GrantTarget::Routine(r) => {
+                    objects.insert(format!("{}.{}", r.name.schema, r.name.name));
                 }
                 pbps_model::GrantTarget::Schema(s) => {
                     schemas.insert(s.clone());

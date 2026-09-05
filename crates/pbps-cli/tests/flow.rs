@@ -691,7 +691,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
-        "version": 4,
+        "version": 6,
         "kind": "baseline",
         "schema": { "tables": { "dbo.t": { "columns": {
             "id": { "type": "bigint", "nullable": false }
@@ -1467,7 +1467,19 @@ fn a_module_named_after_a_table_is_refused() {
     d.module("v.yml", "view: dbo.t\ndefinition: SELECT 1\n");
     let o = d.run(&["validate"]);
     assert_ne!(code(&o), 0);
-    assert!(stderr(&o).contains("already declared"), "{}", stderr(&o));
+    // The dialect's refusal, not the loader's: whether a module competes with
+    // a table for its name is the engine's answer (ADR-0009 §1) — on
+    // PostgreSQL a table `dbo.t` and a function `dbo.t(int)` coexist.
+    assert!(
+        stderr(&o).contains("declared both as a table and as a view"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("one namespace per schema"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 /// A trigger has to name a table that is actually managed here, or pbps would
@@ -8167,7 +8179,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::AlterModule { .. }))
-        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
         .collect();
     assert_eq!(altered, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
@@ -8189,7 +8201,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
         .collect();
     assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
@@ -8544,11 +8556,10 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::CreateModule {
-                    name: "dbo.pbps_plan_b".parse().unwrap(),
+                    id: "dbo.pbps_plan_b".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
-                        on: None,
                         definition: "SELECT 1 AS id".into(),
                     }),
                 },

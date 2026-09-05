@@ -173,14 +173,18 @@ fn what_pull_writes_for_a_module_reads_back_as_the_same_module() {
     );
     assert_eq!(pulled.schema.modules.len(), 2);
 
-    for (name, module) in &pulled.schema.modules {
-        let yaml = pbps_load::render_module(name, module, &Default::default());
+    for (id, module) in &pulled.schema.modules {
+        let yaml = pbps_load::render_module(id, module, &Default::default());
         let loaded = pbps_load::load_module_str(Path::new("pulled.yml"), &yaml)
-            .unwrap_or_else(|e| panic!("{name}: pulled YAML does not parse: {e:?}"));
-        assert_eq!(&loaded.name, name);
+            .unwrap_or_else(|e| panic!("{id}: pulled YAML does not parse: {e:?}"));
+        // The identity too, not only the body: a trigger's file writes
+        // `trigger: dbo.tr_customer` beside `on: dbo.customer`, and the two
+        // have to fold back into the one identity the catalog gave
+        // (ADR-0009 §1).
+        assert_eq!(&loaded.id, id);
         assert_eq!(
             &loaded.module, module,
-            "{name}: the pulled declaration is lossy\n---\n{yaml}"
+            "{id}: the pulled declaration is lossy\n---\n{yaml}"
         );
     }
 }

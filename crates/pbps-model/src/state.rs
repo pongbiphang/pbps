@@ -32,6 +32,15 @@ use crate::schema::Schema;
 /// an older client would drop the field, compare every table and no role, and
 /// report no drift about grants it never looked at.
 ///
+/// Bumped to 6 when a module's key became a [`crate::ModuleId`] (ADR-0009 §1).
+/// This one is not an added field but a changed meaning: a version 5 snapshot
+/// spells a trigger as `app.audit` with its table in a field beside it, and
+/// this build reads `app.audit` as a *view or routine* named `audit` and has
+/// nowhere to put the table. Read partially it would say the environment has
+/// a module it does not have, and no trigger where there is one. Refused, and
+/// re-recorded — the project is pre-release and a baseline is one command
+/// (DECISIONS 145).
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -50,10 +59,13 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// The oldest snapshot version this build reads as its own.
-pub const OLDEST_READABLE_VERSION: u32 = 4;
+///
+/// 6, not 4: the module key's meaning changed under the same spelling, so
+/// there is no reading of an older snapshot that is merely incomplete.
+pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -287,12 +299,16 @@ mod tests {
         assert!(e.contains("pbps baseline"), "{e}");
     }
 
-    /// 4 is the one a deployed environment is most likely to be sitting on —
-    /// it is what the trunk wrote before this phase — and "the oldest
-    /// readable version still works" says nothing about it on its own.
+    /// Version 5 is what the trunk wrote before this phase, so it is what a
+    /// deployed environment is most likely to be sitting on — and it is
+    /// refused, not read partially. A version 5 snapshot spells a trigger as
+    /// `app.audit` with its table in a field beside it; this build reads that
+    /// key as a view and has nowhere to put the table (ADR-0009 §1). "No
+    /// modules of that shape" is not a true reading of such a snapshot, it is
+    /// a missing one, so the remedy is to re-record (DECISIONS 145, 200).
     #[test]
-    fn a_snapshot_from_before_roles_reads_as_one_with_no_managed_roles() {
-        for version in OLDEST_READABLE_VERSION..CURRENT_VERSION {
+    fn a_snapshot_from_before_module_identity_is_refused_with_its_remedy() {
+        for version in 1..CURRENT_VERSION {
             let mut snap = StateSnapshot::new(
                 StateKind::Apply,
                 Schema::default(),
@@ -300,16 +316,15 @@ mod tests {
                 "leon",
             );
             snap.version = version;
-            let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
-            // A writer before roles never wrote these sections at all.
-            json["schema"].as_object_mut().unwrap().remove("roles");
-            json["ids"].as_object_mut().unwrap().remove("roles");
-            let read: StateSnapshot = serde_json::from_value(json).unwrap();
-            assert!(read.check_version().is_ok(), "version {version}");
-            assert!(read.schema.roles.is_empty(), "version {version}");
-            assert!(read.ids.roles.is_empty(), "version {version}");
-            assert_eq!(read.schema, snap.schema, "version {version}");
+            let e = snap
+                .check_version()
+                .expect_err("every earlier version is refused");
+            assert!(e.contains("older pbps"), "version {version}: {e}");
+            assert!(e.contains("pbps baseline"), "version {version}: {e}");
         }
+        // Nothing older is readable, which is what makes the loop above the
+        // whole story rather than a sample of it.
+        assert_eq!(OLDEST_READABLE_VERSION, CURRENT_VERSION);
     }
 
     fn schema_with(ty: &str) -> Schema {

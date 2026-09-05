@@ -662,6 +662,13 @@ pub async fn permissions(
                     pbps_model::GrantTarget::Object(o) => {
                         objects.insert(format!("{}.{}", o.schema, o.name));
                     }
+                    // The engine knows the routine by its bare name, so that
+                    // is what a permission read asks about — and a recorded
+                    // state on this dialect never holds one anyway
+                    // (ADR-0009 §1).
+                    pbps_model::GrantTarget::Routine(r) => {
+                        objects.insert(format!("{}.{}", r.name.schema, r.name.name));
+                    }
                     pbps_model::GrantTarget::Schema(s) => {
                         schemas_wanted.insert(s.clone());
                     }

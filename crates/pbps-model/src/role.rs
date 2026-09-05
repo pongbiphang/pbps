@@ -47,9 +47,15 @@ pub struct Role {
 
 /// What a grant applies to.
 ///
-/// Written as `dbo.customer` for an object and `schema::dbo` for a whole
+/// Written as `dbo.customer` for an object, `app.f(integer,text)` for a
+/// routine the engine identifies by signature, and `schema::dbo` for a whole
 /// schema — the `schema::` prefix is T-SQL's own spelling of the securable
 /// class, which is the one every SQL Server user already knows.
+///
+/// The routine spelling exists because `GRANT EXECUTE ON FUNCTION app.f` is an
+/// error on PostgreSQL where `app.f` is overloaded (ADR-0009 §1, measured):
+/// a grant has to be able to name which one. On SQL Server nothing overloads,
+/// so nothing there writes it.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -58,6 +64,8 @@ pub enum GrantTarget {
     /// A table, view, procedure or function: the objects that share one
     /// namespace and one [`ObjectName`] type.
     Object(ObjectName),
+    /// One overload of a function or procedure, by signature.
+    Routine(crate::module::RoutineId),
     /// Every object in a schema, present and future.
     Schema(String),
 }
@@ -67,6 +75,7 @@ impl GrantTarget {
     pub fn schema(&self) -> &str {
         match self {
             GrantTarget::Object(o) => &o.schema,
+            GrantTarget::Routine(r) => &r.name.schema,
             GrantTarget::Schema(s) => s,
         }
     }
@@ -76,6 +85,7 @@ impl fmt::Display for GrantTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GrantTarget::Object(o) => o.fmt(f),
+            GrantTarget::Routine(r) => r.fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{s}"),
         }
     }
@@ -107,6 +117,13 @@ impl FromStr for GrantTarget {
                 return Err(NameError::EmptySegment(s.to_owned()));
             }
             return Ok(GrantTarget::Schema(rest.to_owned()));
+        }
+        // Parentheses mean a signature, the same shape rule `ModuleId` reads.
+        if s.contains('(') {
+            return match s.parse::<crate::module::ModuleId>() {
+                Ok(crate::module::ModuleId::Routine(r)) => Ok(GrantTarget::Routine(r)),
+                _ => Err(NameError::TableShape(s.to_owned())),
+            };
         }
         ObjectName::from_str(s).map(GrantTarget::Object)
     }
@@ -220,15 +237,37 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                      or name one"
                 ));
             }
-            if let GrantTarget::Object(object) = target
-                && !schema.tables.contains_key(object)
-                && !schema.modules.contains_key(object)
-            {
-                problems.push(format!(
-                    "role `{name}`: grants on `{object}`, which the declarations do not have; \
-                     declare the object, or grant on `schema::{}` if it is outside pbps",
-                    object.schema
-                ));
+            match target {
+                GrantTarget::Object(object)
+                    if !schema.tables.contains_key(object)
+                        && !schema
+                            .modules
+                            .keys()
+                            .any(|id| id.referenced_name().as_ref() == Some(object)) =>
+                {
+                    problems.push(format!(
+                        "role `{name}`: grants on `{object}`, which the declarations do not have; \
+                         declare the object, or grant on `schema::{}` if it is outside pbps",
+                        object.schema
+                    ));
+                }
+                // A signature names one overload, so nothing but that exact
+                // routine satisfies it: a grant on `app.f(integer)` where only
+                // `app.f(text)` is declared is a grant on an object pbps will
+                // never see, exactly as the object case is.
+                GrantTarget::Routine(routine)
+                    if !schema.modules.keys().any(
+                        |id| matches!(id, crate::module::ModuleId::Routine(r) if r == routine),
+                    ) =>
+                {
+                    problems.push(format!(
+                        "role `{name}`: grants on `{routine}`, which the declarations do not \
+                         have; declare the routine with that signature, or grant on \
+                         `schema::{}` if it is outside pbps",
+                        routine.name.schema
+                    ));
+                }
+                GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Schema(_) => {}
             }
         }
     }
