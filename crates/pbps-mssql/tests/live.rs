@@ -1874,7 +1874,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".to_owned()],
+        &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
@@ -1900,7 +1900,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".to_owned()],
+        &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
@@ -4925,7 +4925,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     // With a role granted on the table and on the schema: three gaps, each
     // where the grant has to go.
     let targets = pbps_mssql::doctor::GrantTargets {
-        objects: vec!["dbo.customer".to_owned()],
+        objects: vec!["dbo.customer".parse().unwrap()],
         schemas: vec!["dbo".to_owned()],
         roles: vec![],
     };
@@ -5534,6 +5534,81 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     // `dbo.customer` holds one row whose `region_code` is non-NULL, and no
     // `dbo.band` will ever hold it.
     assert_eq!(count(&mut db.conn, &to_an_empty_parent).await, 1);
+
+    db.drop().await;
+}
+
+/// An object name is spelled for `HAS_PERMS_BY_NAME` by the server, with
+/// `QUOTENAME` on each part. Joined on the client with a dot and passed as
+/// one string, `dbo.a.b` split at the wrong dot and answered 0, and
+/// `dbo.x]y` did not parse and answered NULL — measured on the pinned image,
+/// as `sa`, which holds `CONTROL` on both — so `doctor` reported a gap the
+/// account did not have. Three names, one per shape the review named, on
+/// each of the three object-scope questions; and an object that is not
+/// there is still a gap, so the quoting did not turn absence into silence.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
+    let mut db = TestDb::create("doctorquote").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.[a.b] (id int NOT NULL PRIMARY KEY); \
+             CREATE TABLE dbo.[x]]y] (id int NOT NULL PRIMARY KEY); \
+             CREATE TABLE dbo.[order-items] (id int NOT NULL PRIMARY KEY); \
+             CREATE ROLE app; \
+             GRANT SELECT ON OBJECT::dbo.[a.b] TO app;",
+        )
+        .await
+        .expect("create the oddly named tables and a role granted on one");
+
+    let dot: pbps_model::ObjectName = pbps_model::ObjectName::new("dbo", "a.b");
+    let bracket = pbps_model::ObjectName::new("dbo", "x]y");
+    let hyphen = pbps_model::ObjectName::new("dbo", "order-items");
+    let absent = pbps_model::ObjectName::new("dbo", "nope");
+    let targets = pbps_mssql::doctor::GrantTargets {
+        objects: vec![hyphen.clone(), absent.clone()],
+        schemas: vec![],
+        // The role's own grant on `dbo.[a.b]` reaches the question through
+        // the catalog, spelled by `sys.objects`, not by these declarations.
+        roles: vec!["app".to_owned()],
+    };
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &["dbo".to_owned()],
+        std::slice::from_ref(&bracket),
+        &targets,
+    )
+    .await
+    .expect("read permissions");
+
+    for (name, map) in [
+        (&dot, &held.granted_objects),
+        (&hyphen, &held.granted_objects),
+        (&bracket, &held.referenced_objects),
+    ] {
+        let granted = map
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} was not asked about: {held:?}"));
+        assert!(
+            granted.contains("CONTROL") || granted.contains("REFERENCES"),
+            "`sa` holds everything on {name}, and the question answered {granted:?}"
+        );
+    }
+    let gaps = pbps_mssql::doctor::missing(&held);
+    for name in [&dot, &hyphen, &bracket] {
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.securable == pbps_mssql::doctor::Securable::Object(name.clone())),
+            "a gap on a permission `sa` holds, on {name}: {gaps:?}"
+        );
+    }
+    // Absent is still a gap: the object question asks every named target.
+    assert!(
+        gaps.iter().any(|g| g.permission == "CONTROL"
+            && g.securable == pbps_mssql::doctor::Securable::Object(absent.clone())),
+        "an object that is not there must still be reported: {gaps:?}"
+    );
 
     db.drop().await;
 }
