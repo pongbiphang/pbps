@@ -108,6 +108,17 @@ so it is *less* recourse than the stale crate, not more. Dialect plugins are
 declined separately: no stable Rust ABI, and a plugin API would freeze
 `ChangeSet` while the model still moves.
 
+### Review findings deferred past PR #10
+
+Answered on the PR but not fixed there, because the closing rounds of its
+review fixed only what the apply guard promises (SPEC 7.6) or what refuses a
+valid plan. Each is small and real.
+
+- `Policies::check` trims `error`, `warning` and `note` before comparing (via
+  `Severity::from_str`) but compares `off` untrimmed, so a quoted `" off "`
+  is reported as `policy.invalid` rather than disabling the rule. Trim it in
+  every `off` comparison, with a test for the quoted spelling.
+
 ## Roadmap
 
 **Phase 3.1 is complete** — the usability foundation of SPEC 14, and every P0 row
