@@ -135,6 +135,25 @@ impl EnvDiagnosis {
             ..Self::unknown(environment, env_name, "unconfigured")
         }
     }
+
+    /// Adds a cause to `detail` beside what is already there.
+    ///
+    /// `detail` is one slot that several independent reads write to. Assigned,
+    /// a failed lock read wrote over the cause of a failed permission read a
+    /// few lines above it, and only the second survived into the human view
+    /// and the JSON — the verdict (`permission.unknown`) rode on its own flag,
+    /// the reason did not. Every write in `examine` goes through here so
+    /// there is no second spelling that overwrites (`status` keeps its causes
+    /// the same way).
+    fn note(&mut self, cause: String) {
+        match &mut self.detail {
+            Some(existing) => {
+                existing.push_str(" — ");
+                existing.push_str(&cause);
+            }
+            None => self.detail = Some(cause),
+        }
+    }
 }
 
 /// One target named on the command line, resolved or not.
@@ -472,7 +491,7 @@ async fn examine(
         Err(e) => {
             // `redact` has already reduced the label; the driver's own message
             // names an address and a cause, never the string it was given.
-            d.detail = Some(e.to_string());
+            d.note(e.to_string());
             return d;
         }
     };
@@ -524,7 +543,7 @@ async fn examine(
         // that matters is the worst answer this command can give.
         Err(e) => {
             d.permissions_unknown = true;
-            d.detail = Some(format!("could not read this account's permissions: {e}"));
+            d.note(format!("could not read this account's permissions: {e}"));
         }
     }
 
@@ -548,11 +567,11 @@ async fn examine(
         // established it, which is the same mistake as an empty
         // `missing_permissions` meaning "none missing".
         Err(e) => {
-            d.detail = Some(format!("could not read the deployment lock: {e}"));
+            d.note(format!("could not read the deployment lock: {e}"));
             "lock-unknown"
         }
         Ok(Some(lock)) => {
-            d.detail = Some(format!(
+            d.note(format!(
                 "held by {} since {}; an apply is running, or one died without releasing",
                 lock.locked_by, lock.locked_at
             ));
@@ -563,7 +582,7 @@ async fn examine(
             Ok(true) => match pbps_mssql::state::latest(&mut conn).await {
                 Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
                     let p = entry.snapshot.staged.as_ref().expect("just matched");
-                    d.detail = Some(format!(
+                    d.note(format!(
                         "a staged apply stopped after {} of {} statement(s)",
                         p.completed, p.total
                     ));
@@ -572,12 +591,12 @@ async fn examine(
                 Ok(Some(_)) => "ready",
                 Ok(None) => "uninitialized",
                 Err(e) => {
-                    d.detail = Some(e.to_string());
+                    d.note(e.to_string());
                     "unreachable"
                 }
             },
             Err(e) => {
-                d.detail = Some(e.to_string());
+                d.note(e.to_string());
                 "unreachable"
             }
         },
@@ -847,6 +866,51 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "schema.absent")
             .and_then(|f| f.remedy)
+    }
+
+    /// The permission read and the lock read fail independently, and each
+    /// has a cause. One slot assigned twice kept only the second, so the
+    /// operator saw the verdict of the first (`permission.unknown`) with the
+    /// reason of the other.
+    #[test]
+    fn a_later_failed_read_keeps_the_cause_of_an_earlier_one() {
+        let mut d =
+            EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
+        // In `examine`'s order: permissions first, the lock last.
+        d.permissions_unknown = true;
+        d.note("could not read this account's permissions: denied on sys.schemas".to_owned());
+        d.note("could not read the deployment lock: denied on dbo.__pbps_lock".to_owned());
+        d.state = "lock-unknown";
+
+        let detail = d.detail.as_deref().unwrap();
+        assert!(detail.contains("denied on sys.schemas"), "{detail}");
+        assert!(detail.contains("denied on dbo.__pbps_lock"), "{detail}");
+        // And the first cause still comes first, in the order it was found.
+        assert!(
+            detail.find("sys.schemas") < detail.find("__pbps_lock"),
+            "{detail}"
+        );
+        let findings = env_findings(&d, false);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"permission.unknown"), "{ids:?}");
+        assert!(ids.contains(&"state.lock-unknown"), "{ids:?}");
+        // The state finding carries the whole detail, both causes included.
+        let lock = findings
+            .iter()
+            .find(|f| f.id == "state.lock-unknown")
+            .unwrap();
+        assert!(lock.message.contains("sys.schemas"), "{}", lock.message);
+        assert!(lock.message.contains("__pbps_lock"), "{}", lock.message);
+    }
+
+    /// The first cause is not decorated: a diagnosis with one thing to say
+    /// says it plainly.
+    #[test]
+    fn a_single_cause_is_written_as_it_is() {
+        let mut d =
+            EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
+        d.note("cannot connect".to_owned());
+        assert_eq!(d.detail.as_deref(), Some("cannot connect"));
     }
 
     /// The remedy is advertised as copy-pastable, so it goes through the
