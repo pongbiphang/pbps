@@ -187,9 +187,15 @@ same git: a hook that ran `git add b` widened `git commit --only -- a` to a
 commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
 content, not the previewed hunk. So the push is not automatic. Before it, the
 UI reads the commit back — `git diff-tree --no-commit-id --name-only -r HEAD`
-must name exactly the previewed paths, and `git diff HEAD~1 HEAD -- <paths>`
-must be the previewed hunk — and pushes only a commit that passes both. One
-that does not is left where it is, unpushed and reversible, and the page shows
+must name exactly the previewed paths, `git diff HEAD~1 HEAD -- <paths>` must
+be the previewed hunk, and the commit's one parent must be the tip the UI
+recorded before composing (below) — and pushes only a commit that passes all
+three. The third is there because the first two look only at the new commit's
+own delta: another process moving the branch between the check below and the
+commit gives the intent commit an ancestry the preview never showed, and
+**measured**, a commit slipped in after the check passed both delta checks
+and failed only the parent one. A commit that fails any of the three is left
+where it is, unpushed and reversible, and the page shows
 what differs from the preview and the commands to push it or undo it; the
 hook's change is the user's to look at, not the UI's to publish or discard.
 
