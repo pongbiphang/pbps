@@ -271,7 +271,7 @@ impl Policies {
                         problems.push(format!(
                             "policies: `{id}` is set to `{w}`; use error, warning, note or off"
                         ));
-                    } else if !w.eq_ignore_ascii_case("off") && !rule.required.is_empty() {
+                    } else if !is_off(w) && !rule.required.is_empty() {
                         // Switched on by a bare word, and the rule cannot run
                         // on a word alone: evaluated, it would check nothing
                         // (a naming rule) or refuse everything (a window).
@@ -289,7 +289,7 @@ impl Policies {
             // Switched on — by its own severity, or by the catalogue's default
             // when it names none — the rule has to have what it runs on.
             let on = match &config.severity {
-                Some(w) => !w.eq_ignore_ascii_case("off"),
+                Some(w) => !is_off(w),
                 None => rule.default.is_some(),
             };
             if on {
@@ -423,14 +423,21 @@ impl Policies {
     }
 }
 
+/// The one place `off` is recognised. It trims, because `Severity::from_str`
+/// trims: a quoted `" off "` must switch a rule off the way `" error "`
+/// switches it on, not read as an unknown word.
+fn is_off(w: &str) -> bool {
+    w.trim().eq_ignore_ascii_case("off")
+}
+
 fn is_severity_word(w: &str) -> bool {
-    w.eq_ignore_ascii_case("off") || w.parse::<Severity>().is_ok()
+    is_off(w) || w.parse::<Severity>().is_ok()
 }
 
 /// `Some(Some(s))` for a severity, `Some(None)` for `off`, `None` for a word
 /// that is neither — which `check` has already reported.
 fn severity_word(w: &str) -> Option<Option<Severity>> {
-    if w.eq_ignore_ascii_case("off") {
+    if is_off(w) {
         return Some(None);
     }
     w.parse::<Severity>().ok().map(Some)
@@ -586,6 +593,27 @@ mod tests {
             assert_eq!(p.check(), Vec::<String>::new(), "{word}");
             assert_eq!(p.effective("change.window").severity, None);
         }
+    }
+
+    /// `Severity::from_str` trims, so `" error "` switches a rule on; the
+    /// `off` comparisons did not trim, so `" off "` was reported as an
+    /// unknown word instead of switching the rule off.
+    #[test]
+    fn off_is_trimmed_like_the_other_severity_words() {
+        for word in [" off ", "Off", "OFF "] {
+            let p = block(&format!(
+                r#"{{"rules": {{"data.max-rows": "{word}", "naming.table": {{"severity": "{word}"}}, "change.window": {{"severity": "{word}", "offset": "+08:00"}}}}}}"#
+            ));
+            assert_eq!(p.check(), Vec::<String>::new(), "{word:?}");
+            assert_eq!(p.effective("data.max-rows").severity, None, "{word:?}");
+            assert_eq!(p.effective("naming.table").severity, None, "{word:?}");
+            assert_eq!(p.effective("change.window").severity, None, "{word:?}");
+        }
+        // Negative: a word that is not `off` once trimmed is still refused.
+        let p = block(r#"{"rules": {"data.max-rows": " of "}}"#);
+        let problems = p.check();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("` of `"), "{problems:?}");
     }
 
     #[test]
