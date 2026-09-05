@@ -319,11 +319,15 @@ status` clean. The races the porcelain route needed a parent check and a
 branch check for — another process moving or switching the branch between the
 record and the commit — are closed by the lock and the compare-and-swap.
 
-The preview is `git diff --no-ext-diff --no-textconv <tip> <tree>`: the
-recorded tip against the tree the UI built, exact by construction, and
+The preview is `git diff --no-ext-diff --no-textconv --text <tip> <tree>`:
+the recorded tip against the tree the UI built, exact by construction, and
 rendered without presentation filters because a `diff.external` or
 `textconv` driver can show two blobs as one text (**measured**: a driver
-printing a constant hid a rewritten file). Every `git` the UI runs takes
+printing a constant hid a rewritten file), and as text because a
+`.gitattributes` line can mark the declarations `-diff` and the two flags
+do not override that (**measured**: with `*.json -diff`, the preview said
+`Binary files a/ids.json and b/ids.json differ`; with `--text` it showed
+the hunk). Every `git` the UI runs takes
 `--literal-pathspecs` and `--no-replace-objects`, runs from the worktree's
 root (`-C <git rev-parse --show-toplevel>`) with every path spelled relative
 to that root and refused if it lies outside it, runs with every
