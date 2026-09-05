@@ -3553,7 +3553,11 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
     // (DECISIONS 197). The connection string stays out: it carries the
     // password, and a remedy is printed.
     assert!(!remedy.contains("--env"), "{v}");
-    assert!(remedy.contains("--db <connection string>"), "{v}");
+    // Quoted: "runnable" includes "pasteable", and a bare `<connection string>`
+    // is a redirection in every shell a remedy is pasted into. This assertion
+    // read the unquoted spelling until `placeholder` started quoting them all,
+    // and no PR could see it fail — the live job runs only after a merge.
+    assert!(remedy.contains(r#"--db "<connection string>""#), "{v}");
     assert!(!remedy.contains(&connection), "{v}");
 }
 
