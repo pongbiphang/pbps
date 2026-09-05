@@ -1165,10 +1165,11 @@ SELECT 'R108', 'text / date / bytea / timestamptz, read back',
 
 -- -------------------------- the thirty-eighth 2026-09-05 review round
 
--- Recording the binding gives the comparison a left-hand side. This is the
--- right-hand side: a catalog query, no parsing of the declaration and no
--- speculative DDL -- does a same-named object now sit EARLIER on the write
--- path than the one this object bound to?
+-- Recording the binding gives the comparison a left-hand side. The right-hand
+-- side is a catalog query -- no parsing of the declaration, no speculative DDL.
+-- This is its first version, kept for the contrast R113-R118 draw: it looks
+-- only at pg_proc, and its ordering test treats a bound schema missing from the
+-- path as "no candidates". Both are wrong.
 CREATE SCHEMA ya; CREATE SCHEMA yb;
 CREATE FUNCTION yb.helper() RETURNS text AS $$SELECT 'yb'$$ LANGUAGE sql;
 SET search_path = m, ya, yb;
@@ -1202,6 +1203,90 @@ SELECT 'R112', 'what the catalog records about a check constraint''s binding',
    WHERE c.conname = 'ck_y' AND d.refclassid = 'pg_proc'::regclass);
 SET search_path = m;
 DROP SCHEMA ya CASCADE; DROP SCHEMA yb CASCADE;
+
+-- -------------------------- the thirty-ninth 2026-09-05 review round
+
+-- The shadow test has to follow each dependency's catalog class, and has to
+-- treat a bound schema that left the path as a rebuild rather than as an
+-- unknown that filters itself out of the comparison.
+CREATE SCHEMA za; CREATE SCHEMA zb;
+CREATE TABLE zb.zt (id int);
+CREATE FUNCTION zb.helper() RETURNS text AS $$SELECT 'zb'$$ LANGUAGE sql;
+
+CREATE FUNCTION m.bindings(view_name text)
+RETURNS TABLE(cls oid, sch text, nm text) AS $fn$
+  SELECT d.refclassid, n.nspname, c.relname FROM pg_depend d
+    JOIN pg_rewrite w ON w.oid = d.objid
+    JOIN pg_class c ON c.oid = d.refobjid JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_class'::regclass
+     AND c.relname <> split_part(view_name, '.', 2)
+  UNION
+  SELECT d.refclassid, n.nspname, p.proname FROM pg_depend d
+    JOIN pg_rewrite w ON w.oid = d.objid
+    JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+$fn$ LANGUAGE sql;
+
+CREATE FUNCTION m.rebuild(view_name text, path text[]) RETURNS text AS $fn$
+DECLARE r record; out text := '';
+BEGIN
+  FOR r IN SELECT * FROM m.bindings(view_name) LOOP
+    IF array_position(path, r.sch) IS NULL THEN
+      out := out || 'rebuild: ' || r.sch || '.' || r.nm || ' left the path; ';
+      CONTINUE;
+    END IF;
+    out := out || coalesce((
+      SELECT string_agg('rebuild: shadowed by ' || s || '.' || r.nm, '; ') FROM (
+        SELECT n.nspname AS s FROM pg_class c2 JOIN pg_namespace n ON n.oid = c2.relnamespace
+         WHERE r.cls = 'pg_class'::regclass::oid AND c2.relname = r.nm
+           AND array_position(path, n.nspname) < array_position(path, r.sch)
+        UNION ALL
+        SELECT n.nspname FROM pg_proc p2 JOIN pg_namespace n ON n.oid = p2.pronamespace
+         WHERE r.cls = 'pg_proc'::regclass::oid AND p2.proname = r.nm
+           AND array_position(path, n.nspname) < array_position(path, r.sch)
+      ) q), '');
+  END LOOP;
+  RETURN coalesce(nullif(out, ''), 'none');
+END $fn$ LANGUAGE plpgsql;
+
+CREATE FUNCTION m.routines_only(view_name text, path text[]) RETURNS text AS $fn$
+DECLARE r record; out text := 'none';
+BEGIN
+  FOR r IN SELECT n.nspname AS sch, p.proname AS nm FROM pg_depend d
+      JOIN pg_rewrite w ON w.oid = d.objid JOIN pg_proc p ON p.oid = d.refobjid
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+  LOOP
+    SELECT string_agg(n2.nspname || '.' || r.nm, ',') INTO out FROM pg_proc p2
+      JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+     WHERE p2.proname = r.nm AND array_position(path, n2.nspname) < array_position(path, r.sch);
+  END LOOP;
+  RETURN coalesce(out, 'none');
+END $fn$ LANGUAGE plpgsql;
+
+SET search_path = m, za, zb;
+CREATE VIEW m.zv AS SELECT id FROM zt;
+CREATE VIEW m.zf AS SELECT helper() AS who;
+SELECT 'R113', 'a relation shadow: the class-aware test before za.zt exists',
+       m.rebuild('m.zv', ARRAY['m','za','zb']);
+CREATE TABLE za.zt (id int);
+SELECT 'R114', 'the same test after za.zt appears',
+       m.rebuild('m.zv', ARRAY['m','za','zb']);
+SELECT 'R115', 'the routines-only test on that same case',
+       m.routines_only('m.zv', ARRAY['m','za','zb']);
+CREATE VIEW m.zv2 AS SELECT id FROM zt;
+SELECT 'R116', 'which table a bootstrap of that declaration binds',
+  (SELECT n.nspname || '.' || c.relname FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_class c ON c.oid = d.refobjid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE w.ev_class = 'm.zv2'::regclass AND d.refclassid = 'pg_class'::regclass
+      AND c.relname = 'zt');
+CREATE FUNCTION za.helper() RETURNS text AS $$SELECT 'za'$$ LANGUAGE sql;
+SELECT 'R117', 'the bound schema removed from the path, ordering test alone',
+       m.routines_only('m.zf', ARRAY['m','za']);
+SELECT 'R118', 'the same case, class-aware and missing-aware',
+       m.rebuild('m.zf', ARRAY['m','za']);
+SET search_path = m;
+DROP SCHEMA za CASCADE; DROP SCHEMA zb CASCADE;
 
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;

@@ -209,3 +209,9 @@ R109 | the shadow query before ya.helper() exists | none
 R110 | the same query after ya.helper() appears | ya.helper
 R111 | and for a view that qualified yb.helper() explicitly | ya.helper
 R112 | what the catalog records about a check constraint's binding | yb.helper()
+R113 | a relation shadow: the class-aware test before za.zt exists | none
+R114 | the same test after za.zt appears | rebuild: shadowed by za.zt
+R115 | the routines-only test on that same case | none
+R116 | which table a bootstrap of that declaration binds | za.zt
+R117 | the bound schema removed from the path, ordering test alone | none
+R118 | the same case, class-aware and missing-aware | rebuild: zb.helper left the path; 

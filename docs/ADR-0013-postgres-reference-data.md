@@ -985,8 +985,7 @@ reads deterministic would have made them depend on the declarations.
   **What can be computed is the shadow.** For each recorded dependency, ask the
   catalog whether a same-named object now sits *earlier* on the write path than
   the schema the object actually bound to. No parsing, no DDL, no write —
-  `pg_depend` joined to `pg_proc` and `pg_namespace` against the configured
-  path. **Measured**:
+  `pg_depend` against the configured path. **Measured**:
 
   ```
   the shadow query before ya.helper() exists:  none
@@ -999,6 +998,43 @@ reads deterministic would have made them depend on the declarations.
   ```
   what the catalog records about a check constraint's binding:  yb.helper()
   ```
+
+  **Two things about that query were wrong, and both were wrong in the
+  direction that stays quiet.**
+
+  *It has to follow each dependency's catalog class.* A first version looked at
+  `pg_proc` only, and a view that binds a *table* has no `pg_proc` dependency at
+  all. **Measured**, with a view bound to `zb.zt` and `za.zt` appearing earlier
+  on an unchanged path:
+
+  ```
+  the routines-only test on that case:               none
+  the class-aware test on the same case:             rebuild: shadowed by za.zt
+  which table a bootstrap of that declaration binds: za.zt
+  ```
+
+  The last line is the divergence itself, and the first line is the check
+  reporting nothing about it. Relations, types and operators are bound the same
+  way; the test is driven by `refclassid` and looks in the catalog that class
+  names, not in `pg_proc`.
+
+  *And a bound schema that has left the path is not "no candidates".*
+  `array_position(path, bound_schema)` is `NULL` when the schema is no longer
+  configured, `NULL < anything` is `NULL`, and the comparison filters every
+  candidate out — so the one case where the binding is *certainly* unreachable
+  reads as the case where nothing changed. **Measured**, a view bound to
+  `zb.helper` after `zb` left the extras while `za.helper` is visible:
+
+  ```
+  the ordering test alone:            none
+  class-aware and missing-aware:      rebuild: zb.helper left the path
+  ```
+
+  A recorded binding whose schema is no longer on the write path forces a
+  rebuild, before any ordering question is asked. Both of these are the same
+  mistake as the one they were fixing — a comparison that answers "nothing to
+  do" when it should answer "I cannot tell" — and SQL's three-valued logic
+  supplied the second one silently.
 
   **It is conservative, and the cost is measured rather than guessed:**
 
@@ -1209,7 +1245,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 |---|---|
 | `pbps-model` | Nothing |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with two restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **and the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`. A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object now earlier on the path than the schema this object bound to — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the path at all — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
