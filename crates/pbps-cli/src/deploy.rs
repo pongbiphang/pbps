@@ -1447,6 +1447,49 @@ fn refuse_unplanned_movement(
                 declared.indexes.keys().map(String::as_str).collect(),
                 now.indexes.keys().map(String::as_str).collect(),
             );
+            // And what those parts *are*, where the declaration says it
+            // without the engine's help. Only structure: a check is nothing
+            // but an expression and SQL Server rewrites it (167), and an
+            // index's filter is one too, so those two fields are left to the
+            // name comparison above (DECISIONS 183).
+            for (n, was) in &declared.unique {
+                if let Some(now) = now.unique.get(n)
+                    && was != now
+                {
+                    moved.push(format!(
+                        "{now_name} unique `{n}` is not the one this plan's `CREATE TABLE` \
+                         declares"
+                    ));
+                }
+            }
+            for (n, was) in &declared.indexes {
+                if let Some(now) = now.indexes.get(n)
+                    && (was.columns != now.columns
+                        || was.include != now.include
+                        || was.unique != now.unique)
+                {
+                    moved.push(format!(
+                        "{now_name} index `{n}` is not the one this plan's `CREATE TABLE` \
+                         declares"
+                    ));
+                }
+            }
+            if let (Some(was), Some(now)) = (&declared.primary_key, &now.primary_key) {
+                // The name only where the declaration gives one: `name: None`
+                // leaves it to the database, and the engine's generated
+                // `PK__t__3213E83F` is not movement.
+                if was.columns != now.columns
+                    || was
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| Some(n) != now.name.as_ref())
+                {
+                    moved.push(format!(
+                        "{now_name} primary key is not the one this plan's `CREATE TABLE` \
+                         declares"
+                    ));
+                }
+            }
             if declared.primary_key.is_none() && now.primary_key.is_some() {
                 moved.push(format!(
                     "{now_name} has a primary key, and this plan declares none"
@@ -5399,6 +5442,77 @@ mod tests {
             Settled::Whole,
         )
         .expect("the foreign key this plan adds to the table it creates");
+
+        // A part is not just a name. A primary key put back on different
+        // columns, or under a different declared name, is `Some` on both
+        // sides and the presence check accepted it (DECISIONS 183).
+        let keyed = |name: Option<&str>, columns: &[&str]| {
+            let mut t = declared();
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: name.map(str::to_owned),
+                columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            });
+            t
+        };
+        let plans = |t: pbps_model::Table| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(t),
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(
+            &plans(keyed(Some("pk_new"), &["id"])),
+            &before,
+            &after_with(keyed(Some("pk_new"), &["other"])),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a primary key on columns nobody planned");
+        assert!(format!("{e:#}").contains("primary key"), "{e:#}");
+        let e = refuse_unplanned_movement(
+            &plans(keyed(Some("pk_new"), &["id"])),
+            &before,
+            &after_with(keyed(Some("pk_other"), &["id"])),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a primary key under a name nobody planned");
+        assert!(format!("{e:#}").contains("primary key"), "{e:#}");
+
+        // A declaration that leaves the naming to the database gets whatever
+        // the engine generates, and that is not movement.
+        refuse_unplanned_movement(
+            &plans(keyed(None, &["id"])),
+            &before,
+            &after_with(keyed(Some("PK__new__3213E83F"), &["id"])),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("an unnamed key is named by the database");
+
+        // A unique constraint is nothing but its columns, so the same holds.
+        let uniqued = |columns: &[&str]| {
+            let mut t = declared();
+            t.unique.insert(
+                "uq_new".to_owned(),
+                pbps_model::UniqueConstraint {
+                    columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+                },
+            );
+            t
+        };
+        let e = refuse_unplanned_movement(
+            &plans(uniqued(&["id"])),
+            &before,
+            &after_with(uniqued(&["other"])),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a unique constraint nobody planned");
+        assert!(format!("{e:#}").contains("uq_new"), "{e:#}");
 
         // And one the CREATE asked for that is not there once it has run.
         let e = refuse_unplanned_movement(

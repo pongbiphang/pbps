@@ -7009,7 +7009,7 @@ fn a_created_table_with_a_foreign_key_applies() {
     // creates, which is why the differ splits them out at all.
     std::fs::write(
         d.dir.join("schema/dbo.child.yml"),
-        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\nprimary_key: {name: pk_child, columns: [id]}\nforeign_keys:\n  fk_child_t:\n    columns: [t_id]\n    references: dbo.t(id)\n",
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\n  code: {type: varchar(20)}\n  note: {type: nvarchar(50)}\nprimary_key: {name: pk_child, columns: [id]}\nunique:\n  uq_child_code: [code]\nindexes:\n  ix_child_t:\n    columns: [t_id]\n    include: [note]\nforeign_keys:\n  fk_child_t:\n    columns: [t_id]\n    references: dbo.t(id)\n",
     )
     .unwrap();
     std::fs::write(

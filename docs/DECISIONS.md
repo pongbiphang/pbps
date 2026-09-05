@@ -2540,3 +2540,26 @@ SPEC is in sync with all of these.
     applies one now, over two tables the same plan creates so the split is
     real, and it fails against 181's code. **A guard that has no live plan
     exercising the shape it guards is not covered by the suite being green.**
+
+183. **A part is not just a name, where the declaration says what it is.**
+    181 compared a created table's components by name, on the argument that
+    what they *are* comes back in the engine's spelling. That argument is
+    right about two fields and wrong about the rest: a primary key put back on
+    different columns, or under a different declared name, is `Some` on both
+    sides and a presence check accepts it. So is a unique constraint moved to
+    another column under its own name.
+    The line is which fields the engine renders for itself. A **check** is
+    nothing but an expression and SQL Server rewrites it — 167's problem — and
+    an **index's filter** is one too; those two stay with the name comparison.
+    Everything else is structure the declaration states outright: a unique
+    constraint's columns, an index's columns, includes and uniqueness, a
+    primary key's columns, and its name **where the declaration gives one** —
+    `name: None` leaves the naming to the database, and `PK__t__3213E83F` is
+    not movement.
+    Verified against the engine rather than argued: the live apply of a
+    created table now carries a named primary key, a unique constraint and an
+    index with an `INCLUDE`, and it passes — so the read-back really does
+    match the declaration in every field this compares. That test proves the
+    absence of a false refusal; the unit test proves the detection. Neither
+    proves the other, and after 182 it is worth writing down that they are two
+    different claims.
