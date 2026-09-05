@@ -64,6 +64,8 @@ checksum-pinned, and state lives in the database itself.
   issues, never extra scope on this PR.
 - Reply on each fixed thread yourself: "Fixed in `<sha>`. <what changed>.
   <which test pins it>." Those three facts, nothing else.
+- Resolve each thread yourself once you have replied on it — fixed or deferred
+  to an issue alike. An open thread reads as unanswered.
 - Stop after three consecutive reviews with no P1, or as soon as a review
   reports no findings; a P1 resets the count. Count a review only if its
   `Reviewed commit:` is the pushed head. Never push a docs-only commit to move
