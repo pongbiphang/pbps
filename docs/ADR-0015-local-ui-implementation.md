@@ -271,15 +271,24 @@ The steps:
    `HEAD`'s lock itself when `HEAD` names the branch it moves (**measured**:
    with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
    UI releases `HEAD.lock` for this one command and takes it back right
-   after, then checks that `HEAD` is still symbolic to the recorded branch
-   and that the branch still names `<oid>` (`git rev-parse
-   refs/heads/<branch>`): the gap admits a `symbolic-ref` and it admits a
-   `reset --soft`, which moves the branch under a held index lock, and
-   either leaves an index built for `<oid>` wrong for the checkout. If
-   either check fails, the commit exists and is where `update-ref` put it,
-   but the checkout is no longer at it, so step 6 does not happen and
-   nothing is pushed: the index lock is discarded, the index is as it was,
-   and the page says where the commit is and what moved. **Measured**
+   after, together with the branch's own lock — an empty
+   `<git-common-dir>/refs/heads/<branch>.lock`, created exclusively — and
+   only then checks that `HEAD` is still symbolic to the recorded branch and
+   that the branch still names `<oid>` (`git rev-parse refs/heads/<branch>`).
+   The gap admits a `symbolic-ref` and it admits a `reset --soft`, which
+   moves the branch under a held index lock, and either leaves an index
+   built for `<oid>` wrong for the checkout; and a branch is shared by every
+   worktree of the repository while `HEAD.lock` and `index.lock` belong to
+   one, so without the branch's lock a `git update-ref` from a sibling
+   worktree could move it after the check and before step 6 (**measured**:
+   with the linked worktree's `HEAD.lock` and `index.lock` held, the update
+   from the main worktree went through; with the branch's lock held too, it
+   failed with `cannot lock ref`, while the UI could still read the ref).
+   Both locks are held through step 6. If either check fails, the commit
+   exists and is where `update-ref` put it, but the checkout is no longer
+   at it, so step 6 does not happen and nothing is pushed: the locks are
+   discarded, the index is as it was, and the page says where the commit is
+   and what moved. **Measured**
    both ways: undisturbed, the check passed and the index was installed
    clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
    the branch held the commit, the sibling was untouched, and the index was
