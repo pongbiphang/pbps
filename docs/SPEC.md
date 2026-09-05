@@ -1502,7 +1502,7 @@ not by a version number.
 | **Phase 3** | `__pbps_state` / locking / `verify` (with `--format json`) / `apply` / the `--allow` gate / the rename impact report and automatic preflight probes (7.5) / `snapshot` / `baseline` / `bootstrap` / the `on_apply`, `on_apply_attempt`, and `on_drift` hooks / `status` (9.4); the emitter honours `strategy: online` and `plan --db` classifies by the server's real edition; the optional dev database (9.3) | The complete product |
 | **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
-| **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
+| **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the first built-in analyzer catalogue ([ADR-0008](ADR-0008-policies.md), Decision 6) | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
 | **Phase 5** | The PostgreSQL dialect, designed against a real server before it is built ([ADR-0009](ADR-0009-postgres-modules.md) modules, [ADR-0010](ADR-0010-postgres-privileges.md) privileges, [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) the dialect seam, [ADR-0012](ADR-0012-postgres-type-catalogue.md) the type catalogue, [ADR-0013](ADR-0013-postgres-reference-data.md) reference data, [ADR-0014](ADR-0014-driver-seam-tested.md) the driver seam); then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a single-user viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own. Multi-tenant and hosted deployment are out of the open-source scope by decision, and get their own ADR | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
 
@@ -1792,9 +1792,12 @@ and `status`; and the interactive prompt of 6.3, which was the last part of
 
 Phase 4 delivered the `policies:` block and the first analyzer catalogue
 ([ADR-0008](ADR-0008-policies.md)), and the documented pipelines are in
-[CI.md](CI.md). What remains in 14.1 is P1 and P2, and belongs to the later
-phases: operational estimates, `state show / diff / export`, the wider analyzer
-catalogue, the optional UI and a versioned CI component.
+[CI.md](CI.md). What remains in 14.1 is P1 and P2: operational estimates,
+`state show / diff / export`, the optional UI (Phase 6) and a versioned CI
+component, and the wider analyzer catalogue. The catalogue is not a phase of
+its own: it is depth over the typed `ChangeSet`, added rule by rule, and the
+rules that need the target's row counts belong beside the operational estimate
+in the connected pre-flight (ADR-0008, Decision 6), so they arrive with it.
 
 Acceptance criteria for that slice:
 
