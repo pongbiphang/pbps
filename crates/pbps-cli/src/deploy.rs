@@ -4300,7 +4300,9 @@ fn staged_movement(
                  {completed} of {total} statement(s) completed and the ledger records them; a \
                  staged apply runs outside a transaction, so nothing was rolled back. The \
                  checkpoint holds the database as it stands, this change included — resuming \
-                 accepts it. `pbps verify` shows what it is."
+                 accepts it. The list above is the record of what moved: the checkpoint \
+                 already holds it, so `pbps verify` reads clean; `pbps status` shows this \
+                 refusal as the failed entry's reason."
             ),
             StagedRead::Closing { total } => anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -7885,10 +7887,22 @@ mod tests {
             "{at_checkpoint}"
         );
         assert!(at_checkpoint.contains("1 of 2"), "{at_checkpoint}");
+        // The checkpoint already recorded the movement, so `verify` compares
+        // against a baseline that holds it and reads clean: the refusal must
+        // not send the operator there to see it. Its own list is the record,
+        // and `status` shows it again as the failed entry's reason.
+        assert!(
+            !at_checkpoint.contains("`pbps verify` shows"),
+            "{at_checkpoint}"
+        );
+        assert!(at_checkpoint.contains("`pbps status`"), "{at_checkpoint}");
         let at_close = refusal(StagedRead::Closing { total: 2 });
         assert!(!at_close.contains("resuming accepts"), "{at_close}");
         assert!(at_close.contains("no checkpoint holds it"), "{at_close}");
         assert!(at_close.contains("`--resume` will refuse"), "{at_close}");
+        // No checkpoint holds a change that landed after the last one, so at
+        // the closing read `verify` does show it, and the pointer stays.
+        assert!(at_close.contains("`pbps verify` shows"), "{at_close}");
         // Both say what moved and that nothing was undone — and neither
         // carries the transactional remedy, which used to sit one line above
         // "nothing was rolled back" in every staged refusal.

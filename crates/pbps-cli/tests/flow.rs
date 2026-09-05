@@ -9444,6 +9444,20 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
     // staged run has committed (DECISIONS 190).
     assert!(err.contains("resuming accepts it"), "{err}");
     assert!(!err.contains("transaction was rolled back"), "{err}");
+    // The fact the message has to respect: the checkpoint recorded the
+    // database with the trigger's row in it, and `verify` compares against
+    // that checkpoint, so it reads clean here. A refusal that sent the
+    // operator to `verify` to see what moved would send them to a blank.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "verify reads clean at a checkpoint that holds the change: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert!(!err.contains("`pbps verify` shows"), "{err}");
+    assert!(err.contains("`pbps status`"), "{err}");
 
     // The statement did commit and the checkpoint records it — that is what a
     // checkpoint is for — but the environment is left mid-deployment rather
