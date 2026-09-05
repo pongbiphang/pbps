@@ -3024,7 +3024,10 @@ SPEC is in sync with all of these.
     `gh workflow run ci.yml --ref <branch>`. A repository ruleset
     (`ci-before-merge`, outside the repo — hence this entry) requires every
     CI job to be green on the PR head, so a push after the run clears the
-    checks and the run has to be repeated. The ruleset is not strict about
-    the branch being up to date with `master`: the `push` trigger on `master`
-    stays as the post-merge safety net, and a strict rule would have forced
-    every open PR to rebase and re-run whenever `master` moved.
+    checks and the run has to be repeated. The ruleset is strict: the branch
+    must contain the latest `master` before the merge, so the tree CI ran on
+    is the tree the merge commit holds, and nothing runs on `master` after a
+    merge. The price is that a PR waiting while `master` moves has to rebase
+    and run CI again; with one issue in flight at a time that is rare, and
+    the alternative — a post-merge run on `master` as a safety net — doubled
+    the minutes of every merge to cover it.

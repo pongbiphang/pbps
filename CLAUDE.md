@@ -71,8 +71,9 @@ checksum-pinned, and state lives in the database itself.
 - On stopping: kill the watch, post no further `@codex review`, and mark the PR
   ready. That triggers one more review; wait for it.
 - A P1 in that review: the count resets — back to the loop, as a draft again.
-- No P1: start CI on the PR head, `gh workflow run ci.yml --ref <branch>`, and
-  wait for it. CI does not run on pushes; a push clears the checks.
+- No P1: rebase onto `origin/master` if it moved, then start CI on the PR
+  head, `gh workflow run ci.yml --ref <branch>`, and wait for it. CI runs only
+  when started; a push clears the checks.
 - Red CI: fix it, push, back to the loop as a draft.
 - Green CI: merge with a merge commit (`gh pr merge --merge`), delete the
   branch, remove the worktree.
@@ -84,9 +85,8 @@ checksum-pinned, and state lives in the database itself.
 ## The issue loop
 
 - One issue at a time. Claim the next only after the current PR is merged.
-- Wait for CI on `master` to pass after the merge. Red CI is the next task, not
-  the next issue.
-- Green CI: take the next issue, following "Taking an issue".
+- Nothing runs on `master` after a merge: the merged tree is the one CI passed.
+- Take the next issue, following "Taking an issue".
 
 ## How to be right here
 

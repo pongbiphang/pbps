@@ -1,17 +1,15 @@
 name: CI
 
-# Not triggered by pull requests. CI is the gate before a merge, not feedback
-# on every push: a review round can take several commits, and running the full
-# matrix on each of them spent the private repository's minutes on states
-# nobody would merge. Run it once, by hand, on the commit that is about to be
-# merged (`gh workflow run ci.yml --ref <branch>`); a repository ruleset
-# requires every job below to be green on the PR head before the merge button
-# works, and a later push clears those checks so the run has to be repeated.
+# Started by hand, once per merge, and by nothing else. CI is the gate before
+# a merge, not feedback on every push: a review round can take several
+# commits, and running the full matrix on each of them spent the private
+# repository's minutes on states nobody would merge. Run it on the commit that
+# is about to be merged (`gh workflow run ci.yml --ref <branch>`). A repository
+# ruleset requires every job below to be green on the PR head and the branch
+# to contain the latest `master`, so the tree that was tested is the tree the
+# merge produces; that is why no run follows the merge. A later push clears
+# the checks and the run has to be repeated (DECISIONS 206).
 on:
-  push:
-    # `master` is the current default branch. Keep `main` subscribed as well so
-    # a future branch rename cannot silently remove post-merge coverage.
-    branches: [master, main]
   workflow_dispatch:
 
 concurrency:
