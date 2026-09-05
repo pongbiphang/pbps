@@ -1262,7 +1262,8 @@ fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     match project.config.dialect {
         DialectName::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
         DialectName::Postgres => bail!(
-            "the postgres dialect is not implemented yet (it arrives in Phase 4); this project's pbps.yml selects it"
+            "the postgres dialect is not implemented yet (it is Phase 5; docs/STATUS.md names the \
+             current phase); this project's pbps.yml selects it"
         ),
     }
 }

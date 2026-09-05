@@ -3670,6 +3670,24 @@ fn doctor_reports_server_capabilities_or_says_it_could_not_read_them() {
 /// `postgres` is an accepted `DialectName` with no implementation yet, so this
 /// is a reachable failure on a perfectly valid project — and it escaped before
 /// the JSON branch, leaving stdout empty.
+/// The one place a user meets the roadmap from the binary must agree with
+/// it: STATUS names PostgreSQL as Phase 5, and the refusal said Phase 4 for
+/// a phase that had closed.
+#[test]
+fn the_postgres_refusal_names_the_phase_status_names() {
+    let d = Demo::new("pgphase");
+    d.table(ONE_COLUMN);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("not implemented yet"), "{err}");
+    assert!(err.contains("Phase 5"), "{err}");
+    assert!(err.contains("docs/STATUS.md"), "{err}");
+    assert!(!err.contains("Phase 4"), "{err}");
+}
+
 #[test]
 fn validate_json_emits_an_envelope_for_a_dialect_with_no_implementation() {
     let d = Demo::new("validatedialect");
