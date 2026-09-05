@@ -30,10 +30,12 @@ believed.
 
 `pbps ui` starts a server, and every question the page asks is answered by
 spawning the same executable (`std::env::current_exe()`) with the same
-arguments a user would type, always with `--format json` and `--no-input`, and
-relaying the envelope. `status`, `verify`, `doctor`, `validate`, `explain
---plan` and `docs` are the whole of the read path, and none of them is changed
-for the UI.
+arguments a user would type — `--no-input` always, and `--format json` for
+every command that speaks the envelope of SPEC §9.8 — and relaying what comes
+back. `status`, `verify`, `doctor`, `validate` and `explain --plan` are
+relayed as the envelope; `docs` speaks none, and is the one command relayed as
+what it produces, the HTML page of `docs --format html` (decision 2). That is
+the whole of the read path, and none of it is changed for the UI.
 
 The obvious design links the crates: call `pbps_diff` and render the
 `ChangeSet` directly, skip the process boundary, skip the JSON. It is refused
@@ -74,7 +76,13 @@ and a second supply chain to the binary that a tool claiming "the reviewed
 plan is exactly what runs" is asked to trust. The air-gapped path of SPEC §9.7
 also has to keep working: the page fetches nothing from a network it may not
 have, so every byte it needs ships in the binary, and a `Content-Security-Policy`
-of `default-src 'self'` says so to the browser.
+whose `default-src` is `'self'` says so to the browser. One resource is inline
+by design and the policy has to say so too: the stylesheet `docs` embeds in
+its page, so that the page renders on a machine without internet
+(`pbps-docs`'s `html.rs`, which tests for the inline `<style>`). The policy
+names that stylesheet by its hash — `style-src 'self' 'sha256-…'`, computed
+from the page when it is served — rather than opening `'unsafe-inline'` for
+every style; scripts stay `'self'`.
 
 The cost is hand-written DOM code and no component reuse. The page renders a
 handful of typed shapes — findings, a drift report, a plan summary, a ledger
@@ -87,12 +95,24 @@ reviewed like any other dependency.
 ### 3. Loopback is not enough: a per-launch token, an `Origin` check, and a loopback peer
 
 The server binds `127.0.0.1` only, on an ephemeral port, and prints one URL at
-launch that carries a random token. Every request — reads included — must
-present that token in a request header, not in a cookie and not in the query
-string, and must arrive from a loopback peer with a `Host` header naming the
-address the server bound and an `Origin` (or none, for a same-origin
+launch that carries a random token in its fragment:
+`http://127.0.0.1:<port>/#<token>`. Every request but one — reads included —
+must present that token in a request header, not in a cookie and not in the
+query string, and must arrive from a loopback peer with a `Host` header naming
+the address the server bound and an `Origin` (or none, for a same-origin
 navigation) that matches it. A request failing any of the four is refused
 before it is routed.
+
+The one exception is the request that has to come first. A navigation to the
+printed URL cannot carry a header the page has not yet been served to set, so
+the shell — the embedded page itself, immutable, holding no project data and
+nothing a stranger could not read out of the binary — is served to any
+loopback peer with a matching `Host`. Its script reads the token from the
+fragment, holds it in memory, and sends it in the header on every request that
+follows; every route but the shell requires it. The fragment is the place for
+it because a browser sends the fragment neither to the server nor in a
+`Referer`; the one place it lands is the browser's history, where it names a
+server that is gone when `pbps ui` exits.
 
 Loopback alone is the obvious design, and it would ship a hole through every
 guardrail in SPEC §14.3. Any page open in the same browser can `POST` to
@@ -102,7 +122,7 @@ sent it unless the server asks. Once step 5 of #64 exists, that request is
 resolves to `127.0.0.1` after the page is loaded — which is what the `Host`
 check is for. The token is a header rather than a cookie because a cookie is
 sent by the browser on the attacker's behalf, and rather than a query string
-because a query string lands in the history and in a `Referer`.
+because a query string reaches the server's log and a `Referer`.
 
 None of that is invented here; it is the standard treatment of a local
 development server, and the reason it is a decision at all is *when*. Reads
@@ -131,11 +151,19 @@ the form would be for.
 ### 5. Git through the `git` command, not a library
 
 Composing intent (step 4 of #64) ends as the same file edit the CLI's intent
-commands make, followed by `git add`, `git commit` and `git push` run as
-subprocesses, in the checkout the UI was started in, with the user's own
-configuration. The page shows `git diff` before the commit and the pushed
-branch after it, and links the merge request where the hosting's URL shape is
-known.
+commands make, followed by a commit of *those paths and nothing else* and a
+`git push`, run as subprocesses in the checkout the UI was started in, with
+the user's own configuration. The commit is `git commit --only -- <paths>`,
+after `git add -N` for a path that is new, which takes the named paths from
+the working tree and leaves whatever the index already held staged and
+uncommitted; the preview the page shows first is `git diff HEAD -- <paths>`,
+which is exactly that content. **Measured** on git 2.43: with an unrelated
+file staged, `git commit --only -- ids.json` committed the ids file alone and
+left the other file staged, and `git diff HEAD -- ids.json` showed the same
+hunk — where a plain `git add` and `git commit` would have swept the staged
+file into the intent commit and pushed it, and a plain `git diff` would not
+have shown it in the preview. After the push the page shows the branch and
+links the merge request where the hosting's URL shape is known.
 
 A library (`gix`, `libgit2`) is the obvious design and would remove a runtime
 dependency on a `git` binary. It is refused because ADR-0006's audit story is
@@ -227,6 +255,6 @@ What this ADR reasons about and has not measured, in the order the steps of
   without one gets the commands to run by hand and no worse.
 - **DNS rebinding through browsers that pass a numeric `Host` unchanged.**
   Decision 3's `Host` check is the standard answer; step 3's tests send the
-  cross-origin `POST`, the rebinding `Host` and the foreign peer and watch each
-  refused, which is the test ADR-0006's "structurally rather than by
-  discipline" asks for.
+  cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
+  any route but the shell without the header, and watch each refused, which is
+  the test ADR-0006's "structurally rather than by discipline" asks for.
