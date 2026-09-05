@@ -660,6 +660,9 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 /// members of one are emitted in name order, which is deterministic, and the
 /// engine has the last word inside the plan's transaction. (A genuine cycle
 /// between views is not creatable by any order.)
+///
+/// One edge the scan cannot supply: between the overloads of one routine name,
+/// which the scan cannot tell apart, only `depends_on:` orders (DECISIONS 212).
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
 
@@ -680,10 +683,23 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
             let attached = name
                 .attached_to()
                 .is_some_and(|t| other.referenced_name().as_ref() == Some(t));
+            // The scan matches a *name*, and where a kind overloads a name is
+            // not an identity (ADR-0009 §1). So `app.f` in a routine's body
+            // matches every `app.f(...)`: between the overloads of one name an
+            // automatic edge would order each against all its siblings, and a
+            // body that mentions its own name — a recursive overload, or two
+            // that call each other one way — would make a cycle out of them.
+            // `depends_on:` could not repair that, because it adds an edge and
+            // cannot remove one. Among the modules that share a routine's name,
+            // therefore, only `depends_on:` orders (DECISIONS 212).
+            //
             // A trigger is named by nothing, so nothing can reference it.
-            let referenced = other
-                .referenced_name()
-                .is_some_and(|n| references(&module.definition, &n));
+            let sibling = matches!(name, ModuleId::Routine(_))
+                && other.referenced_name() == name.referenced_name();
+            let referenced = !sibling
+                && other
+                    .referenced_name()
+                    .is_some_and(|n| references(&module.definition, &n));
             if declared || attached || referenced {
                 set.insert(other);
             }
@@ -903,6 +919,75 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(creation_order(&m, &ModuleDeps::default()), first);
         }
+    }
+
+    /// The scan matches a name, and a name is not an identity where routines
+    /// overload: `app.f` in a body matches every `app.f(...)`. So the overloads
+    /// of one name must not order each other automatically — a body mentioning
+    /// its own name would otherwise put its siblings in a cycle with it, where
+    /// `depends_on:` can add an edge but not take one away. Only `depends_on:`
+    /// orders them, and it must be obeyed.
+    #[test]
+    fn a_reference_to_its_own_name_does_not_order_an_overload_against_its_siblings() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            id("app.f(integer)"),
+            module(ModuleKind::Function, "SELECT app.f(1::text)"),
+        );
+        m.insert(
+            id("app.f(text)"),
+            module(ModuleKind::Function, "SELECT app.f(1)"),
+        );
+        // A third module naming `app.f` cannot tell the overloads apart either,
+        // so it follows all of them — the conservative reading (DECISIONS 212).
+        m.insert(id("app.v"), view("SELECT * FROM app.f(1)"));
+
+        let mut deps = ModuleDeps::default();
+        deps.insert(id("app.f(integer)"), BTreeSet::from([id("app.f(text)")]));
+
+        assert_eq!(
+            creation_order(&m, &deps),
+            vec![id("app.f(text)"), id("app.f(integer)"), id("app.v")],
+            "the explicit hint orders the siblings, and the view follows both"
+        );
+    }
+
+    /// The negative half: two overloads that mention the name and declare
+    /// nothing have no edge either way, so neither is held back. A caller shows
+    /// the difference that name order alone would hide — with an automatic edge
+    /// the two are a cycle, nothing is ever ready, and the fallback emits every
+    /// module in name order, which puts the caller *before* what it calls.
+    #[test]
+    fn overloads_that_declare_nothing_are_not_a_cycle_that_reorders_their_caller() {
+        let mut m = BTreeMap::new();
+        for args in ["integer", "text"] {
+            m.insert(
+                id(&format!("app.f({args})")),
+                module(ModuleKind::Function, "SELECT app.f(1)"),
+            );
+        }
+        m.insert(id("app.caller"), view("SELECT * FROM app.f(1)"));
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.f(integer)"), id("app.f(text)"), id("app.caller")],
+            "the overloads are ready together, and the caller follows both"
+        );
+    }
+
+    /// And the edge that is real stays: a routine referencing a *differently*
+    /// named module is ordered after it, overloading or not.
+    #[test]
+    fn a_routine_still_follows_a_module_it_references_under_another_name() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            id("app.f(integer)"),
+            module(ModuleKind::Function, "SELECT * FROM app.base"),
+        );
+        m.insert(id("app.base"), view("SELECT 1"));
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.base"), id("app.f(integer)")]
+        );
     }
 
     /// A cycle cannot be created in any order. It must not hang or drop a
