@@ -502,3 +502,20 @@ the suite may run as root **and** runs on Windows.
 - An opt-in test must **skip** when its variable is unset, not panic. Copying
   the `panic!` used for `PBPS_TEST_DB` — which CI always sets — turned "this
   test is not enabled here" into a red job.
+- **A check run being green on the head commit does not mean the pull request
+  can see it.** A check run reaches a PR through the *check suite* that holds
+  it, and GitHub associates a suite with the PR only when the run's event is
+  `pull_request`, `pull_request_target`, `push` or `merge_group`. A
+  `workflow_dispatch` suite is associated with nothing, so the Actions tab
+  showed five green jobs on the PR head while the PR's own checks list showed
+  none and the merge box waited on "Expected — Waiting for status to be
+  reported" forever. Querying check runs *by SHA* returns them and agrees with
+  the Actions tab, which is why this reads as a GitHub fault rather than a
+  configuration one. The gate reports a **commit status** instead: a status is
+  addressed to a commit, not to a suite, so there is nothing left to associate
+  (DECISIONS 206).
+- **A required job skipped by `if:` counts as passing.** GitHub treats
+  `success`, `skipped` and `neutral` alike in a required check, so guarding
+  an expensive job with a label or a `draft` test opens the gate instead of
+  closing it. If a condition must gate a merge, the job has to run and fail —
+  or the gate has to be a separate report, as `ci-gate` is.

@@ -37,8 +37,11 @@ checksum-pinned, and state lives in the database itself.
 - Treat the issue as the specification: fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
-- Make every check below pass, then push the issue branch without asking. Never
-  push to `master` or to another issue's branch.
+- Before every push, run locally what CI runs: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets` warning-free, `cargo test --workspace
+  --all-targets`, and `scripts/live-tests.sh`. All green, then push.
+- Push the issue branch without asking. Never push to `master` or to another
+  issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
   permission to open it.
 - Post `@codex review` as soon as the draft is open.
@@ -65,11 +68,21 @@ checksum-pinned, and state lives in the database itself.
   reports no findings; a P1 resets the count. Count a review only if its
   `Reviewed commit:` is the pushed head. Never push a docs-only commit to move
   the count.
-- On stopping: kill the watch, post no further `@codex review`, and mark the PR
-  ready. That triggers one more review; wait for it.
-- No P1 in that review: merge with a merge commit (`gh pr merge --merge`),
-  delete the branch, remove the worktree. A P1: the count resets — back to the
-  loop, as a draft again.
+- On stopping: kill the watch and post no further `@codex review`. Rebase onto
+  `origin/master` if it moved, push, then mark the PR ready. That triggers one
+  more review; wait for it.
+- A P1 in that review: the count resets — back to the loop, as a draft again.
+- No P1: start CI on the PR head, `gh workflow run ci.yml --ref <branch>`, and
+  wait for it. CI runs only when started; a push clears the checks.
+- `master` moved before the merge: rebase, push the rebased head
+  (`git push --force-with-lease`), and only then start CI again — `gh workflow
+  run --ref` resolves the *remote* branch, so a run dispatched before the push
+  tests the head you just replaced. A rebase that needed conflict resolution
+  goes back to the loop as a draft.
+- Red CI: fix it, push, back to the loop as a draft.
+- Green CI: merge with a merge commit (`gh pr merge --merge`), delete the
+  branch, remove the worktree.
+- Never bypass the ruleset that requires green CI on the PR head.
 - Report at each merge: the review count, the merge commit, and every finding
   deferred to an issue.
 - Never add "one more round" — more review is a new instruction.
@@ -77,9 +90,12 @@ checksum-pinned, and state lives in the database itself.
 ## The issue loop
 
 - One issue at a time. Claim the next only after the current PR is merged.
-- Wait for CI on `master` to pass after the merge. Red CI is the next task, not
-  the next issue.
-- Green CI: take the next issue, following "Taking an issue".
+- `ci.yml` runs nothing on `master` after a merge: the merged tree is the one
+  CI passed. The dependency audit is separate and does run on `master` when the
+  merge touched `Cargo.toml`, `Cargo.lock`, `deny.toml` or its own workflow —
+  wait for it in that case, and a red audit is the next task, not the next
+  issue.
+- Take the next issue, following "Taking an issue".
 
 ## How to be right here
 

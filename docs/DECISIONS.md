@@ -3012,3 +3012,54 @@ SPEC is in sync with all of these.
     first version dropped it, and a grant on an *unmanaged* object of such a
     name was then reported, and refused, where an ordinary grant on the same
     object is ignored.
+
+## Repository process
+
+206. **CI is a gate started by hand, not feedback on every push.** The
+    workflow no longer has a `pull_request` trigger. A review round takes
+    several commits, and running the full matrix on each of them spent the
+    private repository's minutes on states nobody would merge. Instead, the
+    checks CI runs are run locally before every push (CLAUDE.md), and CI is
+    started once, on the commit about to be merged, with
+    `gh workflow run ci.yml --ref <branch>`. A repository ruleset
+    (`ci-before-merge`, outside the repo — hence this entry) requires the
+    `ci-gate` commit status to be green on the PR head, so a push after the
+    run clears it and the run has to be repeated. The ruleset is strict: the
+    branch must contain the latest `master` before the merge, so the tree CI
+    ran on is the tree the merge commit holds, and this workflow runs nothing
+    on `master` after a merge. (The dependency audit is a separate workflow and
+    keeps its own `master` trigger: its subject is the advisory database, which
+    moves without the tree.) The price is that a PR waiting while `master`
+    moves has to rebase and run CI again; with one issue in flight at a time
+    that is rare, and the alternative — a post-merge run on `master` as a
+    safety net — doubled the minutes of every merge to cover it.
+
+    **The first version of this did not work, and looked as though it did.**
+    It required the five job names directly, on the theory that a check run
+    on the head commit is a check run. It is not: a check run reaches a pull
+    request through the *check suite* that holds it, and a suite is
+    associated with the PR only when the run's event is one of
+    `pull_request`, `pull_request_target`, `push` or `merge_group`. A
+    `workflow_dispatch` suite is associated with nothing. So the Actions tab
+    showed five green jobs on the PR head while the PR's own checks list
+    showed none and the merge box sat on "Expected — Waiting for status to be
+    reported" forever. The gate this entry describes had locked out the very
+    pull request that introduced it.
+
+    The repair keeps the trigger and changes what is reported: a `gate` job
+    needing all five writes one `ci-gate` **commit status** to the dispatched
+    SHA. A commit status has no suite — it is addressed to a commit and read
+    off that commit — so the association problem cannot arise. It is also
+    what makes the expiry exact rather than incidental: a status belongs to
+    one SHA and is never inherited, so the next push starts with no `ci-gate`
+    and the gate is shut without anyone clearing anything.
+
+    Not the Checks API, which is the more commonly suggested workaround for
+    the same limitation: a check run created that way still lands in a suite,
+    and a suite is the mechanism that just failed here. Not a
+    `pull_request` trigger with a label or `ready_for_review` guard either —
+    a required job skipped by `if:` reports `skipped`, which GitHub counts as
+    success, so the guard that saves the minutes is also the guard that opens
+    the gate. Not a merge queue: `merge_group` would be associated correctly,
+    but merge queues need an organisation-owned or public repository and this
+    one is neither.
