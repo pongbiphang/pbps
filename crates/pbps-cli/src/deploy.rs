@@ -1242,6 +1242,10 @@ fn refuse_unplanned_movement(
     // table's `CREATE` payload is *not* everything it will hold: the differ
     // takes the foreign keys out of it (`std::mem::take`) and emits each as
     // its own change, because they sort after every create (DECISIONS 182).
+    // And the foreign keys' own definitions, which is where they live once
+    // the differ has taken them out of the payload: a name restored without
+    // one leaves what the key points at unchecked (DECISIONS 184).
+    let mut added_fks: BTreeMap<(&TableName, &str), &pbps_model::ForeignKey> = BTreeMap::new();
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
@@ -1310,6 +1314,14 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
+        }
+        if let pbps_model::Change::AddForeignKey {
+            table,
+            name,
+            constraint,
+        } = &p.change
+        {
+            added_fks.insert((table, name.as_str()), constraint.as_ref());
         }
         if let Some(dropped) = p.change.drops() {
             gone.insert(dropped);
@@ -1459,6 +1471,19 @@ fn refuse_unplanned_movement(
                     moved.push(format!(
                         "{now_name} unique `{n}` is not the one this plan's `CREATE TABLE` \
                          declares"
+                    ));
+                }
+            }
+            // A foreign key is nothing but structure — the columns, the
+            // parent and the two referential actions — so all of it is
+            // comparable, and its definition is on the change rather than in
+            // the payload (182).
+            for (n, now) in &now.foreign_keys {
+                if let Some(was) = added_fks.get(&(now_name, n.as_str()))
+                    && *was != now
+                {
+                    moved.push(format!(
+                        "{now_name} foreign key `{n}` is not the one this plan adds"
                     ));
                 }
             }
@@ -5513,6 +5538,76 @@ mod tests {
         )
         .expect_err("a unique constraint nobody planned");
         assert!(format!("{e:#}").contains("uq_new"), "{e:#}");
+
+        // The foreign key's own definition, which lives on the
+        // `AddForeignKey` change rather than in the payload (182): restoring
+        // only its *name* left what it points at unchecked (DECISIONS 184).
+        let fk_to = |columns: &[&str], on_delete| pbps_model::ForeignKey {
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            references_table: "dbo.other".parse().unwrap(),
+            references_columns: vec!["id".to_owned()],
+            on_delete,
+            on_update: Default::default(),
+        };
+        let adding = |fk: pbps_model::ForeignKey| pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(declared()),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
+                    table: "dbo.new".parse().unwrap(),
+                    name: "fk_new".to_owned(),
+                    constraint: Box::new(fk),
+                }),
+            ],
+        };
+        let read_back = |fk: pbps_model::ForeignKey| {
+            let mut t = declared();
+            t.foreign_keys.insert("fk_new".to_owned(), fk);
+            t
+        };
+        let planned = fk_to(&["id"], pbps_model::ReferentialAction::NoAction);
+
+        // Different columns under the planned name.
+        let e = refuse_unplanned_movement(
+            &adding(planned.clone()),
+            &before,
+            &after_with(read_back(fk_to(
+                &["other"],
+                pbps_model::ReferentialAction::NoAction,
+            ))),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a foreign key on columns nobody planned");
+        assert!(format!("{e:#}").contains("fk_new"), "{e:#}");
+
+        // Same columns, different referential action: the engine will delete
+        // rows this plan never said it could.
+        let e = refuse_unplanned_movement(
+            &adding(planned.clone()),
+            &before,
+            &after_with(read_back(fk_to(
+                &["id"],
+                pbps_model::ReferentialAction::Cascade,
+            ))),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a cascade nobody planned");
+        assert!(format!("{e:#}").contains("fk_new"), "{e:#}");
+
+        // And the one the plan actually asked for.
+        refuse_unplanned_movement(
+            &adding(planned.clone()),
+            &before,
+            &after_with(read_back(planned)),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the foreign key this plan adds");
 
         // And one the CREATE asked for that is not there once it has run.
         let e = refuse_unplanned_movement(

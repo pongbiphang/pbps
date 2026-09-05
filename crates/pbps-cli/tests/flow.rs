@@ -7014,7 +7014,7 @@ fn a_created_table_with_a_foreign_key_applies() {
     .unwrap();
     std::fs::write(
         d.dir.join("schema/dbo.grand.yml"),
-        "table: dbo.grand\ncolumns:\n  id: {type: int, nullable: false}\n  child_id: {type: int}\nprimary_key: {name: pk_grand, columns: [id]}\nforeign_keys:\n  fk_grand_child:\n    columns: [child_id]\n    references: dbo.child(id)\n",
+        "table: dbo.grand\ncolumns:\n  id: {type: int, nullable: false}\n  child_id: {type: int}\nprimary_key: {name: pk_grand, columns: [id]}\nforeign_keys:\n  fk_grand_child:\n    columns: [child_id]\n    references: dbo.child(id)\n    on_delete: cascade\n",
     )
     .unwrap();
     // Offline first, to mint the identities a deployment plan is pinned to.

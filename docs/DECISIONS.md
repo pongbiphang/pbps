@@ -2563,3 +2563,25 @@ SPEC is in sync with all of these.
     absence of a false refusal; the unit test proves the detection. Neither
     proves the other, and after 182 it is worth writing down that they are two
     different claims.
+
+184. **The last of the created table's parts: a foreign key's definition.**
+    182 restored the foreign keys the differ takes out of a `CREATE`'s payload
+    — but only their *names*, because that entry was about the false refusal.
+    183 then gave every other part a value comparison and left this one where
+    182 had put it, so a key replaced under the planned name, pointing at
+    different columns or carrying a referential action nobody approved, was
+    accepted and recorded.
+    Nothing about it is the engine's to render — the child columns, the parent
+    and its columns, and the two actions are all structure — so all of it is
+    compared. Its definition comes off the `AddForeignKey` change rather than
+    the payload, which is the only reason it needed a collection of its own.
+    Measured, not assumed: the live created-table apply now declares
+    `on_delete: cascade` on one of its keys, so the comparison runs against a
+    non-default action that the catalog has to read back faithfully, and it
+    passes.
+    Three entries to finish one guard is worth noting for what it says about
+    the shape rather than the bug: **each was a smaller version of the same
+    question — what does this plan promise about the object it creates — and
+    each answered it for one more field.** The remaining two, a check's
+    expression and an index's filter, are answered by nothing here on purpose,
+    because SQL Server rewrites them (167).
