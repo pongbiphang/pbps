@@ -200,9 +200,9 @@ have shown it in the preview.
 same git: a hook that ran `git add b` widened `git commit --only -- a` to a
 commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
 content, not the previewed hunk. So the push is not automatic. Before it, the
-UI reads the commit back — `git diff-tree --no-commit-id --name-only -r HEAD`
-must name exactly the previewed paths, the tree entry the commit holds at
-each path (`git ls-tree <oid> -- <path>`: mode, type and blob) must be the
+UI reads the commit back — `git diff-tree --no-commit-id --name-only -r -z
+HEAD` must name exactly the previewed paths, the tree entry the commit holds
+at each path (`git ls-tree -z <oid> -- <path>`: mode, type and blob) must be the
 mode and type the path had at the recorded tip — `100644 blob` for a new
 one — with the blob the UI hashed after writing it (`git hash-object`), and
 the commit's one parent must be the tip the UI recorded before composing
@@ -210,7 +210,13 @@ the commit's one parent must be the tip the UI recorded before composing
 the whole entry and not the blob alone because a hook can change what the
 blob does not carry: **measured**, a `pre-commit` hook running `chmod +x`
 and `git add` left the blob id equal and turned the entry from `100644` to
-`100755`. It compares object ids and not diff output, because a diff is
+`100755`. Both reads take `-z` and are parsed as bytes: without it `git` quotes any
+path that is not plain ASCII (**measured**: `schéma.json` came back as
+`"sch\303\251ma.json"` from `diff-tree` and `ls-tree`, and unquoted with
+`-z`), and a newline in a name makes a line-delimited answer ambiguous — the
+same rule as SPEC §9.8's `location.file`, which refuses a lossy spelling
+rather than point at a different file. It compares object ids and not diff
+output, because a diff is
 a presentation: a `diff.external` or `textconv` driver, or a path marked
 binary, can render two different blobs as one text, and **measured**, with
 `diff.external` set to a helper printing a constant, `git diff HEAD~1 HEAD`
