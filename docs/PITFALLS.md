@@ -215,6 +215,20 @@ columns the plan does not carry, and its expression is deliberately never
 rewritten, so it can only subtract the rows the plan deletes and give no
 answer at all where the plan inserts or updates.
 
+## The engine fills in a type's defaulted arguments
+
+`decimal` is stored as `decimal(18,0)`, `char` as `char(1)`, `float` as
+`float(53)`, `nvarchar` as `nvarchar(1)`. A declaration that omits the
+arguments therefore does **not** equal the read-back, and any comparison of a
+declared type against a catalog type refuses a valid apply.
+
+Measured, twice — once by reasoning about it and once by trying it. The second
+is the one that settled it: comparing declared and read-back types passed every
+test until the live created-table apply grew a `decimal` column, and then
+failed with `column ``bare_dec`` is not the one this plan's CREATE TABLE
+declares` against a database that was exactly right. Those four columns stay in
+that test for that reason.
+
 ## An exclusion wider than its reason
 
 The pre-delete probe left out every child row the plan *updated*, because a

@@ -1459,6 +1459,30 @@ fn refuse_unplanned_movement(
                 declared.indexes.keys().map(String::as_str).collect(),
                 now.indexes.keys().map(String::as_str).collect(),
             );
+            // A column's own promise, in the fields the catalog reads back
+            // unchanged. The **type** is not one of them, and that is
+            // measured rather than assumed: SQL Server fills in a type's
+            // defaulted arguments, so `decimal` comes back `decimal(18,0)`,
+            // `char` as `char(1)`, `float` as `float(53)` and `nvarchar` as
+            // `nvarchar(1)`. Comparing it refuses a valid apply — the live
+            // created-table test declares all four and would fail again.
+            // A default's **text** is rewritten too (`0` comes back `((0))`),
+            // so only whether there is one at all is comparable
+            // (DECISIONS 185).
+            for (n, was) in &declared.columns {
+                let Some(now) = now.columns.get(n) else {
+                    continue;
+                };
+                if was.nullable != now.nullable
+                    || was.identity != now.identity
+                    || was.default.is_some() != now.default.is_some()
+                {
+                    moved.push(format!(
+                        "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
+                         declares"
+                    ));
+                }
+            }
             // And what those parts *are*, where the declaration says it
             // without the engine's help. Only structure: a check is nothing
             // but an expression and SQL Server rewrites it (167), and an
@@ -1491,7 +1515,11 @@ fn refuse_unplanned_movement(
                 if let Some(now) = now.indexes.get(n)
                     && (was.columns != now.columns
                         || was.include != now.include
-                        || was.unique != now.unique)
+                        || was.unique != now.unique
+                        // The predicate's text is the engine's to rewrite;
+                        // whether there is one at all decides which rows the
+                        // index covers, and is not (DECISIONS 185).
+                        || was.filter.is_some() != now.filter.is_some())
                 {
                     moved.push(format!(
                         "{now_name} index `{n}` is not the one this plan's `CREATE TABLE` \
@@ -5467,6 +5495,86 @@ mod tests {
             Settled::Whole,
         )
         .expect("the foreign key this plan adds to the table it creates");
+
+        // Nor is a column just a name. Its catalog-stable fields are its own
+        // promise: nullability, identity, and whether it has a default at all
+        // (the default's *text* is rewritten by the engine, so only its
+        // presence is comparable) (DECISIONS 185).
+        let column = |f: &dyn Fn(&mut pbps_model::Column)| {
+            let mut c = pbps_model::Column::new("int".parse().unwrap());
+            f(&mut c);
+            let mut t = pbps_model::Table::default();
+            t.columns.insert("id".to_owned(), c);
+            t
+        };
+        let creates = |t: pbps_model::Table| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(t),
+                },
+            )],
+        };
+        let plain = creates(column(&|_| {}));
+        for tamper in [
+            (&|c: &mut pbps_model::Column| c.nullable = false) as &dyn Fn(&mut pbps_model::Column),
+            &|c: &mut pbps_model::Column| {
+                c.identity = Some(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                })
+            },
+            &|c: &mut pbps_model::Column| c.default = Some("((0))".to_owned()),
+        ] {
+            let e = refuse_unplanned_movement(
+                &plain,
+                &before,
+                &after_with(column(tamper)),
+                "prod",
+                Settled::Whole,
+            )
+            .expect_err("a column altered underneath the CREATE");
+            assert!(format!("{e:#}").contains("`id`"), "{e:#}");
+        }
+
+        // A filtered index replaced by an unfiltered one covers different
+        // rows. The predicate's text is the engine's to rewrite; whether
+        // there is one at all is not.
+        let filtered = |filter: Option<&str>| {
+            let mut t = declared();
+            t.indexes.insert(
+                "ix_new".to_owned(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "id".to_owned(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: filter.map(str::to_owned),
+                },
+            );
+            t
+        };
+        let e = refuse_unplanned_movement(
+            &creates(filtered(Some("[id] > 0"))),
+            &before,
+            &after_with(filtered(None)),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a filter this plan declared, gone");
+        assert!(format!("{e:#}").contains("ix_new"), "{e:#}");
+        // But the engine's rewriting of the predicate is not movement.
+        refuse_unplanned_movement(
+            &creates(filtered(Some("[id] > 0"))),
+            &before,
+            &after_with(filtered(Some("([id]>(0))"))),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the engine rewrites a filter's text");
 
         // A part is not just a name. A primary key put back on different
         // columns, or under a different declared name, is `Some` on both

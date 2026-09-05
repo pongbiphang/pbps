@@ -2585,3 +2585,30 @@ SPEC is in sync with all of these.
     each answered it for one more field.** The remaining two, a check's
     expression and an index's filter, are answered by nothing here on purpose,
     because SQL Server rewrites them (167).
+
+185. **A created column's stable fields, and the measurement that decided
+    which ones they are.** 181 compared a created table's columns by name
+    alone, on the argument that what a column *is* comes back in the engine's
+    spelling. Two P1s later that argument has been split properly: the
+    spelling problem is real for exactly two fields, and everything else was
+    being excused for nothing.
+    Compared now: **nullability**, **identity**, and **whether the column has
+    a default at all** — the default's *text* is the engine's, `0` comes back
+    `((0))`. And for an index, **whether it has a filter**: the predicate's
+    text is rewritten like a check's, but its presence decides which rows the
+    index covers and is not the engine's to change.
+    **The type is not compared, and this is the entry's real content.** I
+    tried it, because the reviewer named it and my own reason for excluding it
+    was vague. It passed every test — including a live apply declaring
+    `decimal(18,2)`, `char(3)`, `datetime2(3)`, `nvarchar(max)`,
+    `varbinary(16)`, `bit` and `int` — and then failed the moment that test
+    grew a column declared as bare `decimal`. Measured on the engine: SQL
+    Server fills in a type's defaulted arguments, so `decimal` is stored
+    `decimal(18,0)`, `char` as `char(1)`, `float` as `float(53)` and
+    `nvarchar` as `nvarchar(1)`. Comparing the declared type against the
+    catalog's refuses an apply that is exactly right. Those four columns stay
+    in the live test so that the next person to think this is safe finds out
+    in one run.
+    The general form is worth keeping: **"the engine renders this" is not one
+    property of a value, it is a property of each field**, and the way to find
+    out which is to compare and see what the engine refuses.
