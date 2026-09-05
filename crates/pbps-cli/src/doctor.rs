@@ -356,7 +356,7 @@ fn managed_schemas(project: &Project) -> Vec<String> {
 }
 
 /// Tables a declared foreign key points at that lie **outside** the managed
-/// schemas, spelled `schema.table` for `HAS_PERMS_BY_NAME`.
+/// schemas, for the object-scope question `HAS_PERMS_BY_NAME` answers.
 ///
 /// `validate` accepts a foreign key whose target is not declared — the target
 /// is somebody else's table, and pbps is not asked to manage it — but the
@@ -368,17 +368,18 @@ fn managed_schemas(project: &Project) -> Vec<String> {
 /// Targets *inside* the managed schemas are left out: the schema-scoped
 /// `REFERENCES` and `SELECT` already cover them, and asking twice would report
 /// the same gap at two securables.
-fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
+fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::ObjectName> {
     let Ok(loaded) = crate::load_quiet(project) else {
         return Vec::new();
     };
     let managed: std::collections::BTreeSet<&str> = managed.iter().map(String::as_str).collect();
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out: std::collections::BTreeSet<pbps_model::ObjectName> =
+        std::collections::BTreeSet::new();
     for table in loaded.schema.tables.values() {
         for fk in table.foreign_keys.values() {
             let target = &fk.references_table;
             if !managed.contains(target.schema.as_str()) {
-                out.insert(format!("{}.{}", target.schema, target.name));
+                out.insert(target.clone());
             }
         }
     }
@@ -411,7 +412,7 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
         for target in role.grants.keys() {
             match target {
                 pbps_model::GrantTarget::Object(o) => {
-                    objects.insert(format!("{}.{}", o.schema, o.name));
+                    objects.insert(o.clone());
                 }
                 pbps_model::GrantTarget::Schema(s) => {
                     schemas.insert(s.clone());
@@ -431,7 +432,7 @@ async fn examine(
     name: &str,
     connection: &str,
     schemas: &[String],
-    referenced: &[String],
+    referenced: &[pbps_model::ObjectName],
     granted: &pbps_mssql::doctor::GrantTargets,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below

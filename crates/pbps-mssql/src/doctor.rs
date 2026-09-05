@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param};
+use pbps_model::ObjectName;
 
 use crate::catalog::get;
 
@@ -325,7 +326,7 @@ pub struct Held {
     ///
     /// Empty when the ledger does not exist yet, in which case [`missing`]
     /// falls back to the schema answer.
-    pub ledger_objects: BTreeMap<String, BTreeSet<String>>,
+    pub ledger_objects: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Per foreign-key target outside the managed schemas, the permissions
     /// effective on that **object**.
@@ -335,7 +336,7 @@ pub struct Held {
     /// gap there would fire on every project whose referenced table is created
     /// by something else's deployment. That the table is missing at all is a
     /// question for `plan --db`, which sees the change; `doctor` sees no plan.
-    pub referenced_objects: BTreeMap<String, BTreeSet<String>>,
+    pub referenced_objects: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Whether the project has any role at all — declared, recorded, or being
     /// dropped. `false` switches the role requirements off rather than
@@ -345,7 +346,7 @@ pub struct Held {
     /// Per object a declared role is granted on, the permissions effective on
     /// it — asked about every named object, absent or invisible included, for
     /// the same reason `referenced_objects` is.
-    pub granted_objects: BTreeMap<String, BTreeSet<String>>,
+    pub granted_objects: BTreeMap<ObjectName, BTreeSet<String>>,
 
     /// Per schema a declared role is granted on (`schema::x`), the
     /// schema-scoped permissions effective on it. A schema the database does
@@ -359,9 +360,11 @@ pub struct Held {
 /// that the declarations no longer have is one the next plan drops.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantTargets {
-    /// `schema.object`, qualified the way `HAS_PERMS_BY_NAME` takes it, as
-    /// the declarations grant them.
-    pub objects: Vec<String>,
+    /// The objects the declarations grant on, as two parts. They are spelled
+    /// for `HAS_PERMS_BY_NAME` by the server, with `QUOTENAME` on each part:
+    /// joined here with a dot, a name holding a `.` or a `]` resolved to
+    /// nothing and read as a gap the account did not have.
+    pub objects: Vec<ObjectName>,
     pub schemas: Vec<String>,
     /// The managed roles by name, as the project files know them: declared,
     /// or recorded in the ids file. The roles in the environment's recorded
@@ -388,7 +391,7 @@ pub struct Gap {
 pub enum Securable {
     Database,
     Schema(String),
-    Object(String),
+    Object(ObjectName),
 }
 
 impl std::fmt::Display for Securable {
@@ -406,6 +409,102 @@ impl Gap {
     pub fn securable(&self) -> String {
         self.securable.to_string()
     }
+}
+
+/// The ledger tables as objects, from the names `pbps-db` owns.
+pub fn ledger_tables() -> [ObjectName; 2] {
+    LEDGER_TABLES.map(|t| {
+        t.parse()
+            .expect("the ledger table names are this crate's own `schema.table` constants")
+    })
+}
+
+/// Whether the object-scope question is put to every named object or only
+/// to those the catalog shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Joined against `OBJECT_ID`: an object that is not there is unasked,
+    /// and the caller falls back to the schema answer. Right for the ledger,
+    /// which does not exist before the first deployment.
+    Only,
+    /// Every named object, present or not. Metadata visibility hides an
+    /// object from a principal with no permission on it, so `OBJECT_ID`
+    /// cannot tell "not there" from "not allowed to see"; asking anyway
+    /// lands both as a gap rather than as silence. Right for the foreign-key
+    /// targets and the grant targets, where silence would under-report the
+    /// one case a readiness check is for.
+    OrNot,
+}
+
+/// The object-scope question, spelled once for the three lists that ask it.
+///
+/// Each object is bound as its two parts and the securable is assembled by
+/// the server, `QUOTENAME` on each part, the way the schema queries spell
+/// theirs. Joined on the client with a dot and passed as one string, the
+/// name was read back through the engine's own name parser: `dbo.a.b` split
+/// at the wrong dot and answered 0, and `dbo.x]y` did not parse and answered
+/// NULL — both read as a gap on a permission the account held (measured on
+/// the pinned image, as `sa`). The **requested** parts come back as the key,
+/// not the catalog's spelling, for the reason the schema query gives.
+fn object_permissions_sql<'a>(
+    objects: &'a [ObjectName],
+    perms: &[&'a str],
+    existing: Existing,
+) -> (String, Vec<Param<'a>>) {
+    let mut params: Vec<Param<'a>> = Vec::new();
+    let mut perm_slots = Vec::new();
+    for p in perms {
+        params.push(Param::from(*p));
+        perm_slots.push(format!("(@P{})", params.len()));
+    }
+    let mut object_slots = Vec::new();
+    for o in objects {
+        params.push(Param::from(o.schema.as_str()));
+        params.push(Param::from(o.name.as_str()));
+        object_slots.push(format!("(@P{}, @P{})", params.len() - 1, params.len()));
+    }
+    let filter = match existing {
+        Existing::Only => {
+            " WHERE OBJECT_ID(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), N'U') IS NOT NULL"
+        }
+        Existing::OrNot => "",
+    };
+    let sql = format!(
+        "SELECT o.s AS [schema], o.n AS [object], p.n AS permission, \
+         HAS_PERMS_BY_NAME(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), 'OBJECT', p.n) AS held \
+         FROM (VALUES {}) AS o(s, n) CROSS JOIN (VALUES {}) AS p(n){filter};",
+        object_slots.join(", "),
+        perm_slots.join(", ")
+    );
+    (sql, params)
+}
+
+async fn object_permissions(
+    conn: &mut Conn,
+    objects: &[ObjectName],
+    perms: &[&str],
+    existing: Existing,
+) -> Result<BTreeMap<ObjectName, BTreeSet<String>>, DbError> {
+    let mut out: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
+    // `VALUES ()` is not T-SQL: nothing to ask when nothing is named.
+    if objects.is_empty() {
+        return Ok(out);
+    }
+    let (sql, params) = object_permissions_sql(objects, perms, existing);
+    for row in &conn.query_with(&sql, &params).await? {
+        let schema: &str = get(row, "schema")?;
+        let object: &str = get(row, "object")?;
+        let permission: &str = get(row, "permission")?;
+        // A NULL means the securable did not parse, which `QUOTENAME` on each
+        // part rules out for a name the catalog can hold. Read as "not held"
+        // rather than skipped, for the reason the schema query gives.
+        let held: i32 = row.try_get("held")?.unwrap_or(0);
+        let entry = out.entry(ObjectName::new(schema, object)).or_default();
+        if held != 0 {
+            entry.insert(permission.trim().to_ascii_uppercase());
+        }
+    }
+    Ok(out)
 }
 
 /// The permissions the connected account effectively holds.
@@ -432,7 +531,7 @@ impl Gap {
 pub async fn permissions(
     conn: &mut Conn,
     schemas: &[String],
-    referenced: &[String],
+    referenced: &[ObjectName],
     granted: &GrantTargets,
 ) -> Result<Held, DbError> {
     let rows = conn
@@ -521,98 +620,32 @@ pub async fn permissions(
 
     // The ledger and the lock at object scope. A careful DBA grants INSERT and
     // DELETE on exactly these two tables and nowhere else, and only this
-    // question can see that grant. `sys.objects` filters to what exists: before
-    // the first deployment there is nothing to ask about, and `missing` then
-    // falls back to the schema answer above.
-    let mut params: Vec<Param<'_>> = Vec::new();
-    let mut perm_slots = Vec::new();
-    for p in &ledger_perms {
-        params.push(Param::from(*p));
-        perm_slots.push(format!("(@P{})", params.len()));
-    }
-    let mut object_slots = Vec::new();
-    for t in LEDGER_TABLES {
-        params.push(Param::from(t));
-        object_slots.push(format!("@P{}", params.len()));
-    }
-    let sql = format!(
-        "SELECT o.n AS [object], p.n AS permission, \
-         HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
-         FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n) \
-         WHERE OBJECT_ID(o.n, N'U') IS NOT NULL;",
-        object_slots
-            .iter()
-            .map(|s| format!("({s})"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        perm_slots.join(", ")
-    );
-
-    let mut ledger_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for row in &conn.query_with(&sql, &params).await? {
-        let object: &str = get(row, "object")?;
-        let permission: &str = get(row, "permission")?;
-        let held: i32 = row.try_get("held")?.unwrap_or(0);
-        let entry = ledger_objects.entry(object.to_owned()).or_default();
-        if held != 0 {
-            entry.insert(permission.trim().to_ascii_uppercase());
-        }
-    }
+    // question can see that grant. Only where they exist: before the first
+    // deployment there is nothing to ask about, and `missing` then falls back
+    // to the schema answer above.
+    let ledger_objects =
+        object_permissions(conn, &ledger_tables(), &ledger_perms, Existing::Only).await?;
 
     // Foreign-key targets outside the managed schemas, also at object scope —
-    // but **without** the `OBJECT_ID(...) IS NOT NULL` filter the ledger query
-    // uses, and that difference is deliberate.
-    //
-    // Metadata visibility hides an object from a principal with no permission
-    // on it, so that filter cannot tell "not there" from "not allowed to see".
-    // For the ledger that is harmless: a hidden table falls back to the schema
-    // question, which still reports a gap. Here it would drop the object from
-    // the map entirely and `missing` would say nothing — under-reporting the
-    // one case that matters. So every named target is asked about, and
-    // `HAS_PERMS_BY_NAME` answering 0 becomes a gap whether the table is absent
-    // or invisible. Both of those fail the apply, and the operator can tell
-    // which from the name.
-    let mut referenced_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if !referenced.is_empty() {
-        let referenced_perms: Vec<&str> = REQUIRED
-            .iter()
-            .filter(|r| matches!(r.needed, Needed::Referenced))
-            .map(|r| r.name)
-            .collect();
-        let mut params: Vec<Param<'_>> = Vec::new();
-        let mut perm_slots = Vec::new();
-        for p in &referenced_perms {
-            params.push(Param::from(*p));
-            perm_slots.push(format!("(@P{})", params.len()));
-        }
-        let mut object_slots = Vec::new();
-        for t in referenced {
-            params.push(Param::from(t.as_str()));
-            object_slots.push(format!("(@P{})", params.len()));
-        }
-        let sql = format!(
-            "SELECT o.n AS [object], p.n AS permission, \
-             HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
-             FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n);",
-            object_slots.join(", "),
-            perm_slots.join(", ")
-        );
-        for row in &conn.query_with(&sql, &params).await? {
-            let object: &str = get(row, "object")?;
-            let permission: &str = get(row, "permission")?;
-            let held: i32 = row.try_get("held")?.unwrap_or(0);
-            let entry = referenced_objects.entry(object.to_owned()).or_default();
-            if held != 0 {
-                entry.insert(permission.trim().to_ascii_uppercase());
-            }
-        }
-    }
+    // but every named one, present or not, and that difference from the
+    // ledger question is deliberate (see `Existing`). For the ledger a hidden
+    // table falls back to the schema question, which still reports a gap;
+    // here it would drop the object from the map and `missing` would say
+    // nothing. Absent and invisible both fail the apply, and the operator
+    // can tell which from the name.
+    let referenced_perms: Vec<&str> = REQUIRED
+        .iter()
+        .filter(|r| matches!(r.needed, Needed::Referenced))
+        .map(|r| r.name)
+        .collect();
+    let referenced_objects =
+        object_permissions(conn, referenced, &referenced_perms, Existing::OrNot).await?;
 
     // What the declared roles are granted on (ADR-0005). Objects the way the
     // foreign-key targets are asked — every named one, so absent and
     // invisible both land as a gap — and schemas through `sys.schemas`, so a
     // schema that does not exist yet is unasked rather than reported.
-    let mut granted_objects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut granted_objects: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
     let mut granted_schemas: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // A schema a role is granted on that the database does not have: the
     // `GRANT ... ON SCHEMA::x` fails at apply, and pbps never creates a
@@ -654,13 +687,13 @@ pub async fn permissions(
         // some permission on (metadata visibility), which is precisely not
         // the ones a readiness check is for. A ledger this account cannot
         // read is a gap of its own, reported by the ledger rows.
-        let mut objects: BTreeSet<String> = targets.objects.iter().cloned().collect();
+        let mut objects: BTreeSet<ObjectName> = targets.objects.iter().cloned().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
         for role in recorded.values() {
             for target in role.grants.keys() {
                 match target {
                     pbps_model::GrantTarget::Object(o) => {
-                        objects.insert(format!("{}.{}", o.schema, o.name));
+                        objects.insert(o.clone());
                     }
                     pbps_model::GrantTarget::Schema(s) => {
                         schemas_wanted.insert(s.clone());
@@ -693,7 +726,7 @@ pub async fn permissions(
                 let object: Option<&str> = row.try_get("object")?;
                 match (class, schema, object) {
                     (1, Some(schema), Some(object)) => {
-                        objects.insert(format!("{schema}.{object}"));
+                        objects.insert(ObjectName::new(schema, object));
                     }
                     (3, Some(schema), _) => {
                         schemas_wanted.insert(schema.to_owned());
@@ -702,37 +735,10 @@ pub async fn permissions(
                 }
             }
         }
-        let objects: Vec<String> = objects.into_iter().collect();
+        let objects: Vec<ObjectName> = objects.into_iter().collect();
         let schemas_wanted: Vec<String> = schemas_wanted.into_iter().collect();
-        if !objects.is_empty() {
-            let mut params: Vec<Param<'_>> = Vec::new();
-            let mut perm_slots = Vec::new();
-            for p in &granted_perms {
-                params.push(Param::from(*p));
-                perm_slots.push(format!("(@P{})", params.len()));
-            }
-            let mut object_slots = Vec::new();
-            for t in &objects {
-                params.push(Param::from(t.as_str()));
-                object_slots.push(format!("(@P{})", params.len()));
-            }
-            let sql = format!(
-                "SELECT o.n AS [object], p.n AS permission, \
-                 HAS_PERMS_BY_NAME(o.n, 'OBJECT', p.n) AS held \
-                 FROM (VALUES {}) AS o(n) CROSS JOIN (VALUES {}) AS p(n);",
-                object_slots.join(", "),
-                perm_slots.join(", ")
-            );
-            for row in &conn.query_with(&sql, &params).await? {
-                let object: &str = get(row, "object")?;
-                let permission: &str = get(row, "permission")?;
-                let held: i32 = row.try_get("held")?.unwrap_or(0);
-                let entry = granted_objects.entry(object.to_owned()).or_default();
-                if held != 0 {
-                    entry.insert(permission.trim().to_ascii_uppercase());
-                }
-            }
-        }
+        granted_objects =
+            object_permissions(conn, &objects, &granted_perms, Existing::OrNot).await?;
         if !schemas_wanted.is_empty() {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut perm_slots = Vec::new();
@@ -938,9 +944,9 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                 // manages `dbo` would otherwise have the second one swallowed
                 // by the first, losing the reason it is needed.
                 let mut reported: Vec<Securable> = Vec::new();
-                for table in LEDGER_TABLES {
-                    let (granted, securable) = match held.ledger_objects.get(table) {
-                        Some(granted) => (granted, Securable::Object(table.to_owned())),
+                for table in ledger_tables() {
+                    let (granted, securable) = match held.ledger_objects.get(&table) {
+                        Some(granted) => (granted, Securable::Object(table)),
                         None => (
                             &held.ledger_schema,
                             Securable::Schema(LEDGER_SCHEMA.to_owned()),
@@ -1061,6 +1067,38 @@ mod tests {
         }
     }
 
+    /// The securable handed to `HAS_PERMS_BY_NAME` and to `OBJECT_ID` is
+    /// assembled by the server from the two bound parts, `QUOTENAME` on
+    /// each. Passed as one `schema.object` string, a name holding a `.` or a
+    /// `]` was read back through the engine's name parser and answered 0 or
+    /// NULL — a gap on a permission the account held.
+    #[test]
+    fn the_object_securable_is_quoted_by_the_server_from_two_bound_parts() {
+        let objects = [ObjectName::new("dbo", "a.b"), ObjectName::new("app", "x]y")];
+        for existing in [Existing::Only, Existing::OrNot] {
+            let (sql, params) = object_permissions_sql(&objects, &["SELECT"], existing);
+            assert!(
+                sql.contains(
+                    "HAS_PERMS_BY_NAME(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), 'OBJECT', p.n)"
+                ),
+                "{sql}"
+            );
+            assert!(!sql.contains("HAS_PERMS_BY_NAME(o.n"), "{sql}");
+            assert!(sql.contains("AS o(s, n)"), "{sql}");
+            // One permission, then two slots per object: the parts, never
+            // the joined name.
+            assert_eq!(params.len(), 1 + 2 * objects.len(), "{sql}");
+            assert!(sql.contains("(@P2, @P3), (@P4, @P5)"), "{sql}");
+            assert_eq!(
+                sql.contains(
+                    "WHERE OBJECT_ID(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), N'U') IS NOT NULL"
+                ),
+                existing == Existing::Only,
+                "{sql}"
+            );
+        }
+    }
+
     /// The role permissions are asked for only of a project that declares a
     /// role (ADR-0005): `ALTER ANY ROLE` is security-shaped, and demanding it
     /// of every estate would be the over-demand this list refuses elsewhere.
@@ -1088,15 +1126,18 @@ mod tests {
         held.database.insert("CREATE ROLE".into());
         held.database.insert("ALTER ANY ROLE".into());
         held.granted_objects
-            .insert("app.customer".into(), BTreeSet::new());
+            .insert("app.customer".parse().unwrap(), BTreeSet::new());
         held.granted_schemas
             .insert("app".into(), ["CONTROL".to_owned()].into_iter().collect());
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "CONTROL");
-        assert_eq!(gaps[0].securable, Securable::Object("app.customer".into()));
+        assert_eq!(
+            gaps[0].securable,
+            Securable::Object("app.customer".parse().unwrap())
+        );
         held.granted_objects.insert(
-            "app.customer".into(),
+            "app.customer".parse().unwrap(),
             ["CONTROL".to_owned()].into_iter().collect(),
         );
         assert!(missing(&held).is_empty());
@@ -1113,12 +1154,10 @@ mod tests {
             .collect();
         let mut held = everything(schemas);
         held.ledger_schema.clear();
-        held.ledger_objects = [
-            (pbps_db::ledger::STATE_TABLE.to_owned(), ledger.clone()),
-            (pbps_db::ledger::LOCK_TABLE.to_owned(), ledger),
-        ]
-        .into_iter()
-        .collect();
+        let [state, lock] = ledger_tables();
+        held.ledger_objects = [(state, ledger.clone()), (lock, ledger)]
+            .into_iter()
+            .collect();
         held
     }
 
@@ -1246,7 +1285,7 @@ mod tests {
     #[test]
     fn a_half_present_ledger_still_needs_the_creation_permission() {
         let mut held = ledger_granted_on_the_objects_only(&["app"]);
-        held.ledger_objects.remove(pbps_db::ledger::STATE_TABLE);
+        held.ledger_objects.remove(&ledger_tables()[0]);
         assert_eq!(held.ledger_objects.len(), 1, "exactly one survives");
         held.ledger_schema.clear();
 
@@ -1324,7 +1363,7 @@ mod tests {
     fn losing_delete_on_the_lock_object_is_still_a_gap() {
         let mut held = ledger_granted_on_the_objects_only(&["dbo"]);
         held.ledger_objects
-            .get_mut(pbps_db::ledger::LOCK_TABLE)
+            .get_mut(&ledger_tables()[1])
             .unwrap()
             .remove("DELETE");
         let gaps = missing(&held);
@@ -1358,7 +1397,7 @@ mod tests {
     #[test]
     fn a_half_present_ledger_asks_the_missing_table_at_schema_scope() {
         let mut held = ledger_granted_on_the_objects_only(&["app"]);
-        held.ledger_objects.remove(pbps_db::ledger::STATE_TABLE);
+        held.ledger_objects.remove(&ledger_tables()[0]);
         // The creation permission is the other half of this shape and has its
         // own test; granted here so the gaps below are only the DML ones.
         held.ledger_schema.insert("ALTER".to_owned());
@@ -1511,7 +1550,7 @@ mod tests {
     fn a_foreign_key_out_of_the_managed_schemas_is_asked_about_its_target() {
         let mut held = everything(&["app"]);
         held.referenced_objects
-            .insert("shared.parent".to_owned(), BTreeSet::new());
+            .insert("shared.parent".parse().unwrap(), BTreeSet::new());
 
         let gaps = missing(&held);
         for permission in ["REFERENCES", "SELECT"] {
@@ -1535,7 +1574,7 @@ mod tests {
     fn a_granted_foreign_key_target_reports_nothing() {
         let mut held = everything(&["app"]);
         held.referenced_objects.insert(
-            "shared.parent".to_owned(),
+            "shared.parent".parse().unwrap(),
             ["REFERENCES", "SELECT"]
                 .into_iter()
                 .map(str::to_owned)
