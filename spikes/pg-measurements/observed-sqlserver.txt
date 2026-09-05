@@ -1,0 +1,4 @@
+-- Microsoft SQL Server 2025 (RTM-CU8) (KB5104822) - 17.0.4075.5 (X64) 
+M1 | GRANT ON SCHEMA::dbo covers a table created afterwards | true for an existing table, true for a later one
+M2 | DROP ROLE while the role merely holds a grant | accepted
+M3 | an ordinary insert after keys were forced in | accepted, and took id 3

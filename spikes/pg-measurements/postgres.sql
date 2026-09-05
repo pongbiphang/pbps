@@ -1,0 +1,1583 @@
+-- The evidence behind ADR-0009, ADR-0010, ADR-0012 and ADR-0013.
+--
+-- Self-contained: it builds everything it needs and drops it again, so it can
+-- be run against any PostgreSQL and compared with the committed observation.
+-- Every claim prints one line, so a version that answers differently shows up
+-- as a one-line diff rather than as prose somebody has to re-read.
+--
+-- Output is `<id> | <claim> | <observed>`. The ADRs quote the observed column.
+
+\set ON_ERROR_STOP off
+\pset format unaligned
+\pset fieldsep ' | '
+\pset tuples_only on
+
+DROP SCHEMA IF EXISTS m CASCADE;
+CREATE SCHEMA m;
+SET search_path = m;
+
+-- A helper that answers "did this statement rebuild the table?" with the
+-- engine's own answer — relfilenode changes exactly when the heap is rewritten.
+CREATE FUNCTION m.rewrites(create_sql text, insert_sql text, alter_sql text)
+RETURNS text AS $fn$
+DECLARE before oid; after oid;
+BEGIN
+  EXECUTE 'DROP TABLE IF EXISTS m.probe CASCADE';
+  EXECUTE create_sql;
+  IF insert_sql <> '' THEN EXECUTE insert_sql; END IF;
+  SELECT relfilenode INTO before FROM pg_class WHERE oid = 'm.probe'::regclass;
+  BEGIN EXECUTE alter_sql;
+  EXCEPTION WHEN others THEN RETURN 'refused: ' || replace(SQLERRM, E'\n', ' ');
+  END;
+  SELECT relfilenode INTO after FROM pg_class WHERE oid = 'm.probe'::regclass;
+  RETURN CASE WHEN before IS DISTINCT FROM after THEN 'rewrite' ELSE 'no rewrite' END;
+END $fn$ LANGUAGE plpgsql;
+
+-- Answers "was this statement accepted?" without aborting the script.
+CREATE FUNCTION m.accepts(sql text) RETURNS text AS $fn$
+BEGIN EXECUTE sql; RETURN 'accepted';
+EXCEPTION WHEN others THEN RETURN 'refused: ' || split_part(replace(SQLERRM, E'\n', ' '), E'\n', 1);
+END $fn$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------- ADR-0009
+CREATE TABLE m.customer (customer_id int PRIMARY KEY, full_name text, legacy_code text);
+CREATE VIEW m.active AS SELECT customer_id, full_name FROM m.customer WHERE legacy_code IS NULL;
+
+SELECT 'A1', 'a view definition is stored verbatim',
+       CASE WHEN pg_get_viewdef('m.active'::regclass, true) =
+                 'SELECT customer_id, full_name FROM m.customer WHERE legacy_code IS NULL'
+            THEN 'yes' ELSE 'no' END;
+SELECT 'A2', 'pretty and non-pretty deparse agree',
+       CASE WHEN pg_get_viewdef('m.active'::regclass, true) = pg_get_viewdef('m.active'::regclass, false)
+            THEN 'yes' ELSE 'no' END;
+
+CREATE FUNCTION m.f(a int) RETURNS int AS $$  SELECT   a  +  1; $$ LANGUAGE sql;
+SELECT 'A3', 'a string-literal function body is stored verbatim',
+       CASE WHEN (SELECT prosrc FROM pg_proc WHERE oid='m.f(int)'::regprocedure) = '  SELECT   a  +  1; '
+            THEN 'yes' ELSE 'no' END;
+CREATE FUNCTION m.g(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a + 1; END;
+SELECT 'A4', 'a BEGIN ATOMIC function body is stored verbatim',
+       CASE WHEN coalesce((SELECT prosrc FROM pg_proc WHERE oid='m.g(int)'::regprocedure), '') = ''
+            THEN 'no (prosrc is empty)' ELSE 'yes' END;
+
+CREATE FUNCTION m.f(a text) RETURNS int AS $$ SELECT length(a); $$ LANGUAGE sql;
+CREATE FUNCTION m.f(a varchar, b "char") RETURNS int AS $$ SELECT 0; $$ LANGUAGE sql;
+CREATE PROCEDURE m.f(a date) LANGUAGE sql AS $$ SELECT 1; $$;
+SELECT 'A5', 'functions and procedures overload on one name',
+       count(*)::text || ' objects named m.f'
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' AND p.proname='f';
+SELECT 'A6', 'the engine normalizes the identity arguments',
+       string_agg(pg_get_function_identity_arguments(p.oid), ' / ' ORDER BY p.oid::regprocedure::text)
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' AND p.proname='f';
+SELECT 'A7', 'DROP FUNCTION by bare name, with overloads present', m.accepts('DROP FUNCTION m.f');
+SELECT 'A8', 'a function may share a name with a table',
+       m.accepts('CREATE FUNCTION m.customer(a int) RETURNS int AS $q$ SELECT 1; $q$ LANGUAGE sql');
+SELECT 'A9', 'a view may share a name with a table',
+       m.accepts('CREATE VIEW m.customer AS SELECT 1 AS x');
+
+CREATE TABLE m.t (id int PRIMARY KEY, a varchar(10), b int);
+CREATE VIEW m.v AS SELECT id, a FROM m.t;
+SELECT 'A10', 'CREATE OR REPLACE VIEW appends a column',
+       m.accepts('CREATE OR REPLACE VIEW m.v AS SELECT id, a, b FROM m.t');
+SELECT 'A11', 'CREATE OR REPLACE VIEW removes a column',
+       m.accepts('CREATE OR REPLACE VIEW m.v AS SELECT id, b FROM m.t');
+SELECT 'A12', 'CREATE OR REPLACE VIEW retypes a column',
+       m.accepts('CREATE OR REPLACE VIEW m.v AS SELECT id, a::text, b FROM m.t');
+SELECT 'A13', 'CREATE OR REPLACE FUNCTION changes the return type',
+       m.accepts('CREATE OR REPLACE FUNCTION m.g(a int) RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT 1::bigint; END');
+SELECT m.accepts('CREATE OR REPLACE FUNCTION m.g(a bigint) RETURNS int AS $q$ SELECT 2; $q$ LANGUAGE sql') \gset acc_
+SELECT 'A14', 'CREATE OR REPLACE FUNCTION given a new argument type',
+       :'acc_accepts' || ', leaving ' || count(*)::text || ' function(s) named m.g'
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' AND p.proname='g';
+
+CREATE ROLE m_reader;
+GRANT SELECT ON m.v TO m_reader;
+-- The replace has to happen *after* the grant, or this measures only that the
+-- GRANT worked. A15 read `kept` for that reason in the first version of this
+-- file, and would have gone on reading `kept` if a later PostgreSQL dropped
+-- privileges during a replacement.
+SELECT m.accepts('CREATE OR REPLACE VIEW m.v AS SELECT id, a, b, id AS also_id FROM m.t') \gset a15_
+SELECT 'A15', 'CREATE OR REPLACE VIEW keeps the grants',
+       :'a15_accepts' || ', and the grant is '
+       || CASE WHEN (SELECT relacl::text FROM pg_class WHERE oid='m.v'::regclass) LIKE '%m_reader%'
+               THEN 'kept' ELSE 'LOST' END;
+DROP VIEW m.v; CREATE VIEW m.v AS SELECT id, a FROM m.t;
+SELECT 'A16', 'DROP VIEW then CREATE VIEW keeps the grants',
+       CASE WHEN coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.v'::regclass), '') LIKE '%m_reader%'
+            THEN 'kept' ELSE 'lost' END;
+
+ALTER TABLE m.customer RENAME TO client;
+RESET search_path;   -- or the deparser omits the schema and the check reads wrong
+SELECT 'A17', 'a table rename follows into the stored view definition',
+       CASE WHEN pg_get_viewdef('m.active'::regclass, true) LIKE '%client%' THEN 'yes' ELSE 'no' END;
+ALTER TABLE m.client RENAME COLUMN full_name TO name;
+SELECT 'A18', 'and a column rename rewrites it as',
+       trim(both from regexp_replace(pg_get_viewdef('m.active'::regclass, true), E'[\n ]+', ' ', 'g'));
+ALTER TABLE m.client RENAME COLUMN name TO full_name;
+ALTER TABLE m.client RENAME TO customer;
+SET search_path = m;
+SELECT 'A19', 'ALTER COLUMN TYPE is refused while a plain view depends on it',
+       m.accepts('ALTER TABLE m.customer ALTER COLUMN legacy_code TYPE varchar(20)');
+SELECT 'A20', 'DROP COLUMN is refused while a plain view depends on it',
+       m.accepts('ALTER TABLE m.customer DROP COLUMN legacy_code');
+
+-- ---------------------------------------------------------------- ADR-0010
+CREATE ROLE m_owner_a LOGIN PASSWORD 'x';
+CREATE ROLE m_owner_b LOGIN PASSWORD 'x';
+GRANT CREATE, USAGE ON SCHEMA m TO m_owner_a, m_owner_b;
+GRANT SELECT ON m.t TO m_reader;
+SELECT 'B1', 'a table grant without schema USAGE reads as held',
+       has_table_privilege('m_reader','m.t','SELECT')::text
+       || ' (schema USAGE: ' || has_schema_privilege('m_reader','m','USAGE')::text || ')';
+SELECT 'B2', 'and the read actually succeeds',
+       m.accepts('SET ROLE m_reader; SELECT count(*) FROM m.t; RESET ROLE');
+RESET ROLE;
+
+CREATE ROLE m_all;
+GRANT USAGE ON SCHEMA m TO m_all;
+GRANT SELECT ON ALL TABLES IN SCHEMA m TO m_all;
+CREATE TABLE m.later (id int);
+SELECT 'B3', 'GRANT ON ALL TABLES covers a table created afterwards',
+       has_table_privilege('m_all','m.t','SELECT')::text || ' for an existing table, '
+       || has_table_privilege('m_all','m.later','SELECT')::text || ' for a later one';
+
+ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m GRANT SELECT ON TABLES TO m_all;
+SET ROLE m_owner_a; CREATE TABLE m.by_a (id int); RESET ROLE;
+SET ROLE m_owner_b; CREATE TABLE m.by_b (id int); RESET ROLE;
+SELECT 'B4', 'ALTER DEFAULT PRIVILEGES is keyed to the creating role',
+       has_table_privilege('m_all','m.by_a','SELECT')::text || ' for the named role, '
+       || has_table_privilege('m_all','m.by_b','SELECT')::text || ' for another';
+
+CREATE DATABASE m_other;
+\connect m_other
+SELECT 'B5', 'a role created in another database, seen from this one',
+       'connected to ' || current_database()
+       || ', pg_roles rows for m_reader: '
+       || (SELECT count(*)::text FROM pg_roles WHERE rolname = 'm_reader');
+\connect postgres
+SET search_path = m;
+DROP DATABASE m_other;
+SELECT 'B6', 'DROP ROLE while the role merely holds a grant', m.accepts('DROP ROLE m_reader');
+SELECT 'B7', 'a fresh function''s ACL',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.customer(int)'::regprocedure), 'NULL (the built-in default applies)');
+SELECT 'B8', 'GRANT ALTER', m.accepts('GRANT ALTER ON m.t TO m_all');
+
+CREATE TABLE m.ident (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, v text);
+CREATE TABLE m.ser (id serial PRIMARY KEY, v text);
+CREATE ROLE m_writer LOGIN PASSWORD 'x';
+GRANT USAGE ON SCHEMA m TO m_writer;
+GRANT INSERT ON m.ident, m.ser TO m_writer;
+SELECT 'B9', 'inserting into an identity column with only INSERT granted',
+       m.accepts('SET ROLE m_writer; INSERT INTO m.ident (v) VALUES (''x''); RESET ROLE');
+RESET ROLE;
+SELECT 'B10', 'inserting into a serial column with only INSERT granted',
+       m.accepts('SET ROLE m_writer; INSERT INTO m.ser (v) VALUES (''x''); RESET ROLE');
+RESET ROLE;
+
+-- ---------------------------------------------------------------- ADR-0012
+SELECT 'T-' || lpad(row_number() OVER ()::text, 2, '0'), change, m.rewrites(c, i, a)
+FROM (VALUES
+ ('int -> bigint',              'CREATE TABLE m.probe (c int)',          'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ALTER COLUMN c TYPE bigint'),
+ ('bigint -> int',              'CREATE TABLE m.probe (c bigint)',       'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ALTER COLUMN c TYPE int'),
+ ('varchar(10) -> varchar(20)', 'CREATE TABLE m.probe (c varchar(10))',  'INSERT INTO m.probe VALUES (''ab'')', 'ALTER TABLE m.probe ALTER COLUMN c TYPE varchar(20)'),
+ ('varchar(20) -> varchar(10)', 'CREATE TABLE m.probe (c varchar(20))',  'INSERT INTO m.probe VALUES (''ab'')', 'ALTER TABLE m.probe ALTER COLUMN c TYPE varchar(10)'),
+ ('varchar(20) -> text',        'CREATE TABLE m.probe (c varchar(20))',  'INSERT INTO m.probe VALUES (''ab'')', 'ALTER TABLE m.probe ALTER COLUMN c TYPE text'),
+ ('text -> varchar(20)',        'CREATE TABLE m.probe (c text)',         'INSERT INTO m.probe VALUES (''ab'')', 'ALTER TABLE m.probe ALTER COLUMN c TYPE varchar(20)'),
+ ('numeric(10,2)->(12,2)',      'CREATE TABLE m.probe (c numeric(10,2))','INSERT INTO m.probe VALUES (1.5)',    'ALTER TABLE m.probe ALTER COLUMN c TYPE numeric(12,2)'),
+ ('numeric(10,2)->(10,4)',      'CREATE TABLE m.probe (c numeric(10,2))','INSERT INTO m.probe VALUES (1.5)',    'ALTER TABLE m.probe ALTER COLUMN c TYPE numeric(10,4)'),
+ ('int -> text',                'CREATE TABLE m.probe (c int)',          'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ALTER COLUMN c TYPE text'),
+ ('text -> int, no USING',      'CREATE TABLE m.probe (c text)',         'INSERT INTO m.probe VALUES (''1'')',  'ALTER TABLE m.probe ALTER COLUMN c TYPE int'),
+ ('narrowing over real data',   'CREATE TABLE m.probe (c varchar(20))',  'INSERT INTO m.probe VALUES (''abcdefghij'')','ALTER TABLE m.probe ALTER COLUMN c TYPE varchar(5)'),
+ ('add column, no default',     'CREATE TABLE m.probe (c int)',          'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ADD COLUMN d int'),
+ ('add column, const default',  'CREATE TABLE m.probe (c int)',          'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ADD COLUMN d int DEFAULT 7'),
+ ('add column, volatile default','CREATE TABLE m.probe (c int)',         'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ADD COLUMN d uuid DEFAULT gen_random_uuid()'),
+ ('SET NOT NULL',               'CREATE TABLE m.probe (c int)',          'INSERT INTO m.probe VALUES (1)',      'ALTER TABLE m.probe ALTER COLUMN c SET NOT NULL'),
+ ('DROP COLUMN',                'CREATE TABLE m.probe (c int, d int)',   'INSERT INTO m.probe VALUES (1,2)',    'ALTER TABLE m.probe DROP COLUMN d')
+) AS v(change, c, i, a);
+
+SET timezone = 'UTC';
+SELECT 'T-17', 'timestamp -> timestamptz under UTC',
+       m.rewrites('CREATE TABLE m.probe (c timestamp)', 'INSERT INTO m.probe VALUES (now())',
+                  'ALTER TABLE m.probe ALTER COLUMN c TYPE timestamptz');
+SET timezone = 'America/New_York';
+SELECT 'T-18', 'timestamp -> timestamptz under America/New_York',
+       m.rewrites('CREATE TABLE m.probe (c timestamp)', 'INSERT INTO m.probe VALUES (now())',
+                  'ALTER TABLE m.probe ALTER COLUMN c TYPE timestamptz');
+RESET timezone;
+
+DROP TABLE IF EXISTS m.spell CASCADE;
+CREATE TABLE m.spell (a int, b int4, c int2, d int8, e decimal(10,2), f float, g float8,
+                      h real, j bool, k varchar, l varchar(9), m_ char(5),
+                      n time, o timetz, p timestamp, q serial);
+SELECT 'T-19', 'declared spelling -> catalog spelling',
+       string_agg(attname || '=' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum)
+FROM pg_attribute WHERE attrelid='m.spell'::regclass AND attnum > 0 AND NOT attisdropped;
+
+DROP TABLE IF EXISTS m.floats CASCADE;
+CREATE TABLE m.floats (a float(1), b float(24), c float(25), d float(53));
+SELECT 'T-20', 'float(n) either side of 24',
+       string_agg(attname || '=' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum)
+FROM pg_attribute WHERE attrelid='m.floats'::regclass AND attnum > 0;
+
+DROP TABLE IF EXISTS m.dropped CASCADE;
+CREATE TABLE m.dropped (keep int, gone int);
+ALTER TABLE m.dropped DROP COLUMN gone;
+SELECT 'T-21', 'what a dropped column leaves in the catalog',
+       string_agg(attnum || ':' || attname || ' isdropped=' || attisdropped::text
+                  || ' type=' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum)
+FROM pg_attribute WHERE attrelid='m.dropped'::regclass AND attnum > 0;
+
+-- ---------------------------------------------------------------- ADR-0013
+DROP TABLE IF EXISTS m.defs CASCADE;
+CREATE TABLE m.defs (a text DEFAULT 'plain', b int DEFAULT 0, c varchar(9) DEFAULT 'x');
+SELECT 'R1', 'how a declared default is stored',
+       string_agg(at.attname || ' -> ' || pg_get_expr(d.adbin, d.adrelid), ', ' ORDER BY at.attnum)
+FROM pg_attrdef d JOIN pg_attribute at ON at.attrelid=d.adrelid AND at.attnum=d.adnum
+WHERE d.adrelid='m.defs'::regclass;
+
+DROP TABLE IF EXISTS m.pinned CASCADE;
+CREATE TABLE m.pinned (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.pinned (id, v) OVERRIDING SYSTEM VALUE VALUES (1, 'one');
+INSERT INTO m.pinned (id, v) OVERRIDING SYSTEM VALUE VALUES (2, 'two');
+SELECT 'R2', 'an ordinary insert after keys were forced in',
+       m.accepts('INSERT INTO m.pinned (v) VALUES (''next'')');
+
+DROP TABLE IF EXISTS m.child CASCADE; DROP TABLE IF EXISTS m.parent CASCADE;
+CREATE TABLE m.parent (id int PRIMARY KEY);
+CREATE TABLE m.child (id int PRIMARY KEY, pid int);
+INSERT INTO m.child VALUES (1, 999);
+ALTER TABLE m.child ADD CONSTRAINT fk_child FOREIGN KEY (pid) REFERENCES m.parent(id) NOT VALID;
+SELECT 'R3', 'a NOT VALID foreign key reads as',
+       'convalidated=' || (SELECT convalidated::text FROM pg_constraint
+                            WHERE conname='fk_child' AND conrelid='m.child'::regclass);
+SELECT 'R4', 'a new violating row under a NOT VALID key',
+       m.accepts('INSERT INTO m.child VALUES (2, 998)');
+INSERT INTO m.parent VALUES (5); UPDATE m.child SET pid = 5 WHERE id = 1;
+SELECT 'R5', 'deleting a parent referenced under a NOT VALID key',
+       m.accepts('DELETE FROM m.parent WHERE id = 5');
+
+DROP TABLE IF EXISTS m.keys CASCADE;
+CREATE TABLE m.keys (code varchar(20) PRIMARY KEY);
+INSERT INTO m.keys VALUES ('New');
+SELECT 'R6', 'a key differing only in case',
+       m.accepts('INSERT INTO m.keys VALUES (''new'')')
+       || ' (collation ' || (SELECT datcollate FROM pg_database WHERE datname=current_database()) || ')';
+
+DROP TABLE IF EXISTS m.vals CASCADE;
+CREATE TABLE m.vals (b bytea, d date, i interval);
+INSERT INTO m.vals VALUES ('\x0102', '2026-09-05', '1 day 2 hours');
+SELECT 'R7', 'value rendering under the default session',
+       (SELECT b::text || ' / ' || d::text || ' / ' || i::text FROM m.vals);
+SET bytea_output='escape'; SET datestyle='SQL, DMY'; SET intervalstyle='sql_standard';
+SELECT 'R8', 'the same values after three SET commands',
+       (SELECT b::text || ' / ' || d::text || ' / ' || i::text FROM m.vals);
+RESET bytea_output; RESET datestyle; RESET intervalstyle;
+
+-- ------------------------------------------- the 2026-09-05 review round
+-- Five findings on PR #12; these are the four that needed an engine.
+
+SELECT 'A21', 'a type modifier distinguishes two routines',
+       m.accepts('CREATE FUNCTION m.mod1(a varchar(10)) RETURNS int AS $q$ SELECT 1; $q$ LANGUAGE sql')
+       || ' / ' ||
+       m.accepts('CREATE FUNCTION m.mod1(a varchar(20)) RETURNS int AS $q$ SELECT 2; $q$ LANGUAGE sql');
+SELECT 'A22', 'how the engine identifies that routine',
+       string_agg(pg_get_function_identity_arguments(p.oid), ' | ')
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='m' AND p.proname='mod1';
+
+CREATE FUNCTION m.fresh(a int) RETURNS int AS $$ SELECT a; $$ LANGUAGE sql;
+CREATE ROLE m_nobody;
+GRANT USAGE ON SCHEMA m TO m_nobody;
+SELECT 'B11', 'PUBLIC executing a function nobody granted',
+       m.accepts('SET ROLE m_nobody; SELECT m.fresh(7); RESET ROLE');
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION m.fresh(int) FROM PUBLIC;
+SELECT 'B12', 'the ACL after revoking EXECUTE from PUBLIC',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.fresh(int)'::regprocedure), 'NULL')
+       || ', and then: ' || m.accepts('SET ROLE m_nobody; SELECT m.fresh(7); RESET ROLE');
+RESET ROLE;
+
+CREATE TABLE m.seq (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.seq (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'an undeclared row');
+INSERT INTO m.seq (id, v) OVERRIDING SYSTEM VALUE VALUES (1, 'the row this plan writes');
+ALTER TABLE m.seq ALTER COLUMN id RESTART WITH 2;   -- max(written by the plan) + 1
+SELECT m.accepts('INSERT INTO m.seq (v) VALUES (''the next one'')') \gset r9_
+SELECT 'R9', 'the next insert after restarting at max(written)+1',
+       :'r9_accepts' || ', taking id '
+       || (SELECT max(id)::text FROM m.seq WHERE v = 'the next one')
+       || ' while the table already holds a row at id '
+       || (SELECT max(id)::text FROM m.seq);
+
+
+-- ------------------------------------ the second 2026-09-05 review round
+-- Three more findings on PR #12, all consequences of the first round's fixes.
+
+CREATE FUNCTION m.reb(a int) RETURNS int AS $$ SELECT a; $$ LANGUAGE sql;
+REVOKE EXECUTE ON FUNCTION m.reb(int) FROM PUBLIC;
+SELECT 'A23', 'the ACL after an operator revokes EXECUTE from PUBLIC',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.reb(int)'::regprocedure), 'NULL');
+DROP FUNCTION m.reb(int);
+CREATE FUNCTION m.reb(a int) RETURNS bigint AS $$ SELECT a::bigint; $$ LANGUAGE sql;
+SELECT 'A24', 'the ACL after a drop-and-create rebuild of that function',
+       coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.reb(int)'::regprocedure),
+                'NULL — the default is back, and PUBLIC can execute it again');
+
+-- Can "try the replace, and recover" be implemented? A failed statement dooms
+-- a PostgreSQL transaction; ROLLBACK TO SAVEPOINT un-dooms it.
+CREATE FUNCTION m.sp(a int) RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;
+CREATE TABLE m.evidence (note text);
+BEGIN;
+INSERT INTO m.evidence VALUES ('before the attempt');
+SAVEPOINT try_replace;
+CREATE OR REPLACE FUNCTION m.sp(a int) RETURNS bigint AS $$ SELECT 1::bigint; $$ LANGUAGE sql;
+ROLLBACK TO SAVEPOINT try_replace;
+INSERT INTO m.evidence VALUES ('after rolling back to the savepoint');
+COMMIT;
+SELECT 'A25', 'work surviving a failed CREATE OR REPLACE inside a savepoint',
+       count(*)::text || ' of 2 rows committed' FROM m.evidence;
+
+SELECT 'R10', 'a descending identity, with no MAXVALUE the model could carry',
+       m.accepts('CREATE TABLE m.desc_id (id int GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY -1) PRIMARY KEY)');
+CREATE TABLE m.desc_ok (id int GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY -1 MAXVALUE 100 MINVALUE -1000) PRIMARY KEY, v text);
+INSERT INTO m.desc_ok (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'the pinned row');
+SELECT 'R11', 'RESTART at max(keys)+1 on a descending identity',
+       m.accepts('ALTER TABLE m.desc_ok ALTER COLUMN id RESTART WITH 101');
+SELECT 'R12', 'RESTART at min(keys)-1, the direction the sequence counts',
+       m.accepts('ALTER TABLE m.desc_ok ALTER COLUMN id RESTART WITH 99')
+       || ' / ' || m.accepts('INSERT INTO m.desc_ok (v) VALUES (''generated'')');
+
+SELECT 'R13', 'a backslash-escaped quote inside an E-string',
+       'standard_conforming_strings=' || current_setting('standard_conforming_strings')
+       || ', E''it\''s  here'' is ' || length(E'it\'s  here')::text
+       || ' characters: ' || E'it\'s  here';
+
+-- ------------------------------------- the fourth 2026-09-05 review round
+
+CREATE ROLE m_owner LOGIN PASSWORD 'x';
+GRANT CREATE, USAGE ON SCHEMA m TO m_owner;
+SET ROLE m_owner;
+CREATE FUNCTION m.owned(a int) RETURNS int SECURITY DEFINER AS $$ SELECT a; $$ LANGUAGE sql;
+RESET ROLE;
+SELECT 'A26', 'a SECURITY DEFINER function before a rebuild',
+       'owner=' || (SELECT proowner::regrole::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' secdef=' || (SELECT prosecdef::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' acl=' || coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure), 'NULL');
+DROP FUNCTION m.owned(int);
+CREATE FUNCTION m.owned(a int) RETURNS bigint SECURITY DEFINER AS $$ SELECT a::bigint; $$ LANGUAGE sql;
+SELECT 'A27', 'the same function after the deployment account rebuilds it',
+       'owner=' || (SELECT proowner::regrole::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' secdef=' || (SELECT prosecdef::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure)
+       || ' acl=' || coalesce((SELECT proacl::text FROM pg_proc WHERE oid='m.owned(int)'::regprocedure),
+                              'NULL — so the ACL check cannot see the change');
+
+CREATE TABLE m.lockseq (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.lockseq (v) VALUES ('a');
+BEGIN;
+SELECT max(id) FROM m.lockseq;
+SELECT 'R14', 'the lock held after only reading max(id)',
+       coalesce((SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
+                 WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid()), '(none)')
+       ;   -- what that lock permits is argued in the ADR, not observed here
+ALTER TABLE m.lockseq ALTER COLUMN id RESTART WITH 2;
+SELECT 'R15', 'the lock held once the RESTART runs',
+       (SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks
+        WHERE relation='m.lockseq'::regclass AND pid=pg_backend_pid())
+       ;   -- likewise: the ordering is the observation, the window is the argument
+COMMIT;
+
+-- -------------------------------------- the fifth 2026-09-05 review round
+
+CREATE TABLE m.opt_t (id int PRIMARY KEY, a text);
+CREATE VIEW m.opt_v WITH (security_invoker = true, security_barrier = true)
+  AS SELECT id, a FROM m.opt_t;
+SELECT 'A28', 'options a view carries outside its definition',
+       'reloptions: ' || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL')
+       || ' / pg_get_viewdef shows: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.opt_v'::regclass, true), E'[\n ]+', ' ', 'g'));
+SELECT m.accepts('CREATE OR REPLACE VIEW m.opt_v AS SELECT id, a, id AS also FROM m.opt_t') \gset a29_
+SELECT 'A29', 'those options after CREATE OR REPLACE',
+       :'a29_accepts' || ', reloptions: '
+       || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL — lost');
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v AS SELECT id, a FROM m.opt_t;
+SELECT 'A30', 'those options after a drop-and-create rebuild',
+       'reloptions: '
+       || coalesce((SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE oid='m.opt_v'::regclass), 'NULL — lost');
+
+-- What losing security_invoker actually does to a reader with no rights on the
+-- underlying table.
+CREATE ROLE m_sreader;
+GRANT USAGE ON SCHEMA m TO m_sreader;
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v WITH (security_invoker = true) AS SELECT id, a FROM m.opt_t;
+GRANT SELECT ON m.opt_v TO m_sreader;
+SELECT 'A31', 'a reader querying the view while security_invoker=true',
+       m.accepts('SET ROLE m_sreader; SELECT * FROM m.opt_v; RESET ROLE');
+RESET ROLE;
+DROP VIEW m.opt_v;
+CREATE VIEW m.opt_v AS SELECT id, a FROM m.opt_t;   -- the rebuild pbps would emit
+GRANT SELECT ON m.opt_v TO m_sreader;
+SELECT 'A32', 'the same reader after a rebuild dropped the option',
+       m.accepts('SET ROLE m_sreader; SELECT * FROM m.opt_v; RESET ROLE');
+RESET ROLE;
+
+-- -------------------------------------- the sixth 2026-09-05 review round
+
+CREATE TABLE m.step (id int GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 2) PRIMARY KEY, v text);
+INSERT INTO m.step (v) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f');
+SELECT 'R16', 'the keys a step-2 generator owns',
+       (SELECT string_agg(id::text, ', ' ORDER BY id) FROM m.step);
+INSERT INTO m.step (id, v) OVERRIDING SYSTEM VALUE VALUES (13, 'a pinned row');
+ALTER TABLE m.step ALTER COLUMN id RESTART WITH 14;   -- max(keys) + 1
+INSERT INTO m.step (v) VALUES ('after'), ('and again');
+SELECT 'R17', 'the same generator after restarting at max(keys)+1',
+       (SELECT string_agg(id::text, ', ' ORDER BY id) FROM m.step)
+       || ' — it has crossed onto the even series';
+
+CREATE TABLE m.sp_t (id int PRIMARY KEY, a text);
+SET search_path = '';
+SELECT 'R18', 'an unqualified reference inside a definition, search_path empty',
+       m.accepts('CREATE VIEW m.sp_v AS SELECT id, a FROM sp_t');
+SET search_path = m;
+SELECT 'R19', 'the same definition with the object''s own schema on the path',
+       m.accepts('CREATE VIEW m.sp_v AS SELECT id, a FROM sp_t');
+
+CREATE VIEW m.uv AS SELECT id, a FROM m.sp_t;
+ALTER VIEW m.uv ALTER COLUMN a SET DEFAULT 'from the view default';
+SELECT 'A33', 'a view column default, and where it lives',
+       'pg_attrdef: ' || (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='m.uv'::regclass)
+       || ' / pg_get_viewdef shows: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.uv'::regclass, true), E'[\n ]+', ' ', 'g'));
+DROP VIEW m.uv; CREATE VIEW m.uv AS SELECT id, a FROM m.sp_t;
+SELECT 'A34', 'that default after a drop-and-create rebuild',
+       coalesce((SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d WHERE d.adrelid='m.uv'::regclass),
+                'gone');
+
+-- ----------------------------------- the seventh 2026-09-05 review round
+
+CREATE TABLE m.lockable (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+SELECT 'R20', 'locking a sequence with LOCK TABLE',
+       m.accepts('LOCK TABLE ' || pg_get_serial_sequence('m.lockable','id') || ' IN ACCESS EXCLUSIVE MODE');
+SELECT 'R21', 'locking the sequence''s row with FOR UPDATE',
+       m.accepts('SELECT last_value FROM ' || pg_get_serial_sequence('m.lockable','id') || ' FOR UPDATE');
+
+-- Since no lock conflicts with nextval, the restart must be a write that cannot
+-- move the sequence backwards, whatever another session did in the meantime.
+CREATE TABLE m.never_lower (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.never_lower (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'pinned');
+SELECT 'R22', 'setval(GREATEST(target, nextval)) with the sequence behind the target',
+       'returned ' || setval(pg_get_serial_sequence('m.never_lower','id'),
+                             GREATEST(101, nextval(pg_get_serial_sequence('m.never_lower','id'))))::text;
+SELECT nextval(pg_get_serial_sequence('m.never_lower','id')) \gset n1_
+SELECT nextval(pg_get_serial_sequence('m.never_lower','id')) \gset n2_
+SELECT 'R23', 'the same call after another allocation pushed it past the target',
+       'sequence had reached ' || :'n2_nextval'
+       || ', setval(GREATEST(101, nextval)) returned '
+       || setval(pg_get_serial_sequence('m.never_lower','id'),
+                 GREATEST(101, nextval(pg_get_serial_sequence('m.never_lower','id'))))::text
+       || ' — it did not go back';
+
+CREATE FUNCTION m.scs() RETURNS text AS $fn$
+DECLARE n int;
+BEGIN
+  EXECUTE 'SELECT length(' || chr(39) || 'it' || chr(92) || chr(39) || 's  here' || chr(39) || ')' INTO n;
+  RETURN 'one literal of length ' || n::text;
+EXCEPTION WHEN others THEN RETURN 'refused: ' || split_part(SQLERRM, E'\n', 1);
+END $fn$ LANGUAGE plpgsql;
+SET standard_conforming_strings = on;
+SELECT 'R24', 'a plain literal with a backslash-quote, standard_conforming_strings=on', m.scs();
+SET standard_conforming_strings = off;
+SELECT 'R25', 'the same literal with standard_conforming_strings=off', m.scs();
+SET standard_conforming_strings = on;
+
+CREATE TABLE m.sp2 (id int PRIMARY KEY, a text);
+CREATE VIEW m.sp2v AS SELECT id, a FROM m.sp2;
+SET search_path = '';
+SELECT 'R26', 'pg_get_viewdef with an empty search_path',
+       trim(both from regexp_replace(pg_get_viewdef('m.sp2v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'R27', 'pg_get_viewdef with the object''s schema on the path',
+       trim(both from regexp_replace(pg_get_viewdef('m.sp2v'::regclass, true), E'[\n ]+',' ','g'));
+
+CREATE SCHEMA m_ext;
+CREATE FUNCTION m_ext.helper(a int) RETURNS int AS $$ SELECT a * 2; $$ LANGUAGE sql;
+SET search_path = m;
+SELECT 'R28', 'an unqualified function from another schema, path = the object''s schema only',
+       m.accepts('CREATE VIEW m.uses AS SELECT id, helper(id) AS h FROM m.sp2');
+SET search_path = m, m_ext;
+SELECT 'R29', 'the same definition with that other schema on the path',
+       m.accepts('CREATE VIEW m.uses AS SELECT id, helper(id) AS h FROM m.sp2');
+SET search_path = m;
+DROP SCHEMA m_ext CASCADE;
+
+-- ------------------------------------ the eighth 2026-09-05 review round
+
+CREATE TABLE m.race (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO m.race (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'pinned');
+SELECT setval(pg_get_serial_sequence('m.race','id'), 104) \gset seed_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset inner_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset other_
+SELECT setval(pg_get_serial_sequence('m.race','id'), GREATEST(101, :inner_nextval)) \gset wrote_
+SELECT nextval(pg_get_serial_sequence('m.race','id')) \gset after_
+SELECT 'R30', 'setval(GREATEST(target, nextval)) interleaved with one other allocation',
+       'inner nextval ' || :'inner_nextval'
+       || ', another session took ' || :'other_nextval'
+       || ', setval wrote ' || :'wrote_setval'
+       || ', next caller receives ' || :'after_nextval'
+       || CASE WHEN :after_nextval = :other_nextval THEN ' — already issued' ELSE ' — no collision' END;
+
+CREATE SEQUENCE m.fresh_seq;
+ALTER SEQUENCE m.fresh_seq INCREMENT BY 100;
+SELECT nextval('m.fresh_seq') \gset f1_
+SELECT nextval('m.fresh_seq') \gset f2_
+SELECT 'R31', 'a widened INCREMENT on a sequence never called',
+       'first nextval ' || :'f1_nextval' || ', second ' || :'f2_nextval'
+       || ' — the increment does not apply to the first call';
+
+SELECT 'R32', 'ALTER SEQUENCE INCREMENT BY does not move last_value',
+       (SELECT 'last_value ' || last_value::text FROM m.fresh_seq) AS before_alter;
+ALTER SEQUENCE m.fresh_seq INCREMENT BY 1;
+SELECT 'R33', 'and after restoring the increment',
+       (SELECT 'last_value ' || last_value::text || ' — nothing was lowered' FROM m.fresh_seq);
+
+-- ------------------------------------- the ninth 2026-09-05 review round
+
+CREATE ROLE m_deploy LOGIN PASSWORD 'x';
+CREATE ROLE m_bystander;
+GRANT CREATE, USAGE ON SCHEMA m TO m_deploy;
+CREATE TABLE m.dp_t (id int PRIMARY KEY, a text);
+ALTER TABLE m.dp_t OWNER TO m_deploy;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_deploy IN SCHEMA m GRANT SELECT ON TABLES TO m_bystander;
+SET ROLE m_deploy;
+CREATE VIEW m.dp_v AS SELECT id, a FROM m.dp_t;
+RESET ROLE;
+SELECT 'A35', 'the ACL of a view the deployment role just created',
+       coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.dp_v'::regclass), 'NULL')
+       || ' — granted by no declaration';
+SELECT 'A36', 'so a rebuild of an object whose old ACL was NULL',
+       'old acl NULL passes an "reproduce the old ACL" check, new acl is '
+       || coalesce((SELECT relacl::text FROM pg_class WHERE oid='m.dp_v'::regclass), 'NULL');
+
+SET search_path = '';
+SELECT 'R34', 'a catalog query with an empty search_path',
+       count(*)::text || ' row(s) from pg_class — pg_catalog stays reachable'
+FROM pg_class WHERE relname = 'dp_t';
+SELECT 'R35', 'deparse under an empty path is fully qualified',
+       trim(both from regexp_replace(pg_get_viewdef('m.dp_v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'R36', 'the same view deparsed under the project path',
+       trim(both from regexp_replace(pg_get_viewdef('m.dp_v'::regclass, true), E'[\n ]+',' ','g'));
+
+ALTER DEFAULT PRIVILEGES FOR ROLE m_deploy IN SCHEMA m REVOKE SELECT ON TABLES FROM m_bystander;
+
+-- ------------------------------------- the tenth 2026-09-05 review round
+
+CREATE SCHEMA m_a; CREATE SCHEMA m_b;
+CREATE TABLE m_a.t (id int PRIMARY KEY, marker text);
+CREATE TABLE m_b.t (id int PRIMARY KEY, marker text);
+INSERT INTO m_a.t VALUES (1, 'schema m_a');
+INSERT INTO m_b.t VALUES (1, 'schema m_b');
+SET search_path = m_a, m_b;
+CREATE VIEW m_b.v AS SELECT id, marker FROM t;
+SELECT 'R37', 'a view in m_b created under a path ordered (m_a, m_b)',
+       'binds to ' || (SELECT marker FROM m_b.v)
+       || ', and its stored definition is only: '
+       || trim(both from regexp_replace(pg_get_viewdef('m_b.v'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m_b, m_a;
+CREATE VIEW m_b.v2 AS SELECT id, marker FROM t;
+SELECT 'R38', 'the same view with its own schema first',
+       'binds to ' || (SELECT marker FROM m_b.v2);
+SET search_path = m;
+DROP SCHEMA m_a CASCADE; DROP SCHEMA m_b CASCADE;
+
+CREATE TABLE m.cust (id int PRIMARY KEY, full_name text);
+CREATE VIEW m.act AS SELECT id, full_name FROM m.cust;
+ALTER TABLE m.cust RENAME TO clnt;
+SET search_path = '';
+SELECT 'A37', 'what a table rename leaves in the view''s stored definition',
+       trim(both from regexp_replace(pg_get_viewdef('m.act'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m;
+SELECT 'A38', 'recreating that view from the unchanged declaration text',
+       m.accepts('CREATE VIEW m.rebuilt AS SELECT id, full_name FROM m.cust');
+
+-- ---------------------------------- the twelfth 2026-09-05 review round
+
+CREATE TABLE m.orders (id int PRIMARY KEY);
+CREATE TABLE m.customers (id int PRIMARY KEY);
+CREATE FUNCTION m.noop() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER audit AFTER INSERT ON m.orders FOR EACH ROW EXECUTE FUNCTION m.noop();
+CREATE TRIGGER audit AFTER INSERT ON m.customers FOR EACH ROW EXECUTE FUNCTION m.noop();
+SELECT 'A39', 'two triggers of the same name in one schema',
+       string_agg(c.relname || '.' || t.tgname, ', ' ORDER BY c.relname)
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'm' AND NOT t.tgisinternal;
+SELECT 'A40', 'DROP TRIGGER without naming the table', m.accepts('DROP TRIGGER audit');
+SELECT 'A41', 'DROP TRIGGER naming the table', m.accepts('DROP TRIGGER audit ON m.orders');
+
+-- -------------------------------- the thirteenth 2026-09-05 review round
+
+CREATE FUNCTION m.fdep(a int) RETURNS int IMMUTABLE AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE TABLE m.d_chk (id int PRIMARY KEY, v int CHECK (m.fdep(v) > 0));
+SELECT 'A42', 'DROP FUNCTION with a managed check constraint on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_chk;
+CREATE TABLE m.d_def (id int PRIMARY KEY, v int DEFAULT m.fdep(1));
+SELECT 'A43', 'DROP FUNCTION with a column default on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_def;
+CREATE TABLE m.d_gen (id int PRIMARY KEY, v int, g int GENERATED ALWAYS AS (m.fdep(v)) STORED);
+SELECT 'A44', 'DROP FUNCTION with a generated column on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+DROP TABLE m.d_gen;
+CREATE TABLE m.d_idx (id int PRIMARY KEY, v int);
+CREATE INDEX ix_fdep ON m.d_idx (m.fdep(v));
+SELECT 'A45', 'DROP FUNCTION with an expression index on it',
+       m.accepts('DROP FUNCTION m.fdep(int)');
+
+-- ------------------------------- the fourteenth 2026-09-05 review round
+
+CREATE SEQUENCE m.roll;
+BEGIN;
+SELECT nextval('m.roll') FROM generate_series(1,5) \gset r_
+ROLLBACK;
+SELECT 'R39', 'a sequence advance after the transaction that made it rolled back',
+       'last_value ' || (SELECT last_value::text FROM m.roll) || ' — the advance survived';
+
+CREATE SEQUENCE m.cyc START 8 MINVALUE 1 MAXVALUE 10 CYCLE;
+SELECT 'R40', 'nextval on a CYCLE sequence, six calls',
+       (SELECT string_agg(nextval('m.cyc')::text, ', ') FROM generate_series(1,6))
+       || ' — not monotonic, so "advance until past the maximum" never ends';
+SELECT 'R41', 'what the catalog says about that sequence',
+       'cycle=' || seqcycle::text || ' min=' || seqmin::text || ' max=' || seqmax::text
+       || ' — detectable, though Identity records only seed and increment'
+FROM pg_sequence WHERE seqrelid = 'm.cyc'::regclass;
+
+-- -------------------------------- the fifteenth 2026-09-05 review round
+-- The two ownership prerequisites. Both refusals need a *non-superuser*
+-- session — a superuser bypasses them — so the session transcripts are in
+-- ADR-0009 and what one connection can establish is the catalog state.
+
+CREATE ROLE m_ow_owner;
+CREATE ROLE m_ow_deploy LOGIN PASSWORD 'x';
+GRANT CREATE, USAGE ON SCHEMA m TO m_ow_owner;
+SELECT 'A46', 'the target owner''s CREATE on the containing schema',
+       has_schema_privilege('m_ow_owner','m','CREATE')::text || ' — the prerequisite ALTER ... OWNER TO checks';
+REVOKE CREATE ON SCHEMA m FROM m_ow_owner;
+SELECT 'A47', 'the same after REVOKE CREATE',
+       has_schema_privilege('m_ow_owner','m','CREATE')::text
+       || ' — an object may still be validly owned by it';
+GRANT m_ow_owner TO m_ow_deploy WITH SET FALSE;
+SELECT 'A48', 'membership granted WITH SET FALSE',
+       'set_option=' || set_option::text || ' — membership without the right to assume it'
+FROM pg_auth_members WHERE roleid='m_ow_owner'::regrole AND member='m_ow_deploy'::regrole;
+
+-- ------------------------------- the seventeenth 2026-09-05 review round
+-- The interleaving itself needs two sessions and is quoted in ADR-0009; what
+-- one connection can show is that nothing locks pg_default_acl and that a
+-- statement later in the same transaction reads it fresh.
+
+CREATE ROLE m_dp_owner;
+CREATE ROLE m_dp_by;
+GRANT CREATE, USAGE ON SCHEMA m TO m_dp_owner;
+CREATE TABLE m.dp2_t (id int PRIMARY KEY);
+BEGIN;
+SELECT 'A49', 'default-ACL entries a preflight would see at BEGIN',
+       count(*)::text FROM pg_default_acl WHERE defaclnamespace = 'm'::regnamespace;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_dp_owner IN SCHEMA m GRANT SELECT ON TABLES TO m_dp_by;
+SELECT 'A50', 'and what the same transaction sees a statement later',
+       count(*)::text || ' — the catalog read is not pinned to the preflight'
+FROM pg_default_acl WHERE defaclnamespace = 'm'::regnamespace;
+COMMIT;
+ALTER DEFAULT PRIVILEGES FOR ROLE m_dp_owner IN SCHEMA m REVOKE SELECT ON TABLES FROM m_dp_by;
+
+-- -------------------------------- the eighteenth 2026-09-05 review round
+
+CREATE FUNCTION m.dep_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.dep_plpgsql() RETURNS int AS $$ BEGIN RETURN m.dep_f(1); END $$ LANGUAGE plpgsql;
+CREATE FUNCTION m.dep_sqlstr() RETURNS int AS $$ SELECT m.dep_f(1) $$ LANGUAGE sql;
+CREATE FUNCTION m.dep_atomic() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT m.dep_f(1); END;
+SELECT 'A51', 'which of three callers pg_depend records an edge for',
+       coalesce((SELECT string_agg(DISTINCT d.objid::regprocedure::text, ', ') FROM pg_depend d
+                 WHERE d.refobjid = 'm.dep_f(int)'::regprocedure
+                   AND d.deptype = 'n' AND d.classid = 'pg_proc'::regclass), 'none')
+       || ' — the plpgsql and string-literal bodies record nothing';
+DROP FUNCTION m.dep_atomic();
+SELECT 'A52', 'dropping the function with only opaque callers left',
+       m.accepts('DROP FUNCTION m.dep_f(int)');
+SELECT 'A53', 'creating it again under a new signature',
+       m.accepts('CREATE FUNCTION m.dep_f(a int, b int) RETURNS int AS $q$ SELECT a + b $q$ LANGUAGE sql');
+SELECT 'A54', 'and calling the plpgsql caller after that apply committed',
+       m.accepts('SELECT m.dep_plpgsql()');
+
+-- ------------------------------- the nineteenth 2026-09-05 review round
+
+CREATE TABLE m.tz_a (t timestamp);
+CREATE TABLE m.tz_b (t timestamp);
+INSERT INTO m.tz_a VALUES ('2026-01-15 12:00:00');
+INSERT INTO m.tz_b VALUES ('2026-01-15 12:00:00');
+SET TimeZone = 'UTC';
+ALTER TABLE m.tz_a ALTER COLUMN t TYPE timestamptz;
+SET TimeZone = 'America/New_York';
+ALTER TABLE m.tz_b ALTER COLUMN t TYPE timestamptz;
+SET TimeZone = 'UTC';
+SELECT 'R42', 'the same wall-clock value converted under two session zones',
+       'UTC -> ' || (SELECT t::text FROM m.tz_a)
+       || ' / America/New_York -> ' || (SELECT t::text FROM m.tz_b)
+       || ' — they differ by ' || ((SELECT t FROM m.tz_b) - (SELECT t FROM m.tz_a))::text;
+RESET TimeZone;
+
+SELECT 'A55', 'creating a plpgsql body that names a function which does not exist',
+       m.accepts('CREATE FUNCTION m.missing_caller() RETURNS int AS $q$ BEGIN RETURN m.no_such_fn(1); END $q$ LANGUAGE plpgsql');
+SELECT 'A56', 'and calling it',
+       m.accepts('SELECT m.missing_caller()');
+
+-- ------------------------------- the twentieth 2026-09-05 review round
+
+SET DateStyle = 'ISO, MDY';
+SELECT 'R43', 'an ambiguous date literal under DateStyle MDY',
+       ('01/02/2026'::date)::text;
+SET DateStyle = 'ISO, DMY';
+SELECT 'R44', 'the same literal under DateStyle DMY',
+       ('01/02/2026'::date)::text || ' — a month apart, and this is what gets stored';
+SET DateStyle = 'ISO, MDY';
+CREATE TABLE m.ds_a (d date DEFAULT '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE m.ds_b (d date DEFAULT '01/02/2026');
+SET DateStyle = 'ISO, MDY';
+SELECT 'R45', 'the same DEFAULT text created under two DateStyles',
+       (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.ds_a'::regclass)
+       || ' / '
+       || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.ds_b'::regclass);
+RESET DateStyle;
+
+CREATE TABLE m.tzr (t timestamptz);
+INSERT INTO m.tzr VALUES ('2026-01-15 12:00:00+00');
+SET TimeZone = 'UTC';
+SELECT 'R46', 'an unchanged timestamptz read under UTC', (SELECT t::text FROM m.tzr);
+SET TimeZone = 'America/New_York';
+SELECT 'R47', 'the same row read under America/New_York',
+       (SELECT t::text FROM m.tzr)
+       || ' — different text, and the stored instant is identical: '
+       || (SELECT (t = '2026-01-15 12:00:00+00'::timestamptz)::text FROM m.tzr);
+RESET TimeZone;
+
+-- ----------------------------- the twenty-first 2026-09-05 review round
+
+CREATE TABLE m.fl (d double precision, r real);
+INSERT INTO m.fl VALUES (0.1234567890123456789, 0.12345678);
+SET extra_float_digits = 0;
+SELECT 'R48', 'a stored double rendered at extra_float_digits=0',  (SELECT d::text FROM m.fl);
+SET extra_float_digits = 3;
+SELECT 'R49', 'the same value at extra_float_digits=3',            (SELECT d::text FROM m.fl);
+SET extra_float_digits = -3;
+SELECT 'R50', 'and at extra_float_digits=-3',
+       (SELECT d::text FROM m.fl) || ' — one stored value, three spellings';
+RESET extra_float_digits;
+
+-- ---------------------------- the twenty-second 2026-09-05 review round
+
+CREATE TABLE m.dml (id int PRIMARY KEY, d date);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.dml VALUES (1, '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.dml VALUES (2, '01/02/2026');
+RESET DateStyle;
+SELECT 'R51', 'one declared literal inserted under two DateStyles',
+       (SELECT string_agg(id::text || ' -> ' || d::text, ', ' ORDER BY id) FROM m.dml)
+       || ' — the same approved plan, different stored data';
+
+CREATE SCHEMA m_ea; CREATE SCHEMA m_eb;
+CREATE FUNCTION m_ea.helper() RETURNS text AS $$ SELECT 'from m_ea' $$ LANGUAGE sql;
+CREATE FUNCTION m_eb.helper() RETURNS text AS $$ SELECT 'from m_eb' $$ LANGUAGE sql;
+SET search_path = m, m_ea, m_eb;
+CREATE VIEW m.pathv AS SELECT helper() AS who;
+SELECT 'R52', 'a view created under extras ordered (m_ea, m_eb)',
+       (SELECT who FROM m.pathv)
+       || ', stored as: '
+       || trim(both from regexp_replace(pg_get_viewdef('m.pathv'::regclass, true), E'[\n ]+',' ','g'));
+SET search_path = m, m_eb, m_ea;
+SELECT 'R53', 'the same view after the project reorders its extras',
+       (SELECT who FROM m.pathv) || ' — unchanged, and nothing rebuilt it';
+CREATE VIEW m.pathv2 AS SELECT helper() AS who;
+SELECT 'R54', 'a bootstrap of the same declaration under the new order',
+       (SELECT who FROM m.pathv2) || ' — the environment and a bootstrap now differ';
+SET search_path = m;
+DROP SCHEMA m_ea CASCADE; DROP SCHEMA m_eb CASCADE;
+
+-- ----------------------------- the twenty-third 2026-09-05 review round
+-- A view, unlike a sequence, can be locked — which is why this race has a
+-- remedy and the one in R20/R21 did not. The blocking half needs two sessions
+-- and is quoted in ADR-0009.
+
+CREATE TABLE m.lk_t (id int PRIMARY KEY);
+CREATE VIEW m.lk_v AS SELECT id FROM m.lk_t;
+SELECT 'R55', 'locking a view with LOCK TABLE',
+       m.accepts('LOCK TABLE m.lk_v IN ACCESS EXCLUSIVE MODE');
+-- Two statements: inside one, the reloptions subquery reads a snapshot older
+-- than the ALTER that m.accepts() runs. Same shape as A14 and R9.
+SELECT m.accepts('ALTER VIEW m.lk_v SET (security_invoker = true)') \gset r56_
+SELECT 'R56', 'and the option a racing session would set',
+       :'r56_accepts' || ', reloptions now: '
+       || coalesce((SELECT array_to_string(reloptions, ',') FROM pg_class WHERE oid='m.lk_v'::regclass), 'NULL');
+
+-- ---------------------------- the twenty-fourth 2026-09-05 review round
+
+CREATE TABLE m.sl_t (d date);
+BEGIN;
+SET LOCAL DateStyle = 'ISO, DMY';
+INSERT INTO m.sl_t VALUES ('01/02/2026');
+SELECT 'R57', 'DateStyle after the value-carrying statement SET LOCAL was for',
+       current_setting('DateStyle') || ' — SET LOCAL is transaction-scoped';
+CREATE TABLE m.sl_later (d date DEFAULT '01/02/2026');
+SELECT 'R58', 'a DEFAULT created later in the same transaction',
+       (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m.sl_later'::regclass)
+       || ' — the scope leaked into opaque DDL';
+COMMIT;
+
+CREATE FUNCTION m.lockable_fn(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql;
+SELECT 'R59', 'LOCK TABLE on a routine',
+       m.accepts('LOCK TABLE m.lockable_fn IN ACCESS EXCLUSIVE MODE');
+SELECT 'R60', 'a row lock on its pg_proc entry',
+       m.accepts('SELECT oid FROM pg_proc WHERE oid = ''m.lockable_fn(int)''::regprocedure FOR UPDATE')
+       || ' — and measured with two sessions, holding it blocks ALTER FUNCTION (ADR-0009 §3)';
+
+-- ----------------------------- the twenty-fifth 2026-09-05 review round
+-- R61 is taken as the superuser this script runs as; the same statement as a
+-- non-superuser owner is refused, which is the finding and is in ADR-0009 §3.
+
+CREATE TABLE m.tg_t (id int PRIMARY KEY);
+CREATE FUNCTION m.tg_noop() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_audit AFTER INSERT ON m.tg_t FOR EACH ROW EXECUTE FUNCTION m.tg_noop();
+ALTER TABLE m.tg_t DISABLE TRIGGER tg_audit;
+SELECT 'R61', 'a trigger''s enabled state after DISABLE',
+       'tgenabled = ' || (SELECT tgenabled::text FROM pg_trigger
+                          WHERE tgrelid = 'm.tg_t'::regclass AND tgname = 'tg_audit');
+DROP TRIGGER tg_audit ON m.tg_t;
+CREATE TRIGGER tg_audit AFTER INSERT ON m.tg_t FOR EACH ROW EXECUTE FUNCTION m.tg_noop();
+SELECT 'R62', 'the same trigger after a drop-and-create rebuild',
+       'tgenabled = ' || (SELECT tgenabled::text FROM pg_trigger
+                          WHERE tgrelid = 'm.tg_t'::regclass AND tgname = 'tg_audit')
+       || ' — the disable is gone';
+SELECT 'R63', 'is a trigger a lockable relation of its own?',
+       CASE WHEN to_regclass('m.tg_audit') IS NULL THEN 'no — its lock is the parent table''s'
+            ELSE 'yes' END;
+
+-- ----------------------------- the twenty-sixth 2026-09-05 review round
+
+CREATE FUNCTION m.pn_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.pn_caller() RETURNS int AS $$ BEGIN RETURN m.pn_f(a => 1); END $$ LANGUAGE plpgsql;
+SELECT 'A57', 'a named-notation caller before its callee is rebuilt',
+       m.accepts('SELECT m.pn_caller()');
+DROP FUNCTION m.pn_f(int);
+CREATE FUNCTION m.pn_f(x int) RETURNS int AS $$ SELECT x * 2 $$ LANGUAGE sql;
+SELECT 'A58', 'the identity after renaming only the parameter',
+       (SELECT oid::regprocedure::text FROM pg_proc WHERE oid = 'm.pn_f(int)'::regprocedure)
+       || ' — unchanged';
+SELECT 'A59', 'and the same caller now',
+       m.accepts('SELECT m.pn_caller()');
+
+SET TimeZone = 'UTC';
+SET timezone_abbreviations = 'Default';
+SELECT 'R64', 'a quoted timestamptz with an abbreviation, under Default',
+       ('2026-01-15 12:00:00 CST'::timestamptz)::text;
+SET timezone_abbreviations = 'Australia';
+SELECT 'R65', 'the same literal under Australia',
+       ('2026-01-15 12:00:00 CST'::timestamptz)::text
+       || ' — the same approved value, a different instant';
+RESET timezone_abbreviations; RESET TimeZone;
+
+-- --------------------------- the twenty-seventh 2026-09-05 review round
+
+CREATE SCHEMA m_na; CREATE SCHEMA m_nb;
+CREATE FUNCTION m_na.helper() RETURNS text AS $$ SELECT 'from m_na' $$ LANGUAGE sql;
+CREATE FUNCTION m_nb.helper() RETURNS text AS $$ SELECT 'from m_nb' $$ LANGUAGE sql;
+SET search_path = m, m_na;
+CREATE FUNCTION m.opaque_res() RETURNS text AS $$ BEGIN RETURN helper(); END $$ LANGUAGE plpgsql;
+CREATE FUNCTION m.parsed_res() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT helper(); END;
+SELECT 'R66', 'a plpgsql body created under (m, m_na), called under the same',
+       (SELECT m.opaque_res());
+SET search_path = m, m_nb;
+SELECT 'R67', 'the same plpgsql body called under (m, m_nb)',
+       (SELECT m.opaque_res()) || ' — resolved when it runs, not when it was created';
+SELECT 'R68', 'a BEGIN ATOMIC body called under (m, m_nb)',
+       (SELECT m.parsed_res()) || ' — bound at creation';
+SET search_path = m, m_na;
+ALTER FUNCTION m.opaque_res() SET search_path = m, m_na;
+SET search_path = m, m_nb;
+SELECT 'R69', 'the plpgsql body after a function-local SET search_path',
+       (SELECT m.opaque_res()) || ' — the engine''s own remedy';
+SET search_path = m;
+DROP SCHEMA m_na CASCADE; DROP SCHEMA m_nb CASCADE;
+
+SELECT 'A60', 'a LANGUAGE sql string body naming a missing function',
+       m.accepts('CREATE FUNCTION m.bad_sql() RETURNS int AS $q$ SELECT m.no_such(1) $q$ LANGUAGE sql');
+SELECT 'A61', 'a LANGUAGE plpgsql body naming a missing function',
+       m.accepts('CREATE FUNCTION m.bad_pl() RETURNS int AS $q$ BEGIN RETURN m.no_such(1); END $q$ LANGUAGE plpgsql')
+       || ' — check_function_bodies is ' || current_setting('check_function_bodies');
+
+-- ---------------------------- the twenty-eighth 2026-09-05 review round
+
+CREATE FUNCTION m.oo_f(a int) RETURNS int AS $$ SELECT a * 2 $$ LANGUAGE sql;
+CREATE FUNCTION m.oo_sqlcaller() RETURNS int AS $$ SELECT m.oo_f(1) $$ LANGUAGE sql;
+SELECT 'A62', 'reverse pg_depend edges to a callee with a SQL-language caller',
+       coalesce((SELECT string_agg(DISTINCT d.objid::regprocedure::text, ', ') FROM pg_depend d
+                 WHERE d.refobjid = 'm.oo_f(int)'::regprocedure
+                   AND d.deptype = 'n' AND d.classid = 'pg_proc'::regclass), 'none');
+SELECT 'A63', 'a callee-only rebuild, which never recreates the caller',
+       m.accepts('DROP FUNCTION m.oo_f(int)') || ' / '
+       || m.accepts('CREATE FUNCTION m.oo_f(a int, b int) RETURNS int AS $q$ SELECT a + b $q$ LANGUAGE sql');
+SELECT 'A64', 'the unchanged SQL-language caller afterwards',
+       m.accepts('SELECT m.oo_sqlcaller()');
+SELECT 'A65', 'and recreating that caller with its stale reference',
+       m.accepts('CREATE OR REPLACE FUNCTION m.oo_sqlcaller() RETURNS int AS $q$ SELECT m.oo_f(1) $q$ LANGUAGE sql')
+       || ' — the engine checks only when it creates';
+
+-- ---------------------------- the twenty-ninth 2026-09-05 review round
+-- The trigger half needs two fresh connections (plan caching masks it in one)
+-- and is quoted in ADR-0013 §3.
+
+SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'iso_8601'; SET bytea_output = 'hex';
+SET extra_float_digits = 3; SET TimeZone = 'UTC'; SET timezone_abbreviations = 'Default';
+CREATE TABLE m.canon (d date, i interval, b bytea, f double precision, r real, t timestamptz);
+INSERT INTO m.canon VALUES ('2026-01-02', '1 day 2 hours', '\x0102',
+                            0.1234567890123456789, 0.12345678, '2026-01-15 12:00:00+00');
+SELECT 'R70', 'one row rendered under the canonical values',
+       (SELECT d::text || ' | ' || i::text || ' | ' || b::text || ' | '
+               || f::text || ' | ' || r::text || ' | ' || t::text FROM m.canon);
+SELECT 'R71', 'and whether the floats survive that text',
+       (SELECT 'double precision: ' || (f::text::double precision = f)::text
+               || ', real: ' || (r::text::real = r)::text FROM m.canon);
+RESET DateStyle; RESET IntervalStyle; RESET bytea_output;
+RESET extra_float_digits; RESET TimeZone; RESET timezone_abbreviations;
+
+-- ------------------------------ the thirtieth 2026-09-05 review round
+
+SELECT 'R72', 'a nested block comment',
+       (SELECT /* a /* b */ c */ 1)::text
+       || ' — it nests, and measured separately, so does T-SQL';
+
+-- --------------------------- the thirty-first 2026-09-05 review round
+
+CREATE TABLE m.canon_w (id int, d date);
+PREPARE m_ins(int, text) AS INSERT INTO m.canon_w VALUES ($1, $2::date);
+SET DateStyle = 'ISO, MDY';
+EXECUTE m_ins(1, '01/02/2026');
+SET DateStyle = 'ISO, DMY';
+EXECUTE m_ins(2, '01/02/2026');
+RESET DateStyle;
+SELECT 'R73', 'the same text bound as a parameter, under two DateStyles',
+       (SELECT string_agg(d::text, ', ' ORDER BY id) FROM m.canon_w)
+       || ' — binding does not canonicalize';
+DELETE FROM m.canon_w;
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.canon_w VALUES (1, DATE '2026-01-02');
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.canon_w VALUES (2, DATE '2026-01-02');
+RESET DateStyle;
+SELECT 'R74', 'a literal the engine has already resolved, under the same two',
+       (SELECT string_agg(d::text, ', ' ORDER BY id) FROM m.canon_w)
+       || ' — this is what the plan bakes in';
+
+SET DateStyle = 'ISO, MDY';
+SELECT 'R75', 'a default whose cast happens at evaluation, under MDY',
+       (('01/02/2026'::text)::date)::text;
+SET DateStyle = 'ISO, DMY';
+SELECT 'R76', 'the same expression under DMY',
+       (('01/02/2026'::text)::date)::text || ' — so the probe must use the write''s environment';
+RESET DateStyle;
+
+-- --------------------------- the thirty-second 2026-09-05 review round
+
+CREATE COLLATION m.nd_sensitive (provider = icu, locale = 'und', deterministic = false);
+CREATE COLLATION m.nd_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+SELECT 'R77', 'a nondeterministic collation at default strength',
+       'collisdeterministic = ' || (SELECT collisdeterministic::text FROM pg_collation
+                                    WHERE collname = 'nd_sensitive' AND collnamespace = 'm'::regnamespace)
+       || ', ''New'' = ''new'' is ' || ('New' = 'new' COLLATE m.nd_sensitive)::text;
+SELECT 'R78', 'a nondeterministic collation at secondary strength',
+       'collisdeterministic = ' || (SELECT collisdeterministic::text FROM pg_collation
+                                    WHERE collname = 'nd_ci' AND collnamespace = 'm'::regnamespace)
+       || ', ''New'' = ''new'' is ' || ('New' = 'new' COLLATE m.nd_ci)::text
+       || ' — the flag is the same, the answer is not';
+CREATE TABLE m.ndk (code text COLLATE m.nd_sensitive PRIMARY KEY);
+INSERT INTO m.ndk VALUES ('New');
+SELECT 'R79', 'inserting ''new'' beside ''New'' under the case-sensitive one',
+       m.accepts('INSERT INTO m.ndk VALUES (''new'')');
+
+-- -------------------------- the thirty-third 2026-09-05 review round
+
+SET TimeZone = 'UTC';
+SET timezone_abbreviations = 'Default';
+SELECT 'R80', 'a quoted timetz with an abbreviation, under Default',
+       ('12:00 CST'::timetz)::text;
+SET timezone_abbreviations = 'Australia';
+SELECT 'R81', 'the same literal under Australia',
+       ('12:00 CST'::timetz)::text || ' — timetz belongs on the offline refusal list too';
+RESET timezone_abbreviations; RESET TimeZone;
+
+-- -------------------------- the thirty-fourth 2026-09-05 review round
+
+-- A module is not the only thing the write path binds: a generated column is
+-- parsed at creation too, and keeps what it resolved against.
+CREATE SCHEMA uu_a; CREATE SCHEMA uu_b;
+CREATE FUNCTION uu_a.tag(v int) RETURNS text AS $$SELECT 'uu_a row ' || v$$ LANGUAGE sql IMMUTABLE;
+CREATE FUNCTION uu_b.tag(v int) RETURNS text AS $$SELECT 'uu_b row ' || v$$ LANGUAGE sql IMMUTABLE;
+SET search_path = m, uu_a, uu_b;
+CREATE TABLE m.gen (v int, g text GENERATED ALWAYS AS (tag(v)) STORED);
+INSERT INTO m.gen VALUES (1);
+SELECT 'R82', 'a generated column created under extras (uu_a, uu_b)',
+       (SELECT g FROM m.gen WHERE v = 1);
+SET search_path = m, uu_b, uu_a;
+INSERT INTO m.gen VALUES (2);
+SELECT 'R83', 'a new row in the same table after reordering to (uu_b, uu_a)',
+       (SELECT g FROM m.gen WHERE v = 2);
+CREATE TABLE m.gen2 (v int, g text GENERATED ALWAYS AS (tag(v)) STORED);
+INSERT INTO m.gen2 VALUES (1);
+SELECT 'R84', 'a bootstrap of the same declaration under the new order',
+       (SELECT g FROM m.gen2 WHERE v = 1);
+SET search_path = m;
+DROP SCHEMA uu_a CASCADE; DROP SCHEMA uu_b CASCADE;
+
+-- Writes take no settings scope, so the rendering itself has to be
+-- setting-independent. A plain literal is not; an E-string is.
+CREATE TABLE m.bs (t text);
+SET standard_conforming_strings = on;
+INSERT INTO m.bs VALUES ('a\nb');
+SELECT 'R85', 'a rendered text value containing a backslash, under on',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+SET standard_conforming_strings = off;
+INSERT INTO m.bs VALUES ('a\nb');
+SELECT 'R86', 'the same rendered INSERT under off',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+INSERT INTO m.bs VALUES (E'a\\nb');
+SELECT 'R87', 'the E-string form instead, under off',
+       'length ' || length((SELECT t FROM m.bs))::text;
+DELETE FROM m.bs;
+RESET standard_conforming_strings;
+INSERT INTO m.bs VALUES (E'a\\nb');
+SELECT 'R88', 'the same E-string under on',
+       'length ' || length((SELECT t FROM m.bs))::text;
+
+-- bytea's canonical hex output starts with a backslash, so it has the same
+-- dependency -- and this one is accepted rather than refused.
+CREATE TABLE m.by (b bytea);
+SET standard_conforming_strings = off;
+-- Two statements, not one: a subquery beside the EXECUTE reads a snapshot
+-- older than the row m.accepts() just wrote.
+SELECT m.accepts('INSERT INTO m.by VALUES (''\x0102''::bytea)') AS r \gset
+SELECT 'R89', 'a two-byte bytea rendered in canonical hex, under off',
+       :'r' || ', storing ' || (SELECT coalesce(sum(length(b))::text, '0') FROM m.by) || ' byte(s)';
+DELETE FROM m.by;
+SELECT m.accepts('INSERT INTO m.by VALUES (decode(''0102'', ''hex''))') AS r \gset
+SELECT 'R90', 'the decode() form instead, under off',
+       :'r' || ', storing ' || (SELECT coalesce(sum(length(b))::text, '0') FROM m.by) || ' byte(s)';
+RESET standard_conforming_strings;
+
+-- -------------------------- the thirty-fifth 2026-09-05 review round
+
+-- The deparse of R1 is not confined to column defaults: every verbatim
+-- expression the model holds comes back respelled.
+CREATE TABLE m.dp (id int, label text);
+ALTER TABLE m.dp ADD CONSTRAINT ck_label CHECK (label <> 'none');
+CREATE INDEX ix_dp ON m.dp (id) WHERE label <> 'none';
+SELECT 'R91', 'how a declared check expression is stored',
+       (SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_label');
+SELECT 'R92', 'how a declared index filter is stored',
+       (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'm.ix_dp'::regclass);
+
+-- The default probe runs in the planning session; the write that relies on it
+-- runs in another. Nothing carries the first session's settings to the second.
+CREATE TABLE m.dflt (id int, when_ date DEFAULT ('01/02/2026'::text)::date);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO m.dflt (id) VALUES (1);
+SELECT 'R93', 'a column omitted by an INSERT, in the probing session (MDY)',
+       (SELECT when_::text FROM m.dflt WHERE id = 1);
+SET DateStyle = 'ISO, DMY';
+INSERT INTO m.dflt (id) VALUES (2);
+SELECT 'R94', 'the same INSERT in another session (DMY)',
+       (SELECT when_::text FROM m.dflt WHERE id = 2);
+RESET DateStyle;
+
+-- -------------------------- the thirty-sixth 2026-09-05 review round
+
+-- The probe is a read that executes user code, so planning can move the target.
+CREATE SEQUENCE m.pseq;
+CREATE TABLE m.paudit (n int);
+CREATE FUNCTION m.pwrites() RETURNS int AS $fn$
+BEGIN INSERT INTO m.paudit VALUES (1); RETURN 1; END $fn$ LANGUAGE plpgsql VOLATILE;
+BEGIN;
+SELECT nextval('m.pseq') AS n1 \gset
+ROLLBACK;
+SELECT 'R95', 'probing a nextval() default in a rolled-back planning transaction',
+       'returned ' || :'n1' || ', sequence last_value now ' || (SELECT last_value::text FROM m.pseq);
+
+-- The engine's own guard. It refuses exactly the mutating cases, so pbps needs
+-- no volatility analysis of its own -- and does not lose the harmless ones.
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT m.accepts('SELECT nextval(''m.pseq'')') AS r1 \gset
+SELECT m.accepts('SELECT m.pwrites()') AS r2 \gset
+SELECT m.accepts('SELECT random() IS NOT NULL') AS r3 \gset
+SELECT m.accepts('SELECT now() IS NOT NULL') AS r4 \gset
+ROLLBACK;
+SELECT 'R96', 'the same nextval() default under SET TRANSACTION READ ONLY', :'r1';
+SELECT 'R97', 'a volatile function that writes, under READ ONLY', :'r2';
+SELECT 'R98', 'a volatile function that only computes, under READ ONLY', :'r3';
+SELECT 'R99', 'now(), under READ ONLY', :'r4';
+SELECT 'R100', 'the sequence after the read-only probe',
+       'last_value ' || (SELECT last_value::text FROM m.pseq);
+
+-- -------------------------- the thirty-seventh 2026-09-05 review round
+
+-- The recorded write path is a proxy for the binding, and the proxy is not the
+-- property: a new same-named object earlier on an unchanged path moves it.
+CREATE SCHEMA xa; CREATE SCHEMA xb;
+CREATE FUNCTION xb.helper() RETURNS text AS $$SELECT 'xb'$$ LANGUAGE sql;
+SET search_path = m, xa, xb;
+CREATE VIEW m.xv AS SELECT helper() AS who;
+CREATE FUNCTION m.xf() RETURNS text AS $$ BEGIN RETURN helper(); END $$ LANGUAGE plpgsql;
+SELECT 'R101', 'a view created under (xa, xb) while only xb.helper() exists',
+       (SELECT who FROM m.xv);
+SELECT 'R102', 'the same declaration through an opaque plpgsql body', m.xf();
+CREATE FUNCTION xa.helper() RETURNS text AS $$SELECT 'xa'$$ LANGUAGE sql;
+SELECT 'R103', 'the view after xa.helper() appears, path string unchanged',
+       (SELECT who FROM m.xv);
+DISCARD PLANS;
+SELECT 'R104', 'the plpgsql body after the same, with cached plans discarded', m.xf();
+CREATE VIEW m.xv2 AS SELECT helper() AS who;
+SELECT 'R105', 'a bootstrap of the same view declaration, same path',
+       (SELECT who FROM m.xv2);
+SELECT 'R106', 'what the catalog records about the view''s binding',
+  (SELECT string_agg(n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE r.ev_class = 'm.xv'::regclass AND d.refclassid = 'pg_proc'::regclass);
+SELECT 'R107', 'and about the opaque body''s',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'm.xf()'::regprocedure AND d.refclassid = 'pg_proc'::regclass), 'nothing');
+SET search_path = m;
+DROP SCHEMA xa CASCADE; DROP SCHEMA xb CASCADE;
+
+-- Four types ADR-0013's own rules name, absent from ADR-0012's closed catalogue.
+SELECT 'R108', 'text / date / bytea / timestamptz, read back',
+  format_type('text'::regtype, NULL) || ' / ' || format_type('date'::regtype, NULL) || ' / ' ||
+  format_type('bytea'::regtype, NULL) || ' / ' || format_type('timestamptz'::regtype, NULL);
+
+-- -------------------------- the thirty-eighth 2026-09-05 review round
+
+-- Recording the binding gives the comparison a left-hand side. The right-hand
+-- side is a catalog query -- no parsing of the declaration, no speculative DDL.
+-- This is its first version, kept for the contrast R113-R118 draw: it looks
+-- only at pg_proc, and its ordering test treats a bound schema missing from the
+-- path as "no candidates". Both are wrong.
+CREATE SCHEMA ya; CREATE SCHEMA yb;
+CREATE FUNCTION yb.helper() RETURNS text AS $$SELECT 'yb'$$ LANGUAGE sql;
+SET search_path = m, ya, yb;
+CREATE VIEW m.yv AS SELECT helper() AS who;             -- unqualified
+CREATE VIEW m.yq AS SELECT yb.helper() AS who;          -- explicitly qualified
+CREATE TABLE m.yt (n int);
+ALTER TABLE m.yt ADD CONSTRAINT ck_y CHECK (yb.helper() IS NOT NULL);
+CREATE FUNCTION m.shadowed(view_name text) RETURNS text AS $fn$
+DECLARE path text[] := ARRAY['m','ya','yb']; r record; out text := 'none';
+BEGIN
+  FOR r IN
+    SELECT n.nspname AS bound_schema, p.proname AS nm
+      FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+      JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+  LOOP
+    SELECT string_agg(n2.nspname || '.' || r.nm, ',') INTO out
+      FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+     WHERE p2.proname = r.nm
+       AND array_position(path, n2.nspname) < array_position(path, r.bound_schema);
+  END LOOP;
+  RETURN coalesce(out, 'none');
+END $fn$ LANGUAGE plpgsql;
+SELECT 'R109', 'the shadow query before ya.helper() exists', m.shadowed('m.yv');
+CREATE FUNCTION ya.helper() RETURNS text AS $$SELECT 'ya'$$ LANGUAGE sql;
+SELECT 'R110', 'the same query after ya.helper() appears', m.shadowed('m.yv');
+SELECT 'R111', 'and for a view that qualified yb.helper() explicitly', m.shadowed('m.yq');
+SELECT 'R112', 'what the catalog records about a check constraint''s binding',
+  (SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    JOIN pg_constraint c ON c.oid = d.objid
+   WHERE c.conname = 'ck_y' AND d.refclassid = 'pg_proc'::regclass);
+SET search_path = m;
+DROP SCHEMA ya CASCADE; DROP SCHEMA yb CASCADE;
+
+-- -------------------------- the thirty-ninth 2026-09-05 review round
+
+-- The shadow test has to follow each dependency's catalog class, and has to
+-- treat a bound schema that left the path as a rebuild rather than as an
+-- unknown that filters itself out of the comparison.
+CREATE SCHEMA za; CREATE SCHEMA zb;
+CREATE TABLE zb.zt (id int);
+CREATE FUNCTION zb.helper() RETURNS text AS $$SELECT 'zb'$$ LANGUAGE sql;
+
+CREATE FUNCTION m.bindings(view_name text)
+RETURNS TABLE(cls oid, sch text, nm text) AS $fn$
+  SELECT d.refclassid, n.nspname, c.relname FROM pg_depend d
+    JOIN pg_rewrite w ON w.oid = d.objid
+    JOIN pg_class c ON c.oid = d.refobjid JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_class'::regclass
+     AND c.relname <> split_part(view_name, '.', 2)
+  UNION
+  SELECT d.refclassid, n.nspname, p.proname FROM pg_depend d
+    JOIN pg_rewrite w ON w.oid = d.objid
+    JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+$fn$ LANGUAGE sql;
+
+CREATE FUNCTION m.rebuild(view_name text, path text[]) RETURNS text AS $fn$
+DECLARE r record; out text := '';
+BEGIN
+  FOR r IN SELECT * FROM m.bindings(view_name) LOOP
+    IF array_position(path, r.sch) IS NULL THEN
+      out := out || 'rebuild: ' || r.sch || '.' || r.nm || ' left the path; ';
+      CONTINUE;
+    END IF;
+    out := out || coalesce((
+      SELECT string_agg('rebuild: shadowed by ' || s || '.' || r.nm, '; ') FROM (
+        SELECT n.nspname AS s FROM pg_class c2 JOIN pg_namespace n ON n.oid = c2.relnamespace
+         WHERE r.cls = 'pg_class'::regclass::oid AND c2.relname = r.nm
+           AND array_position(path, n.nspname) < array_position(path, r.sch)
+        UNION ALL
+        SELECT n.nspname FROM pg_proc p2 JOIN pg_namespace n ON n.oid = p2.pronamespace
+         WHERE r.cls = 'pg_proc'::regclass::oid AND p2.proname = r.nm
+           AND array_position(path, n.nspname) < array_position(path, r.sch)
+      ) q), '');
+  END LOOP;
+  RETURN coalesce(nullif(out, ''), 'none');
+END $fn$ LANGUAGE plpgsql;
+
+CREATE FUNCTION m.routines_only(view_name text, path text[]) RETURNS text AS $fn$
+DECLARE r record; out text := 'none';
+BEGIN
+  FOR r IN SELECT n.nspname AS sch, p.proname AS nm FROM pg_depend d
+      JOIN pg_rewrite w ON w.oid = d.objid JOIN pg_proc p ON p.oid = d.refobjid
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+  LOOP
+    SELECT string_agg(n2.nspname || '.' || r.nm, ',') INTO out FROM pg_proc p2
+      JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+     WHERE p2.proname = r.nm AND array_position(path, n2.nspname) < array_position(path, r.sch);
+  END LOOP;
+  RETURN coalesce(out, 'none');
+END $fn$ LANGUAGE plpgsql;
+
+SET search_path = m, za, zb;
+CREATE VIEW m.zv AS SELECT id FROM zt;
+CREATE VIEW m.zf AS SELECT helper() AS who;
+SELECT 'R113', 'a relation shadow: the class-aware test before za.zt exists',
+       m.rebuild('m.zv', ARRAY['m','za','zb']);
+CREATE TABLE za.zt (id int);
+SELECT 'R114', 'the same test after za.zt appears',
+       m.rebuild('m.zv', ARRAY['m','za','zb']);
+SELECT 'R115', 'the routines-only test on that same case',
+       m.routines_only('m.zv', ARRAY['m','za','zb']);
+CREATE VIEW m.zv2 AS SELECT id FROM zt;
+SELECT 'R116', 'which table a bootstrap of that declaration binds',
+  (SELECT n.nspname || '.' || c.relname FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_class c ON c.oid = d.refobjid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE w.ev_class = 'm.zv2'::regclass AND d.refclassid = 'pg_class'::regclass
+      AND c.relname = 'zt');
+CREATE FUNCTION za.helper() RETURNS text AS $$SELECT 'za'$$ LANGUAGE sql;
+SELECT 'R117', 'the bound schema removed from the path, ordering test alone',
+       m.routines_only('m.zf', ARRAY['m','za']);
+SELECT 'R118', 'the same case, class-aware and missing-aware',
+       m.rebuild('m.zf', ARRAY['m','za']);
+SET search_path = m;
+DROP SCHEMA za CASCADE; DROP SCHEMA zb CASCADE;
+
+-- -------------------------- the fortieth 2026-09-05 review round
+
+-- "Left the path" has to be asked about the EFFECTIVE path, and only about
+-- bindings the path could have reached in the first place.
+CREATE TABLE m.at (id int, s text);
+CREATE VIEW m.av AS SELECT upper(s) AS u, id + 1 AS n FROM m.at WHERE s <> 'x';
+CREATE SCHEMA ax;
+CREATE FUNCTION ax.digest(t text) RETURNS text AS $$SELECT upper(t)$$ LANGUAGE sql;
+CREATE VIEW m.aq AS SELECT ax.digest(s) AS d FROM m.at;   -- qualified, ax off the path
+SELECT 'R119', 'a view using only built-in functions and operators',
+  coalesce((SELECT string_agg(DISTINCT n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE w.ev_class = 'm.av'::regclass AND d.refclassid = 'pg_proc'::regclass),
+   'no recorded dependency on any of them');
+SELECT 'R120', 'the effective path against the configured one',
+  array_to_string(current_schemas(true), ',') || ' against ' || array_to_string(current_schemas(false), ',');
+SELECT 'R121', 'a view qualifying a function in a schema off the write path',
+  (SELECT string_agg(n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE w.ev_class = 'm.aq'::regclass AND d.refclassid = 'pg_proc'::regclass);
+SELECT 'R122', 'whether ax was on the effective path when that view was created',
+  CASE WHEN 'ax' = ANY(current_schemas(true)) THEN 'yes' ELSE 'no' END;
+DROP SCHEMA ax CASCADE;
+
+-- -------------------------- the forty-first 2026-09-05 review round
+
+-- A65's exemption rests on the engine checking a recreated SQL body. That check
+-- is a session setting, and the opaque-DDL policy keeps the operator's.
+CREATE SCHEMA cfb;
+CREATE FUNCTION cfb.f(a int) RETURNS int AS $$SELECT a$$ LANGUAGE sql;
+CREATE FUNCTION cfb.caller() RETURNS int AS $$SELECT cfb.f(1)$$ LANGUAGE sql;
+DROP FUNCTION cfb.f(int);
+CREATE FUNCTION cfb.f(a int, b int) RETURNS int AS $$SELECT a + b$$ LANGUAGE sql;
+SELECT 'A66', 'recreating the SQL caller with check_function_bodies on',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.caller() RETURNS int AS $x$SELECT cfb.f(1)$x$ LANGUAGE sql');
+SET check_function_bodies = off;
+SELECT 'A67', 'the same recreation with check_function_bodies off',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.caller() RETURNS int AS $x$SELECT cfb.f(1)$x$ LANGUAGE sql');
+SELECT 'A68', 'calling it afterwards', m.accepts('SELECT cfb.caller()');
+SELECT 'A69', 'a BEGIN ATOMIC body naming the same missing function, still off',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.atomic() RETURNS int LANGUAGE sql BEGIN ATOMIC; SELECT cfb.f(1); END');
+RESET check_function_bodies;
+ALTER ROLE m_bystander SET check_function_bodies = off;
+SELECT 'A70', 'how the setting reaches a session nobody configured',
+  (SELECT array_to_string(setconfig, ',') FROM pg_db_role_setting s
+     JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = 'm_bystander');
+ALTER ROLE m_bystander RESET check_function_bodies;
+DROP SCHEMA cfb CASCADE;
+
+-- -------------------------- the forty-second 2026-09-05 review round
+
+-- A probeable default is not automatically a bakeable one: the probe's answer
+-- can belong to the transaction that asked for it.
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT now()::text AS t1, (('01/02/2026'::text)::date)::text AS c1 \gset
+COMMIT;
+SELECT pg_sleep(0.05);
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT now()::text AS t2, (('01/02/2026'::text)::date)::text AS c2 \gset
+COMMIT;
+SELECT 'R123', 'now() probed in two separate read-only transactions',
+  CASE WHEN :'t1' = :'t2' THEN 'the same value' ELSE 'two different values' END;
+SELECT 'R124', 'a constant-folding default probed the same way',
+  CASE WHEN :'c1' = :'c2' THEN 'the same value' ELSE 'two different values' END;
+
+-- A body that validates is not a body that binds what it bound before.
+CREATE SCHEMA ov;
+CREATE FUNCTION ov.g(a bigint) RETURNS text AS $$SELECT 'bigint overload'$$ LANGUAGE sql;
+CREATE FUNCTION ov.g(a int) RETURNS text AS $$SELECT 'integer overload'$$ LANGUAGE sql;
+CREATE FUNCTION ov.caller() RETURNS text AS $$SELECT ov.g(1)$$ LANGUAGE sql;
+CREATE FUNCTION ov.atomic() RETURNS text LANGUAGE sql BEGIN ATOMIC; SELECT ov.g(1); END;
+SELECT 'A71', 'the caller before anything is dropped', ov.caller();
+SELECT 'A72', 'what a string-bodied SQL caller records about its callee',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'ov.caller()'::regprocedure AND d.refclassid = 'pg_proc'::regclass
+      AND d.refobjid <> 'ov.caller()'::regprocedure), 'nothing');
+SELECT 'A73', 'what a BEGIN ATOMIC caller records',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'ov.atomic()'::regprocedure AND d.refclassid = 'pg_proc'::regclass
+      AND d.refobjid <> 'ov.atomic()'::regprocedure), 'nothing');
+DROP FUNCTION ov.atomic();
+DROP FUNCTION ov.g(int);
+SELECT 'A74', 'recreating the caller after g(integer) is dropped, bodies checked',
+  m.accepts('CREATE OR REPLACE FUNCTION ov.caller() RETURNS text AS $x$SELECT ov.g(1)$x$ LANGUAGE sql');
+SELECT 'A75', 'what it answers now', ov.caller();
+DROP SCHEMA ov CASCADE;
+
+-- -------------------------- the forty-third 2026-09-05 review round
+
+-- Two matching probes are not stability: a read-only function over mutable data
+-- answers the same twice and something else at apply time.
+CREATE TABLE m.cfg (k text PRIMARY KEY, v text);
+INSERT INTO m.cfg VALUES ('tier', 'bronze');
+CREATE FUNCTION m.tier() RETURNS text STABLE AS $$SELECT v FROM m.cfg WHERE k = 'tier'$$ LANGUAGE sql;
+CREATE TABLE m.acct (id int, tier text DEFAULT m.tier());
+BEGIN; SET TRANSACTION READ ONLY; SELECT m.tier() AS p1 \gset
+COMMIT;
+BEGIN; SET TRANSACTION READ ONLY; SELECT m.tier() AS p2 \gset
+COMMIT;
+SELECT 'R125', 'a default reading a config row, probed in two read-only transactions',
+  CASE WHEN :'p1' = :'p2' THEN 'the same value both times (' || :'p1' || ')'
+       ELSE 'two different values' END;
+UPDATE m.cfg SET v = 'gold' WHERE k = 'tier';
+INSERT INTO m.acct (id) VALUES (1);
+SELECT 'R126', 'what the apply stored, after that row changed between the two',
+  (SELECT tier FROM m.acct WHERE id = 1);
+
+-- And an omitted cell over a time-varying default has no value to converge on.
+CREATE TABLE m.ev (id int, seen timestamptz DEFAULT clock_timestamp());
+INSERT INTO m.ev (id) VALUES (1);
+SELECT pg_sleep(0.05);
+INSERT INTO m.ev (id) VALUES (2);
+SELECT 'R127', 'two rows that both omitted the same clock_timestamp() default',
+  (SELECT CASE WHEN count(DISTINCT seen) = 1 THEN 'one value' ELSE 'two values' END FROM m.ev);
+SELECT seen::text AS s1 FROM m.ev WHERE id = 1 \gset
+SELECT pg_sleep(0.05);
+SELECT 'R128', 'the stored cell against the default evaluated again on the next plan',
+  CASE WHEN :'s1' = clock_timestamp()::text THEN 'equal'
+       ELSE 'different, so the next plan schedules another update' END;
+
+-- -------------------------- the forty-fourth 2026-09-05 review round
+
+-- A quoted literal is setting-independent as text and not once the column's
+-- type reads it: the DDL that creates the default is where it gets typed.
+CREATE SCHEMA dd;
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d1 (id int, d date DEFAULT '01/02/2026');
+SELECT 'R129', 'DEFAULT ''01/02/2026'' on a date column, created under DMY, as the catalog spells it',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d1'::regclass);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO dd.d1 (id) VALUES (1);
+SELECT 'R130', 'a row omitting that cell under MDY, once the default exists typed',
+  (SELECT d::text FROM dd.d1 WHERE id = 1);
+-- The same-plan case: the probe reads the declared text in the planning
+-- session, the DDL types it in the applying one.
+SET DateStyle = 'ISO, MDY';
+SELECT ('01/02/2026'::text)::date::text AS baked \gset
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d2 (id int, d date DEFAULT '01/02/2026');
+INSERT INTO dd.d2 (id, d) VALUES (1, :'baked');
+SELECT 'R131', 'the declared text baked under MDY, the default created under DMY: cell vs default',
+  (SELECT d::text FROM dd.d2) || ' vs ' || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d2'::regclass);
+SELECT 'R132', 'whether the next plan schedules an update for that row',
+  CASE WHEN (SELECT d FROM dd.d2) = '01/02/2026'::date THEN 'no' ELSE 'yes' END;
+-- What the canonical settings do with the ambiguous spelling, and what a
+-- resolved literal does under the operator's.
+SET DateStyle = 'ISO, YMD';
+SELECT 'R133', '''01/02/2026'' read under the canonical ISO, YMD',
+  m.accepts($q$SELECT ('01/02/2026'::text)::date$q$);
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d3 (id int, d date DEFAULT DATE '2026-01-02');
+SELECT 'R134', 'DEFAULT DATE ''2026-01-02'' created under DMY, as the catalog spells it',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d3'::regclass);
+CREATE TABLE dd.d4 (id int, d date, CHECK (d > '01/02/2026'));
+CREATE INDEX d4i ON dd.d4 (id) WHERE d > '01/02/2026';
+SELECT 'R135', 'a check expression and an index filter carrying the same text, created under DMY',
+  (SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'dd.d4'::regclass)
+  || ' / ' || (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'dd.d4i'::regclass);
+RESET DateStyle;
+SET timezone_abbreviations = 'Default';
+CREATE TABLE dd.d5 (id int, t timestamptz DEFAULT '2026-01-15 12:00:00 CST');
+SET timezone_abbreviations = 'Australia';
+CREATE TABLE dd.d6 (id int, t timestamptz DEFAULT '2026-01-15 12:00:00 CST');
+RESET timezone_abbreviations;
+SELECT 'R136', 'a timestamptz default naming an abbreviation, created under Default and under Australia',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d5'::regclass)
+  || ' / ' || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d6'::regclass);
+DROP SCHEMA dd CASCADE;
+
+-- The shadow test asked of the catalog cannot see an object the same plan
+-- creates: the existing view keeps its binding, a bootstrap does not.
+CREATE SCHEMA wa; CREATE SCHEMA wb;
+CREATE FUNCTION wb.helper() RETURNS text AS $$SELECT 'wb'$$ LANGUAGE sql;
+SET search_path = wa, wb, m;
+CREATE VIEW wa.v AS SELECT helper() AS who;
+SELECT 'R137', 'the shadow test, asked of the catalog before the plan creates wa.helper()',
+  coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'helper' AND n.nspname = 'wa'), 'none');
+BEGIN;
+CREATE FUNCTION wa.helper() RETURNS text AS $$SELECT 'wa'$$ LANGUAGE sql;
+COMMIT;
+SELECT 'R138', 'the view after that plan applied with no rebuild scheduled', who FROM wa.v;
+CREATE OR REPLACE VIEW wa.v AS SELECT helper() AS who;
+SELECT 'R139', 'a bootstrap of the same declaration, wa.helper() created first', who FROM wa.v;
+SELECT 'R140', 'the same test asked of the catalog after apply, one plan late',
+  coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'helper' AND n.nspname = 'wa'), 'none');
+SET search_path = m;
+DROP SCHEMA wa CASCADE; DROP SCHEMA wb CASCADE;
+
+-- -------------------------- the forty-fifth 2026-09-05 review round
+
+-- A qualified reference rebuilds for ever under the shadow test, because the
+-- rebuild changes neither the binding nor the candidate. What the rebuild does
+-- change is what the engine proved: a candidate sat earlier and the object
+-- bound past it.
+CREATE SCHEMA qa; CREATE SCHEMA qb;
+CREATE FUNCTION qb.helper() RETURNS text AS $$SELECT 'qb'$$ LANGUAGE sql;
+SET search_path = qa, qb, m;
+CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+CREATE VIEW qa.vu AS SELECT helper() AS who;
+CREATE FUNCTION qa.helper() RETURNS text AS $$SELECT 'qa'$$ LANGUAGE sql;
+CREATE FUNCTION m.bound(v regclass) RETURNS text AS $$
+  SELECT n.nspname || '.' || p.proname FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+   JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE r.ev_class = v AND d.refclassid = 'pg_proc'::regclass $$ LANGUAGE sql;
+CREATE FUNCTION m.shadow(v regclass) RETURNS text AS $$
+  SELECT coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = split_part(m.bound(v), '.', 2)
+      AND array_position(current_schemas(true), n.nspname)
+        < array_position(current_schemas(true), split_part(m.bound(v), '.', 1))
+    LIMIT 1), 'none') $$ LANGUAGE sql;
+SELECT 'R141', 'a view that qualified qb.helper(): binding / shadow test, after qa.helper() appears',
+  m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+DROP VIEW qa.vq; CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+SELECT 'R142', 'the same after the rebuild that test scheduled', m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+DROP VIEW qa.vq; CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+SELECT 'R143', 'and after the next one', m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+SELECT 'R144', 'what that creation proved: a candidate sat earlier and the object bound past it',
+  CASE WHEN m.shadow('qa.vq') <> 'none' THEN 'yes, so the reference is qualified' ELSE 'no' END;
+SELECT 'R145', 'the unqualified view: binding / shadow test, before its rebuild', m.bound('qa.vu') || ' / ' || m.shadow('qa.vu');
+DROP VIEW qa.vu; CREATE VIEW qa.vu AS SELECT helper() AS who;
+SELECT 'R146', 'the same after its rebuild', m.bound('qa.vu') || ' / ' || m.shadow('qa.vu');
+SET search_path = m;
+DROP FUNCTION m.shadow(regclass); DROP FUNCTION m.bound(regclass);
+DROP SCHEMA qa CASCADE; DROP SCHEMA qb CASCADE;
+
+-- -------------------------- the forty-sixth 2026-09-05 review round
+
+-- Qualification cannot be inferred from a same-named candidate: an unqualified
+-- call binds past an inapplicable overload, and resolution is a function of
+-- the whole visible candidate set, not of what sits earlier on the path.
+CREATE SCHEMA oa; CREATE SCHEMA ob; CREATE SCHEMA oc;
+CREATE FUNCTION oa.helper(t text) RETURNS text AS $$SELECT 'oa(text)'$$ LANGUAGE sql;
+CREATE FUNCTION ob.helper(i int) RETURNS text AS $$SELECT 'ob(integer)'$$ LANGUAGE sql;
+CREATE FUNCTION m.rbound(v regclass) RETURNS text AS $$
+  SELECT n.nspname || '.' || d.refobjid::regprocedure::text FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+   JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE r.ev_class = v AND d.refclassid = 'pg_proc'::regclass $$ LANGUAGE sql;
+CREATE FUNCTION m.candidates(v regclass) RETURNS text AS $$
+  SELECT string_agg(n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', ', '
+                    ORDER BY n.nspname, pg_get_function_identity_arguments(p.oid))
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE p.proname = split_part(split_part(m.rbound(v), '.', 2), '(', 1)
+    AND n.nspname = ANY(current_schemas(true)) $$ LANGUAGE sql;
+SET search_path = oa, ob, m;
+CREATE VIEW oa.v AS SELECT helper(1) AS who;
+SELECT 'R147', 'helper(1) under (oa, ob) with oa.helper(text) and ob.helper(integer)', m.rbound('oa.v');
+SELECT 'R148', 'what a name-and-class flag records at that creation',
+  CASE WHEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'helper' AND n.nspname = 'oa')
+       THEN 'a candidate sat earlier and the object bound past it, so "qualified"' ELSE 'none' END;
+SELECT m.candidates('oa.v') AS c0 \gset
+CREATE FUNCTION oa.helper(i int) RETURNS text AS $$SELECT 'oa(integer)'$$ LANGUAGE sql;
+SELECT who AS w1 FROM oa.v \gset
+CREATE OR REPLACE VIEW oa.v AS SELECT helper(1) AS who;
+SELECT 'R149', 'after oa.helper(integer) appears: the view / a bootstrap of it', :'w1' || ' / ' || (SELECT who FROM oa.v);
+SELECT 'R150', 'the same-named routines on the effective path, at creation -> now', :'c0' || '  ->  ' || m.candidates('oa.v');
+-- A capture with nothing earlier on the path at all.
+CREATE FUNCTION oc.helper(b bigint) RETURNS text AS $$SELECT 'oc(bigint)'$$ LANGUAGE sql;
+SET search_path = oc, m;
+CREATE VIEW oc.w AS SELECT helper(1) AS who;
+SELECT m.rbound('oc.w') AS b0, m.candidates('oc.w') AS c1 \gset
+CREATE FUNCTION oc.helper(i int) RETURNS text AS $$SELECT 'oc(integer)'$$ LANGUAGE sql;
+SELECT who AS w2 FROM oc.w \gset
+CREATE OR REPLACE VIEW oc.w AS SELECT helper(1) AS who;
+SELECT 'R151', 'helper(1) with only oc.helper(bigint) visible, then oc.helper(integer) added in the same schema: bound / the view / a bootstrap',
+  :'b0' || ' / ' || :'w2' || ' / ' || (SELECT who FROM oc.w);
+SELECT 'R152', 'that candidate set, at creation -> now', :'c1' || '  ->  ' || m.candidates('oc.w');
+-- An identical signature earlier on the path hides the later one, which is
+-- the case that made "earlier on the path" look like the whole rule.
+SET search_path = oa, ob, m;
+SELECT 'R153', 'helper(1::int) with oa.helper(integer) and ob.helper(integer) both visible', helper(1::int);
+-- Operators overload the same way.
+CREATE FUNCTION oa.cat(a int, b text) RETURNS text AS $$SELECT a::text || b$$ LANGUAGE sql;
+CREATE OPERATOR oa.<+> (LEFTARG = int, RIGHTARG = text, FUNCTION = oa.cat);
+CREATE FUNCTION ob.add(a int, b int) RETURNS int AS $$SELECT a + b$$ LANGUAGE sql;
+CREATE OPERATOR ob.<+> (LEFTARG = int, RIGHTARG = int, FUNCTION = ob.add);
+CREATE VIEW oa.opv AS SELECT 1 <+> 2 AS r;
+SELECT 'R154', 'an operator bound past an earlier same-named operator with other operand types',
+  (SELECT n.nspname || '.' || d.refobjid::regoperator::text FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+    JOIN pg_operator o ON o.oid = d.refobjid JOIN pg_namespace n ON n.oid = o.oprnamespace
+   WHERE r.ev_class = 'oa.opv'::regclass AND d.refclassid = 'pg_operator'::regclass);
+SET search_path = m;
+DROP FUNCTION m.candidates(regclass); DROP FUNCTION m.rbound(regclass);
+DROP SCHEMA oa CASCADE; DROP SCHEMA ob CASCADE; DROP SCHEMA oc CASCADE;
+
+-- Clean up every principal this script created; roles are cluster-wide.
+ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
+DROP SCHEMA m CASCADE;
+DROP OWNED BY m_owner_a; DROP OWNED BY m_owner_b; DROP OWNED BY m_all; DROP OWNED BY m_writer; DROP OWNED BY m_owner; DROP OWNED BY m_sreader; DROP OWNED BY m_deploy; DROP OWNED BY m_bystander; DROP OWNED BY m_ow_owner; DROP OWNED BY m_ow_deploy; DROP OWNED BY m_dp_owner; DROP OWNED BY m_dp_by;
+DROP ROLE IF EXISTS m_owner_a, m_owner_b, m_all, m_writer, m_reader, m_nobody, m_owner, m_sreader, m_deploy, m_bystander, m_ow_owner, m_ow_deploy, m_dp_owner, m_dp_by;

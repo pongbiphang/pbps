@@ -1,0 +1,263 @@
+-- PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+A1 | a view definition is stored verbatim | no
+A2 | pretty and non-pretty deparse agree | no
+A3 | a string-literal function body is stored verbatim | yes
+A4 | a BEGIN ATOMIC function body is stored verbatim | no (prosrc is empty)
+A5 | functions and procedures overload on one name | 4 objects named m.f
+A6 | the engine normalizes the identity arguments | a character varying, b "char" / IN a date / a integer / a text
+A7 | DROP FUNCTION by bare name, with overloads present | refused: function name "m.f" is not unique
+A8 | a function may share a name with a table | accepted
+A9 | a view may share a name with a table | refused: relation "customer" already exists
+A10 | CREATE OR REPLACE VIEW appends a column | accepted
+A11 | CREATE OR REPLACE VIEW removes a column | refused: cannot drop columns from view
+A12 | CREATE OR REPLACE VIEW retypes a column | refused: cannot change data type of view column "a" from character varying(10) to text
+A13 | CREATE OR REPLACE FUNCTION changes the return type | refused: cannot change return type of existing function
+A14 | CREATE OR REPLACE FUNCTION given a new argument type | accepted, leaving 2 function(s) named m.g
+A15 | CREATE OR REPLACE VIEW keeps the grants | accepted, and the grant is kept
+A16 | DROP VIEW then CREATE VIEW keeps the grants | lost
+A17 | a table rename follows into the stored view definition | yes
+A18 | and a column rename rewrites it as | SELECT customer_id, name AS full_name FROM m.client WHERE legacy_code IS NULL;
+A19 | ALTER COLUMN TYPE is refused while a plain view depends on it | refused: cannot alter type of a column used by a view or rule
+A20 | DROP COLUMN is refused while a plain view depends on it | refused: cannot drop column legacy_code of table customer because other objects depend on it
+B1 | a table grant without schema USAGE reads as held | true (schema USAGE: false)
+B2 | and the read actually succeeds | refused: permission denied for schema m
+B3 | GRANT ON ALL TABLES covers a table created afterwards | true for an existing table, false for a later one
+B4 | ALTER DEFAULT PRIVILEGES is keyed to the creating role | true for the named role, false for another
+B5 | a role created in another database, seen from this one | connected to m_other, pg_roles rows for m_reader: 1
+B6 | DROP ROLE while the role merely holds a grant | refused: role "m_reader" cannot be dropped because some objects depend on it
+B7 | a fresh function's ACL | NULL (the built-in default applies)
+B8 | GRANT ALTER | refused: unrecognized privilege type "alter"
+B9 | inserting into an identity column with only INSERT granted | accepted
+B10 | inserting into a serial column with only INSERT granted | refused: permission denied for sequence ser_id_seq
+T-01 | int -> bigint | rewrite
+T-02 | bigint -> int | rewrite
+T-03 | varchar(10) -> varchar(20) | no rewrite
+T-04 | varchar(20) -> varchar(10) | rewrite
+T-05 | varchar(20) -> text | no rewrite
+T-06 | text -> varchar(20) | rewrite
+T-07 | numeric(10,2)->(12,2) | no rewrite
+T-08 | numeric(10,2)->(10,4) | rewrite
+T-09 | int -> text | rewrite
+T-10 | text -> int, no USING | refused: column "c" cannot be cast automatically to type integer
+T-11 | narrowing over real data | refused: value too long for type character varying(5)
+T-12 | add column, no default | no rewrite
+T-13 | add column, const default | no rewrite
+T-14 | add column, volatile default | rewrite
+T-15 | SET NOT NULL | no rewrite
+T-16 | DROP COLUMN | no rewrite
+T-17 | timestamp -> timestamptz under UTC | no rewrite
+T-18 | timestamp -> timestamptz under America/New_York | rewrite
+T-19 | declared spelling -> catalog spelling | a=integer, b=integer, c=smallint, d=bigint, e=numeric(10,2), f=double precision, g=double precision, h=real, j=boolean, k=character varying, l=character varying(9), m_=character(5), n=time without time zone, o=time with time zone, p=timestamp without time zone, q=integer
+T-20 | float(n) either side of 24 | a=real, b=real, c=double precision, d=double precision
+T-21 | what a dropped column leaves in the catalog | 1:keep isdropped=false type=integer, 2:........pg.dropped.2........ isdropped=true type=-
+R1 | how a declared default is stored | a -> 'plain'::text, b -> 0, c -> 'x'::character varying
+R2 | an ordinary insert after keys were forced in | refused: duplicate key value violates unique constraint "pinned_pkey"
+R3 | a NOT VALID foreign key reads as | convalidated=false
+R4 | a new violating row under a NOT VALID key | refused: insert or update on table "child" violates foreign key constraint "fk_child"
+R5 | deleting a parent referenced under a NOT VALID key | refused: update or delete on table "parent" violates foreign key constraint "fk_child" on table "child"
+R6 | a key differing only in case | accepted (collation en_US.utf8)
+R7 | value rendering under the default session | \x0102 / 2026-09-05 / 1 day 02:00:00
+R8 | the same values after three SET commands | \001\002 / 05/09/2026 / 1 2:00:00
+A21 | a type modifier distinguishes two routines | accepted / refused: function "mod1" already exists with same argument types
+A22 | how the engine identifies that routine | a character varying
+B11 | PUBLIC executing a function nobody granted | accepted
+B12 | the ACL after revoking EXECUTE from PUBLIC | {postgres=X/postgres}, and then: refused: permission denied for function fresh
+R9 | the next insert after restarting at max(written)+1 | accepted, taking id 2 while the table already holds a row at id 100
+A23 | the ACL after an operator revokes EXECUTE from PUBLIC | {postgres=X/postgres}
+A24 | the ACL after a drop-and-create rebuild of that function | NULL — the default is back, and PUBLIC can execute it again
+A25 | work surviving a failed CREATE OR REPLACE inside a savepoint | 2 of 2 rows committed
+R10 | a descending identity, with no MAXVALUE the model could carry | refused: START value (100) cannot be greater than MAXVALUE (-1)
+R11 | RESTART at max(keys)+1 on a descending identity | refused: RESTART value (101) cannot be greater than MAXVALUE (100)
+R12 | RESTART at min(keys)-1, the direction the sequence counts | accepted / accepted
+R13 | a backslash-escaped quote inside an E-string | standard_conforming_strings=on, E'it\'s  here' is 10 characters: it's  here
+A26 | a SECURITY DEFINER function before a rebuild | owner=m_owner secdef=true acl=NULL
+A27 | the same function after the deployment account rebuilds it | owner=postgres secdef=true acl=NULL — so the ACL check cannot see the change
+R14 | the lock held after only reading max(id) | AccessShareLock
+R15 | the lock held once the RESTART runs | AccessExclusiveLock, AccessShareLock
+A28 | options a view carries outside its definition | reloptions: security_invoker=true, security_barrier=true / pg_get_viewdef shows: SELECT id, a FROM opt_t;
+A29 | those options after CREATE OR REPLACE | accepted, reloptions: NULL — lost
+A30 | those options after a drop-and-create rebuild | reloptions: NULL — lost
+A31 | a reader querying the view while security_invoker=true | refused: permission denied for table opt_t
+A32 | the same reader after a rebuild dropped the option | accepted
+R16 | the keys a step-2 generator owns | 1, 3, 5, 7, 9, 11
+R17 | the same generator after restarting at max(keys)+1 | 1, 3, 5, 7, 9, 11, 13, 14, 16 — it has crossed onto the even series
+R18 | an unqualified reference inside a definition, search_path empty | refused: relation "sp_t" does not exist
+R19 | the same definition with the object's own schema on the path | accepted
+A33 | a view column default, and where it lives | pg_attrdef: 'from the view default'::text / pg_get_viewdef shows: SELECT id, a FROM sp_t;
+A34 | that default after a drop-and-create rebuild | gone
+R20 | locking a sequence with LOCK TABLE | refused: cannot lock relation "lockable_id_seq"
+R21 | locking the sequence's row with FOR UPDATE | refused: cannot lock rows in sequence "lockable_id_seq"
+R22 | setval(GREATEST(target, nextval)) with the sequence behind the target | returned 101
+R23 | the same call after another allocation pushed it past the target | sequence had reached 103, setval(GREATEST(101, nextval)) returned 104 — it did not go back
+R24 | a plain literal with a backslash-quote, standard_conforming_strings=on | refused: syntax error at or near "s"
+R25 | the same literal with standard_conforming_strings=off | one literal of length 10
+R26 | pg_get_viewdef with an empty search_path | SELECT id, a FROM m.sp2;
+R27 | pg_get_viewdef with the object's schema on the path | SELECT id, a FROM sp2;
+R28 | an unqualified function from another schema, path = the object's schema only | refused: function helper(integer) does not exist
+R29 | the same definition with that other schema on the path | accepted
+R30 | setval(GREATEST(target, nextval)) interleaved with one other allocation | inner nextval 105, another session took 106, setval wrote 105, next caller receives 106 — already issued
+R31 | a widened INCREMENT on a sequence never called | first nextval 1, second 101 — the increment does not apply to the first call
+R32 | ALTER SEQUENCE INCREMENT BY does not move last_value | last_value 101
+R33 | and after restoring the increment | last_value 101 — nothing was lowered
+A35 | the ACL of a view the deployment role just created | {m_deploy=arwdDxtm/m_deploy,m_bystander=r/m_deploy} — granted by no declaration
+A36 | so a rebuild of an object whose old ACL was NULL | old acl NULL passes an "reproduce the old ACL" check, new acl is {m_deploy=arwdDxtm/m_deploy,m_bystander=r/m_deploy}
+R34 | a catalog query with an empty search_path | 1 row(s) from pg_class — pg_catalog stays reachable
+R35 | deparse under an empty path is fully qualified | SELECT id, a FROM m.dp_t;
+R36 | the same view deparsed under the project path | SELECT id, a FROM dp_t;
+R37 | a view in m_b created under a path ordered (m_a, m_b) | binds to schema m_a, and its stored definition is only: SELECT id, marker FROM t;
+R38 | the same view with its own schema first | binds to schema m_b
+A37 | what a table rename leaves in the view's stored definition | SELECT id, full_name FROM m.clnt;
+A38 | recreating that view from the unchanged declaration text | refused: relation "m.cust" does not exist
+A39 | two triggers of the same name in one schema | customers.audit, orders.audit
+A40 | DROP TRIGGER without naming the table | refused: syntax error at end of input
+A41 | DROP TRIGGER naming the table | accepted
+A42 | DROP FUNCTION with a managed check constraint on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A43 | DROP FUNCTION with a column default on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A44 | DROP FUNCTION with a generated column on it | refused: cannot drop function fdep(integer) because other objects depend on it
+A45 | DROP FUNCTION with an expression index on it | refused: cannot drop function fdep(integer) because other objects depend on it
+R39 | a sequence advance after the transaction that made it rolled back | last_value 5 — the advance survived
+R40 | nextval on a CYCLE sequence, six calls | 8, 9, 10, 1, 2, 3 — not monotonic, so "advance until past the maximum" never ends
+R41 | what the catalog says about that sequence | cycle=true min=1 max=10 — detectable, though Identity records only seed and increment
+A46 | the target owner's CREATE on the containing schema | true — the prerequisite ALTER ... OWNER TO checks
+A47 | the same after REVOKE CREATE | false — an object may still be validly owned by it
+A48 | membership granted WITH SET FALSE | set_option=false — membership without the right to assume it
+A49 | default-ACL entries a preflight would see at BEGIN | 1
+A50 | and what the same transaction sees a statement later | 2 — the catalog read is not pinned to the preflight
+A51 | which of three callers pg_depend records an edge for | dep_atomic() — the plpgsql and string-literal bodies record nothing
+A52 | dropping the function with only opaque callers left | accepted
+A53 | creating it again under a new signature | accepted
+A54 | and calling the plpgsql caller after that apply committed | refused: function m.dep_f(integer) does not exist
+R42 | the same wall-clock value converted under two session zones | UTC -> 2026-01-15 12:00:00+00 / America/New_York -> 2026-01-15 17:00:00+00 — they differ by 05:00:00
+A55 | creating a plpgsql body that names a function which does not exist | accepted
+A56 | and calling it | refused: function m.no_such_fn(integer) does not exist
+R43 | an ambiguous date literal under DateStyle MDY | 2026-01-02
+R44 | the same literal under DateStyle DMY | 2026-02-01 — a month apart, and this is what gets stored
+R45 | the same DEFAULT text created under two DateStyles | '2026-01-02'::date / '2026-02-01'::date
+R46 | an unchanged timestamptz read under UTC | 2026-01-15 12:00:00+00
+R47 | the same row read under America/New_York | 2026-01-15 07:00:00-05 — different text, and the stored instant is identical: true
+R48 | a stored double rendered at extra_float_digits=0 | 0.123456789012346
+R49 | the same value at extra_float_digits=3 | 0.12345678901234568
+R50 | and at extra_float_digits=-3 | 0.123456789012 — one stored value, three spellings
+R51 | one declared literal inserted under two DateStyles | 1 -> 2026-01-02, 2 -> 2026-02-01 — the same approved plan, different stored data
+R52 | a view created under extras ordered (m_ea, m_eb) | from m_ea, stored as: SELECT helper() AS who;
+R53 | the same view after the project reorders its extras | from m_ea — unchanged, and nothing rebuilt it
+R54 | a bootstrap of the same declaration under the new order | from m_eb — the environment and a bootstrap now differ
+R55 | locking a view with LOCK TABLE | accepted
+R56 | and the option a racing session would set | accepted, reloptions now: security_invoker=true
+R57 | DateStyle after the value-carrying statement SET LOCAL was for | ISO, DMY — SET LOCAL is transaction-scoped
+R58 | a DEFAULT created later in the same transaction | '2026-02-01'::date — the scope leaked into opaque DDL
+R59 | LOCK TABLE on a routine | refused: relation "m.lockable_fn" does not exist
+R60 | a row lock on its pg_proc entry | accepted — and measured with two sessions, holding it blocks ALTER FUNCTION (ADR-0009 §3)
+R61 | a trigger's enabled state after DISABLE | tgenabled = D
+R62 | the same trigger after a drop-and-create rebuild | tgenabled = O — the disable is gone
+R63 | is a trigger a lockable relation of its own? | no — its lock is the parent table's
+A57 | a named-notation caller before its callee is rebuilt | accepted
+A58 | the identity after renaming only the parameter | pn_f(integer) — unchanged
+A59 | and the same caller now | refused: function m.pn_f(a => integer) does not exist
+R64 | a quoted timestamptz with an abbreviation, under Default | 2026-01-15 18:00:00+00
+R65 | the same literal under Australia | 2026-01-15 02:30:00+00 — the same approved value, a different instant
+R66 | a plpgsql body created under (m, m_na), called under the same | from m_na
+R67 | the same plpgsql body called under (m, m_nb) | from m_nb — resolved when it runs, not when it was created
+R68 | a BEGIN ATOMIC body called under (m, m_nb) | from m_na — bound at creation
+R69 | the plpgsql body after a function-local SET search_path | from m_na — the engine's own remedy
+A60 | a LANGUAGE sql string body naming a missing function | refused: function m.no_such(integer) does not exist
+A61 | a LANGUAGE plpgsql body naming a missing function | accepted — check_function_bodies is on
+A62 | reverse pg_depend edges to a callee with a SQL-language caller | none
+A63 | a callee-only rebuild, which never recreates the caller | accepted / accepted
+A64 | the unchanged SQL-language caller afterwards | refused: function m.oo_f(integer) does not exist
+A65 | and recreating that caller with its stale reference | refused: function m.oo_f(integer) does not exist — the engine checks only when it creates
+R70 | one row rendered under the canonical values | 2026-01-02 | P1DT2H | \x0102 | 0.12345678901234568 | 0.12345678 | 2026-01-15 12:00:00+00
+R71 | and whether the floats survive that text | double precision: true, real: true
+R72 | a nested block comment | 1 — it nests, and measured separately, so does T-SQL
+R73 | the same text bound as a parameter, under two DateStyles | 2026-01-02, 2026-02-01 — binding does not canonicalize
+R74 | a literal the engine has already resolved, under the same two | 2026-01-02, 2026-01-02 — this is what the plan bakes in
+R75 | a default whose cast happens at evaluation, under MDY | 2026-01-02
+R76 | the same expression under DMY | 2026-02-01 — so the probe must use the write's environment
+R77 | a nondeterministic collation at default strength | collisdeterministic = false, 'New' = 'new' is false
+R78 | a nondeterministic collation at secondary strength | collisdeterministic = false, 'New' = 'new' is true — the flag is the same, the answer is not
+R79 | inserting 'new' beside 'New' under the case-sensitive one | accepted
+R80 | a quoted timetz with an abbreviation, under Default | 12:00:00-06
+R81 | the same literal under Australia | 12:00:00+09:30 — timetz belongs on the offline refusal list too
+R82 | a generated column created under extras (uu_a, uu_b) | uu_a row 1
+R83 | a new row in the same table after reordering to (uu_b, uu_a) | uu_a row 2
+R84 | a bootstrap of the same declaration under the new order | uu_b row 1
+R85 | a rendered text value containing a backslash, under on | length 4
+R86 | the same rendered INSERT under off | length 3
+R87 | the E-string form instead, under off | length 4
+R88 | the same E-string under on | length 4
+R89 | a two-byte bytea rendered in canonical hex, under off | accepted, storing 3 byte(s)
+R90 | the decode() form instead, under off | accepted, storing 2 byte(s)
+R91 | how a declared check expression is stored | CHECK ((label <> 'none'::text))
+R92 | how a declared index filter is stored | (label <> 'none'::text)
+R93 | a column omitted by an INSERT, in the probing session (MDY) | 2026-01-02
+R94 | the same INSERT in another session (DMY) | 2026-02-01
+R95 | probing a nextval() default in a rolled-back planning transaction | returned 1, sequence last_value now 1
+R96 | the same nextval() default under SET TRANSACTION READ ONLY | refused: cannot execute nextval() in a read-only transaction
+R97 | a volatile function that writes, under READ ONLY | refused: cannot execute INSERT in a read-only transaction
+R98 | a volatile function that only computes, under READ ONLY | accepted
+R99 | now(), under READ ONLY | accepted
+R100 | the sequence after the read-only probe | last_value 1
+R101 | a view created under (xa, xb) while only xb.helper() exists | xb
+R102 | the same declaration through an opaque plpgsql body | xb
+R103 | the view after xa.helper() appears, path string unchanged | xb
+R104 | the plpgsql body after the same, with cached plans discarded | xa
+R105 | a bootstrap of the same view declaration, same path | xa
+R106 | what the catalog records about the view's binding | xb.helper
+R107 | and about the opaque body's | nothing
+R108 | text / date / bytea / timestamptz, read back | text / date / bytea / timestamp with time zone
+R109 | the shadow query before ya.helper() exists | none
+R110 | the same query after ya.helper() appears | ya.helper
+R111 | and for a view that qualified yb.helper() explicitly | ya.helper
+R112 | what the catalog records about a check constraint's binding | yb.helper()
+R113 | a relation shadow: the class-aware test before za.zt exists | none
+R114 | the same test after za.zt appears | rebuild: shadowed by za.zt
+R115 | the routines-only test on that same case | none
+R116 | which table a bootstrap of that declaration binds | za.zt
+R117 | the bound schema removed from the path, ordering test alone | none
+R118 | the same case, class-aware and missing-aware | rebuild: zb.helper left the path; 
+R119 | a view using only built-in functions and operators | no recorded dependency on any of them
+R120 | the effective path against the configured one | pg_catalog,m against m
+R121 | a view qualifying a function in a schema off the write path | ax.digest
+R122 | whether ax was on the effective path when that view was created | no
+A66 | recreating the SQL caller with check_function_bodies on | refused: function cfb.f(integer) does not exist
+A67 | the same recreation with check_function_bodies off | accepted
+A68 | calling it afterwards | refused: function cfb.f(integer) does not exist
+A69 | a BEGIN ATOMIC body naming the same missing function, still off | refused: function cfb.f(integer) does not exist
+A70 | how the setting reaches a session nobody configured | check_function_bodies=off
+R123 | now() probed in two separate read-only transactions | two different values
+R124 | a constant-folding default probed the same way | the same value
+A71 | the caller before anything is dropped | integer overload
+A72 | what a string-bodied SQL caller records about its callee | nothing
+A73 | what a BEGIN ATOMIC caller records | ov.g(integer)
+A74 | recreating the caller after g(integer) is dropped, bodies checked | accepted
+A75 | what it answers now | bigint overload
+R125 | a default reading a config row, probed in two read-only transactions | the same value both times (bronze)
+R126 | what the apply stored, after that row changed between the two | gold
+R127 | two rows that both omitted the same clock_timestamp() default | two values
+R128 | the stored cell against the default evaluated again on the next plan | different, so the next plan schedules another update
+R129 | DEFAULT '01/02/2026' on a date column, created under DMY, as the catalog spells it | '2026-02-01'::date
+R130 | a row omitting that cell under MDY, once the default exists typed | 2026-02-01
+R131 | the declared text baked under MDY, the default created under DMY: cell vs default | 2026-01-02 vs '2026-02-01'::date
+R132 | whether the next plan schedules an update for that row | yes
+R133 | '01/02/2026' read under the canonical ISO, YMD | refused: date/time field value out of range: "01/02/2026"
+R134 | DEFAULT DATE '2026-01-02' created under DMY, as the catalog spells it | '2026-01-02'::date
+R135 | a check expression and an index filter carrying the same text, created under DMY | CHECK ((d > '2026-02-01'::date)) / (d > '2026-02-01'::date)
+R136 | a timestamptz default naming an abbreviation, created under Default and under Australia | '2026-01-15 18:00:00+00'::timestamp with time zone / '2026-01-15 02:30:00+00'::timestamp with time zone
+R137 | the shadow test, asked of the catalog before the plan creates wa.helper() | none
+R138 | the view after that plan applied with no rebuild scheduled | wb
+R139 | a bootstrap of the same declaration, wa.helper() created first | wa
+R140 | the same test asked of the catalog after apply, one plan late | wa.helper
+R141 | a view that qualified qb.helper(): binding / shadow test, after qa.helper() appears | qb.helper / qa.helper
+R142 | the same after the rebuild that test scheduled | qb.helper / qa.helper
+R143 | and after the next one | qb.helper / qa.helper
+R144 | what that creation proved: a candidate sat earlier and the object bound past it | yes, so the reference is qualified
+R145 | the unqualified view: binding / shadow test, before its rebuild | qb.helper / qa.helper
+R146 | the same after its rebuild | qa.helper / none
+R147 | helper(1) under (oa, ob) with oa.helper(text) and ob.helper(integer) | ob.helper(integer)
+R148 | what a name-and-class flag records at that creation | a candidate sat earlier and the object bound past it, so "qualified"
+R149 | after oa.helper(integer) appears: the view / a bootstrap of it | ob(integer) / oa(integer)
+R150 | the same-named routines on the effective path, at creation -> now | oa.helper(t text), ob.helper(i integer)  ->  oa.helper(i integer), oa.helper(t text), ob.helper(i integer)
+R151 | helper(1) with only oc.helper(bigint) visible, then oc.helper(integer) added in the same schema: bound / the view / a bootstrap | oc.helper(bigint) / oc(bigint) / oc(integer)
+R152 | that candidate set, at creation -> now | oc.helper(b bigint)  ->  oc.helper(b bigint), oc.helper(i integer)
+R153 | helper(1::int) with oa.helper(integer) and ob.helper(integer) both visible | oa(integer)
+R154 | an operator bound past an earlier same-named operator with other operand types | ob.<+>(integer,integer)

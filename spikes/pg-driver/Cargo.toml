@@ -1,0 +1,22 @@
+[package]
+name = "pg-driver-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Phase 5 spike: does the `pbps-db` seam — `Conn`, `Row`, `FromColumn`, `Param`
+# — absorb a second driver? ADR-0007 decision 5 claims it does, and no second
+# driver has ever been put through it. This crate re-implements that seam's
+# public shape over `tokio-postgres` and runs the SPEC 11.5 all-or-nothing
+# invariant against a live server. It is evidence, not product code, and goes
+# once ADR-0014 is settled.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-postgres = "0.7"
+thiserror = "2"
+
+# Its own workspace root, rather than an entry in the root manifest's
+# `exclude`: PR #10 touches that file, and a spike is not worth a conflict in
+# it. `spikes/yaml-span` is listed there because it predates that constraint.
+[workspace]
