@@ -1288,6 +1288,32 @@ SELECT 'R118', 'the same case, class-aware and missing-aware',
 SET search_path = m;
 DROP SCHEMA za CASCADE; DROP SCHEMA zb CASCADE;
 
+-- -------------------------- the fortieth 2026-09-05 review round
+
+-- "Left the path" has to be asked about the EFFECTIVE path, and only about
+-- bindings the path could have reached in the first place.
+CREATE TABLE m.at (id int, s text);
+CREATE VIEW m.av AS SELECT upper(s) AS u, id + 1 AS n FROM m.at WHERE s <> 'x';
+CREATE SCHEMA ax;
+CREATE FUNCTION ax.digest(t text) RETURNS text AS $$SELECT upper(t)$$ LANGUAGE sql;
+CREATE VIEW m.aq AS SELECT ax.digest(s) AS d FROM m.at;   -- qualified, ax off the path
+SELECT 'R119', 'a view using only built-in functions and operators',
+  coalesce((SELECT string_agg(DISTINCT n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE w.ev_class = 'm.av'::regclass AND d.refclassid = 'pg_proc'::regclass),
+   'no recorded dependency on any of them');
+SELECT 'R120', 'the effective path against the configured one',
+  array_to_string(current_schemas(true), ',') || ' against ' || array_to_string(current_schemas(false), ',');
+SELECT 'R121', 'a view qualifying a function in a schema off the write path',
+  (SELECT string_agg(n.nspname || '.' || p.proname, ',')
+     FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+     JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE w.ev_class = 'm.aq'::regclass AND d.refclassid = 'pg_proc'::regclass);
+SELECT 'R122', 'whether ax was on the effective path when that view was created',
+  CASE WHEN 'ax' = ANY(current_schemas(true)) THEN 'yes' ELSE 'no' END;
+DROP SCHEMA ax CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

@@ -215,3 +215,7 @@ R115 | the routines-only test on that same case | none
 R116 | which table a bootstrap of that declaration binds | za.zt
 R117 | the bound schema removed from the path, ordering test alone | none
 R118 | the same case, class-aware and missing-aware | rebuild: zb.helper left the path; 
+R119 | a view using only built-in functions and operators | no recorded dependency on any of them
+R120 | the effective path against the configured one | pg_catalog,m against m
+R121 | a view qualifying a function in a schema off the write path | ax.digest
+R122 | whether ax was on the effective path when that view was created | no

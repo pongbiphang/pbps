@@ -1036,6 +1036,46 @@ reads deterministic would have made them depend on the declarations.
   do" when it should answer "I cannot tell" — and SQL's three-valued logic
   supplied the second one silently.
 
+  **That rebuild then has to be asked about the *effective* path, and only
+  about bindings the path could have reached.** Written against the configured
+  array it fires on things that were never on it, and a rebuild that fires
+  every plan is the permanent restatement this section exists to prevent —
+  reintroduced by the fix for the previous instance of it.
+
+  The obvious trigger turns out not to be one. **Measured**, PostgreSQL records
+  no dependency at all on the built-in functions and operators a parsed
+  expression uses, because system objects are pinned:
+
+  ```
+  a view using only built-in functions and operators:  no recorded dependency on any of them
+  ```
+
+  so `pg_catalog` never arrives as a recorded binding and the rule never sees
+  it. The correction is still owed, for two reasons that do arise. The path the
+  question must be asked about is the effective one — `pg_catalog` is searched
+  implicitly and a temp schema joins it when one exists:
+
+  ```
+  the effective path against the configured one:  pg_catalog,m against m
+  ```
+
+  And a **qualified** reference into a schema that was never on the path is
+  recorded like any other, which is the real version of this failure — an
+  extension installed in its own schema is the ordinary case:
+
+  ```
+  a view qualifying a function in a schema off the write path:      ax.digest
+  whether ax was on the effective path when that view was created:  no
+  ```
+
+  Against the rule as stated, that view rebuilds on every connected plan, for
+  ever. The last line is what separates the two cases without parsing anything:
+  a binding whose schema was **already off the effective path when the object
+  was created** was necessarily written qualified, and the path losing a schema
+  it never had is not news. So the state records, beside each binding, whether
+  it was on the effective path at creation, and only the ones that were can
+  trigger "left the path".
+
   **It is conservative, and the cost is measured rather than guessed:**
 
   ```
@@ -1243,9 +1283,9 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 | | |
 |---|---|
-| `pbps-model` | Nothing |
+| `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation (§3); and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with two restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **and the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`. A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the path at all — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |

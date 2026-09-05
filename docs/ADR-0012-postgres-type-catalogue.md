@@ -291,7 +291,7 @@ replacement is a declared transformation with its own ADR, not a flag.
 
 | | |
 |---|---|
-| `pbps-model` | **Nothing, because arrays are out.** `ColumnType` holds a base and arguments, which fits every spelling this catalogue admits. Admitting `text[]` would need a dimension in `ColumnType` — a real model change, and the reason arrays wait (§1) |
+| `pbps-model` | **Nothing, because arrays are out.** `ColumnType` holds a base and arguments, which fits every spelling this catalogue admits. Admitting `text[]` would need a dimension in `ColumnType` — a real model change, and the reason arrays wait (§1). Nothing *for this document's decisions*: [ADR-0013](ADR-0013-postgres-reference-data.md) does add three `StateSnapshot` fields |
 | `pbps-dialect` | `normalize_type`'s contract, already named in [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) Amendment 3 |
 | `TypeChangeRisk` | **Nothing** — §2 |
 | The estimate (14.1 P1) | Gains its first measured dataset and a stated boundary — §3 |
