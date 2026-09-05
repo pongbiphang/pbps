@@ -62,18 +62,47 @@ fn rule_ids() -> Vec<serde_json::Value> {
 /// Each key carries the catalogue's own sentence about the rule, so an editor
 /// shows what it checks and what it takes without a second description to
 /// keep in step.
-fn rules_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    let setting = generator.subschema_for::<RuleSetting>();
+fn rules_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // Every rule's own shape, not one shared `RuleSetting`. Shared, the schema
+    // accepted `naming.table: {rows: 5}` — a parameter that rule does not
+    // take, which `Policies::check` refuses — so the editor blessed a file
+    // the loader rejects, which is the whole thing this schema exists not to
+    // do (DECISIONS 188).
     let mut properties = serde_json::Map::new();
     for rule in &rules::RULES {
-        let mut entry = serde_json::Value::from(setting.clone());
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "severity".to_owned(),
+            serde_json::json!({
+                "type": "string",
+                "description": "error, warning, note or off.",
+            }),
+        );
+        for param in rule.params {
+            fields.insert((*param).to_owned(), param_schema(param));
+        }
         let about = match rule.params {
             [] => format!("Checks {}.", rule.about),
             params => format!("Checks {}. Takes {}.", rule.about, params.join(", ")),
         };
-        if let Some(o) = entry.as_object_mut() {
-            o.insert("description".to_owned(), about.into());
-        }
+        let entry = serde_json::json!({
+            "description": about,
+            "anyOf": [
+                // `off` as a YAML boolean. Only `false`: `true` says nothing
+                // about the severity and `check` refuses it.
+                {"const": false},
+                // A bare severity word. Left as a string rather than an
+                // `enum`, because `Severity::from_str` trims and lowercases,
+                // and a schema stricter than the loader is the mirror image
+                // of the bug this is fixing (DECISIONS 172).
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": fields,
+                    "additionalProperties": false,
+                },
+            ],
+        });
         properties.insert(rule.id.to_owned(), entry);
     }
     schemars::Schema::try_from(serde_json::json!({
@@ -82,6 +111,39 @@ fn rules_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "additionalProperties": false,
     }))
     .expect("an object is a schema")
+}
+
+/// One parameter, as the rule that takes it means it.
+///
+/// The names come from the catalogue and the shapes from [`RuleConfig`],
+/// which is still the one place a parameter's type is written down — the
+/// per-rule schemas say *which* parameters, never what they are
+/// (DECISIONS 188).
+fn param_schema(param: &str) -> serde_json::Value {
+    match param {
+        "pattern" => serde_json::json!({
+            "type": "string",
+            "description": "A regular expression the name must match in full.",
+        }),
+        "rows" => serde_json::json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "The row count above which a block is reported.",
+        }),
+        "offset" => serde_json::json!({
+            "type": "string",
+            "description": "The UTC offset the windows are written in (`+08:00`).",
+        }),
+        "allow" => serde_json::json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Windows such as `mon-fri 09:00-17:00`.",
+        }),
+        // A parameter added to the catalogue without a shape here would
+        // otherwise silently accept anything; an empty schema accepts
+        // anything too, but the test below refuses to let it happen.
+        _ => serde_json::json!({}),
+    }
 }
 
 /// One rule id: the same closed list, in the place a suppression names one.

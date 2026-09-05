@@ -1422,6 +1422,28 @@ fn context(root: &std::path::Path) -> Context {
     }
 }
 
+/// The schema with every column type in the dialect's canonical spelling.
+///
+/// Only the types: nothing else a rule reads is the dialect's to normalize.
+/// A type the dialect cannot normalize is left exactly as written — it is
+/// already an error from `refuse_invalid_declarations`, and rewriting what a
+/// finding quotes would make the message name something the file does not
+/// (DECISIONS 187).
+fn types_as_the_dialect_spells_them(
+    schema: &pbps_model::Schema,
+    dialect: &dyn Dialect,
+) -> pbps_model::Schema {
+    let mut out = schema.clone();
+    for table in out.tables.values_mut() {
+        for column in table.columns.values_mut() {
+            if let Ok(ty) = dialect.normalize_type(&column.ty) {
+                column.ty = ty;
+            }
+        }
+    }
+    out
+}
+
 /// Everything `validate` checks, as findings.
 ///
 /// Extracted so `doctor` can run the same checks rather than a second, drifting
@@ -1496,7 +1518,14 @@ pub fn validate_findings(
         };
         let mut ctx = policy_context(project, false);
         ctx.only = only;
-        for f in pbps_policy::declarations(&l.schema, &policies, &ctx) {
+        // Types in the dialect's own spelling, because the policy crate is
+        // dialect-agnostic on purpose and a rule that names a type sees
+        // whatever the declaration wrote. `national text` *is* `ntext` to SQL
+        // Server, and the default-on deprecated-type rule was bypassed by the
+        // alias. The boundary stays where it was: the dialect says what a
+        // type is, the policy says what to think of it (DECISIONS 187).
+        let spelled = types_as_the_dialect_spells_them(&l.schema, dialect);
+        for f in pbps_policy::declarations(&spelled, &policies, &ctx) {
             findings.push(policy_finding(&f));
         }
     }

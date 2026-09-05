@@ -1195,6 +1195,7 @@ fn differing(
 }
 
 fn refuse_unplanned_movement(
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
@@ -1460,20 +1461,33 @@ fn refuse_unplanned_movement(
                 now.indexes.keys().map(String::as_str).collect(),
             );
             // A column's own promise, in the fields the catalog reads back
-            // unchanged. The **type** is not one of them, and that is
-            // measured rather than assumed: SQL Server fills in a type's
-            // defaulted arguments, so `decimal` comes back `decimal(18,0)`,
+            // unchanged. The **type** is one of them once it is normalized,
+            // and only then: SQL Server fills in a type's defaulted
+            // arguments, so a declared `decimal` is stored `decimal(18,0)`,
             // `char` as `char(1)`, `float` as `float(53)` and `nvarchar` as
-            // `nvarchar(1)`. Comparing it refuses a valid apply — the live
-            // created-table test declares all four and would fail again.
-            // A default's **text** is rewritten too (`0` comes back `((0))`),
+            // `nvarchar(1)`. Compared raw it refuses a valid apply — measured,
+            // and the live created-table test declares all four so it would
+            // again. `normalize_type` expands exactly those, which is what
+            // makes the comparison possible at all; a type it cannot
+            // normalize is one nothing here can say anything about, and gets
+            // no answer rather than a wrong one (DECISIONS 186).
+            //
+            // A default's **text** is the engine's (`0` comes back `((0)`),
             // so only whether there is one at all is comparable
             // (DECISIONS 185).
+            let same_type = |a: &pbps_model::ColumnType, b: &pbps_model::ColumnType| match (
+                dialect.normalize_type(a),
+                dialect.normalize_type(b),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => true,
+            };
             for (n, was) in &declared.columns {
                 let Some(now) = now.columns.get(n) else {
                     continue;
                 };
-                if was.nullable != now.nullable
+                if !same_type(&was.ty, &now.ty)
+                    || was.nullable != now.nullable
                     || was.identity != now.identity
                     || was.default.is_some() != now.default.is_some()
                 {
@@ -3695,6 +3709,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         // express stops a state being written down, whether it was there at
         // the start or arrived during the run (110).
         refuse_unplanned_movement(
+            dialect,
             &plan.changes,
             &before,
             &after.schema,
@@ -4001,6 +4016,7 @@ async fn apply_staged_under_lock(
         // statement that has already committed, which is what checkpoints are
         // for. Stopping is the whole remedy a staged run has.
         staged_movement(
+            dialect,
             &plan.changes,
             &previous,
             &recorded,
@@ -4029,6 +4045,7 @@ async fn apply_staged_under_lock(
     // checkpoint is the honest answer, and `refuse_mid_deployment` then makes
     // every other command say so.
     staged_movement(
+        dialect,
         &plan.changes,
         &previous,
         &after.schema,
@@ -4058,6 +4075,7 @@ async fn apply_staged_under_lock(
 /// it (152 to 158). What it costs is a change to an object the plan touches
 /// later; what it buys is that no correct staged apply is ever stopped by it.
 fn staged_movement(
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
@@ -4074,7 +4092,7 @@ fn staged_movement(
     } else {
         Settled::SoFar
     };
-    refuse_unplanned_movement(changes, before, after, label, settled).map_err(|e| {
+    refuse_unplanned_movement(dialect, changes, before, after, label, settled).map_err(|e| {
         anyhow::anyhow!(
             "{e:#}
 
@@ -4592,8 +4610,15 @@ mod tests {
             changes: c.into_iter().map(pbps_model::PlannedChange::new).collect(),
         };
         let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
-            refuse_unplanned_movement(cs, before, after, "prod", Settled::Whole)
-                .map_err(|e| format!("{e:#}"))
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                cs,
+                before,
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
         };
 
         let before = schema("int", &[pbps_model::Permission::Select]);
@@ -4674,8 +4699,15 @@ mod tests {
             })],
         };
         let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
-            refuse_unplanned_movement(cs, before, after, "prod", Settled::Whole)
-                .map_err(|e| format!("{e:#}"))
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                cs,
+                before,
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
         };
 
         let before = schema(&[Permission::Select]);
@@ -4744,6 +4776,7 @@ mod tests {
 
         // What the plan wrote is what is there.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &writing("SELECT 2"),
             &before,
             &schema_with(Some(view("SELECT 2"))),
@@ -4754,6 +4787,7 @@ mod tests {
 
         // Something else rewrote it straight afterwards.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &writing("SELECT 2"),
             &before,
             &schema_with(Some(view("SELECT 3"))),
@@ -4765,6 +4799,7 @@ mod tests {
 
         // Or dropped it.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &writing("SELECT 2"),
             &before,
             &schema_with(None),
@@ -4784,6 +4819,7 @@ mod tests {
             )],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &dropping,
             &before,
             &schema_with(None),
@@ -4791,8 +4827,15 @@ mod tests {
             Settled::Whole,
         )
         .expect("the plan's own drop");
-        let e = refuse_unplanned_movement(&dropping, &before, &before, "prod", Settled::Whole)
-            .expect_err("the module is still there");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &dropping,
+            &before,
+            &before,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
     }
 
@@ -4844,6 +4887,7 @@ mod tests {
         };
         let before = table("nvarchar(50)", None);
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &table("nvarchar(100)", None),
@@ -4854,6 +4898,7 @@ mod tests {
 
         // An index that arrived on the same table is not.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &table("nvarchar(100)", Some("ix_rogue")),
@@ -4874,9 +4919,15 @@ mod tests {
                 "other".to_owned(),
                 pbps_model::Column::new("bigint".parse().unwrap()),
             );
-        let e =
-            refuse_unplanned_movement(&widening, &before, &retyped_other, "prod", Settled::Whole)
-                .expect_err("a column nobody planned");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &widening,
+            &before,
+            &retyped_other,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("a column nobody planned");
         assert!(format!("{e:#}").contains("`other`"), "{e:#}");
 
         // A constraint dropped and recreated under the same name with a
@@ -4892,6 +4943,7 @@ mod tests {
             .unwrap()
             .unique = true;
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &table("nvarchar(50)", Some("ix_note")),
             &rebuilt,
@@ -4905,6 +4957,7 @@ mod tests {
         // a checkpoint that blessed a change became `previous`, after which
         // the final comparison measured the contaminated shape against itself.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &table("nvarchar(50)", Some("ix_rogue")),
@@ -4933,6 +4986,7 @@ mod tests {
             )],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &adding,
             &table("nvarchar(50)", None),
             &table("nvarchar(50)", Some("ix_note")),
@@ -4945,6 +4999,7 @@ mod tests {
         // says so: the shape comparison excludes exactly these, and the table
         // check answers only for the table (DECISIONS 168).
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &adding,
             &table("nvarchar(50)", None),
             &table("nvarchar(50)", None),
@@ -4972,9 +5027,15 @@ mod tests {
         put_check(&mut with_check, "note IS NOT NULL");
         let mut check_moved = table("nvarchar(50)", Some("ix_note"));
         put_check(&mut check_moved, "note <> N''");
-        let e =
-            refuse_unplanned_movement(&adding, &with_check, &check_moved, "prod", Settled::Whole)
-                .expect_err("the check shares a name with the planned index, and is not it");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &adding,
+            &with_check,
+            &check_moved,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the check shares a name with the planned index, and is not it");
         assert!(format!("{e:#}").contains("check `ix_note`"), "{e:#}");
     }
     /// A row the plan writes is held to the cells it spelled, once every
@@ -5021,6 +5082,7 @@ mod tests {
         };
         let empty = Schema::default();
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &inserting,
             &empty,
             &holding(&[("note", "wrote")]),
@@ -5029,6 +5091,7 @@ mod tests {
         )
         .expect("the row holds what the plan wrote");
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &inserting,
             &empty,
             &holding(&[("note", "rewritten")]),
@@ -5041,8 +5104,15 @@ mod tests {
         // A cell the read-back does not carry proves nothing: it is at its
         // column's default, which is where a spelled value equal to that
         // default also lands. Saying anything here would refuse valid applies.
-        refuse_unplanned_movement(&inserting, &empty, &holding(&[]), "prod", Settled::Whole)
-            .expect("an omitted cell is a cell at its default");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &inserting,
+            &empty,
+            &holding(&[]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("an omitted cell is a cell at its default");
     }
 
     /// A module the plan drops leaves the managed set only once the plan has
@@ -5148,6 +5218,7 @@ mod tests {
             ],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &Schema::default(),
             &created(&["declared"]),
@@ -5156,6 +5227,7 @@ mod tests {
         )
         .expect("the row this plan inserts into the table it creates");
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &Schema::default(),
             &created(&["declared", "rogue"]),
@@ -5198,6 +5270,7 @@ mod tests {
             ],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating_role,
             &Schema::default(),
             &with_grants(&[Permission::Select]),
@@ -5206,6 +5279,7 @@ mod tests {
         )
         .expect("the grant this plan gives the role it creates");
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating_role,
             &Schema::default(),
             &with_grants(&[Permission::Select, Permission::Delete]),
@@ -5243,8 +5317,15 @@ mod tests {
             })],
         };
         let none = role(BTreeMap::new());
-        let e = refuse_unplanned_movement(&granting, &none, &none, "prod", Settled::Whole)
-            .expect_err("the first permission on a target is still a permission");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &granting,
+            &none,
+            &none,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the first permission on a target is still a permission");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
 
         // 2. A row the plan writes, gone before the read. Its statement's own
@@ -5277,13 +5358,26 @@ mod tests {
                 },
             )],
         };
-        let e =
-            refuse_unplanned_movement(&inserting, &table(&[]), &table(&[]), "prod", Settled::Whole)
-                .expect_err("the row this plan inserts is not there");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &inserting,
+            &table(&[]),
+            &table(&[]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the row this plan inserts is not there");
         assert!(format!("{e:#}").contains("row `new`"), "{e:#}");
         // Mid-run it simply has not happened yet.
-        refuse_unplanned_movement(&inserting, &table(&[]), &table(&[]), "prod", Settled::SoFar)
-            .expect("the insert has not run yet");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &inserting,
+            &table(&[]),
+            &table(&[]),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("the insert has not run yet");
 
         // 3. A column change that moves no reading leaves its cells compared.
         let with_note = |note: &str| {
@@ -5316,6 +5410,7 @@ mod tests {
             )],
         };
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &tightening,
             &with_note("kept"),
             &with_note("rewritten"),
@@ -5357,6 +5452,7 @@ mod tests {
             ],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &replacing,
             &schema_with(pbps_model::ModuleKind::View),
             &schema_with(pbps_model::ModuleKind::Function),
@@ -5403,20 +5499,56 @@ mod tests {
         };
         let before = Schema::default();
 
-        // What the plan asked for, in the engine's own spelling of the type.
+        // The engine's own spelling of a type is not movement: it fills in
+        // the arguments a declaration omits, and `normalize_type` expands the
+        // same ones, so the two meet (DECISIONS 186).
+        let mut spelled = pbps_model::Table::default();
+        spelled.columns.insert(
+            "id".to_owned(),
+            pbps_model::Column::new("decimal(18,0)".parse().unwrap()),
+        );
+        let bare = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new({
+                        let mut t = pbps_model::Table::default();
+                        t.columns.insert(
+                            "id".to_owned(),
+                            pbps_model::Column::new("decimal".parse().unwrap()),
+                        );
+                        t
+                    }),
+                },
+            )],
+        };
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &bare,
+            &before,
+            &after_with(spelled),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("`decimal` and `decimal(18,0)` are one type");
+
+        // A type that really changed is not that.
         let mut widened = declared();
         widened.columns.insert(
             "id".to_owned(),
             pbps_model::Column::new("bigint".parse().unwrap()),
         );
-        refuse_unplanned_movement(
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &before,
             &after_with(widened),
             "prod",
             Settled::Whole,
         )
-        .expect("what a created column is comes back from the catalog");
+        .expect_err("a type nobody planned");
+        assert!(format!("{e:#}").contains("`id`"), "{e:#}");
 
         // A column nobody declared.
         let mut extra = declared();
@@ -5425,6 +5557,7 @@ mod tests {
             pbps_model::Column::new("int".parse().unwrap()),
         );
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &before,
             &after_with(extra),
@@ -5449,6 +5582,7 @@ mod tests {
             },
         );
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &before,
             &after_with(indexed),
@@ -5488,6 +5622,7 @@ mod tests {
         let mut keyed = declared();
         keyed.foreign_keys.insert("fk_new".to_owned(), fk);
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &with_fk,
             &before,
             &after_with(keyed),
@@ -5528,6 +5663,7 @@ mod tests {
             &|c: &mut pbps_model::Column| c.default = Some("((0))".to_owned()),
         ] {
             let e = refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
                 &plain,
                 &before,
                 &after_with(column(tamper)),
@@ -5558,6 +5694,7 @@ mod tests {
             t
         };
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creates(filtered(Some("[id] > 0"))),
             &before,
             &after_with(filtered(None)),
@@ -5568,6 +5705,7 @@ mod tests {
         assert!(format!("{e:#}").contains("ix_new"), "{e:#}");
         // But the engine's rewriting of the predicate is not movement.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creates(filtered(Some("[id] > 0"))),
             &before,
             &after_with(filtered(Some("([id]>(0))"))),
@@ -5597,6 +5735,7 @@ mod tests {
             )],
         };
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &plans(keyed(Some("pk_new"), &["id"])),
             &before,
             &after_with(keyed(Some("pk_new"), &["other"])),
@@ -5606,6 +5745,7 @@ mod tests {
         .expect_err("a primary key on columns nobody planned");
         assert!(format!("{e:#}").contains("primary key"), "{e:#}");
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &plans(keyed(Some("pk_new"), &["id"])),
             &before,
             &after_with(keyed(Some("pk_other"), &["id"])),
@@ -5618,6 +5758,7 @@ mod tests {
         // A declaration that leaves the naming to the database gets whatever
         // the engine generates, and that is not movement.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &plans(keyed(None, &["id"])),
             &before,
             &after_with(keyed(Some("PK__new__3213E83F"), &["id"])),
@@ -5638,6 +5779,7 @@ mod tests {
             t
         };
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &plans(uniqued(&["id"])),
             &before,
             &after_with(uniqued(&["other"])),
@@ -5680,6 +5822,7 @@ mod tests {
 
         // Different columns under the planned name.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &adding(planned.clone()),
             &before,
             &after_with(read_back(fk_to(
@@ -5695,6 +5838,7 @@ mod tests {
         // Same columns, different referential action: the engine will delete
         // rows this plan never said it could.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &adding(planned.clone()),
             &before,
             &after_with(read_back(fk_to(
@@ -5709,6 +5853,7 @@ mod tests {
 
         // And the one the plan actually asked for.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &adding(planned.clone()),
             &before,
             &after_with(read_back(planned)),
@@ -5719,6 +5864,7 @@ mod tests {
 
         // And one the CREATE asked for that is not there once it has run.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &creating,
             &before,
             &after_with(pbps_model::Table::default()),
@@ -5792,6 +5938,7 @@ mod tests {
         // Absent: a NULL in a column with no default is omitted from the
         // read-back, so absence still proves nothing.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &inserting,
             &before,
             &schema_with(None),
@@ -5803,6 +5950,7 @@ mod tests {
         // Present and NULL: a column *with* a default reads one back
         // explicitly, and that is the plan's own result too.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &inserting,
             &before,
             &schema_with(Some(pbps_model::Value::Null)),
@@ -5813,6 +5961,7 @@ mod tests {
 
         // Present and something else: somebody wrote it.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &inserting,
             &before,
             &schema_with(Some(pbps_model::Value::Text("rogue".into()))),
@@ -5859,6 +6008,7 @@ mod tests {
         // The type is the plan's own business: only the stored form says what
         // it became, which is why the field is excluded at all.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &schema_with("nvarchar(100)", None, true),
@@ -5869,6 +6019,7 @@ mod tests {
 
         // A default that arrived beside it is not.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &schema_with("nvarchar(100)", Some("N'x'"), true),
@@ -5882,6 +6033,7 @@ mod tests {
         // change carries `from_nullable == to_nullable`, so the restatement
         // leaves a value two reads still agree on.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &widening,
             &before,
             &schema_with("nvarchar(100)", None, false),
@@ -5905,6 +6057,7 @@ mod tests {
             )],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &tightening,
             &before,
             &schema_with("nvarchar(100)", None, false),
@@ -5926,9 +6079,15 @@ mod tests {
             seed: 1,
             increment: 1,
         });
-        let e =
-            refuse_unplanned_movement(&widening, &before, &with_identity, "prod", Settled::Whole)
-                .expect_err("an identity nobody planned");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &widening,
+            &before,
+            &with_identity,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("an identity nobody planned");
         assert!(format!("{e:#}").contains("identity"), "{e:#}");
     }
 
@@ -5965,6 +6124,7 @@ mod tests {
             )],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &tightening,
             &schema_with(true),
             &schema_with(false),
@@ -5985,6 +6145,7 @@ mod tests {
             .columns
             .insert("other".to_owned(), c);
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &tightening,
             &schema_with(true),
             &other_moved,
@@ -6033,6 +6194,7 @@ mod tests {
             ],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &redefining,
             &schema_with(false),
             &schema_with(true),
@@ -6051,6 +6213,7 @@ mod tests {
             )],
         };
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &dropping,
             &schema_with(false),
             &schema_with(false),
@@ -6079,20 +6242,41 @@ mod tests {
             )],
         };
         // Mid-run the table is not there yet, and that is not a failure.
-        refuse_unplanned_movement(&creating, &before, &before, "prod", Settled::SoFar)
-            .expect("the statement has not run yet");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &before,
+            &before,
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("the statement has not run yet");
         // Once every statement has run it is one: `CREATE TABLE` reporting
         // success is not the table being there.
-        let e = refuse_unplanned_movement(&creating, &before, &before, "prod", Settled::Whole)
-            .expect_err("the table this plan creates is not there");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &before,
+            &before,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the table this plan creates is not there");
         assert!(format!("{e:#}").contains("dbo.new"), "{e:#}");
         // And movement is compared either way.
         let mut moved = before.clone();
         moved
             .tables
             .remove(&"dbo.kept".parse::<TableName>().unwrap());
-        let e = refuse_unplanned_movement(&creating, &before, &moved, "prod", Settled::SoFar)
-            .expect_err("an untouched table went");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &before,
+            &moved,
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("an untouched table went");
         assert!(format!("{e:#}").contains("dbo.kept"), "{e:#}");
     }
 
@@ -6114,10 +6298,26 @@ mod tests {
                 },
             )],
         };
-        staged_movement(&creating, &before, &before, "prod", 1, 2)
-            .expect("statement 1 of 2: the create has not run yet");
-        let e = staged_movement(&creating, &before, &before, "prod", 2, 2)
-            .expect_err("the last read is asked what the plan achieved");
+        staged_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &before,
+            &before,
+            "prod",
+            1,
+            2,
+        )
+        .expect("statement 1 of 2: the create has not run yet");
+        let e = staged_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &before,
+            &before,
+            "prod",
+            2,
+            2,
+        )
+        .expect_err("the last read is asked what the plan achieved");
         let e = format!("{e:#}");
         assert!(e.contains("dbo.new"), "{e}");
         // And the message says what a staged run cannot do about it.
@@ -6137,8 +6337,15 @@ mod tests {
                 },
             )],
         };
-        let e = refuse_unplanned_movement(&creating, &empty, &empty, "prod", Settled::Whole)
-            .expect_err("the role this plan creates is not there");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &empty,
+            &empty,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the role this plan creates is not there");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
 
         let mut made = Schema::default();
@@ -6149,8 +6356,15 @@ mod tests {
                 grants: BTreeMap::new(),
             },
         );
-        refuse_unplanned_movement(&creating, &empty, &made, "prod", Settled::Whole)
-            .expect("the plan's own role");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &creating,
+            &empty,
+            &made,
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the plan's own role");
 
         // And a dropped role that came back.
         let dropping = pbps_model::ChangeSet {
@@ -6162,8 +6376,15 @@ mod tests {
                 },
             )],
         };
-        let e = refuse_unplanned_movement(&dropping, &made, &made, "prod", Settled::Whole)
-            .expect_err("the role this plan drops is still there");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &dropping,
+            &made,
+            &made,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the role this plan drops is still there");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
@@ -6203,6 +6424,7 @@ mod tests {
             )],
         };
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &rename,
             &granted_on("dbo.old"),
             &granted_on("dbo.new"),
@@ -6216,6 +6438,7 @@ mod tests {
         let mut robbed = granted_on("dbo.new");
         robbed.roles.get_mut("app").unwrap().grants.clear();
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &rename,
             &granted_on("dbo.old"),
             &robbed,
@@ -6274,6 +6497,7 @@ mod tests {
         // The one column is renamed, so the row is keyed differently on each
         // side. That is the plan's own doing.
         refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &renaming,
             &table(&[("old", "kept"), ("note", "same")]),
             &table(&[("new", "kept"), ("note", "same")]),
@@ -6284,6 +6508,7 @@ mod tests {
 
         // And the columns it leaves alone are still compared underneath.
         let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
             &renaming,
             &table(&[("old", "kept"), ("note", "same")]),
             &table(&[("new", "kept"), ("note", "rewritten")]),
@@ -6333,8 +6558,15 @@ mod tests {
                 },
             )],
         };
-        refuse_unplanned_movement(&dropping, &before, &after, "prod", Settled::Whole)
-            .expect("the grant went with the table it was on");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &dropping,
+            &before,
+            &after,
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the grant went with the table it was on");
 
         // A grant on a table the plan does *not* drop still has to be there.
         let mut before_two = before.clone();
@@ -6342,8 +6574,15 @@ mod tests {
             GrantTarget::Schema("dbo".to_owned()),
             [Permission::Select].into_iter().collect(),
         );
-        let e = refuse_unplanned_movement(&dropping, &before_two, &after, "prod", Settled::Whole)
-            .expect_err("the schema grant did not go anywhere");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &dropping,
+            &before_two,
+            &after,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the schema grant did not go anywhere");
         assert!(format!("{e:#}").contains("role app"), "{e:#}");
     }
 
@@ -6393,8 +6632,15 @@ mod tests {
             .map(pbps_model::PlannedChange::new)
             .collect(),
         };
-        refuse_unplanned_movement(&cs, &before, &after, "prod", Settled::Whole)
-            .expect("a rename is not movement");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &cs,
+            &before,
+            &after,
+            "prod",
+            Settled::Whole,
+        )
+        .expect("a rename is not movement");
     }
 
     /// A renamed table's declaration is found under the name the database

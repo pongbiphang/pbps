@@ -2612,3 +2612,53 @@ SPEC is in sync with all of these.
     The general form is worth keeping: **"the engine renders this" is not one
     property of a value, it is a property of each field**, and the way to find
     out which is to compare and see what the engine refuses.
+
+186. **A created column's type is compared, normalized.** 185 concluded the
+    type could not be compared at all, on a measurement: SQL Server fills in a
+    type's defaulted arguments, so a declared `decimal` is stored
+    `decimal(18,0)`. The measurement was right and the conclusion was one step
+    short — `Dialect::normalize_type` expands *exactly* those same arguments,
+    which is what it is for. Normalized on both sides, a bare `decimal` and a
+    stored `decimal(18,0)` are one type and `int` becoming `bigint` is not.
+    So the guard takes a dialect now. It had none, which is why the question
+    looked settled: the reach of a comparison was being decided by what was in
+    scope. A type the dialect cannot normalize gets no answer rather than a
+    wrong one, like every other unspellable thing here.
+    The live created-table test keeps its bare `decimal`, `char`, `float` and
+    `nvarchar` columns — they were added in 185 to prove the comparison
+    impossible and now prove it correct, which is the better job for them.
+
+187. **A policy rule sees types in the dialect's spelling.**
+    `column.no-deprecated-type` matched `spec.ty.base` against `text`, `ntext`
+    and `image`, and `national text` *is* `ntext` — the alias is in
+    `types.rs`. A default-on rule was bypassed by writing the deprecated type
+    the long way.
+    `pbps-policy` does not depend on any dialect and should not: what a type
+    *is* is dialect knowledge, what to think of it is the policy's. So the
+    normalizing happens at the boundary, in the caller that already holds a
+    dialect — `validate_findings` hands the evaluator a schema whose column
+    types are canonical. The rule is unchanged, and so is every future rule
+    that names a type.
+    A type the dialect cannot normalize is passed through exactly as written:
+    it is already an error from `refuse_invalid_declarations`, and rewriting
+    what a finding quotes would make the message name something the file does
+    not say.
+
+188. **Each rule's schema is that rule's own shape.** 172 closed the rule
+    *catalogue* so an editor could not bless `naming.tabel`. Every rule then
+    got the same `RuleSetting` schema, so the editor still blessed
+    `naming.table: {rows: 5}` — a parameter that rule does not take and
+    `Policies::check` refuses. Each entry is generated from the catalogue's
+    own `params` now, with `additionalProperties: false`, so the schema and
+    the checker draw the same line. The boolean form is `false` alone: `true`
+    says nothing about the severity and is refused.
+    Two things stay open on purpose. The **severity word** is a plain string,
+    not an enum, for 172's reason — `Severity::from_str` trims and lowercases,
+    and a schema stricter than the loader is the mirror image of the bug being
+    fixed. And a rule's **required** parameters are not expressed as a JSON
+    Schema `required`, because "required unless the severity is off" needs the
+    same case-insensitive test and would refuse `naming.table: Off`.
+    A parameter's *type* is still written down once, in `RuleConfig`; the
+    per-rule schemas say which parameters, never what they are. A test ties
+    every generated entry back to `rules::RULES` and fails if a parameter is
+    added to the catalogue without a shape.

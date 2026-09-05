@@ -6862,6 +6862,34 @@ fn an_unknown_revision_is_refused_rather_than_read_as_empty() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// `national text` *is* `ntext` to SQL Server — `types.rs` lists the alias —
+/// so a default-on rule that matched the raw base name was bypassed by an
+/// equivalent engine spelling (DECISIONS 187).
+#[test]
+fn a_deprecated_type_is_reported_under_its_alias() {
+    let d = Demo::new("aliastype");
+    for ty in ["ntext", "national text"] {
+        d.table(&format!(
+            "table: dbo.t\ncolumns:\n  id: {{type: int}}\n  body: {{type: \"{ty}\"}}\n"
+        ));
+        // A warning, so `validate` still succeeds: what matters is that the
+        // finding is there.
+        let o = d.run(&["validate", "--format", "json"]);
+        assert_eq!(code(&o), 0, "{ty}: {}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let ids: Vec<&str> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"column.no-deprecated-type"),
+            "{ty} is deprecated whichever way it is spelled: {v}"
+        );
+    }
+}
+
 /// `git ls-tree --name-only` C-quotes any path outside ASCII with
 /// `core.quotePath` at its default — measured: `schéma/dbo.t.yml` comes back
 /// as `"sch\303\251ma/dbo.t.yml"`, and `git show <rev>:<that>` answers
