@@ -171,7 +171,10 @@ Composing intent (step 4 of #64) ends as the same file edit the CLI's intent
 commands make, followed by a commit of *those paths and nothing else* and a
 `git push`, run as subprocesses in the checkout the UI was started in, with
 the user's own configuration. The commit is `git commit --only -m <message>
--- <paths>`, after `git add -N` for a path that is new. The message is the
+-- <paths>`, after `git add -N -- <path>` for a path that is new; every path
+the UI hands `git` comes after `--`, since a path may begin with a dash and
+**measured**, `git add -N -A` with a file called `-A` in the tree marked every
+untracked file, where `git add -N -- -A` marked the one. The message is the
 page's to ask for, prefilled from the intent the way the CLI's own error
 output spells it (`rename dbo.customer.customer_name full_name`), and passed
 with `-m` because a commit with no message opens an editor, which a
@@ -198,10 +201,18 @@ same git: a hook that ran `git add b` widened `git commit --only -- a` to a
 commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
 content, not the previewed hunk. So the push is not automatic. Before it, the
 UI reads the commit back — `git diff-tree --no-commit-id --name-only -r HEAD`
-must name exactly the previewed paths, `git diff HEAD~1 HEAD -- <paths>` must
-be the previewed hunk, and the commit's one parent must be the tip the UI
+must name exactly the previewed paths, the blob the commit holds at each path
+(`git rev-parse <oid>:<path>`) must be the blob the UI hashed after writing
+it (`git hash-object`), and the commit's one parent must be the tip the UI
 recorded before composing (below) — and pushes only a commit that passes all
-three. The third is there because the first two look only at the new commit's
+three. The second compares object ids and not diff output, because a diff is
+a presentation: a `diff.external` or `textconv` driver, or a path marked
+binary, can render two different blobs as one text, and **measured**, with
+`diff.external` set to a helper printing a constant, `git diff HEAD~1 HEAD`
+showed that constant for a file a hook had rewritten, while the recorded and
+committed blob ids differed. The preview the page shows is rendered with
+`--no-ext-diff --no-textconv` for the same reason, and is a preview; the blob
+id is the proof. The third is there because the first two look only at the new commit's
 own delta: another process moving the branch between the check below and the
 commit gives the intent commit an ancestry the preview never showed, and
 **measured**, a commit slipped in after the check passed both delta checks
@@ -226,9 +237,17 @@ verified commit rather than `HEAD`, which another process may have moved, and
 leases the destination on the tip it recorded — or on its absence, with an
 empty expected value: `git push --no-follow-tags
 --force-with-lease=refs/heads/<branch>:<tip> <remote> <oid>:refs/heads/<branch>`,
-never a bare `git push`. **Measured** on the same git: `ls-remote` answered
-nothing for the unpublished branch, the tip was an ancestor of the remote's
-`main`, and the push with the empty lease created the branch. And with
+never a bare `git push`. The first push of a new branch leases its witness
+too: the head that proved the tip was on the remote is named in the same
+push, at the value `ls-remote` gave, under `--atomic` — `--force-with-lease`
+on a ref the push does not name is ignored, and a witness force-moved or
+deleted between `ls-remote` and the push would otherwise let the push make
+its old history reachable again. **Measured** on the same git: `ls-remote`
+answered nothing for the unpublished branch, the tip was an ancestor of the
+remote's `main`, and the push with the empty lease created the branch; with
+`main` then moved on the remote, a lease on `main` without pushing it was
+ignored and the branch was created anyway, while the atomic push naming
+`main` at its recorded value was refused as stale and created nothing. And with
 `push.default=matching` and two branches ahead, a bare `git push` advanced
 both; a branch one unrelated commit ahead had that commit published by
 `HEAD:refs/heads/<branch>`; with `HEAD` moved on after the read-back, the push
