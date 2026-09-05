@@ -54,7 +54,11 @@ pub struct Baseline {
     pub is_empty_fallback: bool,
 }
 
-pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
+pub fn load(
+    project: &Project,
+    source: &Source,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> anyhow::Result<Baseline> {
     match source {
         Source::File(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| {
@@ -73,7 +77,7 @@ pub fn load(project: &Project, source: &Source) -> anyhow::Result<Baseline> {
                 is_empty_fallback: false,
             })
         }
-        Source::Git { rev } => load_from_git(project, rev),
+        Source::Git { rev } => load_from_git(project, rev, dialect),
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
@@ -258,7 +262,11 @@ fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> 
         .collect())
 }
 
-fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
+fn load_from_git(
+    project: &Project,
+    rev: &str,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
         anyhow::anyhow!(
@@ -329,6 +337,21 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
                 );
             }
         }
+    }
+
+    // The historical side gets the routine-identity pass the current side
+    // gets, or a routine respelled since — `f(int)` then, `f(integer)` now,
+    // one object to the engine — is two keys and a destructive plan for an
+    // object that did not change (ADR-0009 §1). A collision at that revision
+    // is the baseline's own defect, reported like a file that does not parse.
+    let collisions =
+        crate::routine_ids_as_the_dialect_spells_them(&mut schema, &mut hints, dialect);
+    if !collisions.is_empty() {
+        anyhow::bail!(
+            "the declarations at `{rev}` name one routine twice (the baseline version itself is \
+             broken): {}",
+            collisions.join("; ")
+        );
     }
 
     // The identity file must come from the same revision: using the current one as
@@ -422,7 +445,11 @@ pub fn changed_subjects(
 /// by the ordinary loader, so `--since` compares what a reader of that commit
 /// would have seen. A revision with no declarations is an empty schema, which
 /// makes everything new — the right answer for a project's first policy run.
-pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Schema> {
+pub fn schema_at(
+    project: &Project,
+    rev: &str,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> anyhow::Result<pbps_model::Schema> {
     let root = &project.root;
     // A revision that does not exist yet is the empty schema, the same answer
     // `load_from_git` gives; anything else git refuses is an error, not "no
@@ -465,17 +492,30 @@ pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Sch
             }
             std::fs::write(&target, text)?;
         }
-        pbps_load::load_schema_dir(&scratch)
-            .map(|l| l.schema)
-            .map_err(|errs| {
-                anyhow::anyhow!(
-                    "the declarations at `{rev}` do not load: {}",
-                    errs.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                )
-            })
+        let mut loaded = pbps_load::load_schema_dir(&scratch).map_err(|errs| {
+            anyhow::anyhow!(
+                "the declarations at `{rev}` do not load: {}",
+                errs.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })?;
+        // The same pass `load_from_git` runs, for the same reason: the two
+        // readers of a historical tree have to see the identities the current
+        // side sees, or a respelled routine reads as a changed subject.
+        let collisions = crate::routine_ids_as_the_dialect_spells_them(
+            &mut loaded.schema,
+            &mut loaded.hints,
+            dialect,
+        );
+        if !collisions.is_empty() {
+            anyhow::bail!(
+                "the declarations at `{rev}` name one routine twice: {}",
+                collisions.join("; ")
+            );
+        }
+        Ok(loaded.schema)
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     result

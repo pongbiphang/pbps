@@ -466,8 +466,13 @@ async fn pull_reads_every_kind_of_module_back() {
     managed.sort();
     assert_eq!(
         managed,
-        ["dbo.fn_double", "dbo.sp_touch", "dbo.tr_t", "dbo.v_active"],
-        "every readable module kind must come back managed"
+        [
+            "dbo.fn_double",
+            "dbo.sp_touch",
+            "dbo.t.tr_t",
+            "dbo.v_active"
+        ],
+        "every readable module kind must come back managed, the trigger under its table (ADR-0009 §1)"
     );
 
     // The body, not the whole CREATE: the prefix is the emitter's, and keeping

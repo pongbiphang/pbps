@@ -1305,8 +1305,9 @@ pub(crate) fn load_quiet(
 /// that kept the second would leave the first a module nobody plans for.
 /// Returns one message per such pair, and no message otherwise.
 #[must_use]
-fn routine_ids_as_the_dialect_spells_them(
-    loaded: &mut pbps_load::Loaded,
+pub(crate) fn routine_ids_as_the_dialect_spells_them(
+    schema: &mut pbps_model::Schema,
+    hints: &mut pbps_model::Hints,
     dialect: &dyn Dialect,
 ) -> Vec<String> {
     let spell = |id: &pbps_model::ModuleId| -> pbps_model::ModuleId {
@@ -1334,7 +1335,7 @@ fn routine_ids_as_the_dialect_spells_them(
         std::collections::BTreeMap::new();
     let mut spelled_by: std::collections::BTreeMap<pbps_model::ModuleId, pbps_model::ModuleId> =
         std::collections::BTreeMap::new();
-    for (id, module) in &loaded.schema.modules {
+    for (id, module) in &schema.modules {
         let key = spell(id);
         if let Some(first) = spelled_by.get(&key) {
             problems.push(format!(
@@ -1347,14 +1348,13 @@ fn routine_ids_as_the_dialect_spells_them(
         spelled_by.insert(key.clone(), id.clone());
         modules.insert(key, module.clone());
     }
-    loaded.schema.modules = modules;
-    loaded.hints.module_deps = loaded
-        .hints
+    schema.modules = modules;
+    hints.module_deps = hints
         .module_deps
         .iter()
         .map(|(id, on)| (spell(id), on.iter().map(&spell).collect()))
         .collect();
-    for role in loaded.schema.roles.values_mut() {
+    for role in schema.roles.values_mut() {
         role.grants = role
             .grants
             .iter()
@@ -1388,10 +1388,11 @@ fn routine_ids_as_the_dialect_spells_them(
 /// Every command that plans, applies or writes files goes through here, and so
 /// through the routine-identity pass: a `Loaded` that the dialect has not
 /// spelled keys a routine as its file wrote it, and the same object read back
-/// from the engine would not match (ADR-0009 §1). The three `load_quiet`
-/// callers in `doctor` skip the pass deliberately — they ask which schemas and
-/// which object names a project mentions, and an argument list is part of
-/// neither answer.
+/// from the engine would not match (ADR-0009 §1). The offline `plan` and the
+/// git baseline run the same pass on their own, because each needs the
+/// declarations before it knows the dialect; the three `load_quiet` callers in
+/// `doctor` skip it deliberately — they ask which schemas and which object
+/// names a project mentions, and an argument list is part of neither answer.
 fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
     let mut loaded = load_quiet(project).map_err(|errs| {
         for e in &errs {
@@ -1399,7 +1400,8 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
         }
         anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
     })?;
-    let collisions = routine_ids_as_the_dialect_spells_them(&mut loaded, dialect);
+    let collisions =
+        routine_ids_as_the_dialect_spells_them(&mut loaded.schema, &mut loaded.hints, dialect);
     if !collisions.is_empty() {
         for c in &collisions {
             eprintln!("error: {c}");
@@ -1589,7 +1591,7 @@ pub fn validate_findings(
     let mut loaded = load_quiet(project);
     let mut collisions = Vec::new();
     if let Ok(l) = &mut loaded {
-        collisions = routine_ids_as_the_dialect_spells_them(l, dialect);
+        collisions = routine_ids_as_the_dialect_spells_them(&mut l.schema, &mut l.hints, dialect);
     }
     // Identity consistency is validate's job too (SPEC §5.3): two branches each
     // adding a same-named column merge cleanly at the line level — two uids, two
@@ -1631,8 +1633,9 @@ pub fn validate_findings(
         let only = match since {
             None => None,
             Some(rev) => match (
-                baseline::ids_at(project, rev)
-                    .and_then(|ids| baseline::schema_at(project, rev).map(|schema| (ids, schema))),
+                baseline::ids_at(project, rev).and_then(|ids| {
+                    baseline::schema_at(project, rev, dialect).map(|schema| (ids, schema))
+                }),
                 read_ids_opt(project),
             ) {
                 (Ok((before, before_schema)), Ok(now)) => Some(baseline::changed_subjects(
@@ -2155,7 +2158,7 @@ fn cmd_plan(
     // typed `load.*` findings it was owed.
     let json = format == OutputFormat::Json;
 
-    let loaded = match load_quiet(project) {
+    let mut loaded = match load_quiet(project) {
         Ok(l) => l,
         Err(errs) => {
             // Unanswerable rather than a finding: `plan`'s question is "what
@@ -2191,6 +2194,32 @@ fn cmd_plan(
         "project.unsupported-dialect",
         dialect(project),
     )?;
+    // The declarations were loaded before the dialect was known, so the
+    // routine-identity pass `load` runs comes here instead — on this side now,
+    // and on the baseline inside `baseline::load`. Skipped on either side, a
+    // routine written `f(int)` at the baseline and `f(integer)` now would be
+    // two keys, and the plan a drop and a create of an unchanged object.
+    let collisions = routine_ids_as_the_dialect_spells_them(
+        &mut loaded.schema,
+        &mut loaded.hints,
+        dialect.as_ref(),
+    );
+    if !collisions.is_empty() {
+        if json {
+            output::unanswerable(
+                "plan",
+                collisions
+                    .iter()
+                    .map(|c| output::Finding::error("schema.name-collision", c.clone()))
+                    .collect(),
+            );
+        } else {
+            for c in &collisions {
+                eprintln!("error: {c}");
+            }
+        }
+        bail!("the declarations have {} problem(s)", collisions.len());
+    }
 
     let mut findings: Vec<output::Finding> = Vec::new();
 
@@ -2269,7 +2298,7 @@ fn cmd_plan(
         "plan",
         json,
         "baseline.unreadable",
-        baseline::load(project, source),
+        baseline::load(project, source, dialect.as_ref()),
     )?;
     if base.is_empty_fallback {
         let message = format!(

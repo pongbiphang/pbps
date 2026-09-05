@@ -790,8 +790,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 on: table.clone(),
                 name: name.name.clone(),
             },
-            _ => pbps_model::ModuleId::Named(name),
+            _ => pbps_model::ModuleId::Named(name.clone()),
         };
+        // The id crosses a snapshot and a plan as its string form, whose
+        // punctuation is structural: `.` separates the parts and `(` opens a
+        // signature. A legal quoted identifier may contain either —
+        // `[audit.v1]`, `[sales(archive)]` — and such an id would be written
+        // faithfully and read back as a *different* module: a trigger on
+        // `dbo.audit`, a routine with an argument. Before the typed id that
+        // read failed loudly; now it would succeed wrongly, so the round trip
+        // is checked here, at the one place engine names enter the model, and
+        // a name that does not survive it is inventoried like any other shape
+        // the format cannot carry.
+        if id.to_string().parse::<pbps_model::ModuleId>().as_ref() != Ok(&id) {
+            unmanageable(
+                "its name contains a period or a parenthesis, which a declaration cannot spell \
+                 (the tool would read it back as a different module)",
+            );
+            continue;
+        }
         schema.modules.insert(
             id,
             Module {
@@ -1531,6 +1548,48 @@ mod module_tests {
             "{:?}",
             p.unmanaged_modules
         );
+    }
+
+    /// A quoted identifier may hold the punctuation the id's string form uses
+    /// for structure. Written to a snapshot such a module would read back as
+    /// another one — `dbo.audit.v1` as a trigger on `dbo.audit`, `dbo.sales(archive)`
+    /// as a routine — so it is inventoried instead, with the reason.
+    #[test]
+    fn a_module_whose_name_the_id_cannot_spell_is_inventoried() {
+        let p = assemble(&catalog_with(vec![
+            module(
+                "dbo",
+                "audit.v1",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[audit.v1] AS SELECT 1"),
+            ),
+            module(
+                "dbo",
+                "sales(archive)",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[sales(archive)] AS SELECT 1"),
+            ),
+            module(
+                "dbo",
+                "sales_archive",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[sales_archive] AS SELECT 1"),
+            ),
+        ]));
+        assert_eq!(
+            p.schema
+                .modules
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["dbo.sales_archive"],
+            "{:?}",
+            p.unmanaged_modules
+        );
+        assert_eq!(p.unmanaged_modules.len(), 2, "{:?}", p.unmanaged_modules);
+        for u in &p.unmanaged_modules {
+            assert!(u.why.contains("period or a parenthesis"), "{u:?}");
+        }
     }
 
     /// SQL Server persists QUOTED_IDENTIFIER and ANSI_NULLS with the module and

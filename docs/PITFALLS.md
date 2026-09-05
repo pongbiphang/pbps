@@ -397,6 +397,18 @@ container, so nothing in the diff looked like a deleted check. **When a key
 gets wider, list what its narrowness was silently enforcing, and write each one
 down as a check before the widening lands.**
 
+**A fourth, the next round: the punctuation was already in the name.** The
+string form uses `.` and `(` as structure, and SQL Server lets a quoted
+identifier contain both. A view named `[audit.v1]` had always failed loudly at
+the snapshot read — `dbo.audit.v1` was no shape an `ObjectName` could take —
+and the typed key gave that string a meaning: a trigger named `v1` on
+`dbo.audit`. A parse that used to refuse now succeeded with a different
+identity, and no test noticed because none had held a name containing the
+delimiter. **When a string form gains a grammar, every input that used to be
+unparseable becomes a candidate for being parsed as something else** — list
+them, and make the round trip `to_string().parse() == self` a checked property
+where engine names enter (DECISIONS 202).
+
 **The shape.** Whenever a typed identity is flattened to a string — a map key,
 a filename, a message — test the flattening on the case where the parts are
 *not* separable by the obvious character, and on two values that must not

@@ -2912,3 +2912,22 @@ SPEC is in sync with all of these.
     and two keys are two objects. This is the guard-whose-reason-has-gone rule
     turned on the change that removed the reason: the key was the guard, and
     it had to be replaced in the same breath it was taken away.
+
+202. **A module whose name the id's string form cannot carry is inventoried,
+    not recorded.** `ModuleId` crosses a snapshot, a plan and every message as
+    a string in which the punctuation is structural: `.` separates the parts
+    and `(` opens a signature. A legal quoted identifier may contain either —
+    `[audit.v1]`, `[sales(archive)]` — and such an id would be written
+    faithfully and read back as a *different* module: a trigger on
+    `dbo.audit`, a routine with an argument named `archive`. Under the
+    `ObjectName` key the same read failed loudly, because `dbo.audit.v1` was
+    no shape a name could take; the typed key gave every such string a
+    meaning, and so turned a loud failure into a quiet one. The check sits in
+    introspection — the one place engine names enter the model — and asks the
+    round trip itself, `id.to_string().parse() == id`, rather than listing
+    forbidden characters, so it stays right if the string form changes. The
+    module is inventoried with the reason, as every other shape the format
+    cannot carry is, because a quiet refusal at the snapshot would leave the
+    next plan proposing its destruction. Not in `ObjectName::new`: engine
+    names arrive there for tables too, whose string form has the same
+    property and is out of this change's scope.

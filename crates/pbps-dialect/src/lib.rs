@@ -603,14 +603,30 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                 ));
             }
         }
-        if matches!(id, ModuleId::Routine(_)) && !dialect.overloads(module.kind) {
-            problems.push(format!(
-                "`{id}` is declared with an argument list, but {} does not overload a {}: name it \
-                 `{}` instead",
-                dialect.name(),
-                module.kind,
-                id.object_name()
-            ));
+        match id {
+            ModuleId::Routine(_) if !dialect.overloads(module.kind) => {
+                problems.push(format!(
+                    "`{id}` is declared with an argument list, but {} does not overload a {}: \
+                     name it `{}` instead",
+                    dialect.name(),
+                    module.kind,
+                    id.object_name()
+                ));
+            }
+            // The mirror image. Where the kind overloads, the engine identifies
+            // every routine by its argument types — the one taking none as
+            // `app.f()` — so a bare name is a key the engine never reads back
+            // under, and connected planning would see the same routine as a
+            // drop and a create.
+            ModuleId::Named(_) if dialect.overloads(module.kind) => {
+                problems.push(format!(
+                    "`{id}` is declared without an argument list, but {} identifies a {} by its \
+                     argument types: name it `{id}()` if it takes none, or list the types",
+                    dialect.name(),
+                    module.kind
+                ));
+            }
+            ModuleId::Routine(_) | ModuleId::Named(_) | ModuleId::Trigger { .. } => {}
         }
     }
     problems
@@ -996,6 +1012,24 @@ mod tests {
     /// A signature on an engine where the kind does not overload names an
     /// object that engine cannot have, and the message says what to write
     /// instead.
+    /// Where the kind overloads, the engine identifies every routine by its
+    /// argument types — the one taking none as `app.f()` — so a bare name is
+    /// a key the read-back never carries, and the same routine would plan as
+    /// a drop and a create. A view is named, on either engine.
+    #[test]
+    fn a_bare_name_is_refused_where_the_kind_overloads() {
+        let bare = schema_with(&[("app.f", ModuleKind::Function)], &[]);
+        let problems = check_module_names(&bare, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`app.f()`"), "{problems:?}");
+        assert!(check_module_names(&bare, &MinimalDialect).is_empty());
+
+        let spelled = schema_with(&[("app.f()", ModuleKind::Function)], &[]);
+        assert!(check_module_names(&spelled, &OverloadingDialect).is_empty());
+        let view = schema_with(&[("app.v", ModuleKind::View)], &[]);
+        assert!(check_module_names(&view, &OverloadingDialect).is_empty());
+    }
+
     #[test]
     fn a_signature_is_refused_where_the_kind_does_not_overload() {
         let signed = schema_with(&[("app.f(integer)", ModuleKind::Function)], &[]);

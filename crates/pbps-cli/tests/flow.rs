@@ -922,6 +922,53 @@ fn respelling_a_type_produces_no_plan() {
     assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
 }
 
+/// The offline plan loads its declarations before it knows the dialect, and
+/// the git baseline is assembled from `git show` and never sees `load`. Both
+/// still get the routine-identity pass: `dbo.f(integer)` at the baseline and
+/// `dbo.f(int)` now are one routine to the engine, and a plan that dropped and
+/// recreated it would be a destructive plan for an object nobody changed
+/// (ADR-0009 §1).
+#[test]
+fn an_offline_plan_spells_a_routine_the_same_way_on_both_sides() {
+    let d = Demo::new("plan-routine-spelling");
+    let f = |args: &str| {
+        std::fs::write(
+            d.dir.join("schema/dbo.f.function.yml"),
+            format!(
+                "function: dbo.f({args})\ndefinition: |-\n  (@a int) RETURNS int AS BEGIN RETURN @a END\n"
+            ),
+        )
+        .unwrap();
+    };
+    f("integer");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+
+    f("int");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+
+    // And a signature that only differs in spelling from another's is a
+    // collision the offline plan reports, not a second module it plans for.
+    std::fs::write(
+        d.dir.join("schema/dbo.f-2.function.yml"),
+        "function: dbo.f(INTEGER)\ndefinition: |-\n  (@a int) RETURNS int AS BEGIN RETURN 2 END\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("one object"), "{}", stderr(&o));
+    let o = d.run(&["plan", "--format", "json"]);
+    assert!(
+        stdout(&o).contains("schema.name-collision"),
+        "{}\n{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
 #[test]
 fn validate_rejects_what_the_engine_would_refuse() {
     let d = Demo::new("validate-dialect");
