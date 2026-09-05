@@ -37,10 +37,11 @@
 //! drawn in the wrong place.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, RiskClass, Role, Schema, Strategy,
-    Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
+    Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -558,19 +559,40 @@ pub trait Dialect {
 /// are here because their answer differs by engine (ADR-0009 §1,
 /// DECISIONS 198):
 ///
-/// - a module competing with a table for its name, which is a rule about one
-///   namespace and holds for views everywhere and for routines only on SQL
-///   Server;
+/// - a module competing for its name with a table, or with another module,
+///   which is a rule about one namespace and holds for views everywhere and
+///   for routines only on SQL Server;
 /// - a declared signature on an engine where that kind does not overload,
 ///   which names an object that engine cannot have.
 ///
 /// Both would otherwise surface as an engine error at apply time, on a
 /// database that is already half-changed.
+///
+/// The module-against-module half exists because this crate's callers stopped
+/// getting it for free (DECISIONS 201). `Schema::modules` was keyed by
+/// `ObjectName`, so two
+/// modules with one name could not both be in the map; keyed by `ModuleId`
+/// they can — a trigger is distinguished by its table and a routine by its
+/// signature — and on an engine that keeps them in one namespace per schema
+/// that is a pair of objects it cannot have. Removing the reason for a
+/// guarantee is not the same as replacing it.
 pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
     let mut problems = Vec::new();
+    // Only the kinds the engine keeps beside tables: the rest have namespaces
+    // of their own, where `ModuleId` is already the whole identity.
+    let mut shared: BTreeMap<ObjectName, &ModuleId> = BTreeMap::new();
     for (id, module) in &schema.modules {
         if dialect.shares_namespace_with_tables(module.kind) {
             let name = id.object_name();
+            if let Some(first) = shared.insert(name.clone(), id)
+                && first != id
+            {
+                problems.push(format!(
+                    "`{first}` and `{id}` are both declared as `{name}`; {} keeps them in one \
+                     namespace per schema, so it can hold only one of them",
+                    dialect.name()
+                ));
+            }
             if schema.tables.contains_key(&name) {
                 problems.push(format!(
                     "`{name}` is declared both as a table and as a {}; {} keeps tables and {}s \
@@ -915,6 +937,59 @@ mod tests {
             check_module_names(&routine, &OverloadingDialect).is_empty(),
             "{:?}",
             check_module_names(&routine, &OverloadingDialect)
+        );
+    }
+
+    /// Two modules can now hold one name — `ModuleId` distinguishes a trigger
+    /// by its table and a routine by its signature — and on an engine that
+    /// keeps them all in one namespace per schema, that is a pair of objects
+    /// the engine cannot both have. The `ObjectName` key used to make this
+    /// unrepresentable; nothing does now, so the check has to.
+    #[test]
+    fn two_modules_with_one_name_are_refused_where_they_share_a_namespace() {
+        let two_triggers = schema_with(
+            &[
+                ("app.orders.audit", ModuleKind::Trigger),
+                ("app.customers.audit", ModuleKind::Trigger),
+            ],
+            &[],
+        );
+        let problems = check_module_names(&two_triggers, &MinimalDialect);
+        assert!(
+            problems[0].contains("one namespace"),
+            "an engine with one namespace accepted two `app.audit`: {problems:?}"
+        );
+        // Both identities are named, because "one of these is wrong" is not a
+        // finding anyone can act on.
+        assert!(problems[0].contains("app.orders.audit"), "{problems:?}");
+        assert!(problems[0].contains("app.customers.audit"), "{problems:?}");
+
+        // A trigger and a view competing for the same name is the same fault.
+        let mixed = schema_with(
+            &[
+                ("app.orders.audit", ModuleKind::Trigger),
+                ("app.audit", ModuleKind::View),
+            ],
+            &[],
+        );
+        assert!(
+            check_module_names(&mixed, &MinimalDialect)[0].contains("one namespace"),
+            "{:?}",
+            check_module_names(&mixed, &MinimalDialect)
+        );
+
+        // Where the kinds have namespaces of their own, both pairs are two
+        // real objects and neither is a finding: a trigger belongs to its
+        // table, and a view is not in the trigger namespace at all.
+        assert!(
+            check_module_names(&two_triggers, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_module_names(&two_triggers, &OverloadingDialect)
+        );
+        assert!(
+            check_module_names(&mixed, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_module_names(&mixed, &OverloadingDialect)
         );
     }
 

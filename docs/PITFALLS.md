@@ -388,6 +388,15 @@ different tables produced one file, `pull` wrote the second over the first, and
 the next plan would have dropped the trigger whose file had vanished. The whole
 point of the change was that those are two objects.
 
+**A third P1, the same PR, the inverse shape.** Widening a key from
+`ObjectName` to `ModuleId` made two modules with one name representable for the
+first time, and the whole-schema check still only compared modules against
+tables — it had never needed to compare them against each other, because the
+map could not hold the collision. The uniqueness was a property of the
+container, so nothing in the diff looked like a deleted check. **When a key
+gets wider, list what its narrowness was silently enforcing, and write each one
+down as a check before the widening lands.**
+
 **The shape.** Whenever a typed identity is flattened to a string — a map key,
 a filename, a message — test the flattening on the case where the parts are
 *not* separable by the obvious character, and on two values that must not

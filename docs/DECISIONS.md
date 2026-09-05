@@ -2892,3 +2892,23 @@ SPEC is in sync with all of these.
     place. Cheap because the format numbers are still pre-release and reset at
     the first tagged release (145). The saved plan goes 4 → 5 for the same
     change with the same reasoning, and refuses the same way.
+
+201. **A guarantee the map key used to give is now a check, because removing
+    the reason for one is not replacing it.** `Schema::modules` keyed by
+    `ObjectName` made two modules with one name *unrepresentable*: the map
+    held one entry per name and that was the end of it. Keyed by `ModuleId`
+    they are representable — a trigger is told apart by its table, a routine
+    by its signature — and on an engine that keeps every kind in one namespace
+    per schema, `app.orders.audit` beside `app.customers.audit` is two objects
+    it cannot both have. Nothing caught that: `check_module_names` compared
+    each module against the *tables* and never against the other modules,
+    because under the old key there was nothing to compare. `validate` passed,
+    and the refusal arrived from the engine partway through a staged apply.
+
+    So the check now groups the kinds the dialect keeps beside tables and
+    refuses a repeated `object_name`, naming both identities — "one of these
+    is wrong" is not a finding anyone can act on. The kinds with namespaces of
+    their own are left alone, because there `ModuleId` *is* the whole identity
+    and two keys are two objects. This is the guard-whose-reason-has-gone rule
+    turned on the change that removed the reason: the key was the guard, and
+    it had to be replaced in the same breath it was taken away.
