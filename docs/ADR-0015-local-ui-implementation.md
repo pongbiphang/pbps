@@ -260,14 +260,31 @@ locked-copy `update-index` ran it), so every `git` also takes
    yet committed, and step 6 would replace it (**measured**: a version
    staged and a different one in the working tree left the staged blob
    unreachable from the index after the refresh, with `git status` clean).
-   The entry must also carry no `skip-worktree` or `assume-unchanged` flag
-   (`git ls-files -v` shows them as `S` and `h`): step 6's `--cacheinfo`
-   writes a plain entry and would clear either (**measured**: `S a h b`
-   became `H a H b`), and a path the user has told `git` to leave alone is
-   not one the UI should quietly bring back. Under the lock, what step 1
-   saw is what step 6 finds.
-2. It writes the edited files, and stores each as a blob exactly as written:
-   `git hash-object -w --no-filters -- <path>`. Without the flag
+   The entry must also be an ordinary one: `git ls-files -v` must show it
+   as `H`, and any other tag — `S` for `skip-worktree`, `h` for
+   `assume-unchanged`, `s` for both, `M` for unmerged, `R` for removed —
+   refuses the path. Step 6's `--cacheinfo` writes a plain entry and would
+   clear the flags (**measured**: `S a h b` became `H a H b`, and a path
+   carrying both showed as `s`), and a path the user has told `git` to
+   leave alone is not one the UI should quietly bring back. Under the
+   lock, what step 1 saw is what step 6 finds.
+2. It writes each edited file beside its path and puts it in place with an
+   atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
+   `renamex_np(RENAME_SWAP)` — then hashes the file that came *out*: if
+   it is the blob the page was shown, the old version is discarded; if it
+   is not, an editor saved between step 1's check and the exchange, the
+   two are exchanged back, and the compose is refused with the newer
+   content shown. Step 1's comparison and this write cannot be made one
+   operation, so the exchange makes the write reversible instead: nothing
+   is overwritten, only swapped, and what was swapped out is inspected
+   before it is let go (**measured**: the exchange put the UI's bytes at
+   the path and the page's bytes in the swapped-out file, with the
+   page's bytes intact to be compared). A platform without an exchange
+   gets a plain rename, and the ADR says so here rather than pretend: the
+   window between the hash and the rename exists there, and step 3 of #64
+   names which platforms have the exchange. Each file is then stored as a
+   blob exactly as written: `git hash-object -w --no-filters -- <path>`.
+   Without the flag
    `hash-object` runs the path's `clean` filter like `git add` does — a
    program from `.gitattributes` and the configuration that neither
    `core.hooksPath` nor `core.fsmonitor` reaches, which can rewrite the
@@ -402,9 +419,14 @@ destination ref, not the range, and **measured**, a branch one unrelated
 commit ahead had that commit published under the intent commit by
 `HEAD:refs/heads/<branch>`. A branch the remote does not have yet — the first
 push of a feature branch, the common case — is published *before* composing,
-as its own step the page names as such: `git push <push-url>
+as its own step the page names as such: `git push --no-verify
+--no-follow-tags --recurse-submodules=no <push-url>
 <tip>:refs/heads/<branch>` with an empty lease (`--force-with-lease=
-refs/heads/<branch>:`), which creates the branch at the tip the checkout
+refs/heads/<branch>:`) — the same flags as the final push, since
+`push.followTags=true` would otherwise send every annotated tag reachable
+from the tip along with the branch (**measured**: the branch and an
+unrelated tag both arrived; with `--no-follow-tags`, the branch alone) —
+which creates the branch at the tip the checkout
 already has and sends nothing the remote lacks when that tip is already
 there (**measured**: the branch appeared at the tip, `ls-remote` then
 equalled the local tip, and a second attempt was refused as `up-to-date`
