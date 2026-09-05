@@ -192,8 +192,14 @@ must be the previewed hunk — and pushes only a commit that passes both. One
 that does not is left where it is, unpushed and reversible, and the page shows
 what differs from the preview and the commands to push it or undo it; the
 hook's change is the user's to look at, not the UI's to publish or discard.
-After a push the page shows the branch and links the merge request where the
-hosting's URL shape is known.
+
+The push is bounded the same way: `git push --no-follow-tags <remote>
+HEAD:refs/heads/<branch>`, never a bare `git push`. **Measured** on the same
+git: with `push.default=matching` and two local branches ahead of the remote,
+a bare `git push` on one advanced both, and the explicit refspec advanced the
+one named. The verification above bounds what `HEAD` holds; the refspec bounds
+what leaves the machine to that. After a push the page shows the branch and
+links the merge request where the hosting's URL shape is known.
 
 A library (`gix`, `libgit2`) is the obvious design and would remove a runtime
 dependency on a `git` binary. It is refused because ADR-0006's audit story is
@@ -240,8 +246,13 @@ the format — holds for a moving envelope payload as well. The PostgreSQL
 dialect itself is not a prerequisite: the page renders envelopes, and an
 envelope does not say which engine produced it.
 
-Step 2 has a list to work from. The read path needs nothing new. The write path
-does: `plan --db` is deliberately outside the envelope set (SPEC §9.8) and the
+Step 2 has a list to work from. The read path needs one thing: the ledger
+timeline. `status` carries only the newest entry of each environment, the
+`state` command exposes only `prune`, and the history read is
+`pbps-mssql`'s, which decision 1 keeps the UI from calling — so step 2 adds a
+`state list --format json` envelope, the first half of the `state show / diff
+/ export` row SPEC §14.1 already holds at P1. The write path needs more:
+`plan --db` is deliberately outside the envelope set (SPEC §9.8) and the
 page reads its result through `explain --plan`, so it needs only the exit code
 and the written file; `apply` speaks no envelope, and the page needs its
 outcome and the ledger entry it wrote — the fields `on_apply_attempt`'s payload
