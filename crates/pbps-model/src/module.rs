@@ -82,7 +82,7 @@ impl fmt::Display for RoutineId {
 }
 
 /// What identifies one module, which depends on its kind (ADR-0009 §1,
-/// DECISIONS 197).
+/// DECISIONS 200).
 ///
 /// | Kind | Identified by | Because |
 /// |---|---|---|

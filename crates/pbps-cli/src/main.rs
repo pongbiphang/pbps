@@ -659,11 +659,12 @@ fn run() -> anyhow::Result<()> {
                     // file the deployment gate approves, read back by `explain
                     // --plan --format json`. Adding a second typed rendering
                     // would give a reviewer two documents to disagree about.
-                    refuse(
+                    let plan = report::placeholder("plan.json");
+                    refuse(&format!(
                         "--format json describes findings, and `plan --db` produces a plan.\n\
-                         Write it with --out <plan.json> and read it with \
-                         `pbps explain --plan <plan.json> --format json`",
-                    )?;
+                         Write it with --out {plan} and read it with \
+                         `pbps explain --plan {plan} --format json`"
+                    ))?;
                 }
                 let target = output::or_unanswerable(
                     "plan",
@@ -1262,7 +1263,8 @@ fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     match project.config.dialect {
         DialectName::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
         DialectName::Postgres => bail!(
-            "the postgres dialect is not implemented yet (it arrives in Phase 4); this project's pbps.yml selects it"
+            "the postgres dialect is not implemented yet (it is Phase 5; docs/STATUS.md names the \
+             current phase); this project's pbps.yml selects it"
         ),
     }
 }

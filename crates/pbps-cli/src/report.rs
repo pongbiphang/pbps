@@ -70,6 +70,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
 }
 
 fn one_blocker(b: &Blocker) -> String {
+    let why = placeholder("why");
     match b {
         Blocker::AmbiguousColumns {
             table,
@@ -88,7 +89,7 @@ fn one_blocker(b: &Blocker) -> String {
                     ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop {table}.{from} --reason \"<why>\"\n"
+                    "    to drop {from}:                pbps drop {table}.{from} --reason {why}\n"
                 ));
             }
             s
@@ -109,16 +110,16 @@ fn one_blocker(b: &Blocker) -> String {
                     ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop-table {from} --reason \"<why>\"\n"
+                    "    to drop {from}:                pbps drop-table {from} --reason {why}\n"
                 ));
             }
             s
         }
         Blocker::DropColumnNeedsReason { column } => format!(
-            "  {column} disappeared from the declarations, but a drop must record why (an audit asks for it)\n\n    pbps drop {column} --reason \"<why>\"\n"
+            "  {column} disappeared from the declarations, but a drop must record why (an audit asks for it)\n\n    pbps drop {column} --reason {why}\n"
         ),
         Blocker::DropTableNeedsReason { table } => format!(
-            "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason \"<why>\"\n"
+            "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason {why}\n"
         ),
         Blocker::AmbiguousRoles {
             disappeared,
@@ -136,14 +137,14 @@ fn one_blocker(b: &Blocker) -> String {
                     ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop-role {from} --reason \"<why>\"\n"
+                    "    to drop {from}:                pbps drop-role {from} --reason {why}\n"
                 ));
             }
             s
         }
         Blocker::DropRoleNeedsReason { role } => format!(
             "  role {role} disappeared from the declarations, but a drop must record why — \
-             its members lose whatever it granted\n\n    pbps drop-role {role} --reason \"<why>\"\n"
+             its members lose whatever it granted\n\n    pbps drop-role {role} --reason {why}\n"
         ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
@@ -747,6 +748,38 @@ pub fn shell_arg(value: &str) -> Option<String> {
     Some(format!("\"{value}\""))
 }
 
+/// A placeholder the reader replaces before pasting: `"<plan path>"`.
+///
+/// Bare, `<plan path>` is a redirection in every shell this tool's remedies
+/// are pasted into, and it lands: `pbps apply --plan <plan.json> --checksum
+/// <approved-checksum>` creates a file called `--checksum` the moment a
+/// `plan.json` exists beside it (measured with bash 5). Double quotes rather
+/// than single: `cmd` has no literal-quote character, so `<` stays live
+/// inside `'...'` there (PITFALLS, "`shell_arg` has been wrong about shells
+/// five times", row 1), while `"..."` is one argument in POSIX shells,
+/// PowerShell and `cmd` alike — and a placeholder carries none of the
+/// characters double quotes fail on (`$`, a backtick, `\`, `%`, `!`).
+/// One spelling, here, for every remedy: quoting each site by hand is how
+/// the bare form spread.
+pub fn placeholder(name: &str) -> String {
+    format!("\"<{name}>\"")
+}
+
+/// `true` when `text` carries a placeholder a shell would read as a
+/// redirection: a `<` that is not the first character inside double quotes.
+/// A test helper, so every command's remedies can be checked the same way.
+#[cfg(test)]
+pub(crate) fn has_bare_placeholder(text: &str) -> bool {
+    let mut previous = None;
+    for c in text.chars() {
+        if c == '<' && previous != Some('"') {
+            return true;
+        }
+        previous = Some(c);
+    }
+    false
+}
+
 /// A `--env` argument for a copy-pastable remedy.
 ///
 /// Environment names are YAML map keys, so `US West` is a perfectly valid one —
@@ -755,7 +788,7 @@ pub fn shell_arg(value: &str) -> Option<String> {
 /// a remedy that changes meaning when pasted is worse than one that has to be
 /// completed by hand.
 pub fn env_arg(name: &str) -> String {
-    shell_arg(name).unwrap_or_else(|| "<environment>".to_owned())
+    shell_arg(name).unwrap_or_else(|| placeholder("environment"))
 }
 
 #[cfg(test)]
@@ -867,5 +900,29 @@ mod tests {
         let summary = summary(&cs);
         assert!(summary.contains("2 table(s)"), "{summary}");
         assert!(summary.contains("1 role(s)"), "{summary}");
+    }
+
+    /// The placeholder is one literal argument in POSIX shells, PowerShell
+    /// and `cmd`; bare, `<plan.json>` is a redirection that creates a file
+    /// named after the next option the moment its input exists.
+    #[test]
+    fn a_placeholder_is_one_quoted_argument_and_never_a_redirection() {
+        assert_eq!(placeholder("plan path"), "\"<plan path>\"");
+        assert!(!has_bare_placeholder(&placeholder("approved-checksum")));
+        assert!(has_bare_placeholder("--plan <plan.json>"));
+        assert!(has_bare_placeholder("--checksum '<approved-checksum>'"));
+        assert!(!has_bare_placeholder(
+            "--plan \"<plan.json>\" --checksum \"<x>\""
+        ));
+        // `env_arg`'s fallback is the same spelling: a name no shell can
+        // carry becomes a quoted placeholder, not a redirection.
+        assert_eq!(env_arg("prod&rm"), "\"<environment>\"");
+        // And every drop remedy a blocker prints carries its `--reason`
+        // placeholder quoted.
+        let text = one_blocker(&Blocker::DropTableNeedsReason {
+            table: "dbo.t".parse().unwrap(),
+        });
+        assert!(text.contains("--reason \"<why>\""), "{text}");
+        assert!(!has_bare_placeholder(&text), "{text}");
     }
 }

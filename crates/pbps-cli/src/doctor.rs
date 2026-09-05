@@ -81,6 +81,18 @@ pub struct EnvDiagnosis {
     pub server_capabilities_unknown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+
+    /// The name this environment can be handed back as, after `--env`, and
+    /// `None` when the caller named a database with `--db`.
+    ///
+    /// Separate from `environment`, which is what to *print*: for a `--db`
+    /// target that is `db::redact`'s `server/database`, which is not a name
+    /// `pbps.yml` knows, so a remedy spelling `--env` with it cannot be run
+    /// (DECISIONS 197). Not serialized: for an `--env` target it repeats
+    /// `environment`, and for a `--db` one there is nothing to say — the
+    /// envelope stays as it was.
+    #[serde(skip)]
+    env_name: Option<String>,
 }
 
 impl EnvDiagnosis {
@@ -95,9 +107,10 @@ impl EnvDiagnosis {
     /// Written out three times before, which is three places to forget a new
     /// field in — and forgetting one here means shipping a default, not a
     /// compile error.
-    fn unknown(environment: String, state: &'static str) -> Self {
+    fn unknown(environment: String, env_name: Option<String>, state: &'static str) -> Self {
         Self {
             environment,
+            env_name,
             state,
             server_version: None,
             edition: None,
@@ -116,11 +129,24 @@ impl EnvDiagnosis {
     /// Distinct from `unreachable`: nothing was attempted, because there was
     /// nothing to attempt it against. An unset `url_env` variable is the
     /// commonest first-run problem there is, and it has its own remedy.
-    fn unconfigured(environment: String, detail: String) -> Self {
+    fn unconfigured(environment: String, env_name: Option<String>, detail: String) -> Self {
         Self {
             detail: Some(detail),
-            ..Self::unknown(environment, "unconfigured")
+            ..Self::unknown(environment, env_name, "unconfigured")
         }
+    }
+
+    /// Adds a cause to `detail` beside what is already there.
+    ///
+    /// `detail` is one slot that several independent reads write to. Assigned,
+    /// a failed lock read wrote over the cause of a failed permission read a
+    /// few lines above it, and only the second survived into the human view
+    /// and the JSON — the verdict (`permission.unknown`) rode on its own flag,
+    /// the reason did not. Every write in `examine` goes through here so
+    /// there is no second spelling that overwrites (`status` keeps its causes
+    /// the same way).
+    fn note(&mut self, cause: String) {
+        append_cause(&mut self.detail, cause);
     }
 }
 
@@ -201,11 +227,14 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // Named by the environment when there is one, and by the
                 // *redacted* label otherwise — `db::redact` gives
                 // server/database, never the connection string CI passed in.
-                let label = name.unwrap_or_else(|| target.label.clone());
+                // The name is kept as well as printed: only it can go back
+                // after `--env` in a remedy (DECISIONS 197).
+                let label = name.clone().unwrap_or_else(|| target.label.clone());
                 let rt =
                     output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
                 rt.block_on(examine(
                     &label,
+                    name.as_deref(),
                     target.connection(),
                     &managed_schemas,
                     &referenced,
@@ -213,7 +242,9 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
-                name.unwrap_or_else(|| "the given target".to_owned()),
+                name.clone()
+                    .unwrap_or_else(|| "the given target".to_owned()),
+                name,
                 format!("{e:#}"),
             ),
         };
@@ -241,8 +272,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
+                // Every environment here is a key of `pbps.yml`, so each one is
+                // a name a remedy may hand back after `--env`.
                 Ok(conn) => rt.block_on(examine(
                     &name,
+                    Some(&name),
                     &conn,
                     &managed_schemas,
                     &referenced,
@@ -252,7 +286,9 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
                 // command worth running before a deployment.
-                Err(e) => EnvDiagnosis::unconfigured(name.clone(), e.to_string()),
+                Err(e) => {
+                    EnvDiagnosis::unconfigured(name.clone(), Some(name.clone()), e.to_string())
+                }
             };
             findings.extend(env_findings(&d, counts.modules > 0));
             environments.push(d);
@@ -356,7 +392,7 @@ fn managed_schemas(project: &Project) -> Vec<String> {
 }
 
 /// Tables a declared foreign key points at that lie **outside** the managed
-/// schemas, spelled `schema.table` for `HAS_PERMS_BY_NAME`.
+/// schemas, for the object-scope question `HAS_PERMS_BY_NAME` answers.
 ///
 /// `validate` accepts a foreign key whose target is not declared — the target
 /// is somebody else's table, and pbps is not asked to manage it — but the
@@ -368,17 +404,18 @@ fn managed_schemas(project: &Project) -> Vec<String> {
 /// Targets *inside* the managed schemas are left out: the schema-scoped
 /// `REFERENCES` and `SELECT` already cover them, and asking twice would report
 /// the same gap at two securables.
-fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
+fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::ObjectName> {
     let Ok(loaded) = crate::load_quiet(project) else {
         return Vec::new();
     };
     let managed: std::collections::BTreeSet<&str> = managed.iter().map(String::as_str).collect();
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out: std::collections::BTreeSet<pbps_model::ObjectName> =
+        std::collections::BTreeSet::new();
     for table in loaded.schema.tables.values() {
         for fk in table.foreign_keys.values() {
             let target = &fk.references_table;
             if !managed.contains(target.schema.as_str()) {
-                out.insert(format!("{}.{}", target.schema, target.name));
+                out.insert(target.clone());
             }
         }
     }
@@ -411,12 +448,12 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
         for target in role.grants.keys() {
             match target {
                 pbps_model::GrantTarget::Object(o) => {
-                    objects.insert(format!("{}.{}", o.schema, o.name));
+                    objects.insert(o.clone());
                 }
                 // The engine knows a routine by its bare name; the signature
                 // only says which overload the declaration meant.
                 pbps_model::GrantTarget::Routine(r) => {
-                    objects.insert(format!("{}.{}", r.name.schema, r.name.name));
+                    objects.insert(r.name.clone());
                 }
                 pbps_model::GrantTarget::Schema(s) => {
                     schemas.insert(s.clone());
@@ -431,24 +468,47 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
     }
 }
 
+/// Adds a cause to a slot beside what is already there.
+///
+/// The version read and the edition read fail independently and each has a
+/// cause; assigned, the second wrote over the first, and the finding they
+/// share carried one reason for two failures. The one spelling of "keep
+/// what an earlier read established": `EnvDiagnosis::note` goes through it
+/// for `detail`, and it is joined the way `status` joins its causes, so the
+/// two commands read alike.
+fn append_cause(slot: &mut Option<String>, cause: String) {
+    match slot {
+        Some(existing) => {
+            existing.push_str(" — ");
+            existing.push_str(&cause);
+        }
+        None => *slot = Some(cause),
+    }
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
+    env_name: Option<&str>,
     connection: &str,
     schemas: &[String],
-    referenced: &[String],
+    referenced: &[pbps_model::ObjectName],
     granted: &pbps_mssql::doctor::GrantTargets,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
     // behind has to say so rather than inherit an optimistic default.
-    let mut d = EnvDiagnosis::unknown(name.to_owned(), "unreachable");
+    let mut d = EnvDiagnosis::unknown(
+        name.to_owned(),
+        env_name.map(ToOwned::to_owned),
+        "unreachable",
+    );
     let mut conn = match Conn::connect(connection).await {
         Ok(c) => c,
         Err(e) => {
             // `redact` has already reduced the label; the driver's own message
             // names an address and a cause, never the string it was given.
-            d.detail = Some(e.to_string());
+            d.note(e.to_string());
             return d;
         }
     };
@@ -460,10 +520,10 @@ async fn examine(
     // reject every module statement in the plan.
     match pbps_mssql::doctor::server_version(&mut conn).await {
         Ok(v) => d.server_version = Some(v),
-        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+        Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
     }
     match pbps_mssql::edition::edition(&mut conn).await {
-        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+        Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
         Ok(ed) => {
             d.supports_online = Some(ed.supports_online());
             // Asked of the version *and* the edition together: Azure reports
@@ -500,7 +560,7 @@ async fn examine(
         // that matters is the worst answer this command can give.
         Err(e) => {
             d.permissions_unknown = true;
-            d.detail = Some(format!("could not read this account's permissions: {e}"));
+            d.note(format!("could not read this account's permissions: {e}"));
         }
     }
 
@@ -524,11 +584,11 @@ async fn examine(
         // established it, which is the same mistake as an empty
         // `missing_permissions` meaning "none missing".
         Err(e) => {
-            d.detail = Some(format!("could not read the deployment lock: {e}"));
+            d.note(format!("could not read the deployment lock: {e}"));
             "lock-unknown"
         }
         Ok(Some(lock)) => {
-            d.detail = Some(format!(
+            d.note(format!(
                 "held by {} since {}; an apply is running, or one died without releasing",
                 lock.locked_by, lock.locked_at
             ));
@@ -539,7 +599,7 @@ async fn examine(
             Ok(true) => match pbps_mssql::state::latest(&mut conn).await {
                 Ok(Some(entry)) if entry.snapshot.staged.is_some() => {
                     let p = entry.snapshot.staged.as_ref().expect("just matched");
-                    d.detail = Some(format!(
+                    d.note(format!(
                         "a staged apply stopped after {} of {} statement(s)",
                         p.completed, p.total
                     ));
@@ -548,17 +608,36 @@ async fn examine(
                 Ok(Some(_)) => "ready",
                 Ok(None) => "uninitialized",
                 Err(e) => {
-                    d.detail = Some(e.to_string());
+                    d.note(e.to_string());
                     "unreachable"
                 }
             },
             Err(e) => {
-                d.detail = Some(e.to_string());
+                d.note(e.to_string());
                 "unreachable"
             }
         },
     };
     d
+}
+
+/// How a remedy names this environment on the command line.
+///
+/// `baseline`, `apply` and `unlock` each require exactly one of `--db` and
+/// `--env`, so a remedy without one fails the moment it is pasted. Which one it
+/// may be is not the diagnosis's display name: for a `--db` target that name is
+/// `db::redact`'s `server/database`, and `--env` takes a key of `pbps.yml`, so
+/// spelling it there produced a command that resolves to nothing. The caller
+/// who gave a connection string is handed the flag they used, with the string
+/// itself left as a placeholder — it carries the password, and this text goes
+/// to CI logs and tickets (DECISIONS 197).
+fn target_arg(d: &EnvDiagnosis) -> String {
+    match &d.env_name {
+        // Quoted: an environment name is a YAML map key, so `US West` is valid
+        // and interpolated verbatim becomes two arguments.
+        Some(name) => format!("--env {}", crate::report::env_arg(name)),
+        None => format!("--db {}", crate::report::placeholder("connection string")),
+    }
 }
 
 fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding> {
@@ -593,16 +672,13 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 "state.uninitialized",
                 format!("{}: pbps has recorded no state here yet", d.environment),
             )
-            // Every per-environment remedy names the environment. `baseline`,
-            // `apply` and `unlock` each require exactly one of --db / --env, so
-            // a remedy without one is a command that fails the moment it is
-            // pasted — and this one is aimed at a first-time user, who has the
-            // least standing to work out why.
-            // Quoted: an environment name is a YAML map key, so `US West` is
-            // valid and interpolated verbatim becomes two arguments.
+            // Every per-environment remedy names the target the way the caller
+            // named it (`target_arg`); this one is aimed at a first-time user,
+            // who has the least standing to work out why a pasted command
+            // resolves to nothing.
             .remedy(format!(
-                "pbps baseline --env {} --reason \"adopting this environment\"",
-                crate::report::env_arg(&d.environment)
+                "pbps baseline {} --reason \"adopting this environment\"",
+                target_arg(d)
             )),
         ),
         "mid-deployment" => out.push(
@@ -617,9 +693,10 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
-                 --staged --resume",
-                crate::report::env_arg(&d.environment)
+                "pbps apply {} --plan {} --checksum {} --staged --resume",
+                target_arg(d),
+                crate::report::placeholder("plan.json"),
+                crate::report::placeholder("approved-checksum"),
             )),
         ),
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
@@ -653,8 +730,8 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "if no apply is running: pbps unlock --env {}",
-                crate::report::env_arg(&d.environment)
+                "if no apply is running: pbps unlock {}",
+                target_arg(d)
             )),
         ),
         _ => {}
@@ -798,7 +875,7 @@ mod tests {
     fn absent(schema: &str) -> EnvDiagnosis {
         EnvDiagnosis {
             absent_schemas: vec![schema.to_owned()],
-            ..EnvDiagnosis::unknown("prod".to_owned(), "ready")
+            ..EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready")
         }
     }
 
@@ -807,6 +884,97 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "schema.absent")
             .and_then(|f| f.remedy)
+    }
+
+    /// The permission read and the lock read fail independently, and each
+    /// has a cause. One slot assigned twice kept only the second, so the
+    /// operator saw the verdict of the first (`permission.unknown`) with the
+    /// reason of the other.
+    #[test]
+    fn a_later_failed_read_keeps_the_cause_of_an_earlier_one() {
+        let mut d =
+            EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
+        // In `examine`'s order: permissions first, the lock last.
+        d.permissions_unknown = true;
+        d.note("could not read this account's permissions: denied on sys.schemas".to_owned());
+        d.note("could not read the deployment lock: denied on dbo.__pbps_lock".to_owned());
+        d.state = "lock-unknown";
+
+        let detail = d.detail.as_deref().unwrap();
+        assert!(detail.contains("denied on sys.schemas"), "{detail}");
+        assert!(detail.contains("denied on dbo.__pbps_lock"), "{detail}");
+        // And the first cause still comes first, in the order it was found.
+        assert!(
+            detail.find("sys.schemas") < detail.find("__pbps_lock"),
+            "{detail}"
+        );
+        let findings = env_findings(&d, false);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"permission.unknown"), "{ids:?}");
+        assert!(ids.contains(&"state.lock-unknown"), "{ids:?}");
+        // The state finding carries the whole detail, both causes included.
+        let lock = findings
+            .iter()
+            .find(|f| f.id == "state.lock-unknown")
+            .unwrap();
+        assert!(lock.message.contains("sys.schemas"), "{}", lock.message);
+        assert!(lock.message.contains("__pbps_lock"), "{}", lock.message);
+    }
+
+    /// The first cause is not decorated: a diagnosis with one thing to say
+    /// says it plainly.
+    #[test]
+    fn a_single_cause_is_written_as_it_is() {
+        let mut d =
+            EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
+        d.note("cannot connect".to_owned());
+        assert_eq!(d.detail.as_deref(), Some("cannot connect"));
+    }
+
+    /// The version read and the edition read fail independently, and each
+    /// has a cause. One slot assigned twice kept only the second, so the one
+    /// finding they share named a reason for half of what went wrong.
+    #[test]
+    fn a_failed_edition_read_keeps_the_cause_of_a_failed_version_read() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        // In `examine`'s order: the version, then the edition.
+        append_cause(
+            &mut d.server_capabilities_unknown,
+            "SERVERPROPERTY('ProductVersion') was NULL".to_owned(),
+        );
+        append_cause(
+            &mut d.server_capabilities_unknown,
+            "SERVERPROPERTY('Edition') was NULL".to_owned(),
+        );
+        let why = d.server_capabilities_unknown.as_deref().unwrap();
+        assert!(why.contains("ProductVersion"), "{why}");
+        assert!(why.contains("'Edition'"), "{why}");
+        assert!(why.find("ProductVersion") < why.find("'Edition'"), "{why}");
+
+        let findings = env_findings(&d, false);
+        let unknown: Vec<&output::Finding> = findings
+            .iter()
+            .filter(|f| f.id == "server.capabilities-unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "{findings:?}");
+        assert!(
+            unknown[0].message.contains("ProductVersion"),
+            "{}",
+            unknown[0].message
+        );
+        assert!(
+            unknown[0].message.contains("'Edition'"),
+            "{}",
+            unknown[0].message
+        );
+    }
+
+    /// One cause is written plainly.
+    #[test]
+    fn a_single_capability_cause_is_written_as_it_is() {
+        let mut slot = None;
+        append_cause(&mut slot, "cannot read".to_owned());
+        assert_eq!(slot.as_deref(), Some("cannot read"));
     }
 
     /// The remedy is advertised as copy-pastable, so it goes through the
@@ -845,5 +1013,84 @@ mod tests {
                 .iter()
                 .any(|f| f.id == "schema.absent")
         );
+    }
+
+    /// The three per-environment remedies, for a target named each way.
+    ///
+    /// `--env` takes a key of `pbps.yml`, and a `--db` target has none: its
+    /// display name is `db::redact`'s `server/database`, so a remedy spelling
+    /// `--env` with it named an environment that does not exist. Measured
+    /// before the fix: `doctor --db "Server=localhost,14330;...;Database=master"`
+    /// offered `pbps baseline --env "localhost,14330/master" --reason ...`
+    /// (DECISIONS 197).
+    fn remedies(d: &EnvDiagnosis) -> Vec<String> {
+        env_findings(d, true)
+            .into_iter()
+            .filter_map(|f| f.remedy)
+            .collect()
+    }
+
+    fn diagnosed(env_name: Option<&str>, state: &'static str) -> EnvDiagnosis {
+        EnvDiagnosis::unknown(
+            "localhost,14330/app".to_owned(),
+            env_name.map(ToOwned::to_owned),
+            state,
+        )
+    }
+
+    #[test]
+    fn a_db_target_is_offered_no_remedy_it_cannot_run() {
+        for state in ["uninitialized", "mid-deployment", "locked"] {
+            let from_db = remedies(&diagnosed(None, state));
+            assert!(
+                !from_db.is_empty(),
+                "{state} still has to offer a remedy: {from_db:?}"
+            );
+            for r in &from_db {
+                assert!(!r.contains("--env"), "{state}: {r}");
+                // And what replaces it is the flag this caller used, with the
+                // string itself left out: it carries the password.
+                assert!(r.contains("--db \"<connection string>\""), "{state}: {r}");
+                assert!(!r.contains("localhost,14330/app"), "{state}: {r}");
+            }
+        }
+    }
+
+    /// Every placeholder a remedy carries is quoted: bare, `<plan.json>` is a
+    /// redirection when pasted, and `--checksum <approved-checksum>` left a
+    /// file called `--checksum` behind (measured with bash 5).
+    #[test]
+    fn no_remedy_carries_a_placeholder_a_shell_would_redirect() {
+        for env in [None, Some("prod"), Some("US West"), Some("prod&rm")] {
+            for state in [
+                "uninitialized",
+                "mid-deployment",
+                "locked",
+                "lock-unknown",
+                "unreachable",
+            ] {
+                for r in remedies(&diagnosed(env, state)) {
+                    assert!(
+                        !crate::report::has_bare_placeholder(&r),
+                        "{env:?} {state}: {r}"
+                    );
+                }
+            }
+        }
+        let staged = remedies(&diagnosed(None, "mid-deployment"));
+        assert!(
+            staged[0].contains("--plan \"<plan.json>\" --checksum \"<approved-checksum>\""),
+            "{staged:?}"
+        );
+    }
+
+    /// The other half: an `--env` target keeps the name, quoted, because an
+    /// environment name is a YAML map key and `US West` is valid.
+    #[test]
+    fn an_env_target_keeps_the_name_it_was_given() {
+        let held = remedies(&diagnosed(Some("US West"), "locked"));
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains(r#"--env "US West""#), "{held:?}");
+        assert!(!held[0].contains("--db"), "{held:?}");
     }
 }

@@ -2801,7 +2801,10 @@ pub fn cmd_bootstrap(
 
     let Some(target) = target else {
         if sql_out.is_none() {
-            bail!("bootstrap needs somewhere to go: pass --sql <file>, --db or --env");
+            bail!(
+                "bootstrap needs somewhere to go: pass --sql {}, --db or --env",
+                crate::report::placeholder("file")
+            );
         }
         return Ok(());
     };
@@ -3440,9 +3443,10 @@ pub fn cmd_plan_db(
         println!(
             "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
              recorded in the ledger as it completes. Apply it with `pbps apply --staged \n\
-             --checksum <approved-checksum>`, and continue an interrupted run with \n\
+             --checksum {}`, and continue an interrupted run with \n\
              `--staged --resume`.",
-            statements.len()
+            statements.len(),
+            crate::report::placeholder("approved-checksum")
         );
     }
 

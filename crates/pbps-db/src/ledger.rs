@@ -5,7 +5,7 @@
 //! The types, the errors and the pruning policy are dialect-agnostic and live
 //! here. The SQL that reads and writes them is T-SQL and lives in
 //! `pbps_mssql::state`, beside the catalog queries — the same split `pull`
-//! already uses, and the one that lets Phase 4's `pbps-pg` supply its own
+//! already uses, and the one that lets Phase 5's `pbps-pg` supply its own
 //! statements without redefining what a ledger entry *is*.
 //!
 //! # Why the whole snapshot, and why the columns duplicate it

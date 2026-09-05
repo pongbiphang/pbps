@@ -65,7 +65,7 @@ use crate::schema::Schema;
 /// (DECISIONS 149).
 /// Bumped to 5 with the state's own bump to 6: a saved plan carries a
 /// `Schema` and a `ChangeSet`, and both spell a module's identity the new way
-/// (ADR-0009 §1, DECISIONS 200). An older `apply` reading this file would take
+/// (ADR-0009 §1, DECISIONS 203). An older `apply` reading this file would take
 /// a trigger's three-part key for a name it cannot parse; a newer one reading
 /// an older file would take `app.audit` for a view. Neither is a partial reading, so
 /// the number moves.

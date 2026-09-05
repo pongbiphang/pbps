@@ -557,7 +557,7 @@ pub trait Dialect {
 ///
 /// The dialect-free half lives in `pbps_model::module::check_names`. These two
 /// are here because their answer differs by engine (ADR-0009 §1,
-/// DECISIONS 198):
+/// DECISIONS 201):
 ///
 /// - a module competing for its name with a table, or with another module,
 ///   which is a rule about one namespace and holds for views everywhere and
@@ -569,7 +569,7 @@ pub trait Dialect {
 /// database that is already half-changed.
 ///
 /// The module-against-module half exists because this crate's callers stopped
-/// getting it for free (DECISIONS 201). `Schema::modules` was keyed by
+/// getting it for free (DECISIONS 204). `Schema::modules` was keyed by
 /// `ObjectName`, so two
 /// modules with one name could not both be in the map; keyed by `ModuleId`
 /// they can — a trigger is distinguished by its table and a routine by its

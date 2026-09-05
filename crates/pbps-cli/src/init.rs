@@ -95,7 +95,11 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
 
     let environment = args.from.as_ref().or(args.env.as_ref());
     if args.url_env.is_some() && environment.is_none() {
-        bail!("--url-env needs an environment; pass --env <name> or --from <name>");
+        bail!(
+            "--url-env needs an environment; pass --env {} or --from {}",
+            crate::report::placeholder("name"),
+            crate::report::placeholder("name")
+        );
     }
     if let Some(name) = environment {
         validate_environment_name(name)?;

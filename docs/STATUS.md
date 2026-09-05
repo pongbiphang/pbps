@@ -172,7 +172,7 @@ change late. The seam preparation the ADRs place *before* the crate has landed
 (DECISIONS 193–195): the server error code is text, the transaction framing is
 the dialect's, the shared definition scanner nests block comments, and the
 dialect crate's header states reasons that hold. ADR-0009 §1's model change has
-landed with them (DECISIONS 197–200): a module is keyed by a typed `ModuleId`,
+landed with them (DECISIONS 200–203): a module is keyed by a typed `ModuleId`,
 namespace sharing and overloading are dialect questions, and the state snapshot
 and the saved plan bumped to 6 and 5 — every older snapshot refused, because
 the meaning of the module map changed and a partial reading of it would be a

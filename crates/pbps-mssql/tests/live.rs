@@ -1320,7 +1320,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].permission, "DELETE");
-    assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+    assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
 
     // And the narrowest shape of all: the ledger tables exist, and INSERT and
     // DELETE are granted on *those two objects* rather than on the schema. Only
@@ -1351,7 +1351,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.iter()
-            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::[dbo]"),
         "an account that cannot create the ledger must not pass readiness: {gaps:?}"
     );
     db.conn
@@ -1426,7 +1426,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     for permission in ["INSERT", "DELETE"] {
         assert!(
             gaps.iter()
-                .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+                .any(|g| g.permission == permission && g.securable() == "SCHEMA::[dbo]"),
             "{permission} for the table still to be created was not asked for: {gaps:?}"
         );
     }
@@ -1435,7 +1435,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     assert!(
         !gaps
             .iter()
-            .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+            .any(|g| g.securable() == "OBJECT::[dbo].[__pbps_lock]"),
         "{gaps:?}"
     );
 
@@ -1663,7 +1663,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.iter()
-            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::app"),
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::[app]"),
         "an account that cannot alter its managed schema must not pass readiness: {gaps:?}"
     );
 
@@ -1895,7 +1895,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".to_owned()],
+        &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
@@ -1904,7 +1904,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     for permission in ["REFERENCES", "SELECT"] {
         assert!(
             gaps.iter()
-                .any(|g| g.permission == permission && g.securable() == "OBJECT::shared.parent"),
+                .any(|g| g.permission == permission && g.securable() == "OBJECT::[shared].[parent]"),
             "{permission} on the referenced table was not reported: {gaps:?}"
         );
     }
@@ -1921,7 +1921,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
-        &["shared.parent".to_owned()],
+        &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
     )
     .await
@@ -4946,7 +4946,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     // With a role granted on the table and on the schema: three gaps, each
     // where the grant has to go.
     let targets = pbps_mssql::doctor::GrantTargets {
-        objects: vec!["dbo.customer".to_owned()],
+        objects: vec!["dbo.customer".parse().unwrap()],
         schemas: vec!["dbo".to_owned()],
         roles: vec![],
     };
@@ -4963,8 +4963,8 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         where_missing,
         [
             "ALTER ANY ROLE on the database",
-            "CONTROL on OBJECT::dbo.customer",
-            "CONTROL on SCHEMA::dbo",
+            "CONTROL on OBJECT::[dbo].[customer]",
+            "CONTROL on SCHEMA::[dbo]",
             "CREATE ROLE on the database",
         ],
         "{gaps:?}"
@@ -5039,10 +5039,10 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         where_missing,
         [
             "ALTER ANY ROLE on the database",
-            "CONTROL on OBJECT::dbo.customer",
-            "CONTROL on OBJECT::legacy.archive",
-            "CONTROL on SCHEMA::dbo",
-            "CONTROL on SCHEMA::legacy",
+            "CONTROL on OBJECT::[dbo].[customer]",
+            "CONTROL on OBJECT::[legacy].[archive]",
+            "CONTROL on SCHEMA::[dbo]",
+            "CONTROL on SCHEMA::[legacy]",
             "CREATE ROLE on the database",
         ],
         "{gaps:?}"
@@ -5556,5 +5556,177 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     // `dbo.band` will ever hold it.
     assert_eq!(count(&mut db.conn, &to_an_empty_parent).await, 1);
 
+    db.drop().await;
+}
+
+/// An object name is spelled for `HAS_PERMS_BY_NAME` by the server, with
+/// `QUOTENAME` on each part. Joined on the client with a dot and passed as
+/// one string, `dbo.a.b` split at the wrong dot and answered 0, and
+/// `dbo.x]y` did not parse and answered NULL — measured on the pinned image,
+/// as `sa`, which holds `CONTROL` on both — so `doctor` reported a gap the
+/// account did not have. Three names, one per shape the review named, on
+/// each of the three object-scope questions; and an object that is not
+/// there is still a gap, so the quoting did not turn absence into silence.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
+    let mut db = TestDb::create("doctorquote").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.[a.b] (id int NOT NULL PRIMARY KEY); \
+             CREATE TABLE dbo.[x]]y] (id int NOT NULL PRIMARY KEY); \
+             CREATE TABLE dbo.[order-items] (id int NOT NULL PRIMARY KEY); \
+             CREATE ROLE app; \
+             GRANT SELECT ON OBJECT::dbo.[a.b] TO app;",
+        )
+        .await
+        .expect("create the oddly named tables and a role granted on one");
+
+    let dot: pbps_model::ObjectName = pbps_model::ObjectName::new("dbo", "a.b");
+    let bracket = pbps_model::ObjectName::new("dbo", "x]y");
+    let hyphen = pbps_model::ObjectName::new("dbo", "order-items");
+    let absent = pbps_model::ObjectName::new("dbo", "nope");
+    let targets = pbps_mssql::doctor::GrantTargets {
+        objects: vec![hyphen.clone(), absent.clone()],
+        schemas: vec![],
+        // The role's own grant on `dbo.[a.b]` reaches the question through
+        // the catalog, spelled by `sys.objects`, not by these declarations.
+        roles: vec!["app".to_owned()],
+    };
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &["dbo".to_owned()],
+        std::slice::from_ref(&bracket),
+        &targets,
+    )
+    .await
+    .expect("read permissions");
+
+    for (name, map) in [
+        (&dot, &held.granted_objects),
+        (&hyphen, &held.granted_objects),
+        (&bracket, &held.referenced_objects),
+    ] {
+        let granted = map
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} was not asked about: {held:?}"));
+        assert!(
+            granted.contains("CONTROL") || granted.contains("REFERENCES"),
+            "`sa` holds everything on {name}, and the question answered {granted:?}"
+        );
+    }
+    let gaps = pbps_mssql::doctor::missing(&held);
+    for name in [&dot, &hyphen, &bracket] {
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.securable == pbps_mssql::doctor::Securable::Object(name.clone())),
+            "a gap on a permission `sa` holds, on {name}: {gaps:?}"
+        );
+    }
+    // Absent is still a gap: the object question asks every named target.
+    assert!(
+        gaps.iter().any(|g| g.permission == "CONTROL"
+            && g.securable == pbps_mssql::doctor::Securable::Object(absent.clone())),
+        "an object that is not there must still be reported: {gaps:?}"
+    );
+
+    db.drop().await;
+}
+
+/// A managed role granted on more tables than one statement can name. At
+/// two bound slots per object, about a thousand objects crossed the
+/// server's 2,100-parameter limit and the whole permission read failed, so
+/// `doctor` reported `permission.unknown` for an estate it could have
+/// checked. Asked in chunks, every table comes back, none twice, and `sa`
+/// holds `CONTROL` on all of them.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() {
+    let mut db = TestDb::create("doctorchunk").await;
+    const TABLES: usize = 1_100;
+    // One batch per hundred tables: a single batch of 1,100 statements is
+    // slow to parse and says nothing the smaller ones do not.
+    for start in (0..TABLES).step_by(100) {
+        let mut batch = String::new();
+        for i in start..(start + 100).min(TABLES) {
+            batch.push_str(&format!(
+                "CREATE TABLE dbo.[many_{i}] (id int NOT NULL PRIMARY KEY); "
+            ));
+        }
+        db.conn.execute(&batch).await.expect("create tables");
+    }
+    let objects: Vec<pbps_model::ObjectName> = (0..TABLES)
+        .map(|i| pbps_model::ObjectName::new("dbo", format!("many_{i}")))
+        .collect();
+    let targets = pbps_mssql::doctor::GrantTargets {
+        objects: objects.clone(),
+        schemas: vec![],
+        roles: vec![],
+    };
+    let held =
+        pbps_mssql::doctor::permissions(&mut db.conn, &["dbo".to_owned()], &objects, &targets)
+            .await
+            .expect("a list past one statement's worth of parameters must still be read");
+
+    assert_eq!(
+        held.granted_objects.len(),
+        TABLES,
+        "every declared target is asked about"
+    );
+    assert_eq!(
+        held.referenced_objects.len(),
+        TABLES,
+        "and every referenced one"
+    );
+    for o in &objects {
+        assert!(
+            held.granted_objects[o].contains("CONTROL"),
+            "`sa` holds CONTROL on {o}: {:?}",
+            held.granted_objects[o]
+        );
+    }
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| matches!(g.securable, pbps_mssql::doctor::Securable::Object(_))),
+        "no gap on an object `sa` holds everything on: {gaps:?}"
+    );
+
+    db.drop().await;
+}
+
+/// Where the parameter limit really sits, measured. The server says 2,100;
+/// a statement bound through `sp_executesql` spends two of those on its own
+/// `@stmt` and `@params`, so the last count a query may bind is 2,098.
+/// `doctor::MAX_PARAMETERS` cites this test.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_query_may_bind_two_fewer_parameters_than_the_server_names() {
+    let mut db = TestDb::create("paramlimit").await;
+    let probe = |n: usize| {
+        let slots: Vec<String> = (1..=n).map(|i| format!("(@P{i})")).collect();
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM (VALUES {}) AS v(x);",
+            slots.join(", ")
+        );
+        let params: Vec<pbps_db::Param<'static>> =
+            (0..n).map(|_| pbps_db::Param::from("x")).collect();
+        (sql, params)
+    };
+    let (sql, params) = probe(2098);
+    db.conn
+        .query_with(&sql, &params)
+        .await
+        .expect("2,098 bound parameters are accepted");
+    let (sql, params) = probe(2099);
+    let err = db
+        .conn
+        .query_with(&sql, &params)
+        .await
+        .err()
+        .expect("2,099 are refused");
+    assert!(format!("{err}").contains("2100"), "{err}");
     db.drop().await;
 }

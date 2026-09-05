@@ -57,7 +57,9 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
             environment: Some(name.to_owned()),
         }),
         (None, None) => bail!(
-            "this command needs a database: pass --db <connection string> or --env <name from pbps.yml>"
+            "this command needs a database: pass --db {} or --env {}",
+            crate::report::placeholder("connection string"),
+            crate::report::placeholder("name from pbps.yml")
         ),
     }
 }

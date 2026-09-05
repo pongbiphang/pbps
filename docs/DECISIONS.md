@@ -2831,9 +2831,82 @@ SPEC is in sync with all of these.
     whose remedies spell `--env <redacted label>` for a `--db` target; that is a
     separate command and a separate issue, not scope here.
 
+197. **A remedy spells the target the way its caller named it.** 196 stopped a
+    message naming a command the caller could not run; this is the same shape
+    one level down, in the commands a remedy *is*. `doctor`'s per-environment
+    remedies — `baseline`, `apply --staged --resume`, `unlock` — each require
+    one of `--db` and `--env`, and all three spelled `--env` with
+    `EnvDiagnosis::environment`. That field is the display name: the
+    environment for an `--env` target, and `db::redact`'s `server/database` for
+    a `--db` one. Measured against the live server, `doctor --db` offered
+    `pbps unlock --env "localhost,14330"` — an environment `pbps.yml` does not
+    have, in a line advertised as copy-pastable.
+
+    So the diagnosis carries `env_name: Option<String>` beside the display
+    name, `Some` only where the caller gave one (the `--env` argument, or a key
+    of `pbps.yml` in the all-environments loop), and one `target_arg` builds
+    the flag: the quoted name, or `--db <connection string>`. The connection
+    string is a placeholder rather than the string itself — it carries the
+    password, and remedies are printed into CI logs (`explain` already made
+    this choice for its approval command, which is why it was not wrong).
+    The field is not serialized: it repeats `environment` where it is `Some`
+    and says nothing where it is `None`.
+
+    Watching the reverted fix fail is what showed the live half was not being
+    measured at all: `doctor_does_not_report_ready_while_the_lock_is_held`
+    takes its lock through `docker exec`, and on a host where `docker` cannot
+    reach the container it returns early and reports a pass. Under a shim it
+    fails against the old spelling with the bad remedy in its output.
+
+198. **A live test arranges its state over its own connection, in its own
+    database.** Four tests in `flow.rs` needed state the tool will not produce —
+    a lock held by somebody else, a table with an `IDENTITY` no `ALTER` can add
+    — and reached for it with `docker exec pbps-test-mssql … sqlcmd`. Each
+    treated a failure to reach the container as a reason to `return`, so on a
+    host whose `docker` cannot see it (this suite also runs under podman) they
+    reported a pass having executed nothing. Measured: with `docker` replaced by
+    a program that exits 1, all four were green; the bug one of them was written
+    to catch went unmeasured for as long as that was true.
+
+    They now run their statements through `pbps_db::Conn` on the connection the
+    test already has, which the file does in a dozen other places, and a failure
+    is a panic: setup is a precondition, and a test that cannot arrange its
+    state has not passed. Against an unreachable server the four now fail with
+    `cannot reach the server under test`.
+
+    Making them run exposed the second half. All four worked in whatever
+    database `PBPS_TEST_DB` names, shared with every other test in the file, and
+    the ledger entries and tables they leave behind made *other* tests fail —
+    which ones depending on the order they ran in. So each takes a database of
+    its own, as every other state-writing live test here already does. Teardown
+    stays tolerant: after the assertions, a failed `DROP` hides nothing, while a
+    panic there would replace the failure the test actually found.
+
+199. **One helper owns a per-test database, and a guard drops it.** 198 gave
+    four live tests a database of their own by copying what eleven others did
+    by hand, and the copy inherited both defects the hand-rolled shape carries.
+
+    The connection string was built as `format!("{server};Database={name}")`
+    with `PBPS_TEST_DB` verbatim. An ADO.NET string is a list of `key=value;`,
+    so a trailing separator is legal and makes `;;`, which tiberius refuses:
+    "Key must not be empty". Measured — every one of those tests creates its
+    database and then cannot connect to it. `with_key` trims the trailing
+    separator and any whitespace, and is the only place a key is appended.
+
+    The drop was each test's last statement, so an assertion that panicked
+    skipped it, and the name carries the pid, so the next run created a
+    differently named database rather than reclaiming the old one. Counted on
+    the shared container: 58 left behind. `OwnDatabase` drops in `Drop`, which
+    runs while unwinding. The teardown stays tolerant for a second reason
+    there: a panic during unwinding aborts the process and would take the rest
+    of the suite with it.
+
+    Both halves are pinned by tests that fail when reverted — the string one
+    without a server, since the defect is in the string.
+
 ## Phase 5 prep — module identity (ADR-0009 §1)
 
-197. **A module is identified by a typed `ModuleId`, and which fields carry
+200. **A module is identified by a typed `ModuleId`, and which fields carry
     that identity depends on the kind.** `Schema::modules` was keyed by
     `ObjectName`, which says every module in a schema has a distinct name.
     Measured on PostgreSQL, that is false twice over: functions and procedures
@@ -2861,7 +2934,7 @@ SPEC is in sync with all of these.
     an `on:` on a kind that has no table, or a trigger whose schema disagrees
     with its table's.
 
-198. **Namespace sharing and overloading are dialect questions, asked of the
+201. **Namespace sharing and overloading are dialect questions, asked of the
     dialect.** `check_names` refused two modules with one name and a module
     sharing a table's name, as one rule for every engine. Both halves are
     engine-specific — on PostgreSQL views share the table namespace and
@@ -2871,7 +2944,7 @@ SPEC is in sync with all of these.
     and `overloads`; `check_names` keeps only what is true of every engine.
     MSSQL answers as before, so no declaration that was valid becomes invalid.
 
-199. **Routine identity is normalized by its own hook, and a collision is
+202. **Routine identity is normalized by its own hook, and a collision is
     reported rather than merged.** PostgreSQL discards type modifiers when
     identifying a routine — measured, `f(varchar(10))` and `f(varchar(20))`
     are one function — which `normalize_type` must not do, because a column's
@@ -2882,7 +2955,7 @@ SPEC is in sync with all of these.
     declared module that no plan ever mentions — absent and unreadable are not
     the same, and only one of them is good news.
 
-200. **The state snapshot's oldest readable version becomes its current one.**
+203. **The state snapshot's oldest readable version becomes its current one.**
     A version 5 snapshot spells a trigger as `app.audit` with its table in a
     field beside it. This build reads that key as a view and has nowhere to
     put the table, so "no modules of that shape" would be a *missing* reading
@@ -2893,7 +2966,7 @@ SPEC is in sync with all of these.
     the first tagged release (145). The saved plan goes 4 → 5 for the same
     change with the same reasoning, and refuses the same way.
 
-201. **A guarantee the map key used to give is now a check, because removing
+204. **A guarantee the map key used to give is now a check, because removing
     the reason for one is not replacing it.** `Schema::modules` keyed by
     `ObjectName` made two modules with one name *unrepresentable*: the map
     held one entry per name and that was the end of it. Keyed by `ModuleId`
@@ -2913,7 +2986,7 @@ SPEC is in sync with all of these.
     turned on the change that removed the reason: the key was the guard, and
     it had to be replaced in the same breath it was taken away.
 
-202. **A module whose name the id's string form cannot carry is inventoried,
+205. **A module whose name the id's string form cannot carry is inventoried,
     not recorded.** `ModuleId` crosses a snapshot, a plan and every message as
     a string in which the punctuation is structural: `.` separates the parts
     and `(` opens a signature. A legal quoted identifier may contain either —

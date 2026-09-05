@@ -8,7 +8,7 @@
 //! [`ledger`] holds the shapes of the `__pbps_state` ledger and the
 //! `__pbps_lock` lock (SPEC §8.1). Only the shapes: the SQL that reads and
 //! writes them is T-SQL, so it lives in `pbps_mssql::state` beside the catalog
-//! queries, and Phase 4's `pbps-pg` will write its own. Keeping the types here
+//! queries, and Phase 5's `pbps-pg` will write its own. Keeping the types here
 //! is what stops the ledger's meaning from being defined twice.
 //!
 //! The driver API is `tiberius`, supplied for now by the `tiberius-ng` package

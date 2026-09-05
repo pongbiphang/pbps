@@ -878,7 +878,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // The target crosses a snapshot as its string form, in which `(`
         // opens a routine signature; a legal quoted object name may contain
         // one, and `dbo.sales(archive)` would be read back as a grant on a
-        // routine (DECISIONS 202). Reported without a target, because the
+        // routine (DECISIONS 205). Reported without a target, because the
         // target is exactly what cannot be spelled.
         if target
             .to_string()

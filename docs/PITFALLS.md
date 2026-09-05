@@ -407,7 +407,7 @@ identity, and no test noticed because none had held a name containing the
 delimiter. **When a string form gains a grammar, every input that used to be
 unparseable becomes a candidate for being parsed as something else** — list
 them, and make the round trip `to_string().parse() == self` a checked property
-where engine names enter (DECISIONS 202).
+where engine names enter (DECISIONS 205).
 
 **The shape.** Whenever a typed identity is flattened to a string — a map key,
 a filename, a message — test the flattening on the case where the parts are

@@ -87,7 +87,7 @@ fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
 /// The file a module is written to, under its whole identity.
 ///
 /// The whole identity, because anything less lets `pull` write one
-/// declaration over another (ADR-0009 §1, DECISIONS 197). A routine carries
+/// declaration over another (ADR-0009 §1, DECISIONS 200). A routine carries
 /// its argument types — `app.f(integer)` and `app.f(text)` are two
 /// declarations — and a trigger carries its table, because `audit` on
 /// `app.orders` and `audit` on `app.customers` are two more. `component`
