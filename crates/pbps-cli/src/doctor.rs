@@ -146,13 +146,7 @@ impl EnvDiagnosis {
     /// there is no second spelling that overwrites (`status` keeps its causes
     /// the same way).
     fn note(&mut self, cause: String) {
-        match &mut self.detail {
-            Some(existing) => {
-                existing.push_str(" — ");
-                existing.push_str(&cause);
-            }
-            None => self.detail = Some(cause),
-        }
+        append_cause(&mut self.detail, cause);
     }
 }
 
@@ -469,6 +463,24 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
     }
 }
 
+/// Adds a cause to a slot beside what is already there.
+///
+/// The version read and the edition read fail independently and each has a
+/// cause; assigned, the second wrote over the first, and the finding they
+/// share carried one reason for two failures. The one spelling of "keep
+/// what an earlier read established": `EnvDiagnosis::note` goes through it
+/// for `detail`, and it is joined the way `status` joins its causes, so the
+/// two commands read alike.
+fn append_cause(slot: &mut Option<String>, cause: String) {
+    match slot {
+        Some(existing) => {
+            existing.push_str(" — ");
+            existing.push_str(&cause);
+        }
+        None => *slot = Some(cause),
+    }
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
@@ -503,10 +515,10 @@ async fn examine(
     // reject every module statement in the plan.
     match pbps_mssql::doctor::server_version(&mut conn).await {
         Ok(v) => d.server_version = Some(v),
-        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+        Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
     }
     match pbps_mssql::edition::edition(&mut conn).await {
-        Err(e) => d.server_capabilities_unknown = Some(format!("{e}")),
+        Err(e) => append_cause(&mut d.server_capabilities_unknown, format!("{e}")),
         Ok(ed) => {
             d.supports_online = Some(ed.supports_online());
             // Asked of the version *and* the edition together: Azure reports
@@ -911,6 +923,52 @@ mod tests {
             EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
         d.note("cannot connect".to_owned());
         assert_eq!(d.detail.as_deref(), Some("cannot connect"));
+    }
+
+    /// The version read and the edition read fail independently, and each
+    /// has a cause. One slot assigned twice kept only the second, so the one
+    /// finding they share named a reason for half of what went wrong.
+    #[test]
+    fn a_failed_edition_read_keeps_the_cause_of_a_failed_version_read() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        // In `examine`'s order: the version, then the edition.
+        append_cause(
+            &mut d.server_capabilities_unknown,
+            "SERVERPROPERTY('ProductVersion') was NULL".to_owned(),
+        );
+        append_cause(
+            &mut d.server_capabilities_unknown,
+            "SERVERPROPERTY('Edition') was NULL".to_owned(),
+        );
+        let why = d.server_capabilities_unknown.as_deref().unwrap();
+        assert!(why.contains("ProductVersion"), "{why}");
+        assert!(why.contains("'Edition'"), "{why}");
+        assert!(why.find("ProductVersion") < why.find("'Edition'"), "{why}");
+
+        let findings = env_findings(&d, false);
+        let unknown: Vec<&output::Finding> = findings
+            .iter()
+            .filter(|f| f.id == "server.capabilities-unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "{findings:?}");
+        assert!(
+            unknown[0].message.contains("ProductVersion"),
+            "{}",
+            unknown[0].message
+        );
+        assert!(
+            unknown[0].message.contains("'Edition'"),
+            "{}",
+            unknown[0].message
+        );
+    }
+
+    /// One cause is written plainly.
+    #[test]
+    fn a_single_capability_cause_is_written_as_it_is() {
+        let mut slot = None;
+        append_cause(&mut slot, "cannot read".to_owned());
+        assert_eq!(slot.as_deref(), Some("cannot read"));
     }
 
     /// The remedy is advertised as copy-pastable, so it goes through the
