@@ -1480,6 +1480,43 @@ SELECT 'R140', 'the same test asked of the catalog after apply, one plan late',
 SET search_path = m;
 DROP SCHEMA wa CASCADE; DROP SCHEMA wb CASCADE;
 
+-- -------------------------- the forty-fifth 2026-09-05 review round
+
+-- A qualified reference rebuilds for ever under the shadow test, because the
+-- rebuild changes neither the binding nor the candidate. What the rebuild does
+-- change is what the engine proved: a candidate sat earlier and the object
+-- bound past it.
+CREATE SCHEMA qa; CREATE SCHEMA qb;
+CREATE FUNCTION qb.helper() RETURNS text AS $$SELECT 'qb'$$ LANGUAGE sql;
+SET search_path = qa, qb, m;
+CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+CREATE VIEW qa.vu AS SELECT helper() AS who;
+CREATE FUNCTION qa.helper() RETURNS text AS $$SELECT 'qa'$$ LANGUAGE sql;
+CREATE FUNCTION m.bound(v regclass) RETURNS text AS $$
+  SELECT n.nspname || '.' || p.proname FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+   JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE r.ev_class = v AND d.refclassid = 'pg_proc'::regclass $$ LANGUAGE sql;
+CREATE FUNCTION m.shadow(v regclass) RETURNS text AS $$
+  SELECT coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = split_part(m.bound(v), '.', 2)
+      AND array_position(current_schemas(true), n.nspname)
+        < array_position(current_schemas(true), split_part(m.bound(v), '.', 1))
+    LIMIT 1), 'none') $$ LANGUAGE sql;
+SELECT 'R141', 'a view that qualified qb.helper(): binding / shadow test, after qa.helper() appears',
+  m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+DROP VIEW qa.vq; CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+SELECT 'R142', 'the same after the rebuild that test scheduled', m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+DROP VIEW qa.vq; CREATE VIEW qa.vq AS SELECT qb.helper() AS who;
+SELECT 'R143', 'and after the next one', m.bound('qa.vq') || ' / ' || m.shadow('qa.vq');
+SELECT 'R144', 'what that creation proved: a candidate sat earlier and the object bound past it',
+  CASE WHEN m.shadow('qa.vq') <> 'none' THEN 'yes, so the reference is qualified' ELSE 'no' END;
+SELECT 'R145', 'the unqualified view: binding / shadow test, before its rebuild', m.bound('qa.vu') || ' / ' || m.shadow('qa.vu');
+DROP VIEW qa.vu; CREATE VIEW qa.vu AS SELECT helper() AS who;
+SELECT 'R146', 'the same after its rebuild', m.bound('qa.vu') || ' / ' || m.shadow('qa.vu');
+SET search_path = m;
+DROP FUNCTION m.shadow(regclass); DROP FUNCTION m.bound(regclass);
+DROP SCHEMA qa CASCADE; DROP SCHEMA qb CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

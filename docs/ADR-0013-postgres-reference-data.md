@@ -674,18 +674,35 @@ pinned on the session, and not wrapped around the writes at all.**
     parsing it. They are created under the operator's settings like every
     opaque definition, and the gap is recorded in Limits rather than hidden.
 
-    This shrinks what the assertion below has to cover but does not remove it:
-    DECISIONS 117's unprobeable-default path and the settings under which pbps's
-    *own* rendered values are read are still live. And it makes the failure this
-    section has now chased through three rounds unrepresentable instead of
-    detected, which is the outcome that was available at the start and that
-    three successive optimisations talked me out of.
-  - **Where it is not** — DECISIONS 117's unprobeable-default path — **the plan
-    records the settings it probed under, and `apply` asserts them before the
-    write**, refusing loudly if they moved. That is the same shape as
-    [ADR-0009](ADR-0009-postgres-modules.md)'s assertions before the `DROP`: the
-    thing the plan reasoned about is checked to still be true at the moment it
-    is acted on.
+    A first version of this paragraph said the decision "shrinks what the
+    assertion below has to cover but does not remove it". It removes it — see
+    the next bullet. What the decision does do is make the failure this section
+    has now chased through three rounds unrepresentable instead of detected,
+    which is the outcome that was available at the start and that three
+    successive optimisations talked me out of.
+  - **There is no second branch.** A first version kept one: for an
+    "unprobeable default" the plan would record the settings it probed under
+    and `apply` would assert them before the write, in the shape of
+    [ADR-0009](ADR-0009-postgres-modules.md)'s assertions before the `DROP`. It
+    cited a numbered decision for that path which exists on PR #10's branch
+    (`bbe605b`, the pre-delete probe reading a defaulted write as an arrival)
+    and not on this branch's base, and — more to the point — after the two
+    decisions above no applyable plan reaches it: an omitted cell over a
+    non-literal default is refused, and over a literal one the plan spells the
+    value itself. Every cell an applyable plan writes is a value the plan
+    spelled, so there is nothing at apply time that a session setting could
+    move and nothing left to assert. The settings under which pbps reads its
+    *own* rendered values are set by pbps around that read (§3 above) and
+    need no assertion either. The requirement is withdrawn rather than kept
+    for a scenario that cannot occur; an assertion nobody can trip is a filter
+    nobody re-reads.
+
+  **What is left of the probe after all of this is nothing on the data path.**
+  `plan --db` no longer evaluates a default for any cell; it converts literals
+  under its own settings and refuses the rest. The `READ ONLY` transaction
+  below stays, because it was never only about defaults: SPEC §9.1 makes
+  `plan` a preview, and every statement `plan --db` runs — the pre-delete
+  probe of §1 included — runs inside it.
 
   **And a probe that executes user code can move the target, which planning may
   not do.** SPEC §9.1 makes `plan` a preview; a default of `nextval(…)` makes it
@@ -699,8 +716,10 @@ pinned on the session, and not wrapped around the writes at all.**
   ```
 
   The obvious remedy is to call any default that may run volatile or
-  user-defined code unprobeable. **Measured, that gives away too much**, because
-  the engine already draws the line exactly where it belongs:
+  user-defined code unprobeable — a line pbps would have had to draw itself, and
+  that at the time still mattered for the omitted cell. **Measured, that gives
+  away too much**, because the engine already draws the line exactly where it
+  belongs:
 
   ```
   nextval() under SET TRANSACTION READ ONLY:                   refused: cannot execute nextval() in a read-only transaction
@@ -711,12 +730,14 @@ pinned on the session, and not wrapped around the writes at all.**
   ```
 
   `random()` and `now()` are volatile and harmless; a blanket volatility rule
-  would refuse the common case to catch the rare one. So: **the probe runs
-  inside `SET TRANSACTION READ ONLY`, and the engine's refusal *is* the
-  definition of unprobeable.** pbps performs no volatility analysis, keeps no
-  list of dangerous functions, and cannot fall behind the engine's — which is
-  §8.2's rule again, one level up: the database is the authority on what its own
-  expression does.
+  would refuse the common case to catch the rare one. So: **`plan --db` runs
+  inside `SET TRANSACTION READ ONLY`, and the engine's refusal is the only
+  definition of "would have written" pbps keeps.** pbps performs no volatility
+  analysis, keeps no list of dangerous functions, and cannot fall behind the
+  engine's — which is §8.2's rule again, one level up: the database is the
+  authority on what its own expression does. With the omitted cell gone from
+  the data path, the transaction guards what §9.1 says planning is rather than
+  a probe that no longer runs.
 
   This is the third decision on this branch that replaces a judgement pbps would
   have to make with a question the engine answers, and the first one where the
@@ -1222,15 +1243,51 @@ reads deterministic would have made them depend on the declarations.
   ```
 
   A declaration that wrote `yb.helper()` in full cannot be affected by
-  `ya.helper`, and this rule rebuilds it anyway, because distinguishing the two
-  needs the unqualified spelling and only the declaration text has it. That is
-  the trade taken: **an unnecessary rebuild on a rare event, rather than a
-  silent divergence on it.** The event is a new object shadowing a managed
-  binding — not a schema reorder, not a deploy, but somebody adding a name that
-  collides — and a rebuild is the operation §2 already performs for every module
-  change, with ADR-0009's carried grants and assertions around it. A false
-  rebuild is loud, recorded in the plan, and gated; the alternative is an
-  environment that quietly stops matching `bootstrap`.
+  `ya.helper`, and this rule rebuilds it anyway. A first version called that
+  "an unnecessary rebuild on a rare event" and accepted the trade, and the
+  trade was mis-measured: the event is rare, the rebuild is not. **Measured**,
+  the rebuild changes neither side of the comparison, so the next plan asks the
+  same question and gets the same answer:
+
+  ```
+  a view that qualified qb.helper(): binding / shadow test, after qa.helper() appears:  qb.helper / qa.helper
+  the same after the rebuild that test scheduled:                                       qb.helper / qa.helper
+  and after the next one:                                                               qb.helper / qa.helper
+  ```
+
+  That is a drop and create — with its locks and ADR-0009's grant restoration
+  — on every connected plan, for ever, for a view, a routine, a default, a
+  check or a filter that was never wrong. A rebuild that fires every plan is
+  the permanent restatement this section exists to prevent, and this one was
+  introduced as a *conservative* choice.
+
+  The first version also said distinguishing a qualified reference "needs the
+  unqualified spelling and only the declaration text has it". It does not: it
+  needs one creation with the shadow present, and the rebuild is exactly that.
+  **Measured**, what the engine proved at that creation:
+
+  ```
+  what that creation proved: a candidate sat earlier and the object bound past it:  yes, so the reference is qualified
+  ```
+
+  An unqualified reference cannot bind past a same-named object earlier on the
+  path; one that did was written qualified, and no shadow can ever move it. So
+  the state records, beside each binding and next to the on-path flag, **whether
+  a same-named object of the same class already sat earlier on the effective
+  path when the object was created**. A binding that carries that flag is
+  proven qualified and the shadow test skips it. The unqualified case converges
+  in the one rebuild it always needed and records no shadow, because after the
+  rebuild it binds the earliest candidate:
+
+  ```
+  the unqualified view: binding / shadow test, before its rebuild:  qb.helper / qa.helper
+  the same after its rebuild:                                       qa.helper / none
+  ```
+
+  This is the same device as the on-path flag one paragraph up: a fact the
+  engine established at creation, recorded so the next plan does not re-ask a
+  question whose answer cannot change. A false rebuild is still loud, recorded
+  in the plan, and gated — but it happens once.
 
   **And the catalog it is asked of is the one this plan will leave, not the one
   it found.** A first version asked the live catalog, and the live catalog
@@ -1330,17 +1387,17 @@ bare numerics.
 
 This is the same family as ADR-0009 §2 — the engine deparses and hands back its
 own spelling — and the answer is the same one §8.2 already gives: **do not
-compare texts across the boundary; ask the engine for the value.** The probe
-machinery already evaluates expressions server-side to decide whether a cell
-equals its default (ADR-0004's implementation notes, and the "unprobeable
-default" path of DECISIONS 117 for the cases where it cannot). That path is
-dialect-agnostic in shape and carries over; what does not carry over is any
-attempt to shortcut it with string equality, which happens to work often enough
-on SQL Server to look like it works.
+compare texts across the boundary; ask the engine for the value.** The engine
+already compares a cell's value server-side (ADR-0004's implementation notes),
+and §3 has since taken the omitted cell off the evaluating path altogether —
+refused over a non-literal default, spelled by the plan over a literal one —
+so what carries over is a comparison of values, dialect-agnostic in shape.
+What does not carry over is any attempt to shortcut it with string equality,
+which happens to work often enough on SQL Server to look like it works.
 
-**And that answer covers the cell, not the column.** The probe decides whether an
-omitted *cell* equals its default; the *structural* default is compared
-somewhere else entirely, and there it is compared as text.
+**And that answer covers the cell, not the column.** A cell is compared as a
+value; the *structural* default is compared somewhere else entirely, and there
+it is compared as text.
 `crates/pbps-diff/src/schema_diff.rs:385` reads:
 
 ```rust
@@ -1449,11 +1506,11 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 | | |
 |---|---|
-| `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation (§3); and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact — and so does a plain-literal default on a setting-sensitive column, emitted as the resolved typed spelling, because the DDL that types a literal is where a session reads it (§3); the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
+| `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation and whether a same-named object of the same class already sat earlier on it (§3) — the second flag is the engine's proof that the reference was qualified, without which a qualified reference is rebuilt on every plan for ever; and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact — and so does a plain-literal default on a setting-sensitive column, emitted as the resolved typed spelling, because the DDL that types a literal is where a session reads it (§3); the **default probe is gone from the data path** — an omitted cell is refused over a non-literal default and spelled by the plan over a literal one, so `plan --db` evaluates no user code for a cell and `apply` has nothing to assert — while `plan --db` itself stays inside a `READ ONLY` transaction, because §9.1 makes it a preview; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is asked of the catalog **as this plan will leave it** — minus what it drops, plus what it creates and the destinations of what it renames, since a shadow the same plan introduces is otherwise found one plan late — is a same-named object of the same catalog class then earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
-| The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
-| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value — resolved under the canonical settings at plan time when the column's type is setting-sensitive, the one conversion feeding both the cell and the default's DDL, so that path has no probe and needs no assertion. The plan still records the probed settings and `apply` asserts them, for DECISIONS 117's unprobeable path |
+| `plan --db`'s transaction | `READ ONLY` (§3). The engine refuses exactly the statements that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so pbps analyses nothing. It was introduced for a default probe that §3 has since removed from the data path, and it stays for what §9.1 says planning is |
+| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value — resolved under the canonical settings at plan time when the column's type is setting-sensitive, the one conversion feeding both the cell and the default's DDL, so no path has a probe and none needs an assertion. A first version kept a recorded-and-asserted settings branch for an "unprobeable default", citing a decision that exists on PR #10's branch and not on this one; no applyable plan reaches that branch, and it is withdrawn |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
 | A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. A plain-literal default on a setting-sensitive column is additionally *emitted* resolved (§3); the declared text is still what the differ compares. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
@@ -1464,11 +1521,11 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 - **Composite keys are still deferred**, as in ADR-0004.
 - **`READ ONLY` bounds the database, not the world.** It refuses writes to this
-  database's tables and sequences, which is what §3 needs; a default that calls
-  out through `dblink`, raises a `NOTIFY`, or writes a file is not stopped by it
-  and is not stopped by anything else pbps can do short of refusing to probe at
-  all. The guard is exact for the failure that was found and honest about the
-  one it does not cover.
+  database's tables and sequences, which is what §3 needs; a function that a
+  planning read happens to invoke and that calls out through `dblink`, raises a
+  `NOTIFY`, or writes a file is not stopped by it and is not stopped by anything
+  else pbps can do. The guard is exact for the failure that was found and
+  honest about the one it does not cover.
 - **§4's expression-comparison finding is not measured against SQL Server.** The
   differ is shared, and all three expressions are read raw with no normalizer
   anywhere in the workspace: `sys.default_constraints.definition`

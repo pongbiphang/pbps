@@ -247,3 +247,9 @@ R137 | the shadow test, asked of the catalog before the plan creates wa.helper()
 R138 | the view after that plan applied with no rebuild scheduled | wb
 R139 | a bootstrap of the same declaration, wa.helper() created first | wa
 R140 | the same test asked of the catalog after apply, one plan late | wa.helper
+R141 | a view that qualified qb.helper(): binding / shadow test, after qa.helper() appears | qb.helper / qa.helper
+R142 | the same after the rebuild that test scheduled | qb.helper / qa.helper
+R143 | and after the next one | qb.helper / qa.helper
+R144 | what that creation proved: a candidate sat earlier and the object bound past it | yes, so the reference is qualified
+R145 | the unqualified view: binding / shadow test, before its rebuild | qb.helper / qa.helper
+R146 | the same after its rebuild | qa.helper / none
