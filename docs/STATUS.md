@@ -150,8 +150,10 @@ engine still cannot express an organization's own rules. The reasoning is in
 SPEC 12 and open question 9.
 
 **Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
-abstraction. Its design is recorded, and every claim in it was measured against
-a real PostgreSQL before any dialect code exists:
+abstraction. Its design is recorded, grounded in measurements taken on a real
+PostgreSQL before any dialect code exists — each ADR's "Limits" section names
+what was not measured, and the PostgreSQL live suite is Phase 5's first
+deliverable:
 [ADR-0009](ADR-0009-postgres-modules.md) (modules — overloading makes the
 identity name plus argument types, which ADR-0002 anticipated),
 [ADR-0010](ADR-0010-postgres-privileges.md) (privileges — the role is not the
