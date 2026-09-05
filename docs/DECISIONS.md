@@ -280,8 +280,8 @@ SPEC is in sync with all of these.
     principal with no permission on it, so it answers NULL for a lock table that
     exists and is held — turning "not authorized to look" into "no lock".
     `HAS_PERMS_BY_NAME` does not separate them either (measured: 0 for both).
-    `DbError::server_error_number` exists so `pbps-mssql` can read the code
-    without a second crate naming `tiberius`.
+    `DbError::server_error_code` (`server_error_number` until 193) exists so
+    `pbps-mssql` can read the code without a second crate naming `tiberius`.
 46. **The lock is asked before initialization, in all four commands.** `status`,
     `doctor` and `explain` each asked `is_initialized` first, because
     `lock_holder` used to select from a table a never-initialized database does
@@ -2770,3 +2770,41 @@ SPEC is in sync with all of these.
     sync function handed the read's result, so a test can hand it a failure;
     the two tests that do fail against the old return with exactly the
     missing finding.
+193. **`DbError` reports the server's error code as text.**
+    `server_error_number() -> Option<u32>` was the one place `pbps-db` held a
+    T-SQL shape under a neutral name: PostgreSQL's SQLSTATE is five characters
+    that may be letters (`42P01`), so a `u32` could never carry the second
+    engine's answer, and every caller comparing against it would have been
+    written against the first engine's. It is `server_error_code() ->
+    Option<String>` now, and the single caller compares against `"208"`. Owned
+    rather than borrowed because this driver hands back a number and the error
+    holds no string for a `&str` to borrow from (ADR-0014 §1). Landed ahead of
+    the PostgreSQL crate, with 194 and 195, so that crate's diff carries only
+    what is new.
+194. **The transaction framing's text is the dialect's; `pbps-db` runs it.**
+    `Conn::begin` held `SET XACT_ABORT ON; BEGIN TRANSACTION;` and `rollback`
+    held `IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;` — T-SQL in the crate
+    CLAUDE.md documents as holding none, kept there for reasons the code
+    explained at length. The reasons stay, beside the text, in `pbps-mssql`;
+    `Dialect::transaction_framing` returns the three statements and
+    `Conn::begin`, `commit` and `rollback` take them. The method has no
+    default: a default would have been one engine's answer under a neutral
+    name, the shape ADR-0011 names three times, and PostgreSQL's `begin` is a
+    bare `BEGIN;` (measured — any error already dooms its transaction). Ruled
+    out: a trait for the framing, since nothing varies between engines but the
+    text; and `begin(&str)`, which would make it a second `execute` and leave
+    the framing owned by nobody. `pbps-db` depends on `pbps-dialect` for the
+    type alone (ADR-0014 §2).
+195. **The shared definition scanner tracks block-comment depth.** Block
+    comments nest in T-SQL and in PostgreSQL alike — measured, `SELECT /* a /*
+    b */ c */ 1` returns 1 on SQL Server, and one closer for two openers is
+    "Missing end comment mark" — and `normalize_definition` left a comment at
+    the first `*/`. What followed was read as code: an apostrophe in it opened
+    a literal that was not there, the `'` that really opened one closed it,
+    and the literal's spacing was folded as layout, so two module bodies
+    returning different strings compared equal and the change was never
+    planned. The repository already had a nesting-aware scanner for the
+    identifier scan in `pbps-model` (3b5c9de); this was the same defect in the
+    second scanner, with the quieter failure. The rest of ADR-0011 Amendment 2
+    — the scanner taking a description of the engine's literals, the default
+    going — waits for the PostgreSQL crate, which is what needs it.

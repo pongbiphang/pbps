@@ -83,16 +83,22 @@ async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
 /// The same, in one transaction the way `apply` runs a plan: the engine's
 /// refusal comes back with the statement, and nothing before it stays.
 async fn try_apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Result<(), String> {
-    conn.begin().await.expect("begin");
+    conn.begin(Mssql.transaction_framing())
+        .await
+        .expect("begin");
     for p in &cs.changes {
         for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
             if let Err(e) = conn.execute(&stmt.sql).await {
-                conn.rollback().await.expect("rollback");
+                conn.rollback(Mssql.transaction_framing())
+                    .await
+                    .expect("rollback");
                 return Err(format!("{}\n{e}", stmt.sql));
             }
         }
     }
-    conn.commit().await.expect("commit");
+    conn.commit(Mssql.transaction_framing())
+        .await
+        .expect("commit");
     Ok(())
 }
 
@@ -814,7 +820,10 @@ async fn a_failed_statement_rolls_the_whole_plan_back() {
         .await
         .expect("create");
 
-    db.conn.begin().await.expect("begin");
+    db.conn
+        .begin(Mssql.transaction_framing())
+        .await
+        .expect("begin");
     db.conn
         .execute("ALTER TABLE dbo.t ADD good nvarchar(10) NULL;")
         .await
@@ -826,7 +835,10 @@ async fn a_failed_statement_rolls_the_whole_plan_back() {
             .is_err(),
         "the second statement must fail"
     );
-    db.conn.rollback().await.expect("rollback");
+    db.conn
+        .rollback(Mssql.transaction_framing())
+        .await
+        .expect("rollback");
 
     let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
         .await

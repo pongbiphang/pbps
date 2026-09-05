@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 pbps-model.workspace = true
+# For `TransactionFraming` only: the text of begin/commit/rollback is the
+# dialect's, so this crate holds no T-SQL (ADR-0014 §2).
+pbps-dialect.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tiberius.workspace = true

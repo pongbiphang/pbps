@@ -23,9 +23,15 @@
 //! | Difference | PostgreSQL | SQL Server | How the interface accommodates it |
 //! |---|---|---|---|
 //! | Unquoted identifiers | folded to lowercase | kept as written | [`Dialect::fold_ident`] |
-//! | Type + nullability change | needs two statements | can be merged into one | [`Dialect::emit`] returns a `Vec` |
+//! | One change, several statements | a view rebuild is `DROP`, `CREATE` and a `GRANT` per permission | a cross-schema table rename is `sp_rename` plus `ALTER SCHEMA TRANSFER` | [`Dialect::emit`] returns a `Vec` |
 //! | Effect of a rename on views | updated automatically | definition text goes stale | left to Phase 3's `DialectDb` |
 //! | Batch separation | not needed | some DDL needs its own batch | [`Statement::own_batch`] |
+//!
+//! The second row once read "type + nullability change: PostgreSQL needs two
+//! statements, SQL Server merges them". Measured, PostgreSQL takes both in one
+//! `ALTER TABLE`; the `Vec` stands for the reasons above (ADR-0011, Amendment
+//! 1). A false reason under a true conclusion is the worse error, because
+//! nothing downstream fails to expose it.
 //!
 //! If adding a dialect later requires changing `pbps-model`, this abstraction was
 //! drawn in the wrong place.
@@ -295,9 +301,15 @@ pub trait Dialect {
             Code,
             Quoted(char),
             Line,
-            /// Carrying how many non-space characters have been consumed, so
-            /// that the `*` of the opener cannot also close it (`/*/`).
-            Block(usize),
+            /// Block comments nest, in T-SQL and in PostgreSQL alike —
+            /// measured, `SELECT /* a /* b */ c */ 1` returns 1 on both —
+            /// so `depth` counts the unmatched openers. `seen` counts the
+            /// non-space characters since the last opener, so that an opener's
+            /// own `*` cannot also close it (`/*/`).
+            Block {
+                depth: usize,
+                seen: usize,
+            },
         }
 
         let mut out = String::with_capacity(definition.len());
@@ -337,9 +349,15 @@ pub trait Dialect {
                         out.push(ch);
                     }
                 }
-                At::Block(seen) => {
-                    // A block comment ends at `*/` wherever it falls, so nothing
-                    // inside it is structure and its layout collapses like code.
+                At::Block { depth, seen } => {
+                    // Nothing inside a block comment is structure, so its layout
+                    // collapses like code — but the comment ends only at the
+                    // `*/` that matches its opener. Leaving at the first `*/`
+                    // read the rest of an outer comment as code: an apostrophe
+                    // in it opened a literal that was not there, and the
+                    // spacing inside the real literal after it was folded as
+                    // layout, so two bodies returning different strings
+                    // compared equal (ADR-0011, Amendment 2).
                     if ch.is_whitespace() {
                         in_space = true;
                     } else {
@@ -348,10 +366,26 @@ pub trait Dialect {
                         }
                         in_space = false;
                         out.push(ch);
+                        let next = bytes.get(i + ch.len_utf8()).copied();
                         at = if ch == '/' && seen >= 2 && out.ends_with("*/") {
-                            At::Code
+                            if depth == 1 {
+                                At::Code
+                            } else {
+                                At::Block {
+                                    depth: depth - 1,
+                                    seen: 2,
+                                }
+                            }
+                        } else if ch == '/' && next == Some(b'*') {
+                            At::Block {
+                                depth: depth + 1,
+                                seen: 0,
+                            }
                         } else {
-                            At::Block(seen + 1)
+                            At::Block {
+                                depth,
+                                seen: seen + 1,
+                            }
                         };
                     }
                 }
@@ -367,7 +401,7 @@ pub trait Dialect {
                     let next = bytes.get(i + ch.len_utf8()).copied();
                     at = match (ch, next) {
                         ('-', Some(b'-')) => At::Line,
-                        ('/', Some(b'*')) => At::Block(0),
+                        ('/', Some(b'*')) => At::Block { depth: 1, seen: 0 },
                         ('\'' | '"' | '[', _) => At::Quoted(ch),
                         _ => At::Code,
                     };
@@ -405,9 +439,14 @@ pub trait Dialect {
 
     /// Renders one change as statements.
     ///
-    /// Returning a `Vec` is necessary: PostgreSQL has to split a type change and
-    /// a nullability change into two `ALTER COLUMN` statements, whereas SQL Server
-    /// can merge them into one.
+    /// Returning a `Vec` is necessary because one change is not always one
+    /// statement: SQL Server's `RenameTable` across schemas is `sp_rename` plus
+    /// `ALTER SCHEMA TRANSFER` (see [`Statement::renames`]), and PostgreSQL's
+    /// `AlterModule` on a view is `DROP VIEW`, `CREATE VIEW` and a `GRANT` per
+    /// declared permission (ADR-0009 §3). An earlier version of this comment
+    /// gave a different reason — that PostgreSQL splits a type change and a
+    /// nullability change into two `ALTER COLUMN`s — and it is false: measured,
+    /// one `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1).
     ///
     /// `strategy` says *how* to get there (ADR-0003) and never *where* to go: a
     /// dialect that cannot honour a hint on this statement emits the statement
@@ -442,6 +481,18 @@ pub trait Dialect {
     fn batch_separator(&self) -> Option<&'static str> {
         None
     }
+
+    /// The statements that open, commit and roll back one transaction in this
+    /// dialect.
+    ///
+    /// Required, not defaulted: a default here would be one engine's answer
+    /// under a neutral name, the shape ADR-0011 found three times. SQL
+    /// Server's `begin` has to carry `SET XACT_ABORT ON` or a failed statement
+    /// leaves the earlier ones committable, and its `rollback` has to tolerate
+    /// a transaction the server already killed; PostgreSQL needs neither.
+    /// `pbps-db` runs these and owns the framing around them, and holds no SQL
+    /// of its own (ADR-0014 §2).
+    fn transaction_framing(&self) -> TransactionFraming;
 
     /// Whether a read-back can tell a cell of this column that is at its
     /// default from one that is not.
@@ -654,6 +705,31 @@ mod tests {
         );
     }
 
+    /// Block comments nest (measured: `SELECT /* a /* b */ c */ 1` returns 1),
+    /// so the scanner may leave one only at the `*/` that matches its opener.
+    /// Leaving at the first `*/` reads `it's here */` as code: the apostrophe
+    /// opens a literal that is not there, the `'` that really opens one closes
+    /// it, and the literal's spacing is folded as layout — two bodies returning
+    /// different strings compare equal, and the change is never planned.
+    #[test]
+    fn a_nested_block_comment_ends_at_the_closer_that_matches_its_opener() {
+        let d = MinimalDialect;
+        assert_ne!(
+            d.normalize_definition("SELECT /* outer /* inner */ it's here */ 'a  b'"),
+            d.normalize_definition("SELECT /* outer /* inner */ it's here */ 'a b'")
+        );
+        // Inside the outer comment, layout is still only layout.
+        assert_eq!(
+            d.normalize_definition("SELECT /* outer\n  /* inner */\n  done */ 1"),
+            "SELECT /* outer /* inner */ done */ 1"
+        );
+        // The overlapping spelling opens and does not close, at either depth.
+        assert_eq!(
+            d.normalize_definition("SELECT /*/ /*/ ' */ ' */ a  b"),
+            "SELECT /*/ /*/ ' */ ' */ a b"
+        );
+    }
+
     /// A dialect that has not implemented probes must say "I checked nothing",
     /// never "nothing is wrong".
     #[test]
@@ -666,6 +742,25 @@ mod tests {
         };
         assert!(MinimalDialect.preflight(&changes).is_empty());
     }
+}
+
+/// The three statements that frame a transaction in a dialect
+/// ([`Dialect::transaction_framing`]).
+///
+/// `pbps-db` owns *when* a transaction opens and closes and what a failure on
+/// the way out must not hide; how each step is spelled is the dialect's. Three
+/// plain strings rather than a trait, because nothing about the framing varies
+/// between engines except the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionFraming {
+    /// Opens the transaction — and, where the engine needs telling, makes any
+    /// statement error doom it.
+    pub begin: &'static str,
+    /// Commits it.
+    pub commit: &'static str,
+    /// Rolls it back. Must succeed on a transaction the server has already
+    /// aborted, or the rollback's own error replaces the statement that broke.
+    pub rollback: &'static str,
 }
 
 /// The minimal dialect used by tests and by Phase 1.
@@ -682,6 +777,16 @@ pub struct MinimalDialect;
 impl Dialect for MinimalDialect {
     fn name(&self) -> &'static str {
         "minimal"
+    }
+
+    /// Standard SQL, which is all a dialect that is not any real database can
+    /// honestly say. Nothing opens a connection with this dialect.
+    fn transaction_framing(&self) -> TransactionFraming {
+        TransactionFraming {
+            begin: "START TRANSACTION;",
+            commit: "COMMIT;",
+            rollback: "ROLLBACK;",
+        }
     }
 
     /// No alias expansion — which names alias which is real-dialect knowledge.
