@@ -326,7 +326,14 @@ rendered without presentation filters because a `diff.external` or
 printing a constant hid a rewritten file). Every `git` the UI runs takes
 `--literal-pathspecs` and `--no-replace-objects`, runs from the worktree's
 root (`-C <git rev-parse --show-toplevel>`) with every path spelled relative
-to that root and refused if it lies outside it, every path comes after `--`,
+to that root and refused if it lies outside it, runs with every
+repository-locating `GIT_*` variable of the UI's own environment removed
+(`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+`GIT_COMMON_DIR` and their kin) so that the repository is the one found from
+that root and not one a relative variable pointed at from wherever `pbps ui`
+was started (**measured**: from a subdirectory, `GIT_INDEX_FILE=alt-index`
+named `../alt-index`, and the same variable under `-C <root>` named a
+different file, `alt-index` at the root), every path comes after `--`,
 and every command that prints paths takes `-z` and is parsed as bytes — each
 for a reason that was measured. `a[12].json` is a pattern to `git` and
 selected three files without `--literal-pathspecs`. A file named `-A` made
