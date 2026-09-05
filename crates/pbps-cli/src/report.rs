@@ -8,7 +8,7 @@
 
 use pbps_diff::Blocker;
 use pbps_model::change::DeleteCause;
-use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
+use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 
 /// One intent in the user's own vocabulary.
 ///
@@ -185,7 +185,7 @@ pub fn touched(cs: &ChangeSet) -> (usize, usize) {
     for p in &cs.changes {
         match (p.change.module_name(), p.change.table()) {
             (Some(m), _) => modules.insert(m.to_string()),
-            (None, Some(_)) => tables.insert(renames.resolve(p.change.subject())),
+            (None, Some(t)) => tables.insert(renames.table(t).clone()),
             // A role is neither; it is counted in its own line of the summary.
             (None, None) => false,
         };
@@ -195,65 +195,128 @@ pub fn touched(cs: &ChangeSet) -> (usize, usize) {
 
 /// The new name of every object a change set renames, by its old name.
 ///
-/// `RenameTable` and `RenameRole` answer [`Change::subject`] with the old
-/// name, and every change that follows them in the same plan acts on the
-/// new one: the differ speaks in the declared schema's names once the rename
-/// is recorded. Counted as they come, the two spellings of one object made
-/// a renamed role whose grants also change "2 role(s)". Every subject goes
-/// through [`Renames::resolve`] before it is counted, so both ends land on
-/// the same key.
-struct Renames(std::collections::BTreeMap<String, String>);
+/// `RenameTable` and `RenameRole` answer for the old name, and every change
+/// that follows them in the same plan acts on the new one: the differ speaks
+/// in the declared schema's names once the rename is recorded. Counted as
+/// they come, the two spellings of one object made a renamed role whose
+/// grants also change "2 role(s)". Every name goes through [`Renames::table`]
+/// or [`Renames::role`] before it is counted, so both ends land on the same
+/// key.
+///
+/// One map per namespace, keyed by the typed name rather than by the rendered
+/// subject of [`Change::subject`]. That subject is a label (DECISIONS 56) and
+/// two namespaces share its spelling: the role `app.reader` and the table
+/// `[role app].reader` both render `role app.reader`, so one map keyed by it
+/// let a role rename rewrite a table's key and count two tables as one.
+struct Renames {
+    tables: std::collections::BTreeMap<TableName, TableName>,
+    roles: std::collections::BTreeMap<String, String>,
+}
 
 impl Renames {
-    fn resolve(&self, subject: String) -> String {
-        self.0.get(&subject).cloned().unwrap_or(subject)
+    /// The far end of `name`'s rename, or `name` where this plan renames no
+    /// such table.
+    fn table<'a>(&'a self, name: &'a TableName) -> &'a TableName {
+        self.tables.get(name).unwrap_or(name)
+    }
+
+    /// The same for a role, which is a principal and has no [`TableName`].
+    fn role<'a>(&'a self, name: &'a str) -> &'a str {
+        self.roles.get(name).map_or(name, String::as_str)
+    }
+}
+
+/// The role a change acts on, under the name the change itself carries — the
+/// *old* name for a rename, so [`Renames::role`] has something to resolve.
+///
+/// `Change::roles` answers with both ends of a rename, which is the right
+/// answer for "did this plan touch that role" and the wrong one for counting:
+/// collected as they come, one renamed role is two.
+// Exhaustive rather than a wildcard, for the reason `Change::roles` gives: a
+// change added later that names a role has to be classified here, or the
+// summary stops counting it.
+fn role_of(change: &Change) -> Option<&str> {
+    match change {
+        Change::CreateRole { name, .. }
+        | Change::DropRole { name, .. }
+        | Change::Grant { role: name, .. }
+        | Change::Revoke { role: name, .. } => Some(name.as_str()),
+        Change::RenameRole { from, .. } => Some(from.as_str()),
+        Change::CreateTable { .. }
+        | Change::DropTable { .. }
+        | Change::RenameTable { .. }
+        | Change::AddColumn { .. }
+        | Change::DropColumn { .. }
+        | Change::RenameColumn { .. }
+        | Change::AlterColumnType { .. }
+        | Change::AlterColumnNullability { .. }
+        | Change::AlterColumnDefault { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { .. }
+        | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
+        | Change::AddForeignKey { .. }
+        | Change::DropForeignKey { .. }
+        | Change::AddCheck { .. }
+        | Change::DropCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. }
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. }
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::DropModule { .. } => None,
     }
 }
 
 fn renames(cs: &ChangeSet) -> Renames {
-    Renames(
-        cs.changes
-            .iter()
-            // Exhaustive, for the reason `Change::objects` gives: a change
-            // added later that moves an object's name has to be named here,
-            // or the summary goes back to counting that object twice.
-            .filter_map(|p| match &p.change {
-                Change::RenameTable { from, to, .. } => Some((from.to_string(), to.to_string())),
-                Change::RenameRole { from, to, .. } => {
-                    Some((format!("role {from}"), format!("role {to}")))
-                }
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. } => None,
-            })
-            .collect(),
-    )
+    let mut tables = std::collections::BTreeMap::new();
+    let mut roles = std::collections::BTreeMap::new();
+    for p in &cs.changes {
+        // Exhaustive, for the reason `Change::objects` gives: a change added
+        // later that moves an object's name has to be named here, or the
+        // summary goes back to counting that object twice.
+        match &p.change {
+            Change::RenameTable { from, to, .. } => {
+                tables.insert(from.clone(), to.clone());
+            }
+            Change::RenameRole { from, to, .. } => {
+                roles.insert(from.clone(), to.clone());
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => {}
+        }
+    }
+    Renames { tables, roles }
 }
 
 /// "3 table(s)", "2 module(s)", or both — never a count of one naming the
@@ -277,8 +340,8 @@ pub fn touched_roles(cs: &ChangeSet) -> usize {
     let renames = renames(cs);
     cs.changes
         .iter()
-        .filter(|p| p.change.table().is_none())
-        .map(|p| renames.resolve(p.change.subject()))
+        .filter_map(|p| role_of(&p.change))
+        .map(|name| renames.role(name))
         .collect::<std::collections::BTreeSet<_>>()
         .len()
 }
@@ -771,5 +834,38 @@ mod tests {
         ]);
         assert_eq!(touched_roles(&cs), 2);
         assert!(summary(&cs).contains("2 role(s)"), "{}", summary(&cs));
+    }
+
+    /// A role and a table can render the same subject string: the role
+    /// `app.reader` and the table `[role app].reader` both read
+    /// `role app.reader`. Keyed by that string, a plan that renames the role
+    /// rewrote the table's key to the rename's far end and counted the two
+    /// tables as one.
+    #[test]
+    fn a_role_rename_does_not_merge_two_tables_that_render_like_it() {
+        let cs = set(vec![
+            Change::RenameRole {
+                uid: uid(UidKind::Role, "app.reader"),
+                from: "app.reader".into(),
+                to: "new.role".into(),
+            },
+            Change::AddColumn {
+                uid: uid(UidKind::Column, "role app.reader.extra"),
+                table: "role app.reader".parse().unwrap(),
+                name: "extra".into(),
+                column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
+            },
+            Change::AddColumn {
+                uid: uid(UidKind::Column, "role new.role.extra"),
+                table: "role new.role".parse().unwrap(),
+                name: "extra".into(),
+                column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
+            },
+        ]);
+        assert_eq!(touched(&cs), (2, 0));
+        assert_eq!(touched_roles(&cs), 1);
+        let summary = summary(&cs);
+        assert!(summary.contains("2 table(s)"), "{summary}");
+        assert!(summary.contains("1 role(s)"), "{summary}");
     }
 }
