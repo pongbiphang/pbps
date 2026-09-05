@@ -5,15 +5,18 @@ the schema should look like; the tool works out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
-  through [docs/ADR-0007-connection-strategy.md](docs/ADR-0007-connection-strategy.md)
+  through [docs/ADR-0014-driver-seam-tested.md](docs/ADR-0014-driver-seam-tested.md);
+  ADR-0009 to ADR-0014 are the PostgreSQL design, measured before the dialect
+  exists
+- Copy-pastable CI pipelines and the exit-code contract they rest on:
+  [docs/CI.md](docs/CI.md)
 - Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)
 - Bugs shipped or nearly shipped, and their shapes: [docs/PITFALLS.md](docs/PITFALLS.md)
 - Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
 
-**Phases 0 through 3.5, and Phase 3.1, are complete** for SQL Server: tables,
-columns, keys,
-constraints and indexes, plus views, procedures, functions and triggers. Two
-groups of commands:
+**Phases 0 through 4 are complete** for SQL Server: tables, columns, keys,
+constraints and indexes; views, procedures, functions and triggers; reference
+data, roles and grants, and the `policies:` block. Two groups of commands:
 
 | No database needed | Purpose |
 |---|---|
@@ -44,18 +47,24 @@ answered and found something to act on, **1** the command could not answer. A
 pipeline that cannot tell 1 from 2 wakes the wrong person half the time.
 `scripts/findings-to-github.py` turns the JSON into CI annotations — outside the
 binary on purpose, so a vendor format that moves breaks a script rather than a
-release.
+release. [docs/CI.md](docs/CI.md) has the complete GitHub Actions and GitLab CI
+pipelines, checked against the binary.
 
 Phase 3.1, the usability foundation, is complete: `init`, `doctor`, plan
 summaries and `explain`, one typed JSON output across the read-only commands,
 editor schemas, shell completions, man pages, and the interactive rename prompt
 — the third intent channel, and the last part of "intent is recorded by a human,
-in git" that was missing (see [SPEC §14](docs/SPEC.md)). Next,
-Phase 4 deepens what one engine can express — reference data, roles and grants,
-declarative policies — and PostgreSQL follows in Phase 5. Depth precedes the
-second dialect on purpose: a team evaluating pbps for SQL Server is not blocked
-by the absence of PostgreSQL, it is blocked by the parts of its own estate that
-are not yet expressible.
+in git" that was missing (see [SPEC §14](docs/SPEC.md)). Phase 4 deepened
+what one engine can express — reference data
+([ADR-0004](docs/ADR-0004-reference-data.md)), roles and grants
+([ADR-0005](docs/ADR-0005-roles-and-grants.md)), declarative policies
+([ADR-0008](docs/ADR-0008-policies.md)). Depth preceded the second dialect on
+purpose: a team evaluating pbps for SQL Server is not blocked by the absence of
+PostgreSQL, it is blocked by the parts of its own estate that are not yet
+expressible. Next is Phase 5, the PostgreSQL dialect; its design is already
+recorded and measured against a real server, in
+[ADR-0009](docs/ADR-0009-postgres-modules.md) through
+[ADR-0014](docs/ADR-0014-driver-seam-tested.md).
 
 ### Starting a project
 

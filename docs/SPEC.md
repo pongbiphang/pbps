@@ -1331,6 +1331,11 @@ record:
   only: [/^prod-v.*$/]
 ```
 
+This is the *shape* of the flow. The complete GitHub Actions and GitLab CI
+pipelines, checked against the binary, are in [CI.md](CI.md) — including the
+credential handling it prefers over the `--db "$PROD_CONN"` form shown here
+(`--env prod`, with the secret named by `url_env` in `pbps.yml`).
+
 **The deployment stage requires no human judgement at all.** Rename and drop
 intent was resolved and committed to git when the developer wrote the MR; at tag
 time CI merely follows instructions. `when: manual` is an approval gate, not a
@@ -1498,7 +1503,7 @@ not by a version number.
 | **Phase 3.1** | The usability foundation of 14: `init`, `doctor`, plan summaries and `explain`, one typed JSON output across the read-only commands, editor schemas and shell completions, and **the interactive prompt of 6.3** — the third intent channel, and the last place where a competitor's rename detection looks more finished than ours | Makes the safe path the shortest path without changing the deployment model |
 | **Phase 3.5** | The module model for views / SPs / functions / triggers ([ADR-0002](ADR-0002-module-model.md)); staged apply for non-transactional operations ([ADR-0003](ADR-0003-execution-strategy.md)) | The other half of a real estate becomes manageable |
 | **Phase 4** | Depth on the engine already supported: declarative reference data ([ADR-0004](ADR-0004-reference-data.md)), roles & grants ([ADR-0005](ADR-0005-roles-and-grants.md)), the `policies:` block and the wider built-in analyzer catalogue of 14.1 | Two of Atlas's Pro-gated features land in the free core, and the estate one deployment covers stops being only tables and modules |
-| **Phase 5** | The PostgreSQL dialect; then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
+| **Phase 5** | The PostgreSQL dialect, designed and measured before it is built ([ADR-0009](ADR-0009-postgres-modules.md) modules, [ADR-0010](ADR-0010-postgres-privileges.md) privileges, [ADR-0011](ADR-0011-dialect-seam-under-a-second-engine.md) the dialect seam, [ADR-0012](ADR-0012-postgres-type-catalogue.md) the type catalogue, [ADR-0013](ADR-0013-postgres-reference-data.md) reference data, [ADR-0014](ADR-0014-driver-seam-tested.md) the driver seam); then further dialects, one at a time | The touchstone for whether the abstraction is right. PG was used as the hypothetical case while designing Phase 0 |
 | **Phase 6** | The optional local UI ([ADR-0006](ADR-0006-optional-ui.md)): a single-user viewer over the typed JSON of 3.1 that can compose intent and commit it, holding no state of its own. Multi-tenant and hosted deployment are out of the open-source scope by decision, and get their own ADR | The people who review database change are not all terminal users; this reaches them without becoming a second system of record |
 
 When designing the `Dialect` trait in Phase 0, **PostgreSQL has to be considered
@@ -1523,10 +1528,12 @@ while `policies:` and the analyzer catalogue would not have been.
 
 The second cost is larger and is not measured in lines: **every model decision
 must then be resolved for two engines before it can ship**, and it is paid in
-design, which is the expensive phase. This is not hypothetical — ADR-0004 and
-ADR-0005 each already carry a recorded PostgreSQL collision, so designing them
-against one decided engine is a different problem from designing them against
-two open ones.
+design, which is the expensive phase. This is not hypothetical — ADR-0005
+carries a recorded PostgreSQL collision, and ADR-0004's, which this sentence
+once claimed was recorded there and was not, is now
+[ADR-0013](ADR-0013-postgres-reference-data.md); designing them against one
+decided engine is a different problem from designing them against two open
+ones.
 
 Against both stands the fact that a team evaluating pbps for SQL Server today is
 not blocked by the absence of PostgreSQL; it is blocked by the parts of *its
@@ -1619,7 +1626,10 @@ engine already supported.
    *not* deferred is the abstraction: PostgreSQL's shape continues to be the
    test applied to every model decision, and two known collisions are already
    recorded (function overloading in ADR-0002, default and schema privileges
-   in ADR-0005).
+   in ADR-0005). The Phase 5 design — ADR-0009 through ADR-0014, each measured
+   against a real PostgreSQL — resolves both and records the ones nobody had
+   written down, and it answers the test in 12: the abstraction holds, at the
+   cost of one map key and three fields in the state snapshot (ADR-0009).
 
 10. **The driver supply chain** — a recorded risk that has already come due.
     `tiberius` was chosen for the property in 11.3 (pure Rust, nothing to
@@ -1743,7 +1753,7 @@ around the typed plan and its checksum.
 | Apply organization-specific safety rules | Built-in validation cannot express local naming, size or change-window rules | A declarative `policies:` block selects built-in rules and severities. Suppression requires a rule id, a reason and an optional expiry; no embedded code in v1 (14.3). `validate --since` evaluates only changed objects, so a large estate can adopt it gradually. The block is a new format surface and gets an ADR before it is built, as reference data and roles did | **P1** |
 | Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
 | Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
-| Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed. A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
+| Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed — delivered in [CI.md](CI.md). A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet, keeping the existing split: `Change::intrinsic_risks()` for what needs no dialect, dialect-computed findings attached to `PlannedChange::risks`. Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
 | Wire pbps into a pipeline that stays upgradeable | The documented pipelines of 10 are copy-pasted, and a copy cannot be upgraded — the same objection that rules out a generator | A first-party, versioned CI component (a GitHub Action, a GitLab CI template) wrapping the existing commands and their exit codes. It differs from a generator in the one way that matters: it is *referenced* by version, so a fix reaches every user, and it adds no capability the CLI lacks | **P2** |
@@ -1778,10 +1788,11 @@ codes (9.8), covering `validate`, `fmt`, `plan`, `explain`, `doctor`, `verify`
 and `status`; and the interactive prompt of 6.3, which was the last part of
 "intent is recorded by a human, in git" still missing.
 
-What remains in 14.1 is P1 and P2, and belongs to the later phases: the
-`policies:` block, operational estimates, `state show / diff / export`, the
-documented pipelines, the wider analyzer catalogue, the optional UI and a
-versioned CI component.
+Phase 4 delivered the `policies:` block and the first analyzer catalogue
+([ADR-0008](ADR-0008-policies.md)), and the documented pipelines are in
+[CI.md](CI.md). What remains in 14.1 is P1 and P2, and belongs to the later
+phases: operational estimates, `state show / diff / export`, the wider analyzer
+catalogue, the optional UI and a versioned CI component.
 
 Acceptance criteria for that slice:
 
