@@ -527,7 +527,7 @@ the suite may run as root **and** runs on Windows.
   the Actions tab, which is why this reads as a GitHub fault rather than a
   configuration one. The gate reports a **commit status** instead: a status is
   addressed to a commit, not to a suite, so there is nothing left to associate
-  (DECISIONS 207).
+  (DECISIONS 206).
 - **A required job skipped by `if:` counts as passing.** GitHub treats
   `success`, `skipped` and `neutral` alike in a required check, so guarding
   an expensive job with a label or a `draft` test opens the gate instead of
