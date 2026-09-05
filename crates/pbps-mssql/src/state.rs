@@ -2,7 +2,7 @@
 //!
 //! The types and the meaning live in `pbps_db::ledger`; only the statements are
 //! here, for the same reason [`crate::catalog`]'s queries are: they are T-SQL,
-//! and Phase 4's PostgreSQL crate will need its own. Nothing in this file
+//! and Phase 5's PostgreSQL crate will need its own. Nothing in this file
 //! interpolates a user-supplied value into SQL — every one of them is bound.
 //!
 //! # Why these two tables are not part of the managed set
