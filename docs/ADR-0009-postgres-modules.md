@@ -1,6 +1,7 @@
 # ADR-0009: Modules on PostgreSQL — overloading, deparsing, and what `CREATE OR ALTER` was buying
 
-- Status: proposed. Phase 5 design; nothing is built. This decides the model
+- Status: accepted. §1 (DECISIONS 200–205) and §2.2 (DECISIONS 207–208) are
+  applied; the rest is design until the PostgreSQL crate. This decided the model
   before the dialect is written.
 - Date: 2026-09-04
 - Related: docs/SPEC.md §8.2, §12, open question 9;
@@ -1290,3 +1291,21 @@ Phase 5, ahead of the emitter. The `ModuleId` key change is a `pbps-model`
 change and therefore the most expensive kind to take late (SPEC §12, Phase 0's
 lesson) — it should land with, or before, the first PostgreSQL code, and it
 costs SQL Server nothing because the argument list is absent there.
+
+## Amendment — what landing §2.2 changed
+
+- **The declared slot falls back rather than restating by rule.** §2.2 says an
+  empty declared slot means "never applied through this tool" and the module is
+  restated once. Landed (DECISIONS 208), the differ compares against the
+  read-back wherever the record is empty: on PostgreSQL that *is* the one
+  restatement, because the read-back never equals the declaration; on SQL
+  Server, whose module text comes back verbatim, it is no change at all, which
+  is what the shipped dialect did before. One rule, two engines, no special
+  case for adoption.
+- **The three fields are one struct**, `StateSnapshot::declared`, holding the
+  module texts, the three expressions and the bindings (DECISIONS 207); a
+  version 6 state reads with it empty, rather than being refused.
+- **§2's "verbatim" claim about SQL Server holds for modules and for nothing
+  else**: every expression the engine stores is respelled (measured, DECISIONS
+  208), which ADR-0013 §4 found on PostgreSQL and its Limits guessed for SQL
+  Server. The fix for the two engines is the same field.

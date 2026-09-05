@@ -176,7 +176,14 @@ landed with them (DECISIONS 200–203): a module is keyed by a typed `ModuleId`,
 namespace sharing and overloading are dialect questions, and the state snapshot
 and the saved plan bumped to 6 and 5 — every older snapshot refused, because
 the meaning of the module map changed and a partial reading of it would be a
-silent wrong answer.
+silent wrong answer. So has the declared record of ADR-0009 §2.2 and ADR-0013
+§3–§4 (DECISIONS 207–209): the state keeps what each object was declared as
+beside what it read back, the differ compares declared against declared and
+falls back to the read-back where nothing was recorded, and the snapshot is 7
+with 6 still readable. That fixed a shipped loop on SQL Server — a check or a
+filtered index restated on every connected plan — and left the bindings'
+recording, which needs a search path, to the PostgreSQL crate. The permission
+widening of ADR-0010 is the model step still open.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

@@ -2931,6 +2931,9 @@ pub fn cmd_bootstrap(
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, ids.clone(), &operator),
             );
             snapshot.module_deps = loaded.hints.module_deps.clone();
+            // Every object was created from these declarations, so what was
+            // declared is exactly what bootstrap holds (ADR-0009 §2.2).
+            snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
             let id = pbps_mssql::state::record(&mut conn, &snapshot).await?;
             Ok::<_, anyhow::Error>((id, snapshot))
         }
@@ -3230,6 +3233,15 @@ pub fn cmd_plan_db(
             &recorded_data,
             &declared_live,
         )?;
+        // The engine respells every expression and module body it stores —
+        // measured on SQL Server, a check declared `n > 0` reads back
+        // `([n]>(0))` — so compared against the read-back an unchanged check
+        // was dropped and re-added, and an unchanged filtered index rebuilt,
+        // on every connected plan. The differ compares the declarations
+        // against what was *declared* when each object was last written,
+        // where the ledger recorded it (ADR-0009 §2.2, ADR-0013 §4,
+        // DECISIONS 207–208).
+        let base = entry.snapshot.declared.overlay(&base);
         // A removed module no longer has a declaration carrying its
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.
@@ -3955,6 +3967,10 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         snapshot.module_deps = plan.module_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
+        // What the previous state declared, advanced by what this plan wrote:
+        // from the plan alone, since `apply --plan` needs nothing else.
+        snapshot.declared = entry.snapshot.declared.clone();
+        snapshot.declared.advance(&plan.changes);
         Ok::<_, anyhow::Error>(pbps_mssql::state::record(conn, &snapshot).await?)
     }
     .await;
@@ -4226,6 +4242,11 @@ async fn apply_staged_under_lock(
             operator,
         );
         checkpoint.module_deps = module_deps;
+        // A checkpoint records the database as it stands, and what was
+        // declared is what the previous state said until the plan finishes:
+        // the closing entry advances it by the whole plan, and nothing plans
+        // against a checkpoint (`refuse_mid_deployment`).
+        checkpoint.declared = entry.snapshot.declared.clone();
         checkpoint.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         checkpoint.plan_checksum = Some(plan_checksum.to_owned());
         checkpoint.staged = Some(pbps_model::StagedProgress {
@@ -4291,6 +4312,10 @@ async fn apply_staged_under_lock(
     snapshot.module_deps = plan.module_deps.clone();
     snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
+    // What the previous state declared, advanced by what this plan wrote: from
+    // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
+    snapshot.declared = entry.snapshot.declared.clone();
+    snapshot.declared.advance(&plan.changes);
     Ok(pbps_mssql::state::record(conn, &snapshot).await?)
 }
 

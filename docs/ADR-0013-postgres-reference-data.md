@@ -1575,17 +1575,19 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
   `NOTIFY`, or writes a file is not stopped by it and is not stopped by anything
   else pbps can do. The guard is exact for the failure that was found and
   honest about the one it does not cover.
-- **§4's expression-comparison finding is not measured against SQL Server.** The
-  differ is shared, and all three expressions are read raw with no normalizer
-  anywhere in the workspace: `sys.default_constraints.definition`
-  (`catalog.rs:189`), `sys.check_constraints.definition` (`catalog.rs:71`) and
-  `sys.indexes.filter_definition` (`catalog.rs:229`). The same comparisons run
-  on both engines, so the same loops may already exist on the shipped dialect —
-  and the check and filter ones cost a revalidation and an index rebuild per
-  plan, not just a restated `ALTER`. That is a *reasoned* worry, not an
-  observation: nothing here ran it. It wants one live check on SQL Server, and
-  it is the fourth item in this design pass to point at shipped code rather than
-  at Phase 5.
+- **§4's expression-comparison finding was, when this was written, not measured
+  against SQL Server.** The differ is shared, and all three expressions are read
+  raw with no normalizer anywhere in the workspace, so the same loops could
+  exist on the shipped dialect. **Since measured, while landing §4's fields
+  (DECISIONS 208): they did.** SQL Server reads `GETDATE()` back as
+  `(getdate())` and `n > 0 AND label <> 'none'` as `([n]>(0) AND
+  [label]<>'none')`, and `plan --db` straight after a `bootstrap` restated the
+  default, dropped and re-added the check and dropped and rebuilt the filtered
+  index — marked destructive — on every run. The fix is the one §4 asks for,
+  with one refinement: where no declared text was recorded the differ falls back
+  to the read-back, so an adopted environment behaves as it did and a version 6
+  state stays readable. The live suite pins it
+  (`a_declared_expression_the_engine_respells_is_not_restated`).
 - **A typed literal inside a check expression or an index filter is folded
   under the operator's settings** — measured, `CHECK (d > '01/02/2026')`
   created under DMY is stored as `'2026-02-01'::date` — and §3's resolution

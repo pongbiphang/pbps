@@ -6,6 +6,7 @@
 //! remember their own state, and an environment several versions behind needs no
 //! artifact passing and no environment-mapping strategy at all.
 
+use crate::declared::Declared;
 use crate::ids::IdsFile;
 use crate::module::ModuleDeps;
 use crate::schema::Schema;
@@ -41,6 +42,11 @@ use crate::schema::Schema;
 /// re-recorded — the project is pre-release and a baseline is one command
 /// (DECISIONS 145).
 ///
+/// Bumped to 7 when the state gained [`Declared`]: what each managed object
+/// was declared as when last written, beside what the engine read back
+/// (ADR-0009 §2.2, ADR-0013 §3–§4). A version 6 state stays readable, with
+/// the field empty — see `OLDEST_READABLE_VERSION`.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -59,12 +65,16 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 6;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// The oldest snapshot version this build reads as its own.
 ///
 /// 6, not 4: the module key's meaning changed under the same spelling, so
-/// there is no reading of an older snapshot that is merely incomplete.
+/// there is no reading of an older snapshot that is merely incomplete. And 6,
+/// not 7: version 7 adds what was *declared* beside the read-back, and a
+/// version 6 state recorded none of it — so "nothing declared here" is what
+/// that state truly says, and the differ falls back to the read-back it always
+/// compared (DECISIONS 207, the same rule that keeps 4 readable).
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -163,6 +173,16 @@ pub struct StateSnapshot {
     /// it is never written on any other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged: Option<StagedProgress>,
+
+    /// What was declared when each managed object was last written through
+    /// this tool — module text, the three verbatim expressions, and the
+    /// bindings — beside the schema read back (ADR-0009 §2.2, ADR-0013 §3–§4).
+    /// Empty for a baseline or a snapshot, which record the database as it
+    /// stands and applied nothing; and empty in a version 6 state, which
+    /// recorded none, so reading one as empty is a *true* reading (DECISIONS
+    /// 207).
+    #[serde(default, skip_serializing_if = "Declared::is_empty")]
+    pub declared: Declared,
 }
 
 /// How far a staged apply has got (ADR-0003 decision 2).
@@ -208,6 +228,7 @@ impl StateSnapshot {
             operator: operator.into(),
             reason: None,
             staged: None,
+            declared: Declared::default(),
         }
     }
 
@@ -305,10 +326,12 @@ mod tests {
     /// `app.audit` with its table in a field beside it; this build reads that
     /// key as a view and has nowhere to put the table (ADR-0009 §1). "No
     /// modules of that shape" is not a true reading of such a snapshot, it is
-    /// a missing one, so the remedy is to re-record (DECISIONS 145, 200).
+    /// a missing one, so the remedy is to re-record (DECISIONS 145, 203).
+    /// Version 6 is the exception the sibling test pins: it recorded nothing
+    /// as declared, and reading it so is true (DECISIONS 207).
     #[test]
     fn a_snapshot_from_before_module_identity_is_refused_with_its_remedy() {
-        for version in 1..CURRENT_VERSION {
+        for version in 1..OLDEST_READABLE_VERSION {
             let mut snap = StateSnapshot::new(
                 StateKind::Apply,
                 Schema::default(),
@@ -322,9 +345,11 @@ mod tests {
             assert!(e.contains("older pbps"), "version {version}: {e}");
             assert!(e.contains("pbps baseline"), "version {version}: {e}");
         }
-        // Nothing older is readable, which is what makes the loop above the
-        // whole story rather than a sample of it.
-        assert_eq!(OLDEST_READABLE_VERSION, CURRENT_VERSION);
+        // Nothing older than 6 is readable, which is what makes the loop above
+        // the whole story rather than a sample of it; 6 is readable because
+        // the field 7 added is one it truly lacks.
+        assert_eq!(OLDEST_READABLE_VERSION, 6);
+        assert_eq!(CURRENT_VERSION, 7);
     }
 
     fn schema_with(ty: &str) -> Schema {
@@ -442,6 +467,85 @@ mod tests {
     /// A staged checkpoint is what tells every other command that this
     /// environment is mid-deployment, so the marker has to survive the round
     /// trip through `state_json` intact.
+    /// The declared record rides in the snapshot's JSON and comes back equal:
+    /// module text, all three expressions and a binding. A snapshot that
+    /// declares nothing writes no `declared` key at all, so a baseline's JSON
+    /// is what it was.
+    #[test]
+    fn the_declared_record_round_trips_through_json_and_is_absent_when_empty() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert!(!serde_json::to_string(&snap).unwrap().contains("declared"));
+        let t: TableName = "dbo.t".parse().unwrap();
+        snap.declared
+            .modules
+            .insert("dbo.v".parse().unwrap(), "SELECT 1".to_owned());
+        snap.declared
+            .expressions
+            .defaults
+            .entry(t.clone())
+            .or_default()
+            .insert("n".to_owned(), "GETDATE()".to_owned());
+        snap.declared
+            .expressions
+            .checks
+            .entry(t.clone())
+            .or_default()
+            .insert("ck".to_owned(), "n > 0".to_owned());
+        snap.declared
+            .expressions
+            .filters
+            .entry(t.clone())
+            .or_default()
+            .insert("ix".to_owned(), "n > 0 AND label <> 'none'".to_owned());
+        snap.declared.bindings.modules.insert(
+            "dbo.v".parse().unwrap(),
+            crate::declared::Binding {
+                candidates: [(
+                    "helper".to_owned(),
+                    [
+                        "app.helper(integer)".to_owned(),
+                        "app.helper(text)".to_owned(),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"declared\""), "{json}");
+        let back: StateSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        assert_eq!(back.version, 7);
+    }
+
+    /// A version 6 state recorded nothing as declared, so reading it with the
+    /// record empty says exactly what that state says — the same rule that
+    /// keeps version 4 readable (DECISIONS 160, 207). A newer or older-than-6
+    /// state is still refused.
+    #[test]
+    fn a_version_6_state_reads_with_nothing_declared() {
+        let json = r#"{"version":6,"kind":"apply","schema":{"tables":{"dbo.t":{"columns":{"n":{"type":"int","nullable":true,"default":"((0))"}}}}},"ids":{"version":1,"tables":{},"columns":{}},"operator":"leon"}"#;
+        let snap: StateSnapshot = serde_json::from_str(json).expect("a version 6 state parses");
+        assert!(snap.check_version().is_ok());
+        assert!(snap.declared.is_empty());
+        assert_eq!(
+            snap.schema.tables[&"dbo.t".parse::<TableName>().unwrap()].columns["n"]
+                .default
+                .as_deref(),
+            Some("((0))")
+        );
+        let newer: StateSnapshot =
+            serde_json::from_str(&json.replace("\"version\":6", "\"version\":8")).unwrap();
+        assert!(newer.check_version().unwrap_err().contains("newer pbps"));
+    }
+
     #[test]
     fn a_staged_checkpoint_carries_its_progress_through_json() {
         let mut snap = StateSnapshot::new(

@@ -48,6 +48,11 @@ pub struct Baseline {
     /// fail on declarations that were always valid. A baseline read from a state
     /// file has none: a snapshot records the database, and hints are not in it.
     pub hints: pbps_model::Hints,
+    /// What the baseline's objects were declared as when last written, where
+    /// the baseline is a recorded state (ADR-0009 §2.2, ADR-0013 §4). A git
+    /// baseline *is* declarations, so it records nothing here and is compared
+    /// as it is.
+    pub declared: pbps_model::Declared,
     pub description: String,
     /// An empty baseline has to be flagged, or "everything is new" reads as a
     /// real plan.
@@ -73,6 +78,7 @@ pub fn load(
                 schema: snap.schema,
                 ids: snap.ids,
                 hints: pbps_model::Hints::default(),
+                declared: snap.declared,
                 description: format!("baseline file {}", path.display()),
                 is_empty_fallback: false,
             })
@@ -82,6 +88,7 @@ pub fn load(
             schema: Schema::default(),
             ids: IdsFile::default(),
             hints: pbps_model::Hints::default(),
+            declared: pbps_model::Declared::default(),
             description: "empty baseline".into(),
             is_empty_fallback: true,
         }),
@@ -285,6 +292,7 @@ fn load_from_git(
             schema: Schema::default(),
             ids: IdsFile::default(),
             hints: pbps_model::Hints::default(),
+            declared: pbps_model::Declared::default(),
             description: format!(
                 "empty baseline (`{rev}` does not exist yet; this repo has no commits)"
             ),
@@ -363,6 +371,7 @@ fn load_from_git(
         schema,
         ids,
         hints,
+        declared: pbps_model::Declared::default(),
         description: format!("git {rev} ({count} objects)"),
         is_empty_fallback: count == 0,
     })
