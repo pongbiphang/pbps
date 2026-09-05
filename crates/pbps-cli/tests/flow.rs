@@ -3200,6 +3200,74 @@ fn a_plan_touching_tables_and_modules_counts_them_separately() {
     assert!(out.contains("1 table(s) and 1 module(s)"), "{out}");
 }
 
+/// A rename answers for the old name and the changes that follow it in the
+/// same plan for the new one; counted as they come, one table read as two
+/// in the summary line and in the JSON count. Here the renamed table also
+/// gains a column.
+#[test]
+fn a_renamed_table_that_also_changes_counts_once() {
+    let d = Demo::new("renamecount");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table(
+        "table: dbo.u\nrenamed_from: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
+    );
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("rename table dbo.t -> dbo.u"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        stdout(&o).contains("2 change(s) across 1 table(s)"),
+        "{}",
+        stdout(&o)
+    );
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["changes"], 2, "{v}");
+    assert_eq!(v["data"]["tables"], 1, "{v}");
+}
+
+/// The same shape for a role: `RenameRole` answers for the old name, the
+/// `Grant` that widens it in the same plan for the new one.
+#[test]
+fn a_renamed_role_whose_grants_also_change_counts_once() {
+    let d = Demo::new("rolerenamecount");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
+    d.files(&[(
+        "reader.role.yml",
+        "role: reader\ngrants:\n  dbo.customer: [select, insert]\n",
+    )]);
+    assert_eq!(code(&d.run(&["rename-role", "app_reader", "reader"])), 0);
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("rename role app_reader -> reader"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        stdout(&o).contains("2 change(s) across 1 role(s)"),
+        "{}",
+        stdout(&o)
+    );
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"]["changes"], 2, "{v}");
+    assert_eq!(v["data"]["roles"], 1, "{v}");
+}
+
 /// `verify` could not answer, so it must say so through the envelope like every
 /// other read-only command — not leave stdout empty for the converter to
 /// report as its own generic failure.
