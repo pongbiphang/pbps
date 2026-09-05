@@ -226,7 +226,18 @@ locked-copy `update-index` ran it), so every `git` also takes
 1. It records the branch `HEAD` is symbolic to and its tip (`git
    symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and the
    remote's tip for that branch, under the rules below. It requires each path
-   it is about to edit to be a regular file or absent — never a symlink:
+   it is about to edit to still hold what the page was shown: the page's
+   request carries the blob id of the file it read, step 1 hashes the file
+   as it is now (`git hash-object --no-filters -- <path>`, no `-w`) and
+   refuses if the two differ — the locks stop `git`, not an editor saving
+   the same file, and the browser's copy would otherwise overwrite newer
+   work (**measured**: the page's id and the id after an editor's save
+   differed). It requires the path to carry no `filter` attribute (`git
+   check-attr filter -- <path>` must answer `unspecified`): a clean filter
+   is a program neither `core.hooksPath` nor `core.fsmonitor` reaches, and
+   a blob stored around it leaves `git status` reporting the path modified
+   the moment it is committed, since `git` compares through the filter. It
+   requires the path to be a regular file or absent — never a symlink:
    `git hash-object` follows a link and hashes the target's content
    (**measured**: the link `a` hashed as `a`'s content, where `git add`
    stores the link text at mode `120000`), so a linked declaration file
@@ -382,36 +393,32 @@ showing the unpushed commits and the commands instead: a refspec bounds the
 destination ref, not the range, and **measured**, a branch one unrelated
 commit ahead had that commit published under the intent commit by
 `HEAD:refs/heads/<branch>`. A branch the remote does not have yet — the first
-push of a feature branch, the common case — is not an ahead branch: the
-destination is absent rather than behind, and the check is instead that the
-tip is already on the remote, an ancestor of one of the heads `ls-remote`
-lists. That head is fetched first into a ref of the UI's own (`git fetch
---no-tags --no-write-fetch-head <push-url>
-+refs/heads/<witness>:refs/pbps-ui/witness` — the second flag so the user's
-`FETCH_HEAD` still names what the user last fetched; **measured**, it did),
-because
-`ls-remote` names an object the local repository need not have
-(**measured**: `merge-base --is-ancestor` against the bare id exited 128,
-against the fetched ref it answered). The push then names the commit by id,
-leases the destination on the tip it recorded — or on its absence, with an
-empty expected value — and, for a first push, names the witness at its
-fetched value in the same push under `--atomic`, since a lease on a ref the
-push does not name is ignored (**measured**: with the witness moved on the
-remote, the lease alone let the branch be created; the atomic push naming the
-witness was refused as stale and created nothing). `--atomic` is asked for
-only on that two-ref push: a server without atomic push support refuses the
-option outright, and the one-ref push of an existing branch has nothing to
-be atomic about. It takes `--no-verify`
+push of a feature branch, the common case — is published *before* composing,
+as its own step the page names as such: `git push <push-url>
+<tip>:refs/heads/<branch>` with an empty lease (`--force-with-lease=
+refs/heads/<branch>:`), which creates the branch at the tip the checkout
+already has and sends nothing the remote lacks when that tip is already
+there (**measured**: the branch appeared at the tip, `ls-remote` then
+equalled the local tip, and a second attempt was refused as `up-to-date`
+because the destination existed). After it the branch is an existing branch
+and the equality rule above applies unchanged. An earlier draft of this
+design proved the tip was on the remote through a "witness" head and leased
+that head in the same push; it is withdrawn because a refspec the remote
+already has at that value is dropped from the push as up to date, so the
+witness was never in the transaction it was meant to guard, and because a
+branch created at a tip the user's checkout is on is a thing the user can
+be shown and asked about, which a witness was not. The push then names the
+commit by id and leases the destination on the tip it recorded.
+It takes `--no-verify`
 as well as the empty `core.hooksPath` every `git` here gets, because a
 `pre-push` hook is a hook (**measured**: it ran without the flag and not
 with it), and `--no-follow-tags`; never a bare `git push`, which under
 `push.default=matching` advanced two branches at once when measured:
 
 ```
-git push --no-verify --no-follow-tags [--atomic] \
-    --force-with-lease=refs/heads/<branch>:<tip-or-empty> \
-    [--force-with-lease=refs/heads/<witness>:<fetched> <fetched>:refs/heads/<witness>] \
-    <remote> <oid>:refs/heads/<branch>
+git push --no-verify --no-follow-tags \
+    --force-with-lease=refs/heads/<branch>:<tip> \
+    <push-url> <oid>:refs/heads/<branch>
 ```
 
 What this gives up is stated plainly: **the user's hooks do not run for a
