@@ -193,16 +193,27 @@ check after the fact is a check too late. The rule this repository already
 holds applies — a failure that can be made unrepresentable is not to be
 checked for — and `git` has the tools to make it so.
 
-The commit is built with plumbing, which runs no hook at any point, under
-the index lock `git` itself uses, so that nothing else can touch the checkout
-while it is built:
+The commit is built with plumbing, under the index lock `git` itself uses so
+that nothing else can touch the checkout while it is built, and **every
+`git` the UI runs takes `-c core.hooksPath=<an empty directory>`**. Plumbing
+runs fewer hooks than porcelain, not none: `update-ref` runs
+`reference-transaction` and `update-index` runs `post-index-change`
+(**measured**: one of each fired, in `prepared` and `committed` phases for
+the first), and a `committed`-phase hook can push before the UI does. Rather
+than know which command runs which hook, the UI points every `git` it runs
+at a directory with no hooks in it (**measured**: the same two commands
+under that setting fired neither, and the control without it fired both).
+The steps:
 
-0. The UI takes the index lock the way `git` does: it creates
-   `.git/index.lock` exclusively, as a copy of `.git/index`, and refuses to
-   compose if the file already exists — another `git` is mid-operation. Every
-   `git` that would change the index or switch the checkout fails on that
-   file until it is gone (**measured**: `git add` and `git switch` both
-   exited 128 with `Unable to create '.git/index.lock': File exists`). The
+0. The UI takes the index lock the way `git` does: it asks where the index
+   is — `git rev-parse --git-path index`, because in a linked worktree
+   `.git` is a file and the index lives under the main repository's
+   `worktrees/<name>/` (**measured**) — creates `<index>.lock` beside it
+   exclusively, as a copy of the index, and refuses to compose if the file
+   already exists — another `git` is mid-operation. Every `git` that would
+   change the index or switch the checkout fails on that file until it is
+   gone (**measured**: `git add` and `git switch` both exited 128 with
+   `Unable to create '.git/index.lock': File exists`). The
    lock is held through step 6; on any failure it is deleted without being
    installed, and the index is as it was.
 1. It records the branch `HEAD` is symbolic to and its tip (`git
@@ -252,9 +263,9 @@ while it is built:
    the branch `HEAD` names cannot have changed since step 1 either, since a
    switch needs the lock.
 6. It writes the same entries into the locked copy of the index —
-   `GIT_INDEX_FILE=.git/index.lock git update-index --add --cacheinfo
-   <mode>,<blob>,<path>` — and installs it by renaming `.git/index.lock` to
-   `.git/index`, which is exactly the commit step of `git`'s own lock. Now
+   `GIT_INDEX_FILE=<index>.lock git update-index --add --cacheinfo
+   <mode>,<blob>,<path>` — and installs it by renaming `<index>.lock` to
+   `<index>`, which is exactly the commit step of `git`'s own lock. Now
    `git status` is clean for what the UI did and untouched for everything
    else, and the entries replaced were the tip's, as step 1 established and
    the lock preserved.
@@ -301,9 +312,10 @@ empty expected value — and, for a first push, names the witness at its
 fetched value in the same push under `--atomic`, since a lease on a ref the
 push does not name is ignored (**measured**: with the witness moved on the
 remote, the lease alone let the branch be created; the atomic push naming the
-witness was refused as stale and created nothing). It takes `--no-verify`,
-because a `pre-push` hook is a hook (**measured**: it ran without the flag and
-not with it), and `--no-follow-tags`; never a bare `git push`, which under
+witness was refused as stale and created nothing). It takes `--no-verify`
+as well as the empty `core.hooksPath` every `git` here gets, because a
+`pre-push` hook is a hook (**measured**: it ran without the flag and not
+with it), and `--no-follow-tags`; never a bare `git push`, which under
 `push.default=matching` advanced two branches at once when measured:
 
 ```
