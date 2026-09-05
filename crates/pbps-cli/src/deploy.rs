@@ -2098,18 +2098,13 @@ fn refuse_unplanned_movement(
                                 .cloned()
                                 .unwrap_or_else(|| object.clone()),
                         ),
-                        // A renamed routine keeps its signature: the rename
-                        // recorded the object, not the overload it resolves.
-                        pbps_model::GrantTarget::Routine(r) => {
-                            pbps_model::GrantTarget::Routine(pbps_model::RoutineId::new(
-                                renamed
-                                    .get(&r.name)
-                                    .copied()
-                                    .cloned()
-                                    .unwrap_or_else(|| r.name.clone()),
-                                r.args.clone(),
-                            ))
-                        }
+                        // Only tables are renamed, and a routine is not a
+                        // table — as `diff_roles` says. Where routines have a
+                        // namespace of their own, `app.f(integer)` stands
+                        // beside a table `app.f`, and forwarding the routine's
+                        // grant through the table's rename refused the apply
+                        // for a grant that had, rightly, not moved.
+                        routine @ pbps_model::GrantTarget::Routine(_) => routine.clone(),
                         schema @ pbps_model::GrantTarget::Schema(_) => schema.clone(),
                     };
                     (target, held.clone())
@@ -5041,6 +5036,73 @@ mod tests {
         assert!(e.contains("role app"), "{e}");
         let e = refuse(&revoking, &before, &before)
             .expect_err("the revoke this plan asked for did not take");
+        assert!(e.contains("role app"), "{e}");
+    }
+
+    /// A table's rename forwards the grants on the table and nothing else.
+    /// Where routines have their own namespace a routine may share the
+    /// table's name, and its grant stays where it is when the table moves;
+    /// forwarding it through the rename refused an apply that had done
+    /// exactly what the plan said.
+    #[test]
+    fn a_table_rename_does_not_forward_the_grant_on_a_routine_of_that_name() {
+        use pbps_model::{GrantTarget, Permission};
+        let routine: GrantTarget = "dbo.f(integer)".parse().unwrap();
+        let with = |table: &str, on_routine: &GrantTarget| {
+            let mut grants = BTreeMap::new();
+            grants.insert(
+                GrantTarget::Object(table.parse().unwrap()),
+                [Permission::Select].into_iter().collect::<BTreeSet<_>>(),
+            );
+            grants.insert(
+                on_routine.clone(),
+                [Permission::Execute].into_iter().collect::<BTreeSet<_>>(),
+            );
+            let mut s = Schema::default();
+            s.tables
+                .insert(table.parse().unwrap(), pbps_model::Table::default());
+            s.modules.insert(
+                "dbo.f(integer)".parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "RETURN 1".to_owned(),
+                },
+            );
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let rename = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.f".parse().unwrap(),
+                    to: "dbo.g".parse().unwrap(),
+                },
+            )],
+        };
+        let refuse = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rename,
+                &with("dbo.f", &routine),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        // The table's grant moved with the table; the routine's stayed.
+        refuse(&with("dbo.g", &routine)).expect("the routine's grant did not move");
+        // A routine grant that *did* move to the new name is movement.
+        let moved: GrantTarget = "dbo.g(integer)".parse().unwrap();
+        let e = refuse(&with("dbo.g", &moved)).expect_err("the routine's grant moved");
         assert!(e.contains("role app"), "{e}");
     }
 
