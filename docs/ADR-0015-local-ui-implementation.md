@@ -193,25 +193,43 @@ check after the fact is a check too late. The rule this repository already
 holds applies — a failure that can be made unrepresentable is not to be
 checked for — and `git` has the tools to make it so.
 
-The commit is built with plumbing, which runs no hook at any point:
+The commit is built with plumbing, which runs no hook at any point, under
+the index lock `git` itself uses, so that nothing else can touch the checkout
+while it is built:
 
-1. Before composing, the UI records the branch `HEAD` is symbolic to and its
-   tip (`git symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and
-   the remote's tip for that branch, under the rules below. It also requires
-   the user's index entry for each path it is about to edit to be the tip's
-   entry (`git ls-files -s -z -- <path>` against `git ls-tree -z <tip> --
-   <path>`), and refuses to compose otherwise, showing the staged change: a
-   path with staged content of its own is work the user has not committed,
-   and step 6 would replace it — **measured**, a version staged and a
-   different one in the working tree left the staged blob unreachable from
-   the index after the refresh, with `git status` clean.
+0. The UI takes the index lock the way `git` does: it creates
+   `.git/index.lock` exclusively, as a copy of `.git/index`, and refuses to
+   compose if the file already exists — another `git` is mid-operation. Every
+   `git` that would change the index or switch the checkout fails on that
+   file until it is gone (**measured**: `git add` and `git switch` both
+   exited 128 with `Unable to create '.git/index.lock': File exists`). The
+   lock is held through step 6; on any failure it is deleted without being
+   installed, and the index is as it was.
+1. It records the branch `HEAD` is symbolic to and its tip (`git
+   symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and the
+   remote's tip for that branch, under the rules below. It requires each path
+   it is about to edit to be a regular file or absent — never a symlink:
+   `git hash-object` follows a link and hashes the target's content
+   (**measured**: the link `a` hashed as `a`'s content, where `git add`
+   stores the link text at mode `120000`), so a linked declaration file
+   would commit its contents as a link's destination. And it requires the
+   index entry for each path to be the tip's entry (`git ls-files -s -z --
+   <path>` against `git ls-tree -z <tip> -- <path>`), refusing otherwise and
+   showing the staged change: staged content of the user's own is work not
+   yet committed, and step 6 would replace it (**measured**: a version
+   staged and a different one in the working tree left the staged blob
+   unreachable from the index after the refresh, with `git status` clean).
+   Under the lock, what step 1 saw is what step 6 finds.
 2. It writes the edited files, and stores each as a blob:
    `git hash-object -w -- <path>`.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
-   tree, replaces the entry for each edited path with that blob at the mode
-   the path had at the tip — `100644` for a new one — and writes the tree:
-   `git read-tree <tip>`, `git update-index --cacheinfo <mode>,<blob>,<path>`,
-   `git write-tree`. The user's own index is never read and never changed.
+   tree, sets the entry for each edited path to that blob at the mode the
+   path had at the tip — `100644` for a new one — and writes the tree:
+   `git read-tree <tip>`, `git update-index --add --cacheinfo
+   <mode>,<blob>,<path>`, `git write-tree`. `--add` because a new path is not
+   in the tree that was read (**measured**: without it, `cannot add to the
+   index - missing --add option?`, exit 128). The user's own index is not
+   read here.
 4. It makes the commit from that tree, on that parent, with that message:
    `git commit-tree <tree> -p <tip> -m <message>`. The commit is what was
    previewed *by construction* — those paths, those blobs, that parent, that
@@ -228,22 +246,28 @@ The commit is built with plumbing, which runs no hook at any point:
    a machine without a key, and so does the shell's.
 5. It moves the branch to the commit only if the branch is still where it
    was: `git update-ref refs/heads/<branch> <oid> <tip>`, a compare-and-swap
-   that refuses if anything moved the branch in between, and the one step
-   that changes the checkout.
-6. It refreshes the user's index for the edited paths with the same
-   `--cacheinfo`, so `git status` is clean for what the UI did and untouched
-   for everything else — safe because step 1 established that each of those
-   entries was the tip's and held nothing of the user's.
+   that refuses if anything moved the branch in between (ref locks are not
+   the index lock; **measured**, the update went through with the index lock
+   held), and the one step that changes the checkout. Under the index lock
+   the branch `HEAD` names cannot have changed since step 1 either, since a
+   switch needs the lock.
+6. It writes the same entries into the locked copy of the index —
+   `GIT_INDEX_FILE=.git/index.lock git update-index --add --cacheinfo
+   <mode>,<blob>,<path>` — and installs it by renaming `.git/index.lock` to
+   `.git/index`, which is exactly the commit step of `git`'s own lock. Now
+   `git status` is clean for what the UI did and untouched for everything
+   else, and the entries replaced were the tip's, as step 1 established and
+   the lock preserved.
 
-**Measured** on git 2.43, with the staging, pushing and pre-push hooks all
-installed: `commit-tree` made a commit holding `a` alone with the message
-intact, the remote did not move, and no hook ran; `update-ref` with a stale
-expected value refused with `is at <x> but expected <tip>` and left the
+**Measured** on git 2.43, with staging, message-editing, pushing and pre-push
+hooks all installed: `commit-tree` made a commit holding `a` alone with the
+message intact, the remote did not move, and no hook ran; `update-ref` with a
+stale expected value refused with `is at <x> but expected <tip>` and left the
 branch where it was, and with the recorded one moved it, leaving `HEAD`
-symbolic to it; and after the `--cacheinfo` refresh `git status` was clean.
-The race the porcelain route needed a parent check and a branch check for —
-another process moving or switching the branch between the record and the
-commit — is closed by step 5 alone.
+symbolic to it; the write through the held lock and the rename left `git
+status` clean. The races the porcelain route needed a parent check and a
+branch check for — another process moving or switching the branch between the
+record and the commit — are closed by the lock and the compare-and-swap.
 
 The preview is `git diff --no-ext-diff --no-textconv <tip> <tree>`: the
 recorded tip against the tree the UI built, exact by construction, and
