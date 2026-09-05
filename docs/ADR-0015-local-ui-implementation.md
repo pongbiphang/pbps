@@ -197,7 +197,14 @@ The commit is built with plumbing, which runs no hook at any point:
 
 1. Before composing, the UI records the branch `HEAD` is symbolic to and its
    tip (`git symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and
-   the remote's tip for that branch, under the rules below.
+   the remote's tip for that branch, under the rules below. It also requires
+   the user's index entry for each path it is about to edit to be the tip's
+   entry (`git ls-files -s -z -- <path>` against `git ls-tree -z <tip> --
+   <path>`), and refuses to compose otherwise, showing the staged change: a
+   path with staged content of its own is work the user has not committed,
+   and step 6 would replace it — **measured**, a version staged and a
+   different one in the working tree left the staged blob unreachable from
+   the index after the refresh, with `git status` clean.
 2. It writes the edited files, and stores each as a blob:
    `git hash-object -w -- <path>`.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
@@ -209,18 +216,24 @@ The commit is built with plumbing, which runs no hook at any point:
    `git commit-tree <tree> -p <tip> -m <message>`. The commit is what was
    previewed *by construction* — those paths, those blobs, that parent, that
    message — and there is nothing to read back. It is signed exactly when the
-   shell's would be: `commit-tree` honours `commit.gpgSign`, the UI passes
-   no `-S`, and the page shows `git log -1 --format=%G? <oid>`. ADR-0006's
+   shell's would be, and that takes one step porcelain does by itself:
+   `commit-tree` does *not* read `commit.gpgSign` (**measured**: with it set
+   and a key that cannot sign, `git commit` failed, `commit-tree` succeeded
+   unsigned, and `commit-tree -S` failed the way `git commit` had), so the
+   UI reads `git config --type=bool commit.gpgSign` and passes `-S` when it
+   is true, leaving the key, the format and the program to the user's
+   configuration. The page shows `git log -1 --format=%G? <oid>`. ADR-0006's
    "signed commit" is the organization's signing policy applied by the user's
    configuration, not a guarantee this UI adds — a forced signature fails on
-   a machine without a key.
+   a machine without a key, and so does the shell's.
 5. It moves the branch to the commit only if the branch is still where it
    was: `git update-ref refs/heads/<branch> <oid> <tip>`, a compare-and-swap
    that refuses if anything moved the branch in between, and the one step
    that changes the checkout.
 6. It refreshes the user's index for the edited paths with the same
    `--cacheinfo`, so `git status` is clean for what the UI did and untouched
-   for everything else.
+   for everything else — safe because step 1 established that each of those
+   entries was the tip's and held nothing of the user's.
 
 **Measured** on git 2.43, with the staging, pushing and pre-push hooks all
 installed: `commit-tree` made a commit holding `a` alone with the message
