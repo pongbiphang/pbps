@@ -466,7 +466,8 @@ pinned on the session, and not wrapped around the writes at all.**
   offline**: a quoted value on a `date`, `time`, **`timetz`**, `timestamp`,
   `timestamptz`, `interval`, `real` or `double precision` column is refused by an
   offline `bootstrap --sql`, naming the connected form as the way to get a script that
-  includes rows. Every other value renders as before. That costs the DR script
+  includes rows — and so, since §3, is a plain-literal *default* on one of those
+  columns, for the same reason. Every other value renders as before. That costs the DR script
   its reference data for those columns specifically, and saying so is better
   than emitting a script that stores January in one environment and February in
   another.
@@ -598,10 +599,80 @@ pinned on the session, and not wrapped around the writes at all.**
     default is refused unless that default is a plain literal — a quoted string
     or a number-shaped scalar, the distinction `pbps fmt` already draws over
     scalars and not an expression parse. The message names the fix, which is to
-    declare the value. Where the default *is* a literal there is nothing that
-    can move between plan and apply, so the earlier half of this decision —
-    write the value rather than omitting the column — applies there and only
-    there.
+    declare the value. Where the default *is* a literal, the earlier half of
+    this decision — write the value rather than omitting the column — applies,
+    and the value comes from the conversion below.
+
+    **"Where the default is a literal, nothing can move between plan and
+    apply" was the first version of that sentence, and it is wrong by one
+    step.** A quoted literal is setting-independent as *text*. The column's type
+    reads it, and it reads it in the session that runs the DDL — this document's
+    own §3 measured `DEFAULT '01/02/2026'` storing two dates under two
+    `DateStyle`s, and then exempted the literal anyway. **Measured**, end to
+    end, the way the rule would have run it:
+
+    ```
+    DEFAULT '01/02/2026' on a date column, created under DMY, as the catalog spells it:  '2026-02-01'::date
+    the declared text baked under MDY, the default created under DMY: cell vs default:  2026-01-02 vs '2026-02-01'::date
+    whether the next plan schedules an update for that row:                              yes
+    ```
+
+    The probe read the declared text in the planning session; the DDL typed the
+    same text in the applying one; the row pbps wrote disagrees with the default
+    it created beside it; and the assertion, kept only for the unprobeable path,
+    is not there to see it. The same fold happens to a `timestamptz` default
+    naming an abbreviation — fifteen and a half hours between the `Default` and
+    `Australia` dictionaries — and once a default *exists* typed, the session is
+    out of it:
+
+    ```
+    a row omitting that cell under MDY, once the default exists typed:  2026-02-01
+    ```
+
+    So the hazard lives in exactly one place: the DDL that types the literal,
+    which is the DDL this plan emits. This is §2's backslash finding reflected —
+    there, a value depended on a setting its type did not; here, a literal
+    depends on a setting through its type.
+
+    Two fixes were on the table: keep the settings assertion for typed literals
+    too, or canonicalize the structural default before emitting its DDL. The
+    second makes the failure unrepresentable and is machinery §2 already has,
+    so it is the one taken. **Decision.** A plain-literal `Column::default` on a
+    column whose type is on §2's setting-sensitive list is **resolved by the
+    engine at plan time under the canonical settings** — the same conversion §2
+    applies to a `data:` value — and the DDL carries the resolved, typed
+    spelling, which is measured setting-independent at creation:
+
+    ```
+    DEFAULT DATE '2026-01-02' created under DMY, as the catalog spells it:  '2026-01-02'::date
+    ```
+
+    The omitted cell over that default is written with the same resolved value
+    from the same conversion, so there is no probe on this path and nothing left
+    for an assertion to cover; the plan carries the resolved spelling as it
+    carries a canonicalized data value, under the checksum. The state keeps the
+    declared text and the differ compares it (§4); the resolved spelling is what
+    runs. Two consequences follow, and both are already the rule for data
+    values:
+
+    - A spelling the canonical settings cannot read is refused at `plan --db`,
+      naming the unambiguous one. **Measured**, `'01/02/2026'` under `ISO, YMD`
+      is *refused* — `date/time field value out of range` — which is the right
+      answer: the declaration was ambiguous, and the operator's `DateStyle` was
+      the only thing deciding it.
+    - Offline `bootstrap --sql` has nobody to ask, so §2's refusal of a quoted
+      value on those column types applies to a literal *default* on them too,
+      naming the connected form. That costs the DR script a column where §2's
+      version cost it a row, and the alternative is a script whose defaults
+      mean January in one environment and February in another — the exact
+      thing §2 refused to emit for rows.
+
+    What this does not reach is a typed literal *inside* a check expression or
+    an index filter. **Measured**, `CHECK (d > '01/02/2026')` created under
+    DMY is stored as `CHECK ((d > '2026-02-01'::date))`, and the filter the
+    same way — but those are expressions, not scalars, and resolving one means
+    parsing it. They are created under the operator's settings like every
+    opaque definition, and the gap is recorded in Limits rather than hidden.
 
     This shrinks what the assertion below has to cover but does not remove it:
     DECISIONS 117's unprobeable-default path and the settings under which pbps's
@@ -1161,12 +1232,39 @@ reads deterministic would have made them depend on the declarations.
   rebuild is loud, recorded in the plan, and gated; the alternative is an
   environment that quietly stops matching `bootstrap`.
 
+  **And the catalog it is asked of is the one this plan will leave, not the one
+  it found.** A first version asked the live catalog, and the live catalog
+  cannot contain what the plan is about to create. **Measured**, with an
+  existing view bound to `wb.helper` and a plan that adds `wa.helper()` earlier
+  on its path:
+
+  ```
+  the shadow test, asked of the catalog before the plan creates wa.helper():  none
+  the view after that plan applied with no rebuild scheduled:                 wb
+  a bootstrap of the same declaration, wa.helper() created first:             wa
+  the same test asked of the catalog after apply, one plan late:              wa.helper
+  ```
+
+  The divergence this test exists to expose is produced by the apply the test
+  cleared, and reported by the next one — after any bootstrap of the revision
+  in between has already disagreed with the environment. The plan's typed
+  `ChangeSet` knows every name it will create or move — a module's declared
+  kind and schema, a table's — so the candidate set is the catalog **minus what
+  the plan drops, plus what it creates and the destinations of what it
+  renames**, still without parsing anything. The rebuild it then schedules is
+  ranked after the change that introduces the shadow, which is the position
+  ADR-0002's name scan gives the same object in a bootstrap. This is the mirror
+  of a shape master's own review found (`c9157f4`: the catalog asked about
+  names the plan had not yet given it); both sides of "which catalog" fail
+  quietly.
+
   A changed path string is then one way to reach the same conclusion rather than
   the definition of it. This is the fifth instance on this branch of the shape
   ADR-0009 collects: **a rule built on a cheap proxy for the real property** —
   and the first where the proxy was introduced by a fix for an earlier instance
   of the same shape. The sixth followed immediately: replacing the proxy with a
-  comparison whose other half did not exist.
+  comparison whose other half did not exist. The seventh is above: the right
+  comparison, asked of the wrong catalog.
 
   **For an opaque body there is no such record, and the divergence runs the
   other way.** A `plpgsql` function re-resolves its unqualified names when it
@@ -1352,12 +1450,12 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation (§3); and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact — and so does a plain-literal default on a setting-sensitive column, emitted as the resolved typed spelling, because the DDL that types a literal is where a session reads it (§3); the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is asked of the catalog **as this plan will leave it** — minus what it drops, plus what it creates and the destinations of what it renames, since a shadow the same plan introduces is otherwise found one plan late — is a same-named object of the same catalog class then earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
-| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value. The plan still records the probed settings and `apply` asserts them, for DECISIONS 117's unprobeable path |
+| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value — resolved under the canonical settings at plan time when the column's type is setting-sensitive, the one conversion feeding both the cell and the default's DDL, so that path has no probe and needs no assertion. The plan still records the probed settings and `apply` asserts them, for DECISIONS 117's unprobeable path |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
-| A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
+| A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. A plain-literal default on a setting-sensitive column is additionally *emitted* resolved (§3); the declared text is still what the differ compares. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
 | `validate` | One rule: an identity-keyed `data:` block is **refused** (§2), naming the sequence and the two ways forward. The key-collision rule moves to `plan --db` — see below |
 | `plan --db` | The key-collision check (§5). `cmd_validate` is offline and the collation lives on the live column, which this ADR keeps out of `pbps-model`, so offline `validate` cannot answer it — and under a nondeterministic collation it would answer *wrongly*, accepting keys whose inserts collide. It says it did not check rather than reporting clean (§9.1: offline is a preview) |
@@ -1382,6 +1480,13 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
   observation: nothing here ran it. It wants one live check on SQL Server, and
   it is the fourth item in this design pass to point at shipped code rather than
   at Phase 5.
+- **A typed literal inside a check expression or an index filter is folded
+  under the operator's settings** — measured, `CHECK (d > '01/02/2026')`
+  created under DMY is stored as `'2026-02-01'::date` — and §3's resolution
+  does not reach it, because it is an expression and resolving one means
+  parsing it. Two operators with different `DateStyle` get two constraints from
+  one declaration, and §4's declared-text comparison cannot see it. This is the
+  opaque-DDL rule's stated gap arriving in a shape the model does hold.
 - **Nondeterministic collations are now measured** (§5), and the flag turned out
   not to mean what this document first assumed.
 - **Everything here is proposed**, and falsifiable by the PostgreSQL live suite.

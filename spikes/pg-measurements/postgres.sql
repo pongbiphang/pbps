@@ -1410,6 +1410,76 @@ SELECT 'R128', 'the stored cell against the default evaluated again on the next 
   CASE WHEN :'s1' = clock_timestamp()::text THEN 'equal'
        ELSE 'different, so the next plan schedules another update' END;
 
+-- -------------------------- the forty-fourth 2026-09-05 review round
+
+-- A quoted literal is setting-independent as text and not once the column's
+-- type reads it: the DDL that creates the default is where it gets typed.
+CREATE SCHEMA dd;
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d1 (id int, d date DEFAULT '01/02/2026');
+SELECT 'R129', 'DEFAULT ''01/02/2026'' on a date column, created under DMY, as the catalog spells it',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d1'::regclass);
+SET DateStyle = 'ISO, MDY';
+INSERT INTO dd.d1 (id) VALUES (1);
+SELECT 'R130', 'a row omitting that cell under MDY, once the default exists typed',
+  (SELECT d::text FROM dd.d1 WHERE id = 1);
+-- The same-plan case: the probe reads the declared text in the planning
+-- session, the DDL types it in the applying one.
+SET DateStyle = 'ISO, MDY';
+SELECT ('01/02/2026'::text)::date::text AS baked \gset
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d2 (id int, d date DEFAULT '01/02/2026');
+INSERT INTO dd.d2 (id, d) VALUES (1, :'baked');
+SELECT 'R131', 'the declared text baked under MDY, the default created under DMY: cell vs default',
+  (SELECT d::text FROM dd.d2) || ' vs ' || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d2'::regclass);
+SELECT 'R132', 'whether the next plan schedules an update for that row',
+  CASE WHEN (SELECT d FROM dd.d2) = '01/02/2026'::date THEN 'no' ELSE 'yes' END;
+-- What the canonical settings do with the ambiguous spelling, and what a
+-- resolved literal does under the operator's.
+SET DateStyle = 'ISO, YMD';
+SELECT 'R133', '''01/02/2026'' read under the canonical ISO, YMD',
+  m.accepts($q$SELECT ('01/02/2026'::text)::date$q$);
+SET DateStyle = 'ISO, DMY';
+CREATE TABLE dd.d3 (id int, d date DEFAULT DATE '2026-01-02');
+SELECT 'R134', 'DEFAULT DATE ''2026-01-02'' created under DMY, as the catalog spells it',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d3'::regclass);
+CREATE TABLE dd.d4 (id int, d date, CHECK (d > '01/02/2026'));
+CREATE INDEX d4i ON dd.d4 (id) WHERE d > '01/02/2026';
+SELECT 'R135', 'a check expression and an index filter carrying the same text, created under DMY',
+  (SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'dd.d4'::regclass)
+  || ' / ' || (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'dd.d4i'::regclass);
+RESET DateStyle;
+SET timezone_abbreviations = 'Default';
+CREATE TABLE dd.d5 (id int, t timestamptz DEFAULT '2026-01-15 12:00:00 CST');
+SET timezone_abbreviations = 'Australia';
+CREATE TABLE dd.d6 (id int, t timestamptz DEFAULT '2026-01-15 12:00:00 CST');
+RESET timezone_abbreviations;
+SELECT 'R136', 'a timestamptz default naming an abbreviation, created under Default and under Australia',
+  (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d5'::regclass)
+  || ' / ' || (SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'dd.d6'::regclass);
+DROP SCHEMA dd CASCADE;
+
+-- The shadow test asked of the catalog cannot see an object the same plan
+-- creates: the existing view keeps its binding, a bootstrap does not.
+CREATE SCHEMA wa; CREATE SCHEMA wb;
+CREATE FUNCTION wb.helper() RETURNS text AS $$SELECT 'wb'$$ LANGUAGE sql;
+SET search_path = wa, wb, m;
+CREATE VIEW wa.v AS SELECT helper() AS who;
+SELECT 'R137', 'the shadow test, asked of the catalog before the plan creates wa.helper()',
+  coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'helper' AND n.nspname = 'wa'), 'none');
+BEGIN;
+CREATE FUNCTION wa.helper() RETURNS text AS $$SELECT 'wa'$$ LANGUAGE sql;
+COMMIT;
+SELECT 'R138', 'the view after that plan applied with no rebuild scheduled', who FROM wa.v;
+CREATE OR REPLACE VIEW wa.v AS SELECT helper() AS who;
+SELECT 'R139', 'a bootstrap of the same declaration, wa.helper() created first', who FROM wa.v;
+SELECT 'R140', 'the same test asked of the catalog after apply, one plan late',
+  coalesce((SELECT n.nspname || '.' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'helper' AND n.nspname = 'wa'), 'none');
+SET search_path = m;
+DROP SCHEMA wa CASCADE; DROP SCHEMA wb CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

@@ -235,3 +235,15 @@ R125 | a default reading a config row, probed in two read-only transactions | th
 R126 | what the apply stored, after that row changed between the two | gold
 R127 | two rows that both omitted the same clock_timestamp() default | two values
 R128 | the stored cell against the default evaluated again on the next plan | different, so the next plan schedules another update
+R129 | DEFAULT '01/02/2026' on a date column, created under DMY, as the catalog spells it | '2026-02-01'::date
+R130 | a row omitting that cell under MDY, once the default exists typed | 2026-02-01
+R131 | the declared text baked under MDY, the default created under DMY: cell vs default | 2026-01-02 vs '2026-02-01'::date
+R132 | whether the next plan schedules an update for that row | yes
+R133 | '01/02/2026' read under the canonical ISO, YMD | refused: date/time field value out of range: "01/02/2026"
+R134 | DEFAULT DATE '2026-01-02' created under DMY, as the catalog spells it | '2026-01-02'::date
+R135 | a check expression and an index filter carrying the same text, created under DMY | CHECK ((d > '2026-02-01'::date)) / (d > '2026-02-01'::date)
+R136 | a timestamptz default naming an abbreviation, created under Default and under Australia | '2026-01-15 18:00:00+00'::timestamp with time zone / '2026-01-15 02:30:00+00'::timestamp with time zone
+R137 | the shadow test, asked of the catalog before the plan creates wa.helper() | none
+R138 | the view after that plan applied with no rebuild scheduled | wb
+R139 | a bootstrap of the same declaration, wa.helper() created first | wa
+R140 | the same test asked of the catalog after apply, one plan late | wa.helper
