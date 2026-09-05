@@ -280,7 +280,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
    UI releases `HEAD.lock` for this one command and takes it back right
    after, together with the branch's own lock — an empty
-   `<git-common-dir>/refs/heads/<branch>.lock`, created exclusively — and
+   `<git-common-dir>/refs/heads/<branch>.lock`, created exclusively — that
+   lock, like `HEAD.lock` and `index.lock`, is the *files* ref backend's own
+   protocol, so the UI refuses a repository whose `extensions.refStorage`
+   names another backend (`reftable` keeps branches in tables no such file
+   guards) rather than hold a lock that locks nothing — and
    only then checks that `HEAD` is still symbolic to the recorded branch and
    that the branch still names `<oid>` (`git rev-parse refs/heads/<branch>`).
    The gap admits a `symbolic-ref` and it admits a `reset --soft`, which
@@ -358,9 +362,13 @@ every one of them while `ls-remote`, the witness and the lease each speak to
 one (**measured**: two `pushurl`s, two destinations listed by `git remote
 get-url --push --all`, and a push reaches both, so a lease can hold at the
 first and fail at the second after the first has published). The UI
-requires that command to name exactly one URL, and refuses the remote
-otherwise, listing them. Before composing,
-the UI reads the remote's tip for the branch (`git ls-remote <remote>
+requires that command to name exactly one URL, refuses the remote
+otherwise, listing them, and uses *that URL* — not the remote's name — for
+`ls-remote`, the witness fetch and the push alike, since the name resolves
+to the fetch URL for the first two and to the push URL for the last, and a
+`pushurl` that differs from the fetch URL would have the checks look at one
+server and the push go to another. Before composing,
+the UI reads the remote's tip for the branch (`git ls-remote <push-url>
 refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
 showing the unpushed commits and the commands instead: a refspec bounds the
 destination ref, not the range, and **measured**, a branch one unrelated
@@ -370,7 +378,7 @@ push of a feature branch, the common case — is not an ahead branch: the
 destination is absent rather than behind, and the check is instead that the
 tip is already on the remote, an ancestor of one of the heads `ls-remote`
 lists. That head is fetched first into a ref of the UI's own (`git fetch
---no-tags --no-write-fetch-head <remote>
+--no-tags --no-write-fetch-head <push-url>
 +refs/heads/<witness>:refs/pbps-ui/witness` — the second flag so the user's
 `FETCH_HEAD` still names what the user last fetched; **measured**, it did),
 because
