@@ -203,7 +203,10 @@ the first), and a `committed`-phase hook can push before the UI does. Rather
 than know which command runs which hook, the UI points every `git` it runs
 at a directory with no hooks in it (**measured**: the same two commands
 under that setting fired neither, and the control without it fired both).
-The steps:
+One hook lives outside that directory: a `core.fsmonitor` naming a program
+is run by `update-index` whatever `core.hooksPath` says (**measured**: the
+locked-copy `update-index` ran it), so every `git` also takes
+`-c core.fsmonitor=false` (**measured**: then it did not). The steps:
 
 0. The UI takes the index lock the way `git` does: it asks where the index
    is — `git rev-parse --git-path index`, because in a linked worktree
