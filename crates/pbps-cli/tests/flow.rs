@@ -106,6 +106,79 @@ fn plan_checksum(path: &std::path::Path) -> String {
 /// the wrong person, and only a test can hold the two apart.
 const FINDING: i32 = 2;
 
+/// Runs one statement against the server under test, for the state a test needs
+/// that the tool itself will not produce: a lock taken by somebody else, a table
+/// with an `IDENTITY` no `ALTER` can add.
+///
+/// Through the connection the test already has, and **not** through
+/// `docker exec … sqlcmd`. Four tests reached for the container CLI, and each
+/// treated failing to reach it as a reason to `return` — so on a host where
+/// `docker` names something that cannot see the container (this suite runs
+/// under podman too) they reported a pass without executing a line of their
+/// bodies. An unreachable container is not an empty one (DECISIONS 198).
+///
+/// Panics on failure, because every caller's setup is a precondition: a test
+/// that cannot arrange its state has not passed.
+fn on_server(connection: &str, sql: &str) {
+    if let Err(e) = try_on_server(connection, sql) {
+        panic!("{e}");
+    }
+}
+
+/// The same, for tidying up *after* the assertions.
+///
+/// Tolerant on purpose, and only here: a failed `DROP TABLE` at the end of a
+/// test leaves nothing another test cannot recreate (each setup drops what it
+/// finds first), while a panic here would replace whatever the test actually
+/// found with an error about the clean-up.
+fn after_test_on_server(connection: &str, sql: &str) {
+    let _ = try_on_server(connection, sql);
+}
+
+/// A database of this test's own, and the connection string that reaches it.
+///
+/// The four tests that used to reach for `docker exec` all worked in whatever
+/// database `PBPS_TEST_DB` names — shared with every other test in the file.
+/// That was invisible while they were skipping; the moment they ran, the ledger
+/// entries and the tables they leave behind made *other* tests fail, and which
+/// ones depended on the order. The suite already answers this: a test that
+/// writes state takes a database of its own (DECISIONS 198).
+fn own_database(server: &str, slug: &str) -> (String, String) {
+    let name = format!("pbps_cli_{slug}_{}", std::process::id());
+    on_server(server, &format!("CREATE DATABASE [{name}];"));
+    let connection = format!("{server};Database={name}");
+    (name, connection)
+}
+
+/// Tolerant, like every other teardown here: the assertions have run, and a
+/// database left behind is cleaned up by the next run of the same test — the
+/// name carries the pid, and `CREATE DATABASE` would fail loudly if it clashed.
+fn drop_own_database(server: &str, name: &str) {
+    after_test_on_server(
+        server,
+        &format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+             DROP DATABASE [{name}];"
+        ),
+    );
+}
+
+fn try_on_server(connection: &str, sql: &str) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("no runtime: {e}"))?;
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(connection)
+            .await
+            .map_err(|e| format!("cannot reach the server under test: {e}"))?;
+        conn.execute(sql)
+            .await
+            .map_err(|e| format!("`{sql}` failed: {e}"))?;
+        Ok(())
+    })
+}
+
 const ONE_COLUMN: &str = "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n";
 
 #[test]
@@ -3303,9 +3376,10 @@ fn verify_json_emits_an_envelope_when_it_cannot_connect() {
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn explain_reports_a_locked_target_rather_than_a_ready_one() {
-    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
+    let (db_name, connection) = own_database(&server, "explainlock");
     let d = Demo::new("explainlock");
     d.table(ONE_COLUMN);
     d.commit();
@@ -3332,25 +3406,10 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
 
     // Now take the lock the way an apply does, and ask again.
     d.git(&["init", "-q"]);
-    let locked = std::process::Command::new("docker")
-        .args([
-            "exec",
-            "pbps-test-mssql",
-            "/opt/mssql-tools18/bin/sqlcmd",
-            "-C",
-            "-S",
-            "localhost",
-            "-U",
-            "sa",
-            "-P",
-            "Pbps!Test12345",
-            "-Q",
-            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
-        ])
-        .output();
-    if locked.map(|o| !o.status.success()).unwrap_or(true) {
-        return; // Not the scripted container; the control above already ran.
-    }
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+    );
 
     let o = d.run(&[
         "explain",
@@ -3363,6 +3422,8 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
     ]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let _ = d.run(&["unlock", "--db", &connection]);
+
+    drop_own_database(&server, &db_name);
 
     assert_eq!(v["data"]["target"]["state"], "locked", "{v}");
     assert!(
@@ -3409,9 +3470,10 @@ fn plan_json_emits_an_envelope_when_the_identity_file_is_unreadable() {
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn doctor_does_not_report_ready_while_the_lock_is_held() {
-    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
+    let (db_name, connection) = own_database(&server, "doctorlock");
     let d = Demo::new("doctorlock");
     d.table(ONE_COLUMN);
     d.commit();
@@ -3420,29 +3482,15 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
         0
     );
 
-    let taken = std::process::Command::new("docker")
-        .args([
-            "exec",
-            "pbps-test-mssql",
-            "/opt/mssql-tools18/bin/sqlcmd",
-            "-C",
-            "-S",
-            "localhost",
-            "-U",
-            "sa",
-            "-P",
-            "Pbps!Test12345",
-            "-Q",
-            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
-        ])
-        .output();
-    if taken.map(|o| !o.status.success()).unwrap_or(true) {
-        return; // Not the scripted container.
-    }
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, 'someone-else');",
+    );
 
     let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let _ = d.run(&["unlock", "--db", &connection]);
+    drop_own_database(&server, &db_name);
 
     assert_eq!(
         v["result"], "findings",
@@ -4146,27 +4194,10 @@ fn plan_json_emits_an_envelope_when_the_artifact_cannot_be_written() {
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
-    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let sqlcmd = |query: &str| {
-        std::process::Command::new("docker")
-            .args([
-                "exec",
-                "pbps-test-mssql",
-                "/opt/mssql-tools18/bin/sqlcmd",
-                "-C",
-                "-S",
-                "localhost",
-                "-U",
-                "sa",
-                "-P",
-                "Pbps!Test12345",
-                "-Q",
-                query,
-            ])
-            .output()
-    };
+    let (db_name, connection) = own_database(&server, "verifyidentity");
 
     let d = Demo::new("verifyidentity");
     d.table("table: dbo.ident_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
@@ -4174,24 +4205,24 @@ fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
-    let made = sqlcmd(
+    on_server(
+        &connection,
         "IF OBJECT_ID(N'dbo.ident_drift', N'U') IS NOT NULL DROP TABLE dbo.ident_drift; \
          CREATE TABLE dbo.ident_drift (id bigint IDENTITY(1,1) NOT NULL);",
     );
-    if made.map(|o| !o.status.success()).unwrap_or(true) {
-        return; // Not the scripted container.
-    }
     // Records the live state, which has the IDENTITY, as the baseline.
     assert_eq!(
         code(&d.run(&["snapshot", "--db", &connection, "--force"])),
         0
     );
     // The same table without it. No ALTER can do this, which is the point.
-    let _ =
-        sqlcmd("DROP TABLE dbo.ident_drift; CREATE TABLE dbo.ident_drift (id bigint NOT NULL);");
+    on_server(
+        &connection,
+        "DROP TABLE dbo.ident_drift; CREATE TABLE dbo.ident_drift (id bigint NOT NULL);",
+    );
 
     let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
-    let _ = sqlcmd("DROP TABLE dbo.ident_drift;");
+    drop_own_database(&server, &db_name);
 
     let v: serde_json::Value = serde_json::from_str(&stdout(&o))
         .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
@@ -4797,27 +4828,10 @@ fn status_says_nothing_about_a_lock_on_a_database_with_no_ledger() {
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
-    let Ok(connection) = std::env::var("PBPS_TEST_DB") else {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let sqlcmd = |query: &str| {
-        std::process::Command::new("docker")
-            .args([
-                "exec",
-                "pbps-test-mssql",
-                "/opt/mssql-tools18/bin/sqlcmd",
-                "-C",
-                "-S",
-                "localhost",
-                "-U",
-                "sa",
-                "-P",
-                "Pbps!Test12345",
-                "-Q",
-                query,
-            ])
-            .output()
-    };
+    let (db_name, connection) = own_database(&server, "verifyboth");
 
     let d = Demo::new("verifyboth");
     d.table("table: dbo.both_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
@@ -4825,26 +4839,25 @@ fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
-    let made = sqlcmd(
+    on_server(
+        &connection,
         "IF OBJECT_ID(N'dbo.both_drift', N'U') IS NOT NULL DROP TABLE dbo.both_drift; \
          CREATE TABLE dbo.both_drift (id bigint IDENTITY(1,1) NOT NULL);",
     );
-    if made.map(|o| !o.status.success()).unwrap_or(true) {
-        return; // Not the scripted container.
-    }
     assert_eq!(
         code(&d.run(&["snapshot", "--db", &connection, "--force"])),
         0
     );
     // Two differences at once: the IDENTITY is gone (no `Change` exists for
     // that) and a column has been added by hand (one does).
-    let _ = sqlcmd(
+    on_server(
+        &connection,
         "DROP TABLE dbo.both_drift; \
          CREATE TABLE dbo.both_drift (id bigint NOT NULL, note nvarchar(50) NULL);",
     );
 
     let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
-    let _ = sqlcmd("DROP TABLE dbo.both_drift;");
+    drop_own_database(&server, &db_name);
 
     let v: serde_json::Value = serde_json::from_str(&stdout(&o))
         .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));

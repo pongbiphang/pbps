@@ -2857,3 +2857,27 @@ SPEC is in sync with all of these.
     takes its lock through `docker exec`, and on a host where `docker` cannot
     reach the container it returns early and reports a pass. Under a shim it
     fails against the old spelling with the bad remedy in its output.
+
+198. **A live test arranges its state over its own connection, in its own
+    database.** Four tests in `flow.rs` needed state the tool will not produce —
+    a lock held by somebody else, a table with an `IDENTITY` no `ALTER` can add
+    — and reached for it with `docker exec pbps-test-mssql … sqlcmd`. Each
+    treated a failure to reach the container as a reason to `return`, so on a
+    host whose `docker` cannot see it (this suite also runs under podman) they
+    reported a pass having executed nothing. Measured: with `docker` replaced by
+    a program that exits 1, all four were green; the bug one of them was written
+    to catch went unmeasured for as long as that was true.
+
+    They now run their statements through `pbps_db::Conn` on the connection the
+    test already has, which the file does in a dozen other places, and a failure
+    is a panic: setup is a precondition, and a test that cannot arrange its
+    state has not passed. Against an unreachable server the four now fail with
+    `cannot reach the server under test`.
+
+    Making them run exposed the second half. All four worked in whatever
+    database `PBPS_TEST_DB` names, shared with every other test in the file, and
+    the ledger entries and tables they leave behind made *other* tests fail —
+    which ones depending on the order they ran in. So each takes a database of
+    its own, as every other state-writing live test here already does. Teardown
+    stays tolerant: after the assertions, a failed `DROP` hides nothing, while a
+    panic there would replace the failure the test actually found.
