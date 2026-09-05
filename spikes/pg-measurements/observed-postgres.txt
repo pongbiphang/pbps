@@ -253,3 +253,11 @@ R143 | and after the next one | qb.helper / qa.helper
 R144 | what that creation proved: a candidate sat earlier and the object bound past it | yes, so the reference is qualified
 R145 | the unqualified view: binding / shadow test, before its rebuild | qb.helper / qa.helper
 R146 | the same after its rebuild | qa.helper / none
+R147 | helper(1) under (oa, ob) with oa.helper(text) and ob.helper(integer) | ob.helper(integer)
+R148 | what a name-and-class flag records at that creation | a candidate sat earlier and the object bound past it, so "qualified"
+R149 | after oa.helper(integer) appears: the view / a bootstrap of it | ob(integer) / oa(integer)
+R150 | the same-named routines on the effective path, at creation -> now | oa.helper(t text), ob.helper(i integer)  ->  oa.helper(i integer), oa.helper(t text), ob.helper(i integer)
+R151 | helper(1) with only oc.helper(bigint) visible, then oc.helper(integer) added in the same schema: bound / the view / a bootstrap | oc.helper(bigint) / oc(bigint) / oc(integer)
+R152 | that candidate set, at creation -> now | oc.helper(b bigint)  ->  oc.helper(b bigint), oc.helper(i integer)
+R153 | helper(1::int) with oa.helper(integer) and ob.helper(integer) both visible | oa(integer)
+R154 | an operator bound past an earlier same-named operator with other operand types | ob.<+>(integer,integer)

@@ -1234,7 +1234,9 @@ reads deterministic would have made them depend on the declarations.
   was created** was necessarily written qualified, and the path losing a schema
   it never had is not news. So the state records, beside each binding, whether
   it was on the effective path at creation, and only the ones that were can
-  trigger "left the path".
+  trigger "left the path". (The candidate set recorded further down subsumes
+  this flag: a binding was on the path at creation exactly when the bound
+  object is a member of the set.)
 
   **It is conservative, and the cost is measured rather than guessed:**
 
@@ -1270,24 +1272,71 @@ reads deterministic would have made them depend on the declarations.
   what that creation proved: a candidate sat earlier and the object bound past it:  yes, so the reference is qualified
   ```
 
-  An unqualified reference cannot bind past a same-named object earlier on the
-  path; one that did was written qualified, and no shadow can ever move it. So
-  the state records, beside each binding and next to the on-path flag, **whether
-  a same-named object of the same class already sat earlier on the effective
-  path when the object was created**. A binding that carries that flag is
-  proven qualified and the shadow test skips it. The unqualified case converges
-  in the one rebuild it always needed and records no shadow, because after the
-  rebuild it binds the earliest candidate:
+  "An unqualified reference cannot bind past a same-named object earlier on
+  the path" was the next sentence, and it is false for anything that
+  overloads. **Measured**, an unqualified call binds past an *inapplicable*
+  overload without being qualified at all:
+
+  ```
+  helper(1) under (oa, ob) with oa.helper(text) and ob.helper(integer):  ob.helper(integer)
+  what a name-and-class flag records at that creation:                   a candidate sat earlier and the object bound past it, so "qualified"
+  after oa.helper(integer) appears: the view / a bootstrap of it:        ob(integer) / oa(integer)
+  ```
+
+  A flag inferred from name and class would have marked that view proven
+  qualified and skipped it for ever, and the third line is the divergence it
+  would then never report. Operators overload the same way — **measured**, an
+  operator bound past an earlier same-named one with other operand types. And
+  "earlier on the path" is not even the question for a routine: **measured**, a
+  new overload in the *same* schema captures the call —
+
+  ```
+  helper(1) with only oc.helper(bigint) visible, then oc.helper(integer) added in the same schema:
+      bound oc.helper(bigint) / the view oc(bigint) / a bootstrap oc(integer)
+  ```
+
+  — which no test written against path positions can see, because nothing on
+  the path moved. What made position look like the whole rule is the one case
+  where it is exact: an identical signature earlier on the path hides the later
+  one (**measured**, `helper(1::int)` with both `oa.helper(integer)` and
+  `ob.helper(integer)` visible answers `oa`). Resolution is a function of the
+  call site and of the **whole visible candidate set**, and under an unchanged
+  declaration only the second can change.
+
+  So the state records neither a proof nor a position but **the candidate set
+  itself**: for each binding, the same-named objects of the same catalog class
+  on every schema of the effective path at creation — by identity, name and
+  argument types, for routines and operators. The test is one comparison: the
+  set recorded at creation against the set the catalog will hold when this
+  plan has run. **Any difference rebuilds the object once**, and the rebuild
+  re-records the set. **Measured**, both captures above are a gained member:
+
+  ```
+  the same-named routines on the effective path, at creation -> now:
+      oa.helper(t text), ob.helper(i integer)  ->  oa.helper(i integer), oa.helper(t text), ob.helper(i integer)
+  that candidate set, at creation -> now:
+      oc.helper(b bigint)  ->  oc.helper(b bigint), oc.helper(i integer)
+  ```
+
+  and the qualified reference that rebuilt for ever is quiet, because its set —
+  `qa.helper()` and `qb.helper()`, both present when it was last created — has
+  not changed. Nothing is inferred about qualification. The rule is that a
+  resolution is re-asked exactly when its inputs changed, and the unqualified
+  case still converges in the one rebuild it always needed:
 
   ```
   the unqualified view: binding / shadow test, before its rebuild:  qb.helper / qa.helper
   the same after its rebuild:                                       qa.helper / none
   ```
 
-  This is the same device as the on-path flag one paragraph up: a fact the
-  engine established at creation, recorded so the next plan does not re-ask a
-  question whose answer cannot change. A false rebuild is still loud, recorded
-  in the plan, and gated — but it happens once.
+  This one field subsumes both flags earlier versions of this section carried.
+  "Was the bound schema on the effective path at creation" is "is the bound
+  object a member of the recorded set"; "did a same-named object already sit
+  earlier" was the proof that overloading refutes. A false rebuild is still
+  loud, recorded in the plan, and gated — and it happens once, on a change to
+  the set in either direction. A lost member cannot promote a binding that
+  already won, but that is reasoning, and one rebuild is cheaper than being
+  wrong about it.
 
   **And the catalog it is asked of is the one this plan will leave, not the one
   it found.** A first version asked the live catalog, and the live catalog
@@ -1506,9 +1555,9 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 
 | | |
 |---|---|
-| `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation and whether a same-named object of the same class already sat earlier on it (§3) — the second flag is the engine's proof that the reference was qualified, without which a qualified reference is rebuilt on every plan for ever; and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
+| `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each with the **candidate set** visible at creation — the same-named objects of the same catalog class on the effective write path, by identity for routines and operators (§3); earlier versions carried two flags in its place, and the one that inferred qualification from a name was refuted by overloading; and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact — and so does a plain-literal default on a setting-sensitive column, emitted as the resolved typed spelling, because the DDL that types a literal is where a session reads it (§3); the **default probe is gone from the data path** — an omitted cell is refused over a non-literal default and spelled by the plan over a literal one, so `plan --db` evaluates no user code for a cell and `apply` has nothing to assert — while `plan --db` itself stays inside a `READ ONLY` transaction, because §9.1 makes it a preview; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
-| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is asked of the catalog **as this plan will leave it** — minus what it drops, plus what it creates and the destinations of what it renames, since a shadow the same plan introduces is otherwise found one plan late — is a same-named object of the same catalog class then earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
+| The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is asked of the catalog **as this plan will leave it** — minus what it drops, plus what it creates and the destinations of what it renames, since a shadow the same plan introduces is otherwise found one plan late — and it is one comparison: the same-named candidates of the same catalog class visible on the effective path, by identity for routines and operators, against the set recorded when the object was created. Any difference rebuilds once and re-records. Position on the path is not the question, because an overload in the same schema captures a call without anything moving; and what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too, once. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | `plan --db`'s transaction | `READ ONLY` (§3). The engine refuses exactly the statements that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so pbps analyses nothing. It was introduced for a default probe that §3 has since removed from the data path, and it stays for what §9.1 says planning is |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value — resolved under the canonical settings at plan time when the column's type is setting-sensitive, the one conversion feeding both the cell and the default's DDL, so no path has a probe and none needs an assertion. A first version kept a recorded-and-asserted settings branch for an "unprobeable default", citing a decision that exists on PR #10's branch and not on this one; no applyable plan reaches that branch, and it is withdrawn |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |

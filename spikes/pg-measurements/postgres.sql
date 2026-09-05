@@ -1517,6 +1517,65 @@ SET search_path = m;
 DROP FUNCTION m.shadow(regclass); DROP FUNCTION m.bound(regclass);
 DROP SCHEMA qa CASCADE; DROP SCHEMA qb CASCADE;
 
+-- -------------------------- the forty-sixth 2026-09-05 review round
+
+-- Qualification cannot be inferred from a same-named candidate: an unqualified
+-- call binds past an inapplicable overload, and resolution is a function of
+-- the whole visible candidate set, not of what sits earlier on the path.
+CREATE SCHEMA oa; CREATE SCHEMA ob; CREATE SCHEMA oc;
+CREATE FUNCTION oa.helper(t text) RETURNS text AS $$SELECT 'oa(text)'$$ LANGUAGE sql;
+CREATE FUNCTION ob.helper(i int) RETURNS text AS $$SELECT 'ob(integer)'$$ LANGUAGE sql;
+CREATE FUNCTION m.rbound(v regclass) RETURNS text AS $$
+  SELECT n.nspname || '.' || d.refobjid::regprocedure::text FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+   JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE r.ev_class = v AND d.refclassid = 'pg_proc'::regclass $$ LANGUAGE sql;
+CREATE FUNCTION m.candidates(v regclass) RETURNS text AS $$
+  SELECT string_agg(n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', ', '
+                    ORDER BY n.nspname, pg_get_function_identity_arguments(p.oid))
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE p.proname = split_part(split_part(m.rbound(v), '.', 2), '(', 1)
+    AND n.nspname = ANY(current_schemas(true)) $$ LANGUAGE sql;
+SET search_path = oa, ob, m;
+CREATE VIEW oa.v AS SELECT helper(1) AS who;
+SELECT 'R147', 'helper(1) under (oa, ob) with oa.helper(text) and ob.helper(integer)', m.rbound('oa.v');
+SELECT 'R148', 'what a name-and-class flag records at that creation',
+  CASE WHEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'helper' AND n.nspname = 'oa')
+       THEN 'a candidate sat earlier and the object bound past it, so "qualified"' ELSE 'none' END;
+SELECT m.candidates('oa.v') AS c0 \gset
+CREATE FUNCTION oa.helper(i int) RETURNS text AS $$SELECT 'oa(integer)'$$ LANGUAGE sql;
+SELECT who AS w1 FROM oa.v \gset
+CREATE OR REPLACE VIEW oa.v AS SELECT helper(1) AS who;
+SELECT 'R149', 'after oa.helper(integer) appears: the view / a bootstrap of it', :'w1' || ' / ' || (SELECT who FROM oa.v);
+SELECT 'R150', 'the same-named routines on the effective path, at creation -> now', :'c0' || '  ->  ' || m.candidates('oa.v');
+-- A capture with nothing earlier on the path at all.
+CREATE FUNCTION oc.helper(b bigint) RETURNS text AS $$SELECT 'oc(bigint)'$$ LANGUAGE sql;
+SET search_path = oc, m;
+CREATE VIEW oc.w AS SELECT helper(1) AS who;
+SELECT m.rbound('oc.w') AS b0, m.candidates('oc.w') AS c1 \gset
+CREATE FUNCTION oc.helper(i int) RETURNS text AS $$SELECT 'oc(integer)'$$ LANGUAGE sql;
+SELECT who AS w2 FROM oc.w \gset
+CREATE OR REPLACE VIEW oc.w AS SELECT helper(1) AS who;
+SELECT 'R151', 'helper(1) with only oc.helper(bigint) visible, then oc.helper(integer) added in the same schema: bound / the view / a bootstrap',
+  :'b0' || ' / ' || :'w2' || ' / ' || (SELECT who FROM oc.w);
+SELECT 'R152', 'that candidate set, at creation -> now', :'c1' || '  ->  ' || m.candidates('oc.w');
+-- An identical signature earlier on the path hides the later one, which is
+-- the case that made "earlier on the path" look like the whole rule.
+SET search_path = oa, ob, m;
+SELECT 'R153', 'helper(1::int) with oa.helper(integer) and ob.helper(integer) both visible', helper(1::int);
+-- Operators overload the same way.
+CREATE FUNCTION oa.cat(a int, b text) RETURNS text AS $$SELECT a::text || b$$ LANGUAGE sql;
+CREATE OPERATOR oa.<+> (LEFTARG = int, RIGHTARG = text, FUNCTION = oa.cat);
+CREATE FUNCTION ob.add(a int, b int) RETURNS int AS $$SELECT a + b$$ LANGUAGE sql;
+CREATE OPERATOR ob.<+> (LEFTARG = int, RIGHTARG = int, FUNCTION = ob.add);
+CREATE VIEW oa.opv AS SELECT 1 <+> 2 AS r;
+SELECT 'R154', 'an operator bound past an earlier same-named operator with other operand types',
+  (SELECT n.nspname || '.' || d.refobjid::regoperator::text FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid
+    JOIN pg_operator o ON o.oid = d.refobjid JOIN pg_namespace n ON n.oid = o.oprnamespace
+   WHERE r.ev_class = 'oa.opv'::regclass AND d.refclassid = 'pg_operator'::regclass);
+SET search_path = m;
+DROP FUNCTION m.candidates(regclass); DROP FUNCTION m.rbound(regclass);
+DROP SCHEMA oa CASCADE; DROP SCHEMA ob CASCADE; DROP SCHEMA oc CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

@@ -32,6 +32,9 @@ on 2026-09-05. Every point where the shape had to bend is marked `SEAM:` in the
 source. Output, verbatim:
 
 ```
+malformed string: Some("BadConnectionString")
+refused socket:   Some("Connect")
+never answered:   Some("ConnectTimeout")
 connect: ok
 execute (multi-statement batch): ok
 query + FromColumn: answer=Some(42) nothing=None by_index=Some(42)
@@ -44,7 +47,8 @@ all-or-nothing: rows left by the first statement = Some(0) (must be 0)
 undefined table SQLSTATE: Some("42P01"), parses as u32: Some(false)
 ```
 
-The seventh and eighth lines are SPEC §11.5's invariant — *a plan whose second
+The first three lines are the connection failures the seam tells apart (§3).
+The tenth and eleventh are SPEC §11.5's invariant — *a plan whose second
 statement fails leaves the first one's effect nowhere* — which is the acceptance
 criterion ADR-0007 named for a driver change, run against a second driver for
 the first time.
@@ -85,6 +89,7 @@ boundary, and it makes one false statement in CLAUDE.md visible.**
 | The absent-is-not-empty invariant | holds — `Param::OptStr(None)` arrived as SQL NULL |
 | `begin` / `commit` / `rollback` framing | holds; **the statements inside them do not** — §2 |
 | `Conn::connect`'s signature | unchanged; what a valid string *is* becomes dialect knowledge — §3 |
+| `DbError::Connect` / `ConnectTimeout` | unchanged in shape; **a first draft of the spike folded the timeout into `BadConnectionString`** and the review caught it — §3 |
 | `DbError::server_error_number` | **cannot express PostgreSQL's error code** — §1 |
 
 ## 1. `Option<u32>` cannot hold a PostgreSQL error code
@@ -161,6 +166,36 @@ task handle that has no counterpart in the current shape.
 That is the one genuinely structural difference between the two drivers, and it
 stayed inside the crate: no caller of `Conn` sees it, and no signature changed.
 This is the part of ADR-0007's claim that was most at risk and it held.
+
+**One thing nearly leaked, and by the spike's hand rather than the driver's.**
+`pbps-db` keeps three connection failures apart — `BadConnectionString`,
+`Connect { addr, source }` and `ConnectTimeout { addr }` — because a malformed
+string, a refused socket and a firewall that drops packets need three different
+fixes, and the CLI's diagnostics say which. A first draft of the spike mapped
+its timeout to `BadConnectionString`, so a target that silently dropped the
+connection for thirty seconds would have been reported as a typo. A driver
+spike that does not preserve the error categories is not testing the seam it
+claims to; the finding is that the shape held once it was actually
+reimplemented, and what it cost:
+
+- the timeout variant carries over unchanged;
+- `Connect` does not come for free, because tokio-postgres opens the socket
+  inside `connect` and wraps the `io::Error` in its own error type. The seam
+  wants that `io::Error` by value, and it cannot be moved out of the driver's
+  error, so it is rebuilt from the `source()`'s kind and text (`SEAM 9`);
+- the address the two variants name comes from the parsed `Config`'s host and
+  port lists rather than from one string, which is the same dialect knowledge
+  §3 above already places behind `connect`.
+
+**Measured** — a string with a non-numeric port, a closed local port, and a
+local socket that accepts and never answers (a blackhole address is refused
+outright by a host with no route to it, so it does not reach the timeout):
+
+```
+malformed string: Some("BadConnectionString")
+refused socket:   Some("Connect")
+never answered:   Some("ConnectTimeout")
+```
 
 ## What this says about the two open decisions
 
