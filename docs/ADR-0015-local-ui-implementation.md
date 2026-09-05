@@ -193,13 +193,24 @@ that does not is left where it is, unpushed and reversible, and the page shows
 what differs from the preview and the commands to push it or undo it; the
 hook's change is the user's to look at, not the UI's to publish or discard.
 
-The push is bounded the same way: `git push --no-follow-tags <remote>
-HEAD:refs/heads/<branch>`, never a bare `git push`. **Measured** on the same
-git: with `push.default=matching` and two local branches ahead of the remote,
-a bare `git push` on one advanced both, and the explicit refspec advanced the
-one named. The verification above bounds what `HEAD` holds; the refspec bounds
-what leaves the machine to that. After a push the page shows the branch and
-links the merge request where the hosting's URL shape is known.
+The push is bounded to that one commit, and to it by name. Before composing,
+the UI reads the branch's tip and the remote's (`git ls-remote <remote>
+refs/heads/<branch>`) and refuses to compose unless they are equal, showing
+the unpushed commits and the commands instead: a refspec bounds the
+destination ref, not the range, and a branch already ahead would have every
+unpushed ancestor published under the intent commit without ever appearing in
+the preview. After the read-back the push names the verified commit rather
+than `HEAD`, which another process may have moved, and leases the destination
+on the tip it recorded: `git push --no-follow-tags
+--force-with-lease=refs/heads/<branch>:<tip> <remote> <oid>:refs/heads/<branch>`,
+never a bare `git push`. **Measured** on the same git: with
+`push.default=matching` and two branches ahead, a bare `git push` advanced
+both; a branch one unrelated commit ahead had that commit published by
+`HEAD:refs/heads/<branch>`; with `HEAD` moved on after the read-back, the push
+by object id published the verified commit and not `HEAD`; and with the
+remote moved, the lease refused the push as stale. After a push the page shows
+the branch and links the merge request where the hosting's URL shape is
+known.
 
 A library (`gix`, `libgit2`) is the obvious design and would remove a runtime
 dependency on a `git` binary. It is refused because ADR-0006's audit story is
