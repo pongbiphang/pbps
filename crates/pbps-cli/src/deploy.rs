@@ -4204,6 +4204,7 @@ async fn apply_staged_under_lock(
             &previous,
             &recorded,
             &target.label,
+            target.environment(),
             StagedRead::Checkpoint {
                 completed: i + 1,
                 total,
@@ -4235,6 +4236,7 @@ async fn apply_staged_under_lock(
         &previous,
         &after.schema,
         &target.label,
+        target.environment(),
         StagedRead::Closing { total },
     )?;
     let mut snapshot = pbps_model::StateSnapshot::new(
@@ -4282,6 +4284,7 @@ fn staged_movement(
     before: &Schema,
     after: &Schema,
     label: &str,
+    environment: Option<&str>,
     read: StagedRead,
 ) -> anyhow::Result<()> {
     // Only the last read of a staged run can be asked what the plan achieved:
@@ -4301,8 +4304,19 @@ fn staged_movement(
                  staged apply runs outside a transaction, so nothing was rolled back. The \
                  checkpoint holds the database as it stands, this change included — resuming \
                  accepts it. The list above is the record of what moved: the checkpoint \
-                 already holds it, so `pbps verify` reads clean; `pbps status` shows this \
-                 refusal as the failed entry's reason."
+                 already holds it, so `pbps verify` reads clean, and this refusal is recorded \
+                 as the failed entry's reason{}.",
+                // Named only to a caller who can run it. `status` takes no
+                // target and reports on the environments `pbps.yml` configures
+                // (SPEC 9.2), so for a `--db` run it answers about other
+                // databases or says none are configured — a pointer that cannot
+                // be followed, in a message whose whole job is to say where the
+                // record is. Without one the sentence is already complete: the
+                // list above is that record (DECISIONS 196).
+                match environment {
+                    Some(_) => ", which `pbps status` shows",
+                    None => "",
+                }
             ),
             StagedRead::Closing { total } => anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -6529,6 +6543,7 @@ mod tests {
             &before,
             &before,
             "prod",
+            Some("prod"),
             StagedRead::Checkpoint {
                 completed: 1,
                 total: 2,
@@ -6541,6 +6556,7 @@ mod tests {
             &before,
             &before,
             "prod",
+            Some("prod"),
             StagedRead::Checkpoint {
                 completed: 2,
                 total: 2,
@@ -7874,18 +7890,20 @@ mod tests {
         let untouched = pbps_model::ChangeSet {
             changes: Vec::new(),
         };
-        let refusal = |read: StagedRead| {
+        let refusal_for = |environment: Option<&str>, read: StagedRead| {
             let e = staged_movement(
                 &pbps_mssql::Mssql,
                 &untouched,
                 &schema(&["kept"]),
                 &schema(&["kept", "rogue"]),
                 "prod",
+                environment,
                 read,
             )
             .expect_err("a row nobody planned");
             format!("{e:#}")
         };
+        let refusal = |read: StagedRead| refusal_for(Some("prod"), read);
         let at_checkpoint = refusal(StagedRead::Checkpoint {
             completed: 1,
             total: 2,
@@ -7920,6 +7938,69 @@ mod tests {
             assert!(!e.contains("transaction was rolled back"), "{e}");
             assert!(!e.contains("then apply again"), "{e}");
         }
+    }
+
+    /// A `--db` run is told where the record is, and sent to no command that
+    /// cannot take one.
+    ///
+    /// `status` reports on the environments `pbps.yml` configures and accepts
+    /// no target at all, so for a target given as a connection string the
+    /// pointer added with DECISIONS 192's sibling led nowhere: to other
+    /// databases, or to "no environments are configured". The sentence has to
+    /// stand without it, because for half the callers there is nothing to name
+    /// (DECISIONS 196).
+    #[test]
+    fn a_checkpoint_refusal_names_status_only_to_a_caller_who_can_run_it() {
+        let schema = |rows: &[&str]| {
+            let t = pbps_model::Table {
+                data: Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    rows: rows
+                        .iter()
+                        .map(|k| (pbps_model::RowKey::from(*k), pbps_model::Row::default()))
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.other".parse().unwrap(), t);
+            s
+        };
+        let untouched = pbps_model::ChangeSet {
+            changes: Vec::new(),
+        };
+        let refusal = |environment: Option<&str>| {
+            let e = staged_movement(
+                &pbps_mssql::Mssql,
+                &untouched,
+                &schema(&["kept"]),
+                &schema(&["kept", "rogue"]),
+                "localhost/app",
+                environment,
+                StagedRead::Checkpoint {
+                    completed: 1,
+                    total: 2,
+                },
+            )
+            .expect_err("a row nobody planned");
+            format!("{e:#}")
+        };
+
+        let from_db = refusal(None);
+        assert!(!from_db.contains("pbps status"), "{from_db}");
+        // What is left has to be an answer on its own: where the record is, and
+        // that the command which *can* be run against this target reads clean.
+        assert!(from_db.contains("the record of what moved"), "{from_db}");
+        assert!(
+            from_db.contains("recorded as the failed entry's reason"),
+            "{from_db}"
+        );
+        assert!(from_db.contains("`pbps verify` reads clean"), "{from_db}");
+        assert!(from_db.contains("dbo.other"), "{from_db}");
+
+        // `--env`: the environment is one `status` walks, so it is named.
+        let from_env = refusal(Some("prod"));
+        assert!(from_env.contains("`pbps status` shows"), "{from_env}");
     }
 
     /// A cell the plan leaves to its default is held there at the closing
