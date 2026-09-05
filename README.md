@@ -5,9 +5,10 @@ the schema should look like; the tool works out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
-  through [docs/ADR-0014-driver-seam-tested.md](docs/ADR-0014-driver-seam-tested.md);
+  through [docs/ADR-0015-local-ui-implementation.md](docs/ADR-0015-local-ui-implementation.md);
   ADR-0009 to ADR-0014 are the PostgreSQL design, written against a real
-  server before the dialect exists
+  server before the dialect exists, and ADR-0015 is how the local UI of
+  ADR-0006 is built
 - Copy-pastable CI pipelines and the exit-code contract they rest on:
   [docs/CI.md](docs/CI.md)
 - Why each non-obvious choice was made: [docs/DECISIONS.md](docs/DECISIONS.md)

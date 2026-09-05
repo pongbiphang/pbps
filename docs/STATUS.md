@@ -199,4 +199,10 @@ reimplement validation. **Scope is single-user and local, and that is the
 open-source boundary** — multi-tenant or hosted is reserved as a possible
 commercial offering and gets its own ADR. It does not inherit permission from
 ADR-0006: commercial pressure pushes hardest towards the UI holding the
-approval, which is the one thing ADR-0006 refuses.
+approval, which is the one thing ADR-0006 refuses. How it is built is decided
+in [ADR-0015](ADR-0015-local-ui-implementation.md): the UI runs the `pbps`
+binary as a subprocess and links none of the crates, serves a page embedded in
+the binary with no build step, refuses any request without its per-launch
+token, reads no credential itself, and commits through the user's own `git`.
+The steps are in issue #64; the code waits for the last Phase 5 model change,
+because a page over a moving payload is a second implementation of it.
