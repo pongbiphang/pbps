@@ -236,7 +236,15 @@ locked-copy `update-index` ran it), so every `git` also takes
    check-attr filter -- <path>` must answer `unspecified`): a clean filter
    is a program neither `core.hooksPath` nor `core.fsmonitor` reaches, and
    a blob stored around it leaves `git status` reporting the path modified
-   the moment it is committed, since `git` compares through the filter. It
+   the moment it is committed, since `git` compares through the filter. The
+   same holds for the transformations built into `git` — `ident`, and the
+   end-of-line conversion `text`, `eol` and `core.autocrlf` ask for — so
+   with no filter program left to run, step 1 also requires `git
+   hash-object -- <path>` and `git hash-object --no-filters -- <path>` to
+   agree: the first hashes what check-in would store, the second the file,
+   and any difference is a transformation that would leave the installed
+   path modified (**measured**: with `*.json ident` and `$Id$` in the file,
+   `filter` was `unspecified` and the two ids differed). It
    requires the path to be a regular file or absent — never a symlink:
    `git hash-object` follows a link and hashes the target's content
    (**measured**: the link `a` hashed as `a`'s content, where `git add`
@@ -377,14 +385,14 @@ both, where `--no-replace-objects` read the real tip throughout.
 
 The push is bounded to that one commit, to it by name, and to one
 destination. A remote may carry several push URLs, and `git push` sends to
-every one of them while `ls-remote`, the witness and the lease each speak to
+every one of them while `ls-remote` and the lease each speak to
 one (**measured**: two `pushurl`s, two destinations listed by `git remote
 get-url --push --all`, and a push reaches both, so a lease can hold at the
 first and fail at the second after the first has published). The UI
 requires that command to name exactly one URL, refuses the remote
 otherwise, listing them, and uses *that URL* — not the remote's name — for
-`ls-remote`, the witness fetch and the push alike, since the name resolves
-to the fetch URL for the first two and to the push URL for the last, and a
+`ls-remote` and the push alike, since the name resolves to the fetch URL
+for the first and to the push URL for the second, and a
 `pushurl` that differs from the fetch URL would have the checks look at one
 server and the push go to another. Before composing,
 the UI reads the remote's tip for the branch (`git ls-remote <push-url>
@@ -416,10 +424,17 @@ with it), and `--no-follow-tags`; never a bare `git push`, which under
 `push.default=matching` advanced two branches at once when measured:
 
 ```
-git push --no-verify --no-follow-tags \
+git push --no-verify --no-follow-tags --recurse-submodules=no \
     --force-with-lease=refs/heads/<branch>:<tip> \
     <push-url> <oid>:refs/heads/<branch>
 ```
+
+Both pushes — this one and the one that publishes a new branch — take
+`--recurse-submodules=no`, because `push.recurseSubmodules=only` makes
+`git push` skip the superproject's own refs and report success
+(**measured**: under it the push said `Everything up-to-date` and the remote
+stayed at the tip; with the flag it moved to `<oid>`), and a UI that read
+that exit code would show a publication that never happened.
 
 What this gives up is stated plainly: **the user's hooks do not run for a
 commit or a push the UI makes**, and the page says so beside the commit. A
