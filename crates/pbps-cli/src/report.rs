@@ -397,7 +397,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
     );
     if !r.structural.is_empty() {
         out.push_str(
-            "\n  The plan does NOT converge: after applying it, the database still differs\n               from the declarations.\n",
+            "\n  The plan does NOT converge: after applying it, the database still differs \
+             from the declarations.\n",
         );
         for d in &r.structural {
             out.push_str(&format!("    {d}\n"));
@@ -408,7 +409,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
         // actually stored. Rewriting the declaration in that form is what makes
         // the difference stop being reported after every apply.
         out.push_str(
-            "\n  These differ only in how the engine spells them. Each costs one rebuilt\n               constraint per apply until the declaration is written in the stored form:\n",
+            "\n  These differ only in how the engine spells them. Each costs one rebuilt \
+             constraint per apply until the declaration is written in the stored form:\n",
         );
         for d in &r.spelling {
             out.push_str(&format!("    {d}\n"));
@@ -421,7 +423,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
     // production may be Standard. Saying so keeps a green rehearsal from
     // reading as a promise it cannot make (ADR-0003 decision 3).
     out.push_str(
-        "  This is still a preview: it proves syntax and convergence, not edition\n           capabilities, and only `pbps plan --db` produces an applyable plan.\n",
+        "  This is still a preview: it proves syntax and convergence, not edition \
+         capabilities, and only `pbps plan --db` produces an applyable plan.\n",
     );
     out
 }

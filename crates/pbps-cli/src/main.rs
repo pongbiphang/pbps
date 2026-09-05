@@ -660,7 +660,9 @@ fn run() -> anyhow::Result<()> {
                     // --plan --format json`. Adding a second typed rendering
                     // would give a reviewer two documents to disagree about.
                     refuse(
-                        "--format json describes findings, and `plan --db` produces a plan.\n                         Write it with --out <plan.json> and read it with                          `pbps explain --plan <plan.json> --format json`",
+                        "--format json describes findings, and `plan --db` produces a plan.\n\
+                         Write it with --out <plan.json> and read it with \
+                         `pbps explain --plan <plan.json> --format json`",
                     )?;
                 }
                 let target = output::or_unanswerable(
@@ -2399,7 +2401,8 @@ fn cmd_plan(
             print!("{}", report::rehearsal(&rehearsal));
             if !rehearsal.converged() {
                 return Err(Found::new(
-                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                     differences above are what would be left behind",
+                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \
+                     differences above are what would be left behind",
                 )
                 .into());
             }

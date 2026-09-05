@@ -2696,3 +2696,32 @@ SPEC is in sync with all of these.
     key with an unnamed one, and adds a unique, an index and a foreign key
     to a table already there, and applies — before it, no live plan had added
     any of those to an existing table at all (182).
+
+190. **A refusal names the remedy of the read that found the change.** A
+    staged run compares each read with the one before it and refuses on
+    movement (159). The message said the same thing at every read: "the
+    checkpoint holds the database as it stands, this change included —
+    resuming accepts it." That is true at a checkpoint, whose read *is* what
+    the checkpoint records. It is false at the closing read: that read comes
+    after the last checkpoint was written and nothing records it, so a
+    `--resume` measures the live database against a checkpoint that does not
+    hold the change and refuses it as moved — the very remedy the message
+    named cannot work. `staged_movement` now takes `StagedRead::Checkpoint`
+    or `StagedRead::Closing` and says, at the close, that no checkpoint holds
+    the change and a resume will refuse: undo it and resume, or baseline and
+    plan from there.
+    Measured: the live staged test makes a hand change after the checkpoint
+    and the resume refuses it with "has moved since the checkpoint"; undone,
+    the same resume accepts the checkpointed change and closes. The closing
+    window itself cannot be hit by a test — the only statement in it is the
+    ledger insert, whose `OUTPUT` clause forbids a trigger on the table — so
+    the message is pinned by a unit test and the resume behaviour by the live
+    one.
+    The same message carried a second wrong remedy, older: the guard's own
+    refusal ended "nothing has been applied — the transaction was rolled back;
+    then apply again", and every staged refusal wrapped it, one line above
+    "nothing was rolled back". The guard now states the finding and the
+    reason and no remedy; the transactional caller and the two staged reads
+    each append their own. A shared function does not know what its caller
+    can do about what it found.
+

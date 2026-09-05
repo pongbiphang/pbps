@@ -7316,6 +7316,11 @@ data:
         err.contains("dbo.other"),
         "the refusal must name what moved: {err}"
     );
+    // And the remedy it names is the transactional one, and only that: a
+    // staged refusal used to carry this sentence too, one line above
+    // "nothing was rolled back" (DECISIONS 190).
+    assert!(err.contains("the transaction was rolled back"), "{err}");
+    assert!(!err.contains("nothing was rolled back"), "{err}");
     assert!(err.contains("rolled back"), "{err}");
 
     // And nothing of the plan stayed: not its own row, and not the trigger's.
@@ -9349,6 +9354,11 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
         err.contains("nothing was rolled back") || err.contains("staged apply runs outside"),
         "and say that nothing was undone: {err}"
     );
+    // The change was found at a checkpoint read, so the checkpoint holds it
+    // and the remedy offered is to resume. Not the transactional remedy: a
+    // staged run has committed (DECISIONS 190).
+    assert!(err.contains("resuming accepts it"), "{err}");
+    assert!(!err.contains("transaction was rolled back"), "{err}");
 
     // The statement did commit and the checkpoint records it — that is what a
     // checkpoint is for — but the environment is left mid-deployment rather
@@ -9364,6 +9374,37 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
         "the environment is mid-deployment: {}",
         stdout(&o)
     );
+
+    // What a resume does with the two kinds of change, measured. A change
+    // made *after* the checkpoint is in no record, and the resume refuses
+    // the database as moved — which is why the closing read's refusal must
+    // not promise one (DECISIONS 190).
+    sql("INSERT INTO dbo.other (code) VALUES ('byhand');");
+    let resume = |d: &Demo| {
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--staged",
+            "--resume",
+        ])
+    };
+    let o = resume(&d);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "a change after the checkpoint: {err}");
+    assert!(err.contains("has moved since the checkpoint"), "{err}");
+    // The change the checkpoint *does* hold — the trigger's row — is accepted,
+    // as the checkpoint's refusal said it would be: with the hand-made one
+    // undone, the resume closes the deployment.
+    sql("DELETE FROM dbo.other WHERE code = 'byhand';");
+    let o = resume(&d);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
     rt.block_on(async {
         let mut c = pbps_db::Conn::connect(&server).await.expect("connect");

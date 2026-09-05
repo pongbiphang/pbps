@@ -2149,12 +2149,18 @@ fn refuse_unplanned_movement(
     if moved.is_empty() {
         return Ok(());
     }
+    // The finding and the reason, and no remedy: what to do about it depends
+    // on the caller. Inside a transaction nothing has been applied and the
+    // plan can simply be run again; a staged run has committed, and whether
+    // a `--resume` can go on depends on which read found the change. Naming
+    // the transactional remedy here put "the transaction was rolled back"
+    // into every staged refusal, one line above "nothing was rolled back"
+    // (DECISIONS 190).
     bail!(
         "`{label}` moved while this plan was running, and not because of it:\n  {}\n\
-         Nothing has been applied — the transaction was rolled back. The state `apply` \
-         records is the database read back, so another session's change committed during \
-         the run would have been written down as this plan's own result, and every later \
-         `verify` would call it clean. `pbps verify` shows what moved; then apply again.",
+         The state `apply` records is the database read back, so another session's change \
+         committed during the run would have been written down as this plan's own result, \
+         and every later `verify` would call it clean.",
         moved.join("\n  ")
     );
 }
@@ -3851,7 +3857,14 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             &after.schema,
             &target.label,
             Settled::Whole,
-        )?;
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\n\n\
+                 Nothing has been applied — the transaction was rolled back. `pbps verify` \
+                 shows what moved; then apply again."
+            )
+        })?;
         refuse_unexpressible(&after, &target.label, "apply again")?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
@@ -4157,8 +4170,10 @@ async fn apply_staged_under_lock(
             &previous,
             &recorded,
             &target.label,
-            i + 1,
-            total,
+            StagedRead::Checkpoint {
+                completed: i + 1,
+                total,
+            },
         )?;
         previous = recorded;
     }
@@ -4186,8 +4201,7 @@ async fn apply_staged_under_lock(
         &previous,
         &after.schema,
         &target.label,
-        total,
-        total,
+        StagedRead::Closing { total },
     )?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
@@ -4210,30 +4224,59 @@ async fn apply_staged_under_lock(
 /// wrong four times in the other one, inventing movement rather than missing
 /// it (152 to 158). What it costs is a change to an object the plan touches
 /// later; what it buys is that no correct staged apply is ever stopped by it.
+/// Which read of a staged run is being compared with the one before it.
+///
+/// The two are told apart because the remedy differs. A change found at a
+/// checkpoint is *in* that checkpoint — the read is what the checkpoint
+/// records — so a `--resume` measures the live database against a record that
+/// already holds it, and goes on. A change found at the closing read landed
+/// after the last checkpoint was written, and no record holds it: the same
+/// `--resume` finds the database moved since that checkpoint and refuses. One
+/// message told the operator to resume in both cases (DECISIONS 190).
+#[derive(Clone, Copy)]
+enum StagedRead {
+    /// The read a checkpoint records, once `completed` of `total` statements
+    /// have run.
+    Checkpoint { completed: usize, total: usize },
+    /// The read after the last checkpoint, which becomes the closing entry.
+    Closing { total: usize },
+}
+
 fn staged_movement(
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
     label: &str,
-    completed: usize,
-    total: usize,
+    read: StagedRead,
 ) -> anyhow::Result<()> {
     // Only the last read of a staged run can be asked what the plan achieved:
     // at a checkpoint most of the plan has not happened, and putting its
     // postconditions to one demanded changes that were still to come
     // (DECISIONS 161).
-    let settled = if completed == total {
-        Settled::Whole
-    } else {
-        Settled::SoFar
+    let settled = match read {
+        StagedRead::Checkpoint { completed, total } if completed < total => Settled::SoFar,
+        StagedRead::Checkpoint { .. } | StagedRead::Closing { .. } => Settled::Whole,
     };
     refuse_unplanned_movement(dialect, changes, before, after, label, settled).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#}
-
-             {completed} of {total} statement(s) completed and the ledger records them; a              staged apply runs outside a transaction, so nothing was rolled back. The              checkpoint holds the database as it stands, this change included — resuming              accepts it. `pbps verify` shows what it is."
-        )
+        match read {
+            StagedRead::Checkpoint { completed, total } => anyhow::anyhow!(
+                "{e:#}\n\n\
+                 {completed} of {total} statement(s) completed and the ledger records them; a \
+                 staged apply runs outside a transaction, so nothing was rolled back. The \
+                 checkpoint holds the database as it stands, this change included — resuming \
+                 accepts it. `pbps verify` shows what it is."
+            ),
+            StagedRead::Closing { total } => anyhow::anyhow!(
+                "{e:#}\n\n\
+                 All {total} statement(s) completed and the ledger records them; a staged \
+                 apply runs outside a transaction, so nothing was rolled back. This change \
+                 landed after the last checkpoint was written, so no checkpoint holds it, and \
+                 `--resume` will refuse the database as having moved since that checkpoint. \
+                 `pbps verify` shows what it is: undo it and resume, or take the database as \
+                 it stands with `pbps baseline --reason ...` and plan from there."
+            ),
+        }
     })
 }
 
@@ -4767,7 +4810,9 @@ mod tests {
         let robbed = schema("int", &[]);
         let e = refuse(&changes(vec![]), &before, &robbed).expect_err("the role moved");
         assert!(e.contains("role app"), "{e}");
-        assert!(e.contains("rolled back"), "{e}");
+        // The reason, and no remedy: that is the caller's to name (190).
+        assert!(e.contains("written down as this plan's own result"), "{e}");
+        assert!(!e.contains("rolled back"), "{e}");
 
         // The same change, when it *is* this plan's: a plan that revokes the
         // grant must not be refused for having revoked it.
@@ -6439,8 +6484,10 @@ mod tests {
             &before,
             &before,
             "prod",
-            1,
-            2,
+            StagedRead::Checkpoint {
+                completed: 1,
+                total: 2,
+            },
         )
         .expect("statement 1 of 2: the create has not run yet");
         let e = staged_movement(
@@ -6449,8 +6496,10 @@ mod tests {
             &before,
             &before,
             "prod",
-            2,
-            2,
+            StagedRead::Checkpoint {
+                completed: 2,
+                total: 2,
+            },
         )
         .expect_err("the last read is asked what the plan achieved");
         let e = format!("{e:#}");
@@ -7753,5 +7802,66 @@ mod tests {
             }),
         )
         .expect("the engine's rendering of the check");
+    }
+
+    /// The remedy a staged refusal names depends on which read found the
+    /// change. At a checkpoint the change is in the record and a resume goes
+    /// on; at the closing read nothing records it and a resume refuses the
+    /// database as moved — so telling the operator to resume there sent them
+    /// down a path that cannot work (DECISIONS 190).
+    #[test]
+    fn a_closing_staged_refusal_does_not_promise_a_resume() {
+        let schema = |rows: &[&str]| {
+            let t = pbps_model::Table {
+                data: Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    rows: rows
+                        .iter()
+                        .map(|k| (pbps_model::RowKey::from(*k), pbps_model::Row::default()))
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let mut s = Schema::default();
+            s.tables.insert("dbo.other".parse().unwrap(), t);
+            s
+        };
+        let untouched = pbps_model::ChangeSet {
+            changes: Vec::new(),
+        };
+        let refusal = |read: StagedRead| {
+            let e = staged_movement(
+                &pbps_mssql::Mssql,
+                &untouched,
+                &schema(&["kept"]),
+                &schema(&["kept", "rogue"]),
+                "prod",
+                read,
+            )
+            .expect_err("a row nobody planned");
+            format!("{e:#}")
+        };
+        let at_checkpoint = refusal(StagedRead::Checkpoint {
+            completed: 1,
+            total: 2,
+        });
+        assert!(
+            at_checkpoint.contains("resuming accepts it"),
+            "{at_checkpoint}"
+        );
+        assert!(at_checkpoint.contains("1 of 2"), "{at_checkpoint}");
+        let at_close = refusal(StagedRead::Closing { total: 2 });
+        assert!(!at_close.contains("resuming accepts"), "{at_close}");
+        assert!(at_close.contains("no checkpoint holds it"), "{at_close}");
+        assert!(at_close.contains("`--resume` will refuse"), "{at_close}");
+        // Both say what moved and that nothing was undone — and neither
+        // carries the transactional remedy, which used to sit one line above
+        // "nothing was rolled back" in every staged refusal.
+        for e in [&at_checkpoint, &at_close] {
+            assert!(e.contains("dbo.other"), "{e}");
+            assert!(e.contains("nothing was rolled back"), "{e}");
+            assert!(!e.contains("transaction was rolled back"), "{e}");
+            assert!(!e.contains("then apply again"), "{e}");
+        }
     }
 }

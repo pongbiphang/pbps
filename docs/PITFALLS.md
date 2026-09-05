@@ -309,6 +309,18 @@ things, and a test that asserts an exit code cannot tell them apart.
 
 `-z` and split on NUL. Never `lines()`, never `trim()`.
 
+## A remedy written where the finding is made
+
+`refuse_unplanned_movement` ended its message with what to do about it —
+"the transaction was rolled back; then apply again" — and the staged run
+wrapped that message under "nothing was rolled back". The staged wrapper then
+made the same mistake one level up: "resuming accepts it" at every read,
+including the one after the last checkpoint, where a resume refuses (decision
+190). A function that finds something does not know what its caller can do
+about it. State the finding and the reason there; let each caller name the
+way out it actually has — and check that way out against the code that
+implements it, not against what it ought to do.
+
 ## A path in a command is spelled with `to_str`, never `display()`
 
 On Unix a filename is bytes. `display()` substitutes U+FFFD, which `shell_arg`
