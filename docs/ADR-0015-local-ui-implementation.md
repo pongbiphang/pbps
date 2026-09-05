@@ -201,11 +201,16 @@ same git: a hook that ran `git add b` widened `git commit --only -- a` to a
 commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
 content, not the previewed hunk. So the push is not automatic. Before it, the
 UI reads the commit back — `git diff-tree --no-commit-id --name-only -r HEAD`
-must name exactly the previewed paths, the blob the commit holds at each path
-(`git rev-parse <oid>:<path>`) must be the blob the UI hashed after writing
-it (`git hash-object`), and the commit's one parent must be the tip the UI
-recorded before composing (below) — and pushes only a commit that passes all
-three. The second compares object ids and not diff output, because a diff is
+must name exactly the previewed paths, the tree entry the commit holds at
+each path (`git ls-tree <oid> -- <path>`: mode, type and blob) must be the
+mode and type the path had at the recorded tip — `100644 blob` for a new
+one — with the blob the UI hashed after writing it (`git hash-object`), and
+the commit's one parent must be the tip the UI recorded before composing
+(below) — and pushes only a commit that passes all three. The second reads
+the whole entry and not the blob alone because a hook can change what the
+blob does not carry: **measured**, a `pre-commit` hook running `chmod +x`
+and `git add` left the blob id equal and turned the entry from `100644` to
+`100755`. It compares object ids and not diff output, because a diff is
 a presentation: a `diff.external` or `textconv` driver, or a path marked
 binary, can render two different blobs as one text, and **measured**, with
 `diff.external` set to a helper printing a constant, `git diff HEAD~1 HEAD`
@@ -232,7 +237,14 @@ feature branch, which is the common case — is not an ahead branch: the
 destination is absent rather than behind, and the check is instead that the
 tip is already on the remote, an ancestor of one of the heads `ls-remote`
 lists (`git merge-base --is-ancestor`), so that the one commit the push
-carries is again the intent commit. After the read-back the push names the
+carries is again the intent commit. That head is fetched first, into a
+temporary ref of the UI's own (`git fetch --no-tags <remote>
++refs/heads/<witness>:refs/pbps-ui/witness`), and the ancestry test and the
+lease use the ref's value: `ls-remote` names an object the local repository
+need not have, and **measured**, with the remote's `main` advanced since the
+last fetch, `merge-base --is-ancestor` against the `ls-remote` id exited 128
+with `Not a valid commit name`, and against the fetched ref answered. After
+the read-back the push names the
 verified commit rather than `HEAD`, which another process may have moved, and
 leases the destination on the tip it recorded — or on its absence, with an
 empty expected value: `git push --no-follow-tags
