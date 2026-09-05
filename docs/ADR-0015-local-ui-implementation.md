@@ -165,138 +165,135 @@ browser is written into the browser's memory, its autofill, and the server's
 request log. Since the UI cannot connect — only the CLI can — there is nothing
 the form would be for.
 
-### 5. Git through the `git` command, not a library
+### 5. Git through the `git` command, not a library — and the commit through plumbing, which runs no hook
 
 Composing intent (step 4 of #64) ends as the same file edit the CLI's intent
 commands make, followed by a commit of *those paths and nothing else* and a
-`git push`, run as subprocesses in the checkout the UI was started in, with
-the user's own configuration. The commit is `git commit --only -m <message>
--- <paths>`, after `git add -N -- <path>` for a path that is new; every path
-the UI hands `git` comes after `--`, since a path may begin with a dash and
-**measured**, `git add -N -A` with a file called `-A` in the tree marked every
-untracked file, where `git add -N -- -A` marked the one. The message is the
-page's to ask for, prefilled from the intent the way the CLI's own error
-output spells it (`rename dbo.customer.customer_name full_name`), and passed
-with `-m` because a commit with no message opens an editor, which a
-subprocess with no terminal cannot answer — **measured**: with no editor
-variable set and no terminal, `git commit --only -- a` exited non-zero
-without committing, and the same command with `-m` committed. The commit is
-signed exactly when the shell's would be: the UI passes no `-S` and sets no
-`commit.gpgSign`, since a commit the UI signs differently from the shell is
-the very difference an auditor asks about, and a forced signature fails on a
-machine without a key. The page reads `git log -1 --format=%G? <oid>` and
-shows whether the commit is signed — ADR-0006's "signed commit" is the
-organization's signing policy applied by the user's own configuration, not a
-guarantee this UI adds. `--only` takes
-the named paths from the working tree and leaves whatever the index already
-held staged and uncommitted; the preview the page shows first is `git diff
-HEAD -- <paths>`, which is exactly that content. Every `git` the UI runs
-takes `--literal-pathspecs`, and the paths as the bytes the configuration
-holds: a path is a *pathspec* to `git`, and **measured**, `git diff HEAD --
-'a[12].json'` selected `a1.json`, `a2.json` and `a[12].json`, and `commit
---only` the same three, where `--literal-pathspecs` selected the one file
-named. **Measured** on git 2.43: with an unrelated
-file staged, `git commit --only -- ids.json` committed the ids file alone and
-left the other file staged, and `git diff HEAD -- ids.json` showed the same
-hunk — where a plain `git add` and `git commit` would have swept the staged
-file into the intent commit and pushed it, and a plain `git diff` would not
-have shown it in the preview.
+push of *that commit and nothing else*, both run as `git` subprocesses in the
+checkout the UI was started in, with the user's own configuration. The page
+asks for the message, prefilled from the intent the way the CLI's own error
+output spells it (`rename dbo.customer.customer_name full_name`), and shows
+the diff before the commit, the branch after the push, and a link to the
+merge request where the hosting's URL shape is known.
 
-`--only` bounds what the UI asks for; it does not bound what a hook does. A
-`pre-commit` hook runs with the index in its hands, and **measured** on the
-same git: a hook that ran `git add b` widened `git commit --only -- a` to a
-commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
-content, not the previewed hunk. So the push is not automatic. Before it, the
-UI reads the commit back — `git diff-tree --no-commit-id --name-only -r -z
-HEAD` must name exactly the previewed paths, the tree entry the commit holds
-at each path (`git ls-tree -z <oid> -- <path>`: mode, type and blob) must be the
-mode and type the path had at the recorded tip — `100644 blob` for a new
-one — with the blob the UI hashed after writing it (`git hash-object`), the
-commit's one parent must be the tip the UI recorded before composing (below),
-and the commit's message (`git log -1 --format=%B <oid>`) must be the one the
-user entered — a `commit-msg` hook edits the message file, and **measured**,
-one appending a line changed what `--only -m requested` recorded — and the
-branch the UI recorded (`refs/heads/<branch>`) must now point at that commit
-with `HEAD` still symbolic to it — a checkout switched to a sibling branch at
-the same tip between the check and the commit passes the parent check, and
-**measured**, the commit then advanced the sibling while the recorded branch
-stayed behind, so the push would have published to a branch the commit was
-never on. It pushes only a commit that passes all five. The second reads
-the whole entry and not the blob alone because a hook can change what the
-blob does not carry: **measured**, a `pre-commit` hook running `chmod +x`
-and `git add` left the blob id equal and turned the entry from `100644` to
-`100755`. Both reads take `-z` and are parsed as bytes: without it `git` quotes any
-path that is not plain ASCII (**measured**: `schéma.json` came back as
-`"sch\303\251ma.json"` from `diff-tree` and `ls-tree`, and unquoted with
-`-z`), and a newline in a name makes a line-delimited answer ambiguous — the
-same rule as SPEC §9.8's `location.file`, which refuses a lossy spelling
-rather than point at a different file. It compares object ids and not diff
-output, because a diff is
-a presentation: a `diff.external` or `textconv` driver, or a path marked
-binary, can render two different blobs as one text, and **measured**, with
-`diff.external` set to a helper printing a constant, `git diff HEAD~1 HEAD`
-showed that constant for a file a hook had rewritten, while the recorded and
-committed blob ids differed. The preview the page shows is rendered with
-`--no-ext-diff --no-textconv` for the same reason, and is a preview; the blob
-id is the proof. The third is there because the first two look only at the new commit's
-own delta: another process moving the branch between the check below and the
-commit gives the intent commit an ancestry the preview never showed, and
-**measured**, a commit slipped in after the check passed both delta checks
-and failed only the parent one. A commit that fails any of the five is left
-where it is, unpushed and reversible, and the page shows
-what differs from the preview and the commands to push it or undo it; the
-hook's change is the user's to look at, not the UI's to publish or discard.
+The first design was the porcelain `git commit --only -m <message> --
+<paths>`, with the commit read back afterwards and pushed only if it matched
+the preview. It is refused, and the record of why is worth keeping, because
+every step of it was **measured** on git 2.43 before it was given up. A
+`pre-commit` hook runs with the index in its hands: one that ran `git add b`
+widened `--only -- a` to a commit of `a` and `b`; one that rewrote `a`
+committed the rewritten content; one that ran `chmod +x` left the blob id
+equal and turned the tree entry from `100644` to `100755`. A `commit-msg`
+hook appending a line changed the message `-m requested` had asked for. And a
+`post-commit` hook that pushes runs before `git commit` returns: with the
+staging hook beside it, the remote held `a` and `b` before the UI could run
+its first read-back. Five checks were written for the first four of those,
+and the fifth showed the shape of the mistake: once a hook can publish, a
+check after the fact is a check too late. The rule this repository already
+holds applies — a failure that can be made unrepresentable is not to be
+checked for — and `git` has the tools to make it so.
+
+The commit is built with plumbing, which runs no hook at any point:
+
+1. Before composing, the UI records the branch `HEAD` is symbolic to and its
+   tip (`git symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and
+   the remote's tip for that branch, under the rules below.
+2. It writes the edited files, and stores each as a blob:
+   `git hash-object -w -- <path>`.
+3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
+   tree, replaces the entry for each edited path with that blob at the mode
+   the path had at the tip — `100644` for a new one — and writes the tree:
+   `git read-tree <tip>`, `git update-index --cacheinfo <mode>,<blob>,<path>`,
+   `git write-tree`. The user's own index is never read and never changed.
+4. It makes the commit from that tree, on that parent, with that message:
+   `git commit-tree <tree> -p <tip> -m <message>`. The commit is what was
+   previewed *by construction* — those paths, those blobs, that parent, that
+   message — and there is nothing to read back. It is signed exactly when the
+   shell's would be: `commit-tree` honours `commit.gpgSign`, the UI passes
+   no `-S`, and the page shows `git log -1 --format=%G? <oid>`. ADR-0006's
+   "signed commit" is the organization's signing policy applied by the user's
+   configuration, not a guarantee this UI adds — a forced signature fails on
+   a machine without a key.
+5. It moves the branch to the commit only if the branch is still where it
+   was: `git update-ref refs/heads/<branch> <oid> <tip>`, a compare-and-swap
+   that refuses if anything moved the branch in between, and the one step
+   that changes the checkout.
+6. It refreshes the user's index for the edited paths with the same
+   `--cacheinfo`, so `git status` is clean for what the UI did and untouched
+   for everything else.
+
+**Measured** on git 2.43, with the staging, pushing and pre-push hooks all
+installed: `commit-tree` made a commit holding `a` alone with the message
+intact, the remote did not move, and no hook ran; `update-ref` with a stale
+expected value refused with `is at <x> but expected <tip>` and left the
+branch where it was, and with the recorded one moved it, leaving `HEAD`
+symbolic to it; and after the `--cacheinfo` refresh `git status` was clean.
+The race the porcelain route needed a parent check and a branch check for —
+another process moving or switching the branch between the record and the
+commit — is closed by step 5 alone.
+
+The preview is `git diff --no-ext-diff --no-textconv <tip> <tree>`: the
+recorded tip against the tree the UI built, exact by construction, and
+rendered without presentation filters because a `diff.external` or
+`textconv` driver can show two blobs as one text (**measured**: a driver
+printing a constant hid a rewritten file). Every `git` the UI runs takes
+`--literal-pathspecs`, every path comes after `--`, and every command that
+prints paths takes `-z` and is parsed as bytes, each for a reason that was
+measured: `a[12].json` is a pattern to `git` and selected three files
+without `--literal-pathspecs`; a file named `-A` made `git add -N -A` mark
+every untracked file; and `schéma.json` came back C-quoted from `ls-tree`
+without `-z`.
 
 The push is bounded to that one commit, and to it by name. Before composing,
-the UI reads the branch's tip and the remote's (`git ls-remote <remote>
-refs/heads/<branch>`) and refuses to compose unless they are equal, showing
-the unpushed commits and the commands instead: a refspec bounds the
-destination ref, not the range, and a branch already ahead would have every
-unpushed ancestor published under the intent commit without ever appearing in
-the preview. A branch the remote does not have yet — the first push of a
-feature branch, which is the common case — is not an ahead branch: the
+the UI reads the remote's tip for the branch (`git ls-remote <remote>
+refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
+showing the unpushed commits and the commands instead: a refspec bounds the
+destination ref, not the range, and **measured**, a branch one unrelated
+commit ahead had that commit published under the intent commit by
+`HEAD:refs/heads/<branch>`. A branch the remote does not have yet — the first
+push of a feature branch, the common case — is not an ahead branch: the
 destination is absent rather than behind, and the check is instead that the
 tip is already on the remote, an ancestor of one of the heads `ls-remote`
-lists (`git merge-base --is-ancestor`), so that the one commit the push
-carries is again the intent commit. That head is fetched first, into a
-temporary ref of the UI's own (`git fetch --no-tags <remote>
-+refs/heads/<witness>:refs/pbps-ui/witness`), and the ancestry test and the
-lease use the ref's value: `ls-remote` names an object the local repository
-need not have, and **measured**, with the remote's `main` advanced since the
-last fetch, `merge-base --is-ancestor` against the `ls-remote` id exited 128
-with `Not a valid commit name`, and against the fetched ref answered. After
-the read-back the push names the
-verified commit rather than `HEAD`, which another process may have moved, and
+lists. That head is fetched first into a ref of the UI's own (`git fetch
+--no-tags <remote> +refs/heads/<witness>:refs/pbps-ui/witness`), because
+`ls-remote` names an object the local repository need not have
+(**measured**: `merge-base --is-ancestor` against the bare id exited 128,
+against the fetched ref it answered). The push then names the commit by id,
 leases the destination on the tip it recorded — or on its absence, with an
-empty expected value: `git push --no-follow-tags
---force-with-lease=refs/heads/<branch>:<tip> <remote> <oid>:refs/heads/<branch>`,
-never a bare `git push`. The first push of a new branch leases its witness
-too: the head that proved the tip was on the remote is named in the same
-push, at the value `ls-remote` gave, under `--atomic` — `--force-with-lease`
-on a ref the push does not name is ignored, and a witness force-moved or
-deleted between `ls-remote` and the push would otherwise let the push make
-its old history reachable again. **Measured** on the same git: `ls-remote`
-answered nothing for the unpublished branch, the tip was an ancestor of the
-remote's `main`, and the push with the empty lease created the branch; with
-`main` then moved on the remote, a lease on `main` without pushing it was
-ignored and the branch was created anyway, while the atomic push naming
-`main` at its recorded value was refused as stale and created nothing. And with
-`push.default=matching` and two branches ahead, a bare `git push` advanced
-both; a branch one unrelated commit ahead had that commit published by
-`HEAD:refs/heads/<branch>`; with `HEAD` moved on after the read-back, the push
-by object id published the verified commit and not `HEAD`; and with the
-remote moved, the lease refused the push as stale. After a push the page shows
-the branch and links the merge request where the hosting's URL shape is
-known.
+empty expected value — and, for a first push, names the witness at its
+fetched value in the same push under `--atomic`, since a lease on a ref the
+push does not name is ignored (**measured**: with the witness moved on the
+remote, the lease alone let the branch be created; the atomic push naming the
+witness was refused as stale and created nothing). It takes `--no-verify`,
+because a `pre-push` hook is a hook (**measured**: it ran without the flag and
+not with it), and `--no-follow-tags`; never a bare `git push`, which under
+`push.default=matching` advanced two branches at once when measured:
+
+```
+git push --no-verify --no-follow-tags --atomic \
+    --force-with-lease=refs/heads/<branch>:<tip-or-empty> \
+    [--force-with-lease=refs/heads/<witness>:<fetched> <fetched>:refs/heads/<witness>] \
+    <remote> <oid>:refs/heads/<branch>
+```
+
+What this gives up is stated plainly: **the user's hooks do not run for a
+commit or a push the UI makes**, and the page says so beside the commit. A
+hook is the shell's policy at commit time; this tool keeps policy in files
+and in CI (SPEC §14.3, and the `policies:` block of ADR-0008), the intent
+commit is one line in the ids file and the declaration it names, and a
+`plan --check` in the pipeline reads it the same whether a hook saw it or
+not. An organization that needs a rule enforced on every commit enforces it
+where a rebase cannot skip it either — on the server or in CI — and one that
+relied on a client hook alone had no enforcement to lose.
 
 A library (`gix`, `libgit2`) is the obvious design and would remove a runtime
 dependency on a `git` binary. It is refused because ADR-0006's audit story is
 "what an auditor is shown is a signed commit", and the signing key, the
-identity, the credential helper, the hooks and the `push.default` are all
-configuration the user's `git` already honours and a library has to re-read
-and re-implement — each one a way for a commit made from the UI to differ from
-a commit made from the shell, which is the difference an auditor is entitled
-to ask about. A `git` that prompts — for a passphrase, for a credential — gets
+identity, the credential helper and the remote configuration are all things
+the user's `git` already honours and a library has to re-read and
+re-implement — each one a way for a commit made from the UI to differ from a
+commit made from the shell, which is the difference an auditor is entitled to
+ask about. A `git` that prompts — for a passphrase, for a credential — gets
 no terminal from the UI and fails; the page then shows the command to run by
 hand, which is SPEC §6.4's rule for the CLI applied unchanged.
 
