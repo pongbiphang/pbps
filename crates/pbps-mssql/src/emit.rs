@@ -230,7 +230,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             permissions,
         } => one(format!(
             "GRANT {} ON {} TO {};",
-            permission_list(permissions),
+            permission_list(permissions)?,
             securable(target)?,
             quote(role)?
         )),
@@ -240,7 +240,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             permissions,
         } => one(format!(
             "REVOKE {} ON {} FROM {};",
-            permission_list(permissions),
+            permission_list(permissions)?,
             securable(target)?,
             quote(role)?
         )),
@@ -1065,16 +1065,21 @@ fn securable(target: &GrantTarget) -> Result<String, DialectError> {
 }
 
 /// The permission names as the engine spells them, in the model's order.
-fn permission_list(permissions: &BTreeSet<Permission>) -> String {
-    permissions
+fn permission_list(permissions: &BTreeSet<Permission>) -> Result<String, DialectError> {
+    Ok(permissions
         .iter()
         .map(|p| permission_sql(*p))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", "))
 }
 
-pub(crate) fn permission_sql(p: Permission) -> &'static str {
-    match p {
+/// The engine's spelling of `p`, or `Unsupported` for a word the model holds
+/// for the other engine (ADR-0010 §6): `validate` refuses those first, and
+/// this is the second lock on the same door — a statement the engine's parser
+/// would stop at (Msg 102) is never rendered, so it cannot be the statement
+/// that fails halfway through a staged apply.
+pub(crate) fn permission_sql(p: Permission) -> Result<&'static str, DialectError> {
+    Ok(match p {
         Permission::Select => "SELECT",
         Permission::Insert => "INSERT",
         Permission::Update => "UPDATE",
@@ -1083,7 +1088,21 @@ pub(crate) fn permission_sql(p: Permission) -> &'static str {
         Permission::Execute => "EXECUTE",
         Permission::Alter => "ALTER",
         Permission::ViewDefinition => "VIEW DEFINITION",
-    }
+        Permission::Usage
+        | Permission::Create
+        | Permission::Truncate
+        | Permission::Trigger
+        | Permission::Maintain => {
+            return Err(DialectError::Unsupported {
+                dialect: types::DIALECT,
+                feature: format!(
+                    "the `{}` permission, which is PostgreSQL's (ADR-0010 §6); this engine takes {}",
+                    p.as_str(),
+                    crate::validate::permission_words()
+                ),
+            });
+        }
+    })
 }
 
 fn null_clause(nullable: bool) -> &'static str {
@@ -2601,6 +2620,49 @@ mod tests {
             permissions: perms(&[Permission::Execute]),
         });
         assert_eq!(sql, ["REVOKE EXECUTE ON SCHEMA::[app] FROM [app_reader];"]);
+    }
+
+    /// A word the model holds for PostgreSQL (ADR-0010 §6) is never rendered
+    /// into a statement this engine's parser would stop at (Msg 102): the
+    /// change is refused as unsupported, naming the word, on a grant and on
+    /// a revoke — even beside words the engine has.
+    #[test]
+    fn a_permission_this_engine_lacks_is_refused_not_rendered() {
+        for change in [
+            Change::Grant {
+                role: "app_reader".into(),
+                target: "dbo.customer".parse().unwrap(),
+                permissions: perms(&[Permission::Select, Permission::Usage]),
+            },
+            Change::Revoke {
+                role: "app_reader".into(),
+                target: "schema::app".parse().unwrap(),
+                permissions: perms(&[Permission::Truncate]),
+            },
+        ] {
+            let e = emit(&change, Strategy::default()).unwrap_err();
+            let DialectError::Unsupported { feature, .. } = &e else {
+                panic!("not unsupported: {e:?}");
+            };
+            assert!(
+                feature.contains("usage") || feature.contains("truncate"),
+                "{feature}"
+            );
+            assert!(feature.contains("PostgreSQL"), "{feature}");
+        }
+        for p in [
+            Permission::Usage,
+            Permission::Create,
+            Permission::Truncate,
+            Permission::Trigger,
+            Permission::Maintain,
+        ] {
+            assert!(permission_sql(p).is_err(), "{p:?}");
+        }
+        assert_eq!(
+            permission_sql(Permission::ViewDefinition).unwrap(),
+            "VIEW DEFINITION"
+        );
     }
 
     /// The same rule identifiers follow: a value can never end its own literal.

@@ -461,6 +461,23 @@ pub trait Dialect {
         self.normalize_type(ty)
     }
 
+    /// Whether this engine's roles are the tool's to create, rename and drop
+    /// (ADR-0010 §3).
+    ///
+    /// SQL Server's database role lives inside the one database the tool is
+    /// connected to, so ADR-0005 manages its existence, and that is what the
+    /// default says. A PostgreSQL role is a cluster object — visible from, and
+    /// granted in, every database of the cluster — and a tool whose blast
+    /// radius is one database must not own an object whose blast radius is
+    /// the cluster; that dialect answers `false`, and on it a declared role
+    /// the cluster lacks is refused by `plan --db` with the `CREATE ROLE` to
+    /// run by hand, while `drop-role` revokes the declared grants and leaves
+    /// the `DROP ROLE` to a human (DECISIONS 211). Grants are managed either
+    /// way: this is about the principal, not what it holds.
+    fn manages_roles(&self) -> bool {
+        true
+    }
+
     /// Checks whether this dialect can express the role and its grants
     /// (ADR-0005). The same default, for the same reason. The schema is there
     /// so a grant can be checked against what its target *is*: which

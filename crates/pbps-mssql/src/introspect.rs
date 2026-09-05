@@ -969,17 +969,26 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 continue;
             }
         }
-        let Ok(permission) = p.permission.parse::<pbps_model::Permission>() else {
-            unexpressible.push(Unexpressible {
-                role: p.role.clone(),
-                target: Some(target.clone()),
-                what: format!(
-                    "role {}: {} on {target} is outside the permissions pbps manages; the \
-                     declarations cannot express it",
-                    p.role, p.permission
-                ),
-            });
-            continue;
+        // The model's set is the union of the engines' (ADR-0010 §6), so a
+        // word that parses is not yet a word this engine has: the second
+        // filter keeps a spelling SQL Server never returns (measured, none of
+        // the five is a built-in permission in any class) from being written
+        // into a role on the day the catalog grows one, where `validate`
+        // would refuse the project `pull` just wrote.
+        let permission = match p.permission.parse::<pbps_model::Permission>() {
+            Ok(permission) if crate::validate::has_permission(permission) => permission,
+            _ => {
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: Some(target.clone()),
+                    what: format!(
+                        "role {}: {} on {target} is outside the permissions pbps manages on SQL \
+                         Server; the declarations cannot express it",
+                        p.role, p.permission
+                    ),
+                });
+                continue;
+            }
         };
         if p.state.trim() == "W" {
             // Not folded into the plain grant: it is wider, and a comparison
@@ -1132,6 +1141,44 @@ mod tests {
         assert!(
             p.unexpressible[0].what.contains("dbo.order_seq")
                 && p.unexpressible[0].what.contains("does not model"),
+            "{:?}",
+            p.unexpressible
+        );
+    }
+
+    /// A word the model spells for the other engine (ADR-0010 §6) is not a
+    /// word this engine's catalog returns — measured, none of the five is a
+    /// built-in permission in any class — and if it ever did, it is reported
+    /// and left out like `CONTROL`, never written into a role `validate`
+    /// would then refuse.
+    #[test]
+    fn a_catalog_word_the_model_holds_for_the_other_engine_is_reported_and_left_out() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |permission: &str| RawPermission {
+            role: "app_reader".into(),
+            class: 1,
+            class_desc: "OBJECT_OR_COLUMN".into(),
+            permission: permission.into(),
+            state: "G".into(),
+            schema: "dbo".into(),
+            object: Some("customer".into()),
+            minor_id: 0,
+        };
+        raw.permissions.push(grant("SELECT"));
+        raw.permissions.push(grant("TRUNCATE"));
+        let p = assemble(&raw);
+        let held = &p.schema.roles["app_reader"].grants[&"dbo.customer".parse().unwrap()];
+        assert_eq!(
+            held.iter().copied().collect::<Vec<_>>(),
+            [pbps_model::Permission::Select]
+        );
+        assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
+        assert!(
+            p.unexpressible[0].what.contains("TRUNCATE")
+                && p.unexpressible[0].what.contains("on SQL Server"),
             "{:?}",
             p.unexpressible
         );

@@ -6769,6 +6769,48 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     assert!(ids.contains("SEC-9 retired"), "{ids}");
 }
 
+/// The permission set is the union of the engines' (ADR-0010 §6): `usage` is a
+/// word the loader accepts, and on SQL Server it is the dialect's finding —
+/// named, with the words this engine takes — so a PostgreSQL role file fails
+/// `validate` here rather than a `GRANT` the engine cannot parse failing
+/// halfway through an apply.
+#[test]
+fn a_permission_the_engine_lacks_is_a_dialect_finding_not_a_parse_error() {
+    let d = Demo::new("rolepgword");
+    d.files(&A_TABLE_AND_A_ROLE);
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [select, usage]\n  schema::app: [create]\n",
+    )]);
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let findings: Vec<(&str, &str)> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["id"].as_str().unwrap(), f["message"].as_str().unwrap()))
+        .collect();
+    assert_eq!(findings.len(), 2, "{v}");
+    for (id, message) in &findings {
+        assert_eq!(*id, "dialect.rejected", "{v}");
+        assert!(message.contains("PostgreSQL's"), "{message}");
+        assert!(message.contains("view-definition"), "{message}");
+    }
+    assert!(findings[0].1.contains("`usage` on `dbo.customer`"), "{v}");
+    assert!(findings[1].1.contains("`create` on `schema::app`"), "{v}");
+    // A word outside both engines is still the loader's error, before any
+    // dialect is asked.
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [control]\n",
+    )]);
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0);
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(all.contains("control") && all.contains("usage"), "{all}");
+}
+
 /// The foreign-key-target rule applied to permissions: a grant on an object
 /// nobody declares is refused by `validate`, and a schema-level grant is not.
 #[test]

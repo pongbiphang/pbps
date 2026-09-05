@@ -182,8 +182,13 @@ beside what it read back, the differ compares declared against declared and
 falls back to the read-back where nothing was recorded, and the snapshot is 7
 with 6 still readable. That fixed a shipped loop on SQL Server — a check or a
 filtered index restated on every connected plan — and left the bindings'
-recording, which needs a search path, to the PostgreSQL crate. The permission
-widening of ADR-0010 is the model step still open.
+recording, which needs a search path, to the PostgreSQL crate. And the
+permission widening of ADR-0010 §6 (DECISIONS 210–211): `Permission` is the
+union of the engines' words, SQL Server refuses the five it lacks from one
+table in `validate`, `emit` and the read-back, role existence is a dialect
+capability SQL Server answers `true` to, and the editor schema lists the words
+(schema version 7). With that, the three model-format steps of Phase 5 are in;
+what remains is the PostgreSQL crate itself.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI
