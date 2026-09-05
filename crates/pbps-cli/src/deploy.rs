@@ -2869,7 +2869,7 @@ pub fn cmd_bootstrap(
             }
 
             transaction_attempted = true;
-            execute_transaction_body(&mut conn, &statements).await?;
+            execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
 
             // Read-back and the success ledger row are part of the same
             // transaction as the DDL. If either fails, the database is still
@@ -2900,7 +2900,7 @@ pub fn cmd_bootstrap(
         }
         .await;
         let result = if transaction_attempted {
-            finish_transaction(&mut conn, result).await
+            finish_transaction(&mut conn, dialect.as_ref(), result).await
         } else {
             result
         };
@@ -3854,7 +3854,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
 
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
-        execute_transaction_body(conn, statements).await?;
+        execute_transaction_body(conn, dialect, statements).await?;
 
         // What gets recorded is the database read back, not the plan applied to
         // the old state. Expressions come back in the engine's stored form, and
@@ -3915,7 +3915,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         Ok::<_, anyhow::Error>(pbps_mssql::state::record(conn, &snapshot).await?)
     }
     .await;
-    finish_transaction(conn, result).await
+    finish_transaction(conn, dialect, result).await
 }
 
 /// A staged apply: one logical change, run statement by statement outside a
@@ -4654,9 +4654,12 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
 /// [`finish_transaction`] is what closes it, on both paths.
 async fn execute_transaction_body(
     conn: &mut Conn,
+    dialect: &dyn Dialect,
     statements: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
-    conn.begin().await.context("cannot open a transaction")?;
+    conn.begin(dialect.transaction_framing())
+        .await
+        .context("cannot open a transaction")?;
     for stmt in statements {
         if let Err(e) = conn.execute(&stmt.sql).await {
             return Err(anyhow::anyhow!(
@@ -4675,11 +4678,16 @@ async fn execute_transaction_body(
 /// Everything between the statements and the commit is inside the transaction,
 /// so a failure there has to undo the statements too — an apply whose
 /// read-back or ledger entry failed has changed nothing (147).
-async fn finish_transaction<T>(conn: &mut Conn, result: anyhow::Result<T>) -> anyhow::Result<T> {
+async fn finish_transaction<T>(
+    conn: &mut Conn,
+    dialect: &dyn Dialect,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let framing = dialect.transaction_framing();
     match result {
         Ok(value) => {
-            if let Err(error) = conn.commit().await {
-                let _ = conn.rollback().await;
+            if let Err(error) = conn.commit(framing).await {
+                let _ = conn.rollback(framing).await;
                 return Err(
                     anyhow::Error::new(error).context("the transaction could not be committed")
                 );
@@ -4687,7 +4695,7 @@ async fn finish_transaction<T>(conn: &mut Conn, result: anyhow::Result<T>) -> an
             Ok(value)
         }
         Err(error) => {
-            let _ = conn.rollback().await;
+            let _ = conn.rollback(framing).await;
             Err(error)
         }
     }

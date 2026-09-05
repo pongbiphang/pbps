@@ -25,6 +25,7 @@
 //! shorter, and would make a replacement an API change for every caller instead
 //! of an edit to one file.
 
+use pbps_dialect::TransactionFraming;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -62,21 +63,27 @@ pub enum DbError {
 }
 
 impl DbError {
-    /// The server's own error number, when the failure came from the server
+    /// The server's own error code, when the failure came from the server
     /// rather than from the connection.
     ///
-    /// Exposed as a bare number and not interpreted here: what 208 or 229
-    /// *mean* is SQL Server's vocabulary, and this crate deliberately holds
-    /// none of it — a dialect's error codes belong in that dialect's crate.
-    /// What this crate owns is that the number is reachable at all without a
-    /// second crate naming `tiberius`.
-    pub fn server_error_number(&self) -> Option<u32> {
+    /// Exposed as text and not interpreted here: what `208` or `229` *mean* is
+    /// SQL Server's vocabulary, and this crate deliberately holds none of it —
+    /// a dialect's error codes belong in that dialect's crate. What this crate
+    /// owns is that the code is reachable at all without a second crate naming
+    /// `tiberius`.
+    ///
+    /// Text rather than a number, because a number is one engine's shape too:
+    /// PostgreSQL's SQLSTATE is five characters that may be letters (`42P01`),
+    /// and an `Option<u32>` here was a T-SQL type under a neutral name
+    /// (ADR-0014 §1). Owned, because this driver hands back a number and there
+    /// is no string in the error for a `&str` to borrow from.
+    pub fn server_error_code(&self) -> Option<String> {
         // Enumerated rather than wildcarded, as `wildcard_enum_match_arm`
         // requires: a variant added later must be looked at here, because the
-        // answer "no number" is the one a caller reads as "not the case I am
+        // answer "no code" is the one a caller reads as "not the case I am
         // asking about" and would silently apply to it.
         match self {
-            DbError::Driver(e) => e.code(),
+            DbError::Driver(e) => e.code().map(|code| code.to_string()),
             DbError::BadConnectionString(_)
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
@@ -274,31 +281,26 @@ impl Conn {
         Ok(result.rows_affected().iter().sum())
     }
 
-    /// Opens a transaction for "one plan, one transaction, all or nothing"
-    /// (SPEC §7.5).
+    /// Opens a transaction with the dialect's own statement.
     ///
-    /// `XACT_ABORT ON` is what makes that promise true rather than merely
-    /// intended: without it, SQL Server keeps a transaction running after many
-    /// statement-level errors, so a failed statement halfway through a plan
-    /// would leave the earlier ones committable. With it, any such error dooms
-    /// the transaction and the rollback is total.
-    pub async fn begin(&mut self) -> Result<(), DbError> {
-        self.execute("SET XACT_ABORT ON; BEGIN TRANSACTION;").await
+    /// What the statement has to say is the dialect's business — SQL Server's
+    /// carries `SET XACT_ABORT ON`, without which a failed statement halfway
+    /// through a plan leaves the earlier ones committable — and it is asked
+    /// for rather than held here, so this crate keeps to what it owns: that a
+    /// transaction is opened, and closed again on every path (ADR-0014 §2).
+    pub async fn begin(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
+        self.execute(framing.begin).await
     }
 
-    pub async fn commit(&mut self) -> Result<(), DbError> {
-        self.execute("COMMIT TRANSACTION;").await
+    pub async fn commit(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
+        self.execute(framing.commit).await
     }
 
-    /// Rolls back, tolerating a transaction the server has already killed.
-    ///
-    /// After `XACT_ABORT` doomed the transaction, `ROLLBACK` may find nothing to
-    /// roll back and error with "no corresponding BEGIN TRANSACTION". Reporting
-    /// that error would replace the real failure — the statement that broke —
-    /// with a confusing second one, so the guard checks `@@TRANCOUNT` instead.
-    pub async fn rollback(&mut self) -> Result<(), DbError> {
-        self.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;")
-            .await
+    /// Rolls back. The dialect's statement is expected to tolerate a
+    /// transaction the server has already killed, so that its own error cannot
+    /// replace the real failure — the statement that broke — with a second one.
+    pub async fn rollback(&mut self, framing: TransactionFraming) -> Result<(), DbError> {
+        self.execute(framing.rollback).await
     }
 }
 

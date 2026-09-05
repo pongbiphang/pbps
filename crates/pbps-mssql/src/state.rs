@@ -230,7 +230,7 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
 /// there. **Not** the code for one that is there and may not be read — that is
 /// 229, "permission was denied", and keeping the two apart is the whole point
 /// of asking by error number.
-const INVALID_OBJECT_NAME: u32 = 208;
+const INVALID_OBJECT_NAME: &str = "208";
 
 /// Whether a failure means "that table does not exist".
 ///
@@ -247,7 +247,7 @@ const INVALID_OBJECT_NAME: u32 = 208;
 /// way. The statement itself is the only thing that does: 208 for absent, 229
 /// for denied, and every other failure stays a failure.
 fn is_missing_table(e: &DbError) -> bool {
-    e.server_error_number() == Some(INVALID_OBJECT_NAME)
+    e.server_error_code().as_deref() == Some(INVALID_OBJECT_NAME)
 }
 
 /// Releases the lock. `false` means it was not held.
