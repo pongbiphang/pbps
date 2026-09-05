@@ -215,7 +215,11 @@ The steps:
    gone (**measured**: `git add` and `git switch` both exited 128 with
    `Unable to create '.git/index.lock': File exists`). The
    lock is held through step 6; on any failure it is deleted without being
-   installed, and the index is as it was.
+   installed, and the index is as it was. It takes `HEAD`'s lock the same
+   way — an empty `<git-path HEAD>.lock`, created exclusively — because the
+   index lock does not cover `HEAD`: **measured**, with `index.lock` held,
+   `git symbolic-ref HEAD refs/heads/<sibling>` went through, and with
+   `HEAD.lock` held it failed with `Unable to create 'HEAD.lock'`.
 1. It records the branch `HEAD` is symbolic to and its tip (`git
    symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and the
    remote's tip for that branch, under the rules below. It requires each path
@@ -259,9 +263,19 @@ The steps:
    was: `git update-ref refs/heads/<branch> <oid> <tip>`, a compare-and-swap
    that refuses if anything moved the branch in between (ref locks are not
    the index lock; **measured**, the update went through with the index lock
-   held), and the one step that changes the checkout. Under the index lock
-   the branch `HEAD` names cannot have changed since step 1 either, since a
-   switch needs the lock.
+   held), and the one step that changes the checkout. `update-ref` takes
+   `HEAD`'s lock itself when `HEAD` names the branch it moves (**measured**:
+   with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
+   UI releases `HEAD.lock` for this one command and takes it back right
+   after, then checks that `HEAD` is still symbolic to the recorded branch.
+   If it is not — a `symbolic-ref` slipped into that gap — the commit is on
+   the branch, which is correct, but the checkout is no longer on that
+   branch, so step 6 does not happen: the index lock is discarded, the index
+   is as it was, and the page says which branch holds the commit. **Measured**
+   both ways: undisturbed, the check passed and the index was installed
+   clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
+   the branch held the commit, the sibling was untouched, and the index was
+   left alone.
 6. It writes the same entries into the locked copy of the index —
    `GIT_INDEX_FILE=<index>.lock git update-index --add --cacheinfo
    <mode>,<blob>,<path>` — and installs it by renaming `<index>.lock` to
