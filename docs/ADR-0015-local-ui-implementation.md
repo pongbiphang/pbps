@@ -247,8 +247,16 @@ locked-copy `update-index` ran it), so every `git` also takes
    became `H a H b`), and a path the user has told `git` to leave alone is
    not one the UI should quietly bring back. Under the lock, what step 1
    saw is what step 6 finds.
-2. It writes the edited files, and stores each as a blob:
-   `git hash-object -w -- <path>`.
+2. It writes the edited files, and stores each as a blob exactly as written:
+   `git hash-object -w --no-filters -- <path>`. Without the flag
+   `hash-object` runs the path's `clean` filter like `git add` does — a
+   program from `.gitattributes` and the configuration that neither
+   `core.hooksPath` nor `core.fsmonitor` reaches, which can rewrite the
+   bytes or run anything it likes (**measured**: under `*.json filter=up`
+   with an upper-casing `clean`, `hash-object -w` stored the upper-cased
+   text and `--no-filters` stored the file). The declarations are this
+   tool's own format, LF and UTF-8 by rule, so what the UI wrote is what
+   the commit should hold.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
    tree, sets the entry for each edited path to that blob at the mode the
    path had at the tip — `100644` for a new one — and writes the tree:
