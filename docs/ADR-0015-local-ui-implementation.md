@@ -271,11 +271,15 @@ The steps:
    `HEAD`'s lock itself when `HEAD` names the branch it moves (**measured**:
    with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
    UI releases `HEAD.lock` for this one command and takes it back right
-   after, then checks that `HEAD` is still symbolic to the recorded branch.
-   If it is not — a `symbolic-ref` slipped into that gap — the commit is on
-   the branch, which is correct, but the checkout is no longer on that
-   branch, so step 6 does not happen: the index lock is discarded, the index
-   is as it was, and the page says which branch holds the commit. **Measured**
+   after, then checks that `HEAD` is still symbolic to the recorded branch
+   and that the branch still names `<oid>` (`git rev-parse
+   refs/heads/<branch>`): the gap admits a `symbolic-ref` and it admits a
+   `reset --soft`, which moves the branch under a held index lock, and
+   either leaves an index built for `<oid>` wrong for the checkout. If
+   either check fails, the commit exists and is where `update-ref` put it,
+   but the checkout is no longer at it, so step 6 does not happen and
+   nothing is pushed: the index lock is discarded, the index is as it was,
+   and the page says where the commit is and what moved. **Measured**
    both ways: undisturbed, the check passed and the index was installed
    clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
    the branch held the commit, the sibling was untouched, and the index was
