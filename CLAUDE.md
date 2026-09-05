@@ -37,8 +37,11 @@ checksum-pinned, and state lives in the database itself.
 - Treat the issue as the specification: fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
-- Make every check below pass, then push the issue branch without asking. Never
-  push to `master` or to another issue's branch.
+- Before every push, run locally what CI runs: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets` warning-free, `cargo test --workspace
+  --all-targets`, and `scripts/live-tests.sh`. All green, then push.
+- Push the issue branch without asking. Never push to `master` or to another
+  issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
   permission to open it.
 - Post `@codex review` as soon as the draft is open.
@@ -65,11 +68,15 @@ checksum-pinned, and state lives in the database itself.
   reports no findings; a P1 resets the count. Count a review only if its
   `Reviewed commit:` is the pushed head. Never push a docs-only commit to move
   the count.
-- On stopping: kill the watch, post no further `@codex review`, and mark the PR
-  ready. That triggers one more review; wait for it.
-- No P1 in that review: merge with a merge commit (`gh pr merge --merge`),
+- On stopping: kill the watch, post no further `@codex review`, mark the PR
+  ready, and start CI on its head: `gh workflow run ci.yml --ref <branch>`.
+  Ready triggers one more review; wait for both.
+- CI does not run on pushes. A push clears the checks; start CI again.
+- Red CI: fix it, push, back to the loop as a draft.
+- No P1 and green CI: merge with a merge commit (`gh pr merge --merge`),
   delete the branch, remove the worktree. A P1: the count resets — back to the
   loop, as a draft again.
+- Never bypass the ruleset that requires green CI on the PR head.
 - Report at each merge: the review count, the merge commit, and every finding
   deferred to an issue.
 - Never add "one more round" — more review is a new instruction.

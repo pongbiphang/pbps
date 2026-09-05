@@ -3012,3 +3012,19 @@ SPEC is in sync with all of these.
     first version dropped it, and a grant on an *unmanaged* object of such a
     name was then reported, and refused, where an ordinary grant on the same
     object is ignored.
+
+## Repository process
+
+206. **CI is a gate started by hand, not feedback on every push.** The
+    workflow no longer has a `pull_request` trigger. A review round takes
+    several commits, and running the full matrix on each of them spent the
+    private repository's minutes on states nobody would merge. Instead, the
+    checks CI runs are run locally before every push (CLAUDE.md), and CI is
+    started once, on the commit about to be merged, with
+    `gh workflow run ci.yml --ref <branch>`. A repository ruleset
+    (`ci-before-merge`, outside the repo — hence this entry) requires every
+    CI job to be green on the PR head, so a push after the run clears the
+    checks and the run has to be repeated. The ruleset is not strict about
+    the branch being up to date with `master`: the `push` trigger on `master`
+    stays as the post-merge safety net, and a strict rule would have forced
+    every open PR to rebase and re-run whenever `master` moved.

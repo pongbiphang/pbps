@@ -1,11 +1,17 @@
 name: CI
 
+# Not triggered by pull requests. CI is the gate before a merge, not feedback
+# on every push: a review round can take several commits, and running the full
+# matrix on each of them spent the private repository's minutes on states
+# nobody would merge. Run it once, by hand, on the commit that is about to be
+# merged (`gh workflow run ci.yml --ref <branch>`); a repository ruleset
+# requires every job below to be green on the PR head before the merge button
+# works, and a later push clears those checks so the run has to be repeated.
 on:
   push:
     # `master` is the current default branch. Keep `main` subscribed as well so
     # a future branch rename cannot silently remove post-merge coverage.
     branches: [master, main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -17,9 +23,10 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Keep the per-push feedback in one job. Besides avoiding repeated setup,
-  # GitHub bills partial minutes per job, so splitting these short checks wastes
-  # the private repository's allowance.
+  # Keep the short checks in one job. Besides avoiding repeated setup, GitHub
+  # bills partial minutes per job, so splitting them wastes the private
+  # repository's allowance. Every other job waits on this one: nothing expensive
+  # starts for a commit that does not even compile.
   quick:
     name: test and lint (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -35,12 +42,10 @@ jobs:
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of
-  # platform difference that only show up here. Run the expensive coverage once
-  # after merge, or explicitly from workflow_dispatch when it is needed sooner.
+  # platform difference that only show up here.
   windows:
     name: test (windows-latest)
     needs: quick
-    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +58,6 @@ jobs:
   # Linux docker host.
   live:
     needs: quick
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     services:
       mssql:
@@ -131,7 +135,6 @@ jobs:
   # pressure the startup crashes suggest is worth not adding.
   dev-rehearsal:
     needs: quick
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:
       PBPS_TEST_DEV_IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
@@ -156,7 +159,6 @@ jobs:
   # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
     needs: quick
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
