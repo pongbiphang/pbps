@@ -28,7 +28,7 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ModuleId, ObjectName, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
+    ModuleId, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -941,7 +941,7 @@ fn dependency_rank(
 /// the permission with it, and a `REVOKE` that ran after it would fail on an
 /// object that is gone (and one ordered before it would be noise).
 fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
-    let dropped: BTreeSet<ObjectName> = changes.iter().filter_map(|c| c.drops()).collect();
+    let dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
     // Base table name -> the name it has after this plan, by uid.
     let renamed: BTreeMap<&TableName, &TableName> = base
         .ids
@@ -1013,15 +1013,9 @@ fn diff_roles(base: Side<'_>, declared: Side<'_>, changes: &mut Vec<Change>) {
         }
         let targets: BTreeSet<&GrantTarget> = before.keys().chain(role.grants.keys()).collect();
         for target in targets {
-            let target_dropped = match target {
-                GrantTarget::Object(o) => dropped.contains(o),
-                // A routine is dropped under the name its namespace knows,
-                // which is the name without the signature: what the plan
-                // recorded as dropped is the object, and the signature only
-                // said which overload it was.
-                GrantTarget::Routine(r) => dropped.contains(&r.name),
-                GrantTarget::Schema(_) => false,
-            };
+            // By whole identity: where routines overload, the drop of one
+            // takes its own grants and leaves the sibling's to be compared.
+            let target_dropped = dropped.iter().any(|d| d.takes(target));
             // A DROP takes the object's permissions with it. An object this
             // plan drops and creates again under the same name — a table
             // replaced by a new one, a module changing kind — therefore has
@@ -3311,6 +3305,73 @@ mod tests {
             declared.1.columns.clear();
             let k = kinds(&base, &declared);
             assert!(k.iter().all(|c| !c.starts_with("revoke")), "{k:?}");
+        }
+
+        /// Where routines overload, a drop takes the grants of the one routine
+        /// it names and no other (ADR-0009 §1). Matching by name read the
+        /// sibling's grant as gone with the drop, and left the role holding a
+        /// permission the plan declared removed.
+        #[test]
+        fn a_dropped_overload_takes_only_its_own_grants() {
+            let routine = |id: &str, body: &str| {
+                (
+                    id.parse::<ModuleId>().unwrap(),
+                    pbps_model::Module {
+                        kind: pbps_model::ModuleKind::Function,
+                        description: None,
+                        definition: body.to_owned(),
+                    },
+                )
+            };
+            let mut base = side(&[(
+                "r_aaaaaa",
+                "r",
+                role(&[
+                    ("dbo.f(integer)", &[Permission::Execute]),
+                    ("dbo.f(text)", &[Permission::Execute]),
+                ]),
+            )]);
+            base.0.modules.extend([
+                routine("dbo.f(integer)", "RETURN 1"),
+                routine("dbo.f(text)", "RETURN 'a'"),
+            ]);
+            // `dbo.f(integer)` is dropped; `dbo.f(text)` stays, and its grant
+            // is declared gone.
+            let mut declared = side(&[("r_aaaaaa", "r", role(&[]))]);
+            declared
+                .0
+                .modules
+                .extend([routine("dbo.f(text)", "RETURN 'a'")]);
+            let cs = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            let revoked: Vec<String> = cs
+                .changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::Revoke { target, .. } => Some(target.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(revoked, ["dbo.f(text)"], "{:?}", kinds(&base, &declared));
+            assert!(
+                cs.changes.iter().any(|p| matches!(
+                    &p.change,
+                    Change::DropModule { id, .. } if id.to_string() == "dbo.f(integer)"
+                )),
+                "{:?}",
+                kinds(&base, &declared)
+            );
         }
 
         /// The drop takes the permission with it, and the CREATE that follows

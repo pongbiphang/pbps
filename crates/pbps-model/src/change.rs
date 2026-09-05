@@ -710,6 +710,41 @@ pub enum ModuleAfter<'a> {
     Gone,
 }
 
+/// An object a plan removes outright, by its whole identity.
+///
+/// Returned by [`Change::drops`] so that the two readers of it — the differ,
+/// deciding which grants need no `REVOKE`, and the deploy guard, deciding
+/// which grants have nothing left to be read back from — ask the same
+/// question of a grant target through [`Dropped::takes`], instead of each
+/// flattening the identity to a name and losing the signature on the way.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dropped {
+    Table(TableName),
+    Module(ModuleId),
+}
+
+impl Dropped {
+    /// Whether dropping this object takes the permissions on `target` with it.
+    ///
+    /// An `Object` target names a table, or a module by name — which a
+    /// dropped routine with a signature never is, since where the signature
+    /// exists it is part of the name. A `Routine` target is taken only by the
+    /// drop of that one overload. A schema is never dropped by a plan.
+    pub fn takes(&self, target: &crate::role::GrantTarget) -> bool {
+        use crate::role::GrantTarget;
+        match (self, target) {
+            (Dropped::Table(t), GrantTarget::Object(o)) => o == t,
+            (Dropped::Module(id), GrantTarget::Object(o)) => {
+                matches!(id, ModuleId::Named(n) if n == o)
+            }
+            (Dropped::Module(id), GrantTarget::Routine(r)) => {
+                matches!(id, ModuleId::Routine(m) if m == r)
+            }
+            (Dropped::Table(_), GrantTarget::Routine(_)) | (_, GrantTarget::Schema(_)) => false,
+        }
+    }
+}
+
 /// Which way a [`Change::Grant`] or [`Change::Revoke`] moves a role's
 /// permissions on one target.
 ///
@@ -1114,12 +1149,17 @@ impl Change {
     /// that drops a granted object emits no `REVOKE` and the grant is simply
     /// not there afterwards. A caller comparing a role's grants across an
     /// apply has to know that (DECISIONS 158).
+    ///
+    /// The whole identity, not the name: where routines overload, dropping
+    /// `app.f(integer)` leaves `app.f(text)` and every grant on it standing,
+    /// and a caller that matched by name would have read the survivor's
+    /// grants as gone with the drop (ADR-0009 §1).
     // Exhaustive rather than a wildcard, for the reason above: a change added
     // later that removes an object takes grants with it too.
-    pub fn drops(&self) -> Option<ObjectName> {
+    pub fn drops(&self) -> Option<Dropped> {
         match self {
-            Change::DropTable { name, .. } => Some(name.clone()),
-            Change::DropModule { id, .. } => Some(id.object_name()),
+            Change::DropTable { name, .. } => Some(Dropped::Table(name.clone())),
+            Change::DropModule { id, .. } => Some(Dropped::Module(id.clone())),
             Change::CreateTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }

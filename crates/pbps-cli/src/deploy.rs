@@ -1372,7 +1372,7 @@ fn refuse_unplanned_movement(
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
-    let mut gone: BTreeSet<TableName> = BTreeSet::new();
+    let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
     // The constraints and indexes this plan moves, and the tables whose
     // primary key it sets. Everything else on a touched table then answers for
     // itself, instead of one index change exempting the whole shape
@@ -2086,14 +2086,9 @@ fn refuse_unplanned_movement(
                 // removes a permission with its securable, so `diff_roles`
                 // emits no `REVOKE` and there is nothing left for the read-back
                 // to hold (DECISIONS 158).
-                .filter(|(target, _)| match target {
-                    pbps_model::GrantTarget::Object(object) => !gone.contains(object),
-                    // A routine is dropped under its bare name, which is what
-                    // `Change::drops` recorded: the signature said which
-                    // overload, not which object the engine removed.
-                    pbps_model::GrantTarget::Routine(r) => !gone.contains(&r.name),
-                    pbps_model::GrantTarget::Schema(_) => true,
-                })
+                // By whole identity: dropping one overload leaves the
+                // sibling's grants standing, and standing grants are compared.
+                .filter(|(target, _)| !gone.iter().any(|d| d.takes(target)))
                 .map(|(target, held)| {
                     let target = match target {
                         pbps_model::GrantTarget::Object(object) => pbps_model::GrantTarget::Object(
@@ -5037,6 +5032,78 @@ mod tests {
         let e = refuse(&revoking, &before, &before)
             .expect_err("the revoke this plan asked for did not take");
         assert!(e.contains("role app"), "{e}");
+    }
+
+    /// A dropped routine takes its own grants and no other's: where routines
+    /// overload, a plan dropping `dbo.f(integer)` says nothing about the
+    /// grants on `dbo.f(text)`, and one of those revoked underneath the apply
+    /// is movement to refuse, not a permission gone with the drop
+    /// (ADR-0009 §1, DECISIONS 158).
+    #[test]
+    fn a_dropped_overload_does_not_excuse_the_siblings_grants() {
+        use pbps_model::{GrantTarget, Permission};
+        let f = |body: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: body.to_owned(),
+        };
+        let int: ModuleId = "dbo.f(integer)".parse().unwrap();
+        let text: ModuleId = "dbo.f(text)".parse().unwrap();
+        let on = |id: &ModuleId| match id {
+            ModuleId::Routine(r) => GrantTarget::Routine(r.clone()),
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => unreachable!(),
+        };
+        let schema = |with_int: bool, text_granted: bool| {
+            let mut s = Schema::default();
+            if with_int {
+                s.modules.insert(int.clone(), f("RETURN 1"));
+            }
+            s.modules.insert(text.clone(), f("RETURN 'a'"));
+            let mut grants = BTreeMap::new();
+            if with_int {
+                grants.insert(on(&int), [Permission::Execute].into_iter().collect());
+            }
+            if text_granted {
+                grants.insert(on(&text), [Permission::Execute].into_iter().collect());
+            }
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let dropping_int = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropModule {
+                    id: int.clone(),
+                    kind: pbps_model::ModuleKind::Function,
+                },
+            )],
+        };
+        let refuse = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &dropping_int,
+                &schema(true, true),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        // The drop took its own grant with it, and the sibling's stands.
+        refuse(&schema(false, true)).expect("only the dropped overload's grant went");
+        // The sibling's grant went too: not this plan's doing.
+        // Named at role granularity: the plan does not name the role, so the
+        // whole-role compare answers, as it does for any untouched role.
+        let e = refuse(&schema(false, false)).expect_err("the sibling's grant moved");
+        assert!(
+            e.contains("role app is not what the plan was approved over"),
+            "{e}"
+        );
     }
 
     /// A module the plan writes is held to the definition it wrote. Nothing
