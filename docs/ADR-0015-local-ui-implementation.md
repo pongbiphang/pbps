@@ -64,8 +64,11 @@ child inherits the environment, so the connection strings of SPEC §8.1's
 
 The page is static files compiled into the binary and served from memory.
 There is no Node toolchain, no bundler, no package manifest and no framework.
-The ERD is the page `pbps docs --format html` already produces, served as it
-is.
+The ERD is the page `pbps docs --format html` already produces. It is a
+document with project data in it, so the shell fetches it with the token like
+any other answer (decision 3) and renders it in a sandboxed `srcdoc` iframe,
+with scripts disallowed — the page carries none, and `pbps-docs`'s test
+forbids one — rather than navigating to it, which could carry no token.
 
 The obvious design is a component framework with a build step, because that
 is how a browser application is written in 2026. It is refused for what it
@@ -80,9 +83,12 @@ whose `default-src` is `'self'` says so to the browser. One resource is inline
 by design and the policy has to say so too: the stylesheet `docs` embeds in
 its page, so that the page renders on a machine without internet
 (`pbps-docs`'s `html.rs`, which tests for the inline `<style>`). The policy
-names that stylesheet by its hash — `style-src 'self' 'sha256-…'`, computed
-from the page when it is served — rather than opening `'unsafe-inline'` for
-every style; scripts stay `'self'`.
+names that stylesheet by its hash — `style-src 'self' 'sha256-…'` — rather
+than opening `'unsafe-inline'` for every style; scripts stay `'self'`. A
+`srcdoc` iframe inherits the policy of the page that holds it, so the hash is
+in the shell's policy: the stylesheet is a constant of `pbps-docs`, `pbps-cli`
+computes its hash and hands it to the UI at launch beside the executable's
+path, and a test pins that hash to what `docs --format html` emits.
 
 The cost is hand-written DOM code and no component reuse. The page renders a
 handful of typed shapes — findings, a drift report, a plan summary, a ledger
@@ -99,9 +105,13 @@ launch that carries a random token in its fragment:
 `http://127.0.0.1:<port>/#<token>`. Every request but one — reads included —
 must present that token in a request header, not in a cookie and not in the
 query string, and must arrive from a loopback peer with a `Host` header naming
-the address the server bound and an `Origin` (or none, for a same-origin
-navigation) that matches it. A request failing any of the four is refused
-before it is routed.
+the address the server bound and an `Origin` that matches it. `Origin` is
+required on every request that is not a `GET` or `HEAD`, and on those two it
+must match when present but may be absent: browsers omit it on a same-origin
+`GET`, and a cross-site `GET` cannot carry the token header without a
+preflight that does carry `Origin`, so an absent `Origin` on a read has
+nothing to hide, while an absent one on a write is a refusal. A request
+failing any of the four is refused before it is routed.
 
 The one exception is the requests that have to come first. A navigation to
 the printed URL cannot carry a header the page has not yet been served to set,
@@ -140,10 +150,13 @@ later step reopens the question.
 The `pbps` process the UI spawns reads the connection string from the
 environment variable `url_env:` names, exactly as it does from a shell. The UI
 process does not read that variable, holds no copy, and sends the browser the
-environment's *name* and the redacted label `pbps-cli`'s `db::redact` already
-produces for every diagnostic — never the string. There is no form in which a
-connection string is typed, no field in which one is stored, and no request in
-which one travels.
+environment's *name* and what the envelope already says about it —
+`status`'s `detail` and `doctor`'s findings, each written never to hold a
+connection string — and no label of its own: the redacted target label the
+CLI prints to a terminal is not in the envelope, and a UI that cannot read
+`pbps.yml` has nothing to redact. There is no form in which a connection
+string is typed, no field in which one is stored, and no request in which one
+travels.
 
 The obvious design has a connection form, because every database UI has one.
 It is refused by SPEC §8.1's rule that a connection string is never written
