@@ -2808,3 +2808,25 @@ SPEC is in sync with all of these.
     second scanner, with the quieter failure. The rest of ADR-0011 Amendment 2
     — the scanner taking a description of the engine's literals, the default
     going — waits for the PostgreSQL crate, which is what needs it.
+
+196. **A message names a command only to a caller who can run it, and the
+    target carries which one that is.** The staged checkpoint refusal was given
+    a pointer to `pbps status` (192's sibling, #15): the checkpoint records the
+    movement, so `verify` reads clean, and `status` shows the refusal again as
+    the failed entry's reason. True for half the callers. `status` takes no
+    target at all — it reports on the environments `pbps.yml` configures
+    (SPEC 9.2) — so a run that named its database with `--db` was sent to a
+    command that answers about other databases, or says none are configured.
+    The refusal exists to say where the record is; a pointer that cannot be
+    followed is worse there than no pointer.
+
+    The condition is not guessable from what the message had. `Target::label`
+    is the environment name for `--env` and a redacted `server/database` for
+    `--db`, and the two are the same *kind* of string: reading the origin off
+    the label is a heuristic. So `Target` carries `environment: Option<String>`,
+    set where `--db` and `--env` are already told apart, and the message asks
+    it. The sentence stands without the pointer — "the list above is the record
+    of what moved" is the answer — so the `--db` form loses nothing but a dead
+    end. Measured against the live server, the same shape sits in `doctor`,
+    whose remedies spell `--env <redacted label>` for a `--db` target; that is a
+    separate command and a separate issue, not scope here.

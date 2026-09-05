@@ -9457,7 +9457,17 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
         stderr(&o)
     );
     assert!(!err.contains("`pbps verify` shows"), "{err}");
-    assert!(err.contains("`pbps status`"), "{err}");
+    // And the other half of the same fact: this run named its target with
+    // `--db`, and `status` takes no target — it reports on the environments
+    // `pbps.yml` configures, of which this project has none. So the refusal
+    // must not name it here, and must still say where the record is
+    // (DECISIONS 196).
+    assert!(!err.contains("pbps status"), "{err}");
+    assert!(err.contains("the record of what moved"), "{err}");
+    assert!(
+        err.contains("recorded as the failed entry's reason"),
+        "{err}"
+    );
 
     // The statement did commit and the checkpoint records it — that is what a
     // checkpoint is for — but the environment is left mid-deployment rather

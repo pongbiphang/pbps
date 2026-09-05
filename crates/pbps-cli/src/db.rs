@@ -14,11 +14,26 @@ pub struct Target {
     /// What to print. **Never** the connection string: see [`redact`].
     pub label: String,
     connection: String,
+    /// The name from `pbps.yml` when the target came from `--env`, and `None`
+    /// for a bare `--db` connection string.
+    ///
+    /// Kept beside the label rather than derived from it: for an `--env` target
+    /// the two are the same string, so telling the origins apart by looking at
+    /// the label is guesswork, and what depends on the answer is which commands
+    /// a message may name. `status` takes no target and walks the configured
+    /// environments (SPEC 9.2), so it can only be offered to a caller who named
+    /// one (DECISIONS 196).
+    environment: Option<String>,
 }
 
 impl Target {
     pub fn connection(&self) -> &str {
         &self.connection
+    }
+
+    /// `Some` only when this target is an environment `pbps.yml` configures.
+    pub fn environment(&self) -> Option<&str> {
+        self.environment.as_deref()
     }
 }
 
@@ -34,10 +49,12 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
         (Some(conn), None) => Ok(Target {
             label: redact(conn),
             connection: conn.to_owned(),
+            environment: None,
         }),
         (None, Some(name)) => Ok(Target {
             label: name.to_owned(),
             connection: project.connection_string(name)?,
+            environment: Some(name.to_owned()),
         }),
         (None, None) => bail!(
             "this command needs a database: pass --db <connection string> or --env <name from pbps.yml>"
@@ -55,6 +72,9 @@ pub fn target_from_connection(connection: &str) -> Target {
     Target {
         label: redact(connection),
         connection: connection.to_owned(),
+        // A connection string names no environment, and there may be no
+        // `pbps.yml` here at all.
+        environment: None,
     }
 }
 
