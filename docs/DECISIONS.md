@@ -3006,5 +3006,9 @@ SPEC is in sync with all of these.
     property and is out of this change's scope. The same check guards a
     grant target read back from the catalog: `GrantTarget::Object` on
     `[dbo].[sales(archive)]` would be read back as a grant on a routine, so
-    the permission is reported as unexpressible, without a target, because
-    the target is exactly what cannot be spelled.
+    the permission is reported as unexpressible. The structured target is
+    kept on the report — only its string form is ambiguous — because the
+    target is what scopes an unexpressible permission to the managed set; a
+    first version dropped it, and a grant on an *unmanaged* object of such a
+    name was then reported, and refused, where an ordinary grant on the same
+    object is ignored.

@@ -878,8 +878,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // The target crosses a snapshot as its string form, in which `(`
         // opens a routine signature; a legal quoted object name may contain
         // one, and `dbo.sales(archive)` would be read back as a grant on a
-        // routine (DECISIONS 205). Reported without a target, because the
-        // target is exactly what cannot be spelled.
+        // routine (DECISIONS 205). The structured target is kept: only its
+        // *string* form is ambiguous, and the target is what scopes the report
+        // to the managed set — without it, a grant on an unmanaged object of
+        // such a name would be reported, and refused, where an ordinary grant
+        // on the same object is ignored (`unexpressible_permissions`).
         if target
             .to_string()
             .parse::<pbps_model::GrantTarget>()
@@ -888,7 +891,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         {
             unexpressible.push(Unexpressible {
                 role: p.role.clone(),
-                target: None,
+                target: Some(target.clone()),
                 what: format!(
                     "role {}: {} on [{}].[{}] is on an object whose name contains a period or a \
                      parenthesis, which a declaration cannot spell; the declarations cannot \
@@ -1137,7 +1140,8 @@ mod tests {
     /// A grant target's string form gives `(` a meaning, and a legal quoted
     /// object name may contain one: read back, `dbo.sales(archive)` would be
     /// a grant on a routine, not on the table it was granted on (DECISIONS
-    /// 202). Reported, and left out of the set.
+    /// 205). Reported, and left out of the set — with the structured target
+    /// kept, so the report is still scoped to the managed set.
     #[test]
     fn a_grant_on_an_object_whose_name_cannot_be_spelled_is_unexpressible() {
         let mut raw = one_table_catalog();
@@ -1167,9 +1171,23 @@ mod tests {
         assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
         for u in &p.unexpressible {
             assert_eq!(u.role, "app_reader");
-            assert!(u.target.is_none(), "{u:?}");
             assert!(u.what.contains("period or a parenthesis"), "{u:?}");
         }
+        let targets: Vec<Option<pbps_model::GrantTarget>> =
+            p.unexpressible.iter().map(|u| u.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [
+                Some(pbps_model::GrantTarget::Object(ObjectName::new(
+                    "dbo",
+                    "sales(archive)"
+                ))),
+                Some(pbps_model::GrantTarget::Object(ObjectName::new(
+                    "dbo", "audit.v1"
+                ))),
+            ],
+            "the securable stays structured, so the managed-set scope still applies"
+        );
         assert!(
             p.unexpressible[0].what.contains("[dbo].[sales(archive)]")
                 || p.unexpressible[1].what.contains("[dbo].[sales(archive)]"),
