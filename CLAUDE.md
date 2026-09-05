@@ -6,15 +6,15 @@ Guidance for Claude working in this repo. Rules here; reasons in `docs/`.
 
 `pbps` (PongBiphang Schema): declarative database schema version control. Users
 declare the desired schema in YAML; the tool diffs it, generates change scripts,
-and applies them behind a risk gate. Differentiator vs Atlas/Skeema: rename and
-drop intent is human-supplied and recorded in git, changes are risk-classified,
-saved plans are checksum-pinned, and state lives in the database itself.
+and applies them behind a risk gate. Rename and drop intent is human-supplied
+and recorded in git, changes are risk-classified, saved plans are
+checksum-pinned, and state lives in the database itself.
 
 - **[docs/SPEC.md](docs/SPEC.md)** — the design. Read before changing the data
   model or adding a kind of change.
 - **[docs/DECISIONS.md](docs/DECISIONS.md)** — numbered record of every choice
-  that is not the obvious one, and why the obvious one is wrong. Code comments
-  cite these numbers; append, never renumber.
+  that is not the obvious one. Code comments cite these numbers; append, never
+  renumber.
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — bugs shipped or nearly shipped, and
   the shapes they belong to.
 - **[docs/STATUS.md](docs/STATUS.md)** — phase, command surface, open items.
@@ -22,21 +22,61 @@ saved plans are checksum-pinned, and state lives in the database itself.
 
 ## Working with me
 
-- Converse in **Chinese**. Write code, comments, docs and commit messages in
-  **English**.
-- Do not merge, and do not open a PR unless I ask. The merge decision is mine.
+- Converse in **Chinese**. Write code, comments, docs, commit messages, issues
+  and PR bodies in **English**.
 - Tell me what you actually verified. Separate "I ran it and saw this" from "I
   reasoned this" every time, and never present the second as the first.
 - When you are wrong, say so in one line and move on. Do not apologise at
   length, and do not re-litigate a decision I have already made.
-- Report failures with their output. If a step was skipped, say which.
-- Do not tell me something is finished until it is. "This was the last such
-  site" has been wrong four times.
+- Report failures with their output. Say which steps were skipped.
+- Do not tell me something is finished until it is.
 - Treat quiet as quiet, not as convergence. A reviewer running out of credits is
   not a clean bill of health.
-- Push work to the branch I named. Never to another branch without asking.
+- Never merge. The merge decision is mine.
 - Recurring background work (CI watches, check-ins) is welcome; keep the notes
   it carries accurate, and stop it when the work is done.
+
+## Taking an issue
+
+- List open issues **and** open PRs first. Confirm the issue is open and no PR
+  carries it, and name the other issues touching the same code.
+- Comment on the issue to claim it **before** starting work.
+- Say so on the issue and stop if it is a duplicate, blocked, wrong, or already
+  fixed.
+- Treat the issue as the specification: fix what it says, at the size it says.
+- Work in a git worktree, never in the main checkout. Remove it after merge.
+- One branch per issue, cut from `master`, named `fix/issue-<n>-<slug>`.
+- Make every check below pass, then push the issue branch without asking. Never
+  push to `master` or to another issue's branch.
+- Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
+  permission to open it.
+- Post `@codex review` as soon as the draft is open.
+
+## The review loop
+
+- Push the round's fixes, verify the PR head is the commit you pushed, then post
+  `@codex review` once. Never per commit.
+- Fix a finding only if it is one of: **(a)** a valid plan is refused; **(b)** a
+  wrong recording with a single deployer and no concurrent writer; **(c)** a
+  concurrent case SPEC §7.6 promises to catch and does not.
+- Answer every other finding with the SPEC section or DECISIONS entry that made
+  the choice, and open an issue for it: `gh issue create --label
+  deferred-review`, title `review: ...`, body linking the thread and naming the
+  fix and its test. Change nothing in the repo for an answered finding, and add
+  no DECISIONS entry for one.
+- Ignore the badge and the size of the fix. A P1 outside the rules is answered;
+  a P3 inside them is fixed.
+- Triage findings you make yourself the same way. Out-of-rule ones become new
+  issues, never extra scope on this PR.
+- Reply on each fixed thread yourself: "Fixed in `<sha>`. <what changed>.
+  <which test pins it>." Those three facts, nothing else.
+- Stop after three consecutive reviews with no P1; a P1 resets the count. Count
+  a review only if its `Reviewed commit:` is the pushed head. Never push a
+  docs-only commit to move the count.
+- On stopping: kill the watch, post no further `@codex review`, and report the
+  count and every finding left unaddressed.
+- Mark the draft ready only at merge time, as the last step. Never add "one more
+  round" — more review is a new instruction.
 
 ## How to be right here
 
@@ -108,7 +148,7 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 
 ## Inviolable constraints
 
-Each was paid for. Stop and think before breaking one; the full reasoning is in
+Each was paid for. Stop and think before breaking one; the reasoning is in
 [docs/DECISIONS.md](docs/DECISIONS.md).
 
 1. **Two semantically identical `Schema`s must be `==`.** No spans, no one-shot
@@ -133,8 +173,7 @@ Each was paid for. Stop and think before breaking one; the full reasoning is in
 ## Product guardrails (SPEC 14.3)
 
 Each refuses a path that is shorter but bypasses the typed plan, the checksum, a
-human's recorded intent, or the git audit trail. They arrive as reasonable
-requests; refuse them and point here.
+human's recorded intent, or the git audit trail. Refuse them and point here.
 
 - **No `push`.** `plan` then `apply --plan` stays two steps.
 - **Rename suggestions, never rename decisions.** No non-interactive flag may
