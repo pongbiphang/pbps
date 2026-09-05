@@ -81,6 +81,18 @@ pub struct EnvDiagnosis {
     pub server_capabilities_unknown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+
+    /// The name this environment can be handed back as, after `--env`, and
+    /// `None` when the caller named a database with `--db`.
+    ///
+    /// Separate from `environment`, which is what to *print*: for a `--db`
+    /// target that is `db::redact`'s `server/database`, which is not a name
+    /// `pbps.yml` knows, so a remedy spelling `--env` with it cannot be run
+    /// (DECISIONS 197). Not serialized: for an `--env` target it repeats
+    /// `environment`, and for a `--db` one there is nothing to say — the
+    /// envelope stays as it was.
+    #[serde(skip)]
+    env_name: Option<String>,
 }
 
 impl EnvDiagnosis {
@@ -95,9 +107,10 @@ impl EnvDiagnosis {
     /// Written out three times before, which is three places to forget a new
     /// field in — and forgetting one here means shipping a default, not a
     /// compile error.
-    fn unknown(environment: String, state: &'static str) -> Self {
+    fn unknown(environment: String, env_name: Option<String>, state: &'static str) -> Self {
         Self {
             environment,
+            env_name,
             state,
             server_version: None,
             edition: None,
@@ -116,10 +129,10 @@ impl EnvDiagnosis {
     /// Distinct from `unreachable`: nothing was attempted, because there was
     /// nothing to attempt it against. An unset `url_env` variable is the
     /// commonest first-run problem there is, and it has its own remedy.
-    fn unconfigured(environment: String, detail: String) -> Self {
+    fn unconfigured(environment: String, env_name: Option<String>, detail: String) -> Self {
         Self {
             detail: Some(detail),
-            ..Self::unknown(environment, "unconfigured")
+            ..Self::unknown(environment, env_name, "unconfigured")
         }
     }
 }
@@ -201,11 +214,14 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // Named by the environment when there is one, and by the
                 // *redacted* label otherwise — `db::redact` gives
                 // server/database, never the connection string CI passed in.
-                let label = name.unwrap_or_else(|| target.label.clone());
+                // The name is kept as well as printed: only it can go back
+                // after `--env` in a remedy (DECISIONS 197).
+                let label = name.clone().unwrap_or_else(|| target.label.clone());
                 let rt =
                     output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
                 rt.block_on(examine(
                     &label,
+                    name.as_deref(),
                     target.connection(),
                     &managed_schemas,
                     &referenced,
@@ -213,7 +229,9 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
-                name.unwrap_or_else(|| "the given target".to_owned()),
+                name.clone()
+                    .unwrap_or_else(|| "the given target".to_owned()),
+                name,
                 format!("{e:#}"),
             ),
         };
@@ -241,8 +259,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
+                // Every environment here is a key of `pbps.yml`, so each one is
+                // a name a remedy may hand back after `--env`.
                 Ok(conn) => rt.block_on(examine(
                     &name,
+                    Some(&name),
                     &conn,
                     &managed_schemas,
                     &referenced,
@@ -252,7 +273,9 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
                 // command worth running before a deployment.
-                Err(e) => EnvDiagnosis::unconfigured(name.clone(), e.to_string()),
+                Err(e) => {
+                    EnvDiagnosis::unconfigured(name.clone(), Some(name.clone()), e.to_string())
+                }
             };
             findings.extend(env_findings(&d, counts.modules > 0));
             environments.push(d);
@@ -430,6 +453,7 @@ fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
+    env_name: Option<&str>,
     connection: &str,
     schemas: &[String],
     referenced: &[pbps_model::ObjectName],
@@ -438,7 +462,11 @@ async fn examine(
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
     // behind has to say so rather than inherit an optimistic default.
-    let mut d = EnvDiagnosis::unknown(name.to_owned(), "unreachable");
+    let mut d = EnvDiagnosis::unknown(
+        name.to_owned(),
+        env_name.map(ToOwned::to_owned),
+        "unreachable",
+    );
     let mut conn = match Conn::connect(connection).await {
         Ok(c) => c,
         Err(e) => {
@@ -557,6 +585,25 @@ async fn examine(
     d
 }
 
+/// How a remedy names this environment on the command line.
+///
+/// `baseline`, `apply` and `unlock` each require exactly one of `--db` and
+/// `--env`, so a remedy without one fails the moment it is pasted. Which one it
+/// may be is not the diagnosis's display name: for a `--db` target that name is
+/// `db::redact`'s `server/database`, and `--env` takes a key of `pbps.yml`, so
+/// spelling it there produced a command that resolves to nothing. The caller
+/// who gave a connection string is handed the flag they used, with the string
+/// itself left as a placeholder — it carries the password, and this text goes
+/// to CI logs and tickets (DECISIONS 197).
+fn target_arg(d: &EnvDiagnosis) -> String {
+    match &d.env_name {
+        // Quoted: an environment name is a YAML map key, so `US West` is valid
+        // and interpolated verbatim becomes two arguments.
+        Some(name) => format!("--env {}", crate::report::env_arg(name)),
+        None => "--db <connection string>".to_owned(),
+    }
+}
+
 fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding> {
     let mut out = Vec::new();
     match d.state {
@@ -589,16 +636,13 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 "state.uninitialized",
                 format!("{}: pbps has recorded no state here yet", d.environment),
             )
-            // Every per-environment remedy names the environment. `baseline`,
-            // `apply` and `unlock` each require exactly one of --db / --env, so
-            // a remedy without one is a command that fails the moment it is
-            // pasted — and this one is aimed at a first-time user, who has the
-            // least standing to work out why.
-            // Quoted: an environment name is a YAML map key, so `US West` is
-            // valid and interpolated verbatim becomes two arguments.
+            // Every per-environment remedy names the target the way the caller
+            // named it (`target_arg`); this one is aimed at a first-time user,
+            // who has the least standing to work out why a pasted command
+            // resolves to nothing.
             .remedy(format!(
-                "pbps baseline --env {} --reason \"adopting this environment\"",
-                crate::report::env_arg(&d.environment)
+                "pbps baseline {} --reason \"adopting this environment\"",
+                target_arg(d)
             )),
         ),
         "mid-deployment" => out.push(
@@ -613,9 +657,9 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
+                "pbps apply {} --plan <plan.json> --checksum <approved-checksum> \
                  --staged --resume",
-                crate::report::env_arg(&d.environment)
+                target_arg(d)
             )),
         ),
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
@@ -649,8 +693,8 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "if no apply is running: pbps unlock --env {}",
-                crate::report::env_arg(&d.environment)
+                "if no apply is running: pbps unlock {}",
+                target_arg(d)
             )),
         ),
         _ => {}
@@ -794,7 +838,7 @@ mod tests {
     fn absent(schema: &str) -> EnvDiagnosis {
         EnvDiagnosis {
             absent_schemas: vec![schema.to_owned()],
-            ..EnvDiagnosis::unknown("prod".to_owned(), "ready")
+            ..EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready")
         }
     }
 
@@ -841,5 +885,56 @@ mod tests {
                 .iter()
                 .any(|f| f.id == "schema.absent")
         );
+    }
+
+    /// The three per-environment remedies, for a target named each way.
+    ///
+    /// `--env` takes a key of `pbps.yml`, and a `--db` target has none: its
+    /// display name is `db::redact`'s `server/database`, so a remedy spelling
+    /// `--env` with it named an environment that does not exist. Measured
+    /// before the fix: `doctor --db "Server=localhost,14330;...;Database=master"`
+    /// offered `pbps baseline --env "localhost,14330/master" --reason ...`
+    /// (DECISIONS 197).
+    fn remedies(d: &EnvDiagnosis) -> Vec<String> {
+        env_findings(d, true)
+            .into_iter()
+            .filter_map(|f| f.remedy)
+            .collect()
+    }
+
+    fn diagnosed(env_name: Option<&str>, state: &'static str) -> EnvDiagnosis {
+        EnvDiagnosis::unknown(
+            "localhost,14330/app".to_owned(),
+            env_name.map(ToOwned::to_owned),
+            state,
+        )
+    }
+
+    #[test]
+    fn a_db_target_is_offered_no_remedy_it_cannot_run() {
+        for state in ["uninitialized", "mid-deployment", "locked"] {
+            let from_db = remedies(&diagnosed(None, state));
+            assert!(
+                !from_db.is_empty(),
+                "{state} still has to offer a remedy: {from_db:?}"
+            );
+            for r in &from_db {
+                assert!(!r.contains("--env"), "{state}: {r}");
+                // And what replaces it is the flag this caller used, with the
+                // string itself left out: it carries the password.
+                assert!(r.contains("--db <connection string>"), "{state}: {r}");
+                assert!(!r.contains("localhost,14330/app"), "{state}: {r}");
+            }
+        }
+    }
+
+    /// The other half: an `--env` target keeps the name, quoted, because an
+    /// environment name is a YAML map key and `US West` is valid.
+    #[test]
+    fn an_env_target_keeps_the_name_it_was_given() {
+        let held = remedies(&diagnosed(Some("US West"), "locked"));
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains(r#"--env "US West""#), "{held:?}");
+        assert!(!held[0].contains("--db"), "{held:?}");
     }
 }

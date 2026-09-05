@@ -3457,10 +3457,16 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
         .unwrap_or_else(|| panic!("no state.locked finding: {v}"));
     assert_eq!(locked["severity"], "error", "{v}");
     // It found this by looking, so it is a finding (exit 2), not unanswerable.
-    assert!(
-        locked["remedy"].as_str().unwrap().contains("pbps unlock"),
-        "{v}"
-    );
+    let remedy = locked["remedy"].as_str().unwrap();
+    assert!(remedy.contains("pbps unlock"), "{v}");
+    // And the remedy is runnable by the caller who got it. This target was
+    // named with `--db`, and this project configures no environment at all, so
+    // the `--env <redacted label>` this used to offer named nothing
+    // (DECISIONS 197). The connection string stays out: it carries the
+    // password, and a remedy is printed.
+    assert!(!remedy.contains("--env"), "{v}");
+    assert!(remedy.contains("--db <connection string>"), "{v}");
+    assert!(!remedy.contains(&connection), "{v}");
 }
 
 // ---- Tenth review round ----

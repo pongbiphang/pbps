@@ -2830,3 +2830,30 @@ SPEC is in sync with all of these.
     end. Measured against the live server, the same shape sits in `doctor`,
     whose remedies spell `--env <redacted label>` for a `--db` target; that is a
     separate command and a separate issue, not scope here.
+
+197. **A remedy spells the target the way its caller named it.** 196 stopped a
+    message naming a command the caller could not run; this is the same shape
+    one level down, in the commands a remedy *is*. `doctor`'s per-environment
+    remedies — `baseline`, `apply --staged --resume`, `unlock` — each require
+    one of `--db` and `--env`, and all three spelled `--env` with
+    `EnvDiagnosis::environment`. That field is the display name: the
+    environment for an `--env` target, and `db::redact`'s `server/database` for
+    a `--db` one. Measured against the live server, `doctor --db` offered
+    `pbps unlock --env "localhost,14330"` — an environment `pbps.yml` does not
+    have, in a line advertised as copy-pastable.
+
+    So the diagnosis carries `env_name: Option<String>` beside the display
+    name, `Some` only where the caller gave one (the `--env` argument, or a key
+    of `pbps.yml` in the all-environments loop), and one `target_arg` builds
+    the flag: the quoted name, or `--db <connection string>`. The connection
+    string is a placeholder rather than the string itself — it carries the
+    password, and remedies are printed into CI logs (`explain` already made
+    this choice for its approval command, which is why it was not wrong).
+    The field is not serialized: it repeats `environment` where it is `Some`
+    and says nothing where it is `None`.
+
+    Watching the reverted fix fail is what showed the live half was not being
+    measured at all: `doctor_does_not_report_ready_while_the_lock_is_held`
+    takes its lock through `docker exec`, and on a host where `docker` cannot
+    reach the container it returns early and reports a pass. Under a shim it
+    fails against the old spelling with the bad remedy in its output.
