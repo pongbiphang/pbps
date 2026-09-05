@@ -32,8 +32,9 @@ checksum-pinned, and state lives in the database itself.
 - Do not tell me something is finished until it is.
 - Treat quiet as quiet, not as convergence. A reviewer running out of credits is
   not a clean bill of health.
-- Never merge, except an issue PR that has finished the issue loop below.
-  Every other merge decision is mine.
+- Merge only a PR that has finished the review loop below. Every other merge
+  decision is mine.
+- Fetch first: every new worktree is cut from the latest `origin/master`.
 - Recurring background work (CI watches, check-ins) is welcome; keep the notes
   it carries accurate, and stop it when the work is done.
 
@@ -46,7 +47,7 @@ checksum-pinned, and state lives in the database itself.
   fixed.
 - Treat the issue as the specification: fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
-- One branch per issue, cut from `master`, named `fix/issue-<n>-<slug>`.
+- One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
 - Make every check below pass, then push the issue branch without asking. Never
   push to `master` or to another issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
@@ -71,26 +72,25 @@ checksum-pinned, and state lives in the database itself.
   issues, never extra scope on this PR.
 - Reply on each fixed thread yourself: "Fixed in `<sha>`. <what changed>.
   <which test pins it>." Those three facts, nothing else.
-- Stop after three consecutive reviews with no P1; a P1 resets the count. Count
-  a review only if its `Reviewed commit:` is the pushed head. Never push a
-  docs-only commit to move the count.
-- On stopping: kill the watch, post no further `@codex review`, and report the
-  count and every finding left unaddressed. An issue PR then enters the issue
-  loop; any other PR waits for me.
+- Stop after three consecutive reviews with no P1, or as soon as a review
+  reports no findings; a P1 resets the count. Count a review only if its
+  `Reviewed commit:` is the pushed head. Never push a docs-only commit to move
+  the count.
+- On stopping: kill the watch, post no further `@codex review`, and mark the PR
+  ready. That triggers one more review; wait for it.
+- No P1 in that review: merge with a merge commit (`gh pr merge --merge`),
+  delete the branch, remove the worktree. A P1: the count resets — back to the
+  loop, as a draft again.
+- Report at each merge: the review count, the merge commit, and every finding
+  deferred to an issue.
 - Never add "one more round" — more review is a new instruction.
 
 ## The issue loop
 
-- After three consecutive reviews with no P1, mark the issue PR ready. That
-  triggers one more review; wait for it.
-- No P1 in that review: merge with a merge commit (`gh pr merge --merge`),
-  delete the branch, remove the worktree. A P1: the count resets — back to the
-  review loop, still as a draft.
+- One issue at a time. Claim the next only after the current PR is merged.
 - Wait for CI on `master` to pass after the merge. Red CI is the next task, not
   the next issue.
 - Green CI: take the next issue, following "Taking an issue".
-- Report at each merge: the review count, the merge commit, and every finding
-  deferred to an issue.
 
 ## How to be right here
 
