@@ -1377,6 +1377,39 @@ SELECT 'A74', 'recreating the caller after g(integer) is dropped, bodies checked
 SELECT 'A75', 'what it answers now', ov.caller();
 DROP SCHEMA ov CASCADE;
 
+-- -------------------------- the forty-third 2026-09-05 review round
+
+-- Two matching probes are not stability: a read-only function over mutable data
+-- answers the same twice and something else at apply time.
+CREATE TABLE m.cfg (k text PRIMARY KEY, v text);
+INSERT INTO m.cfg VALUES ('tier', 'bronze');
+CREATE FUNCTION m.tier() RETURNS text STABLE AS $$SELECT v FROM m.cfg WHERE k = 'tier'$$ LANGUAGE sql;
+CREATE TABLE m.acct (id int, tier text DEFAULT m.tier());
+BEGIN; SET TRANSACTION READ ONLY; SELECT m.tier() AS p1 \gset
+COMMIT;
+BEGIN; SET TRANSACTION READ ONLY; SELECT m.tier() AS p2 \gset
+COMMIT;
+SELECT 'R125', 'a default reading a config row, probed in two read-only transactions',
+  CASE WHEN :'p1' = :'p2' THEN 'the same value both times (' || :'p1' || ')'
+       ELSE 'two different values' END;
+UPDATE m.cfg SET v = 'gold' WHERE k = 'tier';
+INSERT INTO m.acct (id) VALUES (1);
+SELECT 'R126', 'what the apply stored, after that row changed between the two',
+  (SELECT tier FROM m.acct WHERE id = 1);
+
+-- And an omitted cell over a time-varying default has no value to converge on.
+CREATE TABLE m.ev (id int, seen timestamptz DEFAULT clock_timestamp());
+INSERT INTO m.ev (id) VALUES (1);
+SELECT pg_sleep(0.05);
+INSERT INTO m.ev (id) VALUES (2);
+SELECT 'R127', 'two rows that both omitted the same clock_timestamp() default',
+  (SELECT CASE WHEN count(DISTINCT seen) = 1 THEN 'one value' ELSE 'two values' END FROM m.ev);
+SELECT seen::text AS s1 FROM m.ev WHERE id = 1 \gset
+SELECT pg_sleep(0.05);
+SELECT 'R128', 'the stored cell against the default evaluated again on the next plan',
+  CASE WHEN :'s1' = clock_timestamp()::text THEN 'equal'
+       ELSE 'different, so the next plan schedules another update' END;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

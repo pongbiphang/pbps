@@ -231,3 +231,7 @@ A72 | what a string-bodied SQL caller records about its callee | nothing
 A73 | what a BEGIN ATOMIC caller records | ov.g(integer)
 A74 | recreating the caller after g(integer) is dropped, bodies checked | accepted
 A75 | what it answers now | bigint overload
+R125 | a default reading a config row, probed in two read-only transactions | the same value both times (bronze)
+R126 | what the apply stored, after that row changed between the two | gold
+R127 | two rows that both omitted the same clock_timestamp() default | two values
+R128 | the stored cell against the default evaluated again on the next plan | different, so the next plan schedules another update

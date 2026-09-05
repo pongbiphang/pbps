@@ -545,8 +545,8 @@ pinned on the session, and not wrapped around the writes at all.**
 
   Two decisions, in the order this project prefers them:
 
-  - **Where the value is knowable *and the same tomorrow*, do not depend on the
-    default at all.** A row pbps writes carries the value the engine
+  - **Where the default is a literal, do not depend on it at all; where it is
+    not, refuse the omission.** A row pbps writes carries the value the engine
     canonicalized at plan time (§3 above) rather than omitting the column and
     letting `apply`'s session evaluate the default.
 
@@ -563,17 +563,52 @@ pinned on the session, and not wrapped around the writes at all.**
     Baking the first turns `DEFAULT now()` from "the moment of the apply" into
     "the moment of the plan", and the next plan probes a third value and updates
     the row again — a permanent diff, and a changed meaning, produced by an
-    optimisation. So the test is not "can it be probed" but **"does it answer
-    the same in two transactions"**, which is the probe run twice and costs one
-    extra round trip. An expression that does not, or that pbps cannot show
-    does, keeps its `DEFAULT` and relies on the assertion below. Conservative is
-    the safe direction here: keeping `DEFAULT` preserves the declared meaning,
-    baking replaces it.
+    optimisation.
 
-    Two transactions cannot prove stability, only disprove it — a clock read at
-    one-second resolution can answer twice the same. The assertion is what
-    covers the rest, which is why it is not an alternative to this but its
-    other half.
+    A version of this then proposed running the probe twice and baking when both
+    transactions agreed. **That is invalid, and the sentence admitting so was
+    already written beside it**: two observations cannot establish stability,
+    only refute it — and the correction went on to use them as a licence anyway.
+    **Measured**, a default calling a read-only function over a configuration
+    row agrees twice and is something else at apply time:
+
+    ```
+    probed in two read-only transactions:                the same value both times (bronze)
+    what the apply stored, after that row changed:       gold
+    ```
+
+    No settings assertion can see that, because nothing about the *settings*
+    changed. So there is no observational test, and pbps bakes nothing on the
+    strength of one.
+
+    **And keeping `DEFAULT` does not rescue the shape either.** An omitted cell
+    over a time-varying default has no value to converge on at all:
+
+    ```
+    two rows that both omitted the same clock_timestamp() default:  two values
+    the stored cell against the default evaluated again:            different, so the next plan schedules another update
+    ```
+
+    The next plan compares what the last apply stored against a freshly
+    evaluated default, schedules an update, and that update writes a third
+    value. Neither branch converges, which means the shape is not desired state
+    — it is a request pbps cannot satisfy in either direction.
+
+    **Decision.** A `data:` row that **omits** a cell whose column carries a
+    default is refused unless that default is a plain literal — a quoted string
+    or a number-shaped scalar, the distinction `pbps fmt` already draws over
+    scalars and not an expression parse. The message names the fix, which is to
+    declare the value. Where the default *is* a literal there is nothing that
+    can move between plan and apply, so the earlier half of this decision —
+    write the value rather than omitting the column — applies there and only
+    there.
+
+    This shrinks what the assertion below has to cover but does not remove it:
+    DECISIONS 117's unprobeable-default path and the settings under which pbps's
+    *own* rendered values are read are still live. And it makes the failure this
+    section has now chased through three rounds unrepresentable instead of
+    detected, which is the outcome that was available at the start and that
+    three successive optimisations talked me out of.
   - **Where it is not** — DECISIONS 117's unprobeable-default path — **the plan
     records the settings it probed under, and `apply` asserts them before the
     write**, refusing loudly if they moved. That is the same shape as
@@ -1317,10 +1352,10 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation (§3); and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which ADR-0009's opaque-caller exemption suppresses a report while the engine performs no check. A scope around a write would also be a scope around every trigger that write fires |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which a stale reference in a recreated SQL body is accepted silently instead of refused at `CREATE` (ADR-0009; the exemption that first motivated the pin is gone, the loud failure is what it is for now). A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
-| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value where the probe answers the same in two transactions, keeps `DEFAULT` where it does not — `now()` differs, a constant-folding cast does not — and in either case the plan records the probed settings and `apply` asserts them |
+| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so an omitted cell over a non-literal default is **refused** — neither baking nor `DEFAULT` converges, measured both ways — and where the default is a literal pbps writes the value. The plan still records the probed settings and `apply` asserts them, for DECISIONS 117's unprobeable path |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
 | A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
