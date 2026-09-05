@@ -934,10 +934,26 @@ Two things follow, and neither is a new mechanism:
   which is the one outcome §7.5 exists to prevent.
 
   So the enumeration is over **every reverse `pg_depend` edge**, not over
-  modules: the managed ones — a check constraint, a default, a generated column
-  or an index the table declaration holds — are dropped and restored around the
-  rebuild, in the plan where the approver sees them; the unmanaged ones are the
-  refusal above.
+  modules: the managed ones — a check constraint, a column default, or an index
+  the table declaration holds — are dropped and restored around the rebuild, in
+  the plan where the approver sees them; the unmanaged ones are the refusal
+  above.
+
+  **"Managed" here means representable, and two of the four objects in the
+  measurement above are not.** `Column` has no generated-expression field and
+  `IndexColumn` is a name and a direction
+  ([ADR-0013](ADR-0013-postgres-reference-data.md) §3, verified in
+  `crates/pbps-model/src/schema.rs`), so a generated column and an expression
+  index have no declaration for the planner to recreate them from. Promising to
+  restore them would be promising to emit a statement pbps cannot write. They
+  take the **unmanaged-refusal path** with everything else the model cannot
+  hold, until it can.
+
+  A first version of this paragraph listed all four as managed, which is the
+  same over-wide claim ADR-0013 §3 made about the write path in the same round —
+  the correction landed there and not here, because the sweep followed the
+  document I was editing rather than the shape I had just fixed. That is the
+  rule CLAUDE.md states and this is the instance that shows why.
 
   **Their cost has to be visible, because it is not the module's cost.**
   Restoring a check constraint revalidates the table and rebuilding an index
@@ -1109,21 +1125,59 @@ Two things follow, and neither is a new mechanism:
   a BEGIN ATOMIC body naming the same missing function, still off:  refused: function cfb.f(integer) does not exist
   ```
 
-  So the exemption was already safe for the module kind this ADR recommends, and
-  the pin covers the string-bodied one it does not.
+  So the pin covers the string-bodied kind; `BEGIN ATOMIC` never needed it.
+
+  **And then the exemption goes away entirely, because a body that validates is
+  not a body that binds what it bound before.** Overload resolution is not
+  identity: **measured**, a caller of `g(1)` that answered `integer overload`,
+  after `g(integer)` is dropped and with bodies checked, is *accepted* on
+  recreation and answers something else:
+
+  ```
+  the caller before anything is dropped:                             integer overload
+  recreating it after g(integer) is dropped, bodies checked:         accepted
+  what it answers now:                                               bigint overload
+  ```
+
+  PostgreSQL resolved `1` to `bigint` through an implicit conversion. The check
+  the pin restores proves the body *resolves*, which was never the same claim as
+  "resolves to what it resolved to", and suppressing the report on the strength
+  of it hides exactly the behaviour change the scan exists to surface.
+
+  The obvious repair — suppress only when the callee identity is established and
+  shown unchanged — turns out to delete the exemption rather than narrow it:
+
+  ```
+  what a string-bodied SQL caller records about its callee:  nothing
+  what a BEGIN ATOMIC caller records:                        ov.g(integer)
+  ```
+
+  A string-bodied caller records no callee identity at all, so "established and
+  unchanged" is never satisfiable for the one kind the exemption was written
+  about; and a `BEGIN ATOMIC` caller does record one, which means it is already
+  an established dependency and takes the refusal path above without needing an
+  exemption. **So there is no exemption: a name match is reported, always.**
+
+  The pin from the previous paragraph stays, with its reason rewritten rather
+  than left standing after the thing it was for went away — CLAUDE.md's rule
+  about a guard whose reason has gone. It is no longer there to make a
+  suppression safe; it is there because `A67`'s silent acceptance becomes
+  `A66`'s loud refusal at `CREATE`, which is worth having on its own.
 
   Reading this paragraph as a refusal rule is what the decision above already
   rejects: a scan hit is a name, and a legitimate caller of `f(text)` must not
   block a rebuild of `f(integer)`. So the whole of it sits under that rule —
   **refuse only on an established dependency** (`pg_depend`, or a declared
-  `depends_on:`); **report** a name match; and where the plan recreates a
-  SQL-language caller, the engine's own check makes even the report unnecessary,
-  because a stale reference in one fails loudly at `CREATE`. PL/pgSQL and
-  dynamic SQL keep the report, since nothing validates them at all.
+  `depends_on:`) and **report** a name match, in every case. An earlier version
+  ended this sentence with "and where the plan recreates a SQL-language caller,
+  the engine's own check makes even the report unnecessary" — that clause is
+  gone, for the reason two paragraphs above: the check proves the body resolves,
+  not that it resolves to what it did before.
 
-  That is the fourth time in this section a rule has been attached to something
+  That is the fifth time in this section a rule has been attached to something
   easy to see — the identity, the caller's declaration changing, the body's
-  language — rather than to the event that actually decides the outcome. The
+  language, the engine accepting a `CREATE` — rather than to the event that
+  actually decides the outcome. The
   three earlier ones are recorded above; this one is recorded here; and the
   pattern is worth more than any of the four fixes, because the next rule
   written in this section will be tempting for the same reason. Callers found **outside** the managed set are

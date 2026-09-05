@@ -1339,6 +1339,44 @@ SELECT 'A70', 'how the setting reaches a session nobody configured',
 ALTER ROLE m_bystander RESET check_function_bodies;
 DROP SCHEMA cfb CASCADE;
 
+-- -------------------------- the forty-second 2026-09-05 review round
+
+-- A probeable default is not automatically a bakeable one: the probe's answer
+-- can belong to the transaction that asked for it.
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT now()::text AS t1, (('01/02/2026'::text)::date)::text AS c1 \gset
+COMMIT;
+SELECT pg_sleep(0.05);
+BEGIN; SET TRANSACTION READ ONLY;
+SELECT now()::text AS t2, (('01/02/2026'::text)::date)::text AS c2 \gset
+COMMIT;
+SELECT 'R123', 'now() probed in two separate read-only transactions',
+  CASE WHEN :'t1' = :'t2' THEN 'the same value' ELSE 'two different values' END;
+SELECT 'R124', 'a constant-folding default probed the same way',
+  CASE WHEN :'c1' = :'c2' THEN 'the same value' ELSE 'two different values' END;
+
+-- A body that validates is not a body that binds what it bound before.
+CREATE SCHEMA ov;
+CREATE FUNCTION ov.g(a bigint) RETURNS text AS $$SELECT 'bigint overload'$$ LANGUAGE sql;
+CREATE FUNCTION ov.g(a int) RETURNS text AS $$SELECT 'integer overload'$$ LANGUAGE sql;
+CREATE FUNCTION ov.caller() RETURNS text AS $$SELECT ov.g(1)$$ LANGUAGE sql;
+CREATE FUNCTION ov.atomic() RETURNS text LANGUAGE sql BEGIN ATOMIC; SELECT ov.g(1); END;
+SELECT 'A71', 'the caller before anything is dropped', ov.caller();
+SELECT 'A72', 'what a string-bodied SQL caller records about its callee',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'ov.caller()'::regprocedure AND d.refclassid = 'pg_proc'::regclass
+      AND d.refobjid <> 'ov.caller()'::regprocedure), 'nothing');
+SELECT 'A73', 'what a BEGIN ATOMIC caller records',
+  coalesce((SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    WHERE d.objid = 'ov.atomic()'::regprocedure AND d.refclassid = 'pg_proc'::regclass
+      AND d.refobjid <> 'ov.atomic()'::regprocedure), 'nothing');
+DROP FUNCTION ov.atomic();
+DROP FUNCTION ov.g(int);
+SELECT 'A74', 'recreating the caller after g(integer) is dropped, bodies checked',
+  m.accepts('CREATE OR REPLACE FUNCTION ov.caller() RETURNS text AS $x$SELECT ov.g(1)$x$ LANGUAGE sql');
+SELECT 'A75', 'what it answers now', ov.caller();
+DROP SCHEMA ov CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;

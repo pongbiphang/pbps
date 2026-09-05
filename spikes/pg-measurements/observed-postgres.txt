@@ -224,3 +224,10 @@ A67 | the same recreation with check_function_bodies off | accepted
 A68 | calling it afterwards | refused: function cfb.f(integer) does not exist
 A69 | a BEGIN ATOMIC body naming the same missing function, still off | refused: function cfb.f(integer) does not exist
 A70 | how the setting reaches a session nobody configured | check_function_bodies=off
+R123 | now() probed in two separate read-only transactions | two different values
+R124 | a constant-folding default probed the same way | the same value
+A71 | the caller before anything is dropped | integer overload
+A72 | what a string-bodied SQL caller records about its callee | nothing
+A73 | what a BEGIN ATOMIC caller records | ov.g(integer)
+A74 | recreating the caller after g(integer) is dropped, bodies checked | accepted
+A75 | what it answers now | bigint overload

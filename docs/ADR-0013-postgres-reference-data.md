@@ -545,11 +545,35 @@ pinned on the session, and not wrapped around the writes at all.**
 
   Two decisions, in the order this project prefers them:
 
-  - **Where the value is knowable, do not depend on the default at all.** A row
-    pbps writes carries the value the engine canonicalized at plan time (§3
-    above) rather than omitting the column and letting `apply`'s session
-    evaluate the default. That makes the divergence unrepresentable instead of
-    detected, which is CLAUDE.md's stated preference and costs nothing here.
+  - **Where the value is knowable *and the same tomorrow*, do not depend on the
+    default at all.** A row pbps writes carries the value the engine
+    canonicalized at plan time (§3 above) rather than omitting the column and
+    letting `apply`'s session evaluate the default.
+
+    A first version of this said "where the value is knowable" and "costs
+    nothing here", and both were wrong. The `READ ONLY` probe above accepts
+    `now()` and `random()` precisely because they are harmless to *evaluate* —
+    and their answer belongs to the transaction that asked. **Measured**:
+
+    ```
+    now() probed in two separate read-only transactions:  two different values
+    a constant-folding default probed the same way:       the same value
+    ```
+
+    Baking the first turns `DEFAULT now()` from "the moment of the apply" into
+    "the moment of the plan", and the next plan probes a third value and updates
+    the row again — a permanent diff, and a changed meaning, produced by an
+    optimisation. So the test is not "can it be probed" but **"does it answer
+    the same in two transactions"**, which is the probe run twice and costs one
+    extra round trip. An expression that does not, or that pbps cannot show
+    does, keeps its `DEFAULT` and relies on the assertion below. Conservative is
+    the safe direction here: keeping `DEFAULT` preserves the declared meaning,
+    baking replaces it.
+
+    Two transactions cannot prove stability, only disprove it — a clock read at
+    one-second resolution can answer twice the same. The assertion is what
+    covers the rest, which is why it is not an alternative to this but its
+    other half.
   - **Where it is not** — DECISIONS 117's unprobeable-default path — **the plan
     records the settings it probed under, and `apply` asserts them before the
     write**, refusing loudly if they moved. That is the same shape as
@@ -1296,7 +1320,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which ADR-0009's opaque-caller exemption suppresses a report while the engine performs no check. A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
-| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |
+| The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value where the probe answers the same in two transactions, keeps `DEFAULT` where it does not — `now()` differs, a constant-folding cast does not — and in either case the plan records the probed settings and `apply` asserts them |
 | Rendering a value | Setting-independent by construction, not by scope (§2): `E'…'` with backslashes doubled for `text`, `decode('…','hex')` for `bytea`. Canonical hex under `standard_conforming_strings = off` is *accepted* while storing the wrong bytes, so a refusal list cannot cover this — the dependency is in pbps's rendering, not in the declaration |
 | A column's structural default, a check expression, an index filter | All three stored **as declared** beside the read-back (§4), for the reason module text is (ADR-0009 §2.2): they are compared as text and PostgreSQL respells all of them. The check and the filter are the expensive ones — `diff_constraints` answers a mismatch with drop-then-add, so an unchanged check is revalidated and an unchanged index rebuilt on every connected plan |
 | The pre-delete probe | A PostgreSQL rule that is **not** the SQL Server rule (§1) |
