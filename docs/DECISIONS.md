@@ -3063,3 +3063,57 @@ SPEC is in sync with all of these.
     the gate. Not a merge queue: `merge_group` would be associated correctly,
     but merge queues need an organisation-owned or public repository and this
     one is neither.
+
+## Phase 5 prep — the declared record (ADR-0009 §2.2, ADR-0013 §3–§4)
+
+207. **The state keeps what was declared beside what it read back, and a
+    version 6 state reads as having declared nothing.** `StateSnapshot`
+    gains one field, `declared`, holding the three ADR-0009 counts: each
+    managed module's definition as declared when last written, the three
+    verbatim expressions — `Column::default`, `CheckConstraint::expression`,
+    `Index::filter` — as declared, and the bindings of ADR-0013 §3. One
+    struct rather than three loose fields, because the three move together:
+    `bootstrap` records them from the declarations it created everything
+    from; `apply` takes the previous state's record and advances it by the
+    plan — from the plan alone, since `apply --plan` needs nothing else (SPEC
+    §7.3): a change that writes an object carries the text it wrote, a drop
+    forgets it, a rename re-keys it; a staged checkpoint carries the previous
+    record, since nothing plans against a checkpoint; `baseline` and
+    `snapshot` record none, because they applied nothing and either obvious
+    filling is wrong (ADR-0009 §2.2). The version goes to 7, and 6 stays
+    readable: a version 6 state recorded nothing as declared, so an empty
+    record is what it truly says — the rule that keeps 4 readable (160) and
+    not the one that refused 5 (203), where the same spelling had changed its
+    meaning. The issue that scoped this said such a state would be refused;
+    reading it is the better answer, and this entry is where the change of
+    mind is written down.
+208. **The differ compares the declarations against what was declared when
+    each object was last written, and falls back to the read-back where
+    nothing was recorded.** `Declared::overlay` lays the recorded texts over
+    the read-back the connected plan (and a snapshot `--base`) compares
+    against; a git baseline is declarations already. Where the record has no
+    text for an object — an environment adopted with `baseline`, a version 6
+    state, an object created by hand — the read-back stands, which is what
+    the differ always compared. On an engine that stores what it was given
+    that is the same answer as before this change; on one that respells, the
+    object is restated once and the apply records what it declared, which is
+    the "restated once" ADR-0009 §2.2 asks for, reached by a fallback rather
+    than a rule of its own. And the read-back is not the engine that stores
+    what it was given: **measured**, SQL Server reads a default `GETDATE()`
+    back as `(getdate())`, a check `n > 0 AND label <> 'none'` as
+    `([n]>(0) AND [label]<>'none')`, and a filtered index's predicate the
+    same, so `plan --db` straight after a `bootstrap` restated the default,
+    dropped and re-added the check and dropped and rebuilt the index —
+    marked destructive — on every run. ADR-0013's Limits called that a
+    reasoned worry, unmeasured on SQL Server; it was a shipped bug, and the
+    live test pins the fix.
+209. **A binding is the dialect's to record, and SQL Server records none.**
+    The candidate set of ADR-0013 §3 is a property of a search path, and SQL
+    Server has none: an unqualified name binds to the *caller's* default
+    schema when the statement runs, a property of the session and not of the
+    object, so there is no set to record at creation that the catalog could
+    later be asked about. Recording a guess — the identifier scan's qualified
+    references, say — would give the field content that means nothing and
+    could not move. The shape is in the format now, with a round-trip test,
+    so the PostgreSQL crate adds the recording and the rebuild decision and
+    changes no format.

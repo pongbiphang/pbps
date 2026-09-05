@@ -368,6 +368,20 @@ ledger or the permission checks.
   unit suite could only ever check that the SQL said what its author thought it
   said — and it did.
 
+**A reasoned worry in an ADR's Limits was a shipped bug.** ADR-0013 §4 found,
+on PostgreSQL, that comparing a declared expression against the engine's
+respelling restates it on every connected plan, and its Limits noted the same
+comparison runs on SQL Server "with no normalizer anywhere in the workspace" —
+*a reasoned worry, not an observation*. Measured while landing the fix: SQL
+Server respells every one of them (`GETDATE()` → `(getdate())`, `n > 0` →
+`([n]>(0))`), and `plan --db` straight after a `bootstrap` dropped and rebuilt
+an unchanged filtered index, marked destructive, on every run (DECISIONS 208).
+Nothing in the live suite had ever re-planned a table with a check or a filter
+after applying it. **When a design document says "the same code path runs on
+the shipped engine, unmeasured", that sentence is a test that has not been
+written yet** — run it before the design lands, because the fix for the future
+engine is the fix for the present one.
+
 ## A round trip tested only on the simple case
 
 Two P1s on the `ModuleId` PR (#47) were the same mistake in two places: an
@@ -513,7 +527,7 @@ the suite may run as root **and** runs on Windows.
   the Actions tab, which is why this reads as a GitHub fault rather than a
   configuration one. The gate reports a **commit status** instead: a status is
   addressed to a commit, not to a suite, so there is nothing left to associate
-  (DECISIONS 206).
+  (DECISIONS 207).
 - **A required job skipped by `if:` counts as passing.** GitHub treats
   `success`, `skipped` and `neutral` alike in a required check, so guarding
   an expensive job with a label or a `draft` test opens the gate instead of

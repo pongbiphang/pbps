@@ -24,6 +24,7 @@
 
 pub mod change;
 pub mod data;
+pub mod declared;
 pub mod drift;
 pub mod finding;
 pub mod ids;
@@ -47,6 +48,7 @@ pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
     RowConflict, RowKey, RowScope, TableData, Value,
 };
+pub use declared::{Binding, Bindings, Declared, DeclaredExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};

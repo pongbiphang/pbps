@@ -1775,6 +1775,83 @@ mod tests {
         );
     }
 
+    /// The engine respells every expression it stores — measured on SQL
+    /// Server, `n > 0 AND label <> 'none'` comes back `([n]>(0) AND
+    /// [label]<>'none')` and `GETDATE()` as `getdate()` — so a differ that
+    /// compared the declaration against the read-back restated an unchanged
+    /// check and rebuilt an unchanged filtered index on every connected plan.
+    /// With the declared texts recorded and laid over the read-back, an
+    /// unchanged declaration plans nothing, a changed one plans the change,
+    /// and an object nothing was recorded for is compared as it always was
+    /// (ADR-0013 §4, DECISIONS 207–208).
+    #[test]
+    fn a_declared_expression_the_engine_respelled_is_not_restated_when_unchanged() {
+        let declared_t = {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("n", Column::new(ty("int"))),
+                ("d", Column::new(ty("date"))),
+            ]);
+            t.columns.get_mut("n").unwrap().default = Some("0".to_owned());
+            t.columns.get_mut("d").unwrap().default = Some("GETDATE()".to_owned());
+            t.checks.insert(
+                "ck_n".to_owned(),
+                pbps_model::CheckConstraint {
+                    expression: "n > 0 AND n < 10".to_owned(),
+                },
+            );
+            t.indexes.insert(
+                "ix_n".to_owned(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "n".to_owned(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: Some("n > 0".to_owned()),
+                },
+            );
+            t
+        };
+        let read_back_t = {
+            let mut t = declared_t.clone();
+            t.columns.get_mut("n").unwrap().default = Some("(0)".to_owned());
+            t.columns.get_mut("d").unwrap().default = Some("getdate()".to_owned());
+            t.checks.get_mut("ck_n").unwrap().expression = "[n]>(0) AND [n]<(10)".to_owned();
+            t.indexes.get_mut("ix_n").unwrap().filter = Some("[n]>(0)".to_owned());
+            t
+        };
+        let declared = schema_of("dbo.t", declared_t.clone());
+        let read_back = schema_of("dbo.t", read_back_t);
+
+        // Compared against the read-back, as before the record existed: the
+        // restatement, with its drop-and-add of the check and the index.
+        let restated = kinds(&run(&read_back, &declared, &[]));
+        assert!(
+            restated.contains(&"AlterColumnDefault".to_owned()),
+            "{restated:?}"
+        );
+        assert!(restated.contains(&"DropIndex".to_owned()), "{restated:?}");
+
+        // Compared against what was declared when it was written: nothing.
+        let recorded = pbps_model::Declared::from_schema(&declared);
+        let base = recorded.overlay(&read_back);
+        assert!(run(&base, &declared, &[]).changes.is_empty());
+
+        // A changed declaration is still a change — of that expression only.
+        let mut edited = declared.clone();
+        edited
+            .tables
+            .get_mut(&"dbo.t".parse().unwrap())
+            .unwrap()
+            .checks
+            .get_mut("ck_n")
+            .unwrap()
+            .expression = "n > 1 AND n < 10".to_owned();
+        assert_eq!(kinds(&run(&base, &edited, &[])), ["DropCheck", "AddCheck"]);
+    }
+
     /// Each side resolves against its own table: a column that *gains* a
     /// default in this plan holds NULL in every existing row (adding a default
     /// does not backfill), and the declaration says the row should hold the

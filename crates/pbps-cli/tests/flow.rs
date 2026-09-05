@@ -6327,6 +6327,77 @@ fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
 /// rows go in with `bootstrap`, come back into the recorded state in the
 /// engine's spelling, a hand-edited row is drift, a re-declared table plans
 /// against what the target holds, and `pull --data` writes the block back.
+/// The engine respells every expression it stores — measured, a default
+/// `GETDATE()` reads back `(getdate())`, a check `n > 0 AND label <> 'none'`
+/// as `([n]>(0) AND [label]<>'none')`, and a filtered index's predicate the
+/// same — so before the state recorded what was declared, every connected
+/// plan after a bootstrap restated the default, dropped and re-added the
+/// check and dropped and rebuilt the index, for ever (ADR-0013 §4, its Limits
+/// said this was unmeasured on SQL Server; it was real). Now: an unchanged
+/// declaration plans nothing, a changed one plans that change, and the apply
+/// that writes it records the new text so the next plan is quiet again.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_expression_the_engine_respells_is_not_restated() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "respell");
+    let connection = own.connection().to_owned();
+    let declared = |check: &str| {
+        format!(
+            "table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\n  label: {{type: nvarchar(50), nullable: false, default: \"'unnamed'\"}}\n  n: {{type: int, nullable: false, default: \"0\"}}\n  d: {{type: date, default: \"GETDATE()\"}}\nprimary_key: [id]\nchecks:\n  ck_n: \"{check}\"\nindexes:\n  ix_n: {{columns: [n], where: \"n > 0 AND label <> 'none'\"}}\n"
+        )
+    };
+    let d = Demo::new("respell");
+    d.table(&declared("n > 0 AND label <> 'none'"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // Unchanged declarations, straight after the bootstrap that wrote them.
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("No changes."),
+        "an unchanged check, filter and default were restated: {}",
+        stdout(&o)
+    );
+
+    // A real change to the check is planned, and only it.
+    d.table(&declared("n > 1 AND label <> 'none'"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("check constraint ck_n"), "{s}");
+    assert!(!s.contains("index ix_n") && !s.contains("default"), "{s}");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The apply recorded the text it wrote, so the next plan is quiet again,
+    // and the environment matches its recorded state.
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No drift"), "{}", stdout(&o));
+}
+
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn reference_data_round_trips_through_a_real_target() {

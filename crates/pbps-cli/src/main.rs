@@ -2350,9 +2350,14 @@ fn cmd_plan(
             .or_insert_with(|| deps.clone());
     }
 
+    // A snapshot baseline is a read-back, and the engine respells what it
+    // stores; where the snapshot recorded what was declared, that is what the
+    // declarations are compared against (ADR-0013 §4). A git baseline records
+    // nothing and the overlay leaves it as it is.
+    let base_schema = base.declared.overlay(&base.schema);
     let mut cs = pbps_diff::diff(
         Side {
-            schema: &base.schema,
+            schema: &base_schema,
             ids: &base.ids,
         },
         Side {
