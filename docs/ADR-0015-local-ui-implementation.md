@@ -227,7 +227,11 @@ The steps:
    `git hash-object` follows a link and hashes the target's content
    (**measured**: the link `a` hashed as `a`'s content, where `git add`
    stores the link text at mode `120000`), so a linked declaration file
-   would commit its contents as a link's destination. And it requires the
+   would commit its contents as a link's destination. The tip's entry for
+   the path must be a regular file too (`100644` or `100755`) or absent:
+   step 3 reuses the tip's mode, and a path whose link was replaced by a
+   file since the tip would otherwise pass the filesystem check and be
+   committed as a `120000` entry holding the document. And it requires the
    index entry for each path to be the tip's entry (`git ls-files -s -z --
    <path>` against `git ls-tree -z <tip> -- <path>`), refusing otherwise and
    showing the staged change: staged content of the user's own is work not
@@ -317,7 +321,10 @@ push of a feature branch, the common case — is not an ahead branch: the
 destination is absent rather than behind, and the check is instead that the
 tip is already on the remote, an ancestor of one of the heads `ls-remote`
 lists. That head is fetched first into a ref of the UI's own (`git fetch
---no-tags <remote> +refs/heads/<witness>:refs/pbps-ui/witness`), because
+--no-tags --no-write-fetch-head <remote>
++refs/heads/<witness>:refs/pbps-ui/witness` — the second flag so the user's
+`FETCH_HEAD` still names what the user last fetched; **measured**, it did),
+because
 `ls-remote` names an object the local repository need not have
 (**measured**: `merge-base --is-ancestor` against the bare id exited 128,
 against the fetched ref it answered). The push then names the commit by id,
@@ -326,14 +333,17 @@ empty expected value — and, for a first push, names the witness at its
 fetched value in the same push under `--atomic`, since a lease on a ref the
 push does not name is ignored (**measured**: with the witness moved on the
 remote, the lease alone let the branch be created; the atomic push naming the
-witness was refused as stale and created nothing). It takes `--no-verify`
+witness was refused as stale and created nothing). `--atomic` is asked for
+only on that two-ref push: a server without atomic push support refuses the
+option outright, and the one-ref push of an existing branch has nothing to
+be atomic about. It takes `--no-verify`
 as well as the empty `core.hooksPath` every `git` here gets, because a
 `pre-push` hook is a hook (**measured**: it ran without the flag and not
 with it), and `--no-follow-tags`; never a bare `git push`, which under
 `push.default=matching` advanced two branches at once when measured:
 
 ```
-git push --no-verify --no-follow-tags --atomic \
+git push --no-verify --no-follow-tags [--atomic] \
     --force-with-lease=refs/heads/<branch>:<tip-or-empty> \
     [--force-with-lease=refs/heads/<witness>:<fetched> <fetched>:refs/heads/<witness>] \
     <remote> <oid>:refs/heads/<branch>
