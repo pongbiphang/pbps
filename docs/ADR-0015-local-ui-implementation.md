@@ -103,13 +103,17 @@ the address the server bound and an `Origin` (or none, for a same-origin
 navigation) that matches it. A request failing any of the four is refused
 before it is routed.
 
-The one exception is the request that has to come first. A navigation to the
-printed URL cannot carry a header the page has not yet been served to set, so
-the shell — the embedded page itself, immutable, holding no project data and
-nothing a stranger could not read out of the binary — is served to any
-loopback peer with a matching `Host`. Its script reads the token from the
-fragment, holds it in memory, and sends it in the header on every request that
-follows; every route but the shell requires it. The fragment is the place for
+The one exception is the requests that have to come first. A navigation to
+the printed URL cannot carry a header the page has not yet been served to set,
+and the script that would set it is itself a request the browser makes before
+any script has run — decision 2's policy keeps scripts to `'self'`, so the
+script is a file, not an inline block. So the shell — the embedded page, its
+script and its stylesheet, all immutable, holding no project data and nothing
+a stranger could not read out of the binary — is served to any loopback peer
+with a matching `Host`. The script reads the token from the fragment, holds it
+in memory, and sends it in the header on every request that follows; every
+route that answers a question about the project requires it. The fragment is
+the place for
 it because a browser sends the fragment neither to the server nor in a
 `Referer`; the one place it lands is the browser's history, where it names a
 server that is gone when `pbps ui` exits.
@@ -162,8 +166,21 @@ file staged, `git commit --only -- ids.json` committed the ids file alone and
 left the other file staged, and `git diff HEAD -- ids.json` showed the same
 hunk — where a plain `git add` and `git commit` would have swept the staged
 file into the intent commit and pushed it, and a plain `git diff` would not
-have shown it in the preview. After the push the page shows the branch and
-links the merge request where the hosting's URL shape is known.
+have shown it in the preview.
+
+`--only` bounds what the UI asks for; it does not bound what a hook does. A
+`pre-commit` hook runs with the index in its hands, and **measured** on the
+same git: a hook that ran `git add b` widened `git commit --only -- a` to a
+commit of `a` and `b`, and a hook that rewrote `a` committed the rewritten
+content, not the previewed hunk. So the push is not automatic. Before it, the
+UI reads the commit back — `git diff-tree --no-commit-id --name-only -r HEAD`
+must name exactly the previewed paths, and `git diff HEAD~1 HEAD -- <paths>`
+must be the previewed hunk — and pushes only a commit that passes both. One
+that does not is left where it is, unpushed and reversible, and the page shows
+what differs from the preview and the commands to push it or undo it; the
+hook's change is the user's to look at, not the UI's to publish or discard.
+After a push the page shows the branch and links the merge request where the
+hosting's URL shape is known.
 
 A library (`gix`, `libgit2`) is the obvious design and would remove a runtime
 dependency on a `git` binary. It is refused because ADR-0006's audit story is
