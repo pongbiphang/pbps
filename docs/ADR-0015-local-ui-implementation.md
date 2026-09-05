@@ -321,12 +321,22 @@ recorded tip against the tree the UI built, exact by construction, and
 rendered without presentation filters because a `diff.external` or
 `textconv` driver can show two blobs as one text (**measured**: a driver
 printing a constant hid a rewritten file). Every `git` the UI runs takes
-`--literal-pathspecs`, every path comes after `--`, and every command that
-prints paths takes `-z` and is parsed as bytes, each for a reason that was
-measured: `a[12].json` is a pattern to `git` and selected three files
-without `--literal-pathspecs`; a file named `-A` made `git add -N -A` mark
-every untracked file; and `schéma.json` came back C-quoted from `ls-tree`
-without `-z`.
+`--literal-pathspecs` and `--no-replace-objects`, runs from the worktree's
+root (`-C <git rev-parse --show-toplevel>`) with every path spelled relative
+to that root and refused if it lies outside it, every path comes after `--`,
+and every command that prints paths takes `-z` and is parsed as bytes — each
+for a reason that was measured. `a[12].json` is a pattern to `git` and
+selected three files without `--literal-pathspecs`. A file named `-A` made
+`git add -N -A` mark every untracked file. `schéma.json` came back C-quoted
+from `ls-tree` without `-z`. A pathspec is resolved from the current
+directory while a `--cacheinfo` path is an index name from the root: run
+from a subdirectory `p/` of the worktree, the pathspec `a` selected `p/a`
+and `--cacheinfo …,a` wrote the entry `a`, so step 1 would have checked one
+file and step 6 replaced another. And a `refs/replace/<tip>` is honoured by
+`read-tree`, `diff` and `merge-base` but recorded by nobody: with the tip
+replaced by a commit that changed an unrelated file, the preview showed the
+one edited path and the commit — whose parent is the real tip — carried
+both, where `--no-replace-objects` read the real tip throughout.
 
 The push is bounded to that one commit, to it by name, and to one
 destination. A remote may carry several push URLs, and `git push` sends to
