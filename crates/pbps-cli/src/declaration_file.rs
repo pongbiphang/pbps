@@ -86,23 +86,29 @@ fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
 
 /// The file a module is written to, under its whole identity.
 ///
-/// A routine carries its argument types into the filename because they are
-/// part of what it is (ADR-0009 §1): `app.f(integer)` and `app.f(text)` are
-/// two declarations, and one file for both would have `pull` write the second
-/// over the first. `component` percent-encodes the parentheses and commas, so
-/// the name stays one path component.
+/// The whole identity, because anything less lets `pull` write one
+/// declaration over another (ADR-0009 §1, DECISIONS 197). A routine carries
+/// its argument types — `app.f(integer)` and `app.f(text)` are two
+/// declarations — and a trigger carries its table, because `audit` on
+/// `app.orders` and `audit` on `app.customers` are two more. `component`
+/// percent-encodes the parentheses, commas and the separating dot, so the
+/// name stays one path component.
 pub fn module_path(
     directory: &Path,
     id: &pbps_model::ModuleId,
     kind: ModuleKind,
 ) -> anyhow::Result<PathBuf> {
     let name = id.object_name();
-    let stem = match id.args() {
-        Some(args) => {
-            let spelled: Vec<String> = args.iter().map(ToString::to_string).collect();
-            format!("{}({})", name.name, spelled.join(","))
+    let stem = match id {
+        pbps_model::ModuleId::Named(n) => n.name.clone(),
+        pbps_model::ModuleId::Routine(r) => {
+            let spelled: Vec<String> = r.args.iter().map(ToString::to_string).collect();
+            format!("{}({})", r.name.name, spelled.join(","))
         }
-        None => name.name.clone(),
+        // The table's own name only: its schema is `name.schema`, which the
+        // filename already carries, and repeating it would make
+        // `app.app.orders.audit`.
+        pbps_model::ModuleId::Trigger { on, name } => format!("{}.{}", on.name, name),
     };
     let path = directory.join(filename_of(&name.schema, &stem, Some(kind)));
     if path.parent() != Some(directory) {
@@ -222,6 +228,25 @@ pub fn refuse_folded_paths(paths: &[(String, PathBuf)]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trigger's table is half of its identity (ADR-0009 §1), so two
+    /// triggers named `audit` on different tables in one schema are two
+    /// declarations. One filename for both would have `pull` write the second
+    /// over the first, and the next plan would drop the trigger whose file
+    /// vanished — the identity this phase added, undone on the way to disk.
+    #[test]
+    fn same_named_triggers_on_different_tables_get_different_files() {
+        let dir = Path::new("/tmp/schema");
+        let orders: pbps_model::ModuleId = "app.orders.audit".parse().unwrap();
+        let customers: pbps_model::ModuleId = "app.customers.audit".parse().unwrap();
+        let a = module_path(dir, &orders, ModuleKind::Trigger).unwrap();
+        let b = module_path(dir, &customers, ModuleKind::Trigger).unwrap();
+        assert_ne!(a, b, "one file for two triggers");
+        // And the table is what distinguishes them, not a hash nobody can read
+        // back to the declaration it came from.
+        assert!(a.to_string_lossy().contains("orders"), "{}", a.display());
+        assert!(b.to_string_lossy().contains("customers"), "{}", b.display());
+    }
 
     /// A case-sensitive database holds `Reader` beside `reader`; the files
     /// they encode to differ only in case, and one filesystem in two keeps

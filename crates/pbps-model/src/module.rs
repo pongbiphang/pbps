@@ -215,6 +215,40 @@ impl fmt::Display for ModuleId {
     }
 }
 
+/// Splits an argument list at the commas that separate arguments, and not at
+/// the ones inside a type's own modifier.
+///
+/// The two are the same character: `decimal(10,2)` is one argument with a
+/// comma in it, and `integer,text` is two without. Only nesting depth tells
+/// them apart, so a plain `split(',')` turned `app.f(decimal(10,2))` into
+/// `decimal(10` and `2)` — a valid declaration that would not parse back out
+/// of the JSON map key its own `Display` had written (PITFALLS: a round trip
+/// tested only on the simple case).
+///
+/// `None` if the parentheses do not balance, which the caller reports as a
+/// malformed identity rather than guessing where the argument ended.
+fn split_top_level(args: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                parts.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    parts.push(&args[start..]);
+    Some(parts)
+}
+
 impl FromStr for ModuleId {
     type Err = ModuleIdError;
 
@@ -232,7 +266,9 @@ impl FromStr for ModuleId {
                 .map_err(|_| ModuleIdError::Shape(s.to_owned()))?;
             let mut types = Vec::new();
             if !args.trim().is_empty() {
-                for arg in args.split(',') {
+                for arg in
+                    split_top_level(args).ok_or_else(|| ModuleIdError::Shape(s.to_owned()))?
+                {
                     types.push(arg.parse().map_err(|e| ModuleIdError::Argument {
                         whole: s.to_owned(),
                         argument: arg.trim().to_owned(),
@@ -974,6 +1010,36 @@ mod tests {
         );
     }
 
+    /// A comma inside a type's modifier is not an argument separator, and the
+    /// two are the same character. `app.f(decimal(10, 2))` is one argument;
+    /// splitting it flat made `decimal(10` and ` 2)`, so a routine the model
+    /// can hold serialized into a key that would not parse back.
+    #[test]
+    fn a_comma_inside_a_modifier_does_not_separate_arguments() {
+        let one: ModuleId = "app.f(decimal(10, 2))".parse().unwrap();
+        assert_eq!(one.args().unwrap().len(), 1, "{one}");
+        let three: ModuleId = "app.f(decimal(10, 2),text,numeric(38, 10))"
+            .parse()
+            .unwrap();
+        assert_eq!(three.args().unwrap().len(), 3, "{three}");
+        // Spacing is layout, not identity: the compact spelling a human might
+        // type is the same routine as the one `Display` writes.
+        assert_eq!("app.f(decimal(10,2))".parse::<ModuleId>().unwrap(), one);
+
+        // Unbalanced is refused rather than guessed at. A silent split here
+        // would invent an argument list nobody declared.
+        for bad in [
+            "app.f(decimal(10, 2)",
+            "app.f(decimal10, 2))",
+            "app.f(decimal(10, 2)))",
+        ] {
+            assert!(
+                bad.parse::<ModuleId>().is_err(),
+                "`{bad}` parsed as an identity"
+            );
+        }
+    }
+
     /// The three shapes, through the string form the JSON map key uses.
     /// Parentheses mean a routine — `app.f()` is one that takes nothing —
     /// and three dotted parts mean a trigger (ADR-0009 §1).
@@ -982,6 +1048,12 @@ mod tests {
         for spelling in [
             "app.v",
             "app.f(integer,text)",
+            // A modifier with its own comma: the argument separator and the
+            // one inside `decimal(10, 2)` are the same character, and only
+            // nesting tells them apart. Spelled as `ColumnType` spells it,
+            // because that is what wrote the key.
+            "app.f(decimal(10, 2))",
+            "app.f(decimal(10, 2),text,numeric(38, 10))",
             "app.f()",
             "app.orders.audit",
         ] {

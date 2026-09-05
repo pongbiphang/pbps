@@ -368,6 +368,36 @@ ledger or the permission checks.
   unit suite could only ever check that the SQL said what its author thought it
   said — and it did.
 
+## A round trip tested only on the simple case
+
+Two P1s on the `ModuleId` PR (#47) were the same mistake in two places: an
+identity was reduced to something shorter than itself, and the reduction was
+tested only on inputs where it happened to be lossless.
+
+`FromStr` split a routine's argument list on every comma, so
+`app.f(decimal(10, 2))` — one argument — parsed as `decimal(10` and ` 2)`. The
+round-trip test covered `app.f(integer,text)`, where flat splitting is right.
+The failure was not a refused parse in isolation: `Display` wrote that key into
+the state snapshot and the saved plan, so the artifact the tool wrote was one it
+could not read back.
+
+`declaration_file::module_path` built a trigger's filename from
+`object_name()`, which is `schema.name` — the trigger's table, half of its
+identity, was dropped on the way to disk. Two triggers named `audit` on
+different tables produced one file, `pull` wrote the second over the first, and
+the next plan would have dropped the trigger whose file had vanished. The whole
+point of the change was that those are two objects.
+
+**The shape.** Whenever a typed identity is flattened to a string — a map key,
+a filename, a message — test the flattening on the case where the parts are
+*not* separable by the obvious character, and on two values that must not
+collide. A round trip proved on `f(integer,text)` proves nothing about
+`f(decimal(10, 2))`; a filename proved on one trigger proves nothing about two.
+Check the sibling call sites in the same pass: the other two comma splits in
+this repo (a column list, a type's own modifier args) are safe only because
+their elements cannot nest, and that is a property worth confirming rather
+than assuming.
+
 ## Tests that pass for the wrong reason
 
 Nine so far, every one invisible in a green run. **Assert the specific failure,
