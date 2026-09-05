@@ -191,6 +191,11 @@ enum Command {
         /// human (default) or json
         #[arg(long, default_value = "human")]
         format: OutputFormat,
+
+        /// Evaluate the policy rules only for objects changed since this git
+        /// revision, so a large estate can adopt a rule gradually
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Rewrite the declarations in canonical form
@@ -231,6 +236,17 @@ enum Command {
         reason: String,
     },
 
+    /// Record a database role rename (ADR-0005)
+    RenameRole { from: String, to: String },
+
+    /// Record a database role drop
+    DropRole {
+        role: String,
+        /// Why it is being dropped; required for audit
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Render documentation and an ERD from the declarations
     Docs {
         /// markdown, html or erd
@@ -254,6 +270,11 @@ enum Command {
         /// Overwrite existing declarations and identity file
         #[arg(long)]
         force: bool,
+
+        /// Also declare this table's rows as reference data (`data: exact`);
+        /// repeatable
+        #[arg(long = "data", value_name = "TABLE")]
+        data: Vec<String>,
     },
 
     /// Run a saved plan against the environment it was computed for
@@ -355,7 +376,7 @@ impl Command {
         let (name, format) = match self {
             Command::Plan { format, .. } => ("plan", *format),
             Command::Doctor { format, .. } => ("doctor", *format),
-            Command::Validate { format } => ("validate", *format),
+            Command::Validate { format, .. } => ("validate", *format),
             Command::Fmt { format, .. } => ("fmt", *format),
             Command::Verify { format, .. } => ("verify", *format),
             Command::Status { format, .. } => ("status", *format),
@@ -373,6 +394,8 @@ impl Command {
             | Command::RenameTable { .. }
             | Command::Drop { .. }
             | Command::DropTable { .. }
+            | Command::RenameRole { .. }
+            | Command::DropRole { .. }
             | Command::Docs { .. }
             | Command::Pull { .. }
             | Command::Apply { .. }
@@ -637,7 +660,9 @@ fn run() -> anyhow::Result<()> {
                     // --plan --format json`. Adding a second typed rendering
                     // would give a reviewer two documents to disagree about.
                     refuse(
-                        "--format json describes findings, and `plan --db` produces a plan.\n                         Write it with --out <plan.json> and read it with                          `pbps explain --plan <plan.json> --format json`",
+                        "--format json describes findings, and `plan --db` produces a plan.\n\
+                         Write it with --out <plan.json> and read it with \
+                         `pbps explain --plan <plan.json> --format json`",
                     )?;
                 }
                 let target = output::or_unanswerable(
@@ -749,7 +774,7 @@ fn run() -> anyhow::Result<()> {
             };
             doctor::cmd_doctor(&project, one, format == OutputFormat::Json)
         }
-        Command::Validate { format } => cmd_validate(&project, format),
+        Command::Validate { format, since } => cmd_validate(&project, format, since.as_deref()),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
@@ -783,9 +808,17 @@ fn run() -> anyhow::Result<()> {
                 reason,
             },
         ),
-        Command::Pull { target, force } => {
+        Command::RenameRole { from, to } => cmd_intent(&project, Intent::RenameRole { from, to }),
+        Command::DropRole { role, reason } => {
+            cmd_intent(&project, Intent::DropRole { role, reason })
+        }
+        Command::Pull {
+            target,
+            force,
+            data,
+        } => {
             let target = target.resolve(&project)?;
-            cmd_pull(&project, &target, force)
+            cmd_pull(&project, &target, force, &data)
         }
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
@@ -866,8 +899,22 @@ fn cmd_docs(
 /// database has and the model can express becomes YAML, everything it cannot
 /// express is printed as a warning, and a fresh identity file is minted so the
 /// next `plan` starts from "no changes".
-fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Result<()> {
+fn cmd_pull(
+    project: &Project,
+    target: &db::Target,
+    force: bool,
+    data: &[String],
+) -> anyhow::Result<()> {
     db::require_mssql(project, "pull")?;
+    // Parsed before anything connects: a misspelt table name is a fact about
+    // the command line, and it should not cost a round trip to find out.
+    let data: Vec<TableName> = data
+        .iter()
+        .map(|raw| {
+            raw.parse::<TableName>()
+                .map_err(|e| anyhow::anyhow!("--data {raw}: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let dir = project.schema_dir();
     if !force {
@@ -898,7 +945,10 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         // still a pristine project, not user data for pull to overwrite. A
         // non-empty or malformed file remains a hard stop before connecting.
         let identities_exist = read_ids_opt(project)?.is_some_and(|ids| {
-            !ids.tables.is_empty() || !ids.columns.is_empty() || !ids.tombstones.is_empty()
+            !ids.tables.is_empty()
+                || !ids.columns.is_empty()
+                || !ids.roles.is_empty()
+                || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
             bail!(
@@ -913,11 +963,127 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     // hold that.
     let pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        Ok::<_, anyhow::Error>(pbps_mssql::catalog::introspect(&mut conn).await?)
+        let mut pulled = pbps_mssql::catalog::introspect(&mut conn).await?;
+        // `--data`: the table's rows become a `data: exact` block (ADR-0004),
+        // in the engine's own spelling — which is the spelling a declaration
+        // has to use to compare equal against this database from now on.
+        for name in &data {
+            if !pulled.schema.tables.contains_key(name) {
+                anyhow::bail!("--data {name}: this database has no such table");
+            }
+        }
+        let read: std::collections::BTreeMap<TableName, pbps_model::RowScope> = data
+            .iter()
+            .map(|t| {
+                (
+                    t.clone(),
+                    pbps_model::RowScope::Every {
+                        known: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        let rows = pbps_mssql::catalog::read_rows(&mut conn, &pulled.schema, &read).await?;
+        for (name, rows) in rows {
+            if let Some(table) = pulled.schema.tables.get_mut(&name) {
+                table.data = Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    // No declaration to spell the cells: one at its default
+                    // is written omitted, which is the shortest true block.
+                    rows: rows
+                        .rows
+                        .into_iter()
+                        .map(|(k, r)| (k, r.as_seen_by(None)))
+                        .collect(),
+                });
+                // What was just built has to pass `validate`, or `pull` would
+                // report success about files the next command refuses — a
+                // binary cell, say (DECISIONS 70). Refused here, before any
+                // declaration is written.
+                // Both halves of `validate`: the model's rules for a block
+                // (a non-key IDENTITY column the rows must not set, say)
+                // and the dialect's.
+                let mut problems: Vec<String> = pbps_model::data::check(&name, table);
+                problems.extend(
+                    pbps_mssql::validate::table(&name, table)
+                        .iter()
+                        .map(ToString::to_string),
+                );
+                if !problems.is_empty() {
+                    anyhow::bail!(
+                        "--data {name}: this table's rows cannot be declared as a `data:` \
+                         block:\n{}",
+                        problems
+                            .iter()
+                            .map(|e| format!("  - {e}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(pulled)
     })?;
 
     for w in &pulled.warnings {
         eprintln!("warning: {w}");
+    }
+    // A role's permission the model cannot hold: for `pull` a warning like
+    // the others, since nothing is being compared yet; for `verify` the same
+    // fact is drift (DECISIONS 97).
+    // Every one of them, unfiltered: `pull` is writing the declarations, not
+    // comparing them, so there is no managed set yet to be somebody else's
+    // business (DECISIONS 176 filters where there is one).
+    for u in &pulled.unexpressible {
+        eprintln!("warning: {}", u.what);
+    }
+    // The same line `validate` draws, at the moment the block is written
+    // rather than on the next run: a table this size is somebody's business
+    // table, and every plan from here on compares it row by row.
+    //
+    // Drawn by `validate`'s own evaluation of the `data.max-rows` rule,
+    // narrowed to that rule, and not by a count of this command's own: the
+    // rule's severity and row count (DECISIONS 111) and the project's
+    // suppressions all apply here exactly as they do there, so a table the
+    // project has excused by name is not refused at the moment it is
+    // pulled and rejected on the next `validate` (DECISIONS 120). A block
+    // with problems contributes nothing here, as it contributes nothing to
+    // a plan: `validate` reports the problems, and evaluating half a block
+    // would refuse against rules the project did not manage to configure.
+    let policies = project.config.policies();
+    let over: Vec<pbps_model::Finding> = if policies.check().is_empty() {
+        pbps_policy::declarations(&pulled.schema, &policies, &policy_context(project, true))
+            .into_iter()
+            .filter(|f| f.id == pbps_policy::rules::DATA_MAX_ROWS)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !over.is_empty() {
+        // At `error` the files are not written at all. `validate` would
+        // reject what this command had just produced, and a pull that
+        // leaves the project failing its own rules has handed over
+        // nothing usable — refusing before the write is the difference
+        // between "no files" and "files you must now delete by hand"
+        // (DECISIONS 114).
+        if over
+            .iter()
+            .any(|f| f.severity == pbps_model::Severity::Error)
+        {
+            anyhow::bail!(
+                "these tables hold more rows than `data.max-rows` allows, and the rule is \
+                 `error` in pbps.yml:\n  {}\n\
+                 Nothing was written. Pull without `--data`, raise the rule's `rows`, \
+                 suppress it for the table with a reason, or lower its severity.",
+                over.iter()
+                    .map(|f| f.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            );
+        }
+        for f in &over {
+            eprintln!("{}: {}", f.severity, f.message);
+        }
     }
 
     // What pbps cannot manage it still names (ADR-0002): an encrypted module or
@@ -948,6 +1114,11 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
     )
     .map_err(|b| anyhow::anyhow!("pull could not mint identities: {} blocker(s)", b.len()))?;
 
+    // Before the first file: two declarations whose names differ only in case
+    // encode to filenames that differ only in case, and a filesystem that
+    // ignores case would keep one of each — the second silently written over
+    // the first, with the identity file naming both (DECISIONS 135).
+    declaration_file::refuse_folded_paths(&declaration_file::paths_of(&dir, &pulled.schema)?)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for (name, table) in &pulled.schema.tables {
@@ -966,6 +1137,18 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
             pbps_load::render_module(name, module, &Default::default()),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
+    // Roles (ADR-0005), one file each, with the grants the catalog holds on
+    // objects pbps can express.
+    for (name, role) in &pulled.schema.roles {
+        let path = declaration_file::role_path(&dir, name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create `{}`", parent.display()))?;
+        }
+        std::fs::write(&path, pbps_load::render_role(name, role, &[]))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
 
@@ -1010,14 +1193,68 @@ fn cmd_pull(project: &Project, target: &db::Target, force: bool) -> anyhow::Resu
         dir.display(),
         project.ids_file().display()
     );
-    if !pulled.warnings.is_empty() {
+    let left_out = pulled.warnings.len() + pulled.unexpressible.len();
+    if left_out > 0 {
         println!(
-            "{} thing(s) could not be expressed and were left out; see the warnings above.",
-            pulled.warnings.len()
+            "{left_out} thing(s) could not be expressed and were left out; see the warnings above."
         );
     }
     println!("Next: commit these files, then `pbps plan` should report no changes.");
     Ok(())
+}
+
+/// What the policy rules need besides the block (ADR-0008).
+fn policy_context(project: &Project, connected: bool) -> pbps_policy::Context {
+    pbps_policy::Context {
+        now: unix_seconds(),
+        max_rows: project
+            .config
+            .max_data_rows
+            .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS),
+        connected,
+        only: None,
+    }
+}
+
+/// Runs the plan rules, attaches each finding to its change, and returns them
+/// as envelope findings for the command's own report.
+///
+/// A block with problems contributes nothing here: `validate` reports the
+/// problems, and evaluating half a block would report against rules the
+/// project did not manage to configure.
+pub fn attach_policy_findings(
+    cs: &mut pbps_model::ChangeSet,
+    project: &Project,
+    connected: bool,
+) -> Vec<output::Finding> {
+    let policies = project.config.policies();
+    if !policies.check().is_empty() {
+        return vec![
+            output::Finding::error(
+                "policy.invalid",
+                "the `policies:` block in pbps.yml has problems; `pbps validate` lists them",
+            )
+            .at(project.config_file(), None),
+        ];
+    }
+    let ctx = policy_context(project, connected);
+    let mut out = Vec::new();
+    for (at, f) in pbps_policy::plan(cs, &policies, &ctx) {
+        out.push(policy_finding(&f));
+        if let Some(p) = cs.changes.get_mut(at) {
+            p.findings.push(f);
+        }
+    }
+    out
+}
+
+/// A rule's finding as the envelope carries it: the rule id is the finding id.
+pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
+    match f.severity {
+        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), f.message.clone()),
+    }
 }
 
 /// The dialect implementation this project is configured for.
@@ -1056,6 +1293,71 @@ fn load(project: &Project) -> anyhow::Result<pbps_load::Loaded> {
         }
         anyhow::anyhow!("the declarations have {} problem(s)", errs.len())
     })
+}
+
+/// Every declaration problem `validate` reports as an error, as
+/// `(finding id, message)` pairs.
+///
+/// One list, because there were three: `validate` checked the dialect, the
+/// name collisions, the grant targets and the rows; `init` checked the first
+/// two of those on the project it had just staged; and the two commands that
+/// hand statements to a real database — `plan --db` and `bootstrap` — checked
+/// none of them. A role granting `execute` on a table therefore reached a
+/// staged plan, and its `GRANT`, ordered after every table, row and module
+/// statement, failed on a database those statements had already changed.
+/// The questions belong to the declarations, not to the command that reads
+/// them (DECISIONS 141).
+pub(crate) fn declaration_problems(
+    loaded: &pbps_load::Loaded,
+    dialect: &dyn Dialect,
+) -> Vec<(&'static str, String)> {
+    let schema = &loaded.schema;
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    // Three layers, all reported in the same pass: the loader checks shape, the
+    // dialect checks what the engine will refuse (a nullable PK column, an
+    // IDENTITY on nvarchar), and the whole-schema checks below see what no
+    // single declaration can.
+    for (name, table) in &schema.tables {
+        for e in dialect.validate_table(name, table) {
+            out.push(("dialect.rejected", format!("{name}: {e}")));
+        }
+    }
+    for (name, module) in &schema.modules {
+        for e in dialect.validate_module(name, module) {
+            out.push(("dialect.rejected", format!("{name}: {e}")));
+        }
+    }
+    // Two problems only the whole schema can see: a module named after a
+    // table, and a trigger on a table nobody declares. Both would otherwise
+    // surface as an engine error at apply time, on a database that is
+    // already half-changed.
+    for problem in pbps_model::module::check_names(schema) {
+        out.push(("schema.name-collision", problem));
+    }
+    // Roles (ADR-0005): a grant on an object nobody declares is the
+    // foreign-key-target rule applied to permissions.
+    for problem in pbps_model::role::check(schema) {
+        out.push(("schema.grant-target", problem));
+    }
+    for (name, role) in &schema.roles {
+        for e in dialect.validate_role(name, role, schema) {
+            out.push(("dialect.rejected", format!("role {name}: {e}")));
+        }
+    }
+    // And a third: a `depends_on:` naming a module nobody declared. It is
+    // silently a no-op in the ordering, so nothing else would ever say so.
+    for problem in pbps_model::module::check_dependencies(schema, &loaded.hints.module_deps) {
+        out.push(("schema.unknown-dependency", problem));
+    }
+    // Reference data (ADR-0004). Model rules, not engine rules — a row's
+    // key is its identity in every dialect — so they come from the model
+    // rather than from `validate_table`.
+    for (name, table) in &schema.tables {
+        for problem in pbps_model::data::check(name, table) {
+            out.push(("schema.data-invalid", problem));
+        }
+    }
+    out
 }
 
 /// Renders one load error the way a person should see it.
@@ -1122,6 +1424,28 @@ fn context(root: &std::path::Path) -> Context {
     }
 }
 
+/// The schema with every column type in the dialect's canonical spelling.
+///
+/// Only the types: nothing else a rule reads is the dialect's to normalize.
+/// A type the dialect cannot normalize is left exactly as written — it is
+/// already an error from `refuse_invalid_declarations`, and rewriting what a
+/// finding quotes would make the message name something the file does not
+/// (DECISIONS 187).
+fn types_as_the_dialect_spells_them(
+    schema: &pbps_model::Schema,
+    dialect: &dyn Dialect,
+) -> pbps_model::Schema {
+    let mut out = schema.clone();
+    for table in out.tables.values_mut() {
+        for column in table.columns.values_mut() {
+            if let Ok(ty) = dialect.normalize_type(&column.ty) {
+                column.ty = ty;
+            }
+        }
+    }
+    out
+}
+
 /// Everything `validate` checks, as findings.
 ///
 /// Extracted so `doctor` can run the same checks rather than a second, drifting
@@ -1131,6 +1455,7 @@ fn context(root: &std::path::Path) -> Context {
 pub fn validate_findings(
     project: &Project,
     dialect: &dyn Dialect,
+    since: Option<&str>,
 ) -> (Vec<output::Finding>, ValidateData) {
     // Both halves run before either is allowed to fail. A bad merge produces a
     // broken declaration *and* a scrambled identity file together, and the rule
@@ -1151,61 +1476,59 @@ pub fn validate_findings(
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the identity file checks below stand alone.
     if let Ok(l) = &loaded {
-        for (name, table) in &l.schema.tables {
-            for e in dialect.validate_table(name, table) {
-                findings.push(output::Finding::error(
-                    "dialect.rejected",
-                    format!("{name}: {e}"),
-                ));
-            }
+        // The same list every command that reads declarations asks for; the
+        // size warning below is the `data.max-rows` policy rule, with
+        // `max_data_rows` as its default parameter.
+        findings.extend(
+            declaration_problems(l, dialect)
+                .into_iter()
+                .map(|(id, problem)| output::Finding::error(id, problem)),
+        );
+
+        // The project's own rules (ADR-0008): the declaration point. The block
+        // itself is checked first — a misspelled rule id that configured
+        // nothing would be the silent failure this mechanism exists to replace.
+        let policies = project.config.policies();
+        for problem in policies.check() {
+            findings.push(
+                output::Finding::error("policy.invalid", problem).at(project.config_file(), None),
+            );
         }
-        for (name, module) in &l.schema.modules {
-            for e in dialect.validate_module(name, module) {
-                findings.push(output::Finding::error(
-                    "dialect.rejected",
-                    format!("{name}: {e}"),
-                ));
-            }
-        }
-        // Two problems only the whole schema can see: a module named after a
-        // table, and a trigger on a table nobody declares. Both would otherwise
-        // surface as an engine error at apply time, on a database that is
-        // already half-changed.
-        for problem in pbps_model::module::check_names(&l.schema) {
-            findings.push(output::Finding::error("schema.name-collision", problem));
-        }
-        // And a third: a `depends_on:` naming a module nobody declared. It is
-        // silently a no-op in the ordering, so nothing else would ever say so.
-        for problem in pbps_model::module::check_dependencies(&l.schema, &l.hints.module_deps) {
-            findings.push(output::Finding::error("schema.unknown-dependency", problem));
-        }
-        // Reference data (ADR-0004). Model rules, not engine rules — a row's
-        // key is its identity in every dialect — so they come from the model
-        // rather than from `validate_table`.
-        let max_rows = project
-            .config
-            .max_data_rows
-            .unwrap_or(pbps_model::data::DEFAULT_MAX_ROWS);
-        for (name, table) in &l.schema.tables {
-            for problem in pbps_model::data::check(name, table) {
-                findings.push(output::Finding::error("schema.data-invalid", problem));
-            }
-            // A warning, never an error: the philosophy of ADR-0004 is enforced
-            // by the tool saying so, not by refusing a table somebody has a
-            // good reason for. Every plan from here on compares these rows one
-            // by one, which is the cost being pointed at.
-            if let Some(data) = &table.data
-                && data.rows.len() > max_rows
-            {
-                findings.push(output::Finding::warning(
-                    "schema.data-large",
-                    format!(
-                        "{name}: {} declared rows is above `max_data_rows` ({max_rows}) — this \
-                         does not look like reference data, and every plan compares it row by row",
-                        data.rows.len()
-                    ),
-                ));
-            }
+        let only = match since {
+            None => None,
+            Some(rev) => match (
+                baseline::ids_at(project, rev)
+                    .and_then(|ids| baseline::schema_at(project, rev).map(|schema| (ids, schema))),
+                read_ids_opt(project),
+            ) {
+                (Ok((before, before_schema)), Ok(now)) => Some(baseline::changed_subjects(
+                    &before,
+                    &now.unwrap_or_default(),
+                    &before_schema,
+                    &l.schema,
+                )),
+                (Err(e), _) => {
+                    findings.push(output::Finding::error(
+                        "baseline.unreadable",
+                        format!("--since {rev}: {e:#}"),
+                    ));
+                    Some(Default::default())
+                }
+                // An unreadable identity file is already reported below.
+                (_, Err(_)) => Some(Default::default()),
+            },
+        };
+        let mut ctx = policy_context(project, false);
+        ctx.only = only;
+        // Types in the dialect's own spelling, because the policy crate is
+        // dialect-agnostic on purpose and a rule that names a type sees
+        // whatever the declaration wrote. `national text` *is* `ntext` to SQL
+        // Server, and the default-on deprecated-type rule was bypassed by the
+        // alias. The boundary stays where it was: the dialect says what a
+        // type is, the policy says what to think of it (DECISIONS 187).
+        let spelled = types_as_the_dialect_spells_them(&l.schema, dialect);
+        for f in pbps_policy::declarations(&spelled, &policies, &ctx) {
+            findings.push(policy_finding(&f));
         }
     }
     if let Err(e) = &ids {
@@ -1235,7 +1558,11 @@ pub fn validate_findings(
     (findings, data)
 }
 
-fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
+fn cmd_validate(
+    project: &Project,
+    format: OutputFormat,
+    since: Option<&str>,
+) -> anyhow::Result<()> {
     // `postgres` is an accepted `DialectName` with no implementation yet, so
     // this is a reachable failure on a perfectly valid project — and it escaped
     // before the JSON branch, leaving stdout empty.
@@ -1246,7 +1573,7 @@ fn cmd_validate(project: &Project, format: OutputFormat) -> anyhow::Result<()> {
         project.config_file(),
         dialect(project),
     )?;
-    let (findings, data) = validate_findings(project, dialect.as_ref());
+    let (findings, data) = validate_findings(project, dialect.as_ref(), since);
     let report = output::Report::new("validate", findings, Some(data));
 
     if format == OutputFormat::Json {
@@ -1415,6 +1742,14 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     pbps_load::render(&t.name, &t.table, &pending, t.strategy.as_ref()),
                     absorbed,
                 )
+            }
+            pbps_load::LoadedFile::Role(r) => {
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = r
+                    .intents
+                    .iter()
+                    .cloned()
+                    .partition(|i| !pbps_diff::intent_is_absorbed(i, &ids));
+                (pbps_load::render_role(&r.name, &r.role, &pending), absorbed)
             }
         };
         if rendered == original {
@@ -1646,6 +1981,7 @@ struct PlanData {
     /// module's own name, so folding them together called a one-view plan
     /// "1 table" (ADR-0002).
     modules: usize,
+    roles: usize,
     risks: Vec<&'static str>,
 }
 
@@ -1745,41 +2081,31 @@ fn cmd_plan(
         }
     };
 
-    if res.ids != ids {
-        if check {
-            let message = format!(
-                "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
-                project.ids_file().display()
+    if res.ids != ids && check {
+        let message = format!(
+            "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
+            project.ids_file().display()
+        );
+        if json {
+            let report = output::Report::new(
+                "plan",
+                vec![
+                    output::Finding::error("identity.stale", message)
+                        .at(project.ids_file(), None)
+                        .remedy("pbps plan"),
+                ],
+                None::<PlanData>,
             );
-            if json {
-                let report = output::Report::new(
-                    "plan",
-                    vec![
-                        output::Finding::error("identity.stale", message)
-                            .at(project.ids_file(), None)
-                            .remedy("pbps plan"),
-                    ],
-                    None::<PlanData>,
-                );
-                return report.emit_json();
-            }
-            return Err(Found::new(message).into());
+            return report.emit_json();
         }
-        // The identity file is the artifact `plan` exists to maintain — it is
-        // what the MR reviews and what every later comparison matches by uid
-        // — so failing to write it is as much a failure of the command as
-        // failing to write `--out`. Those two were wrapped a commit earlier;
-        // this one, the more important of the three, was not.
-        output::or_unanswerable(
-            "plan",
-            json,
-            "identity.unwritable",
-            write_ids(project, &res.ids),
-        )?;
-        if !json {
-            println!("updated {}", project.ids_file().display());
-        }
+        return Err(Found::new(message).into());
     }
+    // The write itself waits for the policy gate below. `error` refuses the
+    // plan "before any file is written" (ADR-0008), and the identity file is a
+    // file: minting a uid and then refusing left `pbps.ids.json` changed for a
+    // plan that does not exist, so the next run compared against identities no
+    // reviewed plan ever used (DECISIONS 154).
+    let ids_to_write = (res.ids != ids).then(|| res.ids.clone());
 
     // plan never rewrites the user's YAML (SPEC §6.2), so without this line
     // nothing tells the author that the annotations they just had absorbed are now
@@ -1839,7 +2165,7 @@ fn cmd_plan(
             .or_insert_with(|| deps.clone());
     }
 
-    let cs = pbps_diff::diff(
+    let mut cs = pbps_diff::diff(
         Side {
             schema: &base.schema,
             ids: &base.ids,
@@ -1872,9 +2198,47 @@ fn cmd_plan(
         anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
     })?;
 
+    // The plan rules (ADR-0008): attached to the changes they are about, so
+    // the plan file carries them to `explain`, and reported here at the
+    // severity the project chose. An `error` refuses to produce the plan —
+    // nothing below writes a file for it — and never reaches `apply`.
+    let policy = attach_policy_findings(&mut cs, project, false);
+    let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
+    findings.extend(policy);
+
+    // Now that the plan is known to be one this project allows. The identity
+    // file is the artifact `plan` exists to maintain — it is what the MR
+    // reviews and what every later comparison matches by uid — so failing to
+    // write it is as much a failure of the command as failing to write
+    // `--out`.
+    if let Some(minted) = ids_to_write.filter(|_| !refused) {
+        output::or_unanswerable(
+            "plan",
+            json,
+            "identity.unwritable",
+            write_ids(project, &minted),
+        )?;
+        if !json {
+            println!("updated {}", project.ids_file().display());
+        }
+    }
+
     if !json {
         println!("Baseline: {}", base.description);
         print!("{}", report::plan(&cs));
+        // Membership is each environment's own, so an offline plan cannot
+        // list who a dropped role is taken from; saying so keeps "no members
+        // listed" from reading as "no members".
+        if cs
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+        {
+            println!(
+                "\n  A dropped role's members are removed first; `pbps plan --db` lists them for \
+                 the target, this preview cannot."
+            );
+        }
     }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
@@ -1893,6 +2257,18 @@ fn cmd_plan(
             "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
              Enterprise-only, and only `pbps plan --db` can read the target's edition."
         );
+    }
+
+    if refused {
+        if json {
+            let report = output::Report::new("plan", findings, None::<PlanData>);
+            return report.emit_json();
+        }
+        return Err(Found::new(
+            "a policy set to `error` refuses this plan; fix the declarations, or suppress the \
+             rule in pbps.yml with a reason",
+        )
+        .into());
     }
 
     if let Some(path) = out {
@@ -2025,7 +2401,8 @@ fn cmd_plan(
             print!("{}", report::rehearsal(&rehearsal));
             if !rehearsal.converged() {
                 return Err(Found::new(
-                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \n                     differences above are what would be left behind",
+                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \
+                     differences above are what would be left behind",
                 )
                 .into());
             }
@@ -2042,6 +2419,7 @@ fn cmd_plan(
                 changes: cs.changes.len(),
                 tables,
                 modules,
+                roles: report::touched_roles(&cs),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
             }),
         );
@@ -2208,6 +2586,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// `pull` draws its size line from the rule, not from the field that is
+    /// only the rule's default: raising the threshold, lowering it and
+    /// turning the rule off each has to reach `pull`, or it warns about files
+    /// `validate` accepts and stays quiet about files it rejects.
     #[test]
     fn plan_checksums_are_exact_and_canonical() {
         assert_eq!(plan_checksum_arg(&"A".repeat(64)).unwrap(), "a".repeat(64));

@@ -24,6 +24,8 @@
 //! would be theatre. `apply` rejects a preview outright and says to run
 //! `plan --db`.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 
 use crate::change::ChangeSet;
@@ -42,7 +44,26 @@ use crate::schema::Schema;
 /// Bumped to 3 when the post-plan module dependency annotations joined the
 /// artifact. A connected plan needs the baseline annotations to order drops,
 /// and the state written after apply needs the new ones for the next plan.
-pub const CURRENT_VERSION: u32 = 3;
+///
+/// Bumped to 4 for everything Phase 4 puts in the file: `data`, which says
+/// which tables' rows the state recorded after the apply has to cover, and
+/// the guard each row change carries — `InsertRow`'s `defaults` and `types`,
+/// `UpdateRow`'s `types` and `after_types`, `DeleteRow`'s `row`, `types` and
+/// `after_types` (DECISIONS 133, 136, 137, 140, 143, 149). Every one of them
+/// is `#[serde(default)]`, so an older `apply` reads the file, drops them
+/// silently, and executes the same DML with none of its preconditions or
+/// postconditions — recording, on top of that, a state with no rows in it and
+/// leaving every later `verify` blind to what it had just written. That is
+/// the exact failure this number exists to prevent.
+///
+/// One bump covers them all: they arrived in one release cycle, and a version
+/// per guard would invalidate saved plans seven times over for one story. It
+/// covers the type *pair* on `UpdateRow` and `DeleteRow` too, which changes
+/// what `types` means rather than adding a field — a reader without it would
+/// take `types` for the type the column has now, and hold a retyped cell to
+/// the old type's spelling of a value the engine has already converted
+/// (DECISIONS 149).
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -169,6 +190,16 @@ pub struct SavedPlan {
     /// half of it behind would be an artifact that has to be applied from a
     /// checkout — which is exactly what an air-gapped host does not have.
     pub ids: IdsFile,
+
+    /// The tables whose rows are under management **after** this plan, with
+    /// their mode and declared keys (ADR-0004).
+    ///
+    /// Carried for the same reason `ids` is: the state `apply` records is the
+    /// database read back, and reading rows back needs a scope — which of a
+    /// table's rows are declared is not a fact the database holds. It is the
+    /// declarations' scope at plan time, so `apply` needs no checkout.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub data: crate::data::DataScopes,
 }
 
 impl SavedPlan {
@@ -191,6 +222,7 @@ impl SavedPlan {
             changes,
             module_deps: ModuleDeps::default(),
             ids,
+            data: BTreeMap::new(),
         }
     }
 
@@ -384,9 +416,17 @@ mod tests {
     /// than misread.
     #[test]
     fn the_format_version_is_written() {
-        let json = serde_json::to_string(&plan_over(ChangeSet::default())).unwrap();
-        assert!(json.contains(r#""version":3"#), "{json}");
-        assert!(json.contains(r#""origin":"database""#), "{json}");
+        // The parsed field, not a substring: a plan embeds an `IdsFile`,
+        // whose own `version` would answer a `contains` the day the two
+        // constants meet.
+        let json: serde_json::Value =
+            serde_json::to_value(plan_over(ChangeSet::default())).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
+            "{json}"
+        );
+        assert_eq!(json["origin"], serde_json::json!("database"), "{json}");
     }
 
     #[test]

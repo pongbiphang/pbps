@@ -20,8 +20,8 @@ groups of commands:
 | `init` (`--env` / `--from` / `--url-env`) | Create a complete project, optionally adopting an existing database |
 | `plan` (`--check` / `--since` / `--base` / `--out` / `--sql`) | Compare against a baseline and produce a change plan |
 | `plan --dev` | Rehearse the plan in a throwaway engine: does it compile, does it converge (optional) |
-| `validate`, `fmt` (`--check`) | Static checks and canonical formatting |
-| `rename`, `rename-table`, `drop`, `drop-table` | Record the intent only a human can supply |
+| `validate` (`--since <rev>`), `fmt` (`--check`) | Static checks, the project's `policies:`, and canonical formatting |
+| `rename`, `rename-table`, `rename-role`, `drop`, `drop-table`, `drop-role` | Record the intent only a human can supply |
 | `docs` (`--format markdown\|html\|erd`) | Documentation and an ERD from the declarations |
 | `explain --plan` | What a saved plan does, why it needs approval, and the exact command that approves it |
 | `doctor` (`--env`) | Whether this project and its environments are ready to deploy from |
@@ -30,7 +30,7 @@ groups of commands:
 
 | Needs a database | Purpose |
 |---|---|
-| `pull` | Reverse-generate declarations from an existing database |
+| `pull` (`--data <table>`) | Reverse-generate declarations from an existing database; `--data` also declares a table's rows as reference data |
 | `plan --db` / `--env` (`--staged`) | The applyable plan for one environment |
 | `apply --plan --checksum --allow` | Run the checksum-pinned approved plan, in one transaction |
 | `apply --staged --checksum` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |

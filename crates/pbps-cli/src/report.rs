@@ -21,6 +21,8 @@ pub fn intent(i: &Intent) -> String {
         Intent::RenameColumn { table, from, to } => format!("{table}.{to} renamed_from {from}"),
         Intent::DropTable { table, reason } => format!("drop table {table} (reason: {reason})"),
         Intent::DropColumn { column, reason } => format!("drop column {column} (reason: {reason})"),
+        Intent::RenameRole { from, to } => format!("role {to} renamed_from {from}"),
+        Intent::DropRole { role, reason } => format!("drop role {role} (reason: {reason})"),
     }
 }
 
@@ -49,6 +51,8 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
         Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
         Blocker::DropColumnNeedsReason { .. } => "identity.drop-column-needs-reason",
         Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
+        Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
+        Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
         Blocker::UnusedIntent { .. } => "identity.unused-intent",
     };
     let text = one_blocker(b);
@@ -116,6 +120,31 @@ fn one_blocker(b: &Blocker) -> String {
         Blocker::DropTableNeedsReason { table } => format!(
             "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason \"<why>\"\n"
         ),
+        Blocker::AmbiguousRoles {
+            disappeared,
+            appeared,
+        } => {
+            let mut s = format!(
+                "  role {} disappeared, {} is new\n\n",
+                join(disappeared),
+                join(appeared)
+            );
+            for from in disappeared {
+                for to in appeared {
+                    s.push_str(&format!(
+                        "    if {from} was renamed to {to}:  pbps rename-role {from} {to}\n"
+                    ));
+                }
+                s.push_str(&format!(
+                    "    to drop {from}:                pbps drop-role {from} --reason \"<why>\"\n"
+                ));
+            }
+            s
+        }
+        Blocker::DropRoleNeedsReason { role } => format!(
+            "  role {role} disappeared from the declarations, but a drop must record why — \
+             its members lose whatever it granted\n\n    pbps drop-role {role} --reason \"<why>\"\n"
+        ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
                 "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n",
@@ -153,9 +182,11 @@ pub fn touched(cs: &ChangeSet) -> (usize, usize) {
     let mut tables = std::collections::BTreeSet::new();
     let mut modules = std::collections::BTreeSet::new();
     for p in &cs.changes {
-        match p.change.module_name() {
-            Some(m) => modules.insert(m.to_string()),
-            None => tables.insert(p.change.table().to_string()),
+        match (p.change.module_name(), p.change.table()) {
+            (Some(m), _) => modules.insert(m.to_string()),
+            (None, Some(t)) => tables.insert(t.to_string()),
+            // A role is neither; it is counted in its own line of the summary.
+            (None, None) => false,
         };
     }
     (tables.len(), modules.len())
@@ -163,12 +194,28 @@ pub fn touched(cs: &ChangeSet) -> (usize, usize) {
 
 /// "3 table(s)", "2 module(s)", or both — never a count of one naming the
 /// other.
-pub fn objects(tables: usize, modules: usize) -> String {
-    match (tables, modules) {
-        (0, m) => format!("{m} module(s)"),
-        (t, 0) => format!("{t} table(s)"),
-        (t, m) => format!("{t} table(s) and {m} module(s)"),
+pub fn objects(tables: usize, modules: usize, roles: usize) -> String {
+    let mut parts = Vec::new();
+    if tables > 0 || (modules == 0 && roles == 0) {
+        parts.push(format!("{tables} table(s)"));
     }
+    if modules > 0 {
+        parts.push(format!("{modules} module(s)"));
+    }
+    if roles > 0 {
+        parts.push(format!("{roles} role(s)"));
+    }
+    parts.join(" and ")
+}
+
+/// How many distinct roles a change set touches (ADR-0005).
+pub fn touched_roles(cs: &ChangeSet) -> usize {
+    cs.changes
+        .iter()
+        .filter(|p| p.change.table().is_none())
+        .map(|p| p.change.subject())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 pub fn summary(cs: &ChangeSet) -> String {
@@ -179,7 +226,7 @@ pub fn summary(cs: &ChangeSet) -> String {
     let mut out = format!(
         "\n  {} change(s) across {}.\n",
         cs.changes.len(),
-        objects(tables, modules)
+        objects(tables, modules, touched_roles(cs))
     );
 
     let risks = cs.risks();
@@ -212,7 +259,11 @@ pub fn plan(cs: &ChangeSet) -> String {
 
     let mut out = summary(cs);
     out.push_str(&changes(cs));
-    let risks = cs.risks();
+    // The advice names the *gated* classes only. A labelled-but-ungated one
+    // (`grant-widen`, ADR-0005) is on every line it applies to above, and in
+    // the summary; putting it in the `--allow` would advise a flag the gate
+    // never asks for.
+    let risks = cs.gated_risks();
     if !risks.is_empty() {
         out.push_str(&format!(
             "\n  This plan contains risky changes and needs approval to apply: --allow {}\n",
@@ -225,6 +276,12 @@ pub fn plan(cs: &ChangeSet) -> String {
         if risks.contains(&RiskClass::Destructive) {
             out.push_str("  Some of them are destructive and will lose data.\n");
         }
+    }
+    if cs.risks().contains(&RiskClass::GrantWiden) {
+        out.push_str(
+            "\n  This plan widens access (grant-widen). No flag gates it; the merge request is \
+             where the grants are reviewed.\n",
+        );
     }
     out
 }
@@ -239,7 +296,7 @@ pub fn changes(cs: &ChangeSet) -> String {
     let mut out = String::new();
     let mut current = None;
     for p in &cs.changes {
-        let table = p.change.table().to_string();
+        let table = p.change.subject();
         if current.as_deref() != Some(table.as_str()) {
             out.push_str(&format!("\n  {table}\n"));
             current = Some(table);
@@ -257,6 +314,11 @@ pub fn changes(cs: &ChangeSet) -> String {
             )
         };
         out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
+        // The analyzers' findings, under the change they are about, at the
+        // severity the project chose (ADR-0008).
+        for f in &p.findings {
+            out.push_str(&format!("      {}: {} — {}\n", f.severity, f.id, f.message));
+        }
     }
     out
 }
@@ -335,7 +397,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
     );
     if !r.structural.is_empty() {
         out.push_str(
-            "\n  The plan does NOT converge: after applying it, the database still differs\n               from the declarations.\n",
+            "\n  The plan does NOT converge: after applying it, the database still differs \
+             from the declarations.\n",
         );
         for d in &r.structural {
             out.push_str(&format!("    {d}\n"));
@@ -346,7 +409,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
         // actually stored. Rewriting the declaration in that form is what makes
         // the difference stop being reported after every apply.
         out.push_str(
-            "\n  These differ only in how the engine spells them. Each costs one rebuilt\n               constraint per apply until the declaration is written in the stored form:\n",
+            "\n  These differ only in how the engine spells them. Each costs one rebuilt \
+             constraint per apply until the declaration is written in the stored form:\n",
         );
         for d in &r.spelling {
             out.push_str(&format!("    {d}\n"));
@@ -359,7 +423,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
     // production may be Standard. Saying so keeps a green rehearsal from
     // reading as a promise it cannot make (ADR-0003 decision 3).
     out.push_str(
-        "  This is still a preview: it proves syntax and convergence, not edition\n           capabilities, and only `pbps plan --db` produces an applyable plan.\n",
+        "  This is still a preview: it proves syntax and convergence, not edition \
+         capabilities, and only `pbps plan --db` produces an applyable plan.\n",
     );
     out
 }
@@ -437,7 +502,34 @@ pub fn describe(c: &Change) -> String {
             Some(m) => format!("~ reference data is now `{m}`"),
             None => "~ reference data is no longer declared".to_owned(),
         },
+        // Roles (ADR-0005). The permissions are spelled out: "grant on
+        // dbo.customer" tells a reviewer nothing about how much wider access
+        // just got.
+        Change::CreateRole { name, .. } => format!("+ create role {name}"),
+        Change::DropRole { name, members, .. } if members.is_empty() => {
+            format!("- drop role {name}")
+        }
+        Change::DropRole { name, members, .. } => format!(
+            "- drop role {name}, removing {} member(s) first: {}",
+            members.len(),
+            members.join(", ")
+        ),
+        Change::RenameRole { from, to, .. } => format!("~ rename role {from} -> {to}"),
+        Change::Grant {
+            target,
+            permissions,
+            ..
+        } => format!("+ grant {} on {target}", permissions_list(permissions)),
+        Change::Revoke {
+            target,
+            permissions,
+            ..
+        } => format!("- revoke {} on {target}", permissions_list(permissions)),
     }
+}
+
+fn permissions_list(p: &std::collections::BTreeSet<pbps_model::Permission>) -> String {
+    p.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 /// One argument, quoted so that pasting it passes the value through unchanged —

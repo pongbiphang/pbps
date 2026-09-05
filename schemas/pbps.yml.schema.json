@@ -48,6 +48,17 @@
       ],
       "format": "uint",
       "minimum": 0
+    },
+    "policies": {
+      "description": "The organization's own rules and their suppressions (ADR-0008). Absent\nmeans every built-in rule at its default severity.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Policies"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -169,8 +180,314 @@
           ]
         }
       ]
+    },
+    "Policies": {
+      "description": "The whole block. Absent means every rule at its default and nothing\nsuppressed.",
+      "type": "object",
+      "properties": {
+        "rules": {
+          "description": "Rule id to its setting.\n\nA map in Rust, a closed list of keys in the editor schema: see\n[`rules_schema`]. `BTreeMap<String, _>` derives to \"any key\", which\nblessed `naming.tabel` in the editor and left the typo to be found by\n`pbps validate` — the opposite of what a generated schema is for\n(DECISIONS 172).",
+          "type": "object",
+          "properties": {
+            "naming.table": {
+              "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.column": {
+              "description": "Checks a column's name matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.index": {
+              "description": "Checks an index's name matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "naming.constraint": {
+              "description": "Checks a named constraint (primary key, unique, foreign key, check) matches `pattern`. Takes pattern.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": "A regular expression the name must match in full.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "data.max-rows": {
+              "description": "Checks a `data:` block declares at most `rows` rows — past that it stops looking like reference data (ADR-0004). Takes rows.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "rows": {
+                      "description": "The row count above which a block is reported.",
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "column.no-deprecated-type": {
+              "description": "Checks a column does not use a type the engine has deprecated (text, ntext, image).",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.expand-contract": {
+              "description": "Checks one revision does not both add and drop or narrow in the same table, which usually wants expand/contract staging (SPEC §13.3).",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.narrowing-on-data": {
+              "description": "Checks a type narrowing depends on the data already stored; the pre-flight probe measures it at apply time.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "grant.widen": {
+              "description": "Checks a grant widens what a role can do (ADR-0005), for a project that wants the label at a severity of its own.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "change.window": {
+              "description": "Checks a connected plan is computed inside an allowed change window: `offset` (`+08:00`) and `allow` (`mon-fri 09:00-17:00`, ...). Takes offset, allow.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    },
+                    "offset": {
+                      "description": "The UTC offset the windows are written in (`+08:00`).",
+                      "type": "string"
+                    },
+                    "allow": {
+                      "description": "Windows such as `mon-fri 09:00-17:00`.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "suppress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppression"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Suppression": {
+      "description": "One suppression: a rule that does not fire, where, why, and until when.",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string",
+          "enum": [
+            "naming.table",
+            "naming.column",
+            "naming.index",
+            "naming.constraint",
+            "data.max-rows",
+            "column.no-deprecated-type",
+            "change.expand-contract",
+            "change.narrowing-on-data",
+            "grant.widen",
+            "change.window"
+          ]
+        },
+        "on": {
+          "description": "The object it applies to (`dbo.customer`, `role app_reader`). Absent\nmeans the whole project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why. The field an audit reads; blank is refused.",
+          "type": "string"
+        },
+        "until": {
+          "description": "`YYYY-MM-DD`. From that day on the suppression stops applying and the\nfinding comes back at its configured severity (ADR-0008 decision 4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "reason"
+      ]
     }
   },
-  "x-pbps-schema-version": 3,
+  "x-pbps-schema-version": 6,
   "x-pbps-tool-version": "0.0.0"
 }

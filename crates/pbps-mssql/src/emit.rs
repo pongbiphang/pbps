@@ -16,12 +16,13 @@
 //! [`Statement::own_batch`] — the block declares a variable, and two of them in
 //! one batch would collide on the name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{DialectError, Statement};
+use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ForeignKey, Index, Module, ModuleKind, ObjectName, PrimaryKey,
-    ReferentialAction, Row, RowKey, Strategy, Table, TableName, UniqueConstraint, Value,
+    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleKind,
+    ObjectName, Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
+    UniqueConstraint, Value,
 };
 
 use crate::ident::{literal, quote};
@@ -98,7 +99,15 @@ pub fn takes_online(change: &Change) -> bool {
 
 pub fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
-        Change::CreateTable { name, table, .. } => create_table(name, table),
+        // The first statement is the one that brings the table into being;
+        // it says so, and a staged checkpoint adopts the table from there.
+        Change::CreateTable { name, table, .. } => {
+            let mut out = create_table(name, table)?;
+            if let Some(first) = out.first_mut() {
+                first.creates.push(Created::Table(name.clone()));
+            }
+            Ok(out)
+        }
 
         Change::DropTable { name, .. } => one(format!("DROP TABLE {};", qualified(name)?)),
 
@@ -110,31 +119,131 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             identity_key,
             key,
             row,
-        } => insert_row(table, key_column, *identity_key, key, row),
+            defaults,
+            types,
+        } => insert_row(table, key_column, *identity_key, key, row, defaults, types),
 
         Change::UpdateRow {
             table,
             key_column,
             key,
             columns,
-        } => update_row(table, key_column, key, columns),
+            unchanged,
+            types,
+            after_types,
+        } => update_row(
+            table,
+            key_column,
+            key,
+            columns,
+            unchanged,
+            types,
+            after_types,
+        ),
 
+        // The row's content is not carried (the pinned baseline holds it),
+        // so the delete holds the row to its existence: a row already gone
+        // is a baseline this plan was not reviewed against (DECISIONS 122).
         Change::DeleteRow {
             table,
             key_column,
             key,
+            row,
+            types,
+            after_types,
             ..
-        } => one(format!(
-            "DELETE FROM {} WHERE {} = {};",
-            qualified(table)?,
-            quote(key_column)?,
-            row_key(key)
-        )),
+        } => {
+            // Keyed *and* held to the row the plan recorded. The checksum
+            // pins the state only up to the moment `apply` reads it, so a
+            // key-only DELETE removes whatever an application session left
+            // under that key in between, and `@@ROWCOUNT = 1` calls the loss
+            // a success. Each recorded cell is compared the way the read-back
+            // rendered it, exactly as an update's precondition does; a cell
+            // whose type has no comparison is carried and not held
+            // (DECISIONS 143).
+            let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+            for (column, cell) in row {
+                predicates.extend(recorded_cell(
+                    column,
+                    cell,
+                    Held::of(types.get(column), after_types.get(column)),
+                )?);
+            }
+            one(atomically(&format!(
+                // The guard, the delete and the checks after it are one
+                // transaction of their own (`atomically`): the range locks the
+                // guard takes have to be held through the delete they protect,
+                // and a staged apply runs each statement outside a transaction.
+                "{}\n\
+                 DELETE FROM {} WHERE {};\n\
+                 {}\n\
+                 {}",
+                crate::preflight::still_referenced(table, key_column, key)?,
+                qualified(table)?,
+                predicates.join(" AND "),
+                exactly_one_row(table, key),
+                // And the row stayed gone: a trigger that put it back would
+                // otherwise be read back and recorded as this plan's result.
+                gone_row(table, key, key_column)?
+            )))
+        }
 
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
         Change::SetDataMode { .. } => Ok(Vec::new()),
+
+        // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
+        // which is the reason a role rename is intent rather than drop + add.
+        Change::CreateRole { name, .. } => Ok(vec![
+            Statement::new(format!("CREATE ROLE {};", quote(name)?))
+                .creating(Created::Role(name.clone())),
+        ]),
+        // The members go first, each in a statement of its own, and the role
+        // last: the engine refuses to drop a role that still has members, and
+        // a plan that listed them is a plan the reviewer saw.
+        Change::DropRole { name, members, .. } => {
+            let mut out = Vec::new();
+            for member in members {
+                out.push(Statement::new(format!(
+                    "ALTER ROLE {} DROP MEMBER {};",
+                    quote(name)?,
+                    quote(member)?
+                )));
+            }
+            out.push(Statement::new(format!("DROP ROLE {};", quote(name)?)));
+            Ok(out)
+        }
+        // The statement says what it does to the name (`Statement::renaming_role`),
+        // as a table rename does, so a staged checkpoint finds the role again.
+        Change::RenameRole { from, to, .. } => Ok(vec![
+            Statement::new(format!(
+                "ALTER ROLE {} WITH NAME = {};",
+                quote(from)?,
+                quote(to)?
+            ))
+            .renaming_role(from.clone(), to.clone()),
+        ]),
+        Change::Grant {
+            role,
+            target,
+            permissions,
+        } => one(format!(
+            "GRANT {} ON {} TO {};",
+            permission_list(permissions),
+            securable(target)?,
+            quote(role)?
+        )),
+        Change::Revoke {
+            role,
+            target,
+            permissions,
+        } => one(format!(
+            "REVOKE {} ON {} FROM {};",
+            permission_list(permissions),
+            securable(target)?,
+            quote(role)?
+        )),
 
         Change::RenameTable { from, to, .. } => rename_table(from, to),
 
@@ -153,7 +262,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                     qualified(table)?,
                     column_definition(table, name, column)?
                 ))
-                .own_batch(),
+                .own_batch()
+                .creating(Created::Column(table.clone(), name.clone())),
             ])
         }
 
@@ -439,6 +549,8 @@ fn insert_row(
     identity_key: bool,
     key: &RowKey,
     row: &Row,
+    defaults: &BTreeMap<String, String>,
+    types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
     let mut columns = vec![quote(key_column)?];
     let mut values = vec![row_key(key)];
@@ -446,36 +558,135 @@ fn insert_row(
         columns.push(quote(column)?);
         values.push(value_literal(v));
     }
+    // What the row must hold afterwards: a trigger that deleted it again,
+    // or wrote something else, would otherwise be read back and recorded as
+    // the plan's own result (`wrote_the_row`). Each cell by the rendering
+    // that reads it back, under a binary collation, as an update holds its
+    // cells — the column's own collation would call `New` and `new` equal,
+    // and a trailing space nothing, and the read-back would then record the
+    // rewrite (DECISIONS 137). A plan made before the types travelled
+    // compares as the engine compares, which is the check it always had.
+    let mut cells = Vec::new();
+    for (column, v) in row.columns() {
+        let held = recorded_cell(
+            column,
+            &Cell::Value(v.clone()),
+            types.get(column).map(Held::same),
+        )?;
+        cells.push(match (held, v) {
+            (Some(held), _) => held,
+            (None, Value::Null) => format!("{} IS NULL", quote(column)?),
+            (None, v @ (Value::Bool(_) | Value::Int(_) | Value::Text(_))) => {
+                format!("{} = {}", quote(column)?, value_literal(v))
+            }
+        });
+    }
+    // And the columns the row left to the table: a trigger rewriting one of
+    // those is the same silence, so a *constant* default is compared against
+    // itself, and a column the table gives no default is held to the NULL
+    // the insert left there (DECISIONS 133, 136). Anything the engine would
+    // have to run to answer — `NEWID()`, `NEXT VALUE FOR` — is not asked: it
+    // has no value before it runs, and asking would consume a sequence
+    // value. `types` names every non-key column, the spelled ones held
+    // above; a plan made before it travelled names none, and holds nothing
+    // here.
+    for (column, ty) in types {
+        if row.get(column).is_some() {
+            continue;
+        }
+        cells.extend(match defaults.get(column) {
+            Some(default) => defaulted_cell(column, default, Some(Held::same(ty)))?,
+            None => Some(format!("{} IS NULL", quote(column)?)),
+        });
+    }
+    let wrote = wrote_the_row(table, key, key_column, &cells)?;
     let table = qualified(table)?;
     let insert = format!(
         "INSERT INTO {table} ({}) VALUES ({});",
         columns.join(", "),
         values.join(", ")
     );
-    if identity_key {
-        one(format!(
-            "SET IDENTITY_INSERT {table} ON;\n{insert}\nSET IDENTITY_INSERT {table} OFF;"
-        ))
+    // The `IDENTITY_INSERT` goes off before the check can throw: it is a
+    // session setting, not a transactional one, and a rollback would leave
+    // it on for the rest of the connection.
+    let body = if identity_key {
+        format!(
+            "SET IDENTITY_INSERT {table} ON;\n{insert}\nSET IDENTITY_INSERT {table} OFF;\n{wrote}"
+        )
     } else {
-        one(insert)
-    }
+        format!("{insert}\n{wrote}")
+    };
+    one(atomically(&body))
 }
 
+/// One `UPDATE`, holding the row to what the plan recorded.
+///
+/// The plan was reviewed against a recorded state, and the checksum pins
+/// that state up to the moment `apply` reads it — not to the moment this
+/// statement runs. A row changed or deleted in between would be overwritten,
+/// or missed with the statement still counting as success, and the read-back
+/// would record the result as if the reviewed plan had done it. So each
+/// `before` cell the base holds goes into the predicate, compared by the very
+/// rendering that read it (`rows::read_expr`, the column's type's), and the
+/// statement throws unless exactly one row was updated (DECISIONS 122). A
+/// `before` at a default is compared as the read-back compared it, and only
+/// where the read-back did — a literal default on a type with `=`; a default
+/// the engine would have to run has no value to hold the row to.
+///
+/// The cells the plan leaves alone are held the same way, before and after:
+/// the declaration claims them as much as the changed ones, and an `UPDATE`
+/// that checked only what it set would let a trigger rewrite the rest of the
+/// row — or a hand edit since the plan was made stand — and have the result
+/// read back as the plan's own (DECISIONS 136). They are never restated in
+/// `SET`, for the reason `UpdateRow` gives.
+///
+/// The two checks read a cell by two types, not one. The precondition asks
+/// what the *recorded* state holds, so a column that state lacks is held to
+/// nothing. The postcondition asks what the row holds once the statement has
+/// run, by which time this plan's `AddColumn` and `AlterColumnType` have
+/// already run — so every declared cell is held, the added column included
+/// (DECISIONS 140).
+#[allow(clippy::too_many_arguments)]
 fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
     columns: &BTreeMap<String, (Cell, Cell)>,
+    unchanged: &BTreeMap<String, Cell>,
+    types: &BTreeMap<String, ColumnType>,
+    after_types: &BTreeMap<String, ColumnType>,
 ) -> Sql {
+    // The type the *precondition* reads a cell by is the one the recorded
+    // state holds it in; the type the *postcondition* reads it by is the one
+    // the column has once this plan's column changes have run, which sort
+    // before the row changes. Two lookups rather than one, so neither check
+    // can quietly borrow the other's type (DECISIONS 140).
+    // The precondition reads a cell by the type the recorded state held it in
+    // *and* the type the column has by the time the `UPDATE` runs, which are
+    // two types where this plan retypes the column (DECISIONS 149). The
+    // postcondition asks only what the row holds afterwards, which is one.
+    let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
+    let after_ty = |column: &String| {
+        after_types
+            .get(column)
+            .or_else(|| types.get(column))
+            .map(Held::same)
+    };
     let mut sets = Vec::with_capacity(columns.len());
-    for (column, (_, to)) in columns {
+    let mut recorded = Vec::new();
+    for (column, (from, to)) in columns {
+        let quoted = quote(column)?;
         // `DEFAULT` is the keyword: it asks the engine to evaluate the
         // column's default, which is the one thing a literal cannot say.
         let rhs = match to {
             Cell::Value(v) => value_literal(v),
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
-        sets.push(format!("{} = {}", quote(column)?, rhs));
+        sets.push(format!("{quoted} = {rhs}"));
+        recorded.extend(recorded_cell(column, from, before_ty(column))?);
+    }
+    for (column, held) in unchanged {
+        recorded.extend(recorded_cell(column, held, before_ty(column))?);
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -486,17 +697,373 @@ fn update_row(
             message: format!("{table}: a row update with no changed column"),
         });
     }
-    one(format!(
-        "UPDATE {} SET {} WHERE {} = {};",
+    let mut sql = format!(
+        "UPDATE {} SET {} WHERE {} = {}",
         qualified(table)?,
         sets.join(", "),
         quote(key_column)?,
         row_key(key)
+    );
+    for r in &recorded {
+        sql.push_str(" AND ");
+        sql.push_str(r);
+    }
+    sql.push_str(";\n");
+    sql.push_str(&exactly_one_row(table, key));
+    // And what the row holds afterwards: each cell the plan spells and each
+    // it leaves alone, compared by the rendering that read it, so a trigger
+    // that rewrote the row — or took it away — rolls this statement back
+    // instead of being read back as the plan's own result. A cell set to
+    // `DEFAULT` is held to that default where it is a constant, exactly as
+    // the `before` side is; a column the declaration does not name is the
+    // application's business.
+    let mut cells = Vec::new();
+    for (column, (_, to)) in columns {
+        cells.extend(recorded_cell(column, to, after_ty(column))?);
+    }
+    for (column, held) in unchanged {
+        cells.extend(recorded_cell(column, held, after_ty(column))?);
+    }
+    sql.push('\n');
+    sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
+    one(atomically(&sql))
+}
+
+/// One cell as a predicate holding the row to it, by the rendering that read
+/// it back (DECISIONS 122): a NULL as `IS NULL`, a value under a binary
+/// collation so a change of case alone is a change — the drift check
+/// compares the recorded text the same way — and a default as
+/// `defaulted_cell` holds it.
+///
+/// A column whose type the caller does not supply holds nothing, NULL
+/// included. That is the *precondition*'s case for a column the base state
+/// lacks: its `before` is what this plan's `AddColumn` left there — NULL by
+/// the differ's convention, but the default on a `NOT NULL` add — not a
+/// recorded cell. The postcondition always has a type for a declared column
+/// and never takes this path (DECISIONS 140).
+fn recorded_cell(
+    column: &str,
+    cell: &Cell,
+    ty: Option<Held<'_>>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    let now = ty.now();
+    Ok(match cell {
+        // A NULL converts to a NULL whatever the two types are, so the one
+        // predicate covers a retyped column as it covers any other.
+        Cell::Value(Value::Null) => Some(format!("{quoted} IS NULL")),
+        Cell::Value(v) => {
+            let recorded = literal(&recorded_text(v));
+            let Some(expected) = ty.as_stored(&recorded) else {
+                return Ok(None);
+            };
+            Some(format!(
+                "{} = {} COLLATE Latin1_General_BIN2",
+                crate::rows::read_expr(&quoted, &now.base),
+                expected
+            ))
+        }
+        Cell::Default(d) => defaulted_cell(column, d, Some(ty))?,
+    })
+}
+
+/// The two types one recorded cell is measured by: `read` is the type whose
+/// rendering produced the recorded text, and `now` the type the column has
+/// when the statement runs. They are the same type for every column this plan
+/// leaves alone, and differ only where it retypes one — whose
+/// `AlterColumnType` sorts before every row change (DECISIONS 149).
+///
+/// A pair rather than two arguments because the two are the same type and
+/// transposing them compiles: `read` and `now` the wrong way round would
+/// hold a row to the conversion run backwards, which fails on exactly the
+/// rows that are *not* stale.
+#[derive(Clone, Copy)]
+struct Held<'a> {
+    read: &'a ColumnType,
+    now: Option<&'a ColumnType>,
+}
+
+impl<'a> Held<'a> {
+    /// Recorded and held by one type: nothing about the column changes here.
+    fn same(ty: &'a ColumnType) -> Self {
+        Held {
+            read: ty,
+            now: None,
+        }
+    }
+
+    /// Recorded by `read`, held by `now` where this plan gives it a different
+    /// one. `None` is not "no type" — it is "the same one".
+    fn of(read: Option<&'a ColumnType>, now: Option<&'a ColumnType>) -> Option<Self> {
+        let read = read?;
+        Some(Held {
+            read,
+            now: now.filter(|n| *n != read),
+        })
+    }
+
+    /// Whether this plan retypes the column between the read and the write.
+    fn retyped(self) -> bool {
+        self.now.is_some()
+    }
+
+    /// The type the recorded text was rendered in, normalized for spelling.
+    fn read(self) -> ColumnType {
+        normalized(self.read)
+    }
+
+    /// The type the column has when the statement runs.
+    fn now(self) -> ColumnType {
+        normalized(self.now.unwrap_or(self.read))
+    }
+
+    /// Whether a retyped column can be held at all: `xml`, `text` and the
+    /// spatial types have no comparison to give, so asking either end for one
+    /// would be an error rather than a false answer — the same reason
+    /// [`defaulted_cell`] asks first. An unretyped column needs nothing of
+    /// its type but the rendering, and never comes here.
+    fn comparable(self) -> bool {
+        crate::rows::comparable(&self.read().base) && crate::rows::comparable(&self.now().base)
+    }
+
+    /// `value`, an expression of the type the cell was recorded in, as the
+    /// column holds it now.
+    ///
+    /// For everything this plan leaves alone that is `value` itself. For a
+    /// column it retypes it is the conversion the `AlterColumnType` already
+    /// ran, asked of the engine rather than computed here: the tool has no
+    /// business knowing that a `decimal(5,2)` holding `1.50` becomes `1`.
+    /// `TRY_CONVERT` so that a recorded value the new type cannot hold reads
+    /// as "not what the plan recorded" rather than raising Msg 245 from
+    /// inside the write.
+    fn converted(self, value: &str) -> String {
+        match self.retyped() {
+            false => value.to_owned(),
+            true => format!("TRY_CONVERT({}, {value})", self.now()),
+        }
+    }
+
+    /// The recorded text as the column stores it now, rendered the way the
+    /// read-back renders that column — the right-hand side of the predicate.
+    ///
+    /// Where nothing was retyped this is the recorded text itself: the text
+    /// *is* what the rendering produced. Where the column was retyped, the
+    /// text goes back through the old type with the style that wrote it and
+    /// then through the conversion above.
+    ///
+    /// One thing it cannot see, and no predicate could: an edit the
+    /// conversion erases. Measured — a cell moved from `1.50` to `1.99`
+    /// before a `decimal(5,2)` becomes `int` reads back as `1` either way,
+    /// and the column no longer holds what would tell them apart.
+    fn as_stored(self, recorded: &str) -> Option<String> {
+        if !self.retyped() {
+            return Some(recorded.to_owned());
+        }
+        if !self.comparable() {
+            return None;
+        }
+        let now = self.now();
+        Some(crate::rows::read_expr(
+            &self.converted(&crate::rows::from_text(recorded, &self.read())),
+            &now.base,
+        ))
+    }
+}
+
+/// A type spelled the way this dialect spells it, falling back to the spelling
+/// the plan carries. A type the dialect cannot parse has already stopped the
+/// plan elsewhere; here it would only cost the comparison.
+fn normalized(ty: &ColumnType) -> ColumnType {
+    crate::types::normalize(ty).unwrap_or_else(|_| ty.clone())
+}
+
+/// A recorded cell as the read-back's text: what `rows::value_of` decoded.
+fn recorded_text(v: &Value) -> String {
+    match v {
+        Value::Text(t) => t.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => (if *b { "1" } else { "0" }).to_owned(),
+        Value::Null => "NULL".to_owned(),
+    }
+}
+
+/// The check after a row's `UPDATE` or `DELETE`: the statement reached one
+/// row, the one the plan recorded. In the same batch, because `@@ROWCOUNT`
+/// is the last statement's. Measured with an `AFTER` trigger on the table:
+/// the count is the statement's own, not the trigger's.
+/// The check after a row's `DELETE`: it is still gone once the statement has
+/// run. A trigger that reinserted it would otherwise be read back and
+/// recorded as this plan's own result (DECISIONS 132).
+fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String, DialectError> {
+    Ok(format!(
+        "IF EXISTS (SELECT 1 FROM {} WHERE {} = {})\n  THROW 50000, {}, 1;",
+        qualified(table)?,
+        quote(key_column)?,
+        row_key(key),
+        literal(&format!(
+            "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
+             or another writer inside it. Nothing was applied."
+        ))
     ))
+}
+
+/// A row statement and the postconditions it holds itself to, as one
+/// transaction of its own.
+///
+/// A staged apply runs each statement outside a transaction (SPEC §7.5), so
+/// a postcondition that merely threw would leave the write it rejected
+/// committed. Inside the transactional apply this nests, where `COMMIT` only
+/// decrements the count and the outer transaction still decides everything.
+/// The `CATCH` rolls back and rethrows, so no staged run is left holding an
+/// open transaction (DECISIONS 129).
+fn atomically(body: &str) -> String {
+    format!(
+        "BEGIN TRANSACTION;\n\
+         BEGIN TRY\n\
+         {body}\n\
+         COMMIT TRANSACTION;\n\
+         END TRY\n\
+         BEGIN CATCH\n\
+         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n\
+         THROW;\n\
+         END CATCH"
+    )
+}
+
+/// A column left to a default, as a predicate holding it to that default —
+/// or nothing, where there is no answer the engine can give without running
+/// something.
+///
+/// The type decides whether the comparison exists at all: `xml`, `text` and
+/// the spatial types have no `=`, and asking for one is an error rather than
+/// a false answer. A plan made before the types travelled carries none, and
+/// checks nothing here — the same as an older plan's `UpdateRow`.
+///
+/// Both sides are rendered as the read-back renders the column, and compared
+/// under a binary collation: the default is first converted to the column's
+/// type, so a `'2026-01-01'` default on a `datetime2` column renders as the
+/// stored value does, and then `New` against `new` is a difference the
+/// column's own collation would have hidden (DECISIONS 137).
+fn defaulted_cell(
+    column: &str,
+    default: &str,
+    ty: Option<Held<'_>>,
+) -> Result<Option<String>, DialectError> {
+    let quoted = quote(column)?;
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    if !ty.comparable() || !crate::rows::is_constant(default) {
+        return Ok(None);
+    }
+    let (read, now) = (ty.read(), ty.now());
+    // A default of `NULL` references nothing and compares to nothing; both
+    // halves are spelled so the one predicate covers it.
+    Ok(Some(format!(
+        "({} = {} COLLATE Latin1_General_BIN2 OR ({quoted} IS NULL AND ({default}) IS NULL))",
+        crate::rows::read_expr(&quoted, &now.base),
+        // The default converted to the type the column had when the row was
+        // written, and then — where this plan retypes it — the way the
+        // `ALTER` converted the column itself.
+        crate::rows::read_expr(
+            &ty.converted(&format!("CONVERT({read}, {default})")),
+            &now.base
+        ),
+    )))
+}
+
+/// What a row write holds itself to once it has run: the row is there, and
+/// it holds what the plan wrote.
+///
+/// The engine reporting a successful `INSERT` or `UPDATE` is not the same as
+/// the row being what the plan says. An `AFTER` trigger runs inside the
+/// statement and may delete the row again or rewrite what it holds, and the
+/// apply would then read the result back, record it, and report success —
+/// leaving `verify` clean against a state nobody declared and the next
+/// connected plan proposing the same change forever. Checked here, inside
+/// the write's own transaction, so the plan rolls back instead
+/// (DECISIONS 132).
+///
+/// Only the cells the plan spells are checked, by the rendering that reads
+/// them back. A cell left to a default has no value in the plan to hold the
+/// row to, and a column the plan never names is the application's business,
+/// not this statement's.
+///
+/// A *connected* plan cannot fail this on spelling alone: `plan --db` refuses
+/// a declaration the engine reads back differently before the plan exists
+/// (DECISIONS 101). An offline plan carries no such promise, and a value the
+/// engine stores differently from the way it is declared stops here rather
+/// than being applied, recorded, and proposed again by every plan after it —
+/// which is what the message names alongside a trigger.
+fn wrote_the_row(
+    table: &TableName,
+    key: &RowKey,
+    key_column: &str,
+    cells: &[String],
+) -> Result<String, DialectError> {
+    let mut predicate = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+    predicate.extend(cells.iter().cloned());
+    Ok(format!(
+        "IF NOT EXISTS (SELECT 1 FROM {} WHERE {})\n  THROW 50000, {}, 1;",
+        qualified(table)?,
+        predicate.join(" AND "),
+        literal(&format!(
+            "{table} row `{key}` is not what this plan wrote once the statement had run — a \
+             trigger on the table, another writer inside it, or a value the engine stores \
+             differently from the way it is declared. Nothing was applied; `pbps plan --db` \
+             says which."
+        ))
+    ))
+}
+
+fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
+    format!(
+        "IF @@ROWCOUNT <> 1 THROW 50000, {}, 1;",
+        literal(&format!(
+            "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
+             plan was made. Plan again."
+        ))
+    )
 }
 
 fn one(sql: String) -> Sql {
     Ok(vec![Statement::new(sql)])
+}
+
+/// A grant target as T-SQL spells a securable: `OBJECT::[s].[o]` or
+/// `SCHEMA::[s]`. The class is written out even for an object, where the
+/// engine would accept the bare name, so a reader never has to guess which
+/// kind of thing a permission landed on.
+fn securable(target: &GrantTarget) -> Result<String, DialectError> {
+    Ok(match target {
+        GrantTarget::Object(o) => format!("OBJECT::{}", qualified(o)?),
+        GrantTarget::Schema(s) => format!("SCHEMA::{}", quote(s)?),
+    })
+}
+
+/// The permission names as the engine spells them, in the model's order.
+fn permission_list(permissions: &BTreeSet<Permission>) -> String {
+    permissions
+        .iter()
+        .map(|p| permission_sql(*p))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn permission_sql(p: Permission) -> &'static str {
+    match p {
+        Permission::Select => "SELECT",
+        Permission::Insert => "INSERT",
+        Permission::Update => "UPDATE",
+        Permission::Delete => "DELETE",
+        Permission::References => "REFERENCES",
+        Permission::Execute => "EXECUTE",
+        Permission::Alter => "ALTER",
+        Permission::ViewDefinition => "VIEW DEFINITION",
+    }
 }
 
 fn null_clause(nullable: bool) -> &'static str {
@@ -1310,11 +1877,104 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("new"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: row(&[("label", Value::Text("New".to_owned()))]),
         });
-        assert_eq!(
-            sql,
-            ["INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"]
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "INSERT INTO [dbo].[order_status] ([code], [label]) VALUES (N'new', N'New');"
+            ),
+            "{}",
+            sql[0]
+        );
+        // And the row is held to what was written: a trigger that took it
+        // away again would otherwise be recorded as this plan's own result
+        // (DECISIONS 132).
+        assert!(
+            sql[0].contains(
+                "IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] \
+                 WHERE [code] = N'new' AND [label] = N'New')"
+            ),
+            "{}",
+            sql[0]
+        );
+    }
+
+    /// A column the row leaves to the table is checked too, where the default
+    /// is a constant: a trigger rewriting one of those is the same silence as
+    /// a trigger rewriting a spelled cell (DECISIONS 133).
+    #[test]
+    fn an_insert_holds_the_columns_it_left_to_their_defaults() {
+        let sql = sql_of(&Change::InsertRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            identity_key: false,
+            key: RowKey::from("a"),
+            row: row(&[("label", Value::Text("New".to_owned()))]),
+            defaults: [
+                ("sort".to_owned(), "((0))".to_owned()),
+                ("note".to_owned(), "(NULL)".to_owned()),
+                // Nothing the engine has to run is asked about: it has no
+                // value before it runs, and a sequence would be consumed.
+                ("seq".to_owned(), "(NEXT VALUE FOR dbo.s)".to_owned()),
+                ("stamp".to_owned(), "(getdate())".to_owned()),
+                // No `=` exists for the type, so no comparison does either.
+                ("doc".to_owned(), "('<a/>')".to_owned()),
+                // A plan made before the types travelled carries none.
+                ("old".to_owned(), "((1))".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                // Spelled: held by the rendering that reads it back, under a
+                // binary collation, so a rewrite the column's collation calls
+                // equal is still a rewrite (DECISIONS 137).
+                ("label", "nvarchar(50)"),
+                ("sort", "int"),
+                ("note", "nvarchar(50)"),
+                ("seq", "int"),
+                ("stamp", "datetime2"),
+                ("doc", "xml"),
+                // No default at all: the insert leaves NULL, and the row is
+                // held to that (DECISIONS 136) — on a type without `=` too,
+                // since `IS NULL` needs none.
+                ("rank", "int"),
+                ("body", "xml"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+        });
+        let sql = &sql[0];
+        for held in [
+            "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
+            // A constant default: both sides rendered as the read-back
+            // renders the column, the default converted to its type first.
+            "(CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
+            "(CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), CONVERT(nvarchar(50), (NULL))) COLLATE Latin1_General_BIN2 OR ([note] IS NULL AND ((NULL)) IS NULL))",
+            " AND [rank] IS NULL",
+            " AND [body] IS NULL",
+        ] {
+            assert!(sql.contains(held), "{held}\n{sql}");
+        }
+        // A spelled column is held once, to what was spelled — never also
+        // to NULL as a column the row left out.
+        for absent in [
+            "[seq]",
+            "[stamp]",
+            "[doc]",
+            "[old]",
+            "[label] = N'New'",
+            "[label] IS NULL",
+        ] {
+            assert!(!sql.contains(absent), "{absent}\n{sql}");
+        }
+        // And the insert itself names only what the row spells.
+        assert!(
+            sql.contains("INSERT INTO [dbo].[t] ([code], [label]) VALUES (N'a', N'New');"),
+            "{sql}"
         );
     }
 
@@ -1328,15 +1988,26 @@ mod tests {
             key_column: "id".to_owned(),
             identity_key: true,
             key: RowKey::from("7"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: row(&[("label", Value::Text("Seven".to_owned()))]),
         });
-        assert_eq!(
-            sql,
-            [concat!(
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(concat!(
                 "SET IDENTITY_INSERT [dbo].[t] ON;\n",
                 "INSERT INTO [dbo].[t] ([id], [label]) VALUES (N'7', N'Seven');\n",
                 "SET IDENTITY_INSERT [dbo].[t] OFF;"
-            )]
+            )),
+            "{}",
+            sql[0]
+        );
+        // The switch goes off before the postcondition can throw: it is a
+        // session setting, and a rollback would leave it on.
+        assert!(
+            sql[0].find("SET IDENTITY_INSERT [dbo].[t] OFF;") < sql[0].find("IF NOT EXISTS"),
+            "{}",
+            sql[0]
         );
     }
 
@@ -1349,6 +2020,8 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: Row::default(),
         });
         assert!(!sql[0].contains("IDENTITY_INSERT"), "{sql:?}");
@@ -1364,6 +2037,8 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: Row::default(),
         });
         assert!(sql[0].contains("([code])"), "{sql:?}");
@@ -1372,6 +2047,9 @@ mod tests {
     #[test]
     fn an_update_restates_only_the_changed_columns() {
         let sql = sql_of(&Change::UpdateRow {
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.order_status"),
             key_column: "code".to_owned(),
             key: RowKey::from("new"),
@@ -1385,10 +2063,294 @@ mod tests {
             .into_iter()
             .collect(),
         });
+        // No type carried (an older plan): the key alone holds the row, and
+        // the count still has to be one. The postcondition is the key alone
+        // for the same reason — a cell with no type has no rendering to be
+        // compared by.
         assert_eq!(
             sql,
-            ["UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';"]
+            [atomically(&format!(
+                "UPDATE [dbo].[order_status] SET [label] = N'Opened' WHERE [code] = N'new';\n{}\n\
+                 IF NOT EXISTS (SELECT 1 FROM [dbo].[order_status] WHERE [code] = N'new')\n  \
+                 THROW 50000, N'dbo.order_status row `new` is not what this plan wrote once the \
+                 statement had run — a trigger on the table, another writer inside it, or a \
+                 value the engine stores differently from the way it is declared. Nothing was \
+                 applied; `pbps plan --db` says which.', 1;",
+                stale("dbo.order_status", "new")
+            ))]
         );
+    }
+
+    /// The check every row `UPDATE` and `DELETE` ends with (DECISIONS 122).
+    fn stale(table: &str, key: &str) -> String {
+        format!(
+            "IF @@ROWCOUNT <> 1 THROW 50000, N'{table} row `{key}` is not as the plan recorded \
+             it: changed or deleted since the plan was made. Plan again.', 1;"
+        )
+    }
+
+    /// The plan is reviewed against a recorded state, and the checksum pins
+    /// it only up to the moment `apply` reads it. Each recorded cell goes
+    /// into the predicate, compared by the rendering that read it — the
+    /// column's type's — and a NULL as `IS NULL`; a literal default as the
+    /// read-back compared it; a default the engine would have to run, a
+    /// type without `=`, and a column the base does not have hold nothing.
+    #[test]
+    fn an_update_holds_the_row_to_what_the_plan_recorded() {
+        let cell = |from: Cell, to: Cell| (from, to);
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [
+                ("label".to_owned(), cell(text("Old"), text("New"))),
+                (
+                    "since".to_owned(),
+                    cell(text("2026-09-03"), text("2026-09-04")),
+                ),
+                (
+                    "flag".to_owned(),
+                    cell(
+                        Cell::Value(Value::Bool(true)),
+                        Cell::Value(Value::Bool(false)),
+                    ),
+                ),
+                (
+                    "rank".to_owned(),
+                    cell(Cell::Value(Value::Null), Cell::Value(Value::Int(2))),
+                ),
+                (
+                    "sort".to_owned(),
+                    cell(
+                        Cell::Default("((0))".to_owned()),
+                        Cell::Value(Value::Int(3)),
+                    ),
+                ),
+                (
+                    "stamp".to_owned(),
+                    cell(Cell::Default("(getdate())".to_owned()), text("x")),
+                ),
+                (
+                    "doc".to_owned(),
+                    cell(Cell::Default("('')".to_owned()), text("<a/>")),
+                ),
+                (
+                    "added".to_owned(),
+                    cell(Cell::Value(Value::Null), text("y")),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("since", "date"),
+                ("flag", "bit"),
+                ("rank", "int"),
+                ("sort", "int"),
+                ("stamp", "datetime2"),
+                ("doc", "xml"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), t.parse::<ColumnType>().unwrap()))
+            .collect(),
+            after_types: Default::default(),
+        });
+        let sql = &sql[0];
+        let body = sql
+            .strip_prefix("BEGIN TRANSACTION;\nBEGIN TRY\n")
+            .expect("the write and its checks are one transaction");
+        let mut lines = body.split('\n');
+        let update = lines.next().expect("the update");
+        assert_eq!(lines.next(), Some(stale("dbo.t", "a").as_str()));
+        // And the row holds what the plan wrote, by the same rendering
+        // (DECISIONS 132).
+        let wrote = lines.next().expect("the postcondition");
+        for held in [
+            "[code] = N'a'",
+            "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
+            "CONVERT(nvarchar(max), [rank]) = N'2' COLLATE Latin1_General_BIN2",
+            "CONVERT(nvarchar(max), [since], 126) = N'2026-09-04' COLLATE Latin1_General_BIN2",
+        ] {
+            assert!(wrote.contains(held), "{held}\n{wrote}");
+        }
+        // The column with no type carried on either side has no rendering to
+        // be compared by. (A column the base merely lacks *does* have one
+        // after the plan runs; that is `after_types`, and the test below.)
+        assert!(!wrote.contains("[added]"), "{wrote}");
+        assert!(
+            update.starts_with(
+                "UPDATE [dbo].[t] SET [added] = N'y', [doc] = N'<a/>', [flag] = N'false', \
+                 [label] = N'New', [rank] = 2, [since] = N'2026-09-04', [sort] = 3, \
+                 [stamp] = N'x' WHERE [code] = N'a'"
+            ),
+            "{update}"
+        );
+        for held in [
+            // The rendering that read it, and a change of case is a change.
+            " AND CONVERT(nvarchar(max), [label]) = N'Old' COLLATE Latin1_General_BIN2",
+            " AND CONVERT(nvarchar(max), [since], 126) = N'2026-09-03' COLLATE Latin1_General_BIN2",
+            " AND CONVERT(nvarchar(max), [flag]) = N'1' COLLATE Latin1_General_BIN2",
+            " AND [rank] IS NULL",
+            " AND (CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
+        ] {
+            assert!(update.contains(held), "{held}\n{update}");
+        }
+        for not_held in ["[stamp] =", "[doc] =", "[added] IS NULL"] {
+            let after_where = update.split_once(" WHERE ").unwrap().1;
+            assert!(!after_where.contains(not_held), "{not_held}\n{update}");
+        }
+        assert!(update.ends_with(';'), "{update}");
+    }
+
+    /// The cells the plan leaves alone are held too, before and after — but
+    /// never restated in `SET`. A trigger rewriting a cell the plan did not
+    /// touch, or a hand edit to it since the plan was made, is otherwise
+    /// read back as the plan's own result (DECISIONS 136). A cell without a
+    /// carried type holds nothing, as a changed one does not.
+    #[test]
+    fn an_update_holds_the_cells_it_leaves_alone_too() {
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [("label".to_owned(), (text("Old"), text("New")))]
+                .into_iter()
+                .collect(),
+            unchanged: [
+                ("note".to_owned(), text("kept")),
+                ("rank".to_owned(), Cell::Value(Value::Null)),
+                ("sort".to_owned(), Cell::Default("((0))".to_owned())),
+                ("stamp".to_owned(), Cell::Default("(getdate())".to_owned())),
+                ("added".to_owned(), text("z")),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("note", "nvarchar(50)"),
+                ("rank", "int"),
+                ("sort", "int"),
+                ("stamp", "datetime2"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+            after_types: Default::default(),
+        });
+        let sql = &sql[0];
+        let update = sql
+            .lines()
+            .find(|l| l.starts_with("UPDATE "))
+            .expect("the update");
+        let wrote = sql
+            .lines()
+            .find(|l| l.starts_with("IF NOT EXISTS"))
+            .expect("the postcondition");
+        // Only the changed column is set.
+        assert!(
+            update.starts_with("UPDATE [dbo].[t] SET [label] = N'New' WHERE [code] = N'a'"),
+            "{update}"
+        );
+        for held in [
+            " AND CONVERT(nvarchar(max), [note]) = N'kept' COLLATE Latin1_General_BIN2",
+            " AND [rank] IS NULL",
+            " AND (CONVERT(nvarchar(max), [sort]) = CONVERT(nvarchar(max), CONVERT(int, ((0)))) COLLATE Latin1_General_BIN2 OR ([sort] IS NULL AND (((0))) IS NULL))",
+        ] {
+            assert!(update.contains(held), "{held}\n{update}");
+            assert!(wrote.contains(held), "{held}\n{wrote}");
+        }
+        for not_held in ["[stamp]", "[added]"] {
+            assert!(!update.contains(not_held), "{not_held}\n{update}");
+            assert!(!wrote.contains(not_held), "{not_held}\n{wrote}");
+        }
+    }
+
+    /// A column this plan adds and populates in the same revision has no
+    /// recorded cell to hold the row to *before* the write — but it has one
+    /// after: `AddColumn` and `AlterColumnType` both sort ahead of the row
+    /// changes, so the `UPDATE` meets the declared type. Held to the base
+    /// type alone, the added cell was checked by nothing, and an `AFTER
+    /// UPDATE` trigger rewriting it was recorded as the plan's own result
+    /// (DECISIONS 140).
+    #[test]
+    fn a_column_the_plan_adds_is_held_after_the_write_but_not_before() {
+        let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
+        let sql = sql_of(&Change::UpdateRow {
+            table: tname("dbo.t"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("a"),
+            columns: [
+                ("label".to_owned(), (text("Old"), text("New"))),
+                // Added by this same plan: the differ's `before` is NULL by
+                // convention, not something the base recorded.
+                ("added".to_owned(), (Cell::Value(Value::Null), text("y"))),
+                // Retyped by this same plan: `varchar` before, `date` after,
+                // and the two render differently.
+                ("since".to_owned(), (text("2026-09-03"), text("2026-09-04"))),
+            ]
+            .into_iter()
+            .collect(),
+            unchanged: [("note".to_owned(), text("kept"))].into_iter().collect(),
+            types: [
+                ("label", "nvarchar(50)"),
+                ("note", "nvarchar(50)"),
+                ("since", "varchar(10)"),
+            ]
+            .into_iter()
+            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .collect(),
+            after_types: [("added", "nvarchar(50)"), ("since", "date")]
+                .into_iter()
+                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .collect(),
+        });
+        let sql = &sql[0];
+        let update = sql
+            .lines()
+            .find(|l| l.starts_with("UPDATE "))
+            .expect("the update");
+        let wrote = sql
+            .lines()
+            .find(|l| l.starts_with("IF NOT EXISTS"))
+            .expect("the postcondition");
+        let precondition = update.split_once(" WHERE ").expect("the key predicate").1;
+        // Nothing recorded the added column, so nothing holds it beforehand.
+        assert!(!precondition.contains("[added]"), "{update}");
+        // But the row is answerable for it afterwards, by the type the
+        // column will have.
+        assert!(
+            wrote.contains("CONVERT(nvarchar(max), [added]) = N'y' COLLATE Latin1_General_BIN2"),
+            "{wrote}"
+        );
+        // A retyped column is held by both of its types before the write:
+        // the recorded text goes back through `varchar(10)`, which is what
+        // rendered it, and then through the conversion the `ALTER` ran, and
+        // both sides are read in style 126 because that is how a `date`
+        // reads back. Comparing the recorded text against the column
+        // directly — either side's rendering, one type — is what
+        // DECISIONS 146 could not make work and 149 stopped attempting.
+        assert!(
+            precondition.contains(
+                "CONVERT(nvarchar(max), [since], 126) = \
+                 CONVERT(nvarchar(max), TRY_CONVERT(date, \
+                 TRY_CONVERT(varchar(10), N'2026-09-03')), 126) \
+                 COLLATE Latin1_General_BIN2"
+            ),
+            "{update}"
+        );
+        assert!(
+            wrote.contains(
+                "CONVERT(nvarchar(max), [since], 126) = N'2026-09-04' COLLATE Latin1_General_BIN2"
+            ),
+            "{wrote}"
+        );
+        // A column neither added nor retyped reads the same on both sides.
+        let held = "CONVERT(nvarchar(max), [note]) = N'kept' COLLATE Latin1_General_BIN2";
+        assert!(precondition.contains(held), "{held}\n{update}");
+        assert!(wrote.contains(held), "{held}\n{wrote}");
     }
 
     /// An omitted column means the declared default, and only the keyword can
@@ -1398,6 +2360,9 @@ mod tests {
     #[test]
     fn an_update_to_the_default_says_default_not_null() {
         let sql = sql_of(&Change::UpdateRow {
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
             table: tname("dbo.t"),
             key_column: "code".to_owned(),
             key: RowKey::from("a"),
@@ -1408,11 +2373,16 @@ mod tests {
             .into_iter()
             .collect(),
         });
-        assert_eq!(
-            sql,
-            ["UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"]
+        assert!(
+            sql[0].contains("UPDATE [dbo].[t] SET [sort] = DEFAULT WHERE [code] = N'a';"),
+            "{}",
+            sql[0]
         );
-        assert!(!sql[0].contains("NULL"), "{sql:?}");
+        assert!(sql[0].contains(&stale("dbo.t", "a")), "{}", sql[0]);
+        // `NOT EXISTS` is the postcondition's own; nothing here writes NULL,
+        // and nothing compares against one.
+        assert!(!sql[0].contains("= NULL"), "{}", sql[0]);
+        assert!(!sql[0].contains("IS NULL"), "{}", sql[0]);
     }
 
     /// `UPDATE t SET WHERE ...` is not T-SQL. The differ never produces an
@@ -1423,6 +2393,9 @@ mod tests {
         assert!(
             emit(
                 &Change::UpdateRow {
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
                     table: tname("dbo.t"),
                     key_column: "code".to_owned(),
                     key: RowKey::from("a"),
@@ -1434,6 +2407,53 @@ mod tests {
         );
     }
 
+    /// The checksum pins the state up to the moment `apply` reads it, so the
+    /// row the plan recorded travels into the predicate: a row an application
+    /// rewrote in between is not the row that was reviewed (DECISIONS 143).
+    #[test]
+    fn a_delete_holds_the_row_to_what_the_plan_recorded() {
+        let sql = sql_of(&Change::DeleteRow {
+            table: tname("dbo.order_status"),
+            key_column: "code".to_owned(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: [
+                (
+                    "label".to_owned(),
+                    Cell::Value(Value::Text("Old".to_owned())),
+                ),
+                ("rank".to_owned(), Cell::Value(Value::Null)),
+                // No type, so nothing to compare it by: carried, not held.
+                (
+                    "shape".to_owned(),
+                    Cell::Value(Value::Text("POINT (1 1)".to_owned())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            types: [
+                ("label".to_owned(), ty("nvarchar(50)")),
+                ("rank".to_owned(), ty("int")),
+            ]
+            .into_iter()
+            .collect(),
+            after_types: Default::default(),
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        assert!(
+            sql.contains("DELETE FROM [dbo].[order_status] WHERE [code] = N'old' AND "),
+            "{sql}"
+        );
+        // Each cell by the rendering that read it, and a NULL as IS NULL.
+        assert!(sql.contains("COLLATE Latin1_General_BIN2"), "{sql}");
+        assert!(sql.contains("[rank] IS NULL"), "{sql}");
+        assert!(!sql.contains("[shape]"), "{sql}");
+        // And still keyed, guarded and checked as before.
+        assert!(sql.contains(&stale("dbo.order_status", "old")), "{sql}");
+        assert!(sql.contains("WITH (HOLDLOCK)"), "{sql}");
+    }
+
     #[test]
     fn a_delete_is_keyed_on_the_primary_key_column() {
         let sql = sql_of(&Change::DeleteRow {
@@ -1441,11 +2461,126 @@ mod tests {
             key_column: "code".to_owned(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
+            row: BTreeMap::new(),
+            types: BTreeMap::new(),
+            after_types: Default::default(),
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        assert!(
+            sql.contains("DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"),
+            "{sql}"
+        );
+        // And held to the row's existence: one gone already is a baseline
+        // this plan was not reviewed against.
+        assert!(sql.contains(&stale("dbo.order_status", "old")), "{sql}");
+        // And to nothing referencing it *now*: the preflight probe counted
+        // before the plan ran, and this keeps what it counted (DECISIONS 129).
+        assert!(
+            sql.contains("WITH (HOLDLOCK)") && sql.contains("IF @n > 0 THROW"),
+            "{sql}"
+        );
+        // The guard and the delete stand or fall together even where the
+        // apply runs statements outside a transaction.
+        assert!(sql.starts_with("BEGIN TRANSACTION;\nBEGIN TRY\n"), "{sql}");
+        assert!(
+            sql.contains("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;"),
+            "{sql}"
+        );
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    fn perms(list: &[Permission]) -> BTreeSet<Permission> {
+        list.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_role_is_created_dropped_and_renamed_in_place() {
+        let uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
+        assert_eq!(
+            sql_of(&Change::CreateRole {
+                uid: uid.clone(),
+                name: "app_reader".into()
+            }),
+            ["CREATE ROLE [app_reader];"]
+        );
+        assert_eq!(
+            sql_of(&Change::DropRole {
+                uid: uid.clone(),
+                name: "app_reader".into(),
+                members: Vec::new(),
+            }),
+            ["DROP ROLE [app_reader];"]
+        );
+        // Members first, by name, then the role: the engine refuses the drop
+        // while any remain, and the plan says exactly who is removed.
+        assert_eq!(
+            sql_of(&Change::DropRole {
+                uid: uid.clone(),
+                name: "app_reader".into(),
+                members: vec!["app_svc".into(), "reporting".into()],
+            }),
+            [
+                "ALTER ROLE [app_reader] DROP MEMBER [app_svc];",
+                "ALTER ROLE [app_reader] DROP MEMBER [reporting];",
+                "DROP ROLE [app_reader];"
+            ]
+        );
+        // ALTER, never drop + add: the membership has to survive.
+        let sql = sql_of(&Change::RenameRole {
+            uid: uid.clone(),
+            from: "reader".into(),
+            to: "app_reader".into(),
+        });
+        assert_eq!(sql, ["ALTER ROLE [reader] WITH NAME = [app_reader];"]);
+        assert!(!sql[0].contains("DROP"), "{sql:?}");
+        // And the statement says what it did to the name, as a table rename's
+        // do, so a staged checkpoint finds the role again (DECISIONS 93).
+        let stmts = emit(
+            &Change::RenameRole {
+                uid: uid.clone(),
+                from: "reader".into(),
+                to: "app_reader".into(),
+            },
+            Strategy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            stmts[0].role_renames,
+            [("reader".to_owned(), "app_reader".to_owned())]
+        );
+        assert!(stmts[0].renames.is_empty());
+        // And a created role says so, for the checkpoint to adopt it
+        // (DECISIONS 100).
+        let created = emit(
+            &Change::CreateRole {
+                uid: uid.clone(),
+                name: "auditors".into(),
+            },
+            Strategy::default(),
+        )
+        .unwrap();
+        assert_eq!(created[0].creates, [Created::Role("auditors".into())]);
+    }
+
+    #[test]
+    fn grants_name_the_securable_class_and_spell_permissions_the_engines_way() {
+        let sql = sql_of(&Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: perms(&[Permission::ViewDefinition, Permission::Select]),
         });
         assert_eq!(
             sql,
-            ["DELETE FROM [dbo].[order_status] WHERE [code] = N'old';"]
+            ["GRANT SELECT, VIEW DEFINITION ON OBJECT::[dbo].[customer] TO [app_reader];"]
         );
+        let sql = sql_of(&Change::Revoke {
+            role: "app_reader".into(),
+            target: "schema::app".parse().unwrap(),
+            permissions: perms(&[Permission::Execute]),
+        });
+        assert_eq!(sql, ["REVOKE EXECUTE ON SCHEMA::[app] FROM [app_reader];"]);
     }
 
     /// The same rule identifiers follow: a value can never end its own literal.
@@ -1458,6 +2593,8 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("o'brien"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: row(&[(
                 "label",
                 Value::Text("'); DROP TABLE [dbo].[t]; --".to_owned()),
@@ -1466,12 +2603,23 @@ mod tests {
         // Pinned exactly rather than by substring: what matters is that the
         // injected text is *inside* the literal, and only the whole statement
         // shows that. Every quote the value contained is doubled, so none of it
-        // closes the literal early and none of it becomes statement text.
+        // closes the literal early and none of it becomes statement text — in
+        // the postcondition the write holds itself to as much as in the
+        // `INSERT` (DECISIONS 132).
         assert_eq!(
             sql,
             [concat!(
+                "BEGIN TRANSACTION;\nBEGIN TRY\n",
                 "INSERT INTO [dbo].[t] ([code], [label]) ",
-                r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');"
+                r"VALUES (N'o''brien', N'''); DROP TABLE [dbo].[t]; --');",
+                "\nIF NOT EXISTS (SELECT 1 FROM [dbo].[t] WHERE [code] = N'o''brien' ",
+                r"AND [label] = N'''); DROP TABLE [dbo].[t]; --')",
+                "\n  THROW 50000, N'dbo.t row `o''brien` is not what this plan wrote once ",
+                "the statement had run — a trigger on the table, another writer inside it, ",
+                "or a value the engine stores differently from the way it is declared. ",
+                "Nothing was applied; `pbps plan --db` says which.', 1;",
+                "\nCOMMIT TRANSACTION;\nEND TRY\nBEGIN CATCH\n",
+                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\nTHROW;\nEND CATCH"
             )]
         );
     }
@@ -1487,6 +2635,8 @@ mod tests {
             key_column: "code".to_owned(),
             identity_key: false,
             key: RowKey::from("a"),
+            defaults: Default::default(),
+            types: Default::default(),
             row: row(&[
                 ("flag", Value::Bool(true)),
                 ("n", Value::Int(-7)),
@@ -1523,6 +2673,8 @@ mod tests {
                 key_column: "code".to_owned(),
                 identity_key: false,
                 key: RowKey::from("a"),
+                defaults: Default::default(),
+                types: Default::default(),
                 row: Row::default(),
             },
             Change::DeleteRow {
@@ -1530,6 +2682,9 @@ mod tests {
                 key_column: "code".to_owned(),
                 key: RowKey::from("a"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: Default::default(),
             },
         ] {
             assert!(!takes_online(&c), "{c:?}");

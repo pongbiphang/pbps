@@ -23,7 +23,7 @@ const LEN: usize = 6;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{0}` is missing the `t_` or `c_` prefix")]
+    #[error("UID `{0}` is missing the `t_`, `c_` or `r_` prefix")]
     BadPrefix(String),
 
     #[error("UID `{0}` should be {LEN} characters long, excluding the prefix")]
@@ -39,6 +39,10 @@ pub enum UidError {
 pub enum UidKind {
     Table,
     Column,
+    /// A database role (ADR-0005). Pinned alongside the two above because an
+    /// identity format is the most expensive thing in this project to change
+    /// late.
+    Role,
 }
 
 impl UidKind {
@@ -46,6 +50,7 @@ impl UidKind {
         match self {
             UidKind::Table => "t_",
             UidKind::Column => "c_",
+            UidKind::Role => "r_",
         }
     }
 }
@@ -110,6 +115,8 @@ impl Uid {
     pub fn kind(&self) -> UidKind {
         if self.0.starts_with("t_") {
             UidKind::Table
+        } else if self.0.starts_with("r_") {
+            UidKind::Role
         } else {
             UidKind::Column
         }
@@ -133,6 +140,7 @@ impl FromStr for Uid {
         let rest = s
             .strip_prefix("t_")
             .or_else(|| s.strip_prefix("c_"))
+            .or_else(|| s.strip_prefix("r_"))
             .ok_or_else(|| UidError::BadPrefix(s.to_owned()))?;
 
         if rest.len() != LEN {
@@ -249,7 +257,7 @@ mod tests {
 
     #[test]
     fn generated_uids_round_trip() {
-        for kind in [UidKind::Table, UidKind::Column] {
+        for kind in [UidKind::Table, UidKind::Column, UidKind::Role] {
             let u = Uid::generate(kind);
             assert_eq!(u.kind(), kind);
             assert_eq!(u.as_str().parse::<Uid>().unwrap(), u);

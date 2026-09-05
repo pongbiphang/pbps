@@ -38,6 +38,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     }
 
     modules_section(&mut s, schema);
+    roles_section(&mut s, schema);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
     s
@@ -64,6 +65,30 @@ fn modules_section(s: &mut String, schema: &Schema) {
             let _ = writeln!(s, "{d}\n");
         }
         let _ = writeln!(s, "```sql\n{}\n```", m.definition.trim_end());
+    }
+}
+
+/// Database roles and what each is granted (ADR-0005). Membership is not
+/// here: it is each environment's own, and pbps never reads it.
+fn roles_section(s: &mut String, schema: &Schema) {
+    if schema.roles.is_empty() {
+        return;
+    }
+    s.push_str("\n## Roles\n");
+    for (name, role) in &schema.roles {
+        let _ = writeln!(s, "\n### `{name}`\n");
+        if let Some(d) = &role.description {
+            let _ = writeln!(s, "{d}\n");
+        }
+        if role.grants.is_empty() {
+            s.push_str("No grants.\n");
+            continue;
+        }
+        s.push_str("| Granted on | Permissions |\n|---|---|\n");
+        for (target, permissions) in &role.grants {
+            let list: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
+            let _ = writeln!(s, "| `{target}` | {} |", list.join(", "));
+        }
     }
 }
 

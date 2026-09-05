@@ -143,13 +143,14 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         "project.unsupported-dialect",
         crate::dialect(project),
     )?;
-    let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref());
+    let (mut findings, counts) = crate::validate_findings(project, dialect.as_ref(), None);
     // The schemas the permission check asks about. Declarations that do not
     // load leave this empty, which is not a silence: `dbo` is always asked
     // about (the ledger lives there) and the declarations themselves are
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
     let referenced = referenced_tables(project, &managed_schemas);
+    let granted = grant_targets(project);
 
     if !project.ids_file().exists() {
         findings.push(
@@ -208,6 +209,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     target.connection(),
                     &managed_schemas,
                     &referenced,
+                    &granted,
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
@@ -239,7 +241,13 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         let rt = output::or_unanswerable("doctor", json, "runtime.unavailable", db::runtime())?;
         for name in names {
             let d = match project.connection_string(&name) {
-                Ok(conn) => rt.block_on(examine(&name, &conn, &managed_schemas, &referenced)),
+                Ok(conn) => rt.block_on(examine(
+                    &name,
+                    &conn,
+                    &managed_schemas,
+                    &referenced,
+                    &granted,
+                )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
                 // being able to see the whole estate at once is what makes this
@@ -292,7 +300,7 @@ fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
         .filter(|f| {
             f.severity == output::Severity::Error
                 && matches!(
-                    f.id,
+                    f.id.as_str(),
                     "environment.unreachable"
                         | "environment.unconfigured"
                         | "permission.unknown"
@@ -377,12 +385,54 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// What the managed roles are granted on (ADR-0005), as far as the project
+/// files can say. Empty when the project declares no role and its ids file
+/// names none — which is not yet "no role": the environment's recorded state
+/// may still hold one a `drop-role` is about to remove, and the connected
+/// check adds those (see `pbps_mssql::doctor::permissions`). Tombstones are
+/// deliberately not read here: they are permanent audit records, and a drop
+/// applied years ago must not keep asking for `CREATE ROLE`.
+///
+/// "Has" is wider than "declares": a role recorded in the ids file still
+/// exists in the database, and the next plan revokes what it holds there —
+/// needing `CONTROL` on securables the declarations no longer name and
+/// `ALTER ANY ROLE` for a role they no longer have.
+fn grant_targets(project: &Project) -> pbps_mssql::doctor::GrantTargets {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return pbps_mssql::doctor::GrantTargets::default();
+    };
+    let ids = crate::read_ids(project).unwrap_or_default();
+    let mut roles: std::collections::BTreeSet<String> =
+        loaded.schema.roles.keys().cloned().collect();
+    roles.extend(ids.roles.values().cloned());
+    let mut objects = std::collections::BTreeSet::new();
+    let mut schemas = std::collections::BTreeSet::new();
+    for role in loaded.schema.roles.values() {
+        for target in role.grants.keys() {
+            match target {
+                pbps_model::GrantTarget::Object(o) => {
+                    objects.insert(format!("{}.{}", o.schema, o.name));
+                }
+                pbps_model::GrantTarget::Schema(s) => {
+                    schemas.insert(s.clone());
+                }
+            }
+        }
+    }
+    pbps_mssql::doctor::GrantTargets {
+        objects: objects.into_iter().collect(),
+        schemas: schemas.into_iter().collect(),
+        roles: roles.into_iter().collect(),
+    }
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
     connection: &str,
     schemas: &[String],
     referenced: &[String],
+    granted: &pbps_mssql::doctor::GrantTargets,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
@@ -427,7 +477,7 @@ async fn examine(
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced).await {
+    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted).await {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()

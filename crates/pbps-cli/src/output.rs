@@ -68,7 +68,7 @@ pub struct Finding {
     /// Stable is the operative word. It is what a `policies:` block will raise
     /// or lower the severity of (SPEC §14.1), and what a team suppresses by,
     /// so it must survive a reworded message.
-    pub id: &'static str,
+    pub id: String,
 
     pub severity: Severity,
 
@@ -87,9 +87,9 @@ pub struct Finding {
 }
 
 impl Finding {
-    pub fn error(id: &'static str, message: impl Into<String>) -> Self {
+    pub fn error(id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            id,
+            id: id.into(),
             severity: Severity::Error,
             message: message.into(),
             location: None,
@@ -97,14 +97,14 @@ impl Finding {
         }
     }
 
-    pub fn warning(id: &'static str, message: impl Into<String>) -> Self {
+    pub fn warning(id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Warning,
             ..Self::error(id, message)
         }
     }
 
-    pub fn note(id: &'static str, message: impl Into<String>) -> Self {
+    pub fn note(id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Note,
             ..Self::error(id, message)
@@ -130,6 +130,15 @@ impl Finding {
     pub fn remedy(mut self, remedy: impl Into<String>) -> Self {
         self.remedy = Some(remedy.into());
         self
+    }
+
+    /// The severity as a word, for a line of prose.
+    pub fn severity_word(&self) -> &'static str {
+        match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        }
     }
 }
 

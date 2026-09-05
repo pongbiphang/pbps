@@ -28,9 +28,32 @@ use crate::schema::Schema;
 /// failed attempts make the audit promise explicit without changing the schema
 /// recorded as the current baseline.
 ///
+/// Bumped to 5 when `Schema` grew `roles` (ADR-0005), for the reason 2 was:
+/// an older client would drop the field, compare every table and no role, and
+/// report no drift about grants it never looked at.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
-pub const CURRENT_VERSION: u32 = 4;
+///
+/// Version 4 is still read, and 3 is not, and the line between them is the
+/// project's own rule about absence (DECISIONS 160). Every field a later
+/// version adds defaults to empty, but "empty" is only a safe reading where it
+/// is a *true* one. An environment recorded before roles were managed **is**
+/// one with no managed roles, so a version 4 snapshot read by this build says
+/// exactly what that environment was — and refusing it would leave a deployed
+/// environment with no way to be read at all, since re-recording one reads the
+/// latest entry first (DECISIONS 138). A version 3 snapshot predates
+/// `module_deps`, and "no dependencies" is not a true reading of it but a
+/// missing one: a later revision that removes several dependent modules has
+/// no declaration left carrying their `depends_on:` edges, so the drop order
+/// comes from the snapshot — and defaulted to empty it falls back to name
+/// order, which can drop a schema-bound dependency before its dependent.
+/// Refused, with the remedy `check_version` already names: re-record it with
+/// `pbps baseline --reason ...`.
+pub const CURRENT_VERSION: u32 = 5;
+
+/// The oldest snapshot version this build reads as its own.
+pub const OLDEST_READABLE_VERSION: u32 = 4;
 
 /// How this state came about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -188,7 +211,7 @@ impl StateSnapshot {
     /// are the objects a drift check compares. Silently reporting "no drift"
     /// about half a schema is the one answer this tool must never give.
     pub fn check_version(&self) -> Result<(), String> {
-        if self.version == CURRENT_VERSION {
+        if (OLDEST_READABLE_VERSION..=CURRENT_VERSION).contains(&self.version) {
             return Ok(());
         }
         Err(format!(
@@ -207,6 +230,12 @@ impl StateSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ids::IdsFile;
+    use crate::name::TableName;
+    use crate::schema::{Column, Table};
+    use crate::types::ColumnType;
+    use indexmap::IndexMap;
 
     /// Serde accepts a newer file by ignoring what it does not know, and the
     /// fields a state gains are the objects a drift check compares. "No drift"
@@ -221,17 +250,67 @@ mod tests {
         );
         assert!(snap.check_version().is_ok());
 
-        snap.version = CURRENT_VERSION - 1;
+        // The version before roles is read as an environment with none: the
+        // fields it lacks default to empty, that is a *true* reading of it,
+        // and refusing it would leave a deployed environment unreadable, its
+        // re-record included (DECISIONS 138). The version before that is
+        // refused, because "no module dependencies" is a missing reading
+        // rather than a true one (DECISIONS 160).
+        snap.version = OLDEST_READABLE_VERSION;
+        assert!(snap.check_version().is_ok());
+        snap.version = OLDEST_READABLE_VERSION - 1;
         assert!(snap.check_version().unwrap_err().contains("older pbps"));
         snap.version = CURRENT_VERSION + 1;
         assert!(snap.check_version().unwrap_err().contains("newer pbps"));
     }
-    use super::*;
-    use crate::ids::IdsFile;
-    use crate::name::TableName;
-    use crate::schema::{Column, Table};
-    use crate::types::ColumnType;
-    use indexmap::IndexMap;
+
+    /// What an entry from before roles actually holds, read by this build: the
+    /// same state with no roles, not an error and not a partial read.
+    ///
+    /// Version 3 by its number, not by the constant. It is a fixed historical
+    /// format, and what makes it unreadable is a specific thing it lacks:
+    /// `module_deps`. A test written against `OLDEST_READABLE_VERSION` follows
+    /// the constant wherever it goes and pins nothing — it passed unchanged
+    /// with the boundary moved back to 3 (DECISIONS 160).
+    #[test]
+    fn a_snapshot_from_before_module_dependencies_is_refused() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        snap.version = 3;
+        let e = snap.check_version().expect_err("version 3 is not readable");
+        assert!(e.contains("older pbps"), "{e}");
+        // And the remedy, because refusing without one strands the operator.
+        assert!(e.contains("pbps baseline"), "{e}");
+    }
+
+    /// 4 is the one a deployed environment is most likely to be sitting on —
+    /// it is what the trunk wrote before this phase — and "the oldest
+    /// readable version still works" says nothing about it on its own.
+    #[test]
+    fn a_snapshot_from_before_roles_reads_as_one_with_no_managed_roles() {
+        for version in OLDEST_READABLE_VERSION..CURRENT_VERSION {
+            let mut snap = StateSnapshot::new(
+                StateKind::Apply,
+                Schema::default(),
+                IdsFile::default(),
+                "leon",
+            );
+            snap.version = version;
+            let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+            // A writer before roles never wrote these sections at all.
+            json["schema"].as_object_mut().unwrap().remove("roles");
+            json["ids"].as_object_mut().unwrap().remove("roles");
+            let read: StateSnapshot = serde_json::from_value(json).unwrap();
+            assert!(read.check_version().is_ok(), "version {version}");
+            assert!(read.schema.roles.is_empty(), "version {version}");
+            assert!(read.ids.roles.is_empty(), "version {version}");
+            assert_eq!(read.schema, snap.schema, "version {version}");
+        }
+    }
 
     fn schema_with(ty: &str) -> Schema {
         let mut columns = IndexMap::new();
@@ -292,6 +371,11 @@ mod tests {
         assert!(snap.matches(&schema_with("nvarchar(255)")));
     }
 
+    /// Asserted on the parsed document, not on a substring of it. A snapshot
+    /// embeds an [`IdsFile`], which carries a `version` of its own, so
+    /// `contains(r#""version":1"#)` went on passing after this format was
+    /// bumped to 2, 3 and 4 — matching the nested field every time and
+    /// checking nothing about the snapshot's own.
     #[test]
     fn version_is_recorded() {
         let snap = StateSnapshot::new(
@@ -300,9 +384,13 @@ mod tests {
             IdsFile::default(),
             "leon",
         );
-        let json = serde_json::to_value(&snap).unwrap();
-        assert_eq!(json["version"], CURRENT_VERSION);
-        assert_eq!(json["kind"], "baseline");
+        let json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
+            "{json}"
+        );
+        assert_eq!(json["kind"], serde_json::json!("baseline"), "{json}");
     }
 
     /// The ledger writes `kind` into a column of its own so `status` can filter

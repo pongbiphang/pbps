@@ -38,10 +38,20 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 3;
-// 3: the `hooks.on_apply_attempt` event hook.
+pub const SCHEMA_VERSION: u32 = 6;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
+// 3: the `hooks.on_apply_attempt` event hook.
+// 4: the `role:` file (ADR-0005) and the `policies:` block in `pbps.yml`
+//    (ADR-0008). Both schemas grew, and a consumer keying on this number
+//    could not tell the widened schemas from the version-3 ones.
+// 5: `policies.rules` is keyed by the rule catalogue and a suppression's
+//    `rule` is one of its ids, where both were any string. An editor notices
+//    in the way that matters most: it completes the ids, and it stops
+//    accepting a misspelt one (DECISIONS 172).
+// 6: each rule's entry in `policies.rules` is that rule's own shape — its
+//    own parameters and no others — where all ten shared one. An editor
+//    stops completing `rows` into a naming rule (DECISIONS 188).
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {
@@ -199,6 +209,105 @@ mod tests {
         let actions = serde_json::to_string(&v["$defs"]["ReferentialAction"]).unwrap();
         for word in ["no_action", "cascade", "set_null", "set_default"] {
             assert!(actions.contains(word), "{actions}");
+        }
+    }
+
+    /// The rule ids a project writes come from the catalogue the checker
+    /// looks them up in — one list, not two. Derived from
+    /// `BTreeMap<String, _>` the schema accepted any key, so an editor blessed
+    /// `naming.tabel` and the typo waited for `pbps validate`
+    /// (DECISIONS 172).
+    #[test]
+    fn the_config_schema_knows_every_rule_and_no_others() {
+        let v = schema(SchemaKind::Config);
+        let catalogue: Vec<&str> = pbps_policy::rules::RULES.iter().map(|r| r.id).collect();
+
+        let rules = &v["$defs"]["Policies"]["properties"]["rules"];
+        let keys: Vec<&str> = rules["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("`rules` has no properties: {rules}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, catalogue, "{rules}");
+        // The half that refuses the typo. Listing the ids while still
+        // accepting any other key would autocomplete correctly and validate
+        // nothing.
+        assert_eq!(
+            rules["additionalProperties"],
+            serde_json::json!(false),
+            "{rules}"
+        );
+
+        // And the same list where a suppression names a rule: suppressing a
+        // rule that does not exist suppresses nothing.
+        let suppression = &v["$defs"]["Suppression"]["properties"]["rule"];
+        let named: Vec<&str> = suppression["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a suppression's rule is not a closed list: {suppression}"))
+            .iter()
+            .map(|v| v.as_str().expect("a rule id is a string"))
+            .collect();
+        assert_eq!(named, catalogue, "{suppression}");
+    }
+
+    /// Each rule's entry names that rule's own parameters and no others.
+    /// One shared `RuleSetting` for all ten let the editor bless
+    /// `naming.table: {rows: 5}`, which `Policies::check` refuses
+    /// (DECISIONS 188).
+    #[test]
+    fn every_rule_schema_takes_only_that_rules_parameters() {
+        let v = schema(SchemaKind::Config);
+        let rules = &v["$defs"]["Policies"]["properties"]["rules"]["properties"];
+        for rule in &pbps_policy::rules::RULES {
+            let entry = &rules[rule.id];
+            let forms = entry["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: no forms: {entry}", rule.id));
+            // `off` as a YAML boolean, and only `false`: `true` says nothing
+            // about the severity and is refused.
+            assert!(
+                forms.iter().any(|f| f["const"] == serde_json::json!(false)),
+                "{}: {entry}",
+                rule.id
+            );
+            assert!(
+                !forms.iter().any(|f| f["const"] == serde_json::json!(true)),
+                "{}: {entry}",
+                rule.id
+            );
+            let detailed = forms
+                .iter()
+                .find(|f| f["type"] == "object")
+                .unwrap_or_else(|| panic!("{}: no map form: {entry}", rule.id));
+            let mut named: Vec<&str> = detailed["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{}: {entry}", rule.id))
+                .keys()
+                .map(String::as_str)
+                .filter(|k| *k != "severity")
+                .collect();
+            named.sort_unstable();
+            let mut expected: Vec<&str> = rule.params.to_vec();
+            expected.sort_unstable();
+            assert_eq!(named, expected, "{}: {entry}", rule.id);
+            assert_eq!(
+                detailed["additionalProperties"],
+                serde_json::json!(false),
+                "{}: {entry}",
+                rule.id
+            );
+            // Every parameter has a shape; an empty one accepts anything,
+            // which is the failure this whole schema exists to prevent.
+            for p in rule.params {
+                assert!(
+                    detailed["properties"][*p]
+                        .as_object()
+                        .is_some_and(|o| { o.contains_key("type") }),
+                    "{}: `{p}` has no type: {entry}",
+                    rule.id
+                );
+            }
         }
     }
 

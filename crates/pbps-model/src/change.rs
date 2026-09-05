@@ -17,9 +17,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::data::{Cell, DataMode, Row, RowKey};
+use crate::data::{Cell, DataMode, Row, RowKey, Value};
 use crate::module::{Module, ModuleKind, ObjectName};
 use crate::name::{ColumnRef, TableName};
+use crate::role::{GrantTarget, Permission};
 use crate::schema::{
     CheckConstraint, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
 };
@@ -55,6 +56,15 @@ pub enum RiskClass {
     /// A row leaves the table: an `exact` table's undeclared row, or a changed
     /// primary-key value, which is delete plus insert.
     DataDelete,
+    /// Access is taken away (ADR-0005): a `REVOKE`, or a role drop, whose whole
+    /// effect is one. An availability risk — a running application loses
+    /// access mid-flight.
+    Revoke,
+    /// Access widens (ADR-0005). A security risk, labelled in every plan so
+    /// both review layers see it — but **not gated**: granting is the normal
+    /// case, the merge request reviews the YAML diff and the gate approves the
+    /// pinned plan, and a flag for it would add friction without safety.
+    GrantWiden,
 }
 
 impl RiskClass {
@@ -68,7 +78,19 @@ impl RiskClass {
             RiskClass::Constraint => "constraint",
             RiskClass::DataUpdate => "data-update",
             RiskClass::DataDelete => "data-delete",
+            RiskClass::Revoke => "revoke",
+            RiskClass::GrantWiden => "grant-widen",
         }
+    }
+
+    /// Whether `apply` refuses the plan until `--allow` names this class.
+    ///
+    /// Every class is *labelled*; only the gated ones stop an apply. The one
+    /// exception exists because the alternative is worse: a `--allow
+    /// grant-widen` typed on every deployment that adds a permission would be
+    /// typed out of habit, and a gate that is always opened protects nothing.
+    pub const fn is_gated(self) -> bool {
+        !matches!(self, RiskClass::GrantWiden)
     }
 
     /// What can go wrong, in the operator's words.
@@ -99,10 +121,16 @@ impl RiskClass {
             RiskClass::DataDelete => {
                 "a reference row is removed: rows in other tables that point at it fail, or lose what they pointed at"
             }
+            RiskClass::Revoke => {
+                "access is taken away: an application still relying on it fails from the moment the plan commits"
+            }
+            RiskClass::GrantWiden => {
+                "access widens: a role can do more than before, which the merge request should have reviewed"
+            }
         }
     }
 
-    pub const ALL: [RiskClass; 7] = [
+    pub const ALL: [RiskClass; 9] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -110,6 +138,8 @@ impl RiskClass {
         RiskClass::Constraint,
         RiskClass::DataUpdate,
         RiskClass::DataDelete,
+        RiskClass::Revoke,
+        RiskClass::GrantWiden,
     ];
 }
 
@@ -283,6 +313,31 @@ pub enum Change {
         identity_key: bool,
         key: RowKey,
         row: Row,
+        /// The default of every column the row omits and the table gives
+        /// one, by column. An omitted column is inserted at its default
+        /// (ADR-0004), and the pre-delete probe has to know what that is: a
+        /// default that names a parent row this plan deletes is a row
+        /// arriving on it, and the probe cannot see the arrival without this
+        /// (DECISIONS 117). Carried for the reason `key_column` is: apply
+        /// has the plan and nothing else. Absent from older plans, which is
+        /// an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        defaults: BTreeMap<String, String>,
+        /// The type of every non-key column the table has, an `IDENTITY`
+        /// column aside: the ones the row spells, the columns in `defaults`,
+        /// and the ones the table gives no default, which the insert leaves
+        /// at NULL. Carried for the same reason `UpdateRow` carries one: the
+        /// emitter holds the row to what it wrote, by the rendering that
+        /// reads each cell back and under a binary collation, so a rewrite
+        /// the column's own collation would call equal is still a rewrite
+        /// (DECISIONS 137); a column left to a *constant* default is checked
+        /// against that default the same way — which needs the type to know
+        /// the comparison is one the engine allows at all (133) — and a
+        /// column left to nothing is held to NULL (136). Absent from older
+        /// plans, which is an empty map: a spelled cell is then compared as
+        /// the engine compares, and the rest holds nothing.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        types: BTreeMap<String, ColumnType>,
     },
     /// The columns that differ, never the whole row: an `UPDATE` restating a
     /// column that did not change would overwrite a value the declaration and
@@ -299,6 +354,57 @@ pub enum Change {
         /// [`Cell`], not [`Value`]: an omitted column means the declared
         /// default, and the emitter has to write `DEFAULT`, not `NULL`.
         columns: BTreeMap<String, (Cell, Cell)>,
+        /// The declared cells the row already holds — every non-key column
+        /// outside `columns`, resolved by the omission rule. Never restated
+        /// in the `UPDATE`'s `SET`, for the reason `columns` gives; but the
+        /// statement holds the row to them, before and after it runs: a
+        /// cell the plan did not touch is still one the declaration claims,
+        /// and a trigger rewriting it, or a hand edit since the plan was
+        /// made, would otherwise be read back and recorded as the plan's
+        /// own result (DECISIONS 136). Absent from older plans, which is an
+        /// empty map and holds the row to its changed cells alone.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        unchanged: BTreeMap<String, Cell>,
+        /// The type each column in `columns` or `unchanged` has in the state
+        /// the plan was made against, for the columns that state has. The
+        /// emitter compares each cell by the rendering that read it — which
+        /// is the column's type's — and refuses the update when the row is
+        /// no longer as recorded (DECISIONS 122). A column the base does not
+        /// have is absent: its `before` is what this plan's `AddColumn`
+        /// leaves there, not a recorded cell. Absent from older plans,
+        /// which is an empty map.
+        ///
+        /// A column this plan *retypes* is here too, paired with its entry in
+        /// `after_types`: the recorded text is the old type's spelling of a
+        /// value the `AlterColumnType` has since converted, so the two
+        /// together say "recorded in this type, held in that one" and the
+        /// emitter asks the engine for the same conversion. Leaving it out
+        /// dropped the precondition for exactly the cell most likely to be
+        /// contended (DECISIONS 149).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        types: BTreeMap<String, ColumnType>,
+        /// The type each column has *once this plan has run*, where that is
+        /// not the type in `types` — a column this plan adds, and a column
+        /// whose type it changes. Both sort before the row changes
+        /// (`order_key`), so the `UPDATE` meets the declared type, not the
+        /// base one.
+        ///
+        /// Separate from `types` because the two checks around the write ask
+        /// different questions of the same cell. The precondition asks what
+        /// the recorded state holds, and a column the base lacks has no
+        /// recorded cell to hold the row to. The postcondition asks what the
+        /// row holds afterwards, and *every* declared cell is one the write
+        /// is answerable for — including the one this plan's `AddColumn` just
+        /// made room for. Carrying one map made the added column unheld: an
+        /// `AFTER UPDATE` trigger could rewrite it, the apply would record the
+        /// rewritten value, and the next plan would propose the update again
+        /// (DECISIONS 140).
+        ///
+        /// Only the entries that differ, so the plan does not carry the
+        /// whole column list twice per row. The emitter falls back to
+        /// `types`. Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        after_types: BTreeMap<String, ColumnType>,
     },
     DeleteRow {
         table: TableName,
@@ -308,6 +414,37 @@ pub enum Change {
         /// complete and this row is not in it. Recorded because the two reasons
         /// read very differently at the gate.
         cause: DeleteCause,
+        /// The row as the baseline recorded it, so the `DELETE` removes the
+        /// row that was reviewed and not whatever stands under that key when
+        /// it runs.
+        ///
+        /// The checksum pins the state only up to the moment `apply` reads
+        /// it: an application session that rewrites this row in between
+        /// leaves a key-only `DELETE` deleting the new version and
+        /// `@@ROWCOUNT = 1` calling it the reviewed one — an unreviewed loss
+        /// the apply then records as its own result. An update holds every
+        /// declared cell for exactly this reason (136); a delete has more to
+        /// lose, since what it removes cannot be compared afterwards
+        /// (DECISIONS 143). Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        row: BTreeMap<String, Cell>,
+        /// The type each recorded cell was read by, so the predicate compares
+        /// it the way the read-back rendered it (122). A cell whose type has
+        /// no comparison — `xml`, `text`, the spatial types — is carried but
+        /// not held, exactly as in an update.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        types: BTreeMap<String, ColumnType>,
+        /// The type each of those columns has *when the `DELETE` runs*, where
+        /// that is not the type in `types`: a column this plan retypes, whose
+        /// `AlterColumnType` sorts before every row change. The recorded text
+        /// is the old type's spelling and the column now holds the converted
+        /// value, so the predicate converts the recorded text the same way
+        /// rather than comparing two spellings of one value — or, as before
+        /// this pair existed, holding the row to nothing at all
+        /// (DECISIONS 149). Only the entries that differ; the emitter falls
+        /// back to `types`. Absent from older plans, which is an empty map.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        after_types: BTreeMap<String, ColumnType>,
     },
     /// `exact` <-> `ensure`. It emits no SQL by itself — the row changes it
     /// implies are separate entries — but it is a change to the declaration
@@ -336,16 +473,286 @@ pub enum Change {
         name: ObjectName,
         kind: ModuleKind,
     },
+
+    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
+    // ... WITH NAME`, never drop + add, because membership lives only in the
+    // environment. Grants are split out of the create, as foreign keys are
+    // out of `CreateTable`: they sort after the objects they name exist.
+    CreateRole {
+        uid: Uid,
+        name: String,
+    },
+    /// Dropping a role that still has members is refused by the engine, and
+    /// membership is each environment's own — so a connected plan lists the
+    /// members it found and removes them first, by name, where the reviewer
+    /// can see who loses what. An offline plan has no environment to ask and
+    /// leaves the list empty (ADR-0005).
+    DropRole {
+        uid: Uid,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<String>,
+    },
+    RenameRole {
+        uid: Uid,
+        from: String,
+        to: String,
+    },
+    /// Permissions added on one target. Only the ones that are new: restating
+    /// what the role already holds would make the plan claim a widening that
+    /// is not one.
+    Grant {
+        role: String,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// Permissions removed from one target — the ones the declaration no
+    /// longer lists.
+    Revoke {
+        role: String,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+}
+
+/// What a row change leaves at its key.
+///
+/// Every cell the change writes, whether it spells a value or leaves the
+/// column to its default. A spelled cell that the read-back carries must
+/// match, and that is exact: a connected plan is refused outright if the
+/// engine reads a declared value back differently (DECISIONS 101, 165). A
+/// cell left to its default was dropped from here, because a read-back omits
+/// a cell at its default and there was nothing to compare — which also meant
+/// a value that arrived in its place was compared with nothing. It stays as
+/// [`CellAfter::AtDefault`], and the caller that knows how its read-back
+/// spells an at-default cell holds it there (DECISIONS 191).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowAfter<'a> {
+    /// The row is there, and holds at least these cells.
+    Holding(BTreeMap<&'a str, CellAfter<'a>>),
+    /// The row is gone.
+    Gone,
+}
+
+/// What a row change leaves in one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellAfter<'a> {
+    /// The value the plan wrote, NULL included.
+    Spelled(&'a Value),
+    /// The column's default, whatever the engine evaluates it to. The plan
+    /// cannot name the value — only the engine can — so what a read-back can
+    /// be held to is that the cell *is* at the default, and only where the
+    /// read-back says so (DECISIONS 191).
+    AtDefault,
+}
+
+impl<'a> From<&'a Cell> for CellAfter<'a> {
+    fn from(cell: &'a Cell) -> Self {
+        match cell {
+            Cell::Value(v) => CellAfter::Spelled(v),
+            Cell::Default(_) => CellAfter::AtDefault,
+        }
+    }
+}
+
+/// Which attribute of a column a change moves.
+///
+/// A caller excluding what a plan does from a before/after comparison has to
+/// exclude exactly that. Per *column* the exclusion was wider than its reason:
+/// only the engine's stored form can say what a retyped column became, but
+/// that column's default, identity and nullability still came back from two
+/// reads, and excusing the whole value meant nothing compared them
+/// (DECISIONS 173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ColumnField {
+    /// The column is on one side of the comparison only — added, dropped, or
+    /// under another name — so there is no pair of values to compare at all.
+    Whole,
+    Type,
+    Nullable,
+    Default,
+    /// Named for exhaustiveness rather than because a comparison turns on it:
+    /// deprecation emits no statement and no catalog reads it back.
+    Deprecated,
+}
+
+/// Which of a table's named parts a change is about.
+///
+/// The kind travels with the name because the engine keeps indexes and
+/// constraints in **separate namespaces**: a table may hold an index `x` and a
+/// check `x` at once, and a skip set keyed by the bare name let a planned
+/// change to one exempt the other from every comparison (DECISIONS 168).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Part {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    Check,
+    Index,
+}
+
+/// One named part of a table, and what this plan leaves there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartChange<'a> {
+    pub table: &'a TableName,
+    /// `None` for the primary key, which the model keeps in a field of its own
+    /// rather than one of the named maps, and which a declaration need not
+    /// name at all (61).
+    pub name: Option<&'a str>,
+    pub after: PartAfter<'a>,
+}
+
+impl PartChange<'_> {
+    /// Which kind of part this is, whichever way the change leaves it.
+    pub fn part(&self) -> Part {
+        self.after.part()
+    }
+}
+
+/// What a part change leaves at its name: a definition, or nothing.
+///
+/// The definition travels with the presence rather than beside it, so that a
+/// part the plan adds cannot be checked for being *there* without the checker
+/// also holding what it was meant to *be*. Held to presence alone, a
+/// constraint another session replaced under the same name between a staged
+/// statement and its checkpoint was recorded as the plan's own result
+/// (DECISIONS 189). The same shape as [`ModuleAfter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartAfter<'a> {
+    /// The definition the plan adds the part with.
+    Standing(PartDefinition<'a>),
+    /// Nothing: the plan drops it.
+    Gone(Part),
+}
+
+impl PartAfter<'_> {
+    pub fn part(&self) -> Part {
+        match self {
+            PartAfter::Standing(definition) => definition.part(),
+            PartAfter::Gone(part) => *part,
+        }
+    }
+
+    pub fn presence(&self) -> Presence {
+        match self {
+            PartAfter::Standing(_) => Presence::Present,
+            PartAfter::Gone(_) => Presence::Absent,
+        }
+    }
+}
+
+/// The definition a plan adds a part with, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartDefinition<'a> {
+    PrimaryKey(&'a PrimaryKey),
+    Unique(&'a UniqueConstraint),
+    ForeignKey(&'a ForeignKey),
+    Check(&'a CheckConstraint),
+    Index(&'a Index),
+}
+
+impl PartDefinition<'_> {
+    pub fn part(&self) -> Part {
+        match self {
+            PartDefinition::PrimaryKey(_) => Part::PrimaryKey,
+            PartDefinition::Unique(_) => Part::Unique,
+            PartDefinition::ForeignKey(_) => Part::ForeignKey,
+            PartDefinition::Check(_) => Part::Check,
+            PartDefinition::Index(_) => Part::Index,
+        }
+    }
+}
+
+/// What a column change promises about one field of the column, for the
+/// caller checking that a plan got what it asked for.
+///
+/// One promise per field the change moves, because the exclusion it answers
+/// for is field-sized (173): the shape comparison leaves out exactly the
+/// fields [`Change::columns_redefined`] names, so exactly those have to be held
+/// to the plan's value once every statement has run — anything less let a
+/// column another session retyped after the plan's own `ALTER` be recorded as
+/// the plan's result (DECISIONS 189).
+///
+/// Only the fields a read-back can answer for. A default's *text* comes back
+/// in the engine's rendering (185), so the promise is whether there is one;
+/// deprecation and description are read back by no catalog and promise
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPromise<'a> {
+    /// The column is new, and every comparable field is the declaration's.
+    Whole(&'a Column),
+    Type(&'a ColumnType),
+    Nullable(bool),
+    /// Whether the column has a default at all.
+    Default(bool),
+}
+
+/// Whether a name is there once this plan has run.
+///
+/// For the caller that has to check a plan did what it said: a `CREATE` that
+/// reports success and a table that is not there afterwards are two different
+/// facts, and nothing but this comparison puts them together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Present,
+    Absent,
+}
+
+/// What a module change leaves standing at its name.
+///
+/// An enum rather than `Option<Option<_>>`: "dropped" and "no module change
+/// here" are different answers, and nesting them is how they get confused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleAfter<'a> {
+    /// The definition the plan creates the module with, or replaces it by.
+    Standing(&'a Module),
+    /// Nothing: the plan drops it.
+    Gone,
+}
+
+/// Which way a [`Change::Grant`] or [`Change::Revoke`] moves a role's
+/// permissions on one target.
+///
+/// An enum rather than a flag beside the set: the caller adds one and
+/// subtracts the other, and a bool in that position is a mistake that
+/// compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChange<'a> {
+    /// The role holds these afterwards and did not before.
+    Granted(&'a BTreeSet<Permission>),
+    /// The role held these before and does not afterwards.
+    Revoked(&'a BTreeSet<Permission>),
 }
 
 impl Change {
-    /// The object this change acts on, for grouping in output and for ordering.
+    /// What this change acts on, for grouping in output and for ordering:
+    /// `dbo.customer`, or `role app_reader`.
+    // The wildcard stands in for "every change with a table", and `table()`
+    // is the exhaustive match that decides which those are; a variant added
+    // later is handled there, not here.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn subject(&self) -> String {
+        match self {
+            Change::CreateRole { name, .. }
+            | Change::DropRole { name, .. }
+            | Change::Grant { role: name, .. }
+            | Change::Revoke { role: name, .. } => format!("role {name}"),
+            Change::RenameRole { from, .. } => format!("role {from}"),
+            // Every other change acts on an object with a name.
+            other => other.table().map(ToString::to_string).unwrap_or_default(),
+        }
+    }
+
+    /// The object this change acts on, or `None` for a change that is not to
+    /// an object in the tables-and-modules namespace at all.
     ///
     /// For a module change it is the module's own qualified name: tables and
     /// modules share one namespace, so one type covers both and a plan groups
-    /// by "the thing being changed" either way.
-    pub fn table(&self) -> &TableName {
-        match self {
+    /// by "the thing being changed" either way. A role change has no such
+    /// name — a role is a principal, not an object — and the callers that
+    /// want a label use [`Change::subject`].
+    pub fn table(&self) -> Option<&TableName> {
+        Some(match self {
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
             Change::RenameTable { from, .. } => from,
             Change::AddColumn { table, .. }
@@ -371,6 +778,814 @@ impl Change {
             Change::CreateModule { name, .. }
             | Change::AlterModule { name, .. }
             | Change::DropModule { name, .. } => name,
+            Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => return None,
+        })
+    }
+
+    /// Every name in the tables-and-modules namespace this change reaches:
+    /// the one [`Change::table`] gives, plus the far end of a rename, which
+    /// is a second name the same object answers to across one plan.
+    ///
+    /// For a caller asking "did this plan touch that object", both ends have
+    /// to be in the answer: the recorded state knows a renamed table by its
+    /// old name and the plan's result knows it by its new one, and an object
+    /// present under one name and absent under the other is exactly what a
+    /// rename looks like from the outside.
+    // Exhaustive rather than a wildcard, for the reason the body gives: a
+    // change added later that moves an object's name has to be named here, or
+    // a caller asking what this plan touched would be told about one end of it
+    // and left to bless whatever happened at the other.
+    pub fn objects(&self) -> impl Iterator<Item = &TableName> {
+        let far_end = match self {
+            Change::RenameTable { to, .. } => Some(to),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        };
+        self.table().into_iter().chain(far_end)
+    }
+
+    /// The declared row this change writes, where it writes one: the table it
+    /// is in, under the name the plan gives that table, and its key.
+    ///
+    /// A caller comparing a state before an apply with the state after it
+    /// needs this to tell the rows the plan is answerable for from the ones it
+    /// is not. The plan's own statements hold the first kind to what they
+    /// wrote (132, 136, 143); nothing else in a run speaks for the second, and
+    /// an `AFTER` trigger reaches them from inside the very statement that
+    /// writes a row the plan *did* name.
+    ///
+    /// The direction comes with it because those statements stop speaking at
+    /// their own commit. In one transaction that is enough — the row stays
+    /// locked until the commit, so nothing can reach it — but a staged run
+    /// commits each statement, and between that and the checkpoint read a row
+    /// it inserted can be deleted, or one it deleted put back (DECISIONS 162).
+    // Exhaustive rather than a wildcard: a change added later that writes a
+    // declared row has to be named here, or the row it writes would be
+    // compared against a state it was never part of.
+    pub fn row(&self) -> Option<(&TableName, &RowKey, RowAfter<'_>)> {
+        // Every cell the change writes — a NULL *is* written down, and so is
+        // `DEFAULT`. The read-back omits a NULL in a column with no default,
+        // which excuses its **absence** and nothing else: a value that
+        // arrived in its place is present, and dropping the expectation meant
+        // nothing looked (DECISIONS 179). A cell set to `DEFAULT` used to be
+        // dropped for the same wrong reason: its value is omitted only where
+        // the engine *confirmed* it at the default, and one it could not
+        // evaluate (`NEWID()`) comes back with its value — so it is kept as
+        // [`CellAfter::AtDefault`], and the caller asks the dialect which
+        // case it is looking at (117, 165, 191).
+        match self {
+            Change::InsertRow {
+                table,
+                key,
+                row,
+                defaults,
+                ..
+            } => Some((
+                table,
+                key,
+                RowAfter::Holding(
+                    row.0
+                        .iter()
+                        .map(|(column, v)| (column.as_str(), CellAfter::Spelled(v)))
+                        // And the columns the insert leaves to their default.
+                        .chain(
+                            defaults
+                                .keys()
+                                .map(|column| (column.as_str(), CellAfter::AtDefault)),
+                        )
+                        .collect(),
+                ),
+            )),
+            Change::UpdateRow {
+                table,
+                key,
+                columns,
+                unchanged,
+                ..
+            } => Some((
+                table,
+                key,
+                RowAfter::Holding(
+                    columns
+                        .iter()
+                        .map(|(column, (_, to))| (column, to))
+                        .chain(unchanged)
+                        .map(|(column, cell)| (column.as_str(), CellAfter::from(cell)))
+                        .collect(),
+                ),
+            )),
+            Change::DeleteRow { table, key, .. } => Some((table, key, RowAfter::Gone)),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
+    /// Every column this change moves the *reading* of: its name, or the way
+    /// its cells come back.
+    ///
+    /// For a caller comparing a table's rows before and after an apply. A row
+    /// is keyed by column name and each cell reads back in its column's own
+    /// rendering, so a column the plan renames, adds, drops or retypes changes
+    /// the shape of every row in the table without any row change saying so.
+    /// Compared whole, those rows all read as somebody else's work
+    /// (DECISIONS 158).
+    ///
+    /// 158 named every column-level change on the argument that naming one too
+    /// many only narrows a comparison. It does — and that narrowing has a
+    /// price: a column skipped here is a cell nothing compares. The two that
+    /// move no reading are excluded now (DECISIONS 162). **Nullability**
+    /// rewrites no stored value, and the read-back's omission rule turns on
+    /// whether a column *has a default*, not on whether it accepts NULL. A
+    /// column's **deprecation** is a description; it touches no cell at all.
+    /// A change to the **default** stays, because a cell at its default is
+    /// spelled from that default and omitted where it matches.
+    // Exhaustive rather than a wildcard: a change added later that touches a
+    // column has to be named here, or the rows of its table would be compared
+    // against a shape the plan itself moved.
+    pub fn columns(&self) -> Vec<ColumnRef> {
+        match self {
+            Change::AddColumn { table, name, .. } => vec![table.column(name)],
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![table.column(from), table.column(to)],
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnDefault { column, .. } => vec![column.clone()],
+            Change::AlterColumnNullability { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// Every column this change alters the **definition** of.
+    ///
+    /// The sibling of [`Change::columns`], and deliberately not the same set.
+    /// That one answers "whose *reading* did this move" for a caller comparing
+    /// rows; this one answers "whose *definition* did this move" for a caller
+    /// comparing a table's shape across an apply. 162 removed nullability from
+    /// the first, correctly — it rewrites no cell — and 166 then reused the
+    /// first set for the second question, so the shape comparison read a
+    /// plan's own `ALTER COLUMN ... NOT NULL` as somebody else's work and
+    /// refused it. The catalog reads `is_nullable` back; the two questions
+    /// have different answers and now have different functions
+    /// (DECISIONS 170).
+    ///
+    /// **Deprecation is in neither.** It emits no statement at all, and the
+    /// catalog reads back neither it nor the description, so it can move
+    /// nothing in a read-back — and excusing its column would drop a real
+    /// comparison to buy nothing.
+    // Exhaustive rather than a wildcard, for the reason [`Change::columns`]
+    // gives: a change added later that alters a column has to be named here,
+    // or the plan's own edit is reported as movement.
+    pub fn columns_redefined(&self) -> Vec<(ColumnRef, ColumnField)> {
+        match self {
+            Change::AddColumn { table, name, .. } => {
+                vec![(table.column(name), ColumnField::Whole)]
+            }
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![
+                (table.column(from), ColumnField::Whole),
+                (table.column(to), ColumnField::Whole),
+            ],
+            Change::DropColumn { column, .. } => vec![(column.clone(), ColumnField::Whole)],
+            // The type, and the nullability only where it actually moves:
+            // `ALTER COLUMN` restates the whole definition (§12), so the
+            // statement carries both, but a restatement that changes nothing
+            // leaves a value two reads still agree on.
+            Change::AlterColumnType {
+                column,
+                from_nullable,
+                to_nullable,
+                ..
+            } => {
+                let mut out = vec![(column.clone(), ColumnField::Type)];
+                if from_nullable != to_nullable {
+                    out.push((column.clone(), ColumnField::Nullable));
+                }
+                out
+            }
+            // Not the type: the differ emits this change only where the type
+            // is unchanged, and the statement restates the one it read.
+            // Measured: `ALTER COLUMN` leaves the default constraint's stored
+            // definition untouched, so that stays comparable too.
+            Change::AlterColumnNullability { column, .. } => {
+                vec![(column.clone(), ColumnField::Nullable)]
+            }
+            Change::AlterColumnDefault { column, .. } => {
+                vec![(column.clone(), ColumnField::Default)]
+            }
+            Change::SetColumnDeprecated { column, .. } => {
+                vec![(column.clone(), ColumnField::Deprecated)]
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// The object this change removes from the database outright, if it
+    /// removes one.
+    ///
+    /// A securable takes its permissions with it — measured: dropping a table
+    /// leaves the role holding none of what it was granted on it — so a plan
+    /// that drops a granted object emits no `REVOKE` and the grant is simply
+    /// not there afterwards. A caller comparing a role's grants across an
+    /// apply has to know that (DECISIONS 158).
+    // Exhaustive rather than a wildcard, for the reason above: a change added
+    // later that removes an object takes grants with it too.
+    pub fn drops(&self) -> Option<&TableName> {
+        match self {
+            Change::DropTable { name, .. } | Change::DropModule { name, .. } => Some(name),
+            Change::CreateTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
+    /// The permissions this change writes, where it writes any: the role, the
+    /// target they are on, and which way the set moves.
+    ///
+    /// The direction is carried rather than left to the caller because the
+    /// caller has to reconstruct what the role will hold, and "the plan moves
+    /// these" is not enough to do that — subtracting them from both sides
+    /// instead left the plan's own grant checked by nothing at all
+    /// (DECISIONS 160).
+    ///
+    /// The counterpart of [`Change::row`] on the other half of the model, and
+    /// for the same caller. A role a plan touches is not a role the plan is
+    /// answerable for *whole*: it grants or revokes some permissions on some
+    /// targets, and every other permission that role holds is one nothing in
+    /// the run speaks for (DECISIONS 156).
+    // Exhaustive rather than a wildcard: a change added later that moves a
+    // permission has to be named here, or the permission it moves would be
+    // compared against a state it was never part of.
+    pub fn grant(&self) -> Option<(&str, &GrantTarget, PermissionChange<'_>)> {
+        match self {
+            Change::Grant {
+                role,
+                target,
+                permissions,
+            } => Some((role, target, PermissionChange::Granted(permissions))),
+            Change::Revoke {
+                role,
+                target,
+                permissions,
+            } => Some((role, target, PermissionChange::Revoked(permissions))),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. } => None,
+        }
+    }
+
+    /// Every role name this change reaches, both ends of a rename included,
+    /// for the reason [`Change::objects`] gives. Empty for every change that
+    /// is not about a principal.
+    // Exhaustive rather than a wildcard: a change added later that names a
+    // role has to be classified here, or a caller asking what this plan
+    // touched would be told "nothing" about it.
+    pub fn roles(&self) -> impl Iterator<Item = &str> {
+        let (one, two) = match self {
+            Change::CreateRole { name, .. }
+            | Change::DropRole { name, .. }
+            | Change::Grant { role: name, .. }
+            | Change::Revoke { role: name, .. } => (Some(name.as_str()), None),
+            Change::RenameRole { from, to, .. } => (Some(from.as_str()), Some(to.as_str())),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. } => (None, None),
+        };
+        one.into_iter().chain(two)
+    }
+
+    /// Which table names this change leaves standing, and which it leaves
+    /// empty.
+    ///
+    /// Existence only: whether the table is there at all is this accessor's
+    /// one question (DECISIONS 161). Its *shape* is answered for entry by
+    /// entry — [`Change::columns_after`] and [`Change::columns_promised`] for
+    /// the columns, [`Change::constraints`] for the parts — in the fields the
+    /// engine reads back unchanged, since the stored form is the one that
+    /// compares equal on the next drift check (SPEC §8.2).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
+        match self {
+            Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
+            Change::DropTable { name, .. } => vec![(name, Presence::Absent)],
+            Change::RenameTable { from, to, .. } => {
+                vec![(from, Presence::Absent), (to, Presence::Present)]
+            }
+            Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// What this change promises about the columns it redefines, field by
+    /// field, once every statement of the plan has run.
+    ///
+    /// The mirror of [`Change::columns_redefined`]: every field that excludes
+    /// a column from the shape comparison has to be answered for here, or a
+    /// concurrent redefinition of that field goes unread (DECISIONS 189). The
+    /// test `every_excluded_field_is_promised` holds the two together.
+    ///
+    /// A rename promises nothing *here*: its column has no declared value to
+    /// be held to, only the definition it had under the old name, and the
+    /// shape comparison follows it across the rename instead.
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn columns_promised(&self) -> Vec<(ColumnRef, ColumnPromise<'_>)> {
+        match self {
+            Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } => vec![(table.column(name), ColumnPromise::Whole(column))],
+            // Both: `ALTER COLUMN` restates the nullability with the type
+            // (§12), so the statement promises it whether or not it moves.
+            Change::AlterColumnType {
+                column,
+                to,
+                to_nullable,
+                ..
+            } => vec![
+                (column.clone(), ColumnPromise::Type(to)),
+                (column.clone(), ColumnPromise::Nullable(*to_nullable)),
+            ],
+            Change::AlterColumnNullability {
+                column,
+                to_nullable,
+                ..
+            } => vec![(column.clone(), ColumnPromise::Nullable(*to_nullable))],
+            Change::AlterColumnDefault { column, to, .. } => {
+                vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
+            }
+            Change::RenameColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// Which columns this change leaves standing, and which it leaves empty.
+    ///
+    /// Existence only; what the column *is* afterwards is
+    /// [`Change::columns_promised`]'s answer, field by field (189). Whether
+    /// the column is there is this accessor's — and nothing else says so,
+    /// since the shape comparison excludes exactly the columns this plan
+    /// moves (DECISIONS 168).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn columns_after(&self) -> Vec<(ColumnRef, Presence)> {
+        match self {
+            Change::AddColumn { table, name, .. } => {
+                vec![(table.column(name), Presence::Present)]
+            }
+            Change::DropColumn { column, .. } => vec![(column.clone(), Presence::Absent)],
+            Change::RenameColumn {
+                table, from, to, ..
+            } => vec![
+                (table.column(from), Presence::Absent),
+                (table.column(to), Presence::Present),
+            ],
+            // Still there afterwards, whatever else changed about it.
+            Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. }
+            | Change::AlterColumnDefault { column, .. }
+            | Change::SetColumnDeprecated { column, .. } => {
+                vec![(column.clone(), Presence::Present)]
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// The named constraints and indexes this change adds or removes, under
+    /// the table they sit on, and whether the primary key is among them.
+    ///
+    /// For a caller comparing a touched table's *shape* across an apply. Its
+    /// columns and constraints are compared entry by entry between the two
+    /// reads, so the ones this plan moves have to be left out — and everything
+    /// else on the table then answers for itself, instead of the whole table
+    /// being exempt because one index changed (DECISIONS 166).
+    ///
+    /// The primary key is `Named(None)`: the model keeps it in a field of its
+    /// own rather than the constraint maps, and a declaration may not name it
+    /// at all (61).
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn constraints(&self) -> Option<PartChange<'_>> {
+        let it = |table, name, after| Some(PartChange { table, name, after });
+        let standing = |d| PartAfter::Standing(d);
+        match self {
+            Change::SetPrimaryKey { table, to, .. } => it(
+                table,
+                None,
+                match to {
+                    Some(key) => standing(PartDefinition::PrimaryKey(key)),
+                    None => PartAfter::Gone(Part::PrimaryKey),
+                },
+            ),
+            Change::AddUnique {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Unique(constraint)),
+            ),
+            Change::DropUnique { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::Unique))
+            }
+            Change::AddForeignKey {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::ForeignKey(constraint)),
+            ),
+            Change::DropForeignKey { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::ForeignKey))
+            }
+            Change::AddCheck {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Check(constraint)),
+            ),
+            Change::DropCheck { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::Check))
+            }
+            Change::AddIndex { table, name, index } => {
+                it(table, Some(name), standing(PartDefinition::Index(index)))
+            }
+            Change::DropIndex { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::Index))
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
+        }
+    }
+
+    /// The same for roles. A role with no grants is invisible to every other
+    /// comparison here — its whole state is its name — so without this a
+    /// `CREATE ROLE` that another session undid was recorded as success.
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn roles_after(&self) -> Vec<(&str, Presence)> {
+        match self {
+            Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
+            Change::DropRole { name, .. } => vec![(name, Presence::Absent)],
+            Change::RenameRole { from, to, .. } => {
+                vec![(from, Presence::Absent), (to, Presence::Present)]
+            }
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
+    /// What this plan leaves standing where a module change names one.
+    ///
+    /// A module statement has no postcondition of its own — `CREATE OR ALTER`
+    /// reports success and says nothing about what is now stored — so the only
+    /// thing that can hold one to what the plan wrote is a caller comparing
+    /// the read-back with the definition. Safe to compare exactly: a module
+    /// read back equals the declaration that produced it, which the whole
+    /// drift check already rests on, and an apply followed by drift for ever
+    /// is what it would mean if it did not (DECISIONS 160).
+    // Exhaustive rather than a wildcard, as every accessor here is: a change
+    // added later that leaves a definition standing has to say so, or the
+    // read-back would record whatever is there as this plan's own result.
+    pub fn module(&self) -> Option<(&ObjectName, ModuleAfter<'_>)> {
+        match self {
+            Change::CreateModule { name, module } | Change::AlterModule { name, module } => {
+                Some((name, ModuleAfter::Standing(module)))
+            }
+            Change::DropModule { name, .. } => Some((name, ModuleAfter::Gone)),
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
         }
     }
 
@@ -402,7 +1617,12 @@ impl Change {
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. } => None,
+            | Change::SetDataMode { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => None,
         }
     }
 
@@ -423,7 +1643,11 @@ impl Change {
             Change::DropModule { .. } => {
                 r.insert(RiskClass::Destructive);
             }
-            Change::RenameTable { .. } | Change::RenameColumn { .. } => {
+            // A role rename keeps its membership — which is why it is a
+            // rename and not drop + add — but the old name is gone the same
+            // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
+            // application breaks on the spot. Same gate as the other renames.
+            Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
                 r.insert(RiskClass::Rename);
             }
             Change::AlterColumnNullability {
@@ -460,6 +1684,14 @@ impl Change {
                     r.insert(RiskClass::NotNull);
                 }
             }
+            // A role drop's whole effect is revocation, on top of the reason
+            // its tombstone already demanded (ADR-0005).
+            Change::DropRole { .. } | Change::Revoke { .. } => {
+                r.insert(RiskClass::Revoke);
+            }
+            Change::Grant { .. } => {
+                r.insert(RiskClass::GrantWiden);
+            }
             Change::CreateTable { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability {
@@ -480,7 +1712,9 @@ impl Change {
             // there; a failure (a duplicate key, a violated FK) rolls back with
             // the plan. Changing the mode emits nothing at all.
             | Change::InsertRow { .. }
-            | Change::SetDataMode { .. } => {}
+            | Change::SetDataMode { .. }
+            // Creating a role grants nothing by itself.
+            | Change::CreateRole { .. } => {}
         }
         r
     }
@@ -505,6 +1739,12 @@ pub struct PlannedChange {
     /// not even have is a hint nobody reviewed.
     #[serde(default, skip_serializing_if = "Strategy::is_default")]
     pub strategy: Strategy,
+
+    /// What the analyzers said about this change (ADR-0008). Beside the risks,
+    /// never inside them: a finding carries a severity the project chose and
+    /// can be suppressed, a risk class is what the gate reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::finding::Finding>,
 }
 
 impl PlannedChange {
@@ -516,6 +1756,7 @@ impl PlannedChange {
             change,
             risks,
             strategy: Strategy::default(),
+            findings: Vec::new(),
         }
     }
 
@@ -554,9 +1795,25 @@ impl ChangeSet {
             .collect()
     }
 
+    /// The risk classes `--allow` has to name: every gated one this plan
+    /// involves. The advice a plan prints is built from this, never from
+    /// [`ChangeSet::risks`] — advising `--allow grant-widen` for a flag the
+    /// gate never asks for would teach reviewers to type flags by rote.
+    pub fn gated_risks(&self) -> BTreeSet<RiskClass> {
+        self.risks().into_iter().filter(|r| r.is_gated()).collect()
+    }
+
     /// Risks not covered by `allowed`. Non-empty means apply must abort.
+    ///
+    /// Only the gated classes count: a labelled-but-ungated class
+    /// (`grant-widen`) is in [`ChangeSet::risks`] for the reviewer and absent
+    /// here for the gate, by design (ADR-0005).
     pub fn unapproved_risks(&self, allowed: &BTreeSet<RiskClass>) -> BTreeSet<RiskClass> {
-        self.risks().difference(allowed).copied().collect()
+        self.risks()
+            .difference(allowed)
+            .copied()
+            .filter(|r| r.is_gated())
+            .collect()
     }
 }
 
@@ -573,6 +1830,59 @@ mod tests {
             assert!(r.why().len() > 20, "{r} needs a real explanation");
             assert_eq!(r.as_str().parse::<RiskClass>().unwrap(), r);
         }
+    }
+
+    /// ADR-0005: a widening is labelled for the reviewer and never stops an
+    /// apply; a revoke is both labelled and gated. The plan's risk list has to
+    /// show both, and the gate has to see exactly one.
+    #[test]
+    fn a_grant_is_labelled_but_not_gated_and_a_revoke_is_both() {
+        let target: GrantTarget = "dbo.customer".parse().unwrap();
+        let perms: BTreeSet<Permission> = [Permission::Select].into_iter().collect();
+        let cs = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::Grant {
+                    role: "r".into(),
+                    target: target.clone(),
+                    permissions: perms.clone(),
+                }),
+                PlannedChange::new(Change::Revoke {
+                    role: "r".into(),
+                    target,
+                    permissions: perms,
+                }),
+            ],
+        };
+        assert!(cs.risks().contains(&RiskClass::GrantWiden));
+        assert!(cs.risks().contains(&RiskClass::Revoke));
+        let unapproved = cs.unapproved_risks(&BTreeSet::new());
+        assert_eq!(
+            unapproved,
+            [RiskClass::Revoke].into_iter().collect(),
+            "only the gated class stops the apply"
+        );
+        assert!(
+            cs.unapproved_risks(&[RiskClass::Revoke].into_iter().collect())
+                .is_empty()
+        );
+        // And a role drop is a revocation on top of its tombstone.
+        assert!(
+            Change::DropRole {
+                uid: uid("r_aaaaaa"),
+                name: "r".into(),
+                members: Vec::new(),
+            }
+            .intrinsic_risks()
+            .contains(&RiskClass::Revoke)
+        );
+        assert!(
+            Change::CreateRole {
+                uid: uid("r_aaaaaa"),
+                name: "r".into()
+            }
+            .intrinsic_risks()
+            .is_empty()
+        );
     }
     use crate::schema::Column;
 
@@ -758,8 +2068,17 @@ mod tests {
 
     #[test]
     fn every_change_reports_its_table() {
-        assert_eq!(drop_column().table().to_string(), "dbo.customer");
-        assert_eq!(add_column().table().to_string(), "dbo.customer");
+        assert_eq!(drop_column().table().unwrap().to_string(), "dbo.customer");
+        assert_eq!(add_column().table().unwrap().to_string(), "dbo.customer");
+        assert_eq!(drop_column().subject(), "dbo.customer");
+        // A role is a principal, not an object: no table, but a subject.
+        let grant = Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: BTreeSet::new(),
+        };
+        assert_eq!(grant.table(), None);
+        assert_eq!(grant.subject(), "role app_reader");
     }
 
     // ---- modules (ADR-0002) ----
@@ -804,12 +2123,86 @@ mod tests {
             name: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
         };
-        assert_eq!(c.table().to_string(), "dbo.active_customer");
+        assert_eq!(c.table().unwrap().to_string(), "dbo.active_customer");
         assert_eq!(
             c.module_name().map(ToString::to_string).as_deref(),
             Some("dbo.active_customer")
         );
         assert!(add_column().module_name().is_none());
+    }
+
+    /// Every field a change excludes from the shape comparison is a field
+    /// the change promises a value for, so the exclusion is never wider than
+    /// the check that stands in for it (173, 189). `Whole` on a column that
+    /// is *gone* promises nothing, and deprecation is read back by nothing.
+    #[test]
+    fn every_excluded_field_is_promised() {
+        let column: ColumnRef = "dbo.customer"
+            .parse::<TableName>()
+            .unwrap()
+            .column("mobile");
+        let changes = [
+            add_column(),
+            Change::AlterColumnType {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                from: ty("int"),
+                to: ty("bigint"),
+                from_nullable: false,
+                to_nullable: true,
+            },
+            Change::AlterColumnNullability {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                ty: ty("int"),
+                to_nullable: true,
+            },
+            Change::AlterColumnDefault {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                from: None,
+                to: Some("0".into()),
+            },
+            Change::SetColumnDeprecated {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                reason: None,
+            },
+        ];
+        for change in &changes {
+            for (excluded, field) in change.columns_redefined() {
+                if field == ColumnField::Deprecated {
+                    continue;
+                }
+                let promised = change.columns_promised();
+                let promise = promised.iter().find(|(c, p)| {
+                    *c == excluded
+                        && matches!(
+                            (field, p),
+                            (ColumnField::Whole, ColumnPromise::Whole(_))
+                                | (ColumnField::Type, ColumnPromise::Type(_))
+                                | (ColumnField::Nullable, ColumnPromise::Nullable(_))
+                                | (ColumnField::Default, ColumnPromise::Default(_))
+                        )
+                });
+                assert!(
+                    promise.is_some(),
+                    "{change:?} excludes {field:?} and promises nothing"
+                );
+            }
+        }
+        // And the other way: a rename and a drop leave nothing to promise.
+        assert!(drop_column().columns_promised().is_empty());
+        assert!(
+            Change::RenameColumn {
+                uid: uid("c_p3n8vd"),
+                table: "dbo.customer".parse().unwrap(),
+                from: "mobile".into(),
+                to: "phone".into(),
+            }
+            .columns_promised()
+            .is_empty()
+        );
     }
 
     #[test]

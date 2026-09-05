@@ -33,6 +33,36 @@ pub struct KindProbe {
     pub function: Option<String>,
     #[serde(default)]
     pub trigger: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// One database role and its grants (ADR-0005).
+///
+/// `role: app_reader` names it — unqualified, because a role is a principal
+/// and not an object in a schema. Grants are a map of target to permission
+/// list: `dbo.customer: [select]`, or `schema::dbo: [select]` for a whole
+/// schema.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleDto {
+    #[schemars(with = "String")]
+    pub role: Spanned<String>,
+
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// One-shot intent, as for [`TableDto::renamed_from`]: the role keeps its
+    /// membership through the rename, which is why it is intent and not
+    /// drop + add.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    pub renamed_from: Option<Spanned<String>>,
+
+    /// Target to permissions. Order carries no meaning; `fmt` sorts both.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, Vec<String>>")]
+    pub grants: BTreeMap<String, Vec<Spanned<String>>>,
 }
 
 /// One view, procedure, function or trigger (ADR-0002).
@@ -336,14 +366,15 @@ pub struct IndexDto {
 // happened to be tried first. This type exists so the *schema* says what the
 // loader accepts, in one place, generated from the very structures it reads.
 
-/// One pbps declaration file: a table, or one view, procedure, function or
-/// trigger. The leading key is both the kind and the name.
+/// One pbps declaration file: a table, one view, procedure, function or
+/// trigger, or a database role. The leading key is both the kind and the name.
 #[derive(schemars::JsonSchema)]
 #[serde(untagged)]
 #[schemars(title = "pbps declaration")]
 pub enum DeclarationFile {
     Table(TableDto),
     Module(ModuleDto),
+    Role(RoleDto),
 }
 
 #[cfg(test)]

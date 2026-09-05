@@ -728,6 +728,7 @@ dependencies = [
  "pbps-load",
  "pbps-model",
  "pbps-mssql",
+ "pbps-policy",
  "schemars",
  "serde",
  "serde_json",
@@ -740,6 +741,7 @@ dependencies = [
 name = "pbps-config"
 version = "0.0.0"
 dependencies = [
+ "pbps-policy",
  "schemars",
  "serde",
  "serde-saphyr",
@@ -819,8 +821,20 @@ dependencies = [
  "pbps-diff",
  "pbps-model",
  "serde_json",
+ "thiserror",
  "tiberius-ng",
  "tokio",
+]
+
+[[package]]
+name = "pbps-policy"
+version = "0.0.0"
+dependencies = [
+ "pbps-model",
+ "regex-lite",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -884,6 +898,12 @@ dependencies = [
  "quote",
  "syn 3.0.4",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "ring"

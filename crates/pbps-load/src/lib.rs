@@ -15,9 +15,9 @@ use std::path::Path;
 
 use pbps_model::{Hints, Schema, TableName};
 
-pub use convert::{LoadedModule, LoadedTable};
+pub use convert::{LoadedModule, LoadedRole, LoadedTable};
 pub use error::{LoadError, Semantic, SourceFile};
-pub use fmt::{render, render_module};
+pub use fmt::{render, render_module, render_role};
 pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
@@ -39,6 +39,7 @@ pub struct Loaded {
 pub enum LoadedFile {
     Table(Box<LoadedTable>),
     Module(Box<LoadedModule>),
+    Role(Box<LoadedRole>),
 }
 
 /// Loads one table from a string. `path` is used only in diagnostics.
@@ -65,7 +66,19 @@ pub fn load_module_str(path: &Path, text: &str) -> Result<LoadedModule, Vec<Load
     convert::convert_module(&src, dto)
 }
 
-/// Loads one file of either kind.
+/// Loads one role from a string. `path` is used only in diagnostics.
+pub fn load_role_str(path: &Path, text: &str) -> Result<LoadedRole, Vec<LoadError>> {
+    let src = SourceFile::new(path, text);
+    let dto: dto::RoleDto = serde_saphyr::from_str(text).map_err(|e| {
+        vec![LoadError::Yaml {
+            path: path.to_owned(),
+            message: e.to_string(),
+        }]
+    })?;
+    convert::convert_role(&src, dto)
+}
+
+/// Loads one file of any kind.
 ///
 /// The leading key decides, and it is read in a pass of its own: trying the
 /// table shape first and falling back on failure would answer a misspelled
@@ -80,6 +93,9 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     if probe.table.is_some() {
         return load_table_str(path, text).map(|t| LoadedFile::Table(Box::new(t)));
     }
+    if probe.role.is_some() {
+        return load_role_str(path, text).map(|r| LoadedFile::Role(Box::new(r)));
+    }
     if probe.view.is_some()
         || probe.procedure.is_some()
         || probe.function.is_some()
@@ -89,8 +105,8 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     }
     Err(vec![LoadError::Yaml {
         path: path.to_owned(),
-        message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:` \
-                  or `trigger:`"
+        message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:`, \
+                  `trigger:` or `role:`"
             .to_owned(),
     }])
 }
@@ -139,6 +155,10 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     let mut errs = Vec::new();
     let mut seen: std::collections::BTreeMap<TableName, std::path::PathBuf> =
         std::collections::BTreeMap::new();
+    // Roles live in their own namespace — a role and a table may share a
+    // word — so they are checked for duplicates among themselves.
+    let mut seen_roles: std::collections::BTreeMap<String, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
 
     for path in files {
         let file = match load_file(&path) {
@@ -149,9 +169,27 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
             }
         };
 
-        let name = match &file {
-            LoadedFile::Table(t) => t.name.clone(),
-            LoadedFile::Module(m) => m.name.clone(),
+        let (name, file) = match file {
+            LoadedFile::Table(t) => (t.name.clone(), LoadedFile::Table(t)),
+            LoadedFile::Module(m) => (m.name.clone(), LoadedFile::Module(m)),
+            LoadedFile::Role(r) => {
+                let mut r = *r;
+                if let Some(first) = seen_roles.get(&r.name) {
+                    errs.push(LoadError::Yaml {
+                        path: path.clone(),
+                        message: format!(
+                            "role `{}` was already declared in `{}`",
+                            r.name,
+                            first.display()
+                        ),
+                    });
+                    continue;
+                }
+                seen_roles.insert(r.name.clone(), path);
+                loaded.intents.append(&mut r.intents);
+                loaded.schema.roles.insert(r.name, r.role);
+                continue;
+            }
         };
         if let Some(first) = seen.get(&name) {
             errs.push(LoadError::Yaml {
@@ -178,6 +216,8 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                 }
                 loaded.schema.modules.insert(name, m.module);
             }
+            // Merged above, in its own namespace.
+            LoadedFile::Role(_) => {}
         }
     }
 
@@ -627,5 +667,127 @@ indexes:
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- roles (ADR-0005) ----
+
+    const A_ROLE: &str = "role: app_reader\ndescription: Read-only access\n\ngrants:\n  dbo.customer: [select, view-definition]\n  \"schema::app\": [execute]\n";
+
+    #[test]
+    fn a_role_file_loads_and_renders_canonically() {
+        let f = load_file_str(Path::new("schema/app_reader.role.yml"), A_ROLE).unwrap();
+        let LoadedFile::Role(r) = f else {
+            panic!("not a role: {f:?}");
+        };
+        assert_eq!(r.name, "app_reader");
+        assert_eq!(r.role.description.as_deref(), Some("Read-only access"));
+        let customer = &r.role.grants[&"dbo.customer".parse().unwrap()];
+        assert!(customer.contains(&pbps_model::Permission::ViewDefinition));
+        assert!(r.intents.is_empty());
+        // Sorted on the way out, so declaration order never shows as a diff.
+        assert_eq!(render_role(&r.name, &r.role, &[]), A_ROLE);
+    }
+
+    #[test]
+    fn a_role_rename_is_intent_not_state_and_survives_fmt_while_pending() {
+        let text = "role: app_reader\nrenamed_from: reader\n";
+        let f = load_file_str(Path::new("r.yml"), text).unwrap();
+        let LoadedFile::Role(r) = f else {
+            panic!("not a role: {f:?}");
+        };
+        assert_eq!(
+            r.intents,
+            vec![Intent::RenameRole {
+                from: "reader".into(),
+                to: "app_reader".into()
+            }]
+        );
+        assert_eq!(r.role, pbps_model::Role::default());
+        assert_eq!(render_role(&r.name, &r.role, &r.intents), text);
+        assert_eq!(render_role(&r.name, &r.role, &[]), "role: app_reader\n");
+    }
+
+    #[test]
+    fn a_role_with_a_dotted_name_loads_and_an_unknown_permission_is_refused() {
+        // `[app.reader]` is a legal principal name; a role is not in a
+        // schema, but the dot is the name's, and `pull` writes it back as is.
+        let f = load_file_str(Path::new("r.yml"), "role: app.reader\n").unwrap();
+        match f {
+            LoadedFile::Role(r) => assert_eq!(r.name, "app.reader"),
+            other @ (LoadedFile::Table(_) | LoadedFile::Module(_)) => {
+                panic!("not a role: {other:?}")
+            }
+        }
+        let errs = load_file_str(Path::new("r.yml"), "role: r\ngrants:\n  dbo.t: [control]\n")
+            .unwrap_err();
+        assert!(errs[0].to_string().contains("control"), "{errs:?}");
+        let errs =
+            load_file_str(Path::new("r.yml"), "role: r\ngrants:\n  dbo.t: []\n").unwrap_err();
+        assert!(errs[0].to_string().contains("no permission"), "{errs:?}");
+        let errs =
+            load_file_str(Path::new("r.yml"), "role: r\ngrants:\n  t: [select]\n").unwrap_err();
+        assert!(errs[0].to_string().contains("grant target"), "{errs:?}");
+    }
+
+    /// Two spellings of one target are one map key once parsed, and the
+    /// map kept whichever came last: `select` on `SCHEMA::app` vanished
+    /// behind `execute` on `schema::app`, and the next connected plan
+    /// revoked it (DECISIONS 126).
+    ///
+    /// Only the prefix has two spellings. 126 counted surrounding whitespace
+    /// as a third, and the engine disagrees: measured, `[ app]` and `[app]`
+    /// are two schemas, so those are two targets and the case below asserts
+    /// they both survive (DECISIONS 178).
+    #[test]
+    fn two_spellings_of_one_grant_target_are_refused_not_merged() {
+        // The prefix is the only part with two spellings.
+        let (a, b) = ("SCHEMA::app", "schema::app");
+        let text = format!("role: r\ngrants:\n  \"{a}\": [select]\n  \"{b}\": [execute]\n");
+        let errs = load_file_str(Path::new("r.yml"), &text).unwrap_err();
+        let rendered = render(&errs);
+        assert!(
+            rendered.contains("name the same grant target"),
+            "{a} / {b}: {rendered}"
+        );
+        // And a target whose name differs only by padding is a *different*
+        // securable, so both are kept with their own permissions.
+        let loaded = load_file_str(
+            Path::new("r.yml"),
+            "role: r\ngrants:\n  \"schema:: app\": [select]\n  \"schema::app\": [execute]\n",
+        )
+        .expect("two schemas, not two spellings of one");
+        let LoadedFile::Role(role) = loaded else {
+            panic!("a role file");
+        };
+        assert_eq!(role.role.grants.len(), 2, "{:?}", role.role.grants);
+
+        // One spelling, twice, is the YAML duplicate the parser refuses.
+        let errs = load_file_str(
+            Path::new("r.yml"),
+            "role: r\ngrants:\n  dbo.t: [select]\n  dbo.t: [execute]\n",
+        )
+        .unwrap_err();
+        assert!(render(&errs).contains("duplicate"), "{}", render(&errs));
+    }
+
+    #[test]
+    fn two_files_declaring_one_role_are_refused_but_a_role_may_share_a_tables_word() {
+        let dir = std::env::temp_dir().join(format!("pbps-load-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.yml"), "role: customer\n").unwrap();
+        std::fs::write(
+            dir.join("b.yml"),
+            "table: dbo.customer\ncolumns:\n  id: {type: int}\n",
+        )
+        .unwrap();
+        let loaded = load_schema_dir(&dir).unwrap();
+        assert!(loaded.schema.roles.contains_key("customer"));
+        assert!(loaded.schema.tables.len() == 1);
+
+        std::fs::write(dir.join("c.yml"), "role: customer\n").unwrap();
+        let errs = load_schema_dir(&dir).unwrap_err();
+        assert!(errs[0].to_string().contains("already declared"), "{errs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -110,7 +110,7 @@ pub fn online_not_supported(changes: &ChangeSet, edition: &Edition) -> Vec<Strin
         .changes
         .iter()
         .filter(|p| p.strategy.online && crate::emit::takes_online(&p.change))
-        .map(|p| p.change.table().to_string())
+        .map(|p| p.change.subject())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()

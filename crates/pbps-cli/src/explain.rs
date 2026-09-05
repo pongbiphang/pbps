@@ -61,6 +61,8 @@ pub struct Explanation {
     /// for a module change, so folding them together called a one-view plan
     /// "1 table" (ADR-0002 — they are different kinds of object).
     pub module_count: usize,
+    /// Roles touched (ADR-0005).
+    pub role_count: usize,
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
@@ -234,6 +236,7 @@ fn explain(
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
     let (table_count, module_count) = report::touched(cs);
+    let role_count = report::touched_roles(cs);
 
     let present = cs.risks();
     let risks: Vec<RiskDetail> = RiskClass::ALL
@@ -246,7 +249,7 @@ fn explain(
                 .changes
                 .iter()
                 .filter(|p| p.risks.contains(&class))
-                .map(|p| format!("{}  {}", p.change.table(), report::describe(&p.change)))
+                .map(|p| format!("{}  {}", p.change.subject(), report::describe(&p.change)))
                 .collect(),
         })
         .collect();
@@ -292,10 +295,13 @@ fn explain(
             plan_arg,
             plan.checksum()
         );
-        if !present.is_empty() {
+        // The gated classes only: `grant-widen` is listed above for the
+        // reviewer and never asked for by `apply` (ADR-0005).
+        let gated = cs.gated_risks();
+        if !gated.is_empty() {
             approve.push_str(&format!(
                 " --allow {}",
-                present
+                gated
                     .iter()
                     .map(|r| r.as_str())
                     .collect::<Vec<_>>()
@@ -324,6 +330,7 @@ fn explain(
         change_count: cs.changes.len(),
         table_count,
         module_count,
+        role_count,
         risks,
         approve_with: approve,
         plan_path: (plan_arg == PLAN_PLACEHOLDER).then_some(literal),
@@ -472,6 +479,13 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
             format!("{}: {} ({} change(s))", r.class, r.why, r.changes.len()),
         ));
     }
+    // The analyzers' findings the plan carries (ADR-0008), under their own
+    // ids: a reviewer reading the envelope sees what `plan` saw.
+    for p in &plan.changes.changes {
+        for f in &p.findings {
+            out.push(crate::policy_finding(f));
+        }
+    }
     if let Some(t) = &e.target
         && t.state != "ready"
     {
@@ -514,11 +528,26 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     // is what `apply` recomputes, and a plan edited after this review no longer
     // matches it.
     out.push_str(&format!("  checksum    {}\n", e.checksum));
+    if !plan.data.is_empty() {
+        // The rows this plan leaves under management. Listed because it is
+        // what the state recorded after the apply will cover — and a table
+        // that appears here for the first time is one whose rows the
+        // declarations are taking over.
+        out.push_str(&format!(
+            "  rows        {} table(s) under reference-data management afterwards: {}\n",
+            plan.data.len(),
+            plan.data
+                .iter()
+                .map(|(t, s)| format!("{t} ({})", s.mode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     out.push_str(&format!(
         "\nWhat it changes\n  {} change(s) across {}, {} statement(s).\n",
         e.change_count,
-        report::objects(e.table_count, e.module_count),
+        report::objects(e.table_count, e.module_count, e.role_count),
         e.statement_count
     ));
     out.push_str(&report::changes(&plan.changes));

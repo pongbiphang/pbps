@@ -4,7 +4,10 @@
 //! the plain `Raw*` structs and hands them to the pure assembler. The queries
 //! are static — nothing user-controlled is ever interpolated into them.
 
+use std::collections::BTreeMap;
+
 use pbps_db::{Conn, DbError, FromColumn, Row};
+use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
@@ -120,6 +123,32 @@ SELECT s.name AS schema_name, o.name AS object_name, o.type AS type_code,
    AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR')
  ORDER BY s.name, o.name;";
 
+/// User-defined database roles (ADR-0005). `is_fixed_role = 0` drops
+/// `db_owner` and friends; `public` is type `R` and not fixed, so it is
+/// excluded by name.
+const ROLES: &str = "\
+SELECT p.name
+  FROM sys.database_principals p
+ WHERE p.type = 'R' AND p.is_fixed_role = 0 AND p.name <> 'public'
+ ORDER BY p.name;";
+
+/// Every permission held by a user-defined role, of every class. Column-level
+/// rows come too (`minor_id <> 0`), and so do the database-level ones
+/// (class 0: `CONTROL`, `CREATE TABLE`) and every other class the model does
+/// not hold, so the assembler can report each rather than have it silently
+/// absent — a `GRANT CONTROL TO role` that the read never saw compared equal
+/// on the grants it did see (DECISIONS 105).
+const PERMISSIONS: &str = "\
+SELECT pr.name AS role_name, dp.class, dp.class_desc, dp.permission_name, dp.state, dp.minor_id,
+       COALESCE(os.name, ss.name) AS schema_name, o.name AS object_name
+  FROM sys.database_permissions dp
+  JOIN sys.database_principals pr ON pr.principal_id = dp.grantee_principal_id
+  LEFT JOIN sys.objects o ON dp.class = 1 AND o.object_id = dp.major_id
+  LEFT JOIN sys.schemas os ON os.schema_id = o.schema_id
+  LEFT JOIN sys.schemas ss ON dp.class = 3 AND ss.schema_id = dp.major_id
+ WHERE pr.type = 'R' AND pr.is_fixed_role = 0 AND pr.name <> 'public'
+ ORDER BY pr.name, dp.class, schema_name, object_name, dp.permission_name;";
+
 /// A required value that came back NULL means the query and the struct have
 /// drifted apart; that is a bug here, not bad data, and it must be named.
 pub(crate) fn get<'a, T: FromColumn<'a>>(row: &'a Row, col: &str) -> Result<T, DbError> {
@@ -226,5 +255,532 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         });
     }
 
+    for row in conn.query(ROLES).await? {
+        raw.roles.push(crate::introspect::RawRole {
+            name: get::<&str>(&row, "name")?.to_owned(),
+        });
+    }
+
+    for row in conn.query(PERMISSIONS).await? {
+        let class: u8 = get(&row, "class")?;
+        // A permission on an object the catalog has no schema for (a dropped
+        // object's orphaned row) has nothing to be declared against. Any
+        // other class has no schema to begin with and is carried as is.
+        let schema = match opt::<&str>(&row, "schema_name")? {
+            Some(schema) => schema.to_owned(),
+            None if matches!(class, 1 | 3) => continue,
+            None => String::new(),
+        };
+        raw.permissions.push(crate::introspect::RawPermission {
+            role: get::<&str>(&row, "role_name")?.to_owned(),
+            class,
+            class_desc: get::<&str>(&row, "class_desc")?.trim().to_owned(),
+            permission: get::<&str>(&row, "permission_name")?.trim().to_owned(),
+            state: get::<&str>(&row, "state")?.to_owned(),
+            schema,
+            object: opt::<&str>(&row, "object_name")?.map(str::to_owned),
+            minor_id: get(&row, "minor_id")?,
+        });
+    }
+
     Ok(assemble(&raw))
+}
+
+/// Who holds each user-defined role, by role name (ADR-0005).
+///
+/// Read only by `plan --db`, and only to list the members a `DROP ROLE` has
+/// to remove first: membership is each environment's own and is never
+/// compared, but a role cannot be dropped while it has members, and a plan
+/// that removes them has to say whom. A nested role is a member like any
+/// user and comes back the same way.
+/// The database principals holding any of `names`, as the engine compares
+/// names: one `(declared, held, kind)` per collision, `held` being the
+/// principal's own spelling and `kind` the catalog's word for what it is,
+/// in lower case with spaces (`sql user`, `database role`, `application
+/// role`). Users, roles and application roles share one namespace, and a
+/// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
+/// after everything ordered before it has run — so a declared role's name
+/// is checked against these before a connected plan is written and again
+/// before it is applied (DECISIONS 118, 119).
+///
+/// Asked of the engine under the database collation rather than compared
+/// here: `Shadow` and `shadow` are one name to a case-insensitive database
+/// and two to a `BTreeMap`, and a map lookup said the name was free.
+/// `except` names the principals this plan vacates — the roles it drops or
+/// renames away — which hold their name only until the statement that
+/// frees it, and are excluded the same way, by the engine.
+pub async fn principals_holding(
+    conn: &mut Conn,
+    names: &[&str],
+    except: &[&str],
+) -> Result<Vec<(String, String, String)>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = |names: &[&str]| {
+        names
+            .iter()
+            .map(|n| format!("({})", crate::ident::literal(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut sql = format!(
+        "SELECT d.name AS declared, p.name AS held, p.type_desc
+           FROM (VALUES {}) AS d(name)
+           JOIN sys.database_principals AS p
+             ON p.name = d.name COLLATE DATABASE_DEFAULT",
+        values(names)
+    );
+    if !except.is_empty() {
+        sql.push_str(&format!(
+            "
+ WHERE NOT EXISTS (SELECT 1 FROM (VALUES {}) AS v(name)
+                                WHERE v.name = p.name COLLATE DATABASE_DEFAULT)",
+            values(except)
+        ));
+    }
+    sql.push_str(
+        "
+ ORDER BY d.name, p.name;",
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        out.push((
+            get::<&str>(&row, "declared")?.to_owned(),
+            get::<&str>(&row, "held")?.to_owned(),
+            get::<&str>(&row, "type_desc")?
+                .trim()
+                .to_ascii_lowercase()
+                .replace('_', " "),
+        ));
+    }
+    Ok(out)
+}
+
+/// Among `names`, the pairs the database reads as one name — `Reader` and
+/// `reader` under a case-insensitive collation — each as `(earlier, later)`
+/// in the order given. A plan that creates both passes every check against
+/// the catalog, and the second `CREATE ROLE` fails after everything before
+/// it has run (DECISIONS 123).
+pub async fn names_alike(
+    conn: &mut Conn,
+    names: &[&str],
+) -> Result<Vec<(String, String)>, DbError> {
+    if names.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Numbered, so a name is not paired with itself and each pair comes once.
+    let sql = format!(
+        "SELECT a.name AS earlier, b.name AS later
+           FROM (VALUES {values}) AS a(i, name)
+           JOIN (VALUES {values}) AS b(i, name)
+             ON a.i < b.i AND a.name = b.name COLLATE DATABASE_DEFAULT
+          ORDER BY a.i, b.i;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        out.push((
+            get::<&str>(&row, "earlier")?.to_owned(),
+            get::<&str>(&row, "later")?.to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The classes a database principal can own: the catalog view that records
+/// the owner, and the `SELECT` arm that spells each owned securable the way
+/// T-SQL names it (`SCHEMA::sales`, `ROLE::auditors`, `MESSAGE TYPE::m`).
+///
+/// The list is every catalog view with a `principal_id` or
+/// `owning_principal_id` column, read off a live server rather than recalled:
+/// the first version of it named the classes that came to mind and missed a
+/// role that owns another role, exactly the drop a staged apply would have
+/// committed every `DROP MEMBER` for before failing (DECISIONS 88). A view
+/// that arrived after SQL Server 2008 is named in the first field and probed
+/// for before the query is built, so an older engine answers with the classes
+/// it has instead of refusing the whole question.
+const OWNABLE: &[(Option<&str>, &str)] = &[
+    (
+        None,
+        "SELECT principal_id, N'SCHEMA::' + name FROM sys.schemas",
+    ),
+    (
+        None,
+        "SELECT o.principal_id, N'OBJECT::' + SCHEMA_NAME(o.schema_id) + N'.' + o.name \
+         FROM sys.objects o WHERE o.principal_id IS NOT NULL AND o.parent_object_id = 0",
+    ),
+    (
+        None,
+        "SELECT t.principal_id, N'TYPE::' + SCHEMA_NAME(t.schema_id) + N'.' + t.name \
+         FROM sys.types t WHERE t.principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT x.principal_id, N'XML SCHEMA COLLECTION::' + SCHEMA_NAME(x.schema_id) + N'.' + \
+         x.name FROM sys.xml_schema_collections x WHERE x.principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT p.owning_principal_id, \
+         CASE p.type WHEN 'A' THEN N'APPLICATION ROLE::' ELSE N'ROLE::' END + p.name \
+         FROM sys.database_principals p WHERE p.owning_principal_id IS NOT NULL",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ASSEMBLY::' + name FROM sys.assemblies",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'CERTIFICATE::' + name FROM sys.certificates",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'SYMMETRIC KEY::' + name FROM sys.symmetric_keys",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ASYMMETRIC KEY::' + name FROM sys.asymmetric_keys",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'FULLTEXT CATALOG::' + name FROM sys.fulltext_catalogs",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'FULLTEXT STOPLIST::' + name FROM sys.fulltext_stoplists",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'MESSAGE TYPE::' + name FROM sys.service_message_types",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'CONTRACT::' + name FROM sys.service_contracts",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'SERVICE::' + name FROM sys.services",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'ROUTE::' + name FROM sys.routes",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'REMOTE SERVICE BINDING::' + name FROM sys.remote_service_bindings",
+    ),
+    (
+        None,
+        "SELECT principal_id, N'EVENT NOTIFICATION::' + name FROM sys.event_notifications",
+    ),
+    (
+        Some("registered_search_property_lists"),
+        "SELECT principal_id, N'SEARCH PROPERTY LIST::' + name \
+         FROM sys.registered_search_property_lists",
+    ),
+    (
+        Some("database_scoped_credentials"),
+        "SELECT principal_id, N'DATABASE SCOPED CREDENTIAL::' + name \
+         FROM sys.database_scoped_credentials",
+    ),
+    (
+        Some("external_libraries"),
+        "SELECT principal_id, N'EXTERNAL LIBRARY::' + name FROM sys.external_libraries",
+    ),
+    (
+        Some("external_languages"),
+        "SELECT principal_id, N'EXTERNAL LANGUAGE::' + language FROM sys.external_languages",
+    ),
+];
+
+/// The ownership query over the classes whose view `present` says exists.
+fn owned_query(present: &dyn Fn(&str) -> bool) -> String {
+    // The catalog's name columns do not all share a collation (the
+    // `language` of `sys.external_languages` is binary), and a UNION refuses
+    // to pick one; the database's own is the right answer for names in it.
+    let arms = OWNABLE
+        .iter()
+        .filter(|(since, _)| since.is_none_or(present))
+        .enumerate()
+        .map(|(i, (_, arm))| {
+            format!(
+                "SELECT principal_id, securable COLLATE DATABASE_DEFAULT \
+                 FROM ({arm}) AS a{i} (principal_id, securable)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n        UNION ALL\n        ");
+    format!(
+        "\
+SELECT r.name AS role_name, x.securable
+  FROM sys.database_principals r
+  JOIN (
+        {arms}
+       ) AS x (principal_id, securable) ON x.principal_id = r.principal_id
+ WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
+ ORDER BY r.name, x.securable;"
+    )
+}
+
+/// Every securable each user-defined role **owns**, spelled the way T-SQL
+/// names it (`SCHEMA::sales`, `OBJECT::dbo.t`, `ROLE::auditors`, ...), over
+/// every class the catalog can assign an owner to ([`OWNABLE`]).
+///
+/// The engine refuses to drop a role that owns anything, and ownership is
+/// each environment's own, like membership. A connected plan reads this so
+/// the drop is refused *before* anything runs — a staged apply would
+/// otherwise commit every `DROP MEMBER` and then fail on the `DROP ROLE`,
+/// leaving users without access and the role still there.
+pub async fn role_owned_securables(
+    conn: &mut Conn,
+) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+    // The views that are not on every engine, asked about in one round trip:
+    // `OBJECT_ID` is NULL for a view this version does not have.
+    let optional: Vec<&str> = OWNABLE.iter().filter_map(|(since, _)| *since).collect();
+    let probe = format!(
+        "SELECT {};",
+        optional
+            .iter()
+            .map(|view| format!("OBJECT_ID(N'sys.{view}')"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut present = Vec::with_capacity(optional.len());
+    let probed = conn.query(&probe).await?;
+    let Some(row) = probed.first() else {
+        return Err(DbError::BadRow(
+            "the catalog probe returned no row".to_owned(),
+        ));
+    };
+    for (i, view) in optional.iter().enumerate() {
+        if row.try_get_at::<i32>(i)?.is_some() {
+            present.push(*view);
+        }
+    }
+    let query = owned_query(&|view| present.contains(&view));
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in conn.query(&query).await? {
+        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+            .or_default()
+            .push(get::<&str>(&row, "securable")?.to_owned());
+    }
+    Ok(out)
+}
+
+pub async fn role_members(conn: &mut Conn) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+    const MEMBERS: &str = "\
+SELECT r.name AS role_name, m.name AS member_name
+  FROM sys.database_role_members rm
+  JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
+  JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+ WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
+ ORDER BY r.name, m.name;";
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in conn.query(MEMBERS).await? {
+        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+            .or_default()
+            .push(get::<&str>(&row, "member_name")?.to_owned());
+    }
+    Ok(out)
+}
+
+/// Reads the rows of every scoped table the schema has (ADR-0004).
+///
+/// The scope decides *which* rows — every row of an `exact` table, the
+/// declared keys of an `ensure` one — and it is supplied by the caller, because
+/// a database holds rows, not a notion of which of them are declared. A scoped
+/// table the schema does not have gets no entry: it is missing, which the
+/// managed-set check reports, and "missing" must not come back as "empty".
+///
+/// A table whose rows cannot be read (no single-column key, or a value the
+/// model cannot hold) fails the whole read rather than being skipped: a state
+/// recorded without it would say the table declares no rows, and the next
+/// drift check would be blind to the rows it exists to watch.
+pub async fn read_rows(
+    conn: &mut Conn,
+    schema: &Schema,
+    scopes: &BTreeMap<TableName, RowScope>,
+) -> Result<ObservedRows, crate::rows::RowsError> {
+    let mut out = ObservedRows::new();
+    for (name, scope) in scopes {
+        let Some(table) = schema.tables.get(name) else {
+            continue;
+        };
+        let mut observed = pbps_model::ObservedTable::default();
+        if let Some(query) = crate::rows::query(name, table, scope)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            let result = conn.query(&query.sql).await.map_err(read)?;
+            for row in &result {
+                let (key, cells) = crate::rows::decode(name, &query, row)?;
+                observed.rows.insert(key, cells);
+            }
+            if let Some(sql) = &query.aliases {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (requested, canonical) = crate::rows::decode_alias(name, row)?;
+                    observed.aliases.insert(requested, canonical);
+                }
+            }
+        }
+        out.insert(name.clone(), observed);
+    }
+    Ok(out)
+}
+
+/// How the database spells each of the schema names a declaration grants on:
+/// `None` where it has no schema of that name at all.
+///
+/// A schema has no identity to be matched by (ADR-0002); a grant target names
+/// it as text, and the text is all the differ has. So a declaration that
+/// writes `schema::DBO` where the database says `dbo` is caught by nothing
+/// else: on a case-insensitive database the `GRANT` succeeds, introspection
+/// reads `dbo` back, and every plan from then on revokes one spelling and
+/// grants the other without ever converging (DECISIONS 142).
+///
+/// Absent is left to the caller and to the pre-flight probe, and is not the
+/// same answer as differently spelt: one says create it, the other says write
+/// it the way the database already does.
+pub async fn schema_spellings(
+    conn: &mut Conn,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<String>>, DbError> {
+    let mut out = BTreeMap::new();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let wanted: Vec<&String> = names.iter().collect();
+    // Asked by index, never by name: the answer is the database's spelling,
+    // and matching it back to the requested one by name would be the very
+    // comparison in question.
+    let values: Vec<String> = wanted
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect();
+    let sql = format!(
+        "SELECT v.i, SCHEMA_NAME(SCHEMA_ID(v.n)) AS spelled FROM (VALUES {}) AS v(i, n);",
+        values.join(", ")
+    );
+    for row in &conn.query(&sql).await? {
+        let i: i32 = row.try_get_at(0)?.ok_or_else(|| {
+            DbError::BadRow("the schema spelling query returned a NULL index".to_owned())
+        })?;
+        let spelled: Option<&str> = row.try_get_at(1)?;
+        let Some(name) = usize::try_from(i).ok().and_then(|i| wanted.get(i)) else {
+            return Err(DbError::BadRow(format!(
+                "the schema spelling query returned index {i} for {} name(s)",
+                wanted.len()
+            )));
+        };
+        out.insert((*name).clone(), spelled.map(ToOwned::to_owned));
+    }
+    Ok(out)
+}
+
+/// What the engine says about the declared spellings of every table that
+/// declares rows: the ones it would not read back as written, and the keys
+/// it reads as one row.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Spellings {
+    pub misspelt: Vec<crate::rows::Misspelt>,
+    pub conflicts: Vec<pbps_model::RowConflict>,
+}
+
+/// Every declared spelling the engine would not read back as written, and
+/// every pair of keys it reads as one, over every table that declares rows
+/// (DECISIONS 101, 106). Asked of the engine, not of the table: a table this
+/// plan creates can be asked too.
+pub async fn misspelt(
+    conn: &mut Conn,
+    schema: &Schema,
+    at: &crate::rows::CatalogNames,
+) -> Result<Spellings, crate::rows::RowsError> {
+    let mut out = Spellings::default();
+    let as_declared = crate::rows::Catalogued::default();
+    for (name, table) in &schema.tables {
+        let at = at.get(name).unwrap_or(&as_declared);
+        for q in crate::rows::spelling_queries(name, table, at)? {
+            let read = |source| crate::rows::RowsError::Read {
+                table: name.clone(),
+                source: Box::new(source),
+            };
+            if let Some(sql) = &q.collisions {
+                for row in &conn.query(sql).await.map_err(read)? {
+                    let (a, b, canonical) = crate::rows::decode_collision(name, row)?;
+                    let (Some((first, _)), Some((second, _))) =
+                        (q.literals.get(a), q.literals.get(b))
+                    else {
+                        return Err(read(pbps_db::DbError::BadRow(format!(
+                            "the collision query returned indexes {a} and {b} for {} literal(s)",
+                            q.literals.len()
+                        ))));
+                    };
+                    out.conflicts.push(pbps_model::RowConflict {
+                        table: name.clone(),
+                        first: first.clone(),
+                        second: second.clone(),
+                        canonical: pbps_model::RowKey::from(canonical.as_str()),
+                    });
+                }
+            }
+            for row in &conn.query(&q.sql).await.map_err(read)? {
+                let (i, canonical) = crate::rows::decode_spelling(name, row)?;
+                let Some((key, declared)) = q.literals.get(i) else {
+                    return Err(read(pbps_db::DbError::BadRow(format!(
+                        "the spelling query returned index {i} for {} literal(s)",
+                        q.literals.len()
+                    ))));
+                };
+                // A key's spelling is aliased at read time (71); only a text
+                // the type cannot read at all is wrong there.
+                let agrees = match (&q.column, &canonical) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(_), Some(c)) => c == declared,
+                };
+                if !agrees {
+                    out.misspelt.push(crate::rows::Misspelt {
+                        table: name.clone(),
+                        key: key.clone(),
+                        column: q.column.clone(),
+                        declared: declared.clone(),
+                        ty: q.ty.clone(),
+                        canonical,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine without a view answers with the classes it has; one with
+    /// every view is asked about every class.
+    #[test]
+    fn an_absent_catalog_view_removes_its_class_and_nothing_else() {
+        let all = owned_query(&|_| true);
+        let none = owned_query(&|_| false);
+        for (since, arm) in OWNABLE {
+            assert!(all.contains(arm), "{arm}");
+            assert_eq!(none.contains(arm), since.is_none(), "{arm}");
+        }
+        // The class that was missed once is not an optional one.
+        assert!(none.contains("owning_principal_id"));
+        assert!(!none.contains("sys.external_languages"));
+        assert!(all.contains("sys.external_languages"));
+        // A well-formed derived table: one `UNION ALL` fewer than arms.
+        assert_eq!(all.matches("UNION ALL").count() + 1, OWNABLE.len());
+    }
 }

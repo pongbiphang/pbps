@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 use clap::Args;
 use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project, Unmanaged};
-use pbps_dialect::Dialect as _;
 use pbps_model::{IdsFile, Schema};
 
 use crate::{context, db, declaration_file};
@@ -145,6 +144,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         // number written into every generated pbps.yml is one more line to
         // explain in the first hour.
         max_data_rows: None,
+        policies: None,
     };
     let config_text = render_config(&config);
 
@@ -409,6 +409,11 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         std::fs::write(schema_dir.join(GITKEEP), "")
             .with_context(|| format!("cannot stage `{}`", schema_dir.join(GITKEEP).display()))?;
 
+        // Before the first declaration is staged: see `refuse_folded_paths`.
+        declaration_file::refuse_folded_paths(&declaration_file::paths_of(
+            &schema_dir,
+            &prepared.schema,
+        )?)?;
         for (name, table) in &prepared.schema.tables {
             let path = declaration_file::path(&schema_dir, name, None)?;
             std::fs::write(&path, pbps_load::render(name, table, &[], None))
@@ -421,6 +426,15 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
                 pbps_load::render_module(name, module, &Default::default()),
             )
             .with_context(|| format!("cannot stage `{}`", path.display()))?;
+        }
+        for (name, role) in &prepared.schema.roles {
+            let path = declaration_file::role_path(&schema_dir, name)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot stage `{}`", parent.display()))?;
+            }
+            std::fs::write(&path, pbps_load::render_role(name, role, &[]))
+                .with_context(|| format!("cannot stage `{}`", path.display()))?;
         }
         std::fs::write(stage.join(pbps_config::CONFIG_FILE), &prepared.config_text)
             .context("cannot stage pbps.yml")?;
@@ -439,29 +453,15 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         if loaded.schema != prepared.schema {
             bail!("the staged declarations do not round-trip to the pulled schema");
         }
+        // The whole list, not the half this function used to enumerate: the
+        // roles and rows a `pull --data` writes are checked by the checks that
+        // own them, and a staged project that `pbps validate` would reject is
+        // one this command must not leave behind (DECISIONS 141).
         let dialect = pbps_mssql::Mssql;
-        let mut dialect_problems = Vec::new();
-        for (name, table) in &loaded.schema.tables {
-            dialect_problems.extend(
-                dialect
-                    .validate_table(name, table)
-                    .into_iter()
-                    .map(|problem| format!("{name}: {problem}")),
-            );
-        }
-        for (name, module) in &loaded.schema.modules {
-            dialect_problems.extend(
-                dialect
-                    .validate_module(name, module)
-                    .into_iter()
-                    .map(|problem| format!("{name}: {problem}")),
-            );
-        }
-        dialect_problems.extend(pbps_model::module::check_names(&loaded.schema));
-        dialect_problems.extend(pbps_model::module::check_dependencies(
-            &loaded.schema,
-            &loaded.hints.module_deps,
-        ));
+        let dialect_problems: Vec<String> = crate::declaration_problems(&loaded, &dialect)
+            .into_iter()
+            .map(|(_, problem)| problem)
+            .collect();
         if !dialect_problems.is_empty() {
             bail!(
                 "the staged declarations are not valid for mssql:\n  {}",
@@ -672,6 +672,7 @@ mod tests {
             unmanaged: Unmanaged::Ignore,
             dev: None,
             max_data_rows: None,
+            policies: None,
         };
         let text = render_config(&config);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");

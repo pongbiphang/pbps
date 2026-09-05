@@ -51,6 +51,11 @@ pub struct IdsFile {
     #[serde(default)]
     pub columns: BTreeMap<Uid, ColumnRef>,
 
+    /// Database roles (ADR-0005), `r_`-prefixed. A compatible evolution under
+    /// the same version: a file without the section has no managed roles.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<Uid, String>,
+
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
 }
@@ -61,6 +66,7 @@ impl Default for IdsFile {
             version: CURRENT_VERSION,
             tables: BTreeMap::new(),
             columns: BTreeMap::new(),
+            roles: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         }
     }
@@ -93,6 +99,18 @@ impl IdsFile {
         self.columns.iter().find(|(_, n)| *n == r).map(|(u, _)| u)
     }
 
+    pub fn role_uid(&self, name: &str) -> Option<&Uid> {
+        self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
+    /// Whether any live entry or tombstone already holds this uid.
+    pub fn contains_uid(&self, uid: &Uid) -> bool {
+        self.tables.contains_key(uid)
+            || self.columns.contains_key(uid)
+            || self.roles.contains_key(uid)
+            || self.tombstones.contains_key(uid)
+    }
+
     /// Moves a table, and the columns under it, to a new name.
     ///
     /// The uids do not change — that is the point of an identity file, and it is
@@ -113,6 +131,16 @@ impl IdsFile {
                 r.table = to.clone();
             }
         }
+    }
+
+    /// Moves a role to a new name, keeping its uid — the same operation as
+    /// [`Self::rename_table`], for the same reason, and the same no-op when
+    /// nothing is called `from`.
+    pub fn rename_role(&mut self, from: &str, to: &str) {
+        let Some(uid) = self.role_uid(from).cloned() else {
+            return;
+        };
+        self.roles.insert(uid, to.to_owned());
     }
 
     /// Checks internal consistency.
@@ -139,15 +167,24 @@ impl IdsFile {
                 return Err(IdsError::KindMismatch { uid: uid.clone() });
             }
         }
+        for uid in self.roles.keys() {
+            if uid.kind() != UidKind::Role {
+                return Err(IdsError::KindMismatch { uid: uid.clone() });
+            }
+        }
 
         for uid in self.tombstones.keys() {
-            if self.tables.contains_key(uid) || self.columns.contains_key(uid) {
+            if self.tables.contains_key(uid)
+                || self.columns.contains_key(uid)
+                || self.roles.contains_key(uid)
+            {
                 return Err(IdsError::LiveAndTombstoned { uid: uid.clone() });
             }
         }
 
         check_unique(self.tables.iter().map(|(u, n)| (u, n.to_string())))?;
         check_unique(self.columns.iter().map(|(u, n)| (u, n.to_string())))?;
+        check_unique(self.roles.iter().map(|(u, n)| (u, n.clone())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -250,6 +287,23 @@ mod tests {
         assert_eq!(f, before);
     }
 
+    /// The role half of the same replay: the uid stays, the name moves, and
+    /// a rename already absorbed changes nothing.
+    #[test]
+    fn renaming_a_role_keeps_its_uid_and_is_idempotent() {
+        let mut f = sample();
+        f.roles.insert(uid("r_q8m2kd"), "reader".to_owned());
+        f.rename_role("reader", "app_reader");
+        assert_eq!(f.roles[&uid("r_q8m2kd")], "app_reader");
+        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_q8m2kd")));
+        let before = f.clone();
+        f.rename_role("reader", "app_reader");
+        assert_eq!(f, before);
+        // A name nobody has is a no-op, not a new role.
+        f.rename_role("ghost", "phantom");
+        assert_eq!(f, before);
+    }
+
     #[test]
     fn reverse_lookup_works() {
         let f = sample();
@@ -282,8 +336,15 @@ mod tests {
 
     #[test]
     fn version_is_written_and_checked() {
-        let json = serde_json::to_string(&IdsFile::default()).unwrap();
-        assert!(json.contains(r#""version":1"#));
+        // The parsed field, not a substring: a literal version in an
+        // assertion is one nothing updates when the constant moves, and a
+        // nested `version` elsewhere in the document would answer for it.
+        let json: serde_json::Value = serde_json::to_value(IdsFile::default()).unwrap();
+        assert_eq!(
+            json["version"],
+            serde_json::json!(CURRENT_VERSION),
+            "{json}"
+        );
 
         let mut f = sample();
         f.version = 99;
@@ -346,6 +407,38 @@ mod tests {
         assert!(matches!(
             f.validate().unwrap_err(),
             IdsError::KindMismatch { .. }
+        ));
+        let mut f = sample();
+        f.roles.insert(uid("c_bbbbbb"), "app_reader".into());
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::KindMismatch { .. }
+        ));
+    }
+
+    /// Roles are a compatible evolution of the file: absent means none, two
+    /// entries may not share a name, and a tombstoned role is not live.
+    #[test]
+    fn roles_join_the_file_under_the_same_rules_as_tables() {
+        let mut f = sample();
+        f.roles.insert(uid("r_aaaaaa"), "app_reader".into());
+        f.validate().unwrap();
+        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_aaaaaa")));
+        assert_eq!(f.role_uid("nobody"), None);
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"roles\""), "{json}");
+        let back: IdsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+        // Absent in an older file: no roles, not a broken file.
+        let old: IdsFile =
+            serde_json::from_str(&serde_json::to_string(&sample()).unwrap()).unwrap();
+        assert!(old.roles.is_empty());
+        assert!(!serde_json::to_string(&sample()).unwrap().contains("roles"));
+
+        f.roles.insert(uid("r_bbbbbb"), "app_reader".into());
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::DuplicateName { .. }
         ));
     }
 

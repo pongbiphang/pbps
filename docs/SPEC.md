@@ -136,6 +136,13 @@ schema_dir: schema/
 ids_file: schema.ids.json
 ```
 
+The `policies:` block selects built-in rules and their severities and records
+suppressions — a rule id, a reason and an optional expiry — with parameters
+that are data (a pattern, a number, a change window) and never code
+([ADR-0008](ADR-0008-policies.md)). Rules over the declarations run in
+`validate`; rules over the plan run in `plan`, attach to the changes they are
+about, and an `error` refuses to produce the plan. `apply` is never touched.
+
 ### 4.2 Table definitions
 
 One table per file. File names carry no meaning; the table name comes from
@@ -372,11 +379,17 @@ table and somebody's business table is a judgement about the project, and the
 cost being pointed at is that every plan from here on compares those rows one
 by one.
 
-**Against a target.** Until the catalog reads rows back (the connected half of
-ADR-0004), `plan --db` refuses a declaration with `data:` blocks, before it
-connects: a catalog that has not observed rows declares none, and planning
-against it would insert every declared row on every run. `pbps plan` shows the
-DML for review, and the dev rehearsal runs it and compares structure.
+**Against a target.** The catalog reads rows back under a *scope* — every row
+of an `exact` table, the declared keys of an `ensure` one — supplied by the
+command, because a database holds rows and not a notion of which are declared.
+The rows come back in the engine's own spelling, and a cell that holds its
+column's default is read as the declaration spells it — omitted where the
+declaration omits it, explicit where it writes it — so either spelling
+round-trips; a default the engine would have to run is never evaluated by the
+read (ADR-0004, "Implementation status"). `apply` records them into `state_json`
+after the plan, `verify` compares them, and a table whose rows the declarations
+cover for the first time is planned against what it holds rather than against
+nothing. `pull --data <table>` writes the block from an existing table.
 
 **Ordering.** Rows go in after the table and its columns exist and before the
 constraints that check them, and they follow the foreign keys *between* the
@@ -388,6 +401,47 @@ first, and fails loudly in the transaction), but deleting first can fail
 *silently* — a child row that moves to another parent in the same plan is
 still pointing at the old one when it goes, and `ON DELETE CASCADE` takes the
 child with it.
+
+### 4.7 Roles and grants
+
+One database role per file ([ADR-0005](ADR-0005-roles-and-grants.md)); the
+leading key `role:` is the name, unqualified, because a role is a principal and
+not an object in a schema.
+
+```yaml
+# schema/roles/app_reader.yml
+role: app_reader
+grants:
+  dbo.customer:     [select]
+  dbo.order_status: [select, view-definition]
+  schema::app:      [execute]
+```
+
+- **What is managed is the role and its grants; membership is not.** Who holds
+  a role is each environment's own reality, never declared, compared or
+  touched. Logins and users are server-level and out of scope.
+- **Grants are data**: a target — `schema.object`, or `schema::name` for a
+  whole schema — to a set of `select`, `insert`, `update`, `delete`,
+  `references`, `execute`, `alter`, `view-definition`. `DENY` is excluded;
+  column-level grants and permissions outside that set are reported by `pull`
+  and left alone.
+- **A grant's target must be declared** — the foreign-key-target rule applied
+  to permissions — or be a `schema::` target. `validate` refuses the rest.
+- **Roles carry identity.** Drop + add would destroy membership, which the
+  declarations cannot restore, so a role has an `r_` uid in the ids file
+  (5.1), a rename needs intent (`pbps rename-role`, or `renamed_from:`) and is
+  emitted as `ALTER ROLE ... WITH NAME`, and a drop needs `--reason` and leaves
+  a tombstone.
+- A dropped role's members are removed first: `plan --db` lists them by name
+  from the target, so the plan says who loses the role there; an offline plan
+  cannot and says so. Membership is otherwise never declared or compared.
+- Two risk classes (7.2): `revoke`, gated, for anything that takes access
+  away — a role drop included; `grant-widen`, labelled in every plan but never
+  gated, because granting is the normal case and the merge request is where
+  the YAML diff is reviewed.
+- Drift compares the managed set only: a declared role's grants on managed
+  objects and schemas. A role the ids file does not name is left alone, and so
+  is a grant on an object nobody declares.
 
 ## 5. The identity file (`schema.ids.json`)
 
@@ -576,13 +630,15 @@ exists when prod deploys the rename five versions later.
 
 | Class | Trigger | Risk |
 |---|---|---|
-| `rename` | A column or table is renamed | Dependent objects break (see 7.4) |
+| `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX | Data loss |
 | `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
+| `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
+| `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 
 The criterion is **whether this kind of change can fail at all**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is
@@ -692,6 +748,62 @@ would make the checksum describe something other than what ran, and anything it
 changed in the database outside the declarations would become permanent drift
 that the next plan tries to remove (14.3).
 
+### 7.6 What the apply guard promises
+
+After every statement of a plan has run, `apply` reads the database back and
+records that read as the environment's state. Before recording it, the guard
+compares the read against the state the plan was approved over and against the
+plan itself, and refuses to record if either comparison fails. The promise has
+two halves:
+
+1. **Everything the plan does not touch is unchanged.** Every table, column,
+   constraint, index, module, role, grant and declared row that no change of
+   the plan names is the same in the read-back as in the approved baseline.
+2. **Everything the plan does touch is what the plan said.** A column the plan
+   adds or alters has the type (normalized), nullability, identity and
+   default-presence the plan gives it; a constraint or index the plan adds has
+   the definition the plan adds it with; a row the plan writes holds the cells
+   the plan spelled. Fields the engine rewrites (a default's text, a check's or
+   filter's expression) are compared by presence, not text.
+
+**Assumption: one deployer at a time.** The guard is a detector, not a lock
+against other writers. It assumes that no other session is changing the
+schema while this apply runs; a change another session makes is what it is
+designed to *notice*, not to prevent.
+
+**What is detected, and when.**
+
+- In an ordinary apply (one transaction), any change made by another session
+  between the baseline read and the read-back is detected at the read-back,
+  and the whole apply is rolled back. Nothing is recorded.
+- In a staged apply, each checkpoint read is compared with the one before it.
+  A change to an object the plan does not touch is detected at the first
+  checkpoint after it lands; the run stops on that checkpoint, which records
+  the database as it stands.
+- In a staged apply, a change made by another session to **the same field the
+  plan is itself changing**, landing between the plan's own statement and
+  that statement's checkpoint read, is **not** guaranteed to be detected at
+  that checkpoint: the field is expected to move there, and the checkpoint
+  cannot tell the plan's statement from the other session's. It **is**
+  detected at the closing read, when the field is held to the value the plan
+  promised. The run then refuses to close and stays on its last checkpoint.
+
+**What is not promised.**
+
+- Detection of a same-field concurrent change *earlier* than the closing read
+  of a staged apply. Moving detection to the checkpoint would require the
+  guard to know which statement each checkpoint spans; the cost is not
+  justified by finding earlier what is found anyway.
+- Anything about the *text* of an expression the engine stores in its own
+  rendering. Presence is compared; wording is not.
+- Fields no catalog reads back (a column's `description`, its `deprecated`
+  reason). They cannot move in a read-back and are not compared.
+
+A finding that falls inside the last list is a recorded limitation of this
+section, not a defect; it is answered by pointing here.
+
+See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
+
 ---
 
 ## 8. Environment state and drift
@@ -753,6 +865,10 @@ gradual adoption. Teams that want whole-database control tune it with
 `unmanaged: ignore | warn | error` in `pbps.yml`, and scope can also be drawn at
 the schema level (manage `dbo` only).
 
+Declared rows (ADR-0004) are part of the managed set: `exact` tables compare
+every row, `ensure` tables compare the declared keys only, and a table without a
+`data:` block has no rows compared at all.
+
 **Expressions (check / default / index WHERE) are never parsed; the database
 itself is the normalizer.** Immediately after a successful apply, the tool reads
 the definition back and stores the dialect's stored form (MSSQL's
@@ -798,8 +914,8 @@ back is structure: a column that was dropped returns empty (14.3).
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
-| `pbps rename` / `rename-table` / `drop` / `drop-table` | Record intent into the ids file |
-| `pbps validate` | Static checks: type validity, FK targets exist, naming rules, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), plus advisory lints (a revision that both adds and drops or narrows in one table usually wants expand/contract staging, see 13.3) |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` | Record intent into the ids file |
+| `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
 | `pbps schema` / `completions` / `man` | Editor schemas, shell completions and man pages, generated from the binary's own definitions (see 9.7) |
@@ -836,7 +952,7 @@ full state.
 
 | Command | Purpose |
 |---|---|
-| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step) |
+| `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step). `--data <table>` also declares that table's rows as `exact` reference data |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |

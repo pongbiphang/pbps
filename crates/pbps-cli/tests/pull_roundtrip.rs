@@ -42,6 +42,8 @@ fn full_catalog() -> RawCatalog {
     region.is_nullable = false;
 
     RawCatalog {
+        roles: Vec::new(),
+        permissions: Vec::new(),
         tables: vec![
             raw_table(1, "dbo", "customer"),
             raw_table(2, "app", "region"),

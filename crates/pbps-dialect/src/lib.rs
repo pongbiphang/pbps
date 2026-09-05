@@ -33,7 +33,8 @@
 use std::borrow::Cow;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Role, Schema, Strategy, Table,
+    TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -142,6 +143,30 @@ pub struct Statement {
     /// Empty for every statement that renames nothing, which is nearly all of
     /// them.
     pub renames: Vec<(TableName, TableName)>,
+
+    /// The role renames this statement performs, `(from, to)`, for the same
+    /// reason: a staged checkpoint after `ALTER ROLE ... WITH NAME` has to
+    /// find the role under its new name, or it records the environment
+    /// without it and a resume cannot see what changed on it while paused.
+    pub role_renames: Vec<(String, String)>,
+
+    /// The objects this statement brings into being. A staged checkpoint
+    /// scopes the environment by the identities the catalog had before the
+    /// plan, and an object the plan just created is not among them — so a
+    /// grant a new role gained, or a row a new table gained, while the
+    /// deployment was paused went unseen by `--resume` and was recorded as
+    /// clean by the closing entry. The executor adopts each of these into
+    /// the live identities, under the uid the plan gave it, the moment the
+    /// statement commits (DECISIONS 100).
+    pub creates: Vec<Created>,
+}
+
+/// An object a statement creates, for a staged checkpoint to adopt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Created {
+    Table(TableName),
+    Column(TableName, String),
+    Role(String),
 }
 
 impl Statement {
@@ -151,12 +176,26 @@ impl Statement {
             own_batch: false,
             transactional: true,
             renames: Vec::new(),
+            role_renames: Vec::new(),
+            creates: Vec::new(),
         }
     }
 
     /// Records that this statement moves `from` to `to`.
     pub fn renaming(mut self, from: TableName, to: TableName) -> Self {
         self.renames.push((from, to));
+        self
+    }
+
+    /// Records that this statement renames the role `from` to `to`.
+    pub fn renaming_role(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.role_renames.push((from.into(), to.into()));
+        self
+    }
+
+    /// Records that this statement creates `what`.
+    pub fn creating(mut self, what: Created) -> Self {
+        self.creates.push(what);
         self
     }
 
@@ -348,6 +387,16 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// Checks whether this dialect can express the role and its grants
+    /// (ADR-0005). The same default, for the same reason. The schema is there
+    /// so a grant can be checked against what its target *is*: which
+    /// permissions apply to a table, a procedure or a function is the engine's
+    /// rule, and a `GRANT` the engine refuses would fail an apply after the
+    /// changes before it had run.
+    fn validate_role(&self, _name: &str, _role: &Role, _schema: &Schema) -> Vec<DialectError> {
+        Vec::new()
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see
@@ -392,6 +441,19 @@ pub trait Dialect {
     /// can read or paste into their own tooling.
     fn batch_separator(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether a read-back can tell a cell of this column that is at its
+    /// default from one that is not.
+    ///
+    /// The row reader asks the engine to confirm a cell at its default only
+    /// where the default is a literal and the type has `=`; anything else is
+    /// read as a value nobody can tell from the default. A caller holding a
+    /// row to "at its default" has to ask the same question, or it refuses a
+    /// `NEWID()` cell for being there (DECISIONS 191). The default is `false`:
+    /// a dialect that has not said is one that cannot confirm anything.
+    fn reads_back_at_default(&self, _column: &pbps_model::Column) -> bool {
+        false
     }
 }
 

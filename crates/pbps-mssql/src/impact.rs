@@ -105,7 +105,12 @@ impl RenameTarget {
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. } => None,
+                | Change::SetDataMode { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. } => None,
             })
             .collect()
     }

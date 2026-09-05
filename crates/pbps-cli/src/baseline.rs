@@ -19,6 +19,7 @@
 //! actually going to be applied to an environment must be based on that
 //! environment's database as queried (Phase 3).
 
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -99,6 +100,164 @@ fn in_git_repo(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--show-toplevel"]).is_ok()
 }
 
+/// Whether `rev` names a commit in the repository at `root`.
+fn resolves(root: &Path, rev: &str) -> bool {
+    git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_ok()
+}
+
+/// Called only for a `rev` that does not resolve: `Ok(())` when that is the
+/// empty-baseline case, an error when it is a name somebody got wrong.
+///
+/// Absent, empty and unreadable are three different things. A repository
+/// with no commits has no previous version, so `HEAD` not resolving there
+/// means every declaration is genuinely new. Any other unresolvable
+/// revision is a mistake, and the empty baseline is the loudest possible
+/// wrong answer to it: `plan` proposes creating the entire schema, and
+/// `--since` marks every object changed, so gradual-adoption policies fail
+/// declarations nobody has touched (DECISIONS 113).
+fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
+    if rev != "HEAD" || resolves(root, "HEAD") {
+        anyhow::bail!(
+            "`{rev}` is not a revision this repository has.\n\
+             Name one that exists, or leave it out to compare against `HEAD`."
+        );
+    }
+    Ok(())
+}
+
+/// Where this project kept its declarations and its identity file *at* `rev`.
+///
+/// A revision that moved `schema_dir` or `ids_file` recorded the move in its
+/// own `pbps.yml`, and reading its tree at today's paths looks for the
+/// declarations somewhere they have never been: the listing comes back empty
+/// and the identity file missing, so every object reads as new. `plan` calls
+/// that "the baseline is empty" and warns; `validate --since` calls every
+/// table and role changed, and a gradual-adoption policy then fails
+/// declarations nobody has touched (DECISIONS 155).
+///
+/// Falling back to today's paths where that revision has no `pbps.yml` is the
+/// right answer and not a guess: the project did not exist yet, so nothing it
+/// holds is at any path. A `pbps.yml` that is *there* and does not parse is an
+/// error — reading past it would silently be the bug this exists to fix.
+fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
+    let root = &project.root;
+    let here = || {
+        Ok::<_, anyhow::Error>((
+            relative_to(&project.schema_dir())?,
+            relative_to(&project.ids_file())?,
+        ))
+    };
+    let config_rel = relative_to(&project.config_file())?;
+    let Ok(text) = git(root, &["show", &format!("{rev}:{config_rel}")]) else {
+        return here();
+    };
+    let config = pbps_config::Config::parse(&text, &project.config_file())
+        .map_err(|e| anyhow::anyhow!("`{config_rel}` at `{rev}` does not parse: {e}"))?;
+    // The config's paths are relative to the project root; git's are relative
+    // to the repo root. Composed from the *root's* prefix rather than asked of
+    // each path, because a path an old revision used may not exist in the
+    // working tree at all — `legacy/schema` after a move to `schema` — and
+    // `relative_to` answers by running git inside the path's own parent. The
+    // project root is the one directory that is always there (DECISIONS 166).
+    let prefix = relative_to(root)?;
+    Ok((
+        under(&prefix, &config.schema_dir)?,
+        under(&prefix, &config.ids_file)?,
+    ))
+}
+
+/// A path the config states, relative to the project root, as the path git
+/// wants: relative to the repository root, with `/` separators.
+///
+/// `.` is the project root itself, which is the prefix alone — and at the
+/// repository root that is the empty pathspec, which every caller here already
+/// treats as "everything".
+fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
+    use std::path::Component;
+
+    let mut parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            // Resolved against the prefix, not dropped. A project in a
+            // subdirectory may quite reasonably have kept its declarations
+            // beside it — `../shared/schema` — and silently discarding the
+            // `..` pointed the read at `<project>/shared/schema`, a path the
+            // repository does not have. `plan --base` and `validate --since`
+            // then read an empty baseline and called every object new
+            // (DECISIONS 167).
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    anyhow::bail!(
+                        "`{}` reaches outside the repository, and git has no name for it",
+                        path.display()
+                    );
+                }
+            }
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => parts.push(part),
+                None => anyhow::bail!("`{}` is not valid UTF-8", path.display()),
+            },
+            // An absolute path is not repo-relative and never can be.
+            Component::RootDir | Component::Prefix(_) => anyhow::bail!(
+                "`{}` is an absolute path; paths in `pbps.yml` are relative to the project",
+                path.display()
+            ),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// The paths one revision's tree holds under `rel`, as git spells them.
+///
+/// `-z`, because `--name-only` alone renders any path outside ASCII in C
+/// quoting with `core.quotePath` at its default — measured:
+/// `schema/dbo.té.yml` comes back as `"schema/dbo.t\303\251.yml"`, quotes
+/// and all. The failure that caused was silent, which is the part worth
+/// remembering: the quoted form does not end in `.yml`, so the filter below
+/// skipped the file, the revision read as **empty**, and `plan` reported
+/// every table as newly created and exited 0. Absent, empty and unreadable
+/// are three different things (DECISIONS 180).
+///
+/// Split on NUL and never trimmed: a path is what the tree spells it, the
+/// same rule names follow (177, 178).
+fn tree_paths(root: &Path, rev: &str, rel: &str) -> anyhow::Result<Vec<String>> {
+    // `--full-tree` because git resolves an `ls-tree` pathspec against the
+    // current directory, while `<rev>:<path>` resolves against the repo
+    // root. Without it a project in a subdirectory lists nothing, and — since
+    // the identity file is still found — the plan comes back as "no changes"
+    // against a baseline that holds no tables at all.
+    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", "-z", rev];
+    // `schema_dir: .` puts the declarations at the repo root, where the
+    // relative path is empty — and an empty pathspec is an error, not
+    // "everything". The whole tree is what "everything" looks like as
+    // arguments.
+    if !rel.is_empty() {
+        args.push("--");
+        args.push(rel);
+    }
+    let listing = git(root, &args).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read `{}` at `{rev}`: {e}",
+            if rel.is_empty() { "." } else { rel }
+        )
+    })?;
+    Ok(listing
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
@@ -109,18 +268,11 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
 
     // A brand-new repo has no commits, so HEAD does not resolve. That is not an
     // error, it just means there is no previous version yet: fall back to an empty
-    // baseline and say so.
-    if git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .is_err()
-    {
+    // baseline and say so. A revision that does not resolve for any *other*
+    // reason is refused rather than read as empty — `--since` and `--base` both
+    // arrive here carrying whatever the user typed (113).
+    if !resolves(root, rev) {
+        refuse_unknown_revision(root, rev)?;
         return Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default(),
@@ -132,34 +284,18 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         });
     }
 
-    // git paths are relative to the repo root, whereas the declarations directory
-    // is relative to the project root.
-    let rel = relative_to(&project.schema_dir())?;
+    // git paths are relative to the repo root, whereas the declarations
+    // directory is relative to the project root — and it is *that* revision's
+    // directory, not today's, or a revision that moved it reads as empty.
+    let (rel, ids_rel) = paths_at(project, rev)?;
 
-    // `--full-tree` because git resolves an `ls-tree` pathspec against the
-    // current directory, while `<rev>:<path>` below resolves against the repo
-    // root. Without it a project in a subdirectory lists nothing, and — since
-    // the identity file is still found — the plan comes back as "no changes"
-    // against a baseline that holds no tables at all.
-    let mut args = vec!["ls-tree", "-r", "--full-tree", "--name-only", rev];
-    // `schema_dir: .` puts the declarations at the repo root, where the relative
-    // path is empty — and an empty pathspec is an error, not "everything". The
-    // whole tree is what "everything" looks like as arguments.
-    if !rel.is_empty() {
-        args.push("--");
-        args.push(&rel);
-    }
-    let listing = git(root, &args).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read `{}` at `{rev}`: {e}",
-            if rel.is_empty() { "." } else { &rel }
-        )
-    })?;
+    let listing = tree_paths(root, rev, &rel)?;
 
     let mut schema = Schema::default();
     let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
-    for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for path in &listing {
+        let path = path.as_str();
         if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
             continue;
         }
@@ -178,6 +314,12 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
                 schema.modules.insert(m.name, m.module);
                 count += 1;
             }
+            // A role's identity is in the ids file at that revision, which the
+            // caller reads separately; the baseline needs only the state.
+            Ok(pbps_load::LoadedFile::Role(r)) => {
+                schema.roles.insert(r.name, r.role);
+                count += 1;
+            }
             Err(errs) => {
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.
@@ -190,14 +332,9 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
     }
 
     // The identity file must come from the same revision: using the current one as
-    // the baseline would hide renames.
-    let ids_rel = relative_to(&project.ids_file())?;
-    let ids = match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}"))?,
-        // On a first run that revision has no identity file yet; empty is correct.
-        Err(_) => IdsFile::default(),
-    };
+    // the baseline would hide renames. Under that revision's own path, for the
+    // reason `paths_at` gives.
+    let ids = ids_from(&project.root, rev, &ids_rel)?;
 
     Ok(Baseline {
         schema,
@@ -206,6 +343,142 @@ fn load_from_git(project: &Project, rev: &str) -> anyhow::Result<Baseline> {
         description: format!("git {rev} ({count} objects)"),
         is_empty_fallback: count == 0,
     })
+}
+
+/// The identity file as it was at `rev`.
+///
+/// Empty when that revision has none — a first run — which is the right
+/// answer rather than a failure: everything is new against it.
+pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<IdsFile> {
+    let (_, ids_rel) = paths_at(project, rev)?;
+    ids_from(&project.root, rev, &ids_rel)
+}
+
+/// The identity file at `rev`, under a path already resolved for that
+/// revision.
+fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<IdsFile> {
+    match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("the identity file at `{rev}` is malformed: {e}")),
+        Err(_) => Ok(IdsFile::default()),
+    }
+}
+
+/// The objects whose identity differs between `before` and `now`, as a policy
+/// finding names them: a table under either of its names, a column's table,
+/// a role as `role <name>` (ADR-0008 decision 7).
+///
+/// By uid, not by file: a renamed table counts as changed under both names,
+/// and a file moved between directories does not count at all.
+pub fn changed_subjects(
+    before: &IdsFile,
+    now: &IdsFile,
+    before_schema: &pbps_model::Schema,
+    now_schema: &pbps_model::Schema,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (uid, name) in before.tables.iter().chain(&now.tables) {
+        if before.tables.get(uid) != now.tables.get(uid) {
+            out.insert(name.to_string());
+        }
+    }
+    for (uid, column) in before.columns.iter().chain(&now.columns) {
+        if before.columns.get(uid) != now.columns.get(uid) {
+            out.insert(column.table.to_string());
+        }
+    }
+    for (uid, role) in before.roles.iter().chain(&now.roles) {
+        if before.roles.get(uid) != now.roles.get(uid) {
+            out.insert(format!("role {role}"));
+        }
+    }
+    // The declarations themselves, matched through the uid so a rename does
+    // not hide a change behind it: a table that kept its name and gained an
+    // index, changed a type or grew its `data:` block is the object the
+    // revision touched, and identity alone never saw it.
+    for (name, table) in &now_schema.tables {
+        let was = now
+            .table_uid(name)
+            .and_then(|uid| before.tables.get(uid))
+            .and_then(|old_name| before_schema.tables.get(old_name));
+        if was != Some(table) {
+            out.insert(name.to_string());
+        }
+    }
+    for (name, role) in &now_schema.roles {
+        let was = now
+            .role_uid(name)
+            .and_then(|uid| before.roles.get(uid))
+            .and_then(|old_name| before_schema.roles.get(old_name));
+        if was != Some(role) {
+            out.insert(format!("role {name}"));
+        }
+    }
+    out
+}
+
+/// The declarations as they were at `rev`: every file under the schema
+/// directory at that revision, checked out into a scratch directory and read
+/// by the ordinary loader, so `--since` compares what a reader of that commit
+/// would have seen. A revision with no declarations is an empty schema, which
+/// makes everything new — the right answer for a project's first policy run.
+pub fn schema_at(project: &Project, rev: &str) -> anyhow::Result<pbps_model::Schema> {
+    let root = &project.root;
+    // A revision that does not exist yet is the empty schema, the same answer
+    // `load_from_git` gives; anything else git refuses is an error, not "no
+    // declarations" — an unreadable tree read as an empty one would call
+    // every table new (113). The comment said so before the code did.
+    if !resolves(root, rev) {
+        refuse_unknown_revision(root, rev)?;
+        return Ok(pbps_model::Schema::default());
+    }
+    // That revision's own declarations directory, for the reason `paths_at`
+    // gives — this is the second reader of a historical tree, and both have to
+    // ask the same question of it.
+    let (dir_rel, _) = paths_at(project, rev)?;
+    // The same listing `load_from_git` takes, through the same function: the
+    // two readers of a historical tree have to ask git the same question, and
+    // written twice they had the same bug twice (DECISIONS 180).
+    let listing = tree_paths(root, rev, &dir_rel)?;
+    let scratch = std::env::temp_dir().join(format!(
+        "pbps-since-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("cannot create `{}`", scratch.display()))?;
+    let result = (|| {
+        for path in &listing {
+            let path = path.as_str();
+            if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
+                continue;
+            }
+            let inside = path.strip_prefix(dir_rel.as_str()).unwrap_or(path);
+            let inside = inside.trim_start_matches('/');
+            let text = git(root, &["show", &format!("{rev}:{path}")])?;
+            let target = scratch.join(inside);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, text)?;
+        }
+        pbps_load::load_schema_dir(&scratch)
+            .map(|l| l.schema)
+            .map_err(|errs| {
+                anyhow::anyhow!(
+                    "the declarations at `{rev}` do not load: {}",
+                    errs.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 /// Rewrites a path relative to the repo root, which is what git's path arguments
@@ -262,4 +535,81 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// A path an old revision configured, as git names it. The `..` case is
+    /// the one that matters: a project in a subdirectory may keep its
+    /// declarations beside it, and dropping the `..` pointed the read at a
+    /// path the repository does not have (DECISIONS 167).
+    #[test]
+    fn a_configured_path_is_composed_against_the_project_prefix() {
+        let under = |prefix: &str, path: &str| super::under(prefix, Path::new(path));
+        assert_eq!(under("apps/db", "schema").unwrap(), "apps/db/schema");
+        assert_eq!(under("apps/db", "./schema").unwrap(), "apps/db/schema");
+        assert_eq!(
+            under("apps/db", "../shared/schema").unwrap(),
+            "apps/shared/schema"
+        );
+        assert_eq!(under("apps/db", "../../schema").unwrap(), "schema");
+        // `schema_dir: .` is the project root, which at the repository root is
+        // the empty pathspec every caller here reads as "everything".
+        assert_eq!(under("apps/db", ".").unwrap(), "apps/db");
+        assert_eq!(under("", "schema").unwrap(), "schema");
+        assert_eq!(under("", ".").unwrap(), "");
+        // And the two that have no repo-relative name at all.
+        assert!(under("apps", "../../outside").is_err());
+        assert!(under("apps", "/etc/passwd").is_err());
+    }
+    use super::*;
+    use pbps_model::{Column, ColumnType, Schema, Table};
+    use std::str::FromStr;
+
+    fn table(cols: &[&str]) -> Table {
+        let mut t = Table::default();
+        for c in cols {
+            t.columns.insert(
+                (*c).to_owned(),
+                Column::new(ColumnType::from_str("int").unwrap()),
+            );
+        }
+        t
+    }
+
+    /// A rename is a change under both names; a content change with the
+    /// same identity is a change too — the case identity alone never saw.
+    #[test]
+    fn a_table_changed_in_content_only_is_a_changed_subject() {
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let mut before_ids = IdsFile::default();
+        before_ids
+            .tables
+            .insert(uid.clone(), "dbo.t".parse().unwrap());
+        let now_ids = before_ids.clone();
+        let mut before = Schema::default();
+        before
+            .tables
+            .insert("dbo.t".parse().unwrap(), table(&["id"]));
+        let mut now = before.clone();
+        assert!(
+            changed_subjects(&before_ids, &now_ids, &before, &now).is_empty(),
+            "untouched"
+        );
+        now.tables
+            .insert("dbo.t".parse().unwrap(), table(&["id", "added"]));
+        let changed = changed_subjects(&before_ids, &now_ids, &before, &now);
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), ["dbo.t"]);
+
+        // Renamed and unchanged inside: both names, through the uid.
+        let mut renamed_ids = before_ids.clone();
+        renamed_ids.tables.insert(uid, "dbo.t2".parse().unwrap());
+        let mut renamed = Schema::default();
+        renamed
+            .tables
+            .insert("dbo.t2".parse().unwrap(), table(&["id"]));
+        let changed = changed_subjects(&before_ids, &renamed_ids, &before, &renamed);
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), ["dbo.t", "dbo.t2"]);
+    }
 }

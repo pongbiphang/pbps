@@ -9,6 +9,7 @@ members = [
     "crates/pbps-mssql",
     "crates/pbps-docs",
     "crates/pbps-db",
+    "crates/pbps-policy",
     "crates/pbps-cli",
 ]
 
@@ -34,6 +35,7 @@ pbps-dialect = { path = "crates/pbps-dialect" }
 pbps-mssql   = { path = "crates/pbps-mssql" }
 pbps-docs    = { path = "crates/pbps-docs" }
 pbps-db      = { path = "crates/pbps-db" }
+pbps-policy  = { path = "crates/pbps-policy" }
 
 serde      = { version = "1", features = ["derive"] }
 
@@ -60,6 +62,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2       = "0.10"
 
 thiserror  = "2"
+# Naming rules in the `policies:` block take a regular expression
+# (ADR-0008). `regex-lite`: pure Rust, no unsafe, and a small fraction of
+# `regex`'s tree for the anchored patterns a naming rule is.
+regex-lite = "0.1"
 anyhow     = "1"
 miette     = "7"
 # `string`: the man-page generator renames each subcommand to `pbps-<name>` at

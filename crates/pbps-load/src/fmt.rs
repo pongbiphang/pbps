@@ -250,6 +250,34 @@ pub fn render_module(
     s
 }
 
+/// Renders one role as canonical YAML (ADR-0005).
+///
+/// A pending `RenameRole` intent for this role is written back as
+/// `renamed_from:`, exactly as a table's is: the annotation survives `fmt`
+/// until the identity file has absorbed it.
+pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "role: {}", scalar(name));
+    if let Some(d) = &role.description {
+        let _ = writeln!(s, "description: {}", scalar(d));
+    }
+    for i in pending {
+        if let Intent::RenameRole { from, to } = i
+            && to == name
+        {
+            let _ = writeln!(s, "renamed_from: {}", scalar(from));
+        }
+    }
+    if !role.grants.is_empty() {
+        s.push_str("\ngrants:\n");
+        for (target, permissions) in &role.grants {
+            let names: Vec<String> = permissions.iter().map(|p| p.as_str().to_owned()).collect();
+            let _ = writeln!(s, "  {}: {}", scalar(&target.to_string()), seq(&names));
+        }
+    }
+    s
+}
+
 fn action(a: pbps_model::ReferentialAction) -> &'static str {
     use pbps_model::ReferentialAction as R;
     match a {
@@ -369,6 +397,81 @@ mod tests {
             "fmt is not idempotent"
         );
         out
+    }
+
+    /// Measured on SQL Server 2025: `CREATE ROLE [ app_pad ]` stores the name
+    /// with its padding, and `pull` writes it back quoted, because
+    /// `needs_quotes` refuses any scalar that is not its own `trim()`. The
+    /// loader then trimmed it, so a freshly pulled project named a role the
+    /// database does not have while the ids file named the one it does — an
+    /// ambiguous replacement rather than a clean plan (DECISIONS 177).
+    #[test]
+    fn a_role_name_keeps_the_whitespace_the_database_gave_it() {
+        for name in [" app_pad ", "trail ", " lead"] {
+            let out = render_role(name, &pbps_model::Role::default(), &[]);
+            let back = crate::load_role_str(Path::new("r.yml"), &out)
+                .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+            assert_eq!(back.name, name, "output:\n{out}");
+        }
+
+        // The rename intent names the *old* spelling, and it is the same kind
+        // of name: trimmed, it would ask the database to rename a role that is
+        // not there.
+        let out = render_role(
+            "kept",
+            &pbps_model::Role::default(),
+            &[pbps_model::Intent::RenameRole {
+                from: " was ".into(),
+                to: "kept".into(),
+            }],
+        );
+        let back = crate::load_role_str(Path::new("r.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+        assert_eq!(
+            back.intents,
+            [pbps_model::Intent::RenameRole {
+                from: " was ".into(),
+                to: "kept".into(),
+            }],
+            "output:\n{out}"
+        );
+
+        // A name that is nothing but whitespace is still no name.
+        let out = render_role("   ", &pbps_model::Role::default(), &[]);
+        assert!(
+            crate::load_role_str(Path::new("r.yml"), &out).is_err(),
+            "output:\n{out}"
+        );
+    }
+
+    /// 177 one crate over, and the half my sweep missed: `GrantTarget` trimmed
+    /// too. Measured on SQL Server 2025: `CREATE SCHEMA [ app]` keeps its
+    /// padding, and `pull` renders the target as a quoted `"schema:: app"` —
+    /// so a trimmed reload targets a schema that is not there (DECISIONS 178).
+    #[test]
+    fn a_grant_target_keeps_the_whitespace_the_database_gave_it() {
+        let mut role = pbps_model::Role::default();
+        let one =
+            |p| -> std::collections::BTreeSet<pbps_model::Permission> { [p].into_iter().collect() };
+        role.grants.insert(
+            pbps_model::GrantTarget::Schema(" app".to_owned()),
+            one(pbps_model::Permission::Select),
+        );
+        role.grants.insert(
+            pbps_model::GrantTarget::Object(pbps_model::TableName::new(" app", " t ")),
+            one(pbps_model::Permission::Insert),
+        );
+
+        let out = render_role("r", &role, &[]);
+        let back = crate::load_role_str(Path::new("r.yml"), &out)
+            .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
+        assert_eq!(back.role.grants, role.grants, "output:\n{out}");
+
+        // A target that is nothing but the prefix is still no target.
+        assert!(
+            "schema::   ".parse::<pbps_model::GrantTarget>().is_err(),
+            "an empty schema name"
+        );
     }
 
     /// The definition is SQL, and SQL is exactly the kind of text YAML quoting

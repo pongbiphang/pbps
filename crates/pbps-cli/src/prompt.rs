@@ -53,6 +53,7 @@ pub enum ChoiceKind {
     /// the answer everybody accepts.
     DropColumn(ColumnRef),
     DropTable(TableName),
+    DropRole(String),
 }
 
 /// The candidates for one blocker, best first.
@@ -138,6 +139,39 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         Blocker::DropTableNeedsReason { table } => out.push(Choice {
             label: format!("table {table} was dropped (you will be asked why)"),
             kind: ChoiceKind::DropTable(table.clone()),
+        }),
+        Blocker::AmbiguousRoles {
+            disappeared,
+            appeared,
+        } => {
+            let mut pairs: Vec<(&String, &String)> = disappeared
+                .iter()
+                .flat_map(|from| appeared.iter().map(move |to| (from, to)))
+                .collect();
+            pairs.sort_by(|a, b| {
+                similarity(b.0, b.1)
+                    .total_cmp(&similarity(a.0, a.1))
+                    .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+            });
+            for (from, to) in pairs {
+                out.push(Choice {
+                    label: format!("role {from} was renamed to {to}"),
+                    kind: ChoiceKind::Rename(Intent::RenameRole {
+                        from: from.clone(),
+                        to: to.clone(),
+                    }),
+                });
+            }
+            for from in disappeared {
+                out.push(Choice {
+                    label: format!("role {from} was dropped (you will be asked why)"),
+                    kind: ChoiceKind::DropRole(from.clone()),
+                });
+            }
+        }
+        Blocker::DropRoleNeedsReason { role } => out.push(Choice {
+            label: format!("role {role} was dropped (you will be asked why)"),
+            kind: ChoiceKind::DropRole(role.clone()),
         }),
         // A stale or misspelled annotation. There is nothing to choose: the
         // remedy is to edit the file, and offering an option here would invite
@@ -230,6 +264,10 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
                 table: table.clone(),
                 reason: reason(&mut lines, &table.to_string())?,
             },
+            ChoiceKind::DropRole(role) => Intent::DropRole {
+                role: role.clone(),
+                reason: reason(&mut lines, &format!("role {role}"))?,
+            },
         });
     }
     (!intents.is_empty()).then_some(intents)
@@ -272,6 +310,17 @@ fn question(b: &Blocker) -> String {
         }
         Blocker::DropTableNeedsReason { table } => {
             format!("table {table} disappeared from the declarations")
+        }
+        Blocker::AmbiguousRoles {
+            disappeared,
+            appeared,
+        } => format!(
+            "role {} disappeared, {} is new",
+            list(disappeared),
+            list(appeared)
+        ),
+        Blocker::DropRoleNeedsReason { role } => {
+            format!("role {role} disappeared from the declarations")
         }
         Blocker::UnusedIntent { intent } => format!("{intent:?}"),
     }

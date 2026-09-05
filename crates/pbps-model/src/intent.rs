@@ -45,6 +45,18 @@ pub enum Intent {
         column: ColumnRef,
         reason: String,
     },
+    /// A database role was renamed (ADR-0005). Membership follows the role
+    /// through `ALTER ROLE ... WITH NAME`, which is why this is intent and not
+    /// drop plus add.
+    RenameRole {
+        from: String,
+        to: String,
+    },
+    /// Drop a role. "Why was this access removed" is an auditor's question.
+    DropRole {
+        role: String,
+        reason: String,
+    },
 }
 
 impl Intent {
@@ -54,6 +66,7 @@ impl Intent {
             Intent::RenameTable { from, to } => from == t || to == t,
             Intent::RenameColumn { table, .. } | Intent::DropTable { table, .. } => table == t,
             Intent::DropColumn { column, .. } => &column.table == t,
+            Intent::RenameRole { .. } | Intent::DropRole { .. } => false,
         }
     }
 }
@@ -96,6 +109,14 @@ mod tests {
             Intent::DropColumn {
                 column: "dbo.a.x".parse().unwrap(),
                 reason: "REG-2".into(),
+            },
+            Intent::RenameRole {
+                from: "reader".into(),
+                to: "app_reader".into(),
+            },
+            Intent::DropRole {
+                role: "legacy".into(),
+                reason: "REG-3".into(),
             },
         ];
         let back: Vec<Intent> =

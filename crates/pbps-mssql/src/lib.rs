@@ -24,7 +24,9 @@
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Probe, Statement, TypeChangeRisk};
-use pbps_model::{Change, ChangeSet, ColumnType, Module, ObjectName, Strategy, Table, TableName};
+use pbps_model::{
+    Change, ChangeSet, ColumnType, Module, ObjectName, Role, Schema, Strategy, Table, TableName,
+};
 
 pub mod catalog;
 pub mod doctor;
@@ -34,6 +36,7 @@ pub mod ident;
 pub mod impact;
 pub mod introspect;
 pub mod preflight;
+pub mod rows;
 pub mod state;
 pub mod types;
 pub mod validate;
@@ -83,12 +86,20 @@ impl Dialect for Mssql {
         validate::module(name, module)
     }
 
+    fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+        validate::role(name, role, schema)
+    }
+
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(change, strategy)
     }
 
     fn preflight(&self, changes: &ChangeSet) -> Vec<Probe> {
         preflight::probes(changes)
+    }
+
+    fn reads_back_at_default(&self, column: &pbps_model::Column) -> bool {
+        rows::confirms_default(column)
     }
 
     fn batch_separator(&self) -> Option<&'static str> {

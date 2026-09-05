@@ -51,6 +51,35 @@ fn escape_reserved_stem(encoded: String) -> String {
     format!("%{:02X}{rest}", first.as_bytes()[0])
 }
 
+/// The file a role is written to: `roles/<name>.yml`, with the same encoding
+/// as an object name's components and the same hashed fallback.
+///
+/// A directory of its own, not a suffix. `<name>.role.yml` was the first
+/// cut, and a table `app_reader.role` produces exactly `app_reader.role.yml`,
+/// so `pull` wrote the role over the table without a word. No table file is
+/// ever written under `roles/` (a table's file is `<schema>.<name>.yml` at
+/// the top), so the two can no longer name one path. The loader reads
+/// every `.yml` under the schema directory and tells a role by its content,
+/// so a hand-written role file elsewhere still loads.
+pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let readable = format!("{}.yml", escape_reserved_stem(component(name)));
+    let file = if readable.len() <= 240 {
+        readable
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(b"role");
+        format!("~pbps-{:x}.yml", hasher.finalize())
+    };
+    let roles = dir.join("roles");
+    let path = roles.join(&file);
+    if path.parent() != Some(roles.as_path()) {
+        bail!("refusing to write `{file}` outside `{}`", roles.display());
+    }
+    Ok(path)
+}
+
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     let kind_suffix = kind.map(|k| format!(".{}", k.as_str())).unwrap_or_default();
     let readable = format!(
@@ -97,9 +126,122 @@ pub fn path(
     Ok(path)
 }
 
+/// Every file a schema's declarations are written to, each under the name a
+/// human calls the thing.
+pub fn paths_of(
+    directory: &Path,
+    schema: &pbps_model::Schema,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    for name in schema.tables.keys() {
+        out.push((name.to_string(), path(directory, &name.clone(), None)?));
+    }
+    for (name, module) in &schema.modules {
+        out.push((
+            format!("{name} ({})", module.kind.as_str()),
+            path(directory, name, Some(module.kind))?,
+        ));
+    }
+    for name in schema.roles.keys() {
+        out.push((format!("role {name}"), role_path(directory, name)?));
+    }
+    Ok(out)
+}
+
+/// Refuses two declarations whose files differ only in case, before either
+/// is written.
+///
+/// A case-sensitive database holds `Reader` beside `reader`, and their
+/// encoded filenames differ only in case; on a case-insensitive filesystem
+/// the second `pull` wrote over the first, with the identity file still
+/// naming both — declarations that cannot round-trip, and nothing said. The
+/// encoding cannot fix this by itself: a declaration is written into git and
+/// has to resolve to the same file on every platform that checks the
+/// repository out, so the refusal is unconditional rather than a property of
+/// the filesystem underneath (DECISIONS 135).
+pub fn refuse_folded_paths(paths: &[(String, PathBuf)]) -> anyhow::Result<()> {
+    let mut by_folded: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (label, path) in paths {
+        by_folded
+            .entry(path.to_string_lossy().to_lowercase())
+            .or_default()
+            .push(label);
+    }
+    let clashing: Vec<String> = by_folded
+        .iter()
+        .filter(|(_, labels)| labels.len() > 1)
+        .map(|(folded, labels)| format!("{} -> `{folded}`", labels.join(", ")))
+        .collect();
+    if !clashing.is_empty() {
+        bail!(
+            "{} declaration file name(s) differ only in case, and a filesystem that \
+             ignores case would keep one of each:\n  {}\n\
+             Rename one side in the database, or declare only one of them.",
+            clashing.len(),
+            clashing.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A case-sensitive database holds `Reader` beside `reader`; the files
+    /// they encode to differ only in case, and one filesystem in two keeps
+    /// only one of them.
+    #[test]
+    fn two_declarations_whose_files_differ_only_in_case_are_refused() {
+        let dir = Path::new("/tmp/schema");
+        let mut schema = pbps_model::Schema::default();
+        for name in ["dbo.Customer", "dbo.customer", "dbo.order"] {
+            schema
+                .tables
+                .insert(name.parse().unwrap(), pbps_model::Table::default());
+        }
+        schema
+            .roles
+            .insert("Reader".to_owned(), pbps_model::Role::default());
+        schema
+            .roles
+            .insert("reader".to_owned(), pbps_model::Role::default());
+
+        let paths = paths_of(dir, &schema).unwrap();
+        let err = refuse_folded_paths(&paths).unwrap_err().to_string();
+        assert!(err.contains("2 declaration file name(s)"), "{err}");
+        assert!(err.contains("dbo.Customer, dbo.customer"), "{err}");
+        assert!(err.contains("role Reader, role reader"), "{err}");
+        // The one that collides with nothing is not named.
+        assert!(!err.contains("dbo.order"), "{err}");
+
+        // And the ordinary case says nothing: a role and a table of one name
+        // live in different directories, and always did.
+        let mut plain = pbps_model::Schema::default();
+        plain
+            .tables
+            .insert("dbo.reader".parse().unwrap(), pbps_model::Table::default());
+        plain
+            .roles
+            .insert("reader".to_owned(), pbps_model::Role::default());
+        refuse_folded_paths(&paths_of(dir, &plain).unwrap()).expect("no collision");
+    }
+
+    /// `app_reader.role` is a legal table name whose file used to be the
+    /// role `app_reader`'s file; `pull` then wrote one over the other.
+    #[test]
+    fn a_role_file_cannot_share_a_path_with_any_table_file() {
+        let dir = Path::new("schema");
+        let role = role_path(dir, "app_reader").unwrap();
+        assert_eq!(role, dir.join("roles").join("app_reader.yml"));
+        let table = path(dir, &"app_reader.role".parse().unwrap(), None).unwrap();
+        assert_ne!(role, table);
+        assert_eq!(table, dir.join("app_reader.role.yml"));
+        // A role named after a table's file still lands beside the roles.
+        let role = role_path(dir, "dbo.customer").unwrap();
+        assert!(role.starts_with(dir.join("roles")), "{}", role.display());
+    }
 
     #[test]
     fn ordinary_names_stay_readable() {

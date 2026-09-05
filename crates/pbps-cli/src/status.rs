@@ -310,7 +310,65 @@ async fn one(
     let recorded_modules: std::collections::BTreeSet<_> =
         entry.snapshot.schema.modules.keys().cloned().collect();
     let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
-    let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+    // A permission on a managed role that the declarations cannot hold is
+    // drift to `verify` and stops every command that would record a state;
+    // it lives beside the schema, not in it, so the checksum below cannot
+    // see it. The same filter `verify` applies: an unmanaged role's grants
+    // are its own business (DECISIONS 95, 125).
+    let unexpressible =
+        crate::deploy::unexpressible_permissions(&pulled, &recorded_ids, &recorded_modules);
+    // Recorded and carried, never returned on. An unexpressible permission is
+    // drift, and so is a row that moved, a fact the projection could not hold,
+    // or an object `unmanaged: error` refuses — each established
+    // independently, and none of them able to erase the others. Returning here
+    // hid every one of the checks below behind whichever came first
+    // (DECISIONS 159).
+    if !unexpressible.is_empty() {
+        record_drift(&mut row, entry.id, name);
+        record_status_issue(&mut row, "drift", unexpressible.join("; "));
+    }
+    // The rows too, under the recorded scope, as `verify` reads them. A read
+    // that fails is reported as the failure it is, never as "no drift".
+    let recorded_data = entry.snapshot.schema.data_scopes();
+    let read = recorded_data
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let rows = match pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Through the helper, which keeps what was already established.
+            // Assigning here dropped an unexpressible permission the
+            // introspection above had already found: it was known
+            // independently of this read, and a read that failed does not
+            // unfind it (DECISIONS 168).
+            record_unreachable(
+                &mut row,
+                format!("the declared rows could not be read back: {e}"),
+            );
+            return row;
+        }
+    };
+    // Cloned, because the inventories below still need `scoped` whole and
+    // `with_observed_rows` takes the schema by value.
+    let live_schema = match scoped.schema.clone().with_observed_rows(
+        &rows,
+        &recorded_data,
+        &entry.snapshot.schema,
+    ) {
+        Ok(schema) => schema,
+        // Two recorded spellings of one row: the recorded state cannot be
+        // compared against the database, which is the same answer as a read
+        // that failed, never "no drift".
+        Err(e) => {
+            record_unreachable(
+                &mut row,
+                format!("the recorded rows cannot be compared: {e}"),
+            );
+            return row;
+        }
+    };
+    let live = pbps_model::state_checksum(&live_schema, &recorded_ids);
     let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
     if live != recorded {
         record_drift(&mut row, entry.id, name);
@@ -652,7 +710,8 @@ mod tests {
         let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("2 of 5"), "{detail}");
         assert!(detail.contains("moved since that checkpoint"), "{detail}");
-        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        let found = findings(&[r]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.mid-deployment", "state.drift"]);
     }
 
@@ -666,7 +725,8 @@ mod tests {
         let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("2 of 5"), "{detail}");
         assert!(detail.contains("attempt failed"), "{detail}");
-        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        let found = findings(&[r]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.mid-deployment", "state.failed"]);
     }
 
@@ -687,7 +747,8 @@ mod tests {
         let detail = r.detail.as_deref().unwrap();
         assert!(detail.contains("attempt failed"), "{detail}");
         assert!(detail.contains("no longer matches"), "{detail}");
-        let ids: Vec<&str> = findings(&[r]).iter().map(|finding| finding.id).collect();
+        let found = findings(&[r]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.failed", "state.drift"]);
     }
 
@@ -702,7 +763,7 @@ mod tests {
         assert!(detail.contains("permission denied reading sys.tables"));
         assert!(detail.contains("deployment attempt failed"));
         let findings = findings(&[r]);
-        let ids: Vec<&str> = findings.iter().map(|finding| finding.id).collect();
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["environment.unreachable", "state.failed"]);
         assert!(findings[1].message.contains("deployment attempt failed"));
     }
@@ -718,7 +779,7 @@ mod tests {
         );
 
         let findings = findings(&[r]);
-        let ids: Vec<&str> = findings.iter().map(|finding| finding.id).collect();
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.drift", "state.unmanaged-refused"]);
         assert!(findings[1].message.contains("dbo.surprise"));
     }
@@ -775,7 +836,8 @@ mod tests {
     fn a_locked_environment_that_also_drifted_reports_both() {
         let mut r = row("prod", "drift");
         r.locked_by = Some("ci-deploy since 2026-08-31T09:19:00".into());
-        let ids: Vec<&str> = findings(&[r]).iter().map(|f| f.id).collect();
+        let found = findings(&[r]);
+        let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.drift", "state.locked"]);
     }
 

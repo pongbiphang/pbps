@@ -249,6 +249,397 @@ pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Ce
     }
 }
 
+/// Which of a table's rows a read-back is asked for (the connected half of
+/// ADR-0004).
+///
+/// The catalog cannot decide this on its own: a database has rows, not a
+/// notion of which of them are declared. The scope comes from a declaration or
+/// from a recorded state, and it is what turns "the table holds these rows"
+/// into a [`TableData`] the differ can compare.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DataScope {
+    pub mode: DataMode,
+    /// The declared keys. For an `exact` table they are informational — every
+    /// row is read, because an undeclared one is exactly what has to be seen.
+    /// For an `ensure` table they are the whole scope: nothing else in the
+    /// table is looked at, which is the promise the mode makes to a table the
+    /// application also writes to.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub keys: BTreeSet<RowKey>,
+}
+
+/// The scopes of every table that declares rows, by table.
+pub type DataScopes = BTreeMap<TableName, DataScope>;
+
+/// What was read back: every row the read scope asked for, by table.
+///
+/// A table that was in scope but absent from the database has no entry — it
+/// is reported as missing by the managed-set check, not read as empty.
+/// One row as the catalog read it (the connected half of ADR-0004).
+///
+/// Every cell the read fetched is in `cells`, explicit. `at_default` names
+/// the cells that hold the column's default — or whose default the engine was
+/// not asked to evaluate, so the stored value cannot be told from it. The
+/// catalog does not know which spelling a row was *written* with: a cell that
+/// holds `'Unlabelled'` may have been declared as `label: Unlabelled` or by
+/// leaving `label` out. So the observation carries both readings, and the
+/// side that looks at it chooses ([`ObservedRow::as_seen_by`]) — which is
+/// what lets an explicit value that equals the default, and an omitted one,
+/// both compare equal to what they wrote, rather than one of them being
+/// restated on every connected plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedRow {
+    pub cells: Row,
+    /// The engine confirmed these cells hold the column's default.
+    pub at_default: BTreeSet<String>,
+    /// The engine was never asked about these: the column's default is an
+    /// expression it would have had to run. Nobody can tell the value from
+    /// the default, so the side's own spelling decides — and a side with no
+    /// spelling keeps the value, because a `NEWID()` key is a value.
+    pub unknown: BTreeSet<String>,
+}
+
+impl ObservedRow {
+    /// The row as one side spells it. A cell that side writes explicitly is
+    /// read explicit, whatever it holds. A cell the engine confirmed at its
+    /// default is omitted where the side omits it, and where there is no
+    /// side at all (`pull`): it *is* the default. A cell whose default could
+    /// not be asked about is omitted only where the side's own row omits it
+    /// — taken at the declaration's word — and kept everywhere else.
+    pub fn as_seen_by(&self, reference: Option<&Row>) -> Row {
+        self.cells
+            .columns()
+            .filter(|(column, _)| {
+                let spelled = reference.is_some_and(|r| r.get(column).is_some());
+                if self.at_default.contains(*column) {
+                    spelled
+                } else if self.unknown.contains(*column) {
+                    reference.is_none_or(|r| r.get(column).is_some())
+                } else {
+                    true
+                }
+            })
+            .map(|(column, value)| (column.clone(), value.clone()))
+            .collect()
+    }
+}
+
+/// One table's rows as the catalog read them, keyed by the **engine's**
+/// spelling of each key, with the spellings the read was asked for beside
+/// them.
+///
+/// A declaration may write a key the engine spells differently — `"01"` for
+/// an `int` key that comes back as `1`, `"a "` for a `char` that comes back
+/// trimmed — and the engine, not this crate, decides that they are the same
+/// row (§8.2). So every key a side spells is sent along with the read, the
+/// engine says which row it names, and `aliases` records the answer; a side
+/// then reads its rows back under its own spelling ([`ObservedTable::row`],
+/// [`ObservedTable::rows_as`]). Without that, an `exact` declaration of `01`
+/// planned an insert of `01` and a delete of `1` on every connected plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedTable {
+    pub rows: BTreeMap<RowKey, ObservedRow>,
+    /// Requested spelling -> the engine's, for every requested key that
+    /// named a row.
+    pub aliases: BTreeMap<RowKey, RowKey>,
+}
+
+impl ObservedTable {
+    /// The row a side names by its own spelling, with the engine's.
+    pub fn row(&self, key: &RowKey) -> Option<(&RowKey, &ObservedRow)> {
+        let canonical = self.aliases.get(key).unwrap_or(key);
+        self.rows.get_key_value(canonical)
+    }
+
+    /// Two of `spelling`'s keys that name one row, with the engine's key.
+    pub fn conflict(&self, spelling: &BTreeSet<RowKey>) -> Option<(RowKey, RowKey, RowKey)> {
+        let mut seen: BTreeMap<&RowKey, &RowKey> = BTreeMap::new();
+        for key in spelling {
+            if let Some(canonical) = self.aliases.get(key)
+                && let Some(first) = seen.insert(canonical, key)
+            {
+                return Some((first.clone(), key.clone(), canonical.clone()));
+            }
+        }
+        None
+    }
+
+    /// Every row, keyed as `spelling` spells it where it does and as the
+    /// engine does elsewhere.
+    pub fn rows_as(&self, spelling: &BTreeSet<RowKey>) -> BTreeMap<RowKey, &ObservedRow> {
+        let mut requested: BTreeMap<&RowKey, &RowKey> = BTreeMap::new();
+        for key in spelling {
+            if let Some(canonical) = self.aliases.get(key) {
+                requested.entry(canonical).or_insert(key);
+            }
+        }
+        self.rows
+            .iter()
+            .map(|(canonical, row)| {
+                let key = requested
+                    .get(canonical)
+                    .map_or_else(|| canonical.clone(), |k| (*k).clone());
+                (key, row)
+            })
+            .collect()
+    }
+}
+
+pub type ObservedRows = BTreeMap<TableName, ObservedTable>;
+
+/// Two keys one side spells that the engine calls the same row — `1` and
+/// `01` for an `int` key, `a` and `A` under a case-insensitive collation.
+///
+/// Refused rather than reconciled: keeping one spelling would plan an insert
+/// of the other, which fails on the primary key at apply, and `validate`
+/// cannot see it (which spellings are equal is the engine's call). Surfaced by
+/// every connected command that projects rows.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{table}: rows `{first}` and `{second}` are the same row to the database (its key is \
+     `{canonical}`); declare it once"
+)]
+pub struct RowConflict {
+    pub table: TableName,
+    pub first: RowKey,
+    pub second: RowKey,
+    pub canonical: RowKey,
+}
+
+/// Which rows a read-back query fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowScope {
+    /// Every row of the table. `known` are the keys the reader spells, sent
+    /// along so the engine can say which row each names
+    /// ([`ObservedTable::aliases`]).
+    Every { known: BTreeSet<RowKey> },
+    /// Only the rows with these keys; the rest of the table is not looked at.
+    Keys(BTreeSet<RowKey>),
+}
+
+impl RowScope {
+    /// The narrower of two reads that still answers both.
+    pub fn union(self, other: RowScope) -> RowScope {
+        match (self, other) {
+            (RowScope::Every { known: mut a }, RowScope::Every { known: b })
+            | (RowScope::Every { known: mut a }, RowScope::Keys(b))
+            | (RowScope::Keys(b), RowScope::Every { known: mut a }) => {
+                a.extend(b);
+                RowScope::Every { known: a }
+            }
+            (RowScope::Keys(mut a), RowScope::Keys(b)) => {
+                a.extend(b);
+                RowScope::Keys(a)
+            }
+        }
+    }
+
+    /// The keys this read spells, whichever shape it has.
+    pub fn known(&self) -> &BTreeSet<RowKey> {
+        match self {
+            RowScope::Every { known } => known,
+            RowScope::Keys(keys) => keys,
+        }
+    }
+}
+
+impl DataScope {
+    pub fn of(data: &TableData) -> DataScope {
+        DataScope {
+            mode: data.mode,
+            keys: data.rows.keys().cloned().collect(),
+        }
+    }
+
+    /// The rows the catalog has to fetch to answer this scope.
+    /// The scope that answers both: `exact` if either is, and every key
+    /// either spells. What a plan's baseline is pinned under when the
+    /// recorded scope and the plan's both cover a table — a key the plan adds
+    /// to an `ensure` block, or an `ensure` -> `exact` switch, has rows the
+    /// differ measured and the recorded scope alone would not check again
+    /// before apply (DECISIONS 98).
+    pub fn union(mut self, other: DataScope) -> DataScope {
+        if other.mode == DataMode::Exact {
+            self.mode = DataMode::Exact;
+        }
+        self.keys.extend(other.keys);
+        self
+    }
+
+    pub fn rows_to_read(&self) -> RowScope {
+        match self.mode {
+            DataMode::Exact => RowScope::Every {
+                known: self.keys.clone(),
+            },
+            DataMode::Ensure => RowScope::Keys(self.keys.clone()),
+        }
+    }
+
+    /// The block this scope describes, from rows read under it or under a
+    /// wider read.
+    ///
+    /// The filter is what makes `ensure` mean what it says: a read that
+    /// happened to fetch every row (because another scope on the same table
+    /// needed them) must not turn the undeclared ones into recorded state, or
+    /// the next `verify` would call the application's own inserts drift.
+    ///
+    /// `reference` is this side's own block, whose spelling of each cell
+    /// decides how a cell at its default is read (see [`ObservedRow`]).
+    pub fn project(&self, observed: &ObservedTable, reference: Option<&TableData>) -> TableData {
+        let seen = |k: RowKey, r: &ObservedRow| {
+            let row = r.as_seen_by(reference.and_then(|d| d.rows.get(&k)));
+            (k, row)
+        };
+        let rows = match self.mode {
+            DataMode::Exact => observed
+                .rows_as(&self.keys)
+                .into_iter()
+                .map(|(k, r)| seen(k, r))
+                .collect(),
+            DataMode::Ensure => self
+                .keys
+                .iter()
+                .filter_map(|k| observed.row(k).map(|(_, r)| seen(k.clone(), r)))
+                .collect(),
+        };
+        TableData {
+            mode: self.mode,
+            rows,
+        }
+    }
+}
+
+/// The read a connected plan needs: every table under either scope, fetched
+/// widely enough to answer both.
+///
+/// Two scopes meet at plan time — what the environment's recorded state
+/// covers, and what the declarations now cover — and they can disagree on a
+/// table: a block added, removed, or switched between `exact` and `ensure`.
+/// The drift check needs the recorded view, and the differ needs to see every
+/// row the declaration will compare against, so the read is the union and each
+/// caller projects its own view out of it.
+pub fn read_scopes(recorded: &DataScopes, declared: &DataScopes) -> BTreeMap<TableName, RowScope> {
+    let mut out: BTreeMap<TableName, RowScope> = BTreeMap::new();
+    for (name, scope) in recorded.iter().chain(declared) {
+        let read = scope.rows_to_read();
+        let merged = match out.remove(name) {
+            Some(existing) => existing.union(read),
+            None => read,
+        };
+        out.insert(name.clone(), merged);
+    }
+    out
+}
+
+impl crate::schema::Schema {
+    /// The scope of every table that declares rows.
+    pub fn data_scopes(&self) -> DataScopes {
+        self.tables
+            .iter()
+            .filter_map(|(n, t)| t.data.as_ref().map(|d| (n.clone(), DataScope::of(d))))
+            .collect()
+    }
+
+    /// This schema — one read from a catalog, which declares no rows of its
+    /// own — with the rows read back placed under `scopes`. Every table
+    /// outside the scopes is left with `data: None`.
+    ///
+    /// A table in scope with no observed rows is left with `data: None`: the
+    /// read did not reach it (it is missing from the database, and reported as
+    /// such elsewhere), and "absent" must not be recorded as "empty".
+    ///
+    /// `reference` is the schema the scopes came from — the recorded snapshot
+    /// for a drift check, the declarations for a rehearsal — because its rows
+    /// say which cells that side spells explicitly ([`ObservedRow`]).
+    ///
+    /// Two keys the side spells that the engine calls one row is an error
+    /// ([`RowConflict`]), never a choice between them.
+    pub fn with_observed_rows(
+        mut self,
+        rows: &ObservedRows,
+        scopes: &DataScopes,
+        reference: &crate::schema::Schema,
+    ) -> Result<Self, RowConflict> {
+        for (name, table) in &mut self.tables {
+            let own = reference.tables.get(name).and_then(|t| t.data.as_ref());
+            table.data = match (scopes.get(name), rows.get(name)) {
+                (Some(scope), Some(observed)) => {
+                    if let Some((first, second, canonical)) = observed.conflict(&scope.keys) {
+                        return Err(RowConflict {
+                            table: name.clone(),
+                            first,
+                            second,
+                            canonical,
+                        });
+                    }
+                    Some(scope.project(observed, own))
+                }
+                _ => None,
+            };
+        }
+        Ok(self)
+    }
+}
+
+/// The base a connected plan is computed against: the live schema, with the
+/// rows read back for every table either side covers.
+///
+/// The **mode** is the recorded one where there is one, so that a switch
+/// between `exact` and `ensure` shows at the gate as `SetDataMode`; a table the
+/// declarations take over for the first time carries the declared mode, since
+/// nothing was recorded to differ from. The **rows** are everything the union
+/// read fetched, unfiltered: the differ must see every row the declaration
+/// will be measured against — including, for an `exact` declaration, the rows
+/// that are about to be deleted because nobody declared them.
+///
+/// Each cell is read as the **declarations** spell it ([`ObservedRow`]): the
+/// base is what the declared rows are measured against, so a cell they write
+/// explicitly is compared as a value and a cell they omit is compared as the
+/// default. The recorded state's spelling is not consulted here; it belongs to
+/// the drift check, which reads the same rows under its own reference.
+pub fn plan_base(
+    live: &crate::schema::Schema,
+    rows: &ObservedRows,
+    recorded: &DataScopes,
+    declared: &crate::schema::Schema,
+) -> Result<crate::schema::Schema, RowConflict> {
+    let declared_scopes = declared.data_scopes();
+    let mut base = live.clone();
+    for (name, table) in &mut base.tables {
+        let mode = recorded
+            .get(name)
+            .or_else(|| declared_scopes.get(name))
+            .map(|s| s.mode);
+        let own = declared.tables.get(name).and_then(|t| t.data.as_ref());
+        let spelling = declared_scopes.get(name).map(|s| &s.keys);
+        if let (Some(spelling), Some(observed)) = (spelling, rows.get(name))
+            && let Some((first, second, canonical)) = observed.conflict(spelling)
+        {
+            return Err(RowConflict {
+                table: name.clone(),
+                first,
+                second,
+                canonical,
+            });
+        }
+        table.data = match (mode, rows.get(name)) {
+            (Some(mode), Some(observed)) => Some(TableData {
+                mode,
+                rows: observed
+                    .rows_as(spelling.unwrap_or(&BTreeSet::new()))
+                    .into_iter()
+                    .map(|(k, r)| {
+                        let row = r.as_seen_by(own.and_then(|d| d.rows.get(&k)));
+                        (k, row)
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        };
+    }
+    Ok(base)
+}
+
 /// The order declared rows must be inserted in: a referenced table before the
 /// table that references it.
 ///
@@ -718,5 +1109,362 @@ mod tests {
             rows: BTreeMap::new(),
         };
         assert_ne!(exact, ensure);
+    }
+
+    // ---- The connected half: scopes and read-back ----
+
+    fn rows(keys: &[&str]) -> BTreeMap<RowKey, Row> {
+        keys.iter()
+            .map(|k| (RowKey::from(*k), Row::default()))
+            .collect()
+    }
+
+    fn observed(keys: &[&str]) -> ObservedTable {
+        ObservedTable {
+            rows: keys
+                .iter()
+                .map(|k| (RowKey::from(*k), ObservedRow::default()))
+                .collect(),
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    /// The engine spells an `int` key `1`; the declaration wrote `01`. The
+    /// engine said they are the same row, and each side reads it back under
+    /// its own spelling — an `exact` block, an `ensure` block, and `pull`.
+    #[test]
+    fn a_declared_key_comes_back_in_the_declared_spelling() {
+        let mut seen = observed(&["1", "2"]);
+        seen.aliases.insert(RowKey::from("01"), RowKey::from("1"));
+        let keys = |ks: &[&str]| ks.iter().map(|k| RowKey::from(*k)).collect::<BTreeSet<_>>();
+        assert_eq!(seen.row(&RowKey::from("01")).unwrap().0, &RowKey::from("1"));
+        assert_eq!(seen.row(&RowKey::from("2")).unwrap().0, &RowKey::from("2"));
+        assert!(seen.row(&RowKey::from("3")).is_none());
+
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: keys(&["01"]),
+        };
+        let names: Vec<String> = exact
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            ["01", "2"],
+            "declared spelling where declared, the engine's elsewhere"
+        );
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: keys(&["01"]),
+        };
+        let names: Vec<String> = ensure
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            ["01"],
+            "found through the alias, kept under the declared key"
+        );
+        let pull = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        let names: Vec<String> = pull
+            .project(&seen, None)
+            .rows
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["1", "2"], "nothing to spell: the engine's");
+    }
+
+    /// `1` and `01` declared side by side name one row to the engine; keeping
+    /// either would plan an insert of the other, which the primary key then
+    /// refuses at apply. Refused here instead, by both names.
+    #[test]
+    fn two_spellings_of_one_row_are_refused_not_reconciled() {
+        let mut seen = observed(&["1"]);
+        seen.aliases.insert(RowKey::from("01"), RowKey::from("1"));
+        seen.aliases.insert(RowKey::from("1"), RowKey::from("1"));
+        let both: BTreeSet<RowKey> = ["01", "1"].into_iter().map(RowKey::from).collect();
+        assert_eq!(
+            seen.conflict(&both),
+            Some((RowKey::from("01"), RowKey::from("1"), RowKey::from("1")))
+        );
+        // One side spelling `01` and the other `1` is not a conflict: each
+        // side is asked about its own keys.
+        let one: BTreeSet<RowKey> = ["01"].into_iter().map(RowKey::from).collect();
+        assert_eq!(seen.conflict(&one), None);
+
+        let mut schema = crate::schema::Schema::default();
+        schema.tables.insert(
+            name(),
+            table(Some(vec!["code"]), vec![("01", vec![]), ("1", vec![])]),
+        );
+        let scopes = schema.data_scopes();
+        let mut live = crate::schema::Schema::default();
+        live.tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let observed: ObservedRows = [(name(), seen)].into_iter().collect();
+        let err = live
+            .clone()
+            .with_observed_rows(&observed, &scopes, &schema)
+            .unwrap_err();
+        assert_eq!(err.first, RowKey::from("01"));
+        assert_eq!(err.second, RowKey::from("1"));
+        assert!(err.to_string().contains("declare it once"), "{err}");
+        let err = plan_base(&live, &observed, &BTreeMap::new(), &schema).unwrap_err();
+        assert_eq!(err.canonical, RowKey::from("1"));
+    }
+
+    /// The catalog cannot tell `label: Unlabelled` from an omitted `label`
+    /// when the default is `'Unlabelled'`; the side that reads the row can,
+    /// and each side must see its own spelling back — or one of the two
+    /// would be restated on every connected plan.
+    #[test]
+    fn a_cell_at_its_default_is_explicit_only_where_the_side_spells_it() {
+        let text = |s: &str| Value::Text(s.to_owned());
+        let seen = ObservedRow {
+            cells: [
+                ("label".to_owned(), text("Unlabelled")),
+                ("rank".to_owned(), Value::Int(1)),
+            ]
+            .into_iter()
+            .collect(),
+            at_default: ["label".to_owned()].into_iter().collect(),
+            unknown: BTreeSet::new(),
+        };
+        // The side omits `label`: omitted. The side writes it: explicit. No
+        // side at all (`pull`): omitted. `rank` is not at its default and is
+        // explicit every time.
+        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        assert_eq!(seen.as_seen_by(Some(&omits)), omits);
+        let writes: Row = [
+            ("label".to_owned(), text("Unlabelled")),
+            ("rank".to_owned(), Value::Int(1)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen.as_seen_by(Some(&writes)), writes);
+        assert_eq!(seen.as_seen_by(None), omits);
+        // A side that writes a *different* value still sees what is stored:
+        // the hand edit that set `label` back to its default is a drift.
+        let other: Row = [("label".to_owned(), text("Other"))].into_iter().collect();
+        assert_eq!(seen.as_seen_by(Some(&other)), writes);
+    }
+
+    /// A default the engine was never asked about (`NEWID()`, `GETDATE()`)
+    /// leaves the cell's provenance unknown. The side's own row decides;
+    /// with no row — `pull` — the value is kept, because a generated key
+    /// is a value the block has to carry, not a default it can be rebuilt
+    /// from. The first cut dropped every such cell from a pulled block.
+    #[test]
+    fn a_cell_of_unknown_provenance_is_kept_unless_the_side_omits_it() {
+        let text = |s: &str| Value::Text(s.to_owned());
+        let seen = ObservedRow {
+            cells: [
+                ("stamp".to_owned(), text("2026-09-03T10:00:00")),
+                ("rank".to_owned(), Value::Int(1)),
+            ]
+            .into_iter()
+            .collect(),
+            at_default: BTreeSet::new(),
+            unknown: ["stamp".to_owned()].into_iter().collect(),
+        };
+        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        assert_eq!(
+            seen.as_seen_by(Some(&omits)),
+            omits,
+            "the declaration's word"
+        );
+        let writes: Row = [
+            ("stamp".to_owned(), text("2026-09-03T10:00:00")),
+            ("rank".to_owned(), Value::Int(1)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen.as_seen_by(Some(&writes)), writes);
+        assert_eq!(seen.as_seen_by(None), writes, "pull keeps the value");
+    }
+
+    #[test]
+    fn an_exact_scope_reads_every_row_and_an_ensure_scope_only_its_keys() {
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(
+            exact.rows_to_read(),
+            RowScope::Every {
+                known: ["a"].into_iter().map(RowKey::from).collect()
+            }
+        );
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(
+            ensure.rows_to_read(),
+            RowScope::Keys(["a"].into_iter().map(RowKey::from).collect())
+        );
+    }
+
+    /// The promise `ensure` makes: a read that fetched more than the declared
+    /// keys (because another scope on the table needed them) must not record
+    /// the application's own rows, or the next `verify` calls them drift.
+    #[test]
+    fn projecting_an_ensure_scope_drops_the_rows_it_did_not_declare() {
+        let ensure = DataScope {
+            mode: DataMode::Ensure,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        let observed = observed(&["a", "b"]);
+        assert_eq!(ensure.project(&observed, None).rows, rows(&["a"]));
+        // The negative case: `exact` keeps the undeclared row, which is
+        // exactly the row the differ has to delete.
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        assert_eq!(exact.project(&observed, None).rows, rows(&["a", "b"]));
+    }
+
+    #[test]
+    fn the_union_read_is_wide_enough_for_both_scopes() {
+        let t = name();
+        let ensure = |keys: &[&str]| DataScope {
+            mode: DataMode::Ensure,
+            keys: keys.iter().map(|k| RowKey::from(*k)).collect(),
+        };
+        let exact = DataScope {
+            mode: DataMode::Exact,
+            keys: BTreeSet::new(),
+        };
+        // ensure + ensure: the keys of both.
+        let read = read_scopes(
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+            &[(t.clone(), ensure(&["b"]))].into_iter().collect(),
+        );
+        assert_eq!(
+            read[&t],
+            RowScope::Keys(["a", "b"].into_iter().map(RowKey::from).collect())
+        );
+        // ensure + exact, either way round: everything, spelling the keys
+        // of both sides.
+        let every = RowScope::Every {
+            known: ["a"].into_iter().map(RowKey::from).collect(),
+        };
+        let read = read_scopes(
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+            &[(t.clone(), exact.clone())].into_iter().collect(),
+        );
+        assert_eq!(read[&t], every);
+        let read = read_scopes(
+            &[(t.clone(), exact)].into_iter().collect(),
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+        );
+        assert_eq!(read[&t], every);
+        // A table on one side only is still read.
+        let read = read_scopes(
+            &BTreeMap::new(),
+            &[(t.clone(), ensure(&["a"]))].into_iter().collect(),
+        );
+        assert!(read.contains_key(&t));
+    }
+
+    /// Absent, empty and unread are three different things: a scoped table the
+    /// read did not reach stays `None`, never becomes "declares no rows".
+    #[test]
+    fn a_scoped_table_with_no_observed_rows_is_not_recorded_as_empty() {
+        let mut schema = crate::schema::Schema::default();
+        schema
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let scopes: DataScopes = [(
+            name(),
+            DataScope {
+                mode: DataMode::Exact,
+                keys: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let none = crate::schema::Schema::default();
+        let unread = schema
+            .clone()
+            .with_observed_rows(&BTreeMap::new(), &scopes, &none)
+            .unwrap();
+        assert_eq!(unread.tables[&name()].data, None);
+        let read = schema
+            .with_observed_rows(
+                &[(name(), ObservedTable::default())].into_iter().collect(),
+                &scopes,
+                &none,
+            )
+            .unwrap();
+        assert_eq!(
+            read.tables[&name()].data,
+            Some(TableData {
+                mode: DataMode::Exact,
+                rows: BTreeMap::new()
+            })
+        );
+    }
+
+    /// The base a connected plan sees: the recorded mode where there is one,
+    /// so a mode switch reaches the gate, and every row the read fetched.
+    #[test]
+    fn the_plan_base_keeps_the_recorded_mode_and_every_observed_row() {
+        let mut live = crate::schema::Schema::default();
+        live.tables
+            .insert(name(), table(Some(vec!["code"]), vec![]));
+        let observed: ObservedRows = [(name(), observed(&["a", "b"]))].into_iter().collect();
+        let recorded: DataScopes = [(
+            name(),
+            DataScope {
+                mode: DataMode::Ensure,
+                keys: ["a"].into_iter().map(RowKey::from).collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let mut declared = crate::schema::Schema::default();
+        declared
+            .tables
+            .insert(name(), table(Some(vec!["code"]), vec![("a", vec![])]));
+        let base = plan_base(&live, &observed, &recorded, &declared).unwrap();
+        let data = base.tables[&name()].data.as_ref().unwrap();
+        assert_eq!(
+            data.mode,
+            DataMode::Ensure,
+            "the recorded mode, so the switch shows"
+        );
+        assert_eq!(
+            data.rows,
+            rows(&["a", "b"]),
+            "unfiltered: `b` is what exact will delete"
+        );
+        // Taken over for the first time: the declared mode, since nothing was
+        // recorded to differ from.
+        let base = plan_base(&live, &observed, &BTreeMap::new(), &declared).unwrap();
+        assert_eq!(
+            base.tables[&name()].data.as_ref().unwrap().mode,
+            DataMode::Exact
+        );
+        // Neither side covers it: untouched.
+        let base = plan_base(
+            &live,
+            &observed,
+            &BTreeMap::new(),
+            &crate::schema::Schema::default(),
+        )
+        .unwrap();
+        assert_eq!(base.tables[&name()].data, None);
     }
 }

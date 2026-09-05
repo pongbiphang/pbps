@@ -8,12 +8,12 @@ use serde_saphyr::Spanned;
 use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, DataMode, ForeignKey, Identity, Index, IndexColumn,
-    Intent, Module, ModuleKind, ObjectName, PrimaryKey, Row, RowKey, Strategy, Table, TableData,
-    TableName, UniqueConstraint, Value,
+    CheckConstraint, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity, Index,
+    IndexColumn, Intent, Module, ModuleKind, ObjectName, Permission, PrimaryKey, Role, Row, RowKey,
+    Strategy, Table, TableData, TableName, UniqueConstraint, Value,
 };
 
-use crate::dto::{DataDto, ModuleDto, PrimaryKeyDto, TableDto, ValueDto};
+use crate::dto::{DataDto, ModuleDto, PrimaryKeyDto, RoleDto, TableDto, ValueDto};
 use crate::error::{LoadError, SourceFile, to_span};
 
 /// The result of loading one declaration file.
@@ -35,6 +35,127 @@ pub struct LoadedModule {
     /// Kept out of `module` so that `Schema` equality stays a question about
     /// the database alone: creation order is invisible there (ADR-0002).
     pub depends_on: std::collections::BTreeSet<ObjectName>,
+}
+
+/// The result of loading one role declaration (ADR-0005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedRole {
+    pub name: String,
+    pub role: Role,
+    /// A `renamed_from:`, extracted rather than stored — the same one-shot
+    /// rule tables follow.
+    pub intents: Vec<Intent>,
+}
+
+/// DTO to domain model for one role.
+///
+/// The name is a bare identifier: a role is a database principal, not an
+/// object in a schema, so a dot in it is almost certainly a table name typed
+/// into the wrong file.
+pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<LoadError>> {
+    let mut errs = Vec::new();
+    let mut intents = Vec::new();
+
+    // Verbatim, and `trim()` only to ask whether there is a name at all.
+    // Measured: SQL Server stores `CREATE ROLE [ app_pad ]` with its padding,
+    // `needs_quotes` refuses any scalar that is not its own `trim()` so `pull`
+    // writes it back quoted, and YAML hands it here intact — trimming it made
+    // a freshly pulled project name a role the database does not have, while
+    // the ids file named the one it does (DECISIONS 177).
+    let name = dto.role.value.clone();
+    // A dot is not refused: a role is not in a schema, but `[app.reader]`
+    // is a legal principal name, the emitter quotes it, and `pull` writes
+    // it back as it is — refusing it here made a freshly pulled project
+    // fail to load.
+    if name.trim().is_empty() {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&dto.role.defined),
+            "a role must have a name",
+            "empty",
+        ));
+    }
+
+    if let Some(from) = &dto.renamed_from {
+        // The same, for the same reason: this names a role the database has,
+        // and a trimmed one asks it to rename a principal that is not there.
+        let from = from.value.clone();
+        if !name.trim().is_empty() {
+            intents.push(Intent::RenameRole {
+                from,
+                to: name.clone(),
+            });
+        }
+    }
+
+    let mut role = Role {
+        description: dto.description,
+        grants: Default::default(),
+    };
+    // The spelling each parsed target was first written in: `SCHEMA::dbo`
+    // and `schema::dbo` are one target, and the map would keep whichever
+    // came last — with the other's permissions gone, and the next connected
+    // plan revoking them (DECISIONS 126).
+    let mut spelled: std::collections::BTreeMap<GrantTarget, &str> = Default::default();
+    for (target, permissions) in &dto.grants {
+        let written = target.as_str();
+        let target = match GrantTarget::from_str(target) {
+            Ok(t) => t,
+            Err(e) => {
+                errs.push(
+                    LoadError::semantic(
+                        src,
+                        to_span(&dto.role.defined),
+                        format!("invalid grant target `{target}`: {e}"),
+                        e.to_string(),
+                    )
+                    .with_help("a target is `schema.object` or `schema::name`"),
+                );
+                continue;
+            }
+        };
+        if let Some(first) = spelled.insert(target.clone(), written) {
+            errs.push(
+                LoadError::semantic(
+                    src,
+                    to_span(&dto.role.defined),
+                    format!("`{written}` and `{first}` name the same grant target"),
+                    "listed twice",
+                )
+                .with_help("keep one entry per target, with every permission in its list"),
+            );
+            continue;
+        }
+        if permissions.is_empty() {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&dto.role.defined),
+                format!("`{target}` is listed with no permission"),
+                "empty list",
+            ));
+            continue;
+        }
+        let mut set = std::collections::BTreeSet::new();
+        for p in permissions {
+            match parse_at::<Permission>(src, p, "invalid permission") {
+                Ok(p) => {
+                    set.insert(p);
+                }
+                Err(e) => errs.push(e),
+            }
+        }
+        role.grants.insert(target, set);
+    }
+
+    if errs.is_empty() {
+        Ok(LoadedRole {
+            name,
+            role,
+            intents,
+        })
+    } else {
+        Err(errs)
+    }
 }
 
 /// Parses a `Spanned` string, labelling any failure on that value.

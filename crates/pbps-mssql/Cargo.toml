@@ -12,6 +12,7 @@ pbps-model.workspace = true
 pbps-dialect.workspace = true
 pbps-db.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tiberius.workspace = true
 
 [dev-dependencies]

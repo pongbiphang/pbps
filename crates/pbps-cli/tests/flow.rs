@@ -974,6 +974,28 @@ fn pull_refuses_to_overwrite_existing_declarations() {
     assert!(!err.contains("nowhere.invalid"), "{err}");
 }
 
+/// An ids file that names only roles is identity state too: a role-only
+/// project whose declaration directory is empty (a role file deleted by
+/// mistake, say) must not have its `r_` mapping replaced by an unforced pull.
+#[test]
+fn pull_refuses_to_overwrite_role_identities() {
+    let d = Demo::new("pull-refuse-roles");
+    std::fs::write(
+        d.ids_path(),
+        "{\"version\":1,\"tables\":{},\"columns\":{},\"roles\":{\"r_aaaaaa\":\"app_reader\"}}\n",
+    )
+    .unwrap();
+    let o = d.run(&[
+        "pull",
+        "--db",
+        "Server=nowhere.invalid,1433;Database=x;User Id=u;Password=p",
+    ]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("already has declarations"), "{err}");
+    assert!(!err.contains("nowhere.invalid"), "{err}");
+}
+
 #[test]
 fn pull_names_the_dialect_it_needs() {
     let d = Demo::new("pull-dialect");
@@ -1189,6 +1211,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
                 },
                 risks: Default::default(),
                 strategy: Default::default(),
+                findings: Default::default(),
             }],
         },
         pbps_model::IdsFile::default(),
@@ -1502,9 +1525,10 @@ fn staged_needs_a_target() {
 /// list is enough, and nothing here has to connect.
 fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
+    let version = pbps_model::plan::CURRENT_VERSION;
     let plan = format!(
         r#"{{
-  "version": 3,
+  "version": {version},
   "origin": "database",
   "mode": "{mode}",
   "dialect": "mssql",
@@ -1581,6 +1605,8 @@ fn resume_without_staged_is_refused() {
         "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
         "--plan",
         plain.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plain),
         "--resume",
     ]);
     assert_ne!(code(&o), 0);
@@ -1839,6 +1865,46 @@ fn bootstrap_honours_declared_module_dependencies() {
     let first = sql.find("[dbo].[first]").expect(&sql);
     let second = sql.find("[dbo].[second]").expect(&sql);
     assert!(first < second, "dependency order was discarded:\n{sql}");
+}
+
+/// Bootstrap builds what the identity file knows; a declared role (or
+/// table) it does not know would be skipped silently, and the empty state
+/// recorded as the whole one. Refused by name, with `pbps plan` as the
+/// remedy (DECISIONS 109).
+#[test]
+fn bootstrap_refuses_a_declared_object_the_identity_file_does_not_know() {
+    let d = Demo::new("bootids");
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("reporting.yml"),
+        "role: reporting\ngrants:\n  schema::dbo: [select]\n",
+    )
+    .unwrap();
+    // A role-only project, never planned: the identity file is empty.
+    let sql_path = d.dir.join("boot.sql");
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("role reporting") && stderr(&o).contains("pbps plan"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!sql_path.exists(), "nothing was written");
+
+    // Planned, it builds; a table added after that plan is refused the same
+    // way, by name.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        std::fs::read_to_string(&sql_path)
+            .unwrap()
+            .contains("CREATE ROLE [reporting]")
+    );
+    d.table(ONE_COLUMN);
+    let o = d.run(&["bootstrap", "--sql", sql_path.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("dbo.t"), "{}", stderr(&o));
 }
 
 // ---- Phase 3.1: one machine-readable shape, and three exit codes ----
@@ -3043,13 +3109,21 @@ fn explain_refuses_a_plan_version_it_does_not_understand() {
 
     // The same plan, one version ahead.
     let raw = std::fs::read_to_string(&plan).unwrap();
-    let bumped = raw.replace("\"version\": 3", "\"version\": 4");
+    let current = pbps_model::plan::CURRENT_VERSION;
+    let bumped = raw.replace(
+        &format!("\"version\": {current}"),
+        &format!("\"version\": {}", current + 1),
+    );
     assert_ne!(raw, bumped, "the fixture must carry a version to bump");
     std::fs::write(&plan, bumped).unwrap();
 
     let o = d.run(&["explain", "--plan", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("version 4"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(&format!("version {}", current + 1)),
+        "{}",
+        stderr(&o)
+    );
     assert!(
         !stdout(&o).contains("pbps apply"),
         "a plan this build cannot read must not come with an approval command: {}",
@@ -5189,32 +5263,2424 @@ fn an_oversized_data_block_warns_but_still_plans() {
 
     let o = d.run(&["validate", "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert_eq!(v["findings"][0]["id"], "schema.data-large", "{v}");
+    // The `data.max-rows` policy rule, with `max_data_rows` as its default
+    // parameter (ADR-0008).
+    assert_eq!(v["findings"][0]["id"], "data.max-rows", "{v}");
     assert_eq!(v["findings"][0]["severity"], "warning", "{v}");
     // A warning is not a finding the pipeline must act on.
     assert_eq!(code(&o), 0, "{}", stdout(&o));
     assert_eq!(code(&d.run(&["plan"])), 0);
 }
 
-/// Until the connected half of ADR-0004 reads rows back from the catalog, a
-/// live target has not observed them — and a plan computed against it would
-/// insert every declared row on every run. Refused, before any connection is
-/// opened, which is why this test needs no server.
+/// A table this revision renames is read, scoped and measured under the name
+/// the database still has. With the declared scope keyed by the new name the
+/// read found no table, and an `ensure` -> `exact` switch in the same
+/// revision planned none of its deletes: the rogue row survived an apply
+/// that reported success.
 #[test]
-fn a_connected_plan_refuses_reference_data_it_cannot_observe() {
-    let d = Demo::new("datadbrefuse");
-    d.table(LOOKUP);
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_renamedata_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("renamedata-live");
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: ensure\n  rows:\n    new: {}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // Under `ensure` the application's own row is invisible, by design.
+    sql("INSERT INTO dbo.t (code) VALUES ('rogue');");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // One revision: the table is renamed and its block becomes `exact`.
+    std::fs::remove_file(d.dir.join("schema/dbo.t.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.t2.yml"),
+        "table: dbo.t2\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-table", "dbo.t", "dbo.t2"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("row rogue"),
+        "the rogue row is read under the old name: {out}"
+    );
+    assert!(out.contains("data-delete"), "{out}");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,data-delete",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
+
+/// A declared text the engine reads back differently — `"1.5"` in a
+/// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
+/// it and drift from the declaration on every later plan. Every connected
+/// command asks the engine first and refuses with the spelling to write
+/// (DECISIONS 101); only a real engine can say what that spelling is.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_spelling_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("spelling-live");
+    let declared = |pct: &str, since: &str, extra_rows: &str| {
+        format!(
+            "table: dbo.rate\ncolumns:\n  code: {{type: varchar(10), nullable: false}}\n  \
+             pct: {{type: \"decimal(5,2)\"}}\n  since: {{type: date}}\n\
+             primary_key: [code]\ndata:\n  mode: exact\n  rows:\n    std: {{pct: \"{pct}\", \
+             since: \"{since}\"}}\n{extra_rows}"
+        )
+    };
+    // `STD` beside `std`: one row to the engine under its case-insensitive
+    // collation, and no row to alias against on a table that does not exist
+    // yet (DECISIONS 106).
+    d.table(&declared("1.5", "2026-9-3", "    STD: {}\n"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Refused before the table exists, naming both spellings and the two
+    // keys that are one, and nothing was built.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("rows `STD` and `std` are the same row to the database"),
+        "{err}"
+    );
+    assert!(
+        err.contains("`pct` is written \"1.5\"") && err.contains("\"1.50\""),
+        "{err}"
+    );
+    assert!(
+        err.contains("`since` is written \"2026-9-3\"") && err.contains("\"2026-09-03\""),
+        "{err}"
+    );
+
+    // Written the engine's way, it goes in and comes back as declared: the
+    // next connected plan has nothing to say.
+    d.table(&declared("1.50", "2026-09-03", ""));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // And a connected plan against a database that has the row is refused
+    // the same way, before a plan that could never converge is written.
+    d.table(&declared("1.5", "2026-09-03", ""));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`pct` is written \"1.5\"") && stderr(&o).contains("\"1.50\""),
+        "{}",
+        stderr(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// `plan --db` and `bootstrap` hand statements to a database that is not a
+/// rehearsal, and used to ask none of the questions `validate` asks: a role
+/// granting `execute` on a table reached an applyable plan, and its `GRANT` —
+/// ordered after every table, row and module statement — would fail on a
+/// database those statements had already changed (DECISIONS 141).
+///
+/// Offline on purpose: the refusal happens before the connection is opened,
+/// so the unreachable address in the environment is the assertion. Without
+/// the check the command gets as far as failing to connect.
+#[test]
+fn a_connected_plan_refuses_a_declaration_validate_would_reject() {
+    let d = Demo::new("plan-db-validates");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("app_reader.yml"),
+        "role: app_reader\ngrants:\n  dbo.customer: [execute]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // 127.0.0.1:1 answers nothing; reaching it at all is the failure.
+    let unreachable = "Server=127.0.0.1,1;User Id=sa;Password=no;TrustServerCertificate=true";
+    for command in [
+        vec!["plan", "--db", unreachable],
+        vec!["bootstrap", "--db", unreachable],
+    ] {
+        let o = d.run(&command);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("`execute` does not apply to `dbo.customer`"),
+            "{command:?}: {}",
+            stderr(&o)
+        );
+        assert!(
+            !stderr(&o).contains("127.0.0.1"),
+            "the declarations are refused before anything is connected to: {}",
+            stderr(&o)
+        );
+    }
+}
+
+/// One revision that retypes a column and deletes an undeclared row from the
+/// same `exact` table. `AlterColumnType` sorts before the row changes, so by
+/// the time the `DELETE` runs the engine has converted the recorded value out
+/// of the spelling the plan wrote down: `decimal(5,2)` `2.50` reads back as
+/// `2` under `int`, the predicate matched nothing, and the apply aborted —
+/// in staged mode after the conversion had committed (DECISIONS 146).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_delete_beside_a_type_change_in_the_same_revision_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_retype_delete_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let declared = |ty: &str| {
+        format!(
+            "table: dbo.t
+columns:
+  code: {{type: varchar(20), nullable: false}}
+  pct: {{type: '{ty}'}}
+primary_key: {{name: pk_t, columns: [code]}}
+data:
+  mode: exact
+  rows:
+    keep: {{}}
+"
+        )
+    };
+    let d = Demo::new("retype-delete-live");
+    d.table(&declared("decimal(5,2)"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A row the declaration does not have, adopted into the baseline so the
+    // next plan is the one that removes it.
+    sql("INSERT INTO dbo.t (code, pct) VALUES ('rogue', 2.50);");
+    assert_eq!(
+        code(&d.run(&[
+            "baseline",
+            "--db",
+            &connection,
+            "--reason",
+            "adopt the rogue row"
+        ])),
+        0
+    );
+
+    // The same revision retypes the column and deletes that row.
+    d.table(&declared("int"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("row rogue"), "{out}");
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-delete,narrowing,destructive,not-null",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// A schema name is the one name in a declaration with no identity behind
+/// it: text on both sides, whether it is a `schema::` grant target or the
+/// schema half of a qualified table name. Declared `schema::DBO` on a
+/// case-insensitive database grants successfully, reads back as `dbo`, and is
+/// revoked and granted again by every plan after — so it is refused before a
+/// plan is written (DECISIONS 142). Only the engine knows how it spells a
+/// schema, and whether it considers the two one name at all.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_schema_name_the_database_spells_differently_is_refused() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_schemacase_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("schemacase-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    let role_file = d.dir.join("schema").join("roles").join("reporting.yml");
+    let role = |target: &str| format!("role: reporting\ngrants:\n  schema::{target}: [select]\n");
+    std::fs::write(&role_file, role("DBO")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`DBO` (granted to role `reporting`) is written `dbo` by the database"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The schema half of a qualified table name is the same text on both
+    // sides, and worse when it disagrees: `DBO.customer` was created as
+    // `dbo.customer`, recorded as a state with no tables in it at all, and
+    // reported as drift by the `verify` that followed the successful
+    // bootstrap. A project of its own, because swapping one declared table
+    // for another inside one is a rename nobody expressed.
+    {
+        let d = Demo::new("schemacase-table-live");
+        d.table(
+            "table: DBO.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+        );
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let o = d.run(&["bootstrap", "--db", &connection]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("`DBO` (the schema of `DBO.customer`) is written `dbo`"),
+            "{}",
+            stderr(&o)
+        );
+    }
+
+    // The database's own spelling is accepted, and — the point of the
+    // refusal — plans again as no change at all.
+    std::fs::write(&role_file, role("dbo")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("No changes."),
+        "the accepted spelling has to converge: {}",
+        stdout(&o)
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// Users, roles and application roles share one namespace in SQL Server; a
+/// role declared under a user's name looked free to the managed set and
+/// `CREATE ROLE` failed after everything ordered before it had run. Refused
+/// before anything runs, by `bootstrap` and by `plan --db`, with the
+/// principal's kind (DECISIONS 118). Only the engine knows who holds a name.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_role_named_like_a_user_is_refused_before_anything_runs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_rolename_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+    sql("CREATE USER shadow WITHOUT LOGIN;");
+
+    let d = Demo::new("rolename-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    let role_file = d.dir.join("schema").join("roles").join("shadow.yml");
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Two declared roles the database reads as one name pass every check
+    // against the catalog — nothing holds either yet — and the second
+    // `CREATE ROLE` would fail after the tables went in. The engine says
+    // which names are one (DECISIONS 123).
+    let pair = |d: &Demo| {
+        for role in ["Reader", "reader"] {
+            std::fs::write(
+                d.dir
+                    .join("schema")
+                    .join("roles")
+                    .join(format!("{role}.yml")),
+                format!("role: {role}\ngrants:\n  dbo.customer: [select]\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(code(&d.run(&["plan"])), 0);
+    };
+    let unpair = |d: &Demo| {
+        for role in ["Reader", "reader"] {
+            std::fs::remove_file(
+                d.dir
+                    .join("schema")
+                    .join("roles")
+                    .join(format!("{role}.yml")),
+            )
+            .unwrap();
+            let o = d.run(&["drop-role", role, "--reason", "never created"]);
+            assert_eq!(code(&o), 0, "{}", stderr(&o));
+        }
+    };
+    pair(&d);
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    unpair(&d);
+
+    // Bootstrap: refused before the table goes in, naming the user.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Without the role the project bootstraps, with another role to rename
+    // later on.
+    std::fs::remove_file(&role_file).unwrap();
+    let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let reporter_file = d.dir.join("schema").join("roles").join("reporter.yml");
+    std::fs::write(
+        &reporter_file,
+        "role: reporter\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Declared afterwards, the role is refused by the connected plan the
+    // same way.
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_file(&role_file).unwrap();
+    let o = d.run(&["drop-role", "shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The pair, by the connected plan: the same refusal, before any plan is
+    // written.
+    pair(&d);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o)
+            .contains("two declared roles are one name to this database: `Reader` and `reader`"),
+        "{}",
+        stderr(&o)
+    );
+    unpair(&d);
+
+    // And in another case: `Shadow` is `shadow` to this database, which is
+    // the engine's call under its collation, not a string comparison's
+    // (DECISIONS 119).
+    let shadow_file = d.dir.join("schema").join("roles").join("Shadow.yml");
+    std::fs::write(
+        &shadow_file,
+        "role: Shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`Shadow` is `shadow` to this database, a sql user"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_file(&shadow_file).unwrap();
+    let o = d.run(&["drop-role", "Shadow", "--reason", "never created"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A rename onto the name is checked like a creation: the target has to
+    // be free, or `ALTER ROLE ... WITH NAME` fails after everything before it.
+    std::fs::remove_file(&reporter_file).unwrap();
+    std::fs::write(
+        &role_file,
+        "role: shadow\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-role", "reporter", "shadow"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`shadow` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+
+    // Renamed to a free name instead, the plan is made — and a user created
+    // under that name before the apply is met before statement one: a
+    // principal is outside the managed state, so the checksum cannot see it.
+    std::fs::remove_file(&role_file).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("auditor.yml"),
+        "role: auditor\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["rename-role", "shadow", "auditor"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let plan = d.dir.join("rename.plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    sql("CREATE USER auditor WITHOUT LOGIN;");
+    let apply = || {
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--allow",
+            "rename",
+        ])
+    };
+    let o = apply();
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`auditor` is a sql user"),
+        "{}",
+        stderr(&o)
+    );
+    sql("DROP USER auditor;");
+    let o = apply();
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // A permission the declarations cannot hold is drift to `verify`, and
+    // was "ok" to `status`, whose checksum is computed from the schema the
+    // permission is carried beside, not in (DECISIONS 125). Both commands
+    // now say drift, with the permission named.
+    let var = format!("PBPS_STATUS_ROLE_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    let status = || {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["status", "--format", "json"])
+            .env(&var, &connection)
+            .output()
+            .unwrap()
+    };
+    let v: serde_json::Value = serde_json::from_str(&stdout(&status())).unwrap();
+    assert_eq!(v["data"][0]["state"], "ok", "{v}");
+    sql("GRANT SELECT ON dbo.customer TO auditor WITH GRANT OPTION;");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&status())).unwrap();
+    assert_eq!(v["data"][0]["state"], "drift", "{v}");
+    assert!(
+        v["data"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("auditor") && d.contains("GRANT OPTION")),
+        "{v}"
+    );
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// A dropped role's members are listed at plan time so a reviewer sees who
+/// loses the role, and membership is each environment's own — so a member
+/// Two roles dropped together, one a member of the other: the differ ranks
+/// the drops parent-first (DECISIONS 127), but it never sees the members —
+/// `plan --db` writes them in afterwards — so the order has to be applied
+/// again once they are known (139). The names are chosen so that the name
+/// tiebreaker alone would drop the member first, after which the holder's
+/// `DROP MEMBER` names a principal already gone and the whole apply rolls
+/// back. Only a real engine refuses that by name.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_nestedroles_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    let roles = || -> i32 {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let rows = c
+                .query(&format!(
+                    "USE [{name}]; SELECT COUNT(*) FROM sys.database_principals \
+                     WHERE type = 'R' AND name IN ('a_analysts', 'z_reporting');"
+                ))
+                .await
+                .expect("count roles");
+            rows[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("nestedroles-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    let roles_dir = d.dir.join("schema").join("roles");
+    std::fs::create_dir_all(&roles_dir).unwrap();
+    for role in ["a_analysts", "z_reporting"] {
+        std::fs::write(
+            roles_dir.join(format!("{role}.yml")),
+            format!("role: {role}\ngrants:\n  dbo.customer: [select]\n"),
+        )
+        .unwrap();
+    }
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The environment makes one role a member of the other — the member
+    // sorts first by name, which is the wrong order to drop them in.
+    sql("ALTER ROLE z_reporting ADD MEMBER a_analysts;");
+    for role in ["a_analysts", "z_reporting"] {
+        std::fs::remove_file(roles_dir.join(format!("{role}.yml"))).unwrap();
+        let o = d.run(&["drop-role", role, "--reason", "SEC-9 retired"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let listing = stdout(&o);
+    let holder = listing
+        .find("drop role z_reporting, removing 1 member(s) first: a_analysts")
+        .unwrap_or_else(|| panic!("the holder's drop lists its member:\n{listing}"));
+    let member = listing
+        .find("drop role a_analysts")
+        .unwrap_or_else(|| panic!("the member's drop:\n{listing}"));
+    assert!(holder < member, "the holder is dropped first:\n{listing}");
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(roles(), 0, "both roles are gone");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// added between `plan --db` and `apply` is invisible to the checksum. The
+/// apply has to ask again before statement one (DECISIONS 92): a staged apply
+/// that found out at `DROP ROLE` would have committed every `DROP MEMBER` the
+/// reviewer saw. Only a real engine holds a membership to change under the
+/// plan.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_roledrop_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    let members = || -> i32 {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let rows = c
+                .query(&format!(
+                    "USE [{name}]; SELECT COUNT(*) FROM sys.database_role_members rm \
+                     JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
+                     WHERE r.name = 'reporting';"
+                ))
+                .await
+                .expect("count members");
+            rows[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("roledrop-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    std::fs::write(
+        d.dir.join("schema").join("roles").join("reporting.yml"),
+        "role: reporting\ngrants:\n  dbo.customer: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The environment gives the role a member; the plan lists it.
+    sql("CREATE USER analyst_a WITHOUT LOGIN; ALTER ROLE reporting ADD MEMBER analyst_a;");
+    std::fs::remove_file(d.dir.join("schema").join("roles").join("reporting.yml")).unwrap();
+    let o = d.run(&["drop-role", "reporting", "--reason", "SEC-9 retired"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("analyst_a"), "{}", stdout(&o));
+
+    // Another member after the plan was made. The apply is refused before
+    // anything runs, naming the member nobody reviewed, and the first member
+    // still holds the role.
+    sql("CREATE USER analyst_b WITHOUT LOGIN; ALTER ROLE reporting ADD MEMBER analyst_b;");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("analyst_b"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("plan --db"), "{}", stderr(&o));
+    assert_eq!(members(), 2, "nothing ran");
+
+    // A plan made against the role as it is now lists both, and applies.
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("analyst_b"), "{}", stdout(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "revoke",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(members(), 0, "the role is gone");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .expect("drop database");
+    });
+}
+
+/// The connected half of ADR-0004, end to end through the real binary: the
+/// rows go in with `bootstrap`, come back into the recorded state in the
+/// engine's spelling, a hand-edited row is drift, a re-declared table plans
+/// against what the target holds, and `pull --data` writes the block back.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn reference_data_round_trips_through_a_real_target() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    // A database of its own, so the shared server's `master` never holds the
+    // lookup table, and two runs cannot meet in it.
+    let name = format!("pbps_cli_refdata_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    // `seq` is the engine's column: a declaration cannot set it and an UPDATE
+    // cannot change it, so it is never read back and never compared — read
+    // back, its value met the omission every row has to make and the second
+    // plan restated an UPDATE the engine refuses (DECISIONS 94).
+    let declared = "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  label: {type: nvarchar(50), nullable: false, default: \"'Unlabelled'\"}
+  rank: {type: int}
+  seq: {type: int, nullable: false, identity: [1, 1]}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    new: {label: New, rank: 1}
+    old: {}
+";
+    let d = Demo::new("refdata-live");
+    d.table(declared);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Bootstrap builds the table and inserts the rows; the state it records
+    // has to hold them, read back.
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "no drift right after bootstrap: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // A hand edit to a declared row is drift, named by its key.
+    sql("UPDATE dbo.t SET label = N'Ancient' WHERE code = 'old';");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("row old"), "{}", stdout(&o));
+    // ...and a rogue row in an `exact` table is drift too.
+    sql("INSERT INTO dbo.t (code, label) VALUES ('rogue', N'Rogue');");
+    let o = d.run(&["verify", "--db", &connection]);
+    assert!(stdout(&o).contains("row rogue"), "{}", stdout(&o));
+
+    // A connected plan is computed against what the target holds: the edit is
+    // put back, the rogue row goes behind the gate, and the second apply of
+    // the same declaration is empty rather than a primary-key violation.
+    assert_eq!(
+        code(&d.run(&[
+            "baseline",
+            "--db",
+            &connection,
+            "--reason",
+            "adopt the hand edits"
+        ])),
+        0
+    );
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("row old"),
+        "the edited label is restated: {out}"
+    );
+    assert!(out.contains("row rogue"), "{out}");
+    assert!(out.contains("data-delete"), "{out}");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("No changes"),
+        "the same declaration must plan nothing the second time: {}",
+        stdout(&o)
+    );
+
+    // A table gaining its first `data:` block: its rows are pinned by the
+    // plan too, so a row that appears between plan and apply is refused —
+    // under `exact`, that row would otherwise outlive the approved deletes.
+    let u_path = d.dir.join("schema/dbo.u.yml");
+    std::fs::write(
+        &u_path,
+        "table: dbo.u\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_u, columns: [code]}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan2 = d.dir.join("plan2.json");
     let o = d.run(&[
         "plan",
         "--db",
-        "Server=localhost,1;Database=x;User Id=u;Password=p;TrustServerCertificate=true",
+        &connection,
+        "--out",
+        plan2.to_str().unwrap(),
     ]);
-    assert_eq!(code(&o), 1, "{}", stdout(&o));
-    let err = stderr(&o);
-    assert!(err.contains("dbo.t"), "the table must be named: {err}");
-    assert!(err.contains("ADR-0004"), "{err}");
-    // Refused for the right reason, not because the bogus server was tried.
-    assert!(!err.contains("cannot connect"), "{err}");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan2.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan2),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    std::fs::write(
+        &u_path,
+        "table: dbo.u\ncolumns:\n  code: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_u, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    a: {}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let plan3 = d.dir.join("plan3.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan3.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    sql("INSERT INTO dbo.u (code) VALUES ('rogue');");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan3.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan3),
+    ]);
+    assert_ne!(
+        code(&o),
+        0,
+        "a row that appeared after the plan: {}",
+        stdout(&o)
+    );
+    assert!(
+        stderr(&o).contains("no longer the database this plan was computed against"),
+        "{}",
+        stderr(&o)
+    );
+    // Put back the way the plan saw it, the same plan applies.
+    sql("DELETE FROM dbo.u WHERE code = 'rogue';");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan3.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan3),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // The block comes back out in the engine's spelling: the default-valued
+    // label is omitted, the explicit one is kept.
+    let fresh = Demo::new("refdata-pull");
+    let o = fresh.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let file = std::fs::read_to_string(fresh.dir.join("schema").join("dbo.t.yml")).unwrap();
+    assert!(file.contains("mode: exact"), "{file}");
+    assert!(file.contains("new: {label: New, rank: 1}"), "{file}");
+    assert!(file.contains("old: {}"), "{file}");
+    assert!(!file.contains("rogue"), "{file}");
+    // And a table this database does not have is refused by name.
+    let o = fresh.run(&["pull", "--db", &connection, "--data", "dbo.nope", "--force"]);
+    assert_eq!(code(&o), 1);
+    assert!(stderr(&o).contains("dbo.nope"), "{}", stderr(&o));
+    // The row line is `validate`'s rule, suppressions included: at `error`
+    // over the count nothing is written, and the same table excused by name
+    // is pulled without a word (DECISIONS 114, 120).
+    let strict = Demo::new("refdata-pull-strict");
+    let rule =
+        "dialect: mssql\npolicies:\n  rules:\n    data.max-rows: {severity: error, rows: 1}\n";
+    std::fs::write(strict.dir.join("pbps.yml"), rule).unwrap();
+    let o = strict.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("Nothing was written"), "{}", stderr(&o));
+    assert!(!strict.dir.join("schema").join("dbo.t.yml").exists());
+    std::fs::write(
+        strict.dir.join("pbps.yml"),
+        format!(
+            "{rule}  suppress:\n    - rule: data.max-rows\n      on: dbo.t\n      reason: known small\n"
+        ),
+    )
+    .unwrap();
+    let o = strict.run(&["pull", "--db", &connection, "--data", "dbo.t"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("rows"), "{}", stderr(&o));
+    assert!(strict.dir.join("schema").join("dbo.t.yml").is_file());
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
+
+// ---- Roles and grants, ADR-0005 ----
+
+const A_TABLE_AND_A_ROLE: [(&str, &str); 2] = [
+    (
+        "dbo.customer.yml",
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_customer, columns: [id]}\n",
+    ),
+    (
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [select]\n",
+    ),
+];
+
+impl Demo {
+    fn files(&self, files: &[(&str, &str)]) {
+        for (name, body) in files {
+            std::fs::write(self.dir.join("schema").join(name), body).unwrap();
+        }
+    }
+}
+
+/// A declared role reaches the plan as `CREATE ROLE` then `GRANT`, after the
+/// object it grants on; the widening is labelled and nothing is gated.
+#[test]
+fn a_declared_role_is_created_then_granted_and_the_widening_is_not_gated() {
+    let d = Demo::new("rolecreate");
+    d.files(&A_TABLE_AND_A_ROLE);
+
+    let sql_path = d.dir.join("plan.sql");
+    let o = d.run(&["plan", "--sql", sql_path.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    let create_table = sql.find("CREATE TABLE").expect(&sql);
+    let create_role = sql.find("CREATE ROLE [app_reader];").expect(&sql);
+    let grant = sql
+        .find("GRANT SELECT ON OBJECT::[dbo].[customer] TO [app_reader];")
+        .expect(&sql);
+    assert!(create_table < grant && create_role < grant, "{sql}");
+
+    let out = stdout(&o);
+    assert!(out.contains("grant-widen"), "labelled: {out}");
+    assert!(!out.contains("--allow"), "but not gated: {out}");
+    // And the role has identity: an `r_` uid in the file.
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("\"r_"), "{ids}");
+    assert!(ids.contains("app_reader"), "{ids}");
+}
+
+/// Taking a permission away is the availability risk ADR-0005 gates.
+#[test]
+fn removing_a_permission_is_a_revoke_behind_the_gate() {
+    let d = Demo::new("rolerevoke");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.customer: [view-definition]\n",
+    )]);
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("revoke select"), "{out}");
+    assert!(out.contains("grant view-definition"), "{out}");
+    assert!(out.contains("--allow revoke"), "{out}");
+    assert!(!out.contains("--allow revoke,grant-widen"), "{out}");
+}
+
+/// A role rename is a question only its author can answer, and the answer is
+/// recorded the way a table rename is — never as drop + add, which would lose
+/// the role's members.
+#[test]
+fn renaming_a_role_needs_intent_and_rename_role_records_it() {
+    let d = Demo::new("rolerename");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let uid_before = {
+        let ids: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+        ids["roles"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, v)| *v == "app_reader")
+            .map(|(k, _)| k.clone())
+            .unwrap()
+    };
+    d.commit();
+
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
+    d.files(&[(
+        "reader.role.yml",
+        "role: reader\ngrants:\n  dbo.customer: [select]\n",
+    )]);
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("pbps rename-role app_reader reader"),
+        "{}",
+        stderr(&o)
+    );
+
+    let o = d.run(&["rename-role", "app_reader", "reader"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("rename role app_reader -> reader"),
+        "{}",
+        stdout(&o)
+    );
+    // Gated like any rename: the old name is gone, and a module or an
+    // application asking `IS_ROLEMEMBER('app_reader')` breaks on the spot.
+    assert!(stdout(&o).contains("--allow rename"), "{}", stdout(&o));
+    let ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    assert_eq!(
+        ids["roles"][&uid_before], "reader",
+        "the uid survives: {ids}"
+    );
+
+    // The other answer: a drop, which needs a reason and leaves a tombstone.
+    // Committed first, so the baseline knows the role by its new name.
+    d.commit();
+    std::fs::remove_file(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    let o = d.run(&["plan", "--check"]);
+    assert_eq!(code(&o), FINDING);
+    assert!(stderr(&o).contains("drop-role reader"), "{}", stderr(&o));
+    let o = d.run(&["drop-role", "reader", "--reason", "SEC-9 retired"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("drop role reader"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("--allow revoke"), "{}", stdout(&o));
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(ids.contains("SEC-9 retired"), "{ids}");
+}
+
+/// The foreign-key-target rule applied to permissions: a grant on an object
+/// nobody declares is refused by `validate`, and a schema-level grant is not.
+#[test]
+fn a_grant_on_an_undeclared_object_fails_validate() {
+    let d = Demo::new("rolevalidate");
+    d.files(&A_TABLE_AND_A_ROLE);
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: app_reader\ngrants:\n  dbo.ghost: [select]\n  schema::app: [execute]\n",
+    )]);
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["schema.grant-target"], "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dbo.ghost"),
+        "{v}"
+    );
+
+    // And a built-in role is the engine's, not the project's.
+    d.files(&[(
+        "app_reader.role.yml",
+        "role: db_datareader\ngrants:\n  dbo.customer: [select]\n",
+    )]);
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING);
+    assert!(
+        format!("{}{}", stdout(&o), stderr(&o)).contains("built-in"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
+/// `fmt` canonicalizes a role file, keeps a pending rename, and drops it once
+/// the identity file has absorbed it — the same life cycle a table's has.
+#[test]
+fn fmt_keeps_a_pending_role_rename_and_strips_an_absorbed_one() {
+    let d = Demo::new("rolefmt");
+    d.files(&A_TABLE_AND_A_ROLE);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
+    d.files(&[(
+        "reader.role.yml",
+        "role: reader\nrenamed_from: app_reader\ngrants:\n  dbo.customer: [view-definition, select]\n",
+    )]);
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    assert!(text.contains("renamed_from: app_reader"), "pending: {text}");
+    assert!(text.contains("[select, view-definition]"), "sorted: {text}");
+
+    assert_eq!(code(&d.run(&["plan"])), 0, "the annotation is the intent");
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    assert!(!text.contains("renamed_from"), "absorbed: {text}");
+}
+
+// ---- The policies block, ADR-0008 ----
+
+/// A naming rule set to `error` fails `validate` with the rule's own id, and
+/// a suppression with a reason takes it back out — until its expiry.
+#[test]
+fn a_naming_policy_fails_validate_and_a_suppression_lifts_it_until_it_expires() {
+    let d = Demo::new("policynaming");
+    d.table("table: dbo.t\ncolumns:\n  CustomerId: {type: int}\n");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "naming.column", "{v}");
+    assert_eq!(v["findings"][0]["severity"], "error", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`CustomerId`"),
+        "{v}"
+    );
+
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n  suppress:\n    - rule: naming.column\n      on: dbo.t\n      reason: inherited\n      until: 2999-01-01\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Expired: the finding is back at its configured severity.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.column: {severity: error, pattern: \"[a-z_]+\"}\n  suppress:\n    - rule: naming.column\n      on: dbo.t\n      reason: inherited\n      until: 2000-01-01\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["validate"])), FINDING);
+
+    // And a block with a typo is refused by name rather than configuring
+    // nothing: `naming.colum` silently doing nothing would be worse than the
+    // rule having never been written.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.colum: error\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "policy.invalid", "{v}");
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("naming.colum"),
+        "{v}"
+    );
+}
+
+/// The plan point: adding and dropping in one table is the expand/contract
+/// lint, shown under the change at the project's severity — and at `error`
+/// the plan is refused before any file is written.
+#[test]
+fn the_expand_contract_lint_is_shown_in_the_plan_and_at_error_refuses_it() {
+    let d = Demo::new("policyplan");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  old: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    // Not a rename: an add plus a drop, recorded as such.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  added: {type: int}\n");
+    let o = d.run(&["drop", "dbo.t.old", "--reason", "gone"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("warning: change.expand-contract"), "{out}");
+    assert!(out.contains("- drop column old"), "{out}");
+
+    // The same plan carries the finding into the saved artifact.
+    let plan = d.dir.join("plan.json");
+    assert_eq!(code(&d.run(&["plan", "--out", plan.to_str().unwrap()])), 0);
+    let saved = std::fs::read_to_string(&plan).unwrap();
+    assert!(saved.contains("change.expand-contract"), "{saved}");
+    let o = d.run(&[
+        "explain",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.expand-contract"),
+        "{v}"
+    );
+
+    // Raised to error: refused, with nothing written.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.expand-contract: error\n",
+    )
+    .unwrap();
+    let refused = d.dir.join("refused.json");
+    let o = d.run(&["plan", "--out", refused.to_str().unwrap()]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("policy"), "{}", stderr(&o));
+    assert!(!refused.exists(), "a refused plan must not be written");
+    let o = d.run(&["plan", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["result"], "findings", "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.expand-contract" && f["severity"] == "error"),
+        "{v}"
+    );
+
+    // Off: gone, and the plan is produced.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.expand-contract: off\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains("expand-contract"), "{}", stdout(&o));
+}
+
+/// `--since` evaluates the declaration rules for the objects whose identity
+/// changed since the revision, so an estate can adopt a rule one table at a
+/// time — and a rename counts as changed under both names.
+/// `--since` reads the declarations at a revision through git, whose pathspec
+/// resolves against the current directory while `<rev>:<path>` resolves
+/// against the repository root. A project in a subdirectory listed nothing,
+/// so every table read as changed and an error-level rule failed on the
+/// legacy names `--since` exists to leave alone. Its sibling `load_from_git`
+/// already carried the `--full-tree` for this; the second instance is the
+/// shape.
+#[test]
+fn validate_since_reads_the_revision_from_the_repository_root() {
+    let d = Demo::nested("policysince-nested", "db/app");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Nothing changed since HEAD, so nothing is evaluated — though the name
+    // fails the rule, which the plain `validate` confirms.
+    assert_eq!(code(&d.run(&["validate"])), FINDING, "the rule does fail");
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // And a table that did change is still seen, from the same subdirectory.
+    std::fs::write(
+        d.dir.join("schema").join("dbo.NewTable.yml"),
+        "table: dbo.NewTable\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("NewTable"), "{v}");
+}
+
+/// A revision `--since` cannot resolve is a mistake, not an empty history.
+///
+/// Read as empty it is the loudest possible wrong answer: `changed_subjects`
+/// marks every object changed, so a gradual-adoption rule fails declarations
+/// nobody touched, and `plan` proposes creating the entire schema. The one
+/// unresolvable revision that *is* the empty baseline is `HEAD` in a
+/// repository with no commits.
+#[test]
+fn an_unknown_revision_is_refused_rather_than_read_as_empty() {
+    let d = Demo::new("since-unknown");
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    // Before the first commit HEAD does not resolve either, and that one is
+    // the empty baseline: a repository with no previous version.
+    assert_eq!(
+        code(&d.run(&["plan"])),
+        0,
+        "an unborn HEAD is still the empty baseline"
+    );
+    d.commit();
+
+    for args in [
+        vec!["validate", "--since", "no-such-rev"],
+        vec!["plan", "--since", "no-such-rev"],
+    ] {
+        let o = d.run(&args);
+        let msg = format!("{}{}", stdout(&o), stderr(&o));
+        assert_ne!(code(&o), 0, "{args:?} must not succeed: {msg}");
+        assert!(msg.contains("no-such-rev"), "{args:?}: {msg}");
+        assert!(msg.contains("not a revision"), "{args:?}: {msg}");
+    }
+
+    // The revision that does exist still works, and says nothing changed.
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
+/// `national text` *is* `ntext` to SQL Server — `types.rs` lists the alias —
+/// so a default-on rule that matched the raw base name was bypassed by an
+/// equivalent engine spelling (DECISIONS 187).
+#[test]
+fn a_deprecated_type_is_reported_under_its_alias() {
+    let d = Demo::new("aliastype");
+    for ty in ["ntext", "national text"] {
+        d.table(&format!(
+            "table: dbo.t\ncolumns:\n  id: {{type: int}}\n  body: {{type: \"{ty}\"}}\n"
+        ));
+        // A warning, so `validate` still succeeds: what matters is that the
+        // finding is there.
+        let o = d.run(&["validate", "--format", "json"]);
+        assert_eq!(code(&o), 0, "{ty}: {}{}", stdout(&o), stderr(&o));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let ids: Vec<&str> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"column.no-deprecated-type"),
+            "{ty} is deprecated whichever way it is spelled: {v}"
+        );
+    }
+}
+
+/// `git ls-tree --name-only` C-quotes any path outside ASCII with
+/// `core.quotePath` at its default — measured: `schéma/dbo.t.yml` comes back
+/// as `"sch\303\251ma/dbo.t.yml"`, and `git show <rev>:<that>` answers
+/// `fatal: path ... does not exist`. So every historical read of a
+/// declaration under such a path failed, on a repository that is perfectly
+/// well formed (DECISIONS 180).
+#[test]
+fn a_declaration_under_a_non_ascii_path_is_readable_at_a_revision() {
+    let d = Demo::new("unicodepath");
+    std::fs::remove_file(d.dir.join("schema/dbo.t.yml")).ok();
+    let file = d.dir.join("schema").join("dbo.té.yml");
+    std::fs::write(&file, "table: dbo.te\ncolumns:\n  id: {type: int}\n").unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Something has to have changed, or neither command reads the old tree
+    // at all and the bug hides behind the short circuit.
+    std::fs::write(
+        &file,
+        "table: dbo.te\ncolumns:\n  id: {type: int}\n  note: {type: nvarchar(50)}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+
+    // The baseline is that revision's declarations. Skipped, it is *empty* —
+    // and an empty baseline is not an error: the plan reports every table as
+    // newly created and exits 0, which is the silence this codebase exists to
+    // refuse (absent, empty and unreadable are three different things).
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let out = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(!out.contains("baseline is empty"), "{out}");
+    assert!(!out.contains("0 objects"), "{out}");
+    // The revision holds the table, so the plan against it is the one column
+    // that was added — not a `CREATE TABLE`.
+    assert!(out.contains("note"), "{out}");
+    assert!(!out.contains("create table"), "{out}");
+
+    // And `validate --since` copies the same listing out to a scratch
+    // directory: the second reader, and it had the same bug. Skipped there,
+    // the revision looks empty and every object reads as changed.
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
+#[test]
+fn validate_since_evaluates_only_what_changed() {
+    let d = Demo::new("policysince");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: \"[a-z_]+\"}\n",
+    )
+    .unwrap();
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Untouched since HEAD: nothing is evaluated, though the name fails the rule.
+    assert_eq!(code(&d.run(&["validate"])), FINDING, "the rule does fail");
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // A new table is changed.
+    std::fs::write(
+        d.dir.join("schema").join("dbo.NewTable.yml"),
+        "table: dbo.NewTable\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("NewTable"), "{v}");
+
+    // A table changed in content only — same uid, same name, same columns,
+    // one type widened — is the object the revision touched, and identity
+    // alone never saw it: `--since` accepted an error-level rule on it. (A
+    // new column would mint a uid and count as identity; a type does not.)
+    d.commit();
+    let o = d.run(&["validate", "--since", "HEAD"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "committed: nothing changed since HEAD {}",
+        stderr(&o)
+    );
+    d.table("table: dbo.OldTable\ncolumns:\n  id: {type: bigint}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["validate", "--since", "HEAD", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let messages: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1, "{v}");
+    assert!(messages[0].contains("OldTable"), "{v}");
+}
+
+/// A plan that **creates** a table with a foreign key, applied for real.
+///
+/// The gap this fills: no test here ever applied one, and the apply guard got
+/// a created table's shape wrong twice in two commits because of it. The
+/// differ takes the foreign keys out of the `CREATE` payload and emits them
+/// as changes of their own, so the payload alone is not what the table will
+/// hold — and a guard that compares against the payload refuses the plan's
+/// own key (DECISIONS 181, 182).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_created_table_with_a_foreign_key_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_newfk_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("newfk");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // A new table that references the one already there, and a second one
+    // that references *it* — a foreign key between two tables this same plan
+    // creates, which is why the differ splits them out at all.
+    std::fs::write(
+        d.dir.join("schema/dbo.child.yml"),
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  t_id: {type: int}\n  code: {type: varchar(20)}\n  note: {type: nvarchar(50)}\nprimary_key: {name: pk_child, columns: [id]}\nunique:\n  uq_child_code: [code]\nindexes:\n  ix_child_t:\n    columns: [t_id]\n    include: [note]\nforeign_keys:\n  fk_child_t:\n    columns: [t_id]\n    references: dbo.t(id)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.grand.yml"),
+        "table: dbo.grand\ncolumns:\n  id:\n    type: int\n    nullable: false\n    identity: [1, 1]\n  child_id: {type: int}\n  amount: {type: \"decimal(18,2)\"}\n  code: {type: char(3)}\n  stamp: {type: datetime2(3)}\n  body: {type: nvarchar(max)}\n  blob: {type: varbinary(16)}\n  bare_dec: {type: decimal}\n  bare_char: {type: char}\n  bare_float: {type: float}\n  bare_nv: {type: nvarchar}\n  flag: {type: bit, nullable: false, default: \"0\"}\nprimary_key: {name: pk_grand, columns: [id]}\nforeign_keys:\n  fk_grand_child:\n    columns: [child_id]\n    references: dbo.child(id)\n    on_delete: cascade\n",
+    )
+    .unwrap();
+    // Offline first, to mint the identities a deployment plan is pinned to.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // A new foreign key is `constraint` risk: it can refuse rows.
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own foreign key must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
+/// A plan that **reshapes a table already there**, applied for real: a column
+/// added with a bare type and a default, one retyped, one loosened, one given
+/// a default, the primary key replaced by an unnamed one, and a unique, an
+/// index and a foreign key added.
+///
+/// The gap this fills is the mirror of the created-table test above. Every one
+/// of these is a change the apply guard holds to the plan's own definition
+/// once the plan has run (DECISIONS 189), and the comparison is against the
+/// engine's read-back — `decimal` stored as `decimal(18,0)`, a default `0` as
+/// `((0))`, an unnamed key as `PK__t__…`. Only the engine can say the guard
+/// is not refusing its own plan, and before this no live plan added a column,
+/// a key, a unique, an index or a foreign key to an existing table at all.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_plan_that_reshapes_an_existing_table_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_reshape_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("reshape");
+    std::fs::write(
+        d.dir.join("schema/dbo.p.yml"),
+        "table: dbo.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_p, columns: [id]}\n",
+    )
+    .unwrap();
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  region: {type: varchar(10), nullable: false}\n  flag: {type: bit, nullable: false}\n  note: {type: nvarchar(50)}\nprimary_key: {name: pk_t, columns: [code]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The same table, reshaped in every way a plan can reshape one without
+    // dropping anything. `code` keeps its type: it carries the old key, and
+    // the engine refuses to retype a key column under its constraint.
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  region: {type: varchar(10), nullable: false}\n  flag: {type: bit}\n  note: {type: nvarchar(100), default: \"N''\"}\n  amount: {type: decimal, nullable: false, default: \"0\"}\n  p_id: {type: int}\nprimary_key: [code, region]\nunique:\n  uq_t_note: [note]\nindexes:\n  ix_t_p:\n    columns: [p_id, region desc]\n    include: [note]\nforeign_keys:\n  fk_t_p:\n    columns: [p_id]\n    references: dbo.p(id)\n    on_delete: cascade\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The plan holds every shape this test is about, or it proves nothing.
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    for op in [
+        "add_column",
+        "alter_column_type",
+        "alter_column_nullability",
+        "alter_column_default",
+        "set_primary_key",
+        "add_unique",
+        "add_index",
+        "add_foreign_key",
+    ] {
+        assert!(
+            planned.contains(&format!("\"op\":\"{op}\""))
+                || planned.contains(&format!("\"op\": \"{op}\"")),
+            "the plan must carry `{op}`: {planned}"
+        );
+    }
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // The key, the unique and the foreign key are `constraint` risk.
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own definitions must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
+/// A plan that returns a declared cell to its column's default, applied for
+/// real. The guard holds such a cell to *being* at its default at the closing
+/// read, which is a claim about how the engine reads it back: the row reader
+/// asks the engine to confirm a literal default and omits the cell where it
+/// does (DECISIONS 191). Only the engine can say the guard is not refusing its
+/// own plan, and before this no live plan set a cell to `DEFAULT` at all.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_cell_returned_to_its_default_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_todefault_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("todefault");
+    let declared = |label: &str| {
+        format!(
+            "table: dbo.t\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n  \
+             label: {{type: nvarchar(50), nullable: false, default: \"'Unlabelled'\"}}\n  \
+             tag: {{type: uniqueidentifier, nullable: false, default: \"NEWID()\"}}\n\
+             primary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n    \
+             a: {label}\n    b: {{}}\n"
+        )
+    };
+    d.table(&declared("{label: Custom}"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The declaration stops spelling `label`: the plan sets it to DEFAULT.
+    // `tag` was left to `NEWID()` throughout, which the engine cannot confirm
+    // and reads back as a value on every read.
+    d.table(&declared("{}"));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    assert!(
+        planned.contains("\"op\":\"update_row\"") || planned.contains("\"op\": \"update_row\""),
+        "the plan must carry the update: {planned}"
+    );
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a cell at its default must not read as a value: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
+/// `apply` records the database read back, not the plan applied to the old
+/// state — so a change another session makes while the plan is running would
+/// be written down as this plan's own result, and every later `verify` would
+/// call it clean (DECISIONS 150).
+///
+/// Staged with an `AFTER INSERT` trigger, because that is the one shape a test
+/// can time exactly: it fires inside the apply's own transaction, between the
+/// baseline read and the read-back, which is precisely the window. What it
+/// does — putting a row into a *different* declared table — is something no
+/// statement of the plan asks for, and nothing else in the run would notice:
+/// the pinned checksum was answered before the statements, and the per-row
+/// postconditions only speak for the rows the plan itself writes.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_during_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("apply-during");
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  note: {type: nvarchar(50)}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    first: {note: kept}
+",
+    );
+    std::fs::write(
+        d.dir.join("schema/dbo.other.yml"),
+        "table: dbo.other
+columns:
+  code: {type: varchar(20), nullable: false}
+primary_key: {name: pk_other, columns: [code]}
+data:
+  mode: exact
+  rows:
+    kept: {}
+",
+    )
+    .unwrap();
+    let role = |grants: &str| format!("role: app\ngrants:\n  schema::dbo: [{grants}]\n");
+    std::fs::write(d.dir.join("schema/app.yml"), role("select")).unwrap();
+    // Offline first, to mint the identities `bootstrap` insists on.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&d.run(&["verify", "--db", &connection])), 0);
+
+    // The other session, wound up to go off in the middle of the apply.
+    // Through `EXEC`, because `CREATE TRIGGER` has to be first in its batch
+    // and this connection has just said `USE`.
+    //
+    // It writes into a *different* declared table, and below the same test
+    // runs again with a trigger that writes another row of the *same* table —
+    // the shape a whole-table exemption would let through, since the
+    // statement's own postcondition speaks only for the row the plan named
+    // (DECISIONS 153).
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; INSERT INTO dbo.other (code) VALUES (''rogue'');');");
+
+    // A revision that touches `dbo.t` and says nothing at all about
+    // `dbo.other`.
+    d.table(
+        "table: dbo.t
+columns:
+  code: {type: varchar(20), nullable: false}
+  note: {type: nvarchar(50)}
+primary_key: {name: pk_t, columns: [code]}
+data:
+  mode: exact
+  rows:
+    first: {note: kept}
+    second: {note: new}
+",
+    );
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("dbo.other"),
+        "the refusal must name what moved: {err}"
+    );
+    // And the remedy it names is the transactional one, and only that: a
+    // staged refusal used to carry this sentence too, one line above
+    // "nothing was rolled back" (DECISIONS 190).
+    assert!(err.contains("the transaction was rolled back"), "{err}");
+    assert!(!err.contains("nothing was rolled back"), "{err}");
+    assert!(err.contains("rolled back"), "{err}");
+
+    // And nothing of the plan stayed: not its own row, and not the trigger's.
+    let rows = |table: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let r = c
+                .query(&format!("SELECT COUNT(*) FROM {table};"))
+                .await
+                .expect("count");
+            r[0].try_get_at::<i32>(0).unwrap().unwrap()
+        })
+    };
+    assert_eq!(rows("dbo.t"), 1, "the plan's insert must have rolled back");
+    assert_eq!(rows("dbo.other"), 1, "the trigger's row must have gone too");
+    // The ledger says what it said before — the apply recorded nothing, so
+    // the environment still matches the state bootstrap wrote — and the
+    // declarations still ask for the row a plan would put there. Both halves
+    // matter: a recorded state is what `verify` measures against, and had the
+    // read-back been written down, this environment would have been declared
+    // clean against a table holding a row nobody declared.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the recorded state must be untouched: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(
+        stdout(&o).contains("row second"),
+        "the plan is still to be applied: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The same again, with the trigger reaching a different row of the table
+    // the plan *is* writing to. The plan names `dbo.t`, so exempting the
+    // table would exempt this; the row it corrupts is one no statement of the
+    // plan speaks for.
+    sql("DROP TRIGGER dbo.trg_t;");
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; UPDATE dbo.t SET note = N''corrupted'' WHERE code = ''first'';');");
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("row `first`"),
+        "the refusal must name the row the trigger reached: {err}"
+    );
+    assert_eq!(rows("dbo.t"), 1, "the plan's insert must have rolled back");
+    let untouched: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query("SELECT COUNT(*) FROM dbo.t WHERE code = 'first' AND note = N'kept';")
+            .await
+            .expect("count");
+        r[0].try_get_at(0).unwrap().unwrap()
+    });
+    assert_eq!(
+        untouched, 1,
+        "the trigger's write must have rolled back too"
+    );
+
+    // And once more on the other half of the model: a trigger that revokes a
+    // grant the plan leaves alone, on a role the plan *does* touch. Exempting
+    // the whole role saw nothing, exactly as exempting the whole table did
+    // (DECISIONS 156). `REVOKE` inside an `AFTER INSERT` trigger was measured
+    // to work, which is what makes this stageable at all.
+    sql("DROP TRIGGER dbo.trg_t;");
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; REVOKE SELECT ON SCHEMA::dbo TO app;');");
+    // The revision now also widens the role, so the plan names it.
+    std::fs::write(d.dir.join("schema/app.yml"), role("select, insert")).unwrap();
+    d.commit();
+    let plan = d.dir.join("plan2.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update,data-delete",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the apply must not record it: {err}");
+    assert!(
+        err.contains("role app"),
+        "the refusal must name the role whose grant moved: {err}"
+    );
+    // Rolled back whole: the grant the trigger took is back, and the grant the
+    // plan wanted to add never landed.
+    let permissions: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.database_permissions p \
+                 JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id \
+                 WHERE r.name = 'app' AND p.permission_name = 'SELECT';",
+            )
+            .await
+            .expect("count");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(permissions, 1, "the trigger's revoke must have rolled back");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
+
+/// A plan a policy refuses writes nothing at all — the identity file included.
+///
+/// ADR-0008 says an `error` refuses to produce the plan before any file is
+/// written, and the identity file is a file. Minting a uid and then refusing
+/// left the identity file changed for a plan that does not exist, so the next
+/// run compared against identities no reviewed plan ever used (DECISIONS 154).
+#[test]
+fn a_policy_refusal_leaves_the_identity_file_alone() {
+    let d = Demo::new("policyids");
+    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+
+    // One revision that both narrows a column — which the rule below refuses —
+    // and adds a table, which is what mints a new uid.
+    d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(50)}\n");
+    std::fs::write(
+        d.dir.join("schema/dbo.u.yml"),
+        "table: dbo.u\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\npolicies:\n  rules:\n    change.narrowing-on-data: error\n",
+    )
+    .unwrap();
+
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "change.narrowing-on-data" && f["severity"] == "error"),
+        "{v}"
+    );
+
+    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert_eq!(
+        before, after,
+        "a refused plan must leave the identity file as it found it"
+    );
+    assert!(!after.contains("dbo.u"), "{after}");
+
+    // And with the rule at its default the same revision goes through, so the
+    // guard above is about the refusal and not about the write being broken.
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(after.contains("dbo.u"), "{after}");
+}
+
+/// A revision that moved `schema_dir` is read at the paths *it* used.
+///
+/// The historical tree is listed at today's `schema_dir` and the identity file
+/// read from today's `ids_file`, so a revision that kept them elsewhere read
+/// as an empty baseline: `plan` proposes creating the whole schema, and
+/// `validate --since` marks every object changed — failing a gradual-adoption
+/// policy on declarations nobody touched (DECISIONS 155).
+#[test]
+fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
+    let d = Demo::new("movedpaths");
+    // The first revision keeps its declarations *nested*, which is the shape
+    // that matters below: when the whole `legacy/` tree is gone, a path
+    // conversion that asks git about the historical directory has to run it
+    // inside a parent that does not exist either (DECISIONS 166).
+    std::fs::create_dir_all(d.dir.join("legacy/schema")).unwrap();
+    std::fs::write(
+        d.dir.join("legacy/schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: legacy/schema\nids_file: legacy/ids.json\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The second moves them, and says so in its own `pbps.yml`.
+    std::fs::create_dir_all(d.dir.join("db/tables")).unwrap();
+    std::fs::rename(
+        d.dir.join("legacy/schema/dbo.t.yml"),
+        d.dir.join("db/tables/dbo.t.yml"),
+    )
+    .unwrap();
+    std::fs::rename(d.dir.join("legacy/ids.json"), d.dir.join("db/ids.json")).unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n",
+    )
+    .unwrap();
+
+    // Against the previous revision, the only change is where the files live —
+    // which is not a schema change at all.
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stdout(&o).contains("create table"),
+        "moving the files is not creating the schema: {}",
+        stdout(&o)
+    );
+    assert!(
+        !stderr(&o).contains("the baseline is empty"),
+        "the previous revision has declarations, at its own path: {}",
+        stderr(&o)
+    );
+
+    // Even when the old tree is gone from the working copy entirely — parent
+    // directory and all, which is what makes the git question unanswerable.
+    std::fs::remove_dir_all(d.dir.join("legacy")).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the old declarations directory is gone from the working tree: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("create table"), "{}", stdout(&o));
+
+    // And `--since` agrees: nothing about `dbo.t` changed, so a rule that
+    // would fail it is not evaluated against it.
+    d.commit();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n\
+         policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^x_\"}\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--since", "HEAD~1"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a table the revision did not touch must not be judged: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
 }
 
 // ---- SPEC safety invariant repairs ----
@@ -6765,5 +9231,273 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
     rt.block_on(async {
         let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
+    });
+}
+
+/// A plan that renames a table a role is granted on still applies.
+///
+/// Only a live server settles it: SQL Server carries an object-level grant
+/// across `sp_rename`, so the permission is the same permission afterwards
+/// under a different name, and the differ emits no grant change at all. The
+/// post-apply movement guard compares the recorded state with the read-back,
+/// and comparing grant targets by name alone read that one grant as two — and
+/// refused every rename of a granted table (DECISIONS 157).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_grantrename_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("grantrename-live");
+    d.table("table: dbo.old\ncolumns:\n  code: {type: varchar(20), nullable: false}\n");
+    std::fs::write(
+        d.dir.join("schema/app.yml"),
+        "role: app\ngrants:\n  dbo.old: [select]\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The rename, with the grant following it in the declarations exactly as
+    // the engine will follow it in the catalog.
+    d.table(
+        "table: dbo.new\nrenamed_from: dbo.old\ncolumns:\n  code: {type: varchar(20), nullable: false}\n",
+    );
+    std::fs::write(
+        d.dir.join("schema/app.yml"),
+        "role: app\ngrants:\n  dbo.new: [select]\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "OUT:{}ERR:{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    let plan = d.dir.join("rename.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The differ has nothing to say about the grant: the engine moves it, so
+    // the rename is the whole plan. Read off the artifact rather than the
+    // printed summary, which mentions the target's name.
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(
+        matches!(
+            saved.changes.changes.as_slice(),
+            [one] if matches!(one.change, pbps_model::Change::RenameTable { .. })
+        ),
+        "the rename alone is the plan: {:?}",
+        saved.changes
+    );
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a rename of a granted table must apply: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // And the grant really did travel, which is the engine fact the guard
+    // now depends on.
+    let held: i32 = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let r = c
+            .query(
+                "SELECT COUNT(*) FROM sys.database_permissions p \
+                 JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id \
+                 WHERE r.name = 'app' AND p.class = 1 \
+                   AND OBJECT_NAME(p.major_id) = 'new' AND p.permission_name = 'SELECT';",
+            )
+            .await
+            .expect("count");
+        r[0].try_get_at::<i32>(0).unwrap().unwrap()
+    });
+    assert_eq!(held, 1, "the grant follows the rename");
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
+    });
+}
+
+/// A staged apply notices a change that lands between two of its reads.
+///
+/// It cannot roll back — that is what `--staged` is for — so the remedy is to
+/// record the checkpoint and stop, rather than carry the change into every
+/// later read and finally into the closing ordinary snapshot, which is what
+/// `verify` measures against ever after (DECISIONS 159).
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_stagedmove_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sql = |sql: &str| {
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
+        })
+    };
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("stagedmove-live");
+    let rows = |rows: &str| {
+        format!(
+            "table: dbo.t\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n\
+             primary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n{rows}"
+        )
+    };
+    d.table(&rows("    first: {}\n"));
+    std::fs::write(
+        d.dir.join("schema/dbo.other.yml"),
+        "table: dbo.other\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_other, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    kept: {}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // Wound up to go off inside the one statement the staged plan runs, and
+    // aimed at a table the plan never mentions.
+    sql("EXEC(N'CREATE TRIGGER dbo.trg_t ON dbo.t AFTER INSERT AS \
+         SET NOCOUNT ON; INSERT INTO dbo.other (code) VALUES (''rogue'');');");
+
+    // One logical change, which is all `--staged` accepts.
+    d.table(&rows("    first: {}\n    second: {}\n"));
+    d.commit();
+    let plan = d.dir.join("staged.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--staged",
+    ]);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "the run must stop: {err}");
+    assert!(err.contains("dbo.other"), "it must name what moved: {err}");
+    assert!(
+        err.contains("nothing was rolled back") || err.contains("staged apply runs outside"),
+        "and say that nothing was undone: {err}"
+    );
+    // The change was found at a checkpoint read, so the checkpoint holds it
+    // and the remedy offered is to resume. Not the transactional remedy: a
+    // staged run has committed (DECISIONS 190).
+    assert!(err.contains("resuming accepts it"), "{err}");
+    assert!(!err.contains("transaction was rolled back"), "{err}");
+
+    // The statement did commit and the checkpoint records it — that is what a
+    // checkpoint is for — but the environment is left mid-deployment rather
+    // than blessed as a finished apply.
+    let o = d.run(&["status", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let states: Vec<&str> = v["environments"]
+        .as_array()
+        .map(|envs| envs.iter().filter_map(|e| e["state"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        states.contains(&"staged") || stdout(&o).contains("staged"),
+        "the environment is mid-deployment: {}",
+        stdout(&o)
+    );
+
+    // What a resume does with the two kinds of change, measured. A change
+    // made *after* the checkpoint is in no record, and the resume refuses
+    // the database as moved — which is why the closing read's refusal must
+    // not promise one (DECISIONS 190).
+    sql("INSERT INTO dbo.other (code) VALUES ('byhand');");
+    let resume = |d: &Demo| {
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--staged",
+            "--resume",
+        ])
+    };
+    let o = resume(&d);
+    let err = format!("{}{}", stdout(&o), stderr(&o));
+    assert_ne!(code(&o), 0, "a change after the checkpoint: {err}");
+    assert!(err.contains("has moved since the checkpoint"), "{err}");
+    // The change the checkpoint *does* hold — the trigger's row — is accepted,
+    // as the checkpoint's refusal said it would be: with the hand-made one
+    // undone, the resume closes the deployment.
+    sql("DELETE FROM dbo.other WHERE code = 'byhand';");
+    let o = resume(&d);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        let _ = c
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{name}];"
+            ))
+            .await;
     });
 }

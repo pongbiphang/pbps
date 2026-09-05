@@ -5,14 +5,14 @@ shape each one belongs to. The numbered *decisions* live in
 [DECISIONS.md](DECISIONS.md); this file is the record of what went wrong, so the
 same mistake is recognised the second time.
 
-## The four recurring shapes
+## The five recurring shapes
 
 Every one of these was reported, then swept for, then found again somewhere else.
 Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Eighteen instances so far. **Absent, empty and unreadable are three different
+Nineteen instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -29,6 +29,10 @@ things, and only one of them is good news.**
   and `explain`.
 - A lock table the caller has **no permission to read**: metadata visibility
   makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock".
+- `validate --since` reading a failed `ls-tree` as "no declarations at that
+  revision", which calls every table new. From a project in a subdirectory it
+  was empty every time: the pathspec lacked the `--full-tree` its sibling
+  `load_from_git` had carried for exactly this since the baseline was written.
 - A declared module the catalog **cannot read back** reduced to a warning. The
   recorder went ahead, the snapshot's schema could not hold the module, the
   scope every later command rebuilds from that schema forgot it, and the first
@@ -87,6 +91,34 @@ rounds**. Every fix was right about the case in front of it:
 | that check asked `OBJECT_ID` | it is the obvious question | metadata visibility hides the table, so "cannot read" became "no lock" |
 | `REFERENCES` added to the list | a foreign key really needs it | asked only on *managed* schemas, so a foreign key into somebody else's was never checked |
 
+### 5. A sweep that asks one of the two questions
+
+New, and it has produced two findings already. A check can be wrong in two
+directions, and a sweep phrased around one of them clears every instance of
+the other — with a written record saying the ground was covered, which is what
+makes the second direction expensive to find later.
+
+- **Can this probe *miss* a violation?** DECISIONS 112 asked exactly that of
+  every preflight probe and answered it correctly. Nobody asked whether a probe
+  can *report* a violation the plan is about to remove, and `AddForeignKey`
+  refused every plan that repaired its own orphans (151).
+- **Can this comparison be made?** DECISIONS 146 asked that of a cell whose
+  column the plan retypes, answered "by neither type", and carried none — not
+  noticing that the same predicate was also the stale-row guard, so removing it
+  removed a check nobody had asked about (149).
+
+Both shapes have the same tell: a change that makes something *less* checked,
+justified entirely by an argument about accuracy. Write down what the removed
+check was for before removing it.
+
+The mirror runs in the post-apply movement guard, three rounds in a row: "can
+this guard miss a change" was asked and answered each time, and "can this
+guard invent one" was not. It ended up refusing every rename of a granted
+table, because a rename is visible from three sides — the table's two names,
+the role's two names, and the grant *target* — and the first two were paired
+while the third was not (DECISIONS 157). **A guard has two failure directions
+and a sweep down one of them is half a sweep.**
+
 ## Reasoning loses to measurement
 
 Three times the natural, obviously-correct answer was wrong, and only a real
@@ -114,6 +146,126 @@ a lock genuinely held:
 An absent table gives **Msg 208** on that same statement. `HAS_PERMS_BY_NAME` —
 the natural repair — answers 0 for both cases, so only attempting the statement
 separates them. Measurement changed the fix here, it did not merely confirm it.
+
+A list of "the kinds of thing a principal can own", written from memory, had
+six entries; the catalog has nineteen views with an owner column, and the one
+that mattered — a role owning another role — was not on the list. **When the
+engine holds the list, read the list off the engine** (`sys.all_columns` for
+`principal_id` / `owning_principal_id`), and keep the probe that found it in
+the code's comment so the next reader can run it again.
+
+## A comparison that runs what it compares
+
+The row read-back asked the engine, per cell, `CASE WHEN col = (default)`, so
+the omitted spelling of a declared row would round-trip. Written for
+`'Unlabelled'`, it was also run for `NEWID()`, for `SYSUTCDATETIME()`, and for
+`NEXT VALUE FOR dbo.seq` — one evaluation per row of every drift check. The
+first is harmless, the second is wasted, the third **advances the sequence**,
+and the engine refuses `NEXT VALUE FOR` inside a `CASE` at all, so the table
+became unreadable and `plan --db` failed. Only a literal is compared now
+(decision 68). The shape: an expression the *declaration* wrote is being
+handed to the engine in a context the declaration never meant, and "the
+database is the normalizer" does not extend to running things.
+
+The same read had a second fault with the same root: it folded "equals the
+default" into "omitted", and a row that spelled a value equal to its default
+compared unequal to itself on every plan. The catalog cannot know how a row
+was written; only the side reading it can (decision 67).
+
+## A probe reads a state that is not there yet
+
+Two forms, and `order_key` decides which probes have the second.
+
+Every probe runs **before the first statement**, so it may only name what the
+catalog holds *now*. `AsStored` exists for that and translates renames — but a
+column the plan **adds** is a state the probe cannot read at all, and
+`AsStored::column` used to fall back to the declared name, so three probes
+asked the engine about a column that would not exist for another few
+milliseconds.
+
+The tell is that the failure is silent in the direction that matters: an
+invalid probe throws, a throw is reported as *unchecked*, and an unchecked
+probe does not stop an apply. The check most worth having — a unique
+constraint or a foreign key over a column that has *just* arrived, where every
+existing row holds the same value — was the one guaranteed to be skipped.
+
+What such a row will hold is knowable without asking, and the rule is an
+engine fact worth keeping written down: **SQL Server backfills only a NOT NULL
+column.** `ADD col NULL DEFAULT x` leaves every existing row at NULL. So a
+nullable addition reads as `NULL`, a NOT NULL one as its default, and a
+default no probe can evaluate reads as no answer at all. Substituting is not
+always literal: `GROUP BY NULL` is `Msg 164` — a constant groups nothing, so
+it leaves the `GROUP BY` list instead, and an empty list means every row is in
+one group.
+
+**The other form: the rows.** A probe attached to a change that sorts *after*
+the row changes is not asking about the table the statement will meet. Row
+changes are ranks 9 and 10; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
+`AddForeignKey` and `AddIndex` are all 11. So a plan that deletes its own
+violations and then tightens was refused for violations that will be gone, and
+one that writes violating rows was told there were none. `AlterColumnType`,
+`AlterColumnNullability` and `AddColumn` sort at 6-8, before the rows, so
+reading the current table is exactly right for those — **the rank is the
+test**, not the intuition that "a probe should see the future".
+
+The fix is not one fix. Where the constraint's columns are *named* — a unique,
+a primary key, a foreign key — `rows_after` builds the relation the plan will
+leave and the probe groups over that. A check is an arbitrary predicate over
+columns the plan does not carry, and its expression is deliberately never
+rewritten, so it can only subtract the rows the plan deletes and give no
+answer at all where the plan inserts or updates.
+
+## The engine fills in a type's defaulted arguments
+
+`decimal` is stored as `decimal(18,0)`, `char` as `char(1)`, `float` as
+`float(53)`, `nvarchar` as `nvarchar(1)`. A declaration that omits the
+arguments therefore does **not** equal the read-back, and any comparison of a
+declared type against a catalog type refuses a valid apply.
+
+Measured, twice — once by reasoning about it and once by trying it. The second
+is the one that settled it: comparing declared and read-back types passed every
+test until the live created-table apply grew a `decimal` column, and then
+failed with `column ``bare_dec`` is not the one this plan's CREATE TABLE
+declares` against a database that was exactly right. Those four columns stay in
+that test for that reason.
+
+## An exclusion wider than its reason
+
+The pre-delete probe left out every child row the plan *updated*, because a
+row the plan moves off the doomed parent must not be counted against the
+delete. The reason covers an update to the referencing column; the exclusion
+covered an update to any column, and a child updated elsewhere — still
+pointing at the parent — probed zero. Under `ON DELETE CASCADE` the engine
+then deleted it without a word (decision 73). Shape 4: a fix right about the
+case in front of it, one step too wide.
+
+The apply guard had two more. The columns and constraints a plan moves are
+excluded from the shape comparison and held to a *presence* check instead —
+but the exclusion is of a definition, so a definition somebody else put behind
+the plan's name passed (decision 189). And "the column is on one side only"
+excused an added or renamed column by *name*, which is true of the one read
+spanning its statement and of no later read of a staged run. An exclusion has
+a size and a lifetime; check both against the reason.
+
+And a third: a `DEFAULT` cell was dropped from a row's expectations because its
+value could not be named (decision 191). "Cannot be compared as a value" is not
+"cannot be compared": the read-back *omits* a confirmed default, so presence
+was the comparable fact — under conditions the code already knew, one read and
+one function away.
+
+## A readiness check that reads only the declarations
+
+`doctor` derived the securables to ask `CONTROL` about from the declared
+grants, so a revision that *removed* a role's last grant — or the role — had
+nothing to ask about, and the account was called ready for a plan whose
+`REVOKE` then failed. Shape 1 again, in a new coat: an absence in the
+declarations read as "nothing needed", when the thing needed lives in the
+database. The managed roles' grants are asked about too (decision 69) — from
+the recorded state, because the first fix read them from the catalog, and the
+catalog hides a securable from an account with no permission on it: the live
+suite showed the query returning nothing for exactly the login being checked.
+
+## A comment ends at a carriage return
 
 A `--` comment ends at a bare carriage return, and at nothing else that looks
 like a line ending. The lexical scan behind the value-source check and the
@@ -146,6 +298,34 @@ NULL DEFAULT --x<CR>NULL` on a table with one row fails with **Msg 515**.
 Every one was found by testing rather than reasoning. The allowlist is the risky
 half of that function; the placeholder is the safe half. **Reach for the
 placeholder early, not as a last resort.**
+
+## git renders a path outside ASCII in C quoting
+
+`ls-tree --name-only`, and every other porcelain-ish path output, applies
+`core.quotePath` — on by default. `schema/dbo.té.yml` comes back as
+`"schema/dbo.t\303\251.yml"`, **quotes included**, and `git show <rev>:<that>`
+answers `fatal: path ... does not exist`.
+
+The failure was not that error, though, which is the part worth keeping. The
+quoted form does not end in `.yml`, so the extension filter skipped the file,
+the revision read as **empty**, and `plan` announced "Baseline: git HEAD (0
+objects)" and exited 0 — every table newly created, against a repository that
+was perfectly well formed. Absent, empty and unreadable are three different
+things, and a test that asserts an exit code cannot tell them apart.
+
+`-z` and split on NUL. Never `lines()`, never `trim()`.
+
+## A remedy written where the finding is made
+
+`refuse_unplanned_movement` ended its message with what to do about it —
+"the transaction was rolled back; then apply again" — and the staged run
+wrapped that message under "nothing was rolled back". The staged wrapper then
+made the same mistake one level up: "resuming accepts it" at every read,
+including the one after the last checkpoint, where a resume refuses (decision
+190). A function that finds something does not know what its caller can do
+about it. State the finding and the reason there; let each caller name the
+way out it actually has — and check that way out against the code that
+implements it, not against what it ought to do.
 
 ## A path in a command is spelled with `to_str`, never `display()`
 
@@ -183,10 +363,14 @@ ledger or the permission checks.
 - Three permission bugs that survived the first live test because `sa` holds
   `CONTROL`. The permission matrix now runs against **real least-privilege
   logins** created inside the container.
+- A probe naming a column the same plan is *adding*: `Msg 207, Invalid column
+  name`, which the runner reports as unchecked and the apply proceeds past. The
+  unit suite could only ever check that the SQL said what its author thought it
+  said — and it did.
 
 ## Tests that pass for the wrong reason
 
-Seven so far, every one invisible in a green run. **Assert the specific failure,
+Nine so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 - A plan fixture that failed at deserialization instead of at the emitter.
@@ -198,9 +382,25 @@ not merely that something failed.**
   it checked is required for an unrelated reason.
 - A non-UTF-8 path test built on a **preview** plan, for which `explain`
   correctly prints no approval command at all.
+- A GraphQL page read as a whole answer: `reviewThreads(first: 100)` on a PR
+  with 105 threads returned `hasNextPage: true` and I reported "no new
+  findings" from the truncated page. Not code, but the same shape as every
+  entry in section 1, and the reason this bullet is here: **a paginated read
+  that does not check `hasNextPage` is an absence, not an emptiness.**
+- A format-version test asserting `json.contains(r#""version":1"#)` on a
+  serialized state snapshot — which embeds an ids file whose own version is 1.
+  It matched the *nested* field and went on passing through the bumps to 2, 3
+  and 4, checking nothing about the snapshot's own version. **A `contains` over
+  a serialized document is answered by any field that looks like the one you
+  meant.** Assert the parsed field. The same shape was one bump away in the
+  plan and ids tests, and all three were fixed together (DECISIONS 149's
+  commit).
 
 Since these appeared, every fix is reverted and its new test watched to fail
-before the fix is kept. That habit caught three of the seven.
+before the fix is kept. That habit caught three of them. It did not catch
+the version assertion, and could not have: nothing about that test's own
+subject was ever broken, so no revert of a *fix* would have failed it. What
+finds that shape is asserting on the parsed field in the first place.
 
 **Three fixes carry no test at all**, stated in `flow.rs` rather than papered
 over: `pull`'s guard against a failed listing on a real directory, and the

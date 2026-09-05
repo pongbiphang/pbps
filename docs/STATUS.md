@@ -12,18 +12,23 @@ CLAUDE.md's "Development environment"; counts change too often to record here.
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
 
-Declarations may carry reference data (`data:`, ADR-0004): the offline half is
-built, and `max_data_rows` in `pbps.yml` sets when `validate` says a block has
-stopped looking like reference data.
+Declarations may carry reference data (`data:`, ADR-0004), planned offline and
+against a target alike; `max_data_rows` in `pbps.yml` sets when `validate` says
+a block has stopped looking like reference data.
+
+Declarations may carry database roles and their grants (`role:`, ADR-0005);
+membership stays each environment's own.
 
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
-`validate`, `fmt` (`--check`), `rename`, `rename-table`, `drop`, `drop-table`,
+`validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
+`drop-table`, `drop-role`,
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind`), `completions`, `man`. Every read-only command
 takes `--format human|json`; `--no-input` is global.
 
-Connected (each takes `--db <connection string>` or `--env <name>`): `pull`,
-`plan --db` (`--staged`), `apply` (`--plan` / `--checksum` / `--allow` / `--staged` /
+Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
+(`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` /
+`--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
 `status` (`--format json`).
@@ -42,7 +47,13 @@ name its statement declared, the module round-trip through
 readiness check against a **real least-privilege login** created and granted
 inside the test container — `sa` holds `CONTROL` and short-circuits the whole
 permission list, which is how three permission bugs survived the first live
-test) run
+test — and the reference-data path: the DML, the row read-back, drift on rows,
+the pre-delete probe's dynamic SQL, and the binary end to end through
+`bootstrap`, `verify`, `plan --db`, `apply` and `pull --data`; and a plan
+that *creates* a table with a foreign key, applied through the real gate —
+the shape the apply guard got wrong twice because nothing here applied one —
+and one that adds a column, a key, a unique, an index and a foreign key to a
+table already there, and one that returns a declared cell to its default) run
 against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken; the engine is
 pinned by digest there and in CI), or set
@@ -58,6 +69,19 @@ The module round-trip is in the same category: only a real `sys.sql_modules` can
 say whether what the emitter sent is what comes back.
 
 ## Open items
+
+### Artifact format versions reset at the first release
+
+The plan file, the state snapshot and the published editor schemas are each
+several versions in, and the snapshot reader carries an upgrade path from the
+older ones — but this tool has never been released: the workspace is `0.0.0`
+and there is no tag. Those numbers therefore record a history nobody has, and
+the upgrade path leads from versions no deployment ever wrote. **At the first
+tagged release, reset `plan::CURRENT_VERSION`, `state::CURRENT_VERSION` and
+`integration::SCHEMA_VERSION` to 1 and drop `state::OLDEST_READABLE_VERSION`'s
+back-compatibility with the pre-release numbering** (DECISIONS 145). Until
+then, bump freely: a plan file lives for the length of one deployment window,
+and there is nothing in the field to invalidate.
 
 ### Return the driver to `tiberius` once it ships a release
 
@@ -91,24 +115,37 @@ of 14.1. It was placed ahead of the next dialect deliberately: broadening the
 object model improves coverage, but these improve the first hour and every
 failure after it.
 
-**In progress — Phase 4, depth on SQL Server before breadth across engines**:
-declarative reference data (ADR-0004), roles and grants (ADR-0005), the
-`policies:` block and a wider built-in analyzer catalogue.
+**Phase 4, depth on SQL Server before breadth across engines**, is complete as
+scoped: declarative reference data (ADR-0004), roles and grants (ADR-0005),
+the `policies:` block and the first built-in analyzer catalogue (ADR-0008).
 
-Reference data's **offline half is built**: the `data:` block, its `exact` and
+Reference data is **built**, both halves: the `data:` block, its `exact` and
 `ensure` modes, the round trip through `fmt`, the rules `validate` reports, the
 typed row changes with the `data-update` and `data-delete` risk classes, the
-DML, and the ordering — rows after the table and before the constraints, and
-between two tables in the direction their foreign key points. Until the connected
-half exists, `plan --db` refuses a declaration with `data:` blocks rather than
-insert every row on every run. That half (the row read-back into `state_json`
-and the drift comparison, which lifts the refusal; the pre-delete probe;
-`pull --data`) is next; ADR-0004 lists it under "Implementation status". The
-DML itself, including an `IDENTITY` key, is covered by a live test. The ordering was chosen against the
-obvious one — engine count is what every comparison table measures — because a
-second dialect doubles the surface every later feature is built twice for, and
-does it while the first engine still cannot express an organization's own rules.
-The reasoning is in SPEC 12 and open question 9.
+DML and its ordering; and against a target, the row read-back into `state_json`
+under the recorded or declared scope, the row half of the drift comparison, a
+saved plan that carries which rows the recorded state must cover, the
+pre-delete probe counting the rows that still reference the row, and
+`pull --data`. ADR-0004 lists the decisions taken on the way under
+"Implementation status".
+
+Roles and grants (ADR-0005) are **built**: the `role:` file, `r_` uids in the
+ids file, `rename-role` / `drop-role` and the other two intent channels, the
+differ with `revoke` (gated) and `grant-widen` (labelled, never gated), the
+T-SQL, the catalog read-back, drift under the managed set, `validate`'s
+target rule and `pull`. ADR-0005 lists the decisions taken on the way.
+
+The `policies:` block and the first analyzer catalogue (ADR-0008) are
+**built**: rules and suppressions in `pbps.yml`, `validate` (with `--since`)
+at the declaration point, `plan` and `plan --db` at the plan point with the
+findings carried in the saved plan, and refusal of the plan at `error` before
+anything is written. ADR-0008 lists the decisions taken on the way.
+
+Depth before breadth was chosen against the obvious ordering — engine count is
+what every comparison table measures — because a second dialect doubles the
+surface every later feature is built twice for, and does it while the first
+engine still cannot express an organization's own rules. The reasoning is in
+SPEC 12 and open question 9.
 
 **Phase 5** is the PostgreSQL dialect, the touchstone for the `Dialect`
 abstraction; two collisions are already known to be waiting — PostgreSQL
