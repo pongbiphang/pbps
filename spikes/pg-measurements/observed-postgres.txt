@@ -205,3 +205,7 @@ R105 | a bootstrap of the same view declaration, same path | xa
 R106 | what the catalog records about the view's binding | xb.helper
 R107 | and about the opaque body's | nothing
 R108 | text / date / bytea / timestamptz, read back | text / date / bytea / timestamp with time zone
+R109 | the shadow query before ya.helper() exists | none
+R110 | the same query after ya.helper() appears | ya.helper
+R111 | and for a view that qualified yb.helper() explicitly | ya.helper
+R112 | what the catalog records about a check constraint's binding | yb.helper()

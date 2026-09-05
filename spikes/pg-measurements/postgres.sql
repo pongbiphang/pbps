@@ -1163,6 +1163,46 @@ SELECT 'R108', 'text / date / bytea / timestamptz, read back',
   format_type('text'::regtype, NULL) || ' / ' || format_type('date'::regtype, NULL) || ' / ' ||
   format_type('bytea'::regtype, NULL) || ' / ' || format_type('timestamptz'::regtype, NULL);
 
+-- -------------------------- the thirty-eighth 2026-09-05 review round
+
+-- Recording the binding gives the comparison a left-hand side. This is the
+-- right-hand side: a catalog query, no parsing of the declaration and no
+-- speculative DDL -- does a same-named object now sit EARLIER on the write
+-- path than the one this object bound to?
+CREATE SCHEMA ya; CREATE SCHEMA yb;
+CREATE FUNCTION yb.helper() RETURNS text AS $$SELECT 'yb'$$ LANGUAGE sql;
+SET search_path = m, ya, yb;
+CREATE VIEW m.yv AS SELECT helper() AS who;             -- unqualified
+CREATE VIEW m.yq AS SELECT yb.helper() AS who;          -- explicitly qualified
+CREATE TABLE m.yt (n int);
+ALTER TABLE m.yt ADD CONSTRAINT ck_y CHECK (yb.helper() IS NOT NULL);
+CREATE FUNCTION m.shadowed(view_name text) RETURNS text AS $fn$
+DECLARE path text[] := ARRAY['m','ya','yb']; r record; out text := 'none';
+BEGIN
+  FOR r IN
+    SELECT n.nspname AS bound_schema, p.proname AS nm
+      FROM pg_depend d JOIN pg_rewrite w ON w.oid = d.objid
+      JOIN pg_proc p ON p.oid = d.refobjid JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE w.ev_class = view_name::regclass AND d.refclassid = 'pg_proc'::regclass
+  LOOP
+    SELECT string_agg(n2.nspname || '.' || r.nm, ',') INTO out
+      FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+     WHERE p2.proname = r.nm
+       AND array_position(path, n2.nspname) < array_position(path, r.bound_schema);
+  END LOOP;
+  RETURN coalesce(out, 'none');
+END $fn$ LANGUAGE plpgsql;
+SELECT 'R109', 'the shadow query before ya.helper() exists', m.shadowed('m.yv');
+CREATE FUNCTION ya.helper() RETURNS text AS $$SELECT 'ya'$$ LANGUAGE sql;
+SELECT 'R110', 'the same query after ya.helper() appears', m.shadowed('m.yv');
+SELECT 'R111', 'and for a view that qualified yb.helper() explicitly', m.shadowed('m.yq');
+SELECT 'R112', 'what the catalog records about a check constraint''s binding',
+  (SELECT string_agg(d.refobjid::regprocedure::text, ',') FROM pg_depend d
+    JOIN pg_constraint c ON c.oid = d.objid
+   WHERE c.conname = 'ck_y' AND d.refclassid = 'pg_proc'::regclass);
+SET search_path = m;
+DROP SCHEMA ya CASCADE; DROP SCHEMA yb CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
