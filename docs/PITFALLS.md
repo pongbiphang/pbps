@@ -239,6 +239,14 @@ pointing at the parent — probed zero. Under `ON DELETE CASCADE` the engine
 then deleted it without a word (decision 73). Shape 4: a fix right about the
 case in front of it, one step too wide.
 
+The apply guard had two more. The columns and constraints a plan moves are
+excluded from the shape comparison and held to a *presence* check instead —
+but the exclusion is of a definition, so a definition somebody else put behind
+the plan's name passed (decision 189). And "the column is on one side only"
+excused an added or renamed column by *name*, which is true of the one read
+spanning its statement and of no later read of a staged run. An exclusion has
+a size and a lifetime; check both against the reason.
+
 ## A readiness check that reads only the declarations
 
 `doctor` derived the securables to ask `CONTROL` about from the declared

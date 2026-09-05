@@ -572,12 +572,96 @@ pub enum Part {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartChange<'a> {
     pub table: &'a TableName,
-    pub part: Part,
     /// `None` for the primary key, which the model keeps in a field of its own
     /// rather than one of the named maps, and which a declaration need not
     /// name at all (61).
     pub name: Option<&'a str>,
-    pub after: Presence,
+    pub after: PartAfter<'a>,
+}
+
+impl PartChange<'_> {
+    /// Which kind of part this is, whichever way the change leaves it.
+    pub fn part(&self) -> Part {
+        self.after.part()
+    }
+}
+
+/// What a part change leaves at its name: a definition, or nothing.
+///
+/// The definition travels with the presence rather than beside it, so that a
+/// part the plan adds cannot be checked for being *there* without the checker
+/// also holding what it was meant to *be*. Held to presence alone, a
+/// constraint another session replaced under the same name between a staged
+/// statement and its checkpoint was recorded as the plan's own result
+/// (DECISIONS 189). The same shape as [`ModuleAfter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartAfter<'a> {
+    /// The definition the plan adds the part with.
+    Standing(PartDefinition<'a>),
+    /// Nothing: the plan drops it.
+    Gone(Part),
+}
+
+impl PartAfter<'_> {
+    pub fn part(&self) -> Part {
+        match self {
+            PartAfter::Standing(definition) => definition.part(),
+            PartAfter::Gone(part) => *part,
+        }
+    }
+
+    pub fn presence(&self) -> Presence {
+        match self {
+            PartAfter::Standing(_) => Presence::Present,
+            PartAfter::Gone(_) => Presence::Absent,
+        }
+    }
+}
+
+/// The definition a plan adds a part with, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartDefinition<'a> {
+    PrimaryKey(&'a PrimaryKey),
+    Unique(&'a UniqueConstraint),
+    ForeignKey(&'a ForeignKey),
+    Check(&'a CheckConstraint),
+    Index(&'a Index),
+}
+
+impl PartDefinition<'_> {
+    pub fn part(&self) -> Part {
+        match self {
+            PartDefinition::PrimaryKey(_) => Part::PrimaryKey,
+            PartDefinition::Unique(_) => Part::Unique,
+            PartDefinition::ForeignKey(_) => Part::ForeignKey,
+            PartDefinition::Check(_) => Part::Check,
+            PartDefinition::Index(_) => Part::Index,
+        }
+    }
+}
+
+/// What a column change promises about one field of the column, for the
+/// caller checking that a plan got what it asked for.
+///
+/// One promise per field the change moves, because the exclusion it answers
+/// for is field-sized (173): the shape comparison leaves out exactly the
+/// fields [`Change::columns_redefined`] names, so exactly those have to be held
+/// to the plan's value once every statement has run — anything less let a
+/// column another session retyped after the plan's own `ALTER` be recorded as
+/// the plan's result (DECISIONS 189).
+///
+/// Only the fields a read-back can answer for. A default's *text* comes back
+/// in the engine's rendering (185), so the promise is whether there is one;
+/// deprecation and description are read back by no catalog and promise
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPromise<'a> {
+    /// The column is new, and every comparable field is the declaration's.
+    Whole(&'a Column),
+    Type(&'a ColumnType),
+    Nullable(bool),
+    /// Whether the column has a default at all.
+    Default(bool),
 }
 
 /// Whether a name is there once this plan has run.
@@ -1132,12 +1216,12 @@ impl Change {
     /// Which table names this change leaves standing, and which it leaves
     /// empty.
     ///
-    /// Existence only, deliberately: the *shape* of a table the plan creates
-    /// or alters is read back from the catalog precisely because the engine's
-    /// stored form is the only one that compares equal on the next drift check
-    /// (SPEC §8.2), so holding it to the declared shape would refuse valid
-    /// applies. Whether the object is there at all has no such ambiguity
-    /// (DECISIONS 161).
+    /// Existence only: whether the table is there at all is this accessor's
+    /// one question (DECISIONS 161). Its *shape* is answered for entry by
+    /// entry — [`Change::columns_after`] and [`Change::columns_promised`] for
+    /// the columns, [`Change::constraints`] for the parts — in the fields the
+    /// engine reads back unchanged, since the stored form is the one that
+    /// compares equal on the next drift check (SPEC §8.2).
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
         match self {
@@ -1177,12 +1261,80 @@ impl Change {
         }
     }
 
+    /// What this change promises about the columns it redefines, field by
+    /// field, once every statement of the plan has run.
+    ///
+    /// The mirror of [`Change::columns_redefined`]: every field that excludes
+    /// a column from the shape comparison has to be answered for here, or a
+    /// concurrent redefinition of that field goes unread (DECISIONS 189). The
+    /// test `every_excluded_field_is_promised` holds the two together.
+    ///
+    /// A rename promises nothing *here*: its column has no declared value to
+    /// be held to, only the definition it had under the old name, and the
+    /// shape comparison follows it across the rename instead.
+    // Exhaustive rather than a wildcard, as every accessor here is.
+    pub fn columns_promised(&self) -> Vec<(ColumnRef, ColumnPromise<'_>)> {
+        match self {
+            Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } => vec![(table.column(name), ColumnPromise::Whole(column))],
+            // Both: `ALTER COLUMN` restates the nullability with the type
+            // (§12), so the statement promises it whether or not it moves.
+            Change::AlterColumnType {
+                column,
+                to,
+                to_nullable,
+                ..
+            } => vec![
+                (column.clone(), ColumnPromise::Type(to)),
+                (column.clone(), ColumnPromise::Nullable(*to_nullable)),
+            ],
+            Change::AlterColumnNullability {
+                column,
+                to_nullable,
+                ..
+            } => vec![(column.clone(), ColumnPromise::Nullable(*to_nullable))],
+            Change::AlterColumnDefault { column, to, .. } => {
+                vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
+            }
+            Change::RenameColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. } => Vec::new(),
+        }
+    }
+
     /// Which columns this change leaves standing, and which it leaves empty.
     ///
-    /// Existence only, for the reason [`Change::tables_after`] gives: a
-    /// column's *shape* comes back from the catalog in the engine's spelling,
-    /// and holding it to the declaration would refuse valid applies. Whether
-    /// the column is there has no such ambiguity — and nothing else says so,
+    /// Existence only; what the column *is* afterwards is
+    /// [`Change::columns_promised`]'s answer, field by field (189). Whether
+    /// the column is there is this accessor's — and nothing else says so,
     /// since the shape comparison excludes exactly the columns this plan
     /// moves (DECISIONS 168).
     // Exhaustive rather than a wildcard, as every accessor here is.
@@ -1246,47 +1398,58 @@ impl Change {
     /// at all (61).
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn constraints(&self) -> Option<PartChange<'_>> {
-        let it = |table, part, name, after| {
-            Some(PartChange {
-                table,
-                part,
-                name,
-                after,
-            })
-        };
+        let it = |table, name, after| Some(PartChange { table, name, after });
+        let standing = |d| PartAfter::Standing(d);
         match self {
             Change::SetPrimaryKey { table, to, .. } => it(
                 table,
-                Part::PrimaryKey,
                 None,
                 match to {
-                    Some(_) => Presence::Present,
-                    None => Presence::Absent,
+                    Some(key) => standing(PartDefinition::PrimaryKey(key)),
+                    None => PartAfter::Gone(Part::PrimaryKey),
                 },
             ),
-            Change::AddUnique { table, name, .. } => {
-                it(table, Part::Unique, Some(name), Presence::Present)
-            }
+            Change::AddUnique {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Unique(constraint)),
+            ),
             Change::DropUnique { table, name, .. } => {
-                it(table, Part::Unique, Some(name), Presence::Absent)
+                it(table, Some(name), PartAfter::Gone(Part::Unique))
             }
-            Change::AddForeignKey { table, name, .. } => {
-                it(table, Part::ForeignKey, Some(name), Presence::Present)
-            }
+            Change::AddForeignKey {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::ForeignKey(constraint)),
+            ),
             Change::DropForeignKey { table, name, .. } => {
-                it(table, Part::ForeignKey, Some(name), Presence::Absent)
+                it(table, Some(name), PartAfter::Gone(Part::ForeignKey))
             }
-            Change::AddCheck { table, name, .. } => {
-                it(table, Part::Check, Some(name), Presence::Present)
-            }
+            Change::AddCheck {
+                table,
+                name,
+                constraint,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Check(constraint)),
+            ),
             Change::DropCheck { table, name, .. } => {
-                it(table, Part::Check, Some(name), Presence::Absent)
+                it(table, Some(name), PartAfter::Gone(Part::Check))
             }
-            Change::AddIndex { table, name, .. } => {
-                it(table, Part::Index, Some(name), Presence::Present)
+            Change::AddIndex { table, name, index } => {
+                it(table, Some(name), standing(PartDefinition::Index(index)))
             }
             Change::DropIndex { table, name, .. } => {
-                it(table, Part::Index, Some(name), Presence::Absent)
+                it(table, Some(name), PartAfter::Gone(Part::Index))
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -1944,6 +2107,80 @@ mod tests {
             Some("dbo.active_customer")
         );
         assert!(add_column().module_name().is_none());
+    }
+
+    /// Every field a change excludes from the shape comparison is a field
+    /// the change promises a value for, so the exclusion is never wider than
+    /// the check that stands in for it (173, 189). `Whole` on a column that
+    /// is *gone* promises nothing, and deprecation is read back by nothing.
+    #[test]
+    fn every_excluded_field_is_promised() {
+        let column: ColumnRef = "dbo.customer"
+            .parse::<TableName>()
+            .unwrap()
+            .column("mobile");
+        let changes = [
+            add_column(),
+            Change::AlterColumnType {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                from: ty("int"),
+                to: ty("bigint"),
+                from_nullable: false,
+                to_nullable: true,
+            },
+            Change::AlterColumnNullability {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                ty: ty("int"),
+                to_nullable: true,
+            },
+            Change::AlterColumnDefault {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                from: None,
+                to: Some("0".into()),
+            },
+            Change::SetColumnDeprecated {
+                uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                reason: None,
+            },
+        ];
+        for change in &changes {
+            for (excluded, field) in change.columns_redefined() {
+                if field == ColumnField::Deprecated {
+                    continue;
+                }
+                let promised = change.columns_promised();
+                let promise = promised.iter().find(|(c, p)| {
+                    *c == excluded
+                        && matches!(
+                            (field, p),
+                            (ColumnField::Whole, ColumnPromise::Whole(_))
+                                | (ColumnField::Type, ColumnPromise::Type(_))
+                                | (ColumnField::Nullable, ColumnPromise::Nullable(_))
+                                | (ColumnField::Default, ColumnPromise::Default(_))
+                        )
+                });
+                assert!(
+                    promise.is_some(),
+                    "{change:?} excludes {field:?} and promises nothing"
+                );
+            }
+        }
+        // And the other way: a rename and a drop leave nothing to promise.
+        assert!(drop_column().columns_promised().is_empty());
+        assert!(
+            Change::RenameColumn {
+                uid: uid("c_p3n8vd"),
+                table: "dbo.customer".parse().unwrap(),
+                from: "mobile".into(),
+                to: "phone".into(),
+            }
+            .columns_promised()
+            .is_empty()
+        );
     }
 
     #[test]

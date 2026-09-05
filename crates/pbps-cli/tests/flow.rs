@@ -7086,6 +7086,115 @@ fn a_created_table_with_a_foreign_key_applies() {
     });
 }
 
+/// A plan that **reshapes a table already there**, applied for real: a column
+/// added with a bare type and a default, one retyped, one loosened, one given
+/// a default, the primary key replaced by an unnamed one, and a unique, an
+/// index and a foreign key added.
+///
+/// The gap this fills is the mirror of the created-table test above. Every one
+/// of these is a change the apply guard holds to the plan's own definition
+/// once the plan has run (DECISIONS 189), and the comparison is against the
+/// engine's read-back — `decimal` stored as `decimal(18,0)`, a default `0` as
+/// `((0))`, an unnamed key as `PK__t__…`. Only the engine can say the guard
+/// is not refusing its own plan, and before this no live plan added a column,
+/// a key, a unique, an index or a foreign key to an existing table at all.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_plan_that_reshapes_an_existing_table_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_reshape_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("reshape");
+    std::fs::write(
+        d.dir.join("schema/dbo.p.yml"),
+        "table: dbo.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_p, columns: [id]}\n",
+    )
+    .unwrap();
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  region: {type: varchar(10), nullable: false}\n  flag: {type: bit, nullable: false}\n  note: {type: nvarchar(50)}\nprimary_key: {name: pk_t, columns: [code]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The same table, reshaped in every way a plan can reshape one without
+    // dropping anything. `code` keeps its type: it carries the old key, and
+    // the engine refuses to retype a key column under its constraint.
+    d.table(
+        "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  region: {type: varchar(10), nullable: false}\n  flag: {type: bit}\n  note: {type: nvarchar(100), default: \"N''\"}\n  amount: {type: decimal, nullable: false, default: \"0\"}\n  p_id: {type: int}\nprimary_key: [code, region]\nunique:\n  uq_t_note: [note]\nindexes:\n  ix_t_p:\n    columns: [p_id, region desc]\n    include: [note]\nforeign_keys:\n  fk_t_p:\n    columns: [p_id]\n    references: dbo.p(id)\n    on_delete: cascade\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The plan holds every shape this test is about, or it proves nothing.
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    for op in [
+        "add_column",
+        "alter_column_type",
+        "alter_column_nullability",
+        "alter_column_default",
+        "set_primary_key",
+        "add_unique",
+        "add_index",
+        "add_foreign_key",
+    ] {
+        assert!(
+            planned.contains(&format!("\"op\":\"{op}\""))
+                || planned.contains(&format!("\"op\": \"{op}\"")),
+            "the plan must carry `{op}`: {planned}"
+        );
+    }
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // The key, the unique and the foreign key are `constraint` risk.
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own definitions must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
 /// `apply` records the database read back, not the plan applied to the old
 /// state — so a change another session makes while the plan is running would
 /// be written down as this plan's own result, and every later `verify` would

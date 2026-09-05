@@ -1153,6 +1153,92 @@ enum Settled {
     SoFar,
 }
 
+/// Whether two types are one type to the dialect.
+///
+/// SQL Server fills in a type's defaulted arguments, so a declared `decimal`
+/// is stored `decimal(18,0)`, `char` as `char(1)`, `float` as `float(53)` and
+/// `nvarchar` as `nvarchar(1)`; compared raw, a valid apply is refused.
+/// `normalize_type` expands exactly those. A type it cannot normalize is one
+/// nothing here can say anything about, and gets no answer rather than a wrong
+/// one (DECISIONS 186).
+fn same_type(
+    dialect: &dyn pbps_dialect::Dialect,
+    a: &pbps_model::ColumnType,
+    b: &pbps_model::ColumnType,
+) -> bool {
+    match (dialect.normalize_type(a), dialect.normalize_type(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Whether a column read back is the one a declaration asked for, in the
+/// fields the catalog reads back unchanged: the normalized type, the
+/// nullability, the identity, and whether there is a default at all — its
+/// **text** is the engine's (`0` comes back `((0))`), so only its presence is
+/// comparable (DECISIONS 185, 186).
+fn column_as_declared(
+    dialect: &dyn pbps_dialect::Dialect,
+    declared: &pbps_model::Column,
+    now: &pbps_model::Column,
+) -> bool {
+    same_type(dialect, &declared.ty, &now.ty)
+        && declared.nullable == now.nullable
+        && declared.identity == now.identity
+        && declared.default.is_some() == now.default.is_some()
+}
+
+/// Whether an index read back is the one declared. Structure only: the
+/// filter's text is the engine's to rewrite, and whether there is one at all
+/// decides which rows the index covers, and is not (DECISIONS 185).
+fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> bool {
+    declared.columns == now.columns
+        && declared.include == now.include
+        && declared.unique == now.unique
+        && declared.filter.is_some() == now.filter.is_some()
+}
+
+/// Whether a primary key read back is the one declared. The name only where
+/// the declaration gives one: `name: None` leaves it to the database, and the
+/// engine's generated `PK__t__3213E83F` is not movement.
+fn primary_key_as_declared(
+    declared: &pbps_model::PrimaryKey,
+    now: &pbps_model::PrimaryKey,
+) -> bool {
+    declared.columns == now.columns
+        && !declared
+            .name
+            .as_ref()
+            .is_some_and(|n| Some(n) != now.name.as_ref())
+}
+
+/// Whether a part read back is the one the plan adds it as, or `None` where
+/// the definition has nothing a read-back can be held to: a check is nothing
+/// but an expression and SQL Server rewrites it (167), so its name is all
+/// that is comparable (DECISIONS 183).
+///
+/// `None` as well where the part is not there at all: absent and wrong are
+/// two different findings, and the presence check answers for the first.
+fn part_as_planned(
+    planned: pbps_model::PartDefinition<'_>,
+    table: &pbps_model::Table,
+    name: &str,
+) -> Option<bool> {
+    use pbps_model::PartDefinition;
+    Some(match planned {
+        PartDefinition::PrimaryKey(was) => {
+            primary_key_as_declared(was, table.primary_key.as_ref()?)
+        }
+        // A unique constraint is nothing but its columns.
+        PartDefinition::Unique(was) => table.unique.get(name)? == was,
+        // And a foreign key nothing but structure — the columns, the parent
+        // and the two referential actions — so all of it is comparable (182).
+        PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
+        PartDefinition::Check(_) => return None,
+        PartDefinition::Index(was) => index_as_declared(was, table.indexes.get(name)?),
+    })
+}
+
 /// Every field of a column two reads disagree on, with the word to call it.
 ///
 /// Field by field because the exclusion above is: a plan that retypes a column
@@ -1214,6 +1300,11 @@ fn refuse_unplanned_movement(
     // different names across a rename.
     let mut renamed: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     let mut renamed_roles: BTreeMap<&str, &str> = BTreeMap::new();
+    // And the columns, under the name each ends with: across the read that
+    // spans the rename statement, the column is under one name before and
+    // another after, and the shape comparison follows it rather than
+    // excusing both ends (DECISIONS 189).
+    let mut renamed_columns: BTreeMap<(&TableName, &str), &str> = BTreeMap::new();
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
     // The permissions this plan moves, keyed by the role it moves them on and
     // the target they sit on. A role can be both granted and revoked on one
@@ -1268,6 +1359,12 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
         }
+        if let pbps_model::Change::RenameColumn {
+            table, from, to, ..
+        } = &p.change
+        {
+            renamed_columns.insert((table, to), from);
+        }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
         }
@@ -1293,20 +1390,20 @@ fn refuse_unplanned_movement(
                 .insert(field);
         }
         if let Some(part) = p.change.constraints() {
-            if part.after == pbps_model::Presence::Present
+            if part.after.presence() == pbps_model::Presence::Present
                 && let Some(n) = part.name
             {
                 added_parts
                     .entry(part.table)
                     .or_default()
-                    .insert((part.part, n));
+                    .insert((part.part(), n));
             }
             match part.name {
                 Some(name) => {
                     constraints
                         .entry(part.table)
                         .or_default()
-                        .insert((part.part, name));
+                        .insert((part.part(), name));
                 }
                 None => {
                     keys.insert(part.table);
@@ -1370,9 +1467,9 @@ fn refuse_unplanned_movement(
         // read-backs — never against the declaration — so nothing here depends
         // on predicting the engine's stored form, which is why the whole table
         // could stop being exempt (DECISIONS 166). What the plan's own
-        // alterations achieved is still not checked: that *would* need the
-        // stored form, and the column and constraint names it adds or removes
-        // are held to being present or absent instead.
+        // alterations achieved is checked once every statement has run,
+        // below: against the plan's own values, in the fields the catalog
+        // reads back unchanged (DECISIONS 189).
         //
         // At every read, not only the settled one. Everything this plan will
         // move is excluded below whether or not its statement has run, so
@@ -1461,36 +1558,15 @@ fn refuse_unplanned_movement(
                 now.indexes.keys().map(String::as_str).collect(),
             );
             // A column's own promise, in the fields the catalog reads back
-            // unchanged. The **type** is one of them once it is normalized,
-            // and only then: SQL Server fills in a type's defaulted
-            // arguments, so a declared `decimal` is stored `decimal(18,0)`,
-            // `char` as `char(1)`, `float` as `float(53)` and `nvarchar` as
-            // `nvarchar(1)`. Compared raw it refuses a valid apply — measured,
-            // and the live created-table test declares all four so it would
-            // again. `normalize_type` expands exactly those, which is what
-            // makes the comparison possible at all; a type it cannot
-            // normalize is one nothing here can say anything about, and gets
-            // no answer rather than a wrong one (DECISIONS 186).
-            //
-            // A default's **text** is the engine's (`0` comes back `((0)`),
-            // so only whether there is one at all is comparable
-            // (DECISIONS 185).
-            let same_type = |a: &pbps_model::ColumnType, b: &pbps_model::ColumnType| match (
-                dialect.normalize_type(a),
-                dialect.normalize_type(b),
-            ) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => true,
-            };
+            // unchanged — the type once normalized, measured: the live
+            // created-table test declares bare `decimal`, `char`, `float` and
+            // `nvarchar` so a raw comparison would refuse it again
+            // (DECISIONS 185, 186).
             for (n, was) in &declared.columns {
                 let Some(now) = now.columns.get(n) else {
                     continue;
                 };
-                if !same_type(&was.ty, &now.ty)
-                    || was.nullable != now.nullable
-                    || was.identity != now.identity
-                    || was.default.is_some() != now.default.is_some()
-                {
+                if !column_as_declared(dialect, was, now) {
                     moved.push(format!(
                         "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
                          declares"
@@ -1527,13 +1603,7 @@ fn refuse_unplanned_movement(
             }
             for (n, was) in &declared.indexes {
                 if let Some(now) = now.indexes.get(n)
-                    && (was.columns != now.columns
-                        || was.include != now.include
-                        || was.unique != now.unique
-                        // The predicate's text is the engine's to rewrite;
-                        // whether there is one at all decides which rows the
-                        // index covers, and is not (DECISIONS 185).
-                        || was.filter.is_some() != now.filter.is_some())
+                    && !index_as_declared(was, now)
                 {
                     moved.push(format!(
                         "{now_name} index `{n}` is not the one this plan's `CREATE TABLE` \
@@ -1541,21 +1611,12 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
-            if let (Some(was), Some(now)) = (&declared.primary_key, &now.primary_key) {
-                // The name only where the declaration gives one: `name: None`
-                // leaves it to the database, and the engine's generated
-                // `PK__t__3213E83F` is not movement.
-                if was.columns != now.columns
-                    || was
-                        .name
-                        .as_ref()
-                        .is_some_and(|n| Some(n) != now.name.as_ref())
-                {
-                    moved.push(format!(
-                        "{now_name} primary key is not the one this plan's `CREATE TABLE` \
-                         declares"
-                    ));
-                }
+            if let (Some(was), Some(now)) = (&declared.primary_key, &now.primary_key)
+                && !primary_key_as_declared(was, now)
+            {
+                moved.push(format!(
+                    "{now_name} primary key is not the one this plan's `CREATE TABLE` declares"
+                ));
             }
             if declared.primary_key.is_none() && now.primary_key.is_some() {
                 moved.push(format!(
@@ -1578,18 +1639,36 @@ fn refuse_unplanned_movement(
             let moved_parts = constraints.get(now_name).unwrap_or(&no_names);
             let empty = BTreeSet::new();
             for column in was.columns.keys().chain(now.columns.keys()) {
-                let moves = moved_columns.get(column).unwrap_or(&empty);
+                let mut moves = moved_columns.get(column).unwrap_or(&empty).clone();
+                // A renamed column is under its old name in a read taken
+                // before the rename statement and its new one after, so the
+                // read that spans the statement finds it under `from` on one
+                // side and `to` on the other. It is one column, and it is
+                // compared as one — excusing both names left it exempt at
+                // every later read of a staged run as well (DECISIONS 189).
+                // The old name itself is then the one-sided entry below.
+                let from = renamed_columns.get(&(now_name, column.as_str())).copied();
+                let was_c = was.columns.get(column).or_else(|| {
+                    let from = from?;
+                    if now.columns.contains_key(from) {
+                        return None;
+                    }
+                    moves.extend(moved_columns.get(from).into_iter().flatten().copied());
+                    was.columns.get(from)
+                });
                 // Added, dropped or renamed: the column is on one side only,
-                // and its presence is what `columns_after` answers for.
-                if moves.contains(&pbps_model::ColumnField::Whole) {
-                    continue;
-                }
-                let (Some(was_c), Some(now_c)) = (was.columns.get(column), now.columns.get(column))
-                else {
-                    moved.push(format!(
-                        "{now_name} column `{column}` is not on both sides, and no change of \
-                         this plan adds or removes it"
-                    ));
+                // and its presence is what `columns_after` answers for. Only
+                // where it *is* one-sided, though — a column this plan adds
+                // that is on both sides of a later read of a staged run is
+                // two read-backs like any other, and excusing it there is
+                // what let a concurrent redefinition through (DECISIONS 189).
+                let (Some(was_c), Some(now_c)) = (was_c, now.columns.get(column)) else {
+                    if !moves.contains(&pbps_model::ColumnField::Whole) {
+                        moved.push(format!(
+                            "{now_name} column `{column}` is not on both sides, and no change of \
+                             this plan adds or removes it"
+                        ));
+                    }
                     continue;
                 };
                 for (field, what) in differing(was_c, now_c) {
@@ -1769,9 +1848,9 @@ fn refuse_unplanned_movement(
         }
     }
 
-    // And the names the plan leaves standing or empty. Existence only: the
-    // shape of a table it creates comes back from the catalog for a reason,
-    // and holding it to the declared shape would refuse valid applies. A role
+    // And the names the plan leaves standing or empty. Existence, for the
+    // tables and roles themselves: a table's shape is answered for above,
+    // entry by entry, and below for the entries this plan writes. A role
     // with no grants has nothing *but* its name, so without this a
     // `CREATE ROLE` another session undid was recorded as success
     // (DECISIONS 161).
@@ -1797,8 +1876,9 @@ fn refuse_unplanned_movement(
         // became of them: the shape comparison excludes exactly these, and the
         // table check above answers only for the table itself — so a column
         // added and dropped again before the checkpoint read was recorded as
-        // the plan's own result (DECISIONS 168). Existence only, for the
-        // reason 166 gives about a table's shape.
+        // the plan's own result (DECISIONS 168). Presence here, and the
+        // definition next: a presence check is the wrong size for an
+        // exclusion of a definition (DECISIONS 189).
         let mut expected_columns: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence> =
             BTreeMap::new();
         // Keyed, not collected: a constraint or index whose *definition*
@@ -1811,12 +1891,22 @@ fn refuse_unplanned_movement(
         // the same 161 gave the modules.
         let mut expected_parts: BTreeMap<
             (&TableName, pbps_model::Part, Option<&str>),
-            pbps_model::Presence,
+            pbps_model::PartAfter<'_>,
         > = BTreeMap::new();
+        // And the *definition* of each column field the plan moves, for the
+        // same reason: the shape comparison excludes exactly those fields,
+        // so nothing but this says what became of them. Presence alone let a
+        // column another session retyped between the plan's `ALTER` and the
+        // checkpoint read be recorded as the plan's own result — while the
+        // created-table block above already held its columns to the
+        // declaration, in the same fields (DECISIONS 189).
+        let mut expected_promises: Vec<(pbps_model::ColumnRef, pbps_model::ColumnPromise<'_>)> =
+            Vec::new();
         for p in &changes.changes {
             expected_columns.extend(p.change.columns_after());
+            expected_promises.extend(p.change.columns_promised());
             if let Some(part) = p.change.constraints() {
-                expected_parts.insert((part.table, part.part, part.name), part.after);
+                expected_parts.insert((part.table, part.part(), part.name), part.after);
             }
         }
         for (column, expected) in expected_columns {
@@ -1836,10 +1926,56 @@ fn refuse_unplanned_movement(
                 _ => {}
             }
         }
+        for (column, promise) in expected_promises {
+            let Some(now) = after
+                .tables
+                .get(&column.table)
+                .and_then(|t| t.columns.get(&column.name))
+            else {
+                // Reported above, or the table's own check answers.
+                continue;
+            };
+            use pbps_model::ColumnPromise;
+            let (kept, what) = match promise {
+                ColumnPromise::Whole(declared) => {
+                    (column_as_declared(dialect, declared, now), "definition")
+                }
+                ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
+                ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
+                ColumnPromise::Default(has) => (now.default.is_some() == has, "default"),
+            };
+            if !kept {
+                moved.push(format!(
+                    "{} column `{}` does not have the {what} this plan gives it",
+                    column.table, column.name
+                ));
+            }
+        }
         for ((table_name, part, part_name), after_it) in expected_parts {
             let Some(table) = after.tables.get(table_name) else {
                 continue;
             };
+            // Held to what the plan adds, not to being there. A part is
+            // dropped and recreated under one name by anyone who redefines
+            // it, so a read that finds the name says nothing about which
+            // definition is behind it (DECISIONS 189).
+            if let pbps_model::PartAfter::Standing(definition) = after_it
+                && part_as_planned(definition, table, part_name.unwrap_or("")) == Some(false)
+            {
+                let kind = match part {
+                    pbps_model::Part::PrimaryKey => "primary key",
+                    pbps_model::Part::Unique => "unique",
+                    pbps_model::Part::ForeignKey => "foreign key",
+                    pbps_model::Part::Check => "check",
+                    pbps_model::Part::Index => "index",
+                };
+                let name = part_name.unwrap_or("");
+                moved.push(format!(
+                    "{table_name} {kind} `{name}` is there, and is not the one this plan adds"
+                ));
+                continue;
+            }
+            let after_it = after_it.presence();
             let (kind, there) = match (part, part_name) {
                 (pbps_model::Part::PrimaryKey, _) => ("primary key", table.primary_key.is_some()),
                 (pbps_model::Part::Unique, Some(n)) => ("unique", table.unique.contains_key(n)),
@@ -5469,10 +5605,9 @@ mod tests {
     /// `CREATE TABLE` and its checkpoint, could add a column or an index to
     /// it and have that recorded as this plan's own result (DECISIONS 181).
     ///
-    /// By name, never by value: what a created table's columns *are* comes
-    /// back in the engine's spelling, and holding them to the declaration
-    /// would refuse valid applies — the reason the whole table used to be
-    /// exempt (166).
+    /// By name here, and by value in the fields the catalog reads back
+    /// unchanged (185, 186); a created column's type is compared normalized
+    /// because the engine fills in its defaulted arguments.
     #[test]
     fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
         let declared = || {
@@ -7142,5 +7277,481 @@ mod tests {
         assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
         assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
         assert!(!unmanaged.iter().any(|u| u.contains("dbo.declared_secret")));
+    }
+
+    /// A column this plan adds or alters is held to what the plan gives it,
+    /// field by field, once every statement has run. The shape comparison
+    /// excludes exactly those fields, so nothing else says what became of them
+    /// — and presence alone let a column another session retyped after the
+    /// plan's own statement be recorded as the plan's result, while a created
+    /// table's columns were already held to their declaration (DECISIONS 189).
+    #[test]
+    fn a_column_this_plan_writes_is_held_to_the_definition_it_gives() {
+        let dbo_t: TableName = "dbo.t".parse().unwrap();
+        let column = |ty: &str, nullable: bool, default: Option<&str>| {
+            let mut c = pbps_model::Column::new(ty.parse().unwrap());
+            c.nullable = nullable;
+            c.default = default.map(str::to_owned);
+            c
+        };
+        let schema = |columns: &[(&str, pbps_model::Column)]| {
+            let mut t = pbps_model::Table::default();
+            for (name, c) in columns {
+                t.columns.insert((*name).to_owned(), c.clone());
+            }
+            let mut s = Schema::default();
+            s.tables.insert(dbo_t.clone(), t);
+            s
+        };
+        let plan = |change: pbps_model::Change| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(change)],
+        };
+        let kept = column("int", false, None);
+        let before = schema(&[("kept", kept.clone())]);
+
+        // Adding: the read-back is the declaration, in the engine's spelling.
+        let adding = plan(pbps_model::Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: dbo_t.clone(),
+            name: "amount".to_owned(),
+            column: Box::new(column("decimal", false, Some("0"))),
+        });
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &adding,
+            &before,
+            &schema(&[
+                ("kept", kept.clone()),
+                ("amount", column("decimal(18,0)", false, Some("((0))"))),
+            ]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the engine's spelling of the declared column");
+        for (what, got) in [
+            ("type", column("decimal(18,2)", false, Some("((0))"))),
+            ("nullability", column("decimal(18,0)", true, Some("((0))"))),
+            ("default", column("decimal(18,0)", false, None)),
+        ] {
+            let e = refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &adding,
+                &before,
+                &schema(&[("kept", kept.clone()), ("amount", got)]),
+                "prod",
+                Settled::Whole,
+            )
+            .expect_err(what);
+            assert!(format!("{e:#}").contains("`amount`"), "{what}: {e:#}");
+        }
+
+        // Altering: each change promises the field it moves, and only that.
+        let retyping = plan(pbps_model::Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: false,
+            to_nullable: false,
+        });
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &retyping,
+            &before,
+            &schema(&[("kept", column("bigint", false, None))]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the type the plan gives it");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &retyping,
+            &before,
+            &schema(&[("kept", column("int", false, None))]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the ALTER was undone before the read");
+        assert!(format!("{e:#}").contains("type"), "{e:#}");
+        // `ALTER COLUMN` restates the nullability with the type, so a retype
+        // promises it too.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &retyping,
+            &before,
+            &schema(&[("kept", column("bigint", true, None))]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the nullability the ALTER restated");
+        assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+
+        let loosening = plan(pbps_model::Change::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            ty: "int".parse().unwrap(),
+            to_nullable: true,
+        });
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &loosening,
+            &before,
+            &before,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("still NOT NULL");
+        assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+
+        let defaulting = plan(pbps_model::Change::AlterColumnDefault {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            from: None,
+            to: Some("0".to_owned()),
+        });
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &defaulting,
+            &before,
+            &schema(&[("kept", column("int", false, Some("((0))")))]),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("the text is the engine's; that there is one is the promise");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &defaulting,
+            &before,
+            &before,
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("no default arrived");
+        assert!(format!("{e:#}").contains("default"), "{e:#}");
+
+        // Not at a checkpoint: the statement may not have run yet.
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &retyping,
+            &before,
+            &before,
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("mid-run, the old type is not a failure");
+    }
+
+    /// A column is excused from the shape comparison only on the read where
+    /// it is on one side alone. Across the read that spans its rename it is
+    /// followed from the old name to the new; on every other read of a
+    /// staged run it is two read-backs like any other column. Excusing the
+    /// name outright left a renamed or added column exempt for the rest of
+    /// the run (DECISIONS 189).
+    #[test]
+    fn a_column_is_followed_across_its_rename_and_compared_after_it() {
+        let dbo_t: TableName = "dbo.t".parse().unwrap();
+        let schema = |name: &str, ty: &str, nullable: bool| {
+            let mut c = pbps_model::Column::new(ty.parse().unwrap());
+            c.nullable = nullable;
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(name.to_owned(), c);
+            let mut s = Schema::default();
+            s.tables.insert(dbo_t.clone(), t);
+            s
+        };
+        let renaming = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: dbo_t.clone(),
+                    from: "a".to_owned(),
+                    to: "b".to_owned(),
+                },
+            )],
+        };
+        // The read spanning the rename: one column, two names.
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming,
+            &schema("a", "int", false),
+            &schema("b", "int", false),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("renamed, otherwise as it was");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming,
+            &schema("a", "int", false),
+            &schema("b", "bigint", false),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("renamed and retyped, and the plan only renames");
+        assert!(format!("{e:#}").contains("`b`"), "{e:#}");
+        // A later read of the same staged run: both sides know it as `b`.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming,
+            &schema("b", "int", false),
+            &schema("b", "int", true),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("loosened after the rename, by nobody in this plan");
+        assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+        // And before it ran: both sides know it as `a`, and it has not moved.
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming,
+            &schema("a", "int", false),
+            &schema("a", "int", false),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("not renamed yet");
+
+        // The same for a column the plan adds: on both sides of a later read,
+        // it is compared like any other.
+        let adding = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AddColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: dbo_t.clone(),
+                    name: "b".to_owned(),
+                    column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
+                },
+            )],
+        };
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &adding,
+            &schema("b", "int", true),
+            &schema("b", "bigint", true),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("added at an earlier checkpoint, retyped since");
+        assert!(format!("{e:#}").contains("type"), "{e:#}");
+        // A rename the plan pairs with a retype excuses the type across the
+        // rename, and nothing else.
+        let renaming_and_retyping = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: dbo_t.clone(),
+                    from: "a".to_owned(),
+                    to: "b".to_owned(),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: dbo_t.column("b"),
+                    from: "int".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    from_nullable: false,
+                    to_nullable: false,
+                }),
+            ],
+        };
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming_and_retyping,
+            &schema("a", "int", false),
+            &schema("b", "bigint", false),
+            "prod",
+            Settled::Whole,
+        )
+        .expect("renamed and retyped, as planned");
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renaming_and_retyping,
+            &schema("a", "int", false),
+            &schema("b", "bigint", true),
+            "prod",
+            Settled::Whole,
+        )
+        .expect_err("the nullability is nobody's plan");
+        assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+    }
+
+    /// A part this plan adds is held to the definition it adds it with, not
+    /// to being there: anyone who redefines a constraint drops and recreates
+    /// it under the same name, so a read that finds the name says nothing
+    /// about which definition is behind it (DECISIONS 189).
+    #[test]
+    fn a_part_this_plan_adds_is_held_to_its_definition() {
+        let dbo_t: TableName = "dbo.t".parse().unwrap();
+        let dbo_p: TableName = "dbo.p".parse().unwrap();
+        let index = |on: &str, unique: bool| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                name: on.to_owned(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique,
+            filter: None,
+        };
+        let unique = |on: &str| pbps_model::UniqueConstraint {
+            columns: vec![on.to_owned()],
+        };
+        let key = |on: &str| pbps_model::PrimaryKey {
+            name: None,
+            columns: vec![on.to_owned()],
+        };
+        let fk =
+            |to: &TableName, on_delete: pbps_model::ReferentialAction| pbps_model::ForeignKey {
+                columns: vec!["p_id".to_owned()],
+                references_table: to.clone(),
+                references_columns: vec!["id".to_owned()],
+                on_delete,
+                on_update: pbps_model::ReferentialAction::NoAction,
+            };
+        let with = |f: &dyn Fn(&mut pbps_model::Table)| {
+            let mut t = pbps_model::Table::default();
+            for c in ["id", "other", "p_id"] {
+                t.columns.insert(
+                    c.to_owned(),
+                    pbps_model::Column::new("int".parse().unwrap()),
+                );
+            }
+            f(&mut t);
+            let mut s = Schema::default();
+            s.tables.insert(dbo_t.clone(), t);
+            s.tables.insert(dbo_p.clone(), pbps_model::Table::default());
+            s
+        };
+        let bare = with(&|_| {});
+        let plan = |change: pbps_model::Change| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(change)],
+        };
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                plan,
+                &bare,
+                after,
+                "prod",
+                Settled::Whole,
+            )
+        };
+        let refused = |plan: &pbps_model::ChangeSet, after: &Schema, why: &str| {
+            let e = check(plan, after).expect_err(why);
+            let e = format!("{e:#}");
+            assert!(e.contains("is not the one this plan adds"), "{why}: {e}");
+        };
+
+        let adding_index = plan(pbps_model::Change::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".to_owned(),
+            index: Box::new(index("id", false)),
+        });
+        check(
+            &adding_index,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("id", false));
+            }),
+        )
+        .expect("the index as planned");
+        refused(
+            &adding_index,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("other", false));
+            }),
+            "an index of that name on another column",
+        );
+        refused(
+            &adding_index,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("id", true));
+            }),
+            "an index of that name, made unique by somebody",
+        );
+        // Absent is a different finding from wrong, and keeps its own words.
+        let e = check(&adding_index, &bare).expect_err("not there at all");
+        assert!(format!("{e:#}").contains("is not there"), "{e:#}");
+
+        let adding_unique = plan(pbps_model::Change::AddUnique {
+            table: dbo_t.clone(),
+            name: "uq".to_owned(),
+            constraint: unique("id"),
+        });
+        refused(
+            &adding_unique,
+            &with(&|t| {
+                t.unique.insert("uq".to_owned(), unique("other"));
+            }),
+            "a unique of that name over another column",
+        );
+
+        let keying = plan(pbps_model::Change::SetPrimaryKey {
+            table: dbo_t.clone(),
+            from: None,
+            to: Some(key("id")),
+        });
+        check(
+            &keying,
+            &with(&|t| {
+                t.primary_key = Some(pbps_model::PrimaryKey {
+                    name: Some("PK__t__3213E83F".to_owned()),
+                    columns: vec!["id".to_owned()],
+                });
+            }),
+        )
+        .expect("the engine names an unnamed key; that is not movement");
+        refused(
+            &keying,
+            &with(&|t| {
+                t.primary_key = Some(key("other"));
+            }),
+            "a key over another column",
+        );
+
+        let adding_fk = plan(pbps_model::Change::AddForeignKey {
+            table: dbo_t.clone(),
+            name: "fk".to_owned(),
+            constraint: Box::new(fk(&dbo_p, pbps_model::ReferentialAction::Cascade)),
+        });
+        check(
+            &adding_fk,
+            &with(&|t| {
+                t.foreign_keys.insert(
+                    "fk".to_owned(),
+                    fk(&dbo_p, pbps_model::ReferentialAction::Cascade),
+                );
+            }),
+        )
+        .expect("the foreign key as planned");
+        refused(
+            &adding_fk,
+            &with(&|t| {
+                t.foreign_keys.insert(
+                    "fk".to_owned(),
+                    fk(&dbo_p, pbps_model::ReferentialAction::NoAction),
+                );
+            }),
+            "the same key without its cascade",
+        );
+
+        // A check is nothing but an expression, and the engine rewrites it:
+        // its name is all a read-back can be held to (183).
+        let adding_check = plan(pbps_model::Change::AddCheck {
+            table: dbo_t.clone(),
+            name: "ck".to_owned(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "id > 0".to_owned(),
+            },
+        });
+        check(
+            &adding_check,
+            &with(&|t| {
+                t.checks.insert(
+                    "ck".to_owned(),
+                    pbps_model::CheckConstraint {
+                        expression: "([id]>(0))".to_owned(),
+                    },
+                );
+            }),
+        )
+        .expect("the engine's rendering of the check");
     }
 }

@@ -2662,3 +2662,37 @@ SPEC is in sync with all of these.
     per-rule schemas say which parameters, never what they are. A test ties
     every generated entry back to `rules::RULES` and fails if a parameter is
     added to the catalogue without a shape.
+
+189. **A planned column or part is held to what the plan gives it, not to
+    being there.** 168 gave the parts and columns a plan moves a presence
+    check, because the shape comparison excludes exactly those and nothing
+    else said what became of them. Presence was the wrong size for the gap
+    (173): the exclusion is of a *definition*, so a column another session
+    retyped after the plan's own `ALTER`, or a constraint it dropped and
+    recreated under the plan's name with other columns, was there — and was
+    recorded as the plan's result. The created-table block of 181–186 had
+    meanwhile learned to compare the same fields by value; the columns and
+    parts of an existing table were the second instance of the shape.
+    Each column change now promises a value for each field it excludes
+    (`columns_promised`, the mirror of `columns_redefined`, with a test that
+    holds the two together), and each part change carries the definition it
+    adds — `PartAfter::Standing(PartDefinition)`, so a part cannot be checked
+    for presence without the checker holding what it was meant to be. The
+    comparison is the one the created-table block already makes: the
+    normalized type, the nullability, the identity and the default's presence
+    for a column; the columns for a unique, all of a foreign key, the
+    structure and the filter's presence for an index, the columns and the
+    declared name for a primary key. A check has nothing but an expression
+    the engine rewrites, and keeps its name check (183).
+    The other half is the `Whole` exclusion itself. "The column is on one side
+    only" is true of exactly one read — the one spanning the statement that
+    adds or renames it. On every later read of a staged run the column is on
+    both sides, a read-back each, and excusing it by name left it exempt for
+    the rest of the run. A renamed column is now followed from its old name
+    to its new one across that read, and an added or renamed column is
+    compared like any other wherever it is on both sides.
+    Proved against the engine both ways: a live plan adds a column with a
+    bare `decimal` and a default, retypes, loosens, defaults, replaces the
+    key with an unnamed one, and adds a unique, an index and a foreign key
+    to a table already there, and applies — before it, no live plan had added
+    any of those to an existing table at all (182).
