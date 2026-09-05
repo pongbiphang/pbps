@@ -170,8 +170,15 @@ the form would be for.
 Composing intent (step 4 of #64) ends as the same file edit the CLI's intent
 commands make, followed by a commit of *those paths and nothing else* and a
 `git push`, run as subprocesses in the checkout the UI was started in, with
-the user's own configuration. The commit is `git commit --only -- <paths>`,
-after `git add -N` for a path that is new, which takes the named paths from
+the user's own configuration. The commit is `git commit --only -m <message>
+-- <paths>`, after `git add -N` for a path that is new. The message is the
+page's to ask for, prefilled from the intent the way the CLI's own error
+output spells it (`rename dbo.customer.customer_name full_name`), and passed
+with `-m` because a commit with no message opens an editor, which a
+subprocess with no terminal cannot answer — **measured**: with no editor
+variable set and no terminal, `git commit --only -- a` exited non-zero
+without committing, and the same command with `-m` committed. `--only` takes
+the named paths from
 the working tree and leaves whatever the index already held staged and
 uncommitted; the preview the page shows first is `git diff HEAD -- <paths>`,
 which is exactly that content. **Measured** on git 2.43: with an unrelated
