@@ -219,3 +219,8 @@ R119 | a view using only built-in functions and operators | no recorded dependen
 R120 | the effective path against the configured one | pg_catalog,m against m
 R121 | a view qualifying a function in a schema off the write path | ax.digest
 R122 | whether ax was on the effective path when that view was created | no
+A66 | recreating the SQL caller with check_function_bodies on | refused: function cfb.f(integer) does not exist
+A67 | the same recreation with check_function_bodies off | accepted
+A68 | calling it afterwards | refused: function cfb.f(integer) does not exist
+A69 | a BEGIN ATOMIC body naming the same missing function, still off | refused: function cfb.f(integer) does not exist
+A70 | how the setting reaches a session nobody configured | check_function_bodies=off

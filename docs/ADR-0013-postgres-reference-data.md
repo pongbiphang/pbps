@@ -592,9 +592,10 @@ pinned on the session, and not wrapped around the writes at all.**
   have to make with a question the engine answers, and the first one where the
   judgement had already been drafted and was wrong.
 
-- **Opaque DDL** runs under whatever the operator's database has — **with two
-  explicit exceptions, `standard_conforming_strings = on` and the per-statement
-  write `search_path`**, set and restored around it.
+- **Opaque DDL** runs under whatever the operator's database has — **with three
+  explicit exceptions: `standard_conforming_strings = on`, the per-statement
+  write `search_path`, and `check_function_bodies = on`**, set and restored
+  around it.
 
   The second was missing, and the omission contradicted this same section. Opaque
   DDL is a write: a `CREATE VIEW` or `CREATE FUNCTION` whose body carries an
@@ -604,7 +605,15 @@ pinned on the session, and not wrapped around the writes at all.**
   divergence the write path exists to prevent — measured on a view in `m_b` that
   caught `m_a.t` — so exempting opaque DDL from it exempted the one kind of
   statement the rule was written for. A rule with one exception invites a second
-  one nobody re-reads; both are now named in the same sentence. That exception was stated two rounds earlier and dropped when this
+  one nobody re-reads; both are now named in the same sentence.
+
+  The third has the same shape as the first: a rule stated elsewhere is true
+  only while the setting holds. [ADR-0009](ADR-0009-postgres-modules.md)'s
+  opaque-caller exemption suppresses a report because recreating a SQL-language
+  caller makes the engine validate its references — and **measured**, that
+  validation is gone under `check_function_bodies = off`, which reaches a
+  session through `ALTER ROLE … SET` without anybody typing it. The apply then
+  commits a caller that fails the first time it runs. That exception was stated two rounds earlier and dropped when this
   decision was rewritten, which is the second setting to fall out of a list
   during a rewrite about something else. It is not a rendering setting: it
   decides how the *definition text itself* parses, and
@@ -1284,7 +1293,7 @@ SPEC 14.3's shape, and it will arrive as a reasonable suggestion.
 | | |
 |---|---|
 | `pbps-model` | **Three fields in `StateSnapshot`, and a format bump** — the same three ADR-0009 counts, two of which this document is the reason for: the declared module text (ADR-0009 §2.2); the **resolved bindings** of every managed object, each flagged with whether its schema was on the effective write path at creation (§3); and the **declared expressions** — `Column::default`, `CheckConstraint::expression`, `Index::filter` (§4). The differ then compares declared-now against declared-at-last-apply, and drift compares read-back against read-back. This row said "Nothing" for four rounds after the first field was added, which is the stale-summary shape this branch keeps finding: the paragraph moved and the table that summarizes it did not |
-| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with two restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **and the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`. A scope around a write would also be a scope around every trigger that write fires |
+| ADR-0004's design | One construct **refused on this engine** — a `data:` block keyed by an identity column (§2). §3 adds no session pin at all. The canonical settings (with their values, §3) are set and restored around the **reads that render values**; the **writes** carry values the engine canonicalized at plan time, baked into the artifact; the **default probe** runs under the *write's* environment, because it executes the user's code — inside a `READ ONLY` transaction, so planning cannot move the target, and with the settings it probed under recorded for `apply` to assert; and **opaque DDL** runs under the operator's settings **with three restored exceptions, `standard_conforming_strings = on`**, which is what makes ADR-0011's scanner rule true, **the per-statement write `search_path`**, without which opaque DDL binds its unqualified references differently from `bootstrap`, **and `check_function_bodies = on`**, without which ADR-0009's opaque-caller exemption suppresses a report while the engine performs no check. A scope around a write would also be a scope around every trigger that write fires |
 | The search path | Two values, not one (§3): a **canonical empty path for every introspection read**, so a snapshot's spelling does not move when the project's shape does, and a **per-statement write path** — the object's own schema first, then the project's configured extras. For module bodies **and the three verbatim expressions the model holds** (`Column::default`, `CheckConstraint::expression`, `Index::filter`), the state records **the resolved binding, not the path string**: a new same-named object earlier on an unchanged path moves the binding and leaves the string alone. The test is a catalog query — is a same-named object of the same catalog class now earlier on the path than the schema this object bound to, and is that schema still on the **effective** path at all, asked only of bindings whose schema was on it when the object was created — because what an unchanged declaration *would* bind to today cannot be computed without parsing it or creating it. That is conservative: a declaration that qualified the name in full is rebuilt too. An opaque body records nothing, re-resolves at call time, and is the decision's stated gap |
 | The default probe's transaction | `READ ONLY` (§3). The engine refuses exactly the defaults that would move the target — `nextval()`, a function that writes — and accepts the volatile ones that do not, so its refusal defines "unprobeable" and pbps analyses nothing |
 | The default probe's session | Only valid inside itself (§3). The write happens from `apply`, on another connection, and the checksum covers the plan's typed JSON, not a session setting — so pbps writes the canonicalized value rather than omitting the column, and where it cannot, the plan records the probed settings and `apply` asserts them |

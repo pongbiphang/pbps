@@ -1073,6 +1073,45 @@ Two things follow, and neither is a new mechanism:
   check — which is a reason to **suppress the heuristic report**, not a reason to
   refuse anything.
 
+  **And "the engine performs the check" is a session setting, not a fact.** The
+  paragraph above says "with `check_function_bodies` at its default `on`", and a
+  caveat was doing the work of a decision:
+  [ADR-0013](ADR-0013-postgres-reference-data.md) §3 runs opaque DDL under the
+  operator's settings, so a deployment session that has it `off` — by
+  `ALTER ROLE … SET`, by `PGOPTIONS`, by a pooled connection — removes the check
+  this exemption spends. **Measured**:
+
+  ```
+  recreating the SQL caller with check_function_bodies on:   refused: function cfb.f(integer) does not exist
+  the same recreation with it off:                           accepted
+  calling it afterwards:                                     refused: function cfb.f(integer) does not exist
+  how the setting reaches a session nobody configured:       check_function_bodies=off
+  ```
+
+  The apply commits, the report was suppressed, and the caller fails the first
+  time anybody calls it.
+
+  **Decision.** `check_function_bodies = on` joins ADR-0013 §3's list of
+  settings pinned and restored around the DDL pbps emits — a third exception,
+  and one taken for the same reason as `standard_conforming_strings = on`: a
+  rule stated elsewhere in these documents is true only while it holds. Pinning
+  it makes the exemption's premise true rather than detecting when it is false,
+  and the failure it introduces is the loud one — a body that relied on `off`,
+  such as a genuinely circular pair of routines, is refused at `CREATE` instead
+  of committing broken. `depends_on:` orders the non-circular cases, which is
+  what it is for.
+
+  One kind needs no pin. **Measured**, a `BEGIN ATOMIC` body is refused under
+  `off` as well, because it must be parsed to record the dependencies §2 relies
+  on:
+
+  ```
+  a BEGIN ATOMIC body naming the same missing function, still off:  refused: function cfb.f(integer) does not exist
+  ```
+
+  So the exemption was already safe for the module kind this ADR recommends, and
+  the pin covers the string-bodied one it does not.
+
   Reading this paragraph as a refusal rule is what the decision above already
   rejects: a scan hit is a name, and a legitimate caller of `f(text)` must not
   block a rebuild of `f(integer)`. So the whole of it sits under that rule —

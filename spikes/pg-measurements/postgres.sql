@@ -1314,6 +1314,31 @@ SELECT 'R122', 'whether ax was on the effective path when that view was created'
   CASE WHEN 'ax' = ANY(current_schemas(true)) THEN 'yes' ELSE 'no' END;
 DROP SCHEMA ax CASCADE;
 
+-- -------------------------- the forty-first 2026-09-05 review round
+
+-- A65's exemption rests on the engine checking a recreated SQL body. That check
+-- is a session setting, and the opaque-DDL policy keeps the operator's.
+CREATE SCHEMA cfb;
+CREATE FUNCTION cfb.f(a int) RETURNS int AS $$SELECT a$$ LANGUAGE sql;
+CREATE FUNCTION cfb.caller() RETURNS int AS $$SELECT cfb.f(1)$$ LANGUAGE sql;
+DROP FUNCTION cfb.f(int);
+CREATE FUNCTION cfb.f(a int, b int) RETURNS int AS $$SELECT a + b$$ LANGUAGE sql;
+SELECT 'A66', 'recreating the SQL caller with check_function_bodies on',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.caller() RETURNS int AS $x$SELECT cfb.f(1)$x$ LANGUAGE sql');
+SET check_function_bodies = off;
+SELECT 'A67', 'the same recreation with check_function_bodies off',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.caller() RETURNS int AS $x$SELECT cfb.f(1)$x$ LANGUAGE sql');
+SELECT 'A68', 'calling it afterwards', m.accepts('SELECT cfb.caller()');
+SELECT 'A69', 'a BEGIN ATOMIC body naming the same missing function, still off',
+  m.accepts('CREATE OR REPLACE FUNCTION cfb.atomic() RETURNS int LANGUAGE sql BEGIN ATOMIC; SELECT cfb.f(1); END');
+RESET check_function_bodies;
+ALTER ROLE m_bystander SET check_function_bodies = off;
+SELECT 'A70', 'how the setting reaches a session nobody configured',
+  (SELECT array_to_string(setconfig, ',') FROM pg_db_role_setting s
+     JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = 'm_bystander');
+ALTER ROLE m_bystander RESET check_function_bodies;
+DROP SCHEMA cfb CASCADE;
+
 -- Clean up every principal this script created; roles are cluster-wide.
 ALTER DEFAULT PRIVILEGES FOR ROLE m_owner_a IN SCHEMA m REVOKE SELECT ON TABLES FROM m_all;
 DROP SCHEMA m CASCADE;
