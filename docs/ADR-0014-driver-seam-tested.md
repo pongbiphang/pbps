@@ -134,6 +134,8 @@ The cost is exactly two files: the definition, and its single caller —
 grep, not estimated: there are two occurrences of the name in the whole
 workspace.
 
+**Applied** in the seam-preparation PR (DECISIONS 193).
+
 ## 2. `begin()` holds T-SQL, in the crate that is documented to hold none
 
 CLAUDE.md's architectural boundaries say of `pbps-db`:
@@ -156,6 +158,11 @@ triple, not a new trait — and `pbps-db` keeps the framing, which is what it
 actually owns. The value is not the refactor; it is that a stated constraint
 stops being false. CLAUDE.md's own rule covers this case: *"A guard whose reason
 has gone is a filter nobody re-reads."*
+
+**Applied** in the seam-preparation PR as `Dialect::transaction_framing`, a
+required method returning three `&'static str`s that `Conn::begin`, `commit`
+and `rollback` take; the `XACT_ABORT` and `@@TRANCOUNT` reasoning moved with
+the text into `pbps-mssql` (DECISIONS 194).
 
 ## 3. What did not leak
 

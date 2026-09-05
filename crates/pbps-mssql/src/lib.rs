@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 
-use pbps_dialect::{Dialect, DialectError, Probe, Statement, TypeChangeRisk};
+use pbps_dialect::{Dialect, DialectError, Probe, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ObjectName, Role, Schema, Strategy, Table, TableName,
 };
@@ -104,5 +104,37 @@ impl Dialect for Mssql {
 
     fn batch_separator(&self) -> Option<&'static str> {
         Some("GO")
+    }
+
+    /// `XACT_ABORT ON` is what makes SPEC §7.5's "all or nothing" true rather
+    /// than intended: without it SQL Server keeps the transaction alive past
+    /// most statement-level errors, so a failed statement halfway through a
+    /// plan would leave the earlier ones committable. Once it has doomed the
+    /// transaction, `ROLLBACK` may find nothing to roll back and error with
+    /// "no corresponding BEGIN TRANSACTION"; reporting that would replace the
+    /// real failure — the statement that broke — with a confusing second one,
+    /// so the rollback checks `@@TRANCOUNT` first.
+    fn transaction_framing(&self) -> TransactionFraming {
+        TransactionFraming {
+            begin: "SET XACT_ABORT ON; BEGIN TRANSACTION;",
+            commit: "COMMIT TRANSACTION;",
+            rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The framing moved here from `pbps-db` unchanged (ADR-0014 §2). The two
+    /// properties the live rollback test depends on are pinned where the text
+    /// now lives: a statement error dooms the transaction, and the rollback
+    /// tolerates one already doomed.
+    #[test]
+    fn the_transaction_framing_dooms_on_error_and_tolerates_a_dead_transaction() {
+        let tx = Mssql.transaction_framing();
+        assert!(tx.begin.contains("SET XACT_ABORT ON"));
+        assert!(tx.rollback.starts_with("IF @@TRANCOUNT > 0"));
     }
 }

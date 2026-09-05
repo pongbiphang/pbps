@@ -89,9 +89,9 @@ guard's reason was never true, which is worse — the next person to weigh
 against a real engine disproves, and learns that the file's reasons are not
 load-bearing. The fix is to state the reasons that are.
 
-**Not applied in this branch.** The correction touches
-`crates/pbps-dialect/src/lib.rs`, which PR #10 also touches; taking a conflict
-for a comment change gains nothing. It lands with the first PostgreSQL commit.
+**Applied** once PR #10 had merged, in the seam-preparation PR that precedes
+the PostgreSQL crate (DECISIONS 193–195): the header table row and `emit`'s
+comment now give the reasons that hold.
 
 ## Amendment 2: `normalize_definition` is SQL Server's scanner, and PostgreSQL breaks it in both directions
 
@@ -176,6 +176,9 @@ contains a nesting-aware comment scanner, added by `3b5c9de` ("track nested
 T-SQL comments") in `pbps-model/src/module.rs` for the identifier scan: **two
 comment scanners, and only one of them nests.** The second was fixed because
 somebody hit it; the first has the same defect and a quieter failure.
+**The nesting is applied** ahead of the PostgreSQL crate (DECISIONS 195); the
+description of the engine's literals, and the removal of the default, land with
+that crate.
 
 The *default* implementation is removed, so a new dialect cannot silently
 inherit another engine's answer. Two of the three failures on this page came
@@ -262,4 +265,6 @@ than its last.
 
 Phase 5, with the first PostgreSQL commits. None of the three is large; all
 three are the kind of thing that becomes expensive once a second dialect has
-been written against the wrong version.
+been written against the wrong version. Amendment 1 and the nesting half of
+Amendment 2 have since landed ahead of the crate, in the seam-preparation PR
+(DECISIONS 193–195); the rest waits for the engine that needs it.

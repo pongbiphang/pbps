@@ -168,7 +168,10 @@ collision ADR-0004 never recorded) and
 `pbps-db`, measured with a spike). Each ADR's "Placement" section says what
 lands with the first PostgreSQL commits and what must land before them; the
 model changes come first, because format is the most expensive thing here to
-change late.
+change late. The seam preparation the ADRs place *before* the crate has landed
+(DECISIONS 193–195): the server error code is text, the transaction framing is
+the dialect's, the shared definition scanner nests block comments, and the
+dialect crate's header states reasons that hold.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

@@ -753,6 +753,7 @@ dependencies = [
 name = "pbps-db"
 version = "0.0.0"
 dependencies = [
+ "pbps-dialect",
  "pbps-model",
  "serde_json",
  "thiserror",
