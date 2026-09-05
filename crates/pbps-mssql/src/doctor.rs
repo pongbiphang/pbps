@@ -398,10 +398,33 @@ impl std::fmt::Display for Securable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Securable::Database => f.write_str("the database"),
-            Securable::Schema(s) => write!(f, "SCHEMA::{s}"),
-            Securable::Object(o) => write!(f, "OBJECT::{o}"),
+            Securable::Schema(s) => write!(f, "SCHEMA::{}", spelled(s)),
+            // Each part quoted on its own and joined with a dot, the spelling
+            // `emit::qualified` gives a table: `OBJECT::[dbo].[a.b]` is one
+            // object, while `OBJECT::dbo.a.b` is a `b` in some schema `dbo.a`
+            // — a different securable, and the one the reader would grant on.
+            Securable::Object(o) => {
+                write!(f, "OBJECT::{}.{}", spelled(&o.schema), spelled(&o.name))
+            }
         }
     }
+}
+
+/// One part of a securable's name, bracket-quoted the way the emitter spells
+/// every identifier.
+///
+/// The report offers this label as the securable a `GRANT` names, and a reader
+/// pastes it. Bare, a name holding a `]`, a space or a hyphen ends the
+/// statement early or is a syntax error, and a name holding a `.` names
+/// something else entirely.
+///
+/// `ident::quote` refuses the three names the server itself will not take:
+/// empty, holding a NUL, and longer than `MAX_IDENT_CHARS`. No statement can
+/// carry those, so the label keeps the name and says it is not one, rather
+/// than printing something that looks pasteable and is not — the same choice
+/// the `schema.absent` remedy makes by offering no command at all.
+fn spelled(part: &str) -> String {
+    crate::ident::quote(part).unwrap_or_else(|_| format!("<unquotable: {part}>"))
 }
 
 impl Gap {
@@ -1190,8 +1213,72 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].permission, "ALTER");
-        assert_eq!(gaps[0].securable(), "SCHEMA::app");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[app]");
         assert!(!gaps[0].why.is_empty());
+    }
+
+    /// That label is pasted into a `GRANT`, so it carries the emitter's
+    /// quoting, part by part. Bare, the dotted name below reads as a table
+    /// `b` in a schema `dbo.a` — a securable the operator would then grant on
+    /// instead — and the second one ends the identifier at its `]`.
+    ///
+    /// Built with `ObjectName::new` rather than parsed: `FromStr` splits on
+    /// every dot and refuses a name holding one, so today the label is the
+    /// only place such a name could arrive from (a catalog read, a state
+    /// snapshot). The spelling has to be right when it does.
+    #[test]
+    fn an_irregular_object_name_is_quoted_part_by_part() {
+        let dotted = ObjectName::new("dbo", "a.b");
+        assert_eq!(
+            Securable::Object(dotted.clone()).to_string(),
+            "OBJECT::[dbo].[a.b]"
+        );
+        assert_eq!(
+            Securable::Object(ObjectName::new("dbo", "x]y")).to_string(),
+            "OBJECT::[dbo].[x]]y]"
+        );
+        // The emitter's own spelling of the same object, which is the point:
+        // the label names the securable the `GRANT` would land on, or it is
+        // worse than no label at all.
+        assert_eq!(
+            Securable::Object(dotted.clone()).to_string(),
+            format!("OBJECT::{}", crate::emit::qualified(&dotted).unwrap())
+        );
+    }
+
+    /// A schema name needs no dot to need quoting: `my-schema` is a
+    /// subtraction bare, and `[my-schema]` is a name.
+    #[test]
+    fn an_irregular_schema_name_is_bracket_quoted() {
+        assert_eq!(
+            Securable::Schema("my-schema".to_owned()).to_string(),
+            "SCHEMA::[my-schema]"
+        );
+        assert_eq!(
+            Securable::Schema("dbo".to_owned()).to_string(),
+            "SCHEMA::[dbo]"
+        );
+    }
+
+    /// Negative: the three names the server itself refuses have no `GRANT`
+    /// spelling at all. The label names them and says so, rather than putting
+    /// brackets round them and reading as a statement that would run.
+    #[test]
+    fn a_name_no_statement_can_carry_is_not_offered_as_one() {
+        assert_eq!(
+            Securable::Schema(String::new()).to_string(),
+            "SCHEMA::<unquotable: >"
+        );
+        assert_eq!(
+            Securable::Object(ObjectName::new("dbo", "a\0b")).to_string(),
+            "OBJECT::[dbo].<unquotable: a\0b>"
+        );
+        let long = "x".repeat(crate::ident::MAX_IDENT_CHARS + 1);
+        let label = Securable::Object(ObjectName::new("dbo", long.clone())).to_string();
+        assert_eq!(label, format!("OBJECT::[dbo].<unquotable: {long}>"));
+        // Not bracket-quoted anywhere in the part: the reader must not be able
+        // to paste it and be told by the server that it worked.
+        assert!(!label.ends_with(']'), "{label}");
     }
 
     /// An account that can take the lock but not release it is the dangerous
@@ -1204,7 +1291,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].permission, "DELETE");
-        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
     }
 
     /// The ledger and the lock live in `dbo`. Demanding INSERT and DELETE on an
@@ -1240,7 +1327,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "SELECT");
-        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
         // The *ledger* SELECT, not the probes' one: the two entries exist to be
         // told apart, and the reason is what tells them apart in the report.
         assert!(gaps[0].why.contains("recorded state"), "{gaps:?}");
@@ -1274,7 +1361,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "ALTER");
-        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
         assert!(gaps[0].why.contains("first use"), "{gaps:?}");
     }
 
@@ -1292,7 +1379,7 @@ mod tests {
         let gaps = missing(&held);
         assert!(
             gaps.iter()
-                .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+                .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::[dbo]"),
             "the table still to be created needs the creation permission: {gaps:?}"
         );
     }
@@ -1307,7 +1394,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "REFERENCES");
-        assert_eq!(gaps[0].securable(), "SCHEMA::app");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[app]");
     }
 
     /// `CONTROL` is deliberately absent (see the note above `Held`), so the
@@ -1369,7 +1456,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "DELETE");
-        assert_eq!(gaps[0].securable(), "OBJECT::dbo.__pbps_lock");
+        assert_eq!(gaps[0].securable(), "OBJECT::[dbo].[__pbps_lock]");
     }
 
     /// Before a first deployment the ledger does not exist, so there is no
@@ -1385,7 +1472,7 @@ mod tests {
         held.ledger_schema.remove("INSERT");
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
     }
 
     /// The scope is chosen per ledger table, not once for the pair. An account
@@ -1406,7 +1493,7 @@ mod tests {
         for permission in ["SELECT", "INSERT", "DELETE"] {
             assert!(
                 gaps.iter()
-                    .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+                    .any(|g| g.permission == permission && g.securable() == "SCHEMA::[dbo]"),
                 "{permission} on the table still to be created was not asked for: {gaps:?}"
             );
         }
@@ -1415,7 +1502,7 @@ mod tests {
         assert!(
             !gaps
                 .iter()
-                .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+                .any(|g| g.securable() == "OBJECT::[dbo].[__pbps_lock]"),
             "{gaps:?}"
         );
     }
@@ -1432,7 +1519,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "SELECT");
-        assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
     }
 
     /// A trigger is authorized by ALTER on the table it is on, not by a CREATE
@@ -1502,7 +1589,7 @@ mod tests {
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "ALTER");
-        assert_eq!(gaps[0].securable(), "SCHEMA::app");
+        assert_eq!(gaps[0].securable(), "SCHEMA::[app]");
     }
 
     /// The negative case: an empty answer is a real state — a login mapped to
@@ -1555,15 +1642,16 @@ mod tests {
         let gaps = missing(&held);
         for permission in ["REFERENCES", "SELECT"] {
             assert!(
-                gaps.iter().any(|g| g.permission == permission
-                    && g.securable() == "OBJECT::shared.parent"),
+                gaps.iter()
+                    .any(|g| g.permission == permission
+                        && g.securable() == "OBJECT::[shared].[parent]"),
                 "{permission} on the referenced table was not asked for: {gaps:?}"
             );
         }
         // And nothing wider: demanding anything on the whole of somebody else's
         // schema is the over-demand this check exists to avoid.
         assert!(
-            !gaps.iter().any(|g| g.securable() == "SCHEMA::shared"),
+            !gaps.iter().any(|g| g.securable() == "SCHEMA::[shared]"),
             "{gaps:?}"
         );
     }
