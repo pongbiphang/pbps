@@ -178,10 +178,14 @@ with `-m` because a commit with no message opens an editor, which a
 subprocess with no terminal cannot answer — **measured**: with no editor
 variable set and no terminal, `git commit --only -- a` exited non-zero
 without committing, and the same command with `-m` committed. `--only` takes
-the named paths from
-the working tree and leaves whatever the index already held staged and
-uncommitted; the preview the page shows first is `git diff HEAD -- <paths>`,
-which is exactly that content. **Measured** on git 2.43: with an unrelated
+the named paths from the working tree and leaves whatever the index already
+held staged and uncommitted; the preview the page shows first is `git diff
+HEAD -- <paths>`, which is exactly that content. Every `git` the UI runs
+takes `--literal-pathspecs`, and the paths as the bytes the configuration
+holds: a path is a *pathspec* to `git`, and **measured**, `git diff HEAD --
+'a[12].json'` selected `a1.json`, `a2.json` and `a[12].json`, and `commit
+--only` the same three, where `--literal-pathspecs` selected the one file
+named. **Measured** on git 2.43: with an unrelated
 file staged, `git commit --only -- ids.json` committed the ids file alone and
 left the other file staged, and `git diff HEAD -- ids.json` showed the same
 hunk — where a plain `git add` and `git commit` would have swept the staged
@@ -212,11 +216,19 @@ refs/heads/<branch>`) and refuses to compose unless they are equal, showing
 the unpushed commits and the commands instead: a refspec bounds the
 destination ref, not the range, and a branch already ahead would have every
 unpushed ancestor published under the intent commit without ever appearing in
-the preview. After the read-back the push names the verified commit rather
-than `HEAD`, which another process may have moved, and leases the destination
-on the tip it recorded: `git push --no-follow-tags
+the preview. A branch the remote does not have yet — the first push of a
+feature branch, which is the common case — is not an ahead branch: the
+destination is absent rather than behind, and the check is instead that the
+tip is already on the remote, an ancestor of one of the heads `ls-remote`
+lists (`git merge-base --is-ancestor`), so that the one commit the push
+carries is again the intent commit. After the read-back the push names the
+verified commit rather than `HEAD`, which another process may have moved, and
+leases the destination on the tip it recorded — or on its absence, with an
+empty expected value: `git push --no-follow-tags
 --force-with-lease=refs/heads/<branch>:<tip> <remote> <oid>:refs/heads/<branch>`,
-never a bare `git push`. **Measured** on the same git: with
+never a bare `git push`. **Measured** on the same git: `ls-remote` answered
+nothing for the unpublished branch, the tip was an ancestor of the remote's
+`main`, and the push with the empty lease created the branch. And with
 `push.default=matching` and two branches ahead, a bare `git push` advanced
 both; a branch one unrelated commit ahead had that commit published by
 `HEAD:refs/heads/<branch>`; with `HEAD` moved on after the read-back, the push
