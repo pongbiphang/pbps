@@ -2751,3 +2751,22 @@ SPEC is in sync with all of these.
     `DEFAULT` beside a `uniqueidentifier` left to `NEWID()` and applies clean.
     Before it no live plan had set a cell to `DEFAULT` at all.
 
+
+192. **`status` decides the row verdict before it writes the inventory, and
+    lands a failed read last.** The third instance of the shape 159 and 168
+    named: a check that ended the function hid every check after it. The row
+    read was the last such return, and what followed it — the managed
+    limitations, the unreadable modules, the objects `unmanaged: warn/error`
+    sees — needs only the catalog, which had already succeeded, so a read that
+    failed was reported *instead of* a stray object rather than beside it. The
+    obvious fix, moving those checks above the read, changes what the row
+    says on the ordinary path: `record_drift` yields to a state already on the
+    row, so a row that moved beside an `unmanaged: warn` would have read
+    "warning" with drift demoted to a supplemental issue. So the verdict is
+    computed first, as a `Result<bool, String>`, and recorded in two places:
+    drift immediately, keeping its rank over the warning; the failure at the
+    very end, through `record_unreachable`, which keeps whatever is on the row
+    and moves the previous primary state into the issues. The assembly is a
+    sync function handed the read's result, so a test can hand it a failure;
+    the two tests that do fail against the old return with exactly the
+    missing finding.
