@@ -7195,6 +7195,91 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
     });
 }
 
+/// A plan that returns a declared cell to its column's default, applied for
+/// real. The guard holds such a cell to *being* at its default at the closing
+/// read, which is a claim about how the engine reads it back: the row reader
+/// asks the engine to confirm a literal default and omits the cell where it
+/// does (DECISIONS 191). Only the engine can say the guard is not refusing its
+/// own plan, and before this no live plan set a cell to `DEFAULT` at all.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_cell_returned_to_its_default_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let name = format!("pbps_cli_todefault_{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!("CREATE DATABASE [{name}];"))
+            .await
+            .expect("create database");
+    });
+    let connection = format!("{server};Database={name}");
+
+    let d = Demo::new("todefault");
+    let declared = |label: &str| {
+        format!(
+            "table: dbo.t\ncolumns:\n  code: {{type: varchar(20), nullable: false}}\n  \
+             label: {{type: nvarchar(50), nullable: false, default: \"'Unlabelled'\"}}\n  \
+             tag: {{type: uniqueidentifier, nullable: false, default: \"NEWID()\"}}\n\
+             primary_key: {{name: pk_t, columns: [code]}}\ndata:\n  mode: exact\n  rows:\n    \
+             a: {label}\n    b: {{}}\n"
+        )
+    };
+    d.table(&declared("{label: Custom}"));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The declaration stops spelling `label`: the plan sets it to DEFAULT.
+    // `tag` was left to `NEWID()` throughout, which the engine cannot confirm
+    // and reads back as a value on every read.
+    d.table(&declared("{}"));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    assert!(
+        planned.contains("\"op\":\"update_row\"") || planned.contains("\"op\": \"update_row\""),
+        "the plan must carry the update: {planned}"
+    );
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "data-update",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a cell at its default must not read as a value: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+        c.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .ok();
+    });
+}
+
 /// `apply` records the database read back, not the plan applied to the old
 /// state — so a change another session makes while the plan is running would
 /// be written down as this plan's own result, and every later `verify` would

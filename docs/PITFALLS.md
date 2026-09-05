@@ -247,6 +247,12 @@ excused an added or renamed column by *name*, which is true of the one read
 spanning its statement and of no later read of a staged run. An exclusion has
 a size and a lifetime; check both against the reason.
 
+And a third: a `DEFAULT` cell was dropped from a row's expectations because its
+value could not be named (decision 191). "Cannot be compared as a value" is not
+"cannot be compared": the read-back *omits* a confirmed default, so presence
+was the comparable fact — under conditions the code already knew, one read and
+one function away.
+
 ## A readiness check that reads only the declarations
 
 `doctor` derived the securables to ask `CONTROL` about from the declared

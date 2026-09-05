@@ -442,6 +442,19 @@ pub trait Dialect {
     fn batch_separator(&self) -> Option<&'static str> {
         None
     }
+
+    /// Whether a read-back can tell a cell of this column that is at its
+    /// default from one that is not.
+    ///
+    /// The row reader asks the engine to confirm a cell at its default only
+    /// where the default is a literal and the type has `=`; anything else is
+    /// read as a value nobody can tell from the default. A caller holding a
+    /// row to "at its default" has to ask the same question, or it refuses a
+    /// `NEWID()` cell for being there (DECISIONS 191). The default is `false`:
+    /// a dialect that has not said is one that cannot confirm anything.
+    fn reads_back_at_default(&self, _column: &pbps_model::Column) -> bool {
+        false
+    }
 }
 
 /// Renders emitted statements as one script, honouring [`Statement::own_batch`].

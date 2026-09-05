@@ -218,10 +218,7 @@ pub fn query(
         let quoted = quote(column)?;
         let value_at = select.len();
         select.push(read_expr(&quoted, &spec.ty.base));
-        let asked = spec
-            .default
-            .as_deref()
-            .is_some_and(|d| comparable(&spec.ty.base) && is_constant(d));
+        let asked = confirms_default(spec);
         let default_at = match &spec.default {
             Some(default) if asked => {
                 select.push(format!(
@@ -620,6 +617,18 @@ pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> String {
         "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
         _ => format!("TRY_CONVERT({ty}, {literal})"),
     }
+}
+
+/// Whether the engine is asked to confirm a cell of this column at its
+/// default: the default is a literal it can compare without running anything,
+/// and the type has `=`. One function because two callers ask it — the row
+/// reader, to decide what to put in the query, and the apply guard, to know
+/// whether an omitted cell in the read-back *means* at-default (DECISIONS
+/// 191) — and two spellings of it would drift.
+pub fn confirms_default(spec: &pbps_model::Column) -> bool {
+    spec.default
+        .as_deref()
+        .is_some_and(|d| comparable(&spec.ty.base) && is_constant(d))
 }
 
 /// Whether a default expression is a literal — a number, a string, `NULL`, a

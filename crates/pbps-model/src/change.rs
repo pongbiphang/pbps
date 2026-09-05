@@ -517,19 +517,42 @@ pub enum Change {
 
 /// What a row change leaves at its key.
 ///
-/// The cells are the ones the plan *spells* — never the ones it leaves to a
-/// default. A read-back omits a cell that is at its column's default
-/// ([`crate::data::cell`]), so a plan value that happens to equal that default
-/// is simply not there to compare, and demanding it would refuse a valid
-/// apply. What is spelled and present must match, and that is exact: a
-/// connected plan is refused outright if the engine reads a declared value
-/// back differently (DECISIONS 101, 165).
+/// Every cell the change writes, whether it spells a value or leaves the
+/// column to its default. A spelled cell that the read-back carries must
+/// match, and that is exact: a connected plan is refused outright if the
+/// engine reads a declared value back differently (DECISIONS 101, 165). A
+/// cell left to its default was dropped from here, because a read-back omits
+/// a cell at its default and there was nothing to compare — which also meant
+/// a value that arrived in its place was compared with nothing. It stays as
+/// [`CellAfter::AtDefault`], and the caller that knows how its read-back
+/// spells an at-default cell holds it there (DECISIONS 191).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowAfter<'a> {
     /// The row is there, and holds at least these cells.
-    Holding(BTreeMap<&'a str, &'a Value>),
+    Holding(BTreeMap<&'a str, CellAfter<'a>>),
     /// The row is gone.
     Gone,
+}
+
+/// What a row change leaves in one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellAfter<'a> {
+    /// The value the plan wrote, NULL included.
+    Spelled(&'a Value),
+    /// The column's default, whatever the engine evaluates it to. The plan
+    /// cannot name the value — only the engine can — so what a read-back can
+    /// be held to is that the cell *is* at the default, and only where the
+    /// read-back says so (DECISIONS 191).
+    AtDefault,
+}
+
+impl<'a> From<&'a Cell> for CellAfter<'a> {
+    fn from(cell: &'a Cell) -> Self {
+        match cell {
+            Cell::Value(v) => CellAfter::Spelled(v),
+            Cell::Default(_) => CellAfter::AtDefault,
+        }
+    }
 }
 
 /// Which attribute of a column a change moves.
@@ -832,37 +855,36 @@ impl Change {
     // declared row has to be named here, or the row it writes would be
     // compared against a state it was never part of.
     pub fn row(&self) -> Option<(&TableName, &RowKey, RowAfter<'_>)> {
-        // Only what the plan writes down — and a NULL *is* written down. The
-        // read-back omits a NULL in a column with no default, which excuses
-        // its **absence** and nothing else: a value that arrived in its place
-        // is present, and dropping the expectation meant nothing looked. The
-        // caller already skips a cell the read-back does not carry, so
-        // keeping it costs no false refusal and buys the other half
-        // (DECISIONS 179).
-        //
-        // A cell set to `DEFAULT` stays out, and that is not the same case.
-        // Its value is omitted only where the engine *confirmed* it at the
-        // default; one it could not evaluate (`NEWID()`) comes back with its
-        // value, so presence there disproves nothing and demanding a value
-        // this change cannot name would refuse a valid apply (117, 165).
-        fn spelled(cell: &Cell) -> Option<&Value> {
-            match cell {
-                Cell::Default(_) => None,
-                Cell::Value(v) => Some(v),
-            }
-        }
+        // Every cell the change writes — a NULL *is* written down, and so is
+        // `DEFAULT`. The read-back omits a NULL in a column with no default,
+        // which excuses its **absence** and nothing else: a value that
+        // arrived in its place is present, and dropping the expectation meant
+        // nothing looked (DECISIONS 179). A cell set to `DEFAULT` used to be
+        // dropped for the same wrong reason: its value is omitted only where
+        // the engine *confirmed* it at the default, and one it could not
+        // evaluate (`NEWID()`) comes back with its value — so it is kept as
+        // [`CellAfter::AtDefault`], and the caller asks the dialect which
+        // case it is looking at (117, 165, 191).
         match self {
             Change::InsertRow {
-                table, key, row, ..
+                table,
+                key,
+                row,
+                defaults,
+                ..
             } => Some((
                 table,
                 key,
                 RowAfter::Holding(
-                    // Every cell the insert names, NULL included: see
-                    // `spelled` above.
                     row.0
                         .iter()
-                        .map(|(column, v)| (column.as_str(), v))
+                        .map(|(column, v)| (column.as_str(), CellAfter::Spelled(v)))
+                        // And the columns the insert leaves to their default.
+                        .chain(
+                            defaults
+                                .keys()
+                                .map(|column| (column.as_str(), CellAfter::AtDefault)),
+                        )
                         .collect(),
                 ),
             )),
@@ -880,7 +902,7 @@ impl Change {
                         .iter()
                         .map(|(column, (_, to))| (column, to))
                         .chain(unchanged)
-                        .filter_map(|(column, cell)| spelled(cell).map(|v| (column.as_str(), v)))
+                        .map(|(column, cell)| (column.as_str(), CellAfter::from(cell)))
                         .collect(),
                 ),
             )),

@@ -53,7 +53,8 @@ the pre-delete probe's dynamic SQL, and the binary end to end through
 that *creates* a table with a foreign key, applied through the real gate —
 the shape the apply guard got wrong twice because nothing here applied one —
 and one that adds a column, a key, a unique, an index and a foreign key to a
-table already there) run against a real SQL Server in Docker:
+table already there, and one that returns a declared cell to its default) run
+against a real SQL Server in Docker:
 `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if 14330 is taken; the engine is
 pinned by digest there and in CI), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The

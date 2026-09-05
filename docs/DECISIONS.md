@@ -2725,3 +2725,29 @@ SPEC is in sync with all of these.
     each append their own. A shared function does not know what its caller
     can do about what it found.
 
+191. **A cell the plan leaves to its default is held to being at it, at the
+    closing read.** `RowAfter::Holding` carried only the cells the plan
+    *spells*; a `DEFAULT` cell was dropped because the plan cannot name the
+    value the engine will put there, and a read-back omits a cell at its
+    default, so there seemed to be nothing to compare (165). Dropping it also
+    dropped the other half: a value another session wrote into that cell
+    between a staged `UPDATE` and its checkpoint read was present in the
+    read-back and compared with nothing (the same shape as 179, for NULL).
+    The cell stays, as `CellAfter::AtDefault`, and the guard holds it to
+    *being omitted* — under two conditions that are the whole of what makes
+    "omitted" mean "at the default". First, the read has to be the closing
+    one: it is spelled against no recorded row, so a cell the engine confirmed
+    at its default is omitted and one that is there is not at it. A checkpoint
+    read is spelled against the checkpoint before it, and keeps an at-default
+    cell explicit wherever that checkpoint spelled it, so it can say nothing;
+    `Settled::Closing` names the difference. Second, the column's default has
+    to be one the engine is asked to confirm — a literal, on a type with `=`.
+    A `NEWID()` cell comes back with its value on every read, and holding it
+    to omission would refuse every plan that touches such a row. The row
+    reader already draws exactly that line to build its query; the guard asks
+    the dialect the same question (`Dialect::reads_back_at_default`, one
+    function behind both), because two spellings of the line would drift.
+    Measured: a live plan sets a `nvarchar` cell with a literal default to
+    `DEFAULT` beside a `uniqueidentifier` left to `NEWID()` and applies clean.
+    Before it no live plan had set a cell to `DEFAULT` at all.
+

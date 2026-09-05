@@ -98,6 +98,10 @@ impl Dialect for Mssql {
         preflight::probes(changes)
     }
 
+    fn reads_back_at_default(&self, column: &pbps_model::Column) -> bool {
+        rows::confirms_default(column)
+    }
+
     fn batch_separator(&self) -> Option<&'static str> {
         Some("GO")
     }

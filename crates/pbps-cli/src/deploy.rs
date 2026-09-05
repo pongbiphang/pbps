@@ -865,7 +865,7 @@ fn modules_after(
         // Keeping it needs no knowledge of which statements have run: one
         // already dropped is simply absent from the catalog, which the read
         // records truthfully, and one still standing stays watched.
-        if settled == Settled::Whole && matches!(p.change, pbps_model::Change::DropModule { .. }) {
+        if settled.whole() && matches!(p.change, pbps_model::Change::DropModule { .. }) {
             set.remove(name);
         } else {
             set.insert(name.clone());
@@ -1149,8 +1149,22 @@ fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> 
 enum Settled {
     /// Every statement of the plan has run.
     Whole,
+    /// Every statement has run, *and* the read was taken from the plan's
+    /// scope alone — no recorded row said how to spell a cell at its default,
+    /// so one the engine confirmed at its default is omitted, and one that is
+    /// there is not at it. That is the one read a cell the plan leaves to its
+    /// default can be held to (DECISIONS 191). A checkpoint read is spelled
+    /// against the checkpoint before it and cannot say the same.
+    Closing,
     /// Some of them have. Only movement is comparable.
     SoFar,
+}
+
+impl Settled {
+    /// Whether the plan's postconditions can be asked.
+    fn whole(self) -> bool {
+        self != Settled::SoFar
+    }
 }
 
 /// Whether two types are one type to the dialect.
@@ -1515,7 +1529,7 @@ fn refuse_unplanned_movement(
                 // Only once every statement has run: a foreign key is split
                 // out of the `CREATE` into a change of its own, and at a
                 // checkpoint it may not have been added yet.
-                if settled == Settled::Whole {
+                if settled.whole() {
                     for missing in was.difference(&now) {
                         moved.push(format!(
                             "{now_name} {kind} `{missing}` is not there, and this plan's \
@@ -1623,10 +1637,7 @@ fn refuse_unplanned_movement(
                     "{now_name} has a primary key, and this plan declares none"
                 ));
             }
-            if settled == Settled::Whole
-                && declared.primary_key.is_some()
-                && now.primary_key.is_none()
-            {
+            if settled.whole() && declared.primary_key.is_some() && now.primary_key.is_none() {
                 moved.push(format!(
                     "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
                 ));
@@ -1809,7 +1820,7 @@ fn refuse_unplanned_movement(
     // nothing else can reach it; a staged run commits each statement, and a
     // row it inserted can be deleted before the checkpoint read
     // (DECISIONS 162).
-    if settled == Settled::Whole {
+    if settled.whole() {
         for p in &changes.changes {
             let Some((table, key, expected)) = p.change.row() else {
                 continue;
@@ -1827,13 +1838,36 @@ fn refuse_unplanned_movement(
                 // valid apply (DECISIONS 165).
                 (pbps_model::RowAfter::Holding(cells), Some(row)) => {
                     for (column, wrote) in cells {
-                        if let Some(now) = row.get(column)
-                            && now != wrote
-                        {
-                            moved.push(format!(
-                                "{table} row `{key}` does not hold in `{column}` what this plan \
-                                 wrote"
-                            ));
+                        match (wrote, row.get(column)) {
+                            (pbps_model::CellAfter::Spelled(wrote), Some(now)) if now != wrote => {
+                                moved.push(format!(
+                                    "{table} row `{key}` does not hold in `{column}` what this \
+                                     plan wrote"
+                                ));
+                            }
+                            (pbps_model::CellAfter::Spelled(_), _) => {}
+                            // A cell the plan leaves to its default is held
+                            // there only where a present cell *means* not at
+                            // it: at the closing read, whose spelling omits a
+                            // confirmed default, and on a column whose default
+                            // the engine confirms at all. A `NEWID()` cell
+                            // comes back with its value on every read, and a
+                            // checkpoint read spells a cell the way the
+                            // checkpoint before it did (DECISIONS 191).
+                            (pbps_model::CellAfter::AtDefault, Some(_))
+                                if settled == Settled::Closing
+                                    && after
+                                        .tables
+                                        .get(table)
+                                        .and_then(|t| t.columns.get(column))
+                                        .is_some_and(|c| dialect.reads_back_at_default(c)) =>
+                            {
+                                moved.push(format!(
+                                    "{table} row `{key}` holds a value in `{column}`, and this \
+                                     plan leaves it at its default"
+                                ));
+                            }
+                            (pbps_model::CellAfter::AtDefault, _) => {}
                         }
                     }
                 }
@@ -1854,7 +1888,7 @@ fn refuse_unplanned_movement(
     // with no grants has nothing *but* its name, so without this a
     // `CREATE ROLE` another session undid was recorded as success
     // (DECISIONS 161).
-    if settled == Settled::Whole {
+    if settled.whole() {
         let mut expected_tables: BTreeMap<&TableName, pbps_model::Presence> = BTreeMap::new();
         let mut expected_roles: BTreeMap<&str, pbps_model::Presence> = BTreeMap::new();
         for p in &changes.changes {
@@ -2126,7 +2160,7 @@ fn refuse_unplanned_movement(
             match settled {
                 // Every statement has run, so what the plan asked for is part
                 // of the answer.
-                Settled::Whole => {
+                Settled::Whole | Settled::Closing => {
                     for revoked in removes {
                         expected.remove(revoked);
                     }
@@ -3856,7 +3890,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             &before,
             &after.schema,
             &target.label,
-            Settled::Whole,
+            Settled::Closing,
         )
         .map_err(|e| {
             anyhow::anyhow!(
@@ -4256,7 +4290,8 @@ fn staged_movement(
     // (DECISIONS 161).
     let settled = match read {
         StagedRead::Checkpoint { completed, total } if completed < total => Settled::SoFar,
-        StagedRead::Checkpoint { .. } | StagedRead::Closing { .. } => Settled::Whole,
+        StagedRead::Checkpoint { .. } => Settled::Whole,
+        StagedRead::Closing { .. } => Settled::Closing,
     };
     refuse_unplanned_movement(dialect, changes, before, after, label, settled).map_err(|e| {
         match read {
@@ -7863,5 +7898,139 @@ mod tests {
             assert!(!e.contains("transaction was rolled back"), "{e}");
             assert!(!e.contains("then apply again"), "{e}");
         }
+    }
+
+    /// A cell the plan leaves to its default is held there at the closing
+    /// read. The read-back omits a cell the engine confirmed at its default,
+    /// so a present cell on such a column is one somebody else wrote — and
+    /// dropping the expectation because the value could not be named meant a
+    /// rewrite between a staged `UPDATE` and its checkpoint was recorded as
+    /// the plan's result. Only at the closing read, and only on a column
+    /// whose default the engine confirms: a `NEWID()` cell is present on
+    /// every read, and a checkpoint read spells cells after the checkpoint
+    /// before it (DECISIONS 191).
+    #[test]
+    fn a_cell_left_to_its_default_is_held_there_at_the_close() {
+        use pbps_model::{Cell, DataMode, RowKey, TableData, Value};
+        let dbo_t: TableName = "dbo.t".parse().unwrap();
+        let schema = |cells: &[(&str, &str)]| {
+            let column = |ty: &str, default: Option<&str>| {
+                let mut c = pbps_model::Column::new(ty.parse().unwrap());
+                c.default = default.map(str::to_owned);
+                c
+            };
+            let mut t = pbps_model::Table::default();
+            t.columns
+                .insert("code".to_owned(), column("varchar(20)", None));
+            t.columns
+                .insert("note".to_owned(), column("nvarchar(50)", Some("('n/a')")));
+            t.columns.insert(
+                "tag".to_owned(),
+                column("uniqueidentifier", Some("(newid())")),
+            );
+            t.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: [(
+                    RowKey::from("k"),
+                    cells
+                        .iter()
+                        .map(|(c, v)| ((*c).to_owned(), Value::Text((*v).to_owned())))
+                        .collect::<pbps_model::Row>(),
+                )]
+                .into_iter()
+                .collect(),
+            });
+            let mut s = Schema::default();
+            s.tables.insert(dbo_t.clone(), t);
+            s
+        };
+        let plan = |change: pbps_model::Change| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(change)],
+        };
+        // The declaration stops spelling `note`, so the plan sets it to
+        // DEFAULT; `tag` was always left to its `NEWID()`.
+        let defaulting = plan(pbps_model::Change::UpdateRow {
+            table: dbo_t.clone(),
+            key_column: "code".to_owned(),
+            key: RowKey::from("k"),
+            columns: [(
+                "note".to_owned(),
+                (
+                    Cell::Value(Value::Text("custom".to_owned())),
+                    Cell::Default("'n/a'".to_owned()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: [("tag".to_owned(), Cell::Default("NEWID()".to_owned()))]
+                .into_iter()
+                .collect(),
+            types: Default::default(),
+            after_types: Default::default(),
+        });
+        let before = schema(&[("note", "custom")]);
+        let check = |after: &Schema, settled: Settled| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &defaulting,
+                &before,
+                after,
+                "prod",
+                settled,
+            )
+        };
+        // At the close, the cell is omitted: at its default, as planned. The
+        // `NEWID()` cell is there with its value, and that proves nothing.
+        check(
+            &schema(&[("tag", "6F9619FF-8B86-D011-B42D-00C04FC964FF")]),
+            Settled::Closing,
+        )
+        .expect("at its default, and an unconfirmable default beside it");
+        // Present on a column the engine confirms: somebody wrote it.
+        let e = check(&schema(&[("note", "rogue")]), Settled::Closing)
+            .expect_err("a value where the plan left the default");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("leaves it at its default"),
+            "{e:#}"
+        );
+        // The same read-back at the final checkpoint says nothing: that read
+        // spells a cell the way the checkpoint before it did, so a cell at
+        // its default may well be present there.
+        check(&schema(&[("note", "rogue")]), Settled::Whole)
+            .expect("a checkpoint read cannot tell at-default from a value");
+
+        // An insert leaves columns to their defaults too.
+        let inserting = plan(pbps_model::Change::InsertRow {
+            table: dbo_t.clone(),
+            key_column: "code".to_owned(),
+            identity_key: false,
+            key: RowKey::from("k"),
+            row: Default::default(),
+            defaults: [("note".to_owned(), "'n/a'".to_owned())]
+                .into_iter()
+                .collect(),
+            types: Default::default(),
+        });
+        let empty = Schema::default();
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &inserting,
+            &empty,
+            &schema(&[("note", "rogue")]),
+            "prod",
+            Settled::Closing,
+        )
+        .expect_err("inserted at its default, read back with a value");
+        assert!(format!("{e:#}").contains("`note`"), "{e:#}");
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &inserting,
+            &empty,
+            &schema(&[]),
+            "prod",
+            Settled::Closing,
+        )
+        .expect("inserted at its default, read back omitted");
     }
 }
