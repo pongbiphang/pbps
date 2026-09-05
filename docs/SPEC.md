@@ -748,6 +748,62 @@ would make the checksum describe something other than what ran, and anything it
 changed in the database outside the declarations would become permanent drift
 that the next plan tries to remove (14.3).
 
+### 7.6 What the apply guard promises
+
+After every statement of a plan has run, `apply` reads the database back and
+records that read as the environment's state. Before recording it, the guard
+compares the read against the state the plan was approved over and against the
+plan itself, and refuses to record if either comparison fails. The promise has
+two halves:
+
+1. **Everything the plan does not touch is unchanged.** Every table, column,
+   constraint, index, module, role, grant and declared row that no change of
+   the plan names is the same in the read-back as in the approved baseline.
+2. **Everything the plan does touch is what the plan said.** A column the plan
+   adds or alters has the type (normalized), nullability, identity and
+   default-presence the plan gives it; a constraint or index the plan adds has
+   the definition the plan adds it with; a row the plan writes holds the cells
+   the plan spelled. Fields the engine rewrites (a default's text, a check's or
+   filter's expression) are compared by presence, not text.
+
+**Assumption: one deployer at a time.** The guard is a detector, not a lock
+against other writers. It assumes that no other session is changing the
+schema while this apply runs; a change another session makes is what it is
+designed to *notice*, not to prevent.
+
+**What is detected, and when.**
+
+- In an ordinary apply (one transaction), any change made by another session
+  between the baseline read and the read-back is detected at the read-back,
+  and the whole apply is rolled back. Nothing is recorded.
+- In a staged apply, each checkpoint read is compared with the one before it.
+  A change to an object the plan does not touch is detected at the first
+  checkpoint after it lands; the run stops on that checkpoint, which records
+  the database as it stands.
+- In a staged apply, a change made by another session to **the same field the
+  plan is itself changing**, landing between the plan's own statement and
+  that statement's checkpoint read, is **not** guaranteed to be detected at
+  that checkpoint: the field is expected to move there, and the checkpoint
+  cannot tell the plan's statement from the other session's. It **is**
+  detected at the closing read, when the field is held to the value the plan
+  promised. The run then refuses to close and stays on its last checkpoint.
+
+**What is not promised.**
+
+- Detection of a same-field concurrent change *earlier* than the closing read
+  of a staged apply. Moving detection to the checkpoint would require the
+  guard to know which statement each checkpoint spans; the cost is not
+  justified by finding earlier what is found anyway.
+- Anything about the *text* of an expression the engine stores in its own
+  rendering. Presence is compared; wording is not.
+- Fields no catalog reads back (a column's `description`, its `deprecated`
+  reason). They cannot move in a read-back and are not compared.
+
+A finding that falls inside the last list is a recorded limitation of this
+section, not a defect; it is answered by pointing here.
+
+See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
+
 ---
 
 ## 8. Environment state and drift
