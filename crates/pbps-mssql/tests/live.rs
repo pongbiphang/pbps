@@ -1299,7 +1299,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].permission, "DELETE");
-    assert_eq!(gaps[0].securable(), "SCHEMA::dbo");
+    assert_eq!(gaps[0].securable(), "SCHEMA::[dbo]");
 
     // And the narrowest shape of all: the ledger tables exist, and INSERT and
     // DELETE are granted on *those two objects* rather than on the schema. Only
@@ -1330,7 +1330,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.iter()
-            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::dbo"),
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::[dbo]"),
         "an account that cannot create the ledger must not pass readiness: {gaps:?}"
     );
     db.conn
@@ -1405,7 +1405,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     for permission in ["INSERT", "DELETE"] {
         assert!(
             gaps.iter()
-                .any(|g| g.permission == permission && g.securable() == "SCHEMA::dbo"),
+                .any(|g| g.permission == permission && g.securable() == "SCHEMA::[dbo]"),
             "{permission} for the table still to be created was not asked for: {gaps:?}"
         );
     }
@@ -1414,7 +1414,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     assert!(
         !gaps
             .iter()
-            .any(|g| g.securable() == "OBJECT::dbo.__pbps_lock"),
+            .any(|g| g.securable() == "OBJECT::[dbo].[__pbps_lock]"),
         "{gaps:?}"
     );
 
@@ -1642,7 +1642,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.iter()
-            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::app"),
+            .any(|g| g.permission == "ALTER" && g.securable() == "SCHEMA::[app]"),
         "an account that cannot alter its managed schema must not pass readiness: {gaps:?}"
     );
 
@@ -1883,7 +1883,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
     for permission in ["REFERENCES", "SELECT"] {
         assert!(
             gaps.iter()
-                .any(|g| g.permission == permission && g.securable() == "OBJECT::shared.parent"),
+                .any(|g| g.permission == permission && g.securable() == "OBJECT::[shared].[parent]"),
             "{permission} on the referenced table was not reported: {gaps:?}"
         );
     }
@@ -4942,8 +4942,8 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         where_missing,
         [
             "ALTER ANY ROLE on the database",
-            "CONTROL on OBJECT::dbo.customer",
-            "CONTROL on SCHEMA::dbo",
+            "CONTROL on OBJECT::[dbo].[customer]",
+            "CONTROL on SCHEMA::[dbo]",
             "CREATE ROLE on the database",
         ],
         "{gaps:?}"
@@ -5018,10 +5018,10 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         where_missing,
         [
             "ALTER ANY ROLE on the database",
-            "CONTROL on OBJECT::dbo.customer",
-            "CONTROL on OBJECT::legacy.archive",
-            "CONTROL on SCHEMA::dbo",
-            "CONTROL on SCHEMA::legacy",
+            "CONTROL on OBJECT::[dbo].[customer]",
+            "CONTROL on OBJECT::[legacy].[archive]",
+            "CONTROL on SCHEMA::[dbo]",
+            "CONTROL on SCHEMA::[legacy]",
             "CREATE ROLE on the database",
         ],
         "{gaps:?}"
