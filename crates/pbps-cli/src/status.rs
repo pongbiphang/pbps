@@ -307,80 +307,104 @@ async fn one(
     // Scoped by what was recorded, exactly as `verify` scopes it: two commands
     // that disagreed about which objects are managed would disagree about
     // whether an environment has drifted.
-    let recorded_modules: std::collections::BTreeSet<_> =
-        entry.snapshot.schema.modules.keys().cloned().collect();
+    let recorded_modules = recorded_modules(&entry);
     let scoped = pbps_diff::scope(&pulled.schema, &recorded_ids, &recorded_modules);
+    // The rows too, under the recorded scope, as `verify` reads them. Only the
+    // read happens here; what it means is decided beside every other catalog
+    // fact, below, so that a read which failed cannot hide any of them.
+    let read: std::collections::BTreeMap<_, _> = entry
+        .snapshot
+        .schema
+        .data_scopes()
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let rows = pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read)
+        .await
+        .map_err(|e| format!("the declared rows could not be read back: {e}"));
+    record_catalog_findings(&mut row, &entry, &pulled, &scoped, rows, unmanaged);
+    row
+}
+
+fn recorded_modules(
+    entry: &pbps_db::LedgerEntry,
+) -> std::collections::BTreeSet<pbps_model::ObjectName> {
+    entry.snapshot.schema.modules.keys().cloned().collect()
+}
+
+/// Everything `status` concludes about an environment from its catalog and its
+/// rows, once the connection work is done.
+///
+/// Each finding here is established independently of the others, and none of
+/// them may erase another: an unexpressible permission, a row that moved, a
+/// fact the projection cannot hold, an object `unmanaged: error` refuses, and a
+/// row read that failed. Returning on whichever came first hid every check
+/// after it (DECISIONS 159, 168); the last such return was the row read's, and
+/// the inventory below it needs only the catalog, which had already succeeded
+/// — so a read that failed was reported *instead of* a stray object rather
+/// than beside it. The read's failure therefore lands last, through
+/// `record_unreachable`, which keeps what is already on the row
+/// (DECISIONS 192).
+///
+/// Sync and connection-free so that a test can hand it a read that failed.
+fn record_catalog_findings(
+    row: &mut EnvStatus,
+    entry: &pbps_db::LedgerEntry,
+    pulled: &pbps_mssql::introspect::Pulled,
+    scoped: &pbps_diff::Scoped,
+    rows: Result<pbps_model::ObservedRows, String>,
+    unmanaged: pbps_config::Unmanaged,
+) {
+    let recorded_ids = &entry.snapshot.ids;
+    let recorded_modules = recorded_modules(entry);
+    let name = row.environment.clone();
+
     // A permission on a managed role that the declarations cannot hold is
     // drift to `verify` and stops every command that would record a state;
     // it lives beside the schema, not in it, so the checksum below cannot
     // see it. The same filter `verify` applies: an unmanaged role's grants
     // are its own business (DECISIONS 95, 125).
     let unexpressible =
-        crate::deploy::unexpressible_permissions(&pulled, &recorded_ids, &recorded_modules);
-    // Recorded and carried, never returned on. An unexpressible permission is
-    // drift, and so is a row that moved, a fact the projection could not hold,
-    // or an object `unmanaged: error` refuses — each established
-    // independently, and none of them able to erase the others. Returning here
-    // hid every one of the checks below behind whichever came first
-    // (DECISIONS 159).
+        crate::deploy::unexpressible_permissions(pulled, recorded_ids, &recorded_modules);
     if !unexpressible.is_empty() {
-        record_drift(&mut row, entry.id, name);
-        record_status_issue(&mut row, "drift", unexpressible.join("; "));
+        record_drift(row, entry.id, &name);
+        record_status_issue(row, "drift", unexpressible.join("; "));
     }
-    // The rows too, under the recorded scope, as `verify` reads them. A read
-    // that fails is reported as the failure it is, never as "no drift".
-    let recorded_data = entry.snapshot.schema.data_scopes();
-    let read = recorded_data
-        .iter()
-        .map(|(n, s)| (n.clone(), s.rows_to_read()))
-        .collect();
-    let rows = match pbps_mssql::catalog::read_rows(&mut conn, &scoped.schema, &read).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            // Through the helper, which keeps what was already established.
-            // Assigning here dropped an unexpressible permission the
-            // introspection above had already found: it was known
-            // independently of this read, and a read that failed does not
-            // unfind it (DECISIONS 168).
-            record_unreachable(
-                &mut row,
-                format!("the declared rows could not be read back: {e}"),
-            );
-            return row;
-        }
-    };
-    // Cloned, because the inventories below still need `scoped` whole and
-    // `with_observed_rows` takes the schema by value.
-    let live_schema = match scoped.schema.clone().with_observed_rows(
-        &rows,
-        &recorded_data,
-        &entry.snapshot.schema,
-    ) {
-        Ok(schema) => schema,
-        // Two recorded spellings of one row: the recorded state cannot be
-        // compared against the database, which is the same answer as a read
-        // that failed, never "no drift".
-        Err(e) => {
-            record_unreachable(
-                &mut row,
-                format!("the recorded rows cannot be compared: {e}"),
-            );
-            return row;
-        }
-    };
-    let live = pbps_model::state_checksum(&live_schema, &recorded_ids);
-    let recorded = pbps_model::state_checksum(&entry.snapshot.schema, &recorded_ids);
-    if live != recorded {
-        record_drift(&mut row, entry.id, name);
+
+    // Decided here and recorded in two places: drift right away, so that it
+    // keeps outranking an `unmanaged: warn` on the row; a failure at the very
+    // end, so that nothing established in between is dropped.
+    let moved = rows.and_then(|rows| {
+        // Cloned, because the inventories below still need `scoped` whole and
+        // `with_observed_rows` takes the schema by value.
+        scoped
+            .schema
+            .clone()
+            .with_observed_rows(
+                &rows,
+                &entry.snapshot.schema.data_scopes(),
+                &entry.snapshot.schema,
+            )
+            // Two recorded spellings of one row: the recorded state cannot be
+            // compared against the database, which is the same answer as a
+            // read that failed, never "no drift".
+            .map_err(|e| format!("the recorded rows cannot be compared: {e}"))
+            .map(|live_schema| {
+                pbps_model::state_checksum(&live_schema, recorded_ids)
+                    != pbps_model::state_checksum(&entry.snapshot.schema, recorded_ids)
+            })
+    });
+    if moved == Ok(true) {
+        record_drift(row, entry.id, &name);
     }
 
     // The same inventory `verify` reports as unexpressible drift, including a
     // recorded module the catalog can no longer read back: one screen must not
     // call an environment clean where the other calls it drifted.
-    let limitations = crate::deploy::managed_limitations(&pulled, &recorded_ids, &recorded_modules);
+    let limitations = crate::deploy::managed_limitations(pulled, recorded_ids, &recorded_modules);
     if !limitations.is_empty() {
         record_status_issue(
-            &mut row,
+            row,
             "drift",
             format!(
                 "{} fact(s) inside the managed set could not be compared: {}",
@@ -392,10 +416,10 @@ async fn one(
 
     let unreadable = crate::deploy::unreadable_modules(&pulled.unmanaged_modules);
     let unmanaged_objects =
-        crate::deploy::unmanaged_objects(&scoped, &unreadable, &recorded_modules);
+        crate::deploy::unmanaged_objects(scoped, &unreadable, &recorded_modules);
     if unmanaged != pbps_config::Unmanaged::Ignore && !unmanaged_objects.is_empty() {
         record_status_issue(
-            &mut row,
+            row,
             if unmanaged == pbps_config::Unmanaged::Error {
                 "policy"
             } else {
@@ -413,7 +437,12 @@ async fn one(
             ),
         );
     }
-    row
+
+    // Last, on top of everything above. A read that failed is reported as the
+    // failure it is: never as "no drift", and never as the only thing wrong.
+    if let Err(why) = moved {
+        record_unreachable(row, why);
+    }
 }
 
 /// Makes an interrupted staged apply the primary human state while retaining
@@ -782,6 +811,109 @@ mod tests {
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.drift", "state.unmanaged-refused"]);
         assert!(findings[1].message.contains("dbo.surprise"));
+    }
+
+    /// A ledger entry that recorded an empty schema, and a catalog that has one
+    /// table the entry never named.
+    fn stray_table() -> (
+        pbps_db::LedgerEntry,
+        pbps_mssql::introspect::Pulled,
+        pbps_diff::Scoped,
+    ) {
+        let entry = pbps_db::LedgerEntry {
+            id: 7,
+            applied_at: "2026-08-31T09:14:22.517".into(),
+            snapshot: pbps_model::StateSnapshot::new(
+                pbps_model::StateKind::Apply,
+                pbps_model::Schema::default(),
+                pbps_model::IdsFile::default(),
+                "ci-deploy",
+            ),
+        };
+        let mut live = pbps_model::Schema::default();
+        live.tables.insert(
+            "dbo.surprise".parse().unwrap(),
+            pbps_model::Table::default(),
+        );
+        let pulled = pbps_mssql::introspect::Pulled {
+            schema: live,
+            warnings: Vec::new(),
+            unexpressible: Vec::new(),
+            limitations: Vec::new(),
+            unmanaged_modules: Vec::new(),
+        };
+        let scoped = pbps_diff::scope(
+            &pulled.schema,
+            &entry.snapshot.ids,
+            &recorded_modules(&entry),
+        );
+        (entry, pulled, scoped)
+    }
+
+    /// The row read is the last thing `status` reads, and the inventory after
+    /// it needs only the catalog, which had already succeeded. A read that
+    /// failed is reported beside the stray object, never instead of it.
+    #[test]
+    fn a_failed_row_read_keeps_an_unmanaged_object_visible() {
+        let (entry, pulled, scoped) = stray_table();
+        let mut r = row("prod", "ok");
+        record_catalog_findings(
+            &mut r,
+            &entry,
+            &pulled,
+            &scoped,
+            Err("the declared rows could not be read back: denied".into()),
+            pbps_config::Unmanaged::Warn,
+        );
+
+        assert_eq!(r.state, "unreachable");
+        let findings = findings(&[r]);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["environment.unreachable", "state.unmanaged"]);
+        assert!(findings[0].message.contains("denied"), "{findings:?}");
+        assert!(findings[1].message.contains("dbo.surprise"), "{findings:?}");
+    }
+
+    /// The same, where the object is one `unmanaged: error` refuses: the
+    /// refusal is the finding `plan --db` and `apply` will act on, and a
+    /// read that failed does not lift it.
+    #[test]
+    fn a_failed_row_read_keeps_an_unmanaged_refusal_visible() {
+        let (entry, pulled, scoped) = stray_table();
+        let mut r = row("prod", "ok");
+        record_catalog_findings(
+            &mut r,
+            &entry,
+            &pulled,
+            &scoped,
+            Err("the recorded rows cannot be compared: two spellings".into()),
+            pbps_config::Unmanaged::Error,
+        );
+
+        let findings = findings(&[r]);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["environment.unreachable", "state.unmanaged-refused"]);
+    }
+
+    /// Negative case: the stray object is a finding only when the project asks
+    /// for it, and a read that succeeded on a database that matches its entry
+    /// leaves the row clean.
+    #[test]
+    fn a_clean_environment_stays_ok_when_the_stray_object_is_ignored() {
+        let (entry, pulled, scoped) = stray_table();
+        let mut r = row("prod", "ok");
+        record_catalog_findings(
+            &mut r,
+            &entry,
+            &pulled,
+            &scoped,
+            Ok(pbps_model::ObservedRows::default()),
+            pbps_config::Unmanaged::Ignore,
+        );
+
+        assert_eq!(r.state, "ok", "{r:?}");
+        assert!(r.issues.is_empty(), "{r:?}");
+        assert!(findings(&[r]).is_empty());
     }
 
     #[test]
