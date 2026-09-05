@@ -4,7 +4,8 @@
   [ADR-0007](ADR-0007-connection-strategy.md); it **tests one of its claims**.
 - Date: 2026-09-05
 - Related: docs/SPEC.md §11.2, §11.3, §11.5, §12, open question 10;
-  CLAUDE.md inviolable constraint 9; `crates/pbps-db/src/lib.rs`;
+  [architecture constraint 9](ARCHITECTURE.md#inviolable-constraints);
+  `crates/pbps-db/src/lib.rs`;
   `spikes/pg-driver`
 
 ## The claim under test
@@ -136,7 +137,8 @@ workspace.
 
 ## 2. `begin()` holds T-SQL, in the crate that is documented to hold none
 
-CLAUDE.md's architectural boundaries say of `pbps-db`:
+The architectural boundaries originally recorded in `CLAUDE.md` (now in
+[ARCHITECTURE.md](ARCHITECTURE.md#architectural-boundaries)) said of `pbps-db`:
 
 > Connections (tiberius) plus transaction framing. Owns "there is a network";
 > ledger types and prune policy, **no T-SQL**.

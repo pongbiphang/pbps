@@ -22,18 +22,7 @@ checksum-pinned, and state lives in the database itself.
 
 ## Working with me
 
-- Converse in **Chinese**. Write code, comments, docs, commit messages, issues
-  and PR bodies in **English**.
-- Tell me what you actually verified. Separate "I ran it and saw this" from "I
-  reasoned this" every time, and never present the second as the first.
-- When you are wrong, say so in one line and move on. Do not apologise at
-  length, and do not re-litigate a decision I have already made.
-- Report failures with their output. Say which steps were skipped.
-- Do not tell me something is finished until it is.
-- Treat quiet as quiet, not as convergence. A reviewer running out of credits is
-  not a clean bill of health.
-- Merge only a PR that has finished the review loop below. Every other merge
-  decision is mine.
+- Write code, comments, docs, commit messages, issues and PR bodies in English.
 - Fetch first: every new worktree is cut from the latest `origin/master`.
 - Recurring background work (CI watches, check-ins) is welcome; keep the notes
   it carries accurate, and stop it when the work is done.
@@ -108,81 +97,15 @@ checksum-pinned, and state lives in the database itself.
 - Prefer making a failure *unrepresentable* over handling it. A type that cannot
   hold the bad value beats a branch that checks for it.
 
-## Development environment
-
-- **Develop inside WSL** (Linux is the primary target); the project lives at
-  `~/pbps`, not under `/mnt/c`.
-- Do not attempt `x86_64-pc-windows-gnu`: rustup's mingw lacks a GNU assembler.
-  Details in README.
-- All three must pass before committing (a Markdown-only change is exempt):
-
-```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets    # must be warning-free
-cargo fmt --all
-```
-
-- Touching dependencies also means `cargo deny check`. Every `ignore` entry must
-  name the advisory, why it does not endanger the tool, and what removes it.
-- Run the live tests when touching the emitter, the catalog queries, the ledger
-  or the permission checks: `scripts/live-tests.sh` (set `PBPS_TEST_PORT` if
-  14330 is taken, `PBPS_TEST_DEV_IMAGE` to include the `docker://` rehearsal).
-- If `docker info` fails, check whether `dockerd` is merely **not started**
-  before concluding the live tests cannot run.
-
 ## Architectural boundaries
 
-```
-pbps-model     Domain model. Dialect-agnostic, span-free, serializes to JSON:
-               the ids file, the state snapshot, the saved plan, the drift report
-pbps-config    Project configuration (pbps.yml): paths, environments, hooks
-pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
-pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL. Also owns
-               the managed-set scope and observed identity
-pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
-               probes. Connection-bound work is free async fns in the dialect
-               crate, not trait methods
-pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
-               only place a *change* becomes SQL), catalog introspection,
-               the ledger/lock statements, rename impact
-pbps-db        Connections (tiberius) plus transaction framing. Owns "there is
-               a network"; ledger types and prune policy, no T-SQL. **`tiberius`
-               is named in exactly one file** — `Row`, `FromColumn` and `Param`
-               are this crate's own, so a driver change touches nothing else
-pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
-               Pure: no dialect, no connection, no configuration
-pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
-               `output` is the one typed findings envelope every read-only
-               command speaks; `prompt` is the TTY intent channel of SPEC 6.3
-```
-
-- Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
-  `state`, `impact`, `edition`) are async; the CLI `block_on`s them per command.
-- `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#architectural-boundaries)
+before changing crate responsibilities or dependencies.
 
 ## Inviolable constraints
 
-Each was paid for. Stop and think before breaking one; the reasoning is in
-[docs/DECISIONS.md](docs/DECISIONS.md).
-
-1. **Two semantically identical `Schema`s must be `==`.** No spans, no one-shot
-   annotations in the model; normalize type case before comparing.
-2. **Containers hold names; elements do not.** `Table` / `Column` have no
-   `name` — it is the parent map's key. Functions needing one take `(name, table)`.
-3. **SQL appears exactly once, in the dialect emitter.** Risk, gating and impact
-   work on the typed `ChangeSet`, never on strings.
-4. **Risk is data, not a method.** `intrinsic_risks()` answers only what needs no
-   dialect knowledge; the differ attaches the rest.
-5. **Serialization is deterministic.** `BTreeMap` / `BTreeSet` throughout. Sole
-   exception: `Table::columns` is an `IndexMap` whose equality ignores order.
-6. **Only rename and drop need human intent.** Never prompt non-interactively —
-   fail with a copy-pastable command.
-7. **Only data-bearing objects get identity.** Tables and columns have uids;
-   modules have none (ADR-0002).
-8. **Annotations travel beside the model, never inside it.** `strategy:` and
-   `depends_on:` come back as `Loaded.hints`, or constraint 1 breaks.
-9. **`tiberius` is named in exactly one file** (`pbps-db`), so the driver stays
-   replaceable.
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#inviolable-constraints)
+before changing the model or the dialect and driver boundaries.
 
 ## Product guardrails (SPEC 14.3)
 
@@ -212,7 +135,5 @@ human's recorded intent, or the git audit trail. Refuse them and point here.
 
 ## Format rules the loader depends on
 
-- **`null` cannot be a YAML key** (it is the null literal); the field is
-  `nullable`.
-- **`no` / `yes` / `on` / `off` parse as booleans**, so `pbps fmt` quotes
-  boolean-ish, null-ish and number-shaped string scalars.
+See [SPEC §4.3](docs/SPEC.md#43-format-rules) and
+[YAML and file-format traps](docs/PITFALLS.md#yaml-and-file-format-traps).
