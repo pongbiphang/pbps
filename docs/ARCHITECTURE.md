@@ -20,7 +20,8 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact
 pbps-db        Connections plus transaction framing. Owns "there is a network";
-               ledger types and prune policy. Driver isolation: see constraint 9
+               ledger types and prune policy, no T-SQL.
+               Driver isolation: see constraint 9
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
@@ -31,9 +32,9 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 - Only `pbps-db` and the `pbps-mssql` modules that take a `Conn` (`catalog`,
   `state`, `impact`, `edition`) are async; the CLI `block_on`s them per command.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
-- The intended `pbps-db` boundary excludes T-SQL. Transaction framing is an
-  existing exception documented in [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none),
-  together with the proposed move behind the dialect.
+- The dialect supplies transaction statements; `pbps-db` owns the transaction
+  framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
+  for the boundary correction.
 
 ## Inviolable constraints
 
