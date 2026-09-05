@@ -68,12 +68,14 @@ checksum-pinned, and state lives in the database itself.
   reports no findings; a P1 resets the count. Count a review only if its
   `Reviewed commit:` is the pushed head. Never push a docs-only commit to move
   the count.
-- On stopping: kill the watch, post no further `@codex review`, and mark the PR
-  ready. That triggers one more review; wait for it.
+- On stopping: kill the watch and post no further `@codex review`. Rebase onto
+  `origin/master` if it moved, push, then mark the PR ready. That triggers one
+  more review; wait for it.
 - A P1 in that review: the count resets — back to the loop, as a draft again.
-- No P1: rebase onto `origin/master` if it moved, then start CI on the PR
-  head, `gh workflow run ci.yml --ref <branch>`, and wait for it. CI runs only
-  when started; a push clears the checks.
+- No P1: start CI on the PR head, `gh workflow run ci.yml --ref <branch>`, and
+  wait for it. CI runs only when started; a push clears the checks.
+- `master` moved before the merge: rebase and start CI again. A rebase that
+  needed conflict resolution goes back to the loop as a draft.
 - Red CI: fix it, push, back to the loop as a draft.
 - Green CI: merge with a merge commit (`gh pr merge --merge`), delete the
   branch, remove the worktree.
