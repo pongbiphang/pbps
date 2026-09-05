@@ -208,8 +208,13 @@ one — with the blob the UI hashed after writing it (`git hash-object`), the
 commit's one parent must be the tip the UI recorded before composing (below),
 and the commit's message (`git log -1 --format=%B <oid>`) must be the one the
 user entered — a `commit-msg` hook edits the message file, and **measured**,
-one appending a line changed what `--only -m requested` recorded — and pushes
-only a commit that passes all four. The second reads
+one appending a line changed what `--only -m requested` recorded — and the
+branch the UI recorded (`refs/heads/<branch>`) must now point at that commit
+with `HEAD` still symbolic to it — a checkout switched to a sibling branch at
+the same tip between the check and the commit passes the parent check, and
+**measured**, the commit then advanced the sibling while the recorded branch
+stayed behind, so the push would have published to a branch the commit was
+never on. It pushes only a commit that passes all five. The second reads
 the whole entry and not the blob alone because a hook can change what the
 blob does not carry: **measured**, a `pre-commit` hook running `chmod +x`
 and `git add` left the blob id equal and turned the entry from `100644` to
@@ -230,7 +235,7 @@ id is the proof. The third is there because the first two look only at the new c
 own delta: another process moving the branch between the check below and the
 commit gives the intent commit an ancestry the preview never showed, and
 **measured**, a commit slipped in after the check passed both delta checks
-and failed only the parent one. A commit that fails any of the four is left
+and failed only the parent one. A commit that fails any of the five is left
 where it is, unpushed and reversible, and the page shows
 what differs from the preview and the commands to push it or undo it; the
 hook's change is the user's to look at, not the UI's to publish or discard.
