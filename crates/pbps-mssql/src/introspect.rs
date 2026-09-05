@@ -782,15 +782,41 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map(|(s, t)| ObjectName::new(s.clone(), t.clone()))
             .or(on);
 
+        // The identity, which for a trigger is its table and its own name
+        // (ADR-0009 §1). Nothing on this engine overloads, so no read-back
+        // ever carries a signature.
+        let id = match (m.kind, &on) {
+            (pbps_model::ModuleKind::Trigger, Some(table)) => pbps_model::ModuleId::Trigger {
+                on: table.clone(),
+                name: name.name.clone(),
+            },
+            _ => pbps_model::ModuleId::Named(name.clone()),
+        };
+        // The id crosses a snapshot and a plan as its string form, whose
+        // punctuation is structural: `.` separates the parts and `(` opens a
+        // signature. A legal quoted identifier may contain either —
+        // `[audit.v1]`, `[sales(archive)]` — and such an id would be written
+        // faithfully and read back as a *different* module: a trigger on
+        // `dbo.audit`, a routine with an argument. Before the typed id that
+        // read failed loudly; now it would succeed wrongly, so the round trip
+        // is checked here, at the one place engine names enter the model, and
+        // a name that does not survive it is inventoried like any other shape
+        // the format cannot carry.
+        if id.to_string().parse::<pbps_model::ModuleId>().as_ref() != Ok(&id) {
+            unmanageable(
+                "its name contains a period or a parenthesis, which a declaration cannot spell \
+                 (the tool would read it back as a different module)",
+            );
+            continue;
+        }
         schema.modules.insert(
-            name,
+            id,
             Module {
                 kind: m.kind,
                 // A description lives in the declarations, not in the database;
                 // pulling one back is not possible and pretending otherwise
                 // would make every pulled module compare unequal.
                 description: None,
-                on,
                 definition,
             },
         );
@@ -849,6 +875,35 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 continue;
             }
         };
+        // The target crosses a snapshot as its string form, in which `(`
+        // opens a routine signature; a legal quoted object name may contain
+        // one, and `dbo.sales(archive)` would be read back as a grant on a
+        // routine (DECISIONS 205). The structured target is kept: only its
+        // *string* form is ambiguous, and the target is what scopes the report
+        // to the managed set — without it, a grant on an unmanaged object of
+        // such a name would be reported, and refused, where an ordinary grant
+        // on the same object is ignored (`unexpressible_permissions`).
+        if target
+            .to_string()
+            .parse::<pbps_model::GrantTarget>()
+            .as_ref()
+            != Ok(&target)
+        {
+            unexpressible.push(Unexpressible {
+                role: p.role.clone(),
+                target: Some(target.clone()),
+                what: format!(
+                    "role {}: {} on [{}].[{}] is on an object whose name contains a period or a \
+                     parenthesis, which a declaration cannot spell; the declarations cannot \
+                     express it",
+                    p.role,
+                    p.permission,
+                    p.schema,
+                    p.object.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
         // Every permission the model cannot hold is left out of the role's
         // set *and* reported as unexpressible, never as a warning alone: a
         // managed role that gained a column-level grant, a DENY, a CONTROL
@@ -859,7 +914,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // refuse the project `pull` just wrote.
         if let pbps_model::GrantTarget::Object(object) = &target
             && !schema.tables.contains_key(object)
-            && !schema.modules.contains_key(object)
+            && !schema
+                .modules
+                .keys()
+                .any(|id| id.referenced_name().as_ref() == Some(object))
         {
             unexpressible.push(Unexpressible {
                 role: p.role.clone(),
@@ -1074,6 +1132,65 @@ mod tests {
         assert!(
             p.unexpressible[0].what.contains("dbo.order_seq")
                 && p.unexpressible[0].what.contains("does not model"),
+            "{:?}",
+            p.unexpressible
+        );
+    }
+
+    /// A grant target's string form gives `(` a meaning, and a legal quoted
+    /// object name may contain one: read back, `dbo.sales(archive)` would be
+    /// a grant on a routine, not on the table it was granted on (DECISIONS
+    /// 205). Reported, and left out of the set — with the structured target
+    /// kept, so the report is still scoped to the managed set.
+    #[test]
+    fn a_grant_on_an_object_whose_name_cannot_be_spelled_is_unexpressible() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |object: &str| RawPermission {
+            role: "app_reader".into(),
+            class: 1,
+            class_desc: "OBJECT_OR_COLUMN".into(),
+            permission: "SELECT".into(),
+            state: "G".into(),
+            schema: "dbo".into(),
+            object: Some(object.to_owned()),
+            minor_id: 0,
+        };
+        raw.permissions.push(grant("customer"));
+        raw.permissions.push(grant("sales(archive)"));
+        raw.permissions.push(grant("audit.v1"));
+        let p = assemble(&raw);
+        let targets: Vec<String> = p.schema.roles["app_reader"]
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(targets, ["dbo.customer"], "{:?}", p.unexpressible);
+        assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
+        for u in &p.unexpressible {
+            assert_eq!(u.role, "app_reader");
+            assert!(u.what.contains("period or a parenthesis"), "{u:?}");
+        }
+        let targets: Vec<Option<pbps_model::GrantTarget>> =
+            p.unexpressible.iter().map(|u| u.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [
+                Some(pbps_model::GrantTarget::Object(ObjectName::new(
+                    "dbo",
+                    "sales(archive)"
+                ))),
+                Some(pbps_model::GrantTarget::Object(ObjectName::new(
+                    "dbo", "audit.v1"
+                ))),
+            ],
+            "the securable stays structured, so the managed-set scope still applies"
+        );
+        assert!(
+            p.unexpressible[0].what.contains("[dbo].[sales(archive)]")
+                || p.unexpressible[1].what.contains("[dbo].[sales(archive)]"),
             "{:?}",
             p.unexpressible
         );
@@ -1458,11 +1575,11 @@ mod module_tests {
         assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
         assert_eq!(p.schema.modules.len(), 2);
         assert_eq!(
-            p.schema.modules[&"dbo.v_active".parse::<ObjectName>().unwrap()].definition,
+            p.schema.modules[&"dbo.v_active".parse::<pbps_model::ModuleId>().unwrap()].definition,
             "SELECT id FROM dbo.customer"
         );
         assert_eq!(
-            p.schema.modules[&"dbo.sp_reprice".parse::<ObjectName>().unwrap()].definition,
+            p.schema.modules[&"dbo.sp_reprice".parse::<pbps_model::ModuleId>().unwrap()].definition,
             "@pct int AS UPDATE dbo.customer SET id = id;"
         );
     }
@@ -1479,9 +1596,12 @@ mod module_tests {
         );
         trg.parent = Some(("dbo".into(), "customer".into()));
         let p = assemble(&catalog_with(vec![trg]));
-        let m = &p.schema.modules[&"dbo.trg_audit".parse::<ObjectName>().unwrap()];
+        // The table is in the key now, not in a field beside it
+        // (ADR-0009 §1).
+        let id: pbps_model::ModuleId = "dbo.customer.trg_audit".parse().unwrap();
+        let m = &p.schema.modules[&id];
         assert_eq!(
-            m.on.as_ref().map(ToString::to_string).as_deref(),
+            id.attached_to().map(ToString::to_string).as_deref(),
             Some("dbo.customer")
         );
         assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");
@@ -1516,6 +1636,48 @@ mod module_tests {
             "{:?}",
             p.unmanaged_modules
         );
+    }
+
+    /// A quoted identifier may hold the punctuation the id's string form uses
+    /// for structure. Written to a snapshot such a module would read back as
+    /// another one — `dbo.audit.v1` as a trigger on `dbo.audit`, `dbo.sales(archive)`
+    /// as a routine — so it is inventoried instead, with the reason.
+    #[test]
+    fn a_module_whose_name_the_id_cannot_spell_is_inventoried() {
+        let p = assemble(&catalog_with(vec![
+            module(
+                "dbo",
+                "audit.v1",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[audit.v1] AS SELECT 1"),
+            ),
+            module(
+                "dbo",
+                "sales(archive)",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[sales(archive)] AS SELECT 1"),
+            ),
+            module(
+                "dbo",
+                "sales_archive",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.[sales_archive] AS SELECT 1"),
+            ),
+        ]));
+        assert_eq!(
+            p.schema
+                .modules
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["dbo.sales_archive"],
+            "{:?}",
+            p.unmanaged_modules
+        );
+        assert_eq!(p.unmanaged_modules.len(), 2, "{:?}", p.unmanaged_modules);
+        for u in &p.unmanaged_modules {
+            assert!(u.why.contains("period or a parenthesis"), "{u:?}");
+        }
     }
 
     /// SQL Server persists QUOTED_IDENTIFIER and ANSI_NULLS with the module and
@@ -1633,14 +1795,21 @@ mod module_tests {
             let module = Module {
                 kind,
                 description: None,
-                on: on.map(|t| t.parse().unwrap()),
                 definition: body.to_owned(),
             };
-            let stored = crate::emit::module_definition(&name, &module).expect("emit");
+            let on: Option<ObjectName> = on.map(|t| t.parse().unwrap());
+            let id = match &on {
+                Some(table) => pbps_model::ModuleId::Trigger {
+                    on: table.clone(),
+                    name: name.name.clone(),
+                },
+                None => pbps_model::ModuleId::Named(name.clone()),
+            };
+            let stored = crate::emit::module_definition(&id, &module).expect("emit");
             let (back_on, back_body) = split_module(kind, &stored, false)
                 .unwrap_or_else(|| panic!("could not split:\n{stored}"));
             assert_eq!(back_body, body, "{kind}");
-            assert_eq!(back_on, module.on, "{kind}");
+            assert_eq!(back_on, on, "{kind}");
         }
     }
 

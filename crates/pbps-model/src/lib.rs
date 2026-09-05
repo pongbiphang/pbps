@@ -39,8 +39,9 @@ pub mod types;
 pub mod uid;
 
 pub use change::{
-    CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, ModuleAfter, Part, PartAfter,
-    PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, RiskClass, RowAfter,
+    CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, Dropped, ModuleAfter, Part,
+    PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, RiskClass,
+    RowAfter,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
@@ -50,7 +51,9 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
-pub use module::{Hints, Module, ModuleDeps, ModuleKind, ObjectName};
+pub use module::{
+    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineId,
+};
 pub use name::{ColumnRef, NameError, TableName};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
 pub use role::{GrantTarget, Permission, Role};

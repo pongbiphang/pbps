@@ -2903,3 +2903,112 @@ SPEC is in sync with all of these.
 
     Both halves are pinned by tests that fail when reverted — the string one
     without a server, since the defect is in the string.
+
+## Phase 5 prep — module identity (ADR-0009 §1)
+
+200. **A module is identified by a typed `ModuleId`, and which fields carry
+    that identity depends on the kind.** `Schema::modules` was keyed by
+    `ObjectName`, which says every module in a schema has a distinct name.
+    Measured on PostgreSQL, that is false twice over: functions and procedures
+    overload, so `app.f(integer)` and `app.f(text)` are two objects with one
+    name; and a trigger's name is unique only within its table, so `audit` on
+    `orders` and `audit` on `customers` are two objects with one name in one
+    schema. `ModuleId` is therefore an enum — `Named(ObjectName)` for a view,
+    `Routine { name, args }`, `Trigger { on, name }` — and the shape of the
+    key is the shape of the identity.
+
+    **The signature is a `Vec<ColumnType>`, not a string.** Two semantically
+    identical schemas must be `==` (the inviolable constraint), and
+    `f(int)`/`f(integer)`/`f( INTEGER )` are one signature spelled three ways.
+    A string key would have made three modules of one. The `Display`/`FromStr`
+    pair exists for the JSON map key and for messages, and parses back to the
+    same value; it is not the identity.
+
+    **The trigger's table lives in the key, not in `Module`.** `Module::on` is
+    removed. Containers hold names, elements do not: with the table in both
+    places a snapshot could say `app.audit` is on `app.orders` in the key and
+    on `app.customers` in the value, and nothing in the type would stop it.
+    Removing the field makes that unrepresentable rather than checked. The
+    declaration file keeps both lines — `trigger:` and `on:` — because that is
+    where a human writes them; the loader folds them into one key and refuses
+    an `on:` on a kind that has no table, or a trigger whose schema disagrees
+    with its table's.
+
+201. **Namespace sharing and overloading are dialect questions, asked of the
+    dialect.** `check_names` refused two modules with one name and a module
+    sharing a table's name, as one rule for every engine. Both halves are
+    engine-specific — on PostgreSQL views share the table namespace and
+    routines do not, and routines overload — and `pbps-model` may not know
+    which engine it is describing. So the rule moves to
+    `pbps_dialect::check_module_names`, over `shares_namespace_with_tables`
+    and `overloads`; `check_names` keeps only what is true of every engine.
+    MSSQL answers as before, so no declaration that was valid becomes invalid.
+
+202. **Routine identity is normalized by its own hook, and a collision is
+    reported rather than merged.** PostgreSQL discards type modifiers when
+    identifying a routine — measured, `f(varchar(10))` and `f(varchar(20))`
+    are one function — which `normalize_type` must not do, because a column's
+    modifier is part of the column. `normalize_routine_arg` is therefore a
+    separate hook, applied to the loaded schema in one CLI pass after loading.
+    When two declarations normalize to one id, the pass reports both and the
+    command bails. Silently keeping the second would have left the first a
+    declared module that no plan ever mentions — absent and unreadable are not
+    the same, and only one of them is good news.
+
+203. **The state snapshot's oldest readable version becomes its current one.**
+    A version 5 snapshot spells a trigger as `app.audit` with its table in a
+    field beside it. This build reads that key as a view and has nowhere to
+    put the table, so "no modules of that shape" would be a *missing* reading
+    presented as a true one — the failure this tool exists to prevent. The
+    meaning of the module map changed, not just its contents, so the snapshot
+    is refused with the remedy (`pbps baseline`) rather than upgraded in
+    place. Cheap because the format numbers are still pre-release and reset at
+    the first tagged release (145). The saved plan goes 4 → 5 for the same
+    change with the same reasoning, and refuses the same way.
+
+204. **A guarantee the map key used to give is now a check, because removing
+    the reason for one is not replacing it.** `Schema::modules` keyed by
+    `ObjectName` made two modules with one name *unrepresentable*: the map
+    held one entry per name and that was the end of it. Keyed by `ModuleId`
+    they are representable — a trigger is told apart by its table, a routine
+    by its signature — and on an engine that keeps every kind in one namespace
+    per schema, `app.orders.audit` beside `app.customers.audit` is two objects
+    it cannot both have. Nothing caught that: `check_module_names` compared
+    each module against the *tables* and never against the other modules,
+    because under the old key there was nothing to compare. `validate` passed,
+    and the refusal arrived from the engine partway through a staged apply.
+
+    So the check now groups the kinds the dialect keeps beside tables and
+    refuses a repeated `object_name`, naming both identities — "one of these
+    is wrong" is not a finding anyone can act on. The kinds with namespaces of
+    their own are left alone, because there `ModuleId` *is* the whole identity
+    and two keys are two objects. This is the guard-whose-reason-has-gone rule
+    turned on the change that removed the reason: the key was the guard, and
+    it had to be replaced in the same breath it was taken away.
+
+205. **A module whose name the id's string form cannot carry is inventoried,
+    not recorded.** `ModuleId` crosses a snapshot, a plan and every message as
+    a string in which the punctuation is structural: `.` separates the parts
+    and `(` opens a signature. A legal quoted identifier may contain either —
+    `[audit.v1]`, `[sales(archive)]` — and such an id would be written
+    faithfully and read back as a *different* module: a trigger on
+    `dbo.audit`, a routine with an argument named `archive`. Under the
+    `ObjectName` key the same read failed loudly, because `dbo.audit.v1` was
+    no shape a name could take; the typed key gave every such string a
+    meaning, and so turned a loud failure into a quiet one. The check sits in
+    introspection — the one place engine names enter the model — and asks the
+    round trip itself, `id.to_string().parse() == id`, rather than listing
+    forbidden characters, so it stays right if the string form changes. The
+    module is inventoried with the reason, as every other shape the format
+    cannot carry is, because a quiet refusal at the snapshot would leave the
+    next plan proposing its destruction. Not in `ObjectName::new`: engine
+    names arrive there for tables too, whose string form has the same
+    property and is out of this change's scope. The same check guards a
+    grant target read back from the catalog: `GrantTarget::Object` on
+    `[dbo].[sales(archive)]` would be read back as a grant on a routine, so
+    the permission is reported as unexpressible. The structured target is
+    kept on the report — only its string form is ambiguous — because the
+    target is what scopes an unexpressible permission to the managed set; a
+    first version dropped it, and a grant on an *unmanaged* object of such a
+    name was then reported, and refused, where an ordinary grant on the same
+    object is ignored.

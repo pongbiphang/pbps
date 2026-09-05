@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{ColumnRef, IdsFile, ObjectName, Schema, TableName, Uid, UidKind};
+use pbps_model::{ColumnRef, IdsFile, ModuleId, Schema, TableName, Uid, UidKind};
 
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct Scoped {
 
     /// Modules the database has that nobody manages. Left alone, exactly like
     /// an unmanaged table.
-    pub unmanaged_modules: Vec<ObjectName>,
+    pub unmanaged_modules: Vec<ModuleId>,
 
     /// Roles the database has that the identity file does not name (ADR-0005).
     /// Left alone: their grants are neither compared nor touched.
@@ -70,7 +70,7 @@ pub struct Scoped {
 /// since pbps last recorded it"), while `plan --db` passes those plus the
 /// declared ones ("what would it take to get there"). A module in neither is
 /// somebody else's, and pbps neither changes nor drops it.
-pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectName>) -> Scoped {
+pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ModuleId>) -> Scoped {
     let managed: BTreeSet<&TableName> = ids.tables.values().collect();
 
     let mut scoped = Schema::default();
@@ -112,9 +112,19 @@ pub fn scope(schema: &Schema, ids: &IdsFile, managed_modules: &BTreeSet<ObjectNa
         }
         let mut kept = role.clone();
         kept.grants.retain(|target, _| match target {
+            // A grant names an object, or one overload of a routine. Either
+            // way the question is whether pbps manages the thing named, and a
+            // module's name in that namespace is its identity's
+            // (ADR-0009 §1).
             pbps_model::GrantTarget::Object(o) => {
-                managed.contains(o) || managed_modules.contains(o)
+                managed.contains(o)
+                    || managed_modules
+                        .iter()
+                        .any(|id| id.referenced_name().as_ref() == Some(o))
             }
+            pbps_model::GrantTarget::Routine(r) => managed_modules
+                .iter()
+                .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
             pbps_model::GrantTarget::Schema(_) => true,
         });
         scoped.roles.insert(name.clone(), kept);
@@ -443,7 +453,6 @@ mod tests {
             pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
-                on: None,
                 definition: "SELECT 1".into(),
             },
         );
@@ -459,7 +468,7 @@ mod tests {
             with_module(schema(&["dbo.customer"]), "dbo.v_mine"),
             "dbo.v_theirs",
         );
-        let managed = BTreeSet::from(["dbo.v_mine".parse::<TableName>().unwrap()]);
+        let managed = BTreeSet::from(["dbo.v_mine".parse::<ModuleId>().unwrap()]);
         let scoped = scope(&live, &ids(&[("t_aaaaaa", "dbo.customer")]), &managed);
 
         assert_eq!(scoped.schema.modules.len(), 1);
@@ -471,7 +480,7 @@ mod tests {
         );
         assert_eq!(
             scoped.unmanaged_modules,
-            vec!["dbo.v_theirs".parse::<TableName>().unwrap()]
+            vec!["dbo.v_theirs".parse::<ModuleId>().unwrap()]
         );
     }
 

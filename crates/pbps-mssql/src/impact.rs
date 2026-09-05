@@ -77,7 +77,7 @@ impl RenameTarget {
                 // A module rename reaches the plan as this drop plus a create,
                 // so the drop side is where the catalog has to be asked what
                 // still points at the old name.
-                Change::DropModule { name, .. } => Some(RenameTarget::Module(name.clone())),
+                Change::DropModule { id, .. } => Some(RenameTarget::Module(id.object_name())),
                 // Exhaustive rather than `_`: a change added later that also
                 // moves a name must be considered here, and a catch-all would
                 // let it through silently.
@@ -376,15 +376,14 @@ mod tests {
         let changes = ChangeSet {
             changes: vec![
                 PlannedChange::new(Change::DropModule {
-                    name: "dbo.active_customer".parse().unwrap(),
+                    id: "dbo.active_customer".parse().unwrap(),
                     kind: pbps_model::ModuleKind::View,
                 }),
                 PlannedChange::new(Change::CreateModule {
-                    name: "dbo.live_customer".parse().unwrap(),
+                    id: "dbo.live_customer".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
-                        on: None,
                         definition: "SELECT 1".into(),
                     }),
                 }),

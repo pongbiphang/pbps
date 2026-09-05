@@ -184,7 +184,7 @@ pub fn touched(cs: &ChangeSet) -> (usize, usize) {
     let mut tables = std::collections::BTreeSet::new();
     let mut modules = std::collections::BTreeSet::new();
     for p in &cs.changes {
-        match (p.change.module_name(), p.change.table()) {
+        match (p.change.module_id(), p.change.table()) {
             (Some(m), _) => modules.insert(m.to_string()),
             (None, Some(t)) => tables.insert(renames.table(t).clone()),
             // A role is neither; it is counted in its own line of the summary.

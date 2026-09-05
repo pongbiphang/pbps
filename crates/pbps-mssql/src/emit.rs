@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleKind,
-    ObjectName, Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
+    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
+    Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
     UniqueConstraint, Value,
 };
 
@@ -434,13 +434,18 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
         // because it is idempotent: it **preserves the permissions** granted on
         // the object, which drop + create silently destroys (ADR-0002).
-        Change::CreateModule { name, module } | Change::AlterModule { name, module } => Ok(vec![
-            Statement::new(module_definition(name, module)?).own_batch(),
+        Change::CreateModule { id, module } | Change::AlterModule { id, module } => Ok(vec![
+            Statement::new(module_definition(id, module)?).own_batch(),
         ]),
 
-        Change::DropModule { name, kind } => {
-            one(format!("DROP {} {};", keyword(*kind), qualified(name)?))
-        }
+        // The object's own name, without a signature: nothing overloads on
+        // this engine (ADR-0009 §1), so `DROP FUNCTION app.f` names exactly
+        // one object — and a signature in the statement is a syntax error.
+        Change::DropModule { id, kind } => one(format!(
+            "DROP {} {};",
+            keyword(*kind),
+            qualified(&id.object_name())?
+        )),
     }
 }
 
@@ -465,27 +470,29 @@ const fn keyword(kind: ModuleKind) -> &'static str {
 /// It is [`Statement::own_batch`] because T-SQL requires it: `CREATE VIEW`,
 /// `CREATE PROCEDURE`, `CREATE FUNCTION` and `CREATE TRIGGER` must each be the
 /// only statement in their batch.
-pub fn module_definition(name: &ObjectName, module: &Module) -> Result<String, DialectError> {
+pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, DialectError> {
     let body = module.definition.trim();
     if body.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            message: format!("module `{name}` has an empty definition"),
+            message: format!("module `{id}` has an empty definition"),
         });
     }
     let head = format!(
         "CREATE OR ALTER {} {}",
         keyword(module.kind),
-        qualified(name)?
+        qualified(&id.object_name())?
     );
     Ok(match module.kind {
         // The `AS` is the emitter's, so a view's definition is just its query —
         // which is what a reader of the declarations wants to see.
         ModuleKind::View => format!("{head}\nAS\n{body}"),
         ModuleKind::Trigger => {
-            let on = module.on.as_ref().ok_or_else(|| DialectError::Invalid {
+            // The table is in the identity now, so a trigger without one is
+            // not a module this emitter can be handed: the type says so.
+            let on = id.attached_to().ok_or_else(|| DialectError::Invalid {
                 dialect: DIALECT,
-                message: format!("trigger `{name}` does not say which table it is on"),
+                message: format!("trigger `{id}` does not say which table it is on"),
             })?;
             format!("{head}\nON {}\n{body}", qualified(on)?)
         }
@@ -1040,6 +1047,19 @@ fn one(sql: String) -> Sql {
 fn securable(target: &GrantTarget) -> Result<String, DialectError> {
     Ok(match target {
         GrantTarget::Object(o) => format!("OBJECT::{}", qualified(o)?),
+        // Refused rather than written without its arguments: T-SQL has no
+        // spelling for one overload, because it has no overloads (ADR-0009
+        // §1). `validate::role` says the same thing before a plan exists;
+        // this is the emitter's own guard for a plan that arrived some other
+        // way.
+        GrantTarget::Routine(r) => {
+            return Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "`{r}` names an argument list; SQL Server identifies a routine by name alone"
+                ),
+            });
+        }
         GrantTarget::Schema(s) => format!("SCHEMA::{}", quote(s)?),
     })
 }

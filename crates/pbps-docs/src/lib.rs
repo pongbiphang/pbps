@@ -106,7 +106,6 @@ mod tests {
             pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
                 description: Some("Customers that are not legacy records".into()),
-                on: None,
                 definition: "SELECT customer_id FROM dbo.customer".into(),
             },
         );

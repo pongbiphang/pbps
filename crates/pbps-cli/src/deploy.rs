@@ -23,8 +23,8 @@ use pbps_config::Project;
 use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
-    DataScopes, IdsFile, ObjectName, ObservedRows, RowScope, Schema, StateKind, StateSnapshot,
-    TableName,
+    DataScopes, IdsFile, ModuleId, ObjectName, ObservedRows, RowScope, Schema, StateKind,
+    StateSnapshot, TableName,
 };
 
 use crate::db::{self, Target};
@@ -83,7 +83,7 @@ fn rows_to_read(scopes: &DataScopes) -> BTreeMap<TableName, RowScope> {
 async fn managed_state(
     conn: &mut Conn,
     ids: &IdsFile,
-    modules: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     reference: &Schema,
@@ -132,7 +132,7 @@ fn refuse_managed_limitations(limitations: &[String]) -> anyhow::Result<()> {
 async fn baseline_state(
     conn: &mut Conn,
     ids: &IdsFile,
-    modules: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
     unmanaged: pbps_config::Unmanaged,
     scopes: &DataScopes,
     recorded: &Schema,
@@ -170,8 +170,8 @@ async fn baseline_state(
 async fn staged_baseline(
     conn: &mut Conn,
     ids: &IdsFile,
-    checked: &BTreeSet<ObjectName>,
-    watched: &BTreeSet<ObjectName>,
+    checked: &BTreeSet<ModuleId>,
+    watched: &BTreeSet<ModuleId>,
     unmanaged: pbps_config::Unmanaged,
     checked_scopes: &DataScopes,
     recorded: &Schema,
@@ -236,7 +236,7 @@ async fn staged_baseline(
 async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
-    modules: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
     unmanaged: pbps_config::Unmanaged,
     read: &BTreeMap<TableName, RowScope>,
 ) -> anyhow::Result<Managed> {
@@ -275,7 +275,7 @@ async fn pull(conn: &mut Conn) -> anyhow::Result<pbps_mssql::introspect::Pulled>
 fn cut(
     pulled: &pbps_mssql::introspect::Pulled,
     ids: &IdsFile,
-    modules: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
     unreadable: &[(ObjectName, String)],
     unmanaged: pbps_config::Unmanaged,
 ) -> anyhow::Result<pbps_diff::Scoped> {
@@ -306,8 +306,9 @@ fn cut(
 /// those live in the hints rather than in the model (constraint 8).
 fn declared_scope(
     project: &Project,
-) -> anyhow::Result<(BTreeSet<ObjectName>, DataScopes, pbps_load::Loaded)> {
-    let loaded = crate::load(project)?;
+    dialect: &dyn pbps_dialect::Dialect,
+) -> anyhow::Result<(BTreeSet<ModuleId>, DataScopes, pbps_load::Loaded)> {
+    let loaded = crate::load(project, dialect)?;
     Ok((
         managed_modules(None, Some(&loaded.schema)),
         loaded.schema.data_scopes(),
@@ -554,9 +555,9 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         out.entry(name.schema.clone())
             .or_insert_with(|| format!("the schema of `{name}`"));
     }
-    for name in schema.modules.keys() {
-        out.entry(name.schema.clone())
-            .or_insert_with(|| format!("the schema of `{name}`"));
+    for id in schema.modules.keys() {
+        out.entry(id.schema().to_owned())
+            .or_insert_with(|| format!("the schema of `{id}`"));
     }
     out
 }
@@ -779,7 +780,7 @@ fn scopes_under(data: &DataScopes, final_ids: &IdsFile, live_ids: &IdsFile) -> D
 pub(crate) fn managed_limitations(
     pulled: &pbps_mssql::introspect::Pulled,
     ids: &IdsFile,
-    modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
     let managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
     pulled
@@ -791,7 +792,11 @@ pub(crate) fn managed_limitations(
             pulled
                 .unmanaged_modules
                 .iter()
-                .filter(|m| modules.contains(&m.name))
+                // An unmanageable module is known by the name the catalog
+                // gave it, so the managed set is asked under the same name:
+                // whatever a module's identity holds, that is what it is
+                // called (ADR-0009 §1).
+                .filter(|m| modules.iter().any(|id| id.object_name() == m.name))
                 .map(|m| format!("{} {} is in the managed set, but {}", m.kind, m.name, m.why)),
         )
         .collect()
@@ -820,7 +825,7 @@ pub(crate) fn managed_limitations(
 pub(crate) fn unexpressible_permissions<'a>(
     pulled: &'a pbps_mssql::introspect::Pulled,
     ids: &IdsFile,
-    modules: &BTreeSet<ObjectName>,
+    modules: &BTreeSet<ModuleId>,
 ) -> Vec<&'a str> {
     let managed_tables: BTreeSet<&TableName> = ids.tables.values().collect();
     pulled
@@ -829,8 +834,14 @@ pub(crate) fn unexpressible_permissions<'a>(
         .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
         .filter(|u| match &u.target {
             Some(pbps_model::GrantTarget::Object(o)) => {
-                managed_tables.contains(o) || modules.contains(o)
+                managed_tables.contains(o)
+                    || modules
+                        .iter()
+                        .any(|id| id.referenced_name().as_ref() == Some(o))
             }
+            Some(pbps_model::GrantTarget::Routine(r)) => modules
+                .iter()
+                .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
             Some(pbps_model::GrantTarget::Schema(_)) | None => true,
         })
         .map(|u| u.what.as_str())
@@ -846,12 +857,12 @@ fn modules_after(
     recorded: &pbps_model::StateSnapshot,
     changes: &pbps_model::ChangeSet,
     settled: Settled,
-) -> BTreeSet<ObjectName> {
+) -> BTreeSet<ModuleId> {
     let mut set: BTreeSet<_> = recorded.schema.modules.keys().cloned().collect();
     for p in &changes.changes {
         // Every module change names its module and nothing else does, so the
         // accessor is the whole classification; only the direction is left.
-        let Some(name) = p.change.module_name() else {
+        let Some(id) = p.change.module_id() else {
             continue;
         };
         // A module the plan drops leaves the set only once the plan has run.
@@ -866,9 +877,9 @@ fn modules_after(
         // already dropped is simply absent from the catalog, which the read
         // records truthfully, and one still standing stays watched.
         if settled.whole() && matches!(p.change, pbps_model::Change::DropModule { .. }) {
-            set.remove(name);
+            set.remove(id);
         } else {
-            set.insert(name.clone());
+            set.insert(id.clone());
         }
     }
     set
@@ -893,7 +904,7 @@ fn dependency_hints_for_schema(
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|planned| planned.change.module_name())
+        .filter_map(|planned| planned.change.module_id())
         .collect();
     let present: std::collections::BTreeSet<_> = schema.modules.keys().collect();
     let mut dependencies = pbps_model::ModuleDeps::new();
@@ -932,7 +943,7 @@ fn dependency_hints_for_schema(
 fn managed_modules(
     recorded: Option<&pbps_model::StateSnapshot>,
     declared: Option<&pbps_model::Schema>,
-) -> BTreeSet<ObjectName> {
+) -> BTreeSet<ModuleId> {
     let mut set = BTreeSet::new();
     if let Some(s) = recorded {
         set.extend(s.schema.modules.keys().cloned());
@@ -993,13 +1004,13 @@ pub(crate) fn unreadable_modules(
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_model::ObjectName, String)],
-    managed_modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    managed_modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
     scoped
         .unmanaged
         .iter()
-        .chain(&scoped.unmanaged_modules)
         .map(ToString::to_string)
+        .chain(scoped.unmanaged_modules.iter().map(ToString::to_string))
         // A role is a principal rather than an object, so it has no
         // `TableName` to be listed under and needs its own spelling — but the
         // policy is about everything in the database this project does not
@@ -1013,7 +1024,7 @@ pub(crate) fn unmanaged_objects(
         .chain(
             unreadable
                 .iter()
-                .filter(|(name, _)| !managed_modules.contains(name))
+                .filter(|(name, _)| !managed_modules.iter().any(|id| id.object_name() == *name))
                 .map(|(_, description)| description.clone()),
         )
         .collect()
@@ -1024,7 +1035,7 @@ pub(crate) fn unmanaged_objects(
 fn report_unmanaged(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_model::ObjectName, String)],
-    managed_modules: &std::collections::BTreeSet<pbps_model::ObjectName>,
+    managed_modules: &std::collections::BTreeSet<ModuleId>,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
     let names = unmanaged_objects(scoped, unreadable, managed_modules);
@@ -1303,9 +1314,15 @@ fn refuse_unplanned_movement(
     settled: Settled,
 ) -> anyhow::Result<()> {
     let mut objects: BTreeSet<&TableName> = BTreeSet::new();
+    // Modules are counted in their own set, under their own identity: a
+    // module is no longer a name in the tables namespace (ADR-0009 §1), and
+    // asking whether the plan touched `app.f` would exempt every overload of
+    // it from the comparison below.
+    let mut touched_modules: BTreeSet<&pbps_model::ModuleId> = BTreeSet::new();
     let mut roles: BTreeSet<&str> = BTreeSet::new();
     for p in &changes.changes {
         objects.extend(p.change.objects());
+        touched_modules.extend(p.change.module_id());
         roles.extend(p.change.roles());
     }
 
@@ -1355,7 +1372,7 @@ fn refuse_unplanned_movement(
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
-    let mut gone: BTreeSet<&TableName> = BTreeSet::new();
+    let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
     // The constraints and indexes this plan moves, and the tables whose
     // primary key it sets. Everything else on a touched table then answers for
     // itself, instead of one index change exempting the whole shape
@@ -1774,20 +1791,28 @@ fn refuse_unplanned_movement(
             ));
         }
     }
-    compare("", &before.modules, &after.modules, named, &mut moved);
+    compare(
+        "",
+        &before.modules,
+        &after.modules,
+        |id: &pbps_model::ModuleId| touched_modules.contains(id),
+        &mut moved,
+    );
     // A module the plan names is held to the definition the plan wrote, not
     // exempted. `CREATE OR ALTER` reports success and says nothing about what
     // is now stored, and no statement carries a postcondition for one — so a
     // session, or a DDL trigger inside the statement itself, that altered or
     // dropped the module straight afterwards was read back and recorded as
     // this plan's own result (DECISIONS 160).
-    // By name, not by change: a module that changes kind, or a trigger that
-    // changes its target, is a `DropModule` *and* a `CreateModule` for one
-    // name (`diff_modules`). Checked separately the drop always failed — the
-    // create had put the module back — and every replacement was refused
-    // (DECISIONS 161). The plan is in `order_key` order, which puts the drop
-    // first, so the last word on a name is the net one.
-    let mut modules_after_plan: BTreeMap<&pbps_model::ObjectName, pbps_model::ModuleAfter<'_>> =
+    // By identity, not by change: a module that changes kind is a
+    // `DropModule` *and* a `CreateModule` for one identity (`diff_modules`).
+    // Checked separately the drop always failed — the create had put the
+    // module back — and every replacement was refused (DECISIONS 161). The
+    // plan is in `order_key` order, which puts the drop first, so the last
+    // word on an identity is the net one. A trigger moved to another table is
+    // no longer such a pair: it is two identities, one dropped and one
+    // created, and each answers for itself.
+    let mut modules_after_plan: BTreeMap<&pbps_model::ModuleId, pbps_model::ModuleAfter<'_>> =
         BTreeMap::new();
     for p in &changes.changes {
         if let Some((name, expected)) = p.change.module() {
@@ -2061,10 +2086,9 @@ fn refuse_unplanned_movement(
                 // removes a permission with its securable, so `diff_roles`
                 // emits no `REVOKE` and there is nothing left for the read-back
                 // to hold (DECISIONS 158).
-                .filter(|(target, _)| match target {
-                    pbps_model::GrantTarget::Object(object) => !gone.contains(object),
-                    pbps_model::GrantTarget::Schema(_) => true,
-                })
+                // By whole identity: dropping one overload leaves the
+                // sibling's grants standing, and standing grants are compared.
+                .filter(|(target, _)| !gone.iter().any(|d| d.takes(target)))
                 .map(|(target, held)| {
                     let target = match target {
                         pbps_model::GrantTarget::Object(object) => pbps_model::GrantTarget::Object(
@@ -2074,7 +2098,14 @@ fn refuse_unplanned_movement(
                                 .cloned()
                                 .unwrap_or_else(|| object.clone()),
                         ),
-                        schema => schema.clone(),
+                        // Only tables are renamed, and a routine is not a
+                        // table — as `diff_roles` says. Where routines have a
+                        // namespace of their own, `app.f(integer)` stands
+                        // beside a table `app.f`, and forwarding the routine's
+                        // grant through the table's rename refused the apply
+                        // for a grant that had, rightly, not moved.
+                        routine @ pbps_model::GrantTarget::Routine(_) => routine.clone(),
+                        schema @ pbps_model::GrantTarget::Schema(_) => schema.clone(),
                     };
                     (target, held.clone())
                 })
@@ -2523,7 +2554,8 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
     db::require_mssql(project, "snapshot")?;
     let ids = crate::read_ids(project)?;
-    let (declared_modules, declared_data, loaded) = declared_scope(project)?;
+    let (declared_modules, declared_data, loaded) =
+        declared_scope(project, crate::dialect(project)?.as_ref())?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
@@ -2604,7 +2636,8 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow::Result<()> {
     db::require_mssql(project, "baseline")?;
     let ids = crate::read_ids(project)?;
-    let (declared_modules, declared_data, loaded) = declared_scope(project)?;
+    let (declared_modules, declared_data, loaded) =
+        declared_scope(project, crate::dialect(project)?.as_ref())?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
@@ -2692,9 +2725,9 @@ pub fn cmd_bootstrap(
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let loaded = crate::load(project)?;
-    let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    let loaded = crate::load(project, dialect.as_ref())?;
+    let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref())?;
     let declared_modules = managed_modules(None, Some(&loaded.schema));
 
@@ -3016,9 +3049,9 @@ pub fn cmd_plan_db(
     staged: bool,
 ) -> anyhow::Result<()> {
     db::require_mssql(project, "plan --db")?;
-    let loaded = crate::load(project)?;
-    let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
+    let loaded = crate::load(project, dialect.as_ref())?;
+    let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref())?;
     let created_at = crate::now();
 
@@ -3115,7 +3148,13 @@ pub fn cmd_plan_db(
         let colliding: Vec<&str> = managed
             .unreadable
             .iter()
-            .filter(|(n, _)| loaded.schema.modules.contains_key(n))
+            .filter(|(n, _)| {
+                loaded
+                    .schema
+                    .modules
+                    .keys()
+                    .any(|id| &id.object_name() == n)
+            })
             .map(|(_, why)| why.as_str())
             .collect();
         if !colliding.is_empty() {
@@ -4492,14 +4531,7 @@ async fn preflight(
     // runs first (ADR-0002). The catalog is queried before anything executes, so
     // it still sees the dependency — and reporting it would refuse a plan whose
     // own first statement removes the obstacle.
-    let dropped: std::collections::BTreeSet<String> = plan
-        .changes
-        .changes
-        .iter()
-        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|p| p.change.module_name())
-        .map(ToString::to_string)
-        .collect();
+    let dropped = dropped_referrer_names(&plan.changes);
 
     let mut blocked = Vec::new();
     for target in rename_targets {
@@ -4725,6 +4757,23 @@ fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> State
     snapshot
 }
 
+/// The modules this plan drops, spelled as the catalog spells a referrer.
+///
+/// `rename_impact` names a referrer `schema.name` from `sys.objects`, and a
+/// trigger's `ModuleId` is `schema.table.name` — so the id's own string form
+/// matched nothing, a trigger this plan drops before the rename stayed in the
+/// report, and a schema-bound one refused the plan whose first statement
+/// removes it. The object name is what the catalog has (ADR-0009 §1).
+fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
+    changes
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|p| p.change.module_id())
+        .map(|id| id.object_name().to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -4743,8 +4792,8 @@ mod tests {
         ids.tables.insert("t_aaaaaa".parse().unwrap(), mine.clone());
         ids.roles
             .insert("r_aaaaaa".parse().unwrap(), "app".to_owned());
-        let module: ObjectName = "dbo.v".parse().unwrap();
-        let modules: BTreeSet<ObjectName> = [module.clone()].into_iter().collect();
+        let module: ModuleId = "dbo.v".parse().unwrap();
+        let modules: BTreeSet<ModuleId> = [module.clone()].into_iter().collect();
 
         let entry =
             |role: &str, target: Option<pbps_model::GrantTarget>, what: &str| Unexpressible {
@@ -4760,7 +4809,11 @@ mod tests {
             unmanaged_modules: Vec::new(),
             unexpressible: vec![
                 entry("app", object(&mine), "on a table this project manages"),
-                entry("app", object(&module), "on a module this project manages"),
+                entry(
+                    "app",
+                    object(&module.object_name()),
+                    "on a module this project manages",
+                ),
                 entry("app", object(&theirs), "on somebody else's table"),
                 entry("other", object(&mine), "an unmanaged role's business"),
                 // No object to belong to: a permission on the database itself,
@@ -4990,6 +5043,174 @@ mod tests {
         assert!(e.contains("role app"), "{e}");
     }
 
+    /// A table's rename forwards the grants on the table and nothing else.
+    /// Where routines have their own namespace a routine may share the
+    /// table's name, and its grant stays where it is when the table moves;
+    /// forwarding it through the rename refused an apply that had done
+    /// exactly what the plan said.
+    #[test]
+    fn a_table_rename_does_not_forward_the_grant_on_a_routine_of_that_name() {
+        use pbps_model::{GrantTarget, Permission};
+        let routine: GrantTarget = "dbo.f(integer)".parse().unwrap();
+        let with = |table: &str, on_routine: &GrantTarget| {
+            let mut grants = BTreeMap::new();
+            grants.insert(
+                GrantTarget::Object(table.parse().unwrap()),
+                [Permission::Select].into_iter().collect::<BTreeSet<_>>(),
+            );
+            grants.insert(
+                on_routine.clone(),
+                [Permission::Execute].into_iter().collect::<BTreeSet<_>>(),
+            );
+            let mut s = Schema::default();
+            s.tables
+                .insert(table.parse().unwrap(), pbps_model::Table::default());
+            s.modules.insert(
+                "dbo.f(integer)".parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "RETURN 1".to_owned(),
+                },
+            );
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let rename = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.f".parse().unwrap(),
+                    to: "dbo.g".parse().unwrap(),
+                },
+            )],
+        };
+        let refuse = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rename,
+                &with("dbo.f", &routine),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        // The table's grant moved with the table; the routine's stayed.
+        refuse(&with("dbo.g", &routine)).expect("the routine's grant did not move");
+        // A routine grant that *did* move to the new name is movement.
+        let moved: GrantTarget = "dbo.g(integer)".parse().unwrap();
+        let e = refuse(&with("dbo.g", &moved)).expect_err("the routine's grant moved");
+        assert!(e.contains("role app"), "{e}");
+    }
+
+    /// The rename impact report names a referrer as the catalog does,
+    /// `schema.name`; a trigger this plan drops has to be looked up under that
+    /// spelling, not under its id's, or the drop excuses nothing.
+    #[test]
+    fn a_dropped_trigger_is_excused_from_the_rename_impact_under_its_catalog_name() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                    id: "dbo.t.audit".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::Trigger,
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                    id: "dbo.v".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AlterModule {
+                    id: "dbo.kept".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1".to_owned(),
+                    }),
+                }),
+            ],
+        };
+        let names: Vec<String> = dropped_referrer_names(&changes).into_iter().collect();
+        assert_eq!(names, ["dbo.audit", "dbo.v"]);
+    }
+
+    /// A dropped routine takes its own grants and no other's: where routines
+    /// overload, a plan dropping `dbo.f(integer)` says nothing about the
+    /// grants on `dbo.f(text)`, and one of those revoked underneath the apply
+    /// is movement to refuse, not a permission gone with the drop
+    /// (ADR-0009 §1, DECISIONS 158).
+    #[test]
+    fn a_dropped_overload_does_not_excuse_the_siblings_grants() {
+        use pbps_model::{GrantTarget, Permission};
+        let f = |body: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: body.to_owned(),
+        };
+        let int: ModuleId = "dbo.f(integer)".parse().unwrap();
+        let text: ModuleId = "dbo.f(text)".parse().unwrap();
+        let on = |id: &ModuleId| match id {
+            ModuleId::Routine(r) => GrantTarget::Routine(r.clone()),
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => unreachable!(),
+        };
+        let schema = |with_int: bool, text_granted: bool| {
+            let mut s = Schema::default();
+            if with_int {
+                s.modules.insert(int.clone(), f("RETURN 1"));
+            }
+            s.modules.insert(text.clone(), f("RETURN 'a'"));
+            let mut grants = BTreeMap::new();
+            if with_int {
+                grants.insert(on(&int), [Permission::Execute].into_iter().collect());
+            }
+            if text_granted {
+                grants.insert(on(&text), [Permission::Execute].into_iter().collect());
+            }
+            s.roles.insert(
+                "app".to_owned(),
+                pbps_model::Role {
+                    description: None,
+                    grants,
+                },
+            );
+            s
+        };
+        let dropping_int = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropModule {
+                    id: int.clone(),
+                    kind: pbps_model::ModuleKind::Function,
+                },
+            )],
+        };
+        let refuse = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &dropping_int,
+                &schema(true, true),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        // The drop took its own grant with it, and the sibling's stands.
+        refuse(&schema(false, true)).expect("only the dropped overload's grant went");
+        // The sibling's grant went too: not this plan's doing.
+        // Named at role granularity: the plan does not name the role, so the
+        // whole-role compare answers, as it does for any untouched role.
+        let e = refuse(&schema(false, false)).expect_err("the sibling's grant moved");
+        assert!(
+            e.contains("role app is not what the plan was approved over"),
+            "{e}"
+        );
+    }
+
     /// A module the plan writes is held to the definition it wrote. Nothing
     /// else in a run is: `CREATE OR ALTER` reports success and says nothing
     /// about what is now stored (DECISIONS 160).
@@ -4998,7 +5219,6 @@ mod tests {
         let view = |definition: &str| pbps_model::Module {
             kind: pbps_model::ModuleKind::View,
             description: None,
-            on: None,
             definition: definition.to_owned(),
         };
         let schema_with = |module: Option<pbps_model::Module>| {
@@ -5011,7 +5231,7 @@ mod tests {
         let writing = |definition: &str| pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::AlterModule {
-                    name: "dbo.v".parse().unwrap(),
+                    id: "dbo.v".parse().unwrap(),
                     module: Box::new(view(definition)),
                 },
             )],
@@ -5057,7 +5277,7 @@ mod tests {
         let dropping = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::DropModule {
-                    name: "dbo.v".parse().unwrap(),
+                    id: "dbo.v".parse().unwrap(),
                     kind: pbps_model::ModuleKind::View,
                 },
             )],
@@ -5368,11 +5588,10 @@ mod tests {
     fn a_module_still_to_be_dropped_stays_in_the_staged_scope() {
         let module = |name: &str| {
             (
-                name.parse::<pbps_model::ObjectName>().unwrap(),
+                name.parse::<pbps_model::ModuleId>().unwrap(),
                 pbps_model::Module {
                     kind: pbps_model::ModuleKind::View,
                     description: None,
-                    on: None,
                     definition: "SELECT 1".to_owned(),
                 },
             )
@@ -5385,7 +5604,7 @@ mod tests {
                 .into_iter()
                 .map(|name| {
                     pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                        name: name.parse().unwrap(),
+                        id: name.parse().unwrap(),
                         kind: pbps_model::ModuleKind::View,
                     })
                 })
@@ -5406,7 +5625,7 @@ mod tests {
         let creating = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::CreateModule {
-                    name: "dbo.c".parse().unwrap(),
+                    id: "dbo.c".parse().unwrap(),
                     module: Box::new(module("dbo.c").1),
                 },
             )],
@@ -5414,7 +5633,7 @@ mod tests {
         for settled in [Settled::Whole, Settled::SoFar] {
             assert!(
                 modules_after(&recorded, &creating, settled)
-                    .contains(&"dbo.c".parse::<pbps_model::ObjectName>().unwrap()),
+                    .contains(&"dbo.c".parse::<pbps_model::ModuleId>().unwrap()),
                 "a module the plan adds is in the set from the start"
             );
         }
@@ -5674,7 +5893,6 @@ mod tests {
         let module = |kind: pbps_model::ModuleKind| pbps_model::Module {
             kind,
             description: None,
-            on: None,
             definition: "SELECT 1".to_owned(),
         };
         let schema_with = |kind: pbps_model::ModuleKind| {
@@ -5686,11 +5904,11 @@ mod tests {
         let replacing = pbps_model::ChangeSet {
             changes: vec![
                 pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                    name: "dbo.v".parse().unwrap(),
+                    id: "dbo.v".parse().unwrap(),
                     kind: pbps_model::ModuleKind::View,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
-                    name: "dbo.v".parse().unwrap(),
+                    id: "dbo.v".parse().unwrap(),
                     module: Box::new(module(pbps_model::ModuleKind::Function)),
                 }),
             ],

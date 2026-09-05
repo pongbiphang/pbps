@@ -390,13 +390,13 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
             // it the way it rewrites an expression. So it is the emitter or the
             // introspection that is wrong, and swallowing it here would let a
             // view with the wrong body pass as converged.
-            Change::AlterModule { name, module, .. } => structural.push(format!(
-                "{} {name}: declared `{}`, the engine stores `{}`",
+            Change::AlterModule { id, module, .. } => structural.push(format!(
+                "{} {id}: declared `{}`, the engine stores `{}`",
                 module.kind,
                 module.definition.trim(),
                 engine
                     .modules
-                    .get(name)
+                    .get(id)
                     .map(|m| m.definition.trim())
                     .unwrap_or("(absent)")
             )),
@@ -583,7 +583,6 @@ mod tests {
         pbps_model::Module {
             kind: pbps_model::ModuleKind::View,
             description: None,
-            on: None,
             definition: definition.into(),
         }
     }
@@ -594,13 +593,13 @@ mod tests {
     /// would let a view with the wrong body rehearse as converged.
     #[test]
     fn a_module_the_engine_stored_differently_fails_the_rehearsal() {
-        let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
+        let name: pbps_model::ModuleId = "dbo.v".parse().unwrap();
         let mut engine = Schema::default();
         engine.modules.insert(name.clone(), view("SELECT 1 AS one"));
 
         let remaining = ChangeSet {
             changes: vec![planned(Change::AlterModule {
-                name: name.clone(),
+                id: name.clone(),
                 module: Box::new(view("SELECT 2 AS two")),
             })],
         };

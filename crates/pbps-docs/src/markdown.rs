@@ -56,10 +56,10 @@ fn modules_section(s: &mut String, schema: &Schema) {
     s.push_str("\n## Views, procedures, functions and triggers\n");
     for (name, m) in &schema.modules {
         let _ = writeln!(s, "\n### `{name}`\n");
-        let on =
-            m.on.as_ref()
-                .map(|t| format!(" on `{t}`"))
-                .unwrap_or_default();
+        let on = name
+            .attached_to()
+            .map(|t| format!(" on `{t}`"))
+            .unwrap_or_default();
         let _ = writeln!(s, "*{}{on}*\n", m.kind);
         if let Some(d) = &m.description {
             let _ = writeln!(s, "{d}\n");

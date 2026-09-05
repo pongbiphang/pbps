@@ -25,7 +25,7 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Probe, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ObjectName, Role, Schema, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, Role, Schema, Strategy, Table, TableName,
 };
 
 pub mod catalog;
@@ -82,8 +82,8 @@ impl Dialect for Mssql {
         validate::table(name, table)
     }
 
-    fn validate_module(&self, name: &ObjectName, module: &Module) -> Vec<DialectError> {
-        validate::module(name, module)
+    fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
+        validate::module(id, module)
     }
 
     fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {

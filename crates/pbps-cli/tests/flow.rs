@@ -806,7 +806,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     let ids: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
     let snap = serde_json::json!({
-        "version": 4,
+        "version": 6,
         "kind": "baseline",
         "schema": { "tables": { "dbo.t": { "columns": {
             "id": { "type": "bigint", "nullable": false }
@@ -1035,6 +1035,94 @@ fn respelling_a_type_produces_no_plan() {
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+}
+
+/// The offline plan loads its declarations before it knows the dialect, and
+/// the git baseline is assembled from `git show` and never sees `load`. Both
+/// still get the routine-identity pass: `dbo.f(integer)` at the baseline and
+/// `dbo.f(int)` now are one routine to the engine, and a plan that dropped and
+/// recreated it would be a destructive plan for an object nobody changed
+/// (ADR-0009 §1).
+#[test]
+fn an_offline_plan_spells_a_routine_the_same_way_on_both_sides() {
+    let d = Demo::new("plan-routine-spelling");
+    let f = |args: &str| {
+        std::fs::write(
+            d.dir.join("schema/dbo.f.function.yml"),
+            format!(
+                "function: dbo.f({args})\ndefinition: |-\n  (@a int) RETURNS int AS BEGIN RETURN @a END\n"
+            ),
+        )
+        .unwrap();
+    };
+    f("integer");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+
+    f("int");
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+
+    // And a signature that only differs in spelling from another's is a
+    // collision the offline plan reports, not a second module it plans for.
+    std::fs::write(
+        d.dir.join("schema/dbo.f-2.function.yml"),
+        "function: dbo.f(INTEGER)\ndefinition: |-\n  (@a int) RETURNS int AS BEGIN RETURN 2 END\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("one object"), "{}", stderr(&o));
+    let o = d.run(&["plan", "--format", "json"]);
+    assert!(
+        stdout(&o).contains("schema.name-collision"),
+        "{}\n{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
+/// The routine-identity pass re-keys a role's grants too, and two targets
+/// that spell one routine are a collision to report, not a map entry to
+/// overwrite: kept silently, the later permission set would replace the
+/// earlier one, and the next plan would revoke what the declaration grants.
+#[test]
+fn two_grant_targets_that_spell_one_routine_are_a_collision() {
+    let d = Demo::new("validate-grant-spelling");
+    std::fs::write(
+        d.dir.join("schema/app.role.yml"),
+        "role: app\ngrants:\n  dbo.f(int): [execute]\n  dbo.f(integer): [execute]\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("role app"), "{err}");
+    assert!(
+        err.contains("`dbo.f(int)`") && err.contains("`dbo.f(integer)`"),
+        "{err}"
+    );
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        stdout(&o).contains("schema.name-collision"),
+        "{}",
+        stdout(&o)
+    );
+
+    // One spelling is one grant, whatever it is spelled as.
+    std::fs::write(
+        d.dir.join("schema/app.role.yml"),
+        "role: app\ngrants:\n  dbo.f(int): [execute]\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate", "--format", "json"]);
+    assert!(
+        !stdout(&o).contains("schema.name-collision"),
+        "{}",
+        stdout(&o)
+    );
 }
 
 #[test]
@@ -1582,7 +1670,19 @@ fn a_module_named_after_a_table_is_refused() {
     d.module("v.yml", "view: dbo.t\ndefinition: SELECT 1\n");
     let o = d.run(&["validate"]);
     assert_ne!(code(&o), 0);
-    assert!(stderr(&o).contains("already declared"), "{}", stderr(&o));
+    // The dialect's refusal, not the loader's: whether a module competes with
+    // a table for its name is the engine's answer (ADR-0009 §1) — on
+    // PostgreSQL a table `dbo.t` and a function `dbo.t(int)` coexist.
+    assert!(
+        stderr(&o).contains("declared both as a table and as a view"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("one namespace per schema"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 /// A trigger has to name a table that is actually managed here, or pbps would
@@ -8052,7 +8152,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::AlterModule { .. }))
-        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
         .collect();
     assert_eq!(altered, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
@@ -8074,7 +8174,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|planned| planned.change.module_name().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
         .collect();
     assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
@@ -8429,11 +8529,10 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::CreateModule {
-                    name: "dbo.pbps_plan_b".parse().unwrap(),
+                    id: "dbo.pbps_plan_b".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
-                        on: None,
                         definition: "SELECT 1 AS id".into(),
                     }),
                 },

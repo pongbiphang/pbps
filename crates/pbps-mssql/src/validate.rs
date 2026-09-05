@@ -7,7 +7,8 @@
 
 use pbps_dialect::DialectError;
 use pbps_model::{
-    GrantTarget, Module, ModuleKind, ObjectName, Permission, Role, Schema, Table, TableName, Value,
+    GrantTarget, Module, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table,
+    TableName, Value,
 };
 
 use crate::ident;
@@ -43,6 +44,20 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     for (target, permissions) in &role.grants {
         let parts: Vec<&str> = match target {
             GrantTarget::Object(o) => vec![&o.schema, &o.name],
+            // Nothing overloads here, so a grant that names a signature names
+            // a securable this engine cannot resolve (ADR-0009 §1). Refused
+            // rather than narrowed to the bare name: the two spellings would
+            // mean the same object on this dialect and different ones on
+            // another, and quietly picking is how a grant lands on the wrong
+            // overload the day a project moves.
+            GrantTarget::Routine(r) => {
+                errs.push(invalid(format!(
+                    "role `{name}`: `{r}` names an argument list; SQL Server identifies a routine \
+                     by name alone, so grant on `{}` instead",
+                    r.name
+                )));
+                vec![&r.name.schema, &r.name.name]
+            }
             GrantTarget::Schema(s) => vec![s],
         };
         for part in parts {
@@ -221,7 +236,13 @@ fn target_kind(object: &ObjectName, schema: &Schema) -> Option<TargetKind> {
     if schema.tables.contains_key(object) {
         return Some(TargetKind::Table);
     }
-    let module = schema.modules.get(object)?;
+    // By the name the grant namespace knows, which is the identity's own name
+    // (ADR-0009 §1): a grant is written against `app.f`, and on this engine
+    // exactly one module answers to it.
+    let (_, module) = schema
+        .modules
+        .iter()
+        .find(|(id, _)| id.referenced_name().as_ref() == Some(object))?;
     Some(match module.kind {
         ModuleKind::View => TargetKind::View,
         ModuleKind::Procedure => TargetKind::Procedure,
@@ -291,13 +312,29 @@ pub const FIXED_ROLES: [&str; 10] = [
 /// not do. What is checked is what the *emitter* needs to be true in order to
 /// produce a statement at all, plus the two shapes that would otherwise become
 /// a puzzling engine error on a database that is already half-changed.
-pub fn module(name: &ObjectName, module: &Module) -> Vec<DialectError> {
+pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
     let mut errs = Vec::new();
+    let name = id.object_name();
 
     for part in [&name.schema, &name.name] {
         if let Err(e) = ident::quote(part) {
             errs.push(e);
         }
+    }
+
+    // Nothing overloads on SQL Server, so a signature names an object this
+    // engine cannot have (ADR-0009 §1). `Dialect::overloads` says the same
+    // thing for the whole-schema check; this one catches a module that
+    // reached the emitter another way — a saved plan, a state snapshot.
+    if let Some(args) = id.args() {
+        let spelled: Vec<String> = args.iter().map(ToString::to_string).collect();
+        errs.push(invalid(format!(
+            "{} `{name}` is declared with the argument list `({})`; SQL Server identifies a {} by \
+             name alone",
+            module.kind,
+            spelled.join(","),
+            module.kind
+        )));
     }
 
     let body = module.definition.trim();
@@ -346,21 +383,21 @@ pub fn module(name: &ObjectName, module: &Module) -> Vec<DialectError> {
         )));
     }
 
-    match (module.kind, &module.on) {
-        (ModuleKind::Trigger, None) => errs.push(invalid(format!(
-            "trigger `{name}` does not say which table it is on (`on:`)"
-        ))),
-        (ModuleKind::Trigger, Some(table)) => {
-            for part in [&table.schema, &table.name] {
+    match (module.kind, id) {
+        (ModuleKind::Trigger, ModuleId::Trigger { on, .. }) => {
+            for part in [&on.schema, &on.name] {
                 if let Err(e) = ident::quote(part) {
                     errs.push(e);
                 }
             }
         }
-        (kind, Some(table)) => errs.push(invalid(format!(
-            "`{name}` is a {kind} and cannot be `on: {table}`; only a trigger names a table"
+        (ModuleKind::Trigger, _) => errs.push(invalid(format!(
+            "trigger `{name}` does not say which table it is on (`on:`)"
         ))),
-        (_, None) => {}
+        (kind, ModuleId::Trigger { on, .. }) => errs.push(invalid(format!(
+            "`{name}` is a {kind} and cannot be `on: {on}`; only a trigger names a table"
+        ))),
+        (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
     }
 
     errs
@@ -1089,37 +1126,36 @@ mod tests {
         let module = |kind: ModuleKind, body: &str| Module {
             kind,
             description: None,
-            on: None,
             definition: body.to_owned(),
         };
         schema.modules.insert(
-            TableName::new("dbo", "v"),
+            ModuleId::Named(TableName::new("dbo", "v")),
             module(ModuleKind::View, "SELECT 1 AS one"),
         );
         schema.modules.insert(
-            TableName::new("dbo", "p"),
+            ModuleId::Named(TableName::new("dbo", "p")),
             module(ModuleKind::Procedure, "AS SELECT 1"),
         );
         schema.modules.insert(
-            TableName::new("dbo", "fs"),
+            ModuleId::Named(TableName::new("dbo", "fs")),
             module(ModuleKind::Function, "() RETURNS int AS BEGIN RETURN 1 END"),
         );
         schema.modules.insert(
-            TableName::new("dbo", "fi"),
+            ModuleId::Named(TableName::new("dbo", "fi")),
             module(
                 ModuleKind::Function,
                 "() RETURNS TABLE AS RETURN SELECT 1 AS one",
             ),
         );
         schema.modules.insert(
-            TableName::new("dbo", "fm"),
+            ModuleId::Named(TableName::new("dbo", "fm")),
             module(
                 ModuleKind::Function,
                 "() RETURNS @r TABLE (one int) AS BEGIN INSERT @r VALUES (1); RETURN END",
             ),
         );
         schema.modules.insert(
-            TableName::new("dbo", "tr"),
+            ModuleId::Named(TableName::new("dbo", "tr")),
             module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
         );
         let grant = |target: &str, p: Permission| {
@@ -1332,7 +1368,6 @@ mod tests {
         Module {
             kind,
             description: None,
-            on: None,
             definition: definition.to_owned(),
         }
     }
@@ -1429,10 +1464,23 @@ mod tests {
         );
         assert!(e.contains("which table"), "{e}");
 
-        let mut view = a_module(ModuleKind::View, "SELECT 1");
-        view.on = Some("dbo.customer".parse().unwrap());
-        let e = module_errors("dbo.v", &view);
+        // A view under a trigger's identity: the loader refuses the `on:`
+        // that would build one, and this is the same check for a plan or a
+        // state that arrived as JSON.
+        let e = module_errors("dbo.customer.v", &a_module(ModuleKind::View, "SELECT 1"));
         assert!(e.contains("only a trigger"), "{e}");
+    }
+
+    /// Nothing overloads on SQL Server, so a declared signature names an
+    /// object this engine cannot have (ADR-0009 §1).
+    #[test]
+    fn a_signature_is_refused() {
+        let e = module_errors(
+            "dbo.f(int,nvarchar(10))",
+            &a_module(ModuleKind::Function, "() RETURNS int AS BEGIN RETURN 1 END"),
+        );
+        assert!(e.contains("argument list `(int,nvarchar(10))`"), "{e}");
+        assert!(e.contains("by name alone"), "{e}");
     }
 
     #[test]

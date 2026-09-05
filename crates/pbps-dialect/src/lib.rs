@@ -37,10 +37,11 @@
 //! drawn in the wrong place.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ObjectName, RiskClass, Role, Schema, Strategy, Table,
-    TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
+    Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -417,8 +418,47 @@ pub trait Dialect {
     /// The default is "no objection", which is the honest answer from a dialect
     /// that does not implement modules: `validate` says what it checked, and
     /// this one checked nothing.
-    fn validate_module(&self, _name: &ObjectName, _module: &Module) -> Vec<DialectError> {
+    fn validate_module(&self, _id: &ModuleId, _module: &Module) -> Vec<DialectError> {
         Vec::new()
+    }
+
+    /// Whether this engine keeps modules of `kind` in the same namespace as
+    /// tables, so that a table and a module may not share a name.
+    ///
+    /// Measured on PostgreSQL 18 (ADR-0009 §1): `CREATE VIEW app.customer`
+    /// over a table `app.customer` fails, and `CREATE FUNCTION app.customer(int)`
+    /// succeeds — views live in `pg_class` with tables, routines live in
+    /// `pg_proc`. On SQL Server every kind shares `sys.objects`, which is what
+    /// the default says.
+    fn shares_namespace_with_tables(&self, _kind: ModuleKind) -> bool {
+        true
+    }
+
+    /// Whether this engine lets modules of `kind` overload — several objects
+    /// of one name, told apart by their argument types.
+    ///
+    /// The default is "no", which is SQL Server's answer for every kind: a
+    /// declared signature there names an object the engine cannot have, so
+    /// `check_module_names` refuses it rather than emitting a `DROP` the
+    /// engine would not parse.
+    fn overloads(&self, _kind: ModuleKind) -> bool {
+        false
+    }
+
+    /// This type as the engine spells it *for routine identity*.
+    ///
+    /// Deliberately not [`Dialect::normalize_type`]. Measured on PostgreSQL 18
+    /// (ADR-0009 §1), `f(varchar(10))` and `f(varchar(20))` are one function,
+    /// identified as `f(character varying)`: the engine discards type
+    /// modifiers when it identifies a routine, and keeps them when it types a
+    /// column. Reusing the column normalizer would key one engine object as
+    /// two modules, and every `DROP` and `GRANT` the plan emitted would name a
+    /// signature the engine resolves to something else.
+    ///
+    /// The default defers to the column spelling, which is right for any
+    /// dialect where nothing overloads: nothing calls it there.
+    fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+        self.normalize_type(ty)
     }
 
     /// Checks whether this dialect can express the role and its grants
@@ -513,6 +553,85 @@ pub trait Dialect {
 /// This lives here rather than in the CLI because "what a runnable script looks
 /// like" is dialect knowledge — but only the separator differs per dialect, so
 /// the walk itself is shared.
+/// The whole-schema module rules that only the engine can answer.
+///
+/// The dialect-free half lives in `pbps_model::module::check_names`. These two
+/// are here because their answer differs by engine (ADR-0009 §1,
+/// DECISIONS 201):
+///
+/// - a module competing for its name with a table, or with another module,
+///   which is a rule about one namespace and holds for views everywhere and
+///   for routines only on SQL Server;
+/// - a declared signature on an engine where that kind does not overload,
+///   which names an object that engine cannot have.
+///
+/// Both would otherwise surface as an engine error at apply time, on a
+/// database that is already half-changed.
+///
+/// The module-against-module half exists because this crate's callers stopped
+/// getting it for free (DECISIONS 204). `Schema::modules` was keyed by
+/// `ObjectName`, so two
+/// modules with one name could not both be in the map; keyed by `ModuleId`
+/// they can — a trigger is distinguished by its table and a routine by its
+/// signature — and on an engine that keeps them in one namespace per schema
+/// that is a pair of objects it cannot have. Removing the reason for a
+/// guarantee is not the same as replacing it.
+pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let mut problems = Vec::new();
+    // Only the kinds the engine keeps beside tables: the rest have namespaces
+    // of their own, where `ModuleId` is already the whole identity.
+    let mut shared: BTreeMap<ObjectName, &ModuleId> = BTreeMap::new();
+    for (id, module) in &schema.modules {
+        if dialect.shares_namespace_with_tables(module.kind) {
+            let name = id.object_name();
+            if let Some(first) = shared.insert(name.clone(), id)
+                && first != id
+            {
+                problems.push(format!(
+                    "`{first}` and `{id}` are both declared as `{name}`; {} keeps them in one \
+                     namespace per schema, so it can hold only one of them",
+                    dialect.name()
+                ));
+            }
+            if schema.tables.contains_key(&name) {
+                problems.push(format!(
+                    "`{name}` is declared both as a table and as a {}; {} keeps tables and {}s \
+                     in one namespace per schema",
+                    module.kind,
+                    dialect.name(),
+                    module.kind
+                ));
+            }
+        }
+        match id {
+            ModuleId::Routine(_) if !dialect.overloads(module.kind) => {
+                problems.push(format!(
+                    "`{id}` is declared with an argument list, but {} does not overload a {}: \
+                     name it `{}` instead",
+                    dialect.name(),
+                    module.kind,
+                    id.object_name()
+                ));
+            }
+            // The mirror image. Where the kind overloads, the engine identifies
+            // every routine by its argument types — the one taking none as
+            // `app.f()` — so a bare name is a key the engine never reads back
+            // under, and connected planning would see the same routine as a
+            // drop and a create.
+            ModuleId::Named(_) if dialect.overloads(module.kind) => {
+                problems.push(format!(
+                    "`{id}` is declared without an argument list, but {} identifies a {} by its \
+                     argument types: name it `{id}()` if it takes none, or list the types",
+                    dialect.name(),
+                    module.kind
+                ));
+            }
+            ModuleId::Routine(_) | ModuleId::Named(_) | ModuleId::Trigger { .. } => {}
+        }
+    }
+    problems
+}
+
 pub fn render_script(statements: &[Statement], separator: Option<&str>) -> String {
     let mut out = String::new();
     let mut previous_own_batch = false;
@@ -741,6 +860,206 @@ mod tests {
             })],
         };
         assert!(MinimalDialect.preflight(&changes).is_empty());
+    }
+
+    // ---- module identity (ADR-0009 §1) ----
+
+    /// An engine that overloads its routines and keeps them out of the table
+    /// namespace: PostgreSQL's answers, as measured in ADR-0009 §1, with the
+    /// modifier-discarding normalization that goes with them.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct OverloadingDialect;
+
+    impl Dialect for OverloadingDialect {
+        fn name(&self) -> &'static str {
+            "overloading"
+        }
+        fn transaction_framing(&self) -> TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+        fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+            Ok(ty.clone())
+        }
+        fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str> {
+            Cow::Borrowed(ident)
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
+            Ok(ident.to_owned())
+        }
+        fn validate_table(&self, _n: &TableName, _t: &Table) -> Vec<DialectError> {
+            Vec::new()
+        }
+        fn emit(&self, _c: &Change, _s: Strategy) -> Result<Vec<Statement>, DialectError> {
+            Ok(Vec::new())
+        }
+        fn shares_namespace_with_tables(&self, kind: ModuleKind) -> bool {
+            matches!(kind, ModuleKind::View)
+        }
+        fn overloads(&self, kind: ModuleKind) -> bool {
+            matches!(kind, ModuleKind::Function | ModuleKind::Procedure)
+        }
+        /// The modifiers a column keeps: `varchar(10)` and `varchar(20)` are
+        /// one function to this engine, and `f(character varying)` is what it
+        /// calls both.
+        fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+            Ok(ColumnType::simple(&ty.base))
+        }
+    }
+
+    fn module(kind: ModuleKind) -> Module {
+        Module {
+            kind,
+            description: None,
+            definition: "AS SELECT 1".to_owned(),
+        }
+    }
+
+    fn schema_with(entries: &[(&str, ModuleKind)], tables: &[&str]) -> Schema {
+        let mut schema = Schema::default();
+        for t in tables {
+            schema.tables.insert(t.parse().unwrap(), Table::default());
+        }
+        for (id, kind) in entries {
+            schema.modules.insert(id.parse().unwrap(), module(*kind));
+        }
+        schema
+    }
+
+    /// Whether a module competes with a table for its name is the engine's
+    /// answer: SQL Server keeps every kind in `sys.objects`, PostgreSQL keeps
+    /// views in `pg_class` with tables and routines in `pg_proc`.
+    #[test]
+    fn a_name_a_table_holds_is_refused_only_where_the_kind_shares_its_namespace() {
+        let clash = schema_with(&[("app.customer", ModuleKind::View)], &["app.customer"]);
+        assert!(
+            check_module_names(&clash, &MinimalDialect)[0].contains("one namespace"),
+            "{:?}",
+            check_module_names(&clash, &MinimalDialect)
+        );
+        assert!(
+            check_module_names(&clash, &OverloadingDialect)[0].contains("one namespace"),
+            "a view shares the table namespace on both"
+        );
+
+        // A routine of that name does not, where routines have their own.
+        let routine = schema_with(
+            &[("app.customer(integer)", ModuleKind::Function)],
+            &["app.customer"],
+        );
+        assert!(
+            check_module_names(&routine, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_module_names(&routine, &OverloadingDialect)
+        );
+    }
+
+    /// Two modules can now hold one name — `ModuleId` distinguishes a trigger
+    /// by its table and a routine by its signature — and on an engine that
+    /// keeps them all in one namespace per schema, that is a pair of objects
+    /// the engine cannot both have. The `ObjectName` key used to make this
+    /// unrepresentable; nothing does now, so the check has to.
+    #[test]
+    fn two_modules_with_one_name_are_refused_where_they_share_a_namespace() {
+        let two_triggers = schema_with(
+            &[
+                ("app.orders.audit", ModuleKind::Trigger),
+                ("app.customers.audit", ModuleKind::Trigger),
+            ],
+            &[],
+        );
+        let problems = check_module_names(&two_triggers, &MinimalDialect);
+        assert!(
+            problems[0].contains("one namespace"),
+            "an engine with one namespace accepted two `app.audit`: {problems:?}"
+        );
+        // Both identities are named, because "one of these is wrong" is not a
+        // finding anyone can act on.
+        assert!(problems[0].contains("app.orders.audit"), "{problems:?}");
+        assert!(problems[0].contains("app.customers.audit"), "{problems:?}");
+
+        // A trigger and a view competing for the same name is the same fault.
+        let mixed = schema_with(
+            &[
+                ("app.orders.audit", ModuleKind::Trigger),
+                ("app.audit", ModuleKind::View),
+            ],
+            &[],
+        );
+        assert!(
+            check_module_names(&mixed, &MinimalDialect)[0].contains("one namespace"),
+            "{:?}",
+            check_module_names(&mixed, &MinimalDialect)
+        );
+
+        // Where the kinds have namespaces of their own, both pairs are two
+        // real objects and neither is a finding: a trigger belongs to its
+        // table, and a view is not in the trigger namespace at all.
+        assert!(
+            check_module_names(&two_triggers, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_module_names(&two_triggers, &OverloadingDialect)
+        );
+        assert!(
+            check_module_names(&mixed, &OverloadingDialect).is_empty(),
+            "{:?}",
+            check_module_names(&mixed, &OverloadingDialect)
+        );
+    }
+
+    /// A signature on an engine where the kind does not overload names an
+    /// object that engine cannot have, and the message says what to write
+    /// instead.
+    /// Where the kind overloads, the engine identifies every routine by its
+    /// argument types — the one taking none as `app.f()` — so a bare name is
+    /// a key the read-back never carries, and the same routine would plan as
+    /// a drop and a create. A view is named, on either engine.
+    #[test]
+    fn a_bare_name_is_refused_where_the_kind_overloads() {
+        let bare = schema_with(&[("app.f", ModuleKind::Function)], &[]);
+        let problems = check_module_names(&bare, &OverloadingDialect);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`app.f()`"), "{problems:?}");
+        assert!(check_module_names(&bare, &MinimalDialect).is_empty());
+
+        let spelled = schema_with(&[("app.f()", ModuleKind::Function)], &[]);
+        assert!(check_module_names(&spelled, &OverloadingDialect).is_empty());
+        let view = schema_with(&[("app.v", ModuleKind::View)], &[]);
+        assert!(check_module_names(&view, &OverloadingDialect).is_empty());
+    }
+
+    #[test]
+    fn a_signature_is_refused_where_the_kind_does_not_overload() {
+        let signed = schema_with(&[("app.f(integer)", ModuleKind::Function)], &[]);
+        let problems = check_module_names(&signed, &MinimalDialect);
+        assert!(problems[0].contains("does not overload"), "{problems:?}");
+        assert!(problems[0].contains("`app.f`"), "{problems:?}");
+        assert!(check_module_names(&signed, &OverloadingDialect).is_empty());
+
+        // And a view is not a thing that overloads anywhere.
+        let signed_view = schema_with(&[("app.v(integer)", ModuleKind::View)], &[]);
+        assert!(
+            check_module_names(&signed_view, &OverloadingDialect)[0].contains("does not overload"),
+            "{:?}",
+            check_module_names(&signed_view, &OverloadingDialect)
+        );
+    }
+
+    /// Routine identity is not column identity: the modifiers `normalize_type`
+    /// keeps are the ones the engine discards when it identifies a routine
+    /// (ADR-0009 §1, measured). The default defers to the column spelling,
+    /// which is only ever right where nothing overloads.
+    #[test]
+    fn routine_argument_normalization_is_not_column_normalization() {
+        let ty: ColumnType = "varchar(10)".parse().unwrap();
+        assert_eq!(
+            OverloadingDialect.normalize_routine_arg(&ty).unwrap(),
+            ColumnType::simple("varchar")
+        );
+        assert_eq!(OverloadingDialect.normalize_type(&ty).unwrap(), ty);
+        assert_eq!(MinimalDialect.normalize_routine_arg(&ty).unwrap(), ty);
     }
 }
 

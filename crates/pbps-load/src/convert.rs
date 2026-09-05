@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity, Index,
-    IndexColumn, Intent, Module, ModuleKind, ObjectName, Permission, PrimaryKey, Role, Row, RowKey,
+    IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey, Role, Row, RowKey,
     Strategy, Table, TableData, TableName, UniqueConstraint, Value,
 };
 
@@ -30,11 +30,11 @@ pub struct LoadedTable {
 /// The result of loading one module declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedModule {
-    pub name: ObjectName,
+    pub id: ModuleId,
     pub module: Module,
     /// Kept out of `module` so that `Schema` equality stays a question about
     /// the database alone: creation order is invisible there (ADR-0002).
-    pub depends_on: std::collections::BTreeSet<ObjectName>,
+    pub depends_on: std::collections::BTreeSet<ModuleId>,
 }
 
 /// The result of loading one role declaration (ADR-0005).
@@ -518,11 +518,16 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         }
     };
 
-    let name: Option<ObjectName> = match parse_at(src, name_value, "invalid object name") {
+    // The declared name, by shape alone: `app.v`, `app.f(int, text)` or, for a
+    // trigger, the two-part name that goes with an `on:`. Which shapes this
+    // engine allows for this kind is the dialect's answer, checked once the
+    // whole schema is loaded (`pbps_dialect::check_module_names`).
+    let declared: Option<ModuleId> = match parse_at(src, name_value, "invalid object name") {
         Ok(n) => Some(n),
         Err(e) => {
             errs.push(e.with_help(
-                "an object name must have the two parts `schema.object`, e.g. `dbo.active_customer`",
+                "an object name has the two parts `schema.object`, e.g. `dbo.active_customer`; a \
+                 function or procedure may carry its argument types, e.g. `app.f(int, text)`",
             ));
             None
         }
@@ -535,10 +540,81 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
             Err(e) => errs.push(e),
         }
     }
+    if on.is_some() && kind != ModuleKind::Trigger {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&name_value.defined),
+            format!("a {kind} cannot be `on:` a table; only a trigger names one"),
+            "remove the `on:` line",
+        ));
+    }
+
+    // A trigger's identity is its table plus its own name (ADR-0009 §1,
+    // measured: `DROP TRIGGER audit` is a syntax error on PostgreSQL). The
+    // file keeps its two lines — `trigger: app.audit` and `on: app.orders` —
+    // and they fold into one id here.
+    let id: Option<ModuleId> = match (kind, declared, &on) {
+        (ModuleKind::Trigger, Some(ModuleId::Named(name)), Some(table)) => {
+            // The trigger's schema is not its own: SQL Server puts it in its
+            // table's, and PostgreSQL gives it none. Two spellings that
+            // disagree are a declaration whose halves mean different things,
+            // and dropping one silently is how a trigger ends up managed on a
+            // table nobody named.
+            if name.schema != table.schema {
+                errs.push(LoadError::semantic(
+                    src,
+                    to_span(&name_value.defined),
+                    format!(
+                        "trigger `{name}` is on `{table}`, which is in schema `{}`; a trigger \
+                         lives in the schema of the table it is on",
+                        table.schema
+                    ),
+                    format!("name it `{}.{}`", table.schema, name.name),
+                ));
+                None
+            } else {
+                Some(ModuleId::Trigger {
+                    on: table.clone(),
+                    name: name.name,
+                })
+            }
+        }
+        (ModuleKind::Trigger, Some(_), None) => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&name_value.defined),
+                format!(
+                    "trigger `{}` does not say which table it is on",
+                    name_value.value
+                ),
+                "add `on: schema.table`",
+            ));
+            None
+        }
+        (ModuleKind::Trigger, Some(other), Some(_)) => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&name_value.defined),
+                format!("`{other}` is not a trigger name"),
+                "a trigger is named `schema.trigger`, with its table in `on:`",
+            ));
+            None
+        }
+        (_, Some(ModuleId::Trigger { .. }), _) => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&name_value.defined),
+                format!("a {kind} name has the two parts `schema.object`"),
+                "only a trigger is named for the table it is on",
+            ));
+            None
+        }
+        (_, declared, _) => declared,
+    };
 
     let mut depends_on = std::collections::BTreeSet::new();
     for v in &dto.depends_on {
-        match parse_at::<ObjectName>(src, v, "invalid object name in `depends_on`") {
+        match parse_at::<ModuleId>(src, v, "invalid object name in `depends_on`") {
             Ok(n) => {
                 depends_on.insert(n);
             }
@@ -546,13 +622,12 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         }
     }
 
-    match (name, errs.is_empty()) {
-        (Some(name), true) => Ok(LoadedModule {
-            name,
+    match (id, errs.is_empty()) {
+        (Some(id), true) => Ok(LoadedModule {
+            id,
             module: Module {
                 kind,
                 description: dto.description,
-                on,
                 definition: dto.definition,
             },
             depends_on,

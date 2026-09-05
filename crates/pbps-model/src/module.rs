@@ -32,8 +32,11 @@
 //! parameter syntax would be parsing SQL — which this tool does not do (§8.2).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::str::FromStr;
 
 use crate::name::TableName;
+use crate::types::ColumnType;
 
 /// The qualified name of a database object: `schema.object`.
 ///
@@ -42,6 +45,281 @@ use crate::name::TableName;
 /// named after a table" is not a rule to remember but a consequence of the two
 /// names having one type. [`check_names`] is that consequence made checkable.
 pub type ObjectName = TableName;
+
+/// The identity of a routine: its qualified name **and** its argument types.
+///
+/// The types are normalized for *routine identity*, which is not column
+/// normalization: PostgreSQL discards type modifiers when it identifies a
+/// routine, so `f(varchar(10))` and `f(varchar(20))` are one function
+/// (ADR-0009 §1, measured). `Dialect::normalize_routine_arg` is the hook that
+/// does it; the model only holds the result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutineId {
+    pub name: ObjectName,
+    /// Empty for a routine declared `f()`. A routine that takes no arguments
+    /// is still a routine — the parentheses in the declared name are what
+    /// separate it from a view, not the presence of an argument.
+    pub args: Vec<ColumnType>,
+}
+
+impl RoutineId {
+    pub fn new(name: ObjectName, args: Vec<ColumnType>) -> Self {
+        Self { name, args }
+    }
+}
+
+impl fmt::Display for RoutineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.name)?;
+        for (i, a) in self.args.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{a}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// What identifies one module, which depends on its kind (ADR-0009 §1,
+/// DECISIONS 200).
+///
+/// | Kind | Identified by | Because |
+/// |---|---|---|
+/// | view | `schema.name` | one `pg_class` namespace with tables |
+/// | function, procedure | `schema.name` + argument types | they overload |
+/// | trigger | its table + name | `DROP TRIGGER audit` is a syntax error |
+///
+/// # Why this is the map key and not a field of [`Module`]
+///
+/// Inviolable constraint 2 — containers hold names, elements do not. A
+/// signature is part of the name, and so is the table a trigger is on: two
+/// triggers called `audit` on two tables are two objects, and under a
+/// name-only key they were one. A key/field pair that has to agree is the
+/// class of bug that cannot detect itself.
+///
+/// # Why not a string
+///
+/// `app.f(int, text)` and `app.f(integer,text)` are one object. Inviolable
+/// constraint 1 says two semantically identical schemas must be `==`; a string
+/// key makes them unequal, a key holding normalized types makes them equal.
+///
+/// The string form — the JSON map key, and what a message shows — is
+/// `app.v`, `app.f(integer,text)` and `app.orders.audit`. Each shape is
+/// unambiguous: parentheses mean a routine, three dotted parts mean a trigger.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModuleId {
+    /// A view: one name, one namespace with tables.
+    Named(ObjectName),
+    /// A function or procedure, identified by name and signature.
+    Routine(RoutineId),
+    /// A trigger: its table, and its own name within that table.
+    ///
+    /// The trigger's own schema is not held separately because it is not its
+    /// own: SQL Server puts a trigger in the schema of the table it is on, and
+    /// PostgreSQL gives it no schema at all. `on.schema` is that schema, and
+    /// the loader refuses a declaration whose two spellings disagree.
+    Trigger { on: ObjectName, name: String },
+}
+
+impl ModuleId {
+    /// The schema this module lives in.
+    pub fn schema(&self) -> &str {
+        match self {
+            ModuleId::Named(n) => &n.schema,
+            ModuleId::Routine(r) => &r.name.schema,
+            ModuleId::Trigger { on, .. } => &on.schema,
+        }
+    }
+
+    /// The object's own name, unqualified.
+    pub fn name(&self) -> &str {
+        match self {
+            ModuleId::Named(n) => &n.name,
+            ModuleId::Routine(r) => &r.name.name,
+            ModuleId::Trigger { name, .. } => name,
+        }
+    }
+
+    /// The qualified name, for the one namespace where a module competes with
+    /// a table for its spelling.
+    ///
+    /// A trigger has one on SQL Server, where it is an object in
+    /// `sys.objects`; whether that namespace is shared with tables is the
+    /// dialect's answer (`shares_namespace_with_tables`), not this type's.
+    pub fn object_name(&self) -> ObjectName {
+        match self {
+            ModuleId::Named(n) => n.clone(),
+            ModuleId::Routine(r) => r.name.clone(),
+            ModuleId::Trigger { on, name } => ObjectName::new(on.schema.clone(), name.clone()),
+        }
+    }
+
+    /// The name another module's definition would use to reference this one,
+    /// where such a reference is possible at all.
+    ///
+    /// `None` for a trigger: nothing names a trigger in its body, and the one
+    /// ordering edge a trigger has is [`ModuleId::attached_to`].
+    pub fn referenced_name(&self) -> Option<ObjectName> {
+        match self {
+            ModuleId::Named(n) => Some(n.clone()),
+            ModuleId::Routine(r) => Some(r.name.clone()),
+            ModuleId::Trigger { .. } => None,
+        }
+    }
+
+    /// The table or view a trigger is on; `None` for every other kind.
+    pub fn attached_to(&self) -> Option<&ObjectName> {
+        match self {
+            ModuleId::Trigger { on, .. } => Some(on),
+            ModuleId::Named(_) | ModuleId::Routine(_) => None,
+        }
+    }
+
+    /// The declared argument types, where the kind has them.
+    pub fn args(&self) -> Option<&[ColumnType]> {
+        match self {
+            ModuleId::Routine(r) => Some(&r.args),
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ModuleIdError {
+    #[error(
+        "a module id is `schema.view`, `schema.function(argument types)` or \
+         `schema.table.trigger`, got `{0}`"
+    )]
+    Shape(String),
+
+    #[error("`{0}` contains an empty identifier")]
+    EmptySegment(String),
+
+    #[error("`{argument}` in `{whole}` is not a type: {source}")]
+    Argument {
+        whole: String,
+        argument: String,
+        #[source]
+        source: crate::types::TypeParseError,
+    },
+}
+
+impl fmt::Display for ModuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModuleId::Named(n) => n.fmt(f),
+            ModuleId::Routine(r) => r.fmt(f),
+            ModuleId::Trigger { on, name } => write!(f, "{on}.{name}"),
+        }
+    }
+}
+
+/// Splits an argument list at the commas that separate arguments, and not at
+/// the ones inside a type's own modifier.
+///
+/// The two are the same character: `decimal(10,2)` is one argument with a
+/// comma in it, and `integer,text` is two without. Only nesting depth tells
+/// them apart, so a plain `split(',')` turned `app.f(decimal(10,2))` into
+/// `decimal(10` and `2)` — a valid declaration that would not parse back out
+/// of the JSON map key its own `Display` had written (PITFALLS: a round trip
+/// tested only on the simple case).
+///
+/// `None` if the parentheses do not balance, which the caller reports as a
+/// malformed identity rather than guessing where the argument ended.
+fn split_top_level(args: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                parts.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    parts.push(&args[start..]);
+    Some(parts)
+}
+
+impl FromStr for ModuleId {
+    type Err = ModuleIdError;
+
+    /// Shape decides the variant, and only shape: parentheses mean a routine
+    /// (`app.f()` is one that takes nothing), three dotted parts mean a
+    /// trigger. Nothing here knows which kinds a dialect lets overload — that
+    /// is `Dialect::overloads`, checked where the dialect is present.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(open) = s.find('(') {
+            let Some(args) = s.strip_suffix(')').map(|t| &t[open + 1..]) else {
+                return Err(ModuleIdError::Shape(s.to_owned()));
+            };
+            let name: ObjectName = s[..open]
+                .parse()
+                .map_err(|_| ModuleIdError::Shape(s.to_owned()))?;
+            let mut types = Vec::new();
+            if !args.trim().is_empty() {
+                for arg in
+                    split_top_level(args).ok_or_else(|| ModuleIdError::Shape(s.to_owned()))?
+                {
+                    types.push(arg.parse().map_err(|e| ModuleIdError::Argument {
+                        whole: s.to_owned(),
+                        argument: arg.trim().to_owned(),
+                        source: e,
+                    })?);
+                }
+            }
+            return Ok(ModuleId::Routine(RoutineId::new(name, types)));
+        }
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            return Err(ModuleIdError::EmptySegment(s.to_owned()));
+        }
+        match parts.as_slice() {
+            [schema, name] => Ok(ModuleId::Named(ObjectName::new(*schema, *name))),
+            [schema, table, name] => Ok(ModuleId::Trigger {
+                on: ObjectName::new(*schema, *table),
+                name: (*name).to_owned(),
+            }),
+            _ => Err(ModuleIdError::Shape(s.to_owned())),
+        }
+    }
+}
+
+impl TryFrom<String> for ModuleId {
+    type Error = ModuleIdError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<ModuleId> for String {
+    fn from(id: ModuleId) -> String {
+        id.to_string()
+    }
+}
+
+// The map key of `Schema::modules` and of `ModuleDeps`, so it crosses JSON as a
+// string like every other name in this model.
+impl serde::Serialize for ModuleId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ModuleId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -83,7 +361,12 @@ impl std::fmt::Display for ModuleKind {
 /// One view, procedure, function or trigger.
 ///
 /// As everywhere else in the model, the container holds the name: a module's
-/// name is the key in [`crate::Schema::modules`].
+/// identity is the key in [`crate::Schema::modules`], a [`ModuleId`].
+///
+/// That is where the table a trigger is on lives, and where a routine's
+/// argument types live. Both were fields once; both are part of what the
+/// object *is* (ADR-0009 §1), and a field beside a key that has to agree with
+/// it is the bug that cannot detect itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Module {
@@ -91,14 +374,6 @@ pub struct Module {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-
-    /// The table a trigger is attached to. `None` for every other kind.
-    ///
-    /// It is part of the state and not an annotation: moving a trigger to
-    /// another table is a different object, and the engine cannot `ALTER` it
-    /// across.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on: Option<ObjectName>,
 
     /// The body, kept verbatim and **never parsed**.
     ///
@@ -110,6 +385,10 @@ pub struct Module {
 
 /// Explicit creation-order edges, `module -> the modules it needs first`.
 ///
+/// Keyed by [`ModuleId`] on **both** sides: under a name-only key one entry
+/// for `app.f` was shared by `app.f(integer)` and `app.f(text)`, which are two
+/// objects with two different bodies and two different orders.
+///
 /// # Why this is not a field of [`Module`]
 ///
 /// Order of creation is invisible in the database, so a `depends_on:` inside
@@ -117,7 +396,7 @@ pub struct Module {
 /// module read back from the catalog — inviolable constraint 1, and drift
 /// crying wolf on every run. It travels beside the model the way `strategy:`
 /// does, and for the same reason: it says how to get there, not where to go.
-pub type ModuleDeps = BTreeMap<ObjectName, BTreeSet<ObjectName>>;
+pub type ModuleDeps = BTreeMap<ModuleId, BTreeSet<ModuleId>>;
 
 /// The annotations that travel beside the model.
 ///
@@ -381,28 +660,31 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 /// members of one are emitted in name order, which is deterministic, and the
 /// engine has the last word inside the plan's transaction. (A genuine cycle
 /// between views is not creatable by any order.)
-pub fn creation_order(
-    modules: &BTreeMap<ObjectName, Module>,
-    deps: &ModuleDeps,
-) -> Vec<ObjectName> {
-    let names: Vec<ObjectName> = modules.keys().cloned().collect();
+pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
+    let names: Vec<ModuleId> = modules.keys().cloned().collect();
 
     // needs[a] = the modules `a` must follow.
-    let mut needs: BTreeMap<&ObjectName, BTreeSet<&ObjectName>> = BTreeMap::new();
+    let mut needs: BTreeMap<&ModuleId, BTreeSet<&ModuleId>> = BTreeMap::new();
     for name in &names {
         let module = &modules[name];
-        let mut set: BTreeSet<&ObjectName> = BTreeSet::new();
+        let mut set: BTreeSet<&ModuleId> = BTreeSet::new();
         for other in &names {
             if other == name {
                 continue;
             }
             let declared = deps.get(name).is_some_and(|d| d.contains(other));
             // A trigger's target is not named in its definition — the emitter
-            // writes it into the `ON` clause — so the `on:` has to be read
-            // directly. It matters only when the target is itself a module: a
-            // trigger on a view has to be created after that view.
-            let attached = module.on.as_ref().is_some_and(|t| t == other);
-            if declared || attached || references(&module.definition, other) {
+            // writes it into the `ON` clause — so the identity's own table has
+            // to be read directly. It matters only when the target is itself a
+            // module: a trigger on a view has to be created after that view.
+            let attached = name
+                .attached_to()
+                .is_some_and(|t| other.referenced_name().as_ref() == Some(t));
+            // A trigger is named by nothing, so nothing can reference it.
+            let referenced = other
+                .referenced_name()
+                .is_some_and(|n| references(&module.definition, &n));
+            if declared || attached || referenced {
                 set.insert(other);
             }
         }
@@ -411,12 +693,12 @@ pub fn creation_order(
         needs.insert(name, set);
     }
 
-    let mut done: BTreeSet<&ObjectName> = BTreeSet::new();
-    let mut out: Vec<ObjectName> = Vec::new();
+    let mut done: BTreeSet<&ModuleId> = BTreeSet::new();
+    let mut out: Vec<ModuleId> = Vec::new();
     // Kahn's algorithm, taking the name-least ready module each round so that
     // two runs over the same declarations produce the same plan.
     loop {
-        let ready: Vec<&ObjectName> = names
+        let ready: Vec<&ModuleId> = names
             .iter()
             .filter(|n| !done.contains(n))
             .filter(|n| needs[*n].iter().all(|d| done.contains(d)))
@@ -439,54 +721,51 @@ pub fn creation_order(
     out
 }
 
-/// Problems that need the whole schema to see.
+/// Problems that need the whole schema to see, and no dialect.
 ///
-/// Both of these would otherwise surface only at apply time, as an engine error
-/// on a database that is half-changed:
+/// Each would otherwise surface only at apply time, as an engine error on a
+/// database that is half-changed:
 ///
-/// - a module named after a table (or after another module): SQL Server keeps
-///   them in one namespace, so the `CREATE` fails;
-/// - a trigger on a table nobody declares: the tool would be managing a trigger
-///   on an object it does not manage, and a `pull` of that environment would
-///   not reproduce it.
+/// - a module whose kind and whose identity disagree: a trigger that does not
+///   say which table it is on, or a view under a trigger's identity;
+/// - a trigger on a table nobody declares: the tool would be managing a
+///   trigger on an object it does not manage, and a `pull` of that environment
+///   would not reproduce it.
+///
+/// Two rules that were here are not, because they are the engine's and not the
+/// model's: whether a module competes with a table for its name, and which
+/// kinds overload. Both moved to `pbps_dialect::check_module_names`, where the
+/// dialect can answer them (ADR-0009 §1: views share `pg_class` with tables and
+/// routines do not).
 pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
     let mut problems = Vec::new();
-    for (name, module) in &schema.modules {
-        if schema.tables.contains_key(name) {
-            problems.push(format!(
-                "`{name}` is declared both as a table and as a {}; SQL Server keeps tables and \
-                 modules in one namespace per schema",
-                module.kind
-            ));
-        }
-        match (module.kind, &module.on) {
-            (ModuleKind::Trigger, None) => problems.push(format!(
-                "trigger `{name}` does not say which table it is on (`on:`)"
-            )),
-            // A view is as valid a target as a table: SQL Server supports
-            // `INSTEAD OF` triggers on views, and `pull` reconstructs the `on:`
-            // from what it finds — so refusing one here would make a database
-            // that has one impossible to round-trip.
-            (ModuleKind::Trigger, Some(target))
-                if !schema.tables.contains_key(target)
-                    && !matches!(
-                        schema.modules.get(target).map(|m| m.kind),
-                        Some(ModuleKind::View)
-                    ) =>
-            {
-                problems.push(format!(
-                    "trigger `{name}` is on `{target}`, which is not declared here as a table or \
-                     a view"
-                ));
+    for (id, module) in &schema.modules {
+        match (module.kind, id) {
+            (ModuleKind::Trigger, ModuleId::Trigger { on, .. }) => {
+                // A view is as valid a target as a table: SQL Server supports
+                // `INSTEAD OF` triggers on views, and `pull` reconstructs the
+                // target from what it finds — so refusing one here would make
+                // a database that has one impossible to round-trip.
+                let on_a_view = schema.modules.iter().any(|(other, m)| {
+                    m.kind == ModuleKind::View && other.referenced_name().as_ref() == Some(on)
+                });
+                if !schema.tables.contains_key(on) && !on_a_view {
+                    problems.push(format!(
+                        "trigger `{id}` is on `{on}`, which is not declared here as a table or a \
+                         view"
+                    ));
+                }
             }
-            (ModuleKind::Trigger, Some(_)) => {}
-            (kind, Some(table)) => problems.push(format!(
-                "`{name}` is a {kind} and cannot be `on: {table}`; only a trigger names a table"
+            (ModuleKind::Trigger, _) => problems.push(format!(
+                "trigger `{id}` does not say which table it is on (`on:`)"
             )),
-            (_, None) => {}
+            (kind, ModuleId::Trigger { on, .. }) => problems.push(format!(
+                "`{id}` is a {kind} and cannot be `on: {on}`; only a trigger names a table"
+            )),
+            (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
         }
         if module.definition.trim().is_empty() {
-            problems.push(format!("`{name}` has an empty definition"));
+            problems.push(format!("`{id}` has an empty definition"));
         }
     }
     problems
@@ -526,11 +805,15 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A module identity, by the same shape rules the file uses.
+    fn id(s: &str) -> ModuleId {
+        s.parse().unwrap()
+    }
+
     fn module(kind: ModuleKind, definition: &str) -> Module {
         Module {
             kind,
             description: None,
-            on: None,
             definition: definition.to_owned(),
         }
     }
@@ -575,10 +858,10 @@ mod tests {
         assert!(!references("SELECT 1", &n("dbo.active_customer")));
     }
 
-    fn modules(specs: &[(&str, &str)]) -> BTreeMap<ObjectName, Module> {
+    fn modules(specs: &[(&str, &str)]) -> BTreeMap<ModuleId, Module> {
         specs
             .iter()
-            .map(|(name, def)| (n(name), view(def)))
+            .map(|(name, def)| (id(name), view(def)))
             .collect()
     }
 
@@ -592,7 +875,7 @@ mod tests {
         ]);
         assert_eq!(
             creation_order(&m, &ModuleDeps::default()),
-            vec![n("dbo.base"), n("dbo.middle"), n("dbo.top")]
+            vec![id("dbo.base"), id("dbo.middle"), id("dbo.top")]
         );
     }
 
@@ -602,8 +885,8 @@ mod tests {
     fn an_explicit_dependency_orders_what_the_scan_cannot_see() {
         let m = modules(&[("dbo.a", "SELECT 1"), ("dbo.b", "SELECT 2")]);
         let mut deps = ModuleDeps::default();
-        deps.insert(n("dbo.a"), BTreeSet::from([n("dbo.b")]));
-        assert_eq!(creation_order(&m, &deps), vec![n("dbo.b"), n("dbo.a")]);
+        deps.insert(id("dbo.a"), BTreeSet::from([id("dbo.b")]));
+        assert_eq!(creation_order(&m, &deps), vec![id("dbo.b"), id("dbo.a")]);
     }
 
     /// Unrelated modules must come out in one fixed order, or two runs over the
@@ -616,7 +899,7 @@ mod tests {
             ("dbo.m", "SELECT 3"),
         ]);
         let first = creation_order(&m, &ModuleDeps::default());
-        assert_eq!(first, vec![n("dbo.a"), n("dbo.m"), n("dbo.z")]);
+        assert_eq!(first, vec![id("dbo.a"), id("dbo.m"), id("dbo.z")]);
         for _ in 0..5 {
             assert_eq!(creation_order(&m, &ModuleDeps::default()), first);
         }
@@ -632,32 +915,56 @@ mod tests {
         ]);
         let order = creation_order(&m, &ModuleDeps::default());
         assert_eq!(order.len(), 2);
-        assert!(order.contains(&n("dbo.a")) && order.contains(&n("dbo.b")));
+        assert!(order.contains(&id("dbo.a")) && order.contains(&id("dbo.b")));
     }
 
-    #[test]
-    fn a_module_named_after_a_table_is_reported() {
-        let mut schema = Schema::default();
-        schema.tables.insert(n("dbo.customer"), Table::default());
-        schema.modules.insert(n("dbo.customer"), view("SELECT 1"));
-        let problems = check_names(&schema);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("one namespace"), "{problems:?}");
+    fn trigger_id(on: &str, name: &str) -> ModuleId {
+        ModuleId::Trigger {
+            on: n(on),
+            name: name.to_owned(),
+        }
     }
 
     #[test]
     fn a_trigger_must_name_a_declared_table() {
         let mut schema = Schema::default();
-        let mut trigger = module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1");
-        schema.modules.insert(n("dbo.trg"), trigger.clone());
+        let trigger = module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1");
+        // An identity with no table at all: the loader refuses one, and a
+        // state or plan read from JSON can still carry it.
+        schema.modules.insert(id("dbo.trg"), trigger.clone());
         assert!(check_names(&schema)[0].contains("does not say which table"));
 
-        trigger.on = Some(n("dbo.absent"));
-        schema.modules.insert(n("dbo.trg"), trigger.clone());
+        schema.modules.clear();
+        schema
+            .modules
+            .insert(trigger_id("dbo.absent", "trg"), trigger.clone());
         assert!(check_names(&schema)[0].contains("not declared here"));
 
         schema.tables.insert(n("dbo.absent"), Table::default());
         assert!(check_names(&schema).is_empty());
+    }
+
+    /// Two triggers of one name on two tables are two objects, not one
+    /// declaration overwriting the other (ADR-0009 §1, measured on
+    /// PostgreSQL 18: `DROP TRIGGER audit` is a syntax error).
+    #[test]
+    fn one_trigger_name_on_two_tables_is_two_modules() {
+        let mut schema = Schema::default();
+        schema.tables.insert(n("tg.orders"), Table::default());
+        schema.tables.insert(n("tg.customers"), Table::default());
+        let trigger = module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1");
+        schema
+            .modules
+            .insert(trigger_id("tg.orders", "audit"), trigger.clone());
+        schema
+            .modules
+            .insert(trigger_id("tg.customers", "audit"), trigger);
+        assert_eq!(schema.modules.len(), 2);
+        assert!(
+            check_names(&schema).is_empty(),
+            "{:?}",
+            check_names(&schema)
+        );
     }
 
     /// SQL Server allows `INSTEAD OF` triggers on views, and `pull` rebuilds
@@ -666,10 +973,11 @@ mod tests {
     #[test]
     fn a_trigger_may_be_attached_to_a_declared_view() {
         let mut schema = Schema::default();
-        schema.modules.insert(n("dbo.v"), view("SELECT 1 AS one"));
-        let mut trigger = module(ModuleKind::Trigger, "INSTEAD OF INSERT AS SELECT 1");
-        trigger.on = Some(n("dbo.v"));
-        schema.modules.insert(n("dbo.trg"), trigger);
+        schema.modules.insert(id("dbo.v"), view("SELECT 1 AS one"));
+        schema.modules.insert(
+            trigger_id("dbo.v", "trg"),
+            module(ModuleKind::Trigger, "INSTEAD OF INSERT AS SELECT 1"),
+        );
         assert!(
             check_names(&schema).is_empty(),
             "{:?}",
@@ -678,9 +986,9 @@ mod tests {
 
         // And the view has to exist before the trigger can be attached to it.
         // The definition never names it — the emitter writes it into the `ON`
-        // clause — so only `on:` can supply that edge.
+        // clause — so only the identity can supply that edge.
         let order = creation_order(&schema.modules, &ModuleDeps::default());
-        assert_eq!(order, vec![n("dbo.v"), n("dbo.trg")]);
+        assert_eq!(order, vec![id("dbo.v"), trigger_id("dbo.v", "trg")]);
     }
 
     /// A target that is neither a declared table nor a declared view is still
@@ -690,14 +998,134 @@ mod tests {
         let mut schema = Schema::default();
         schema
             .modules
-            .insert(n("dbo.p"), module(ModuleKind::Procedure, "AS SELECT 1"));
-        let mut trigger = module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1");
-        trigger.on = Some(n("dbo.p"));
-        schema.modules.insert(n("dbo.trg"), trigger);
+            .insert(id("dbo.p"), module(ModuleKind::Procedure, "AS SELECT 1"));
+        schema.modules.insert(
+            trigger_id("dbo.p", "trg"),
+            module(ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
+        );
         assert!(
             check_names(&schema)[0].contains("not declared here as a table or a view"),
             "{:?}",
             check_names(&schema)
+        );
+    }
+
+    /// A comma inside a type's modifier is not an argument separator, and the
+    /// two are the same character. `app.f(decimal(10, 2))` is one argument;
+    /// splitting it flat made `decimal(10` and ` 2)`, so a routine the model
+    /// can hold serialized into a key that would not parse back.
+    #[test]
+    fn a_comma_inside_a_modifier_does_not_separate_arguments() {
+        let one: ModuleId = "app.f(decimal(10, 2))".parse().unwrap();
+        assert_eq!(one.args().unwrap().len(), 1, "{one}");
+        let three: ModuleId = "app.f(decimal(10, 2),text,numeric(38, 10))"
+            .parse()
+            .unwrap();
+        assert_eq!(three.args().unwrap().len(), 3, "{three}");
+        // Spacing is layout, not identity: the compact spelling a human might
+        // type is the same routine as the one `Display` writes.
+        assert_eq!("app.f(decimal(10,2))".parse::<ModuleId>().unwrap(), one);
+
+        // Unbalanced is refused rather than guessed at. A silent split here
+        // would invent an argument list nobody declared.
+        for bad in [
+            "app.f(decimal(10, 2)",
+            "app.f(decimal10, 2))",
+            "app.f(decimal(10, 2)))",
+        ] {
+            assert!(
+                bad.parse::<ModuleId>().is_err(),
+                "`{bad}` parsed as an identity"
+            );
+        }
+    }
+
+    /// The three shapes, through the string form the JSON map key uses.
+    /// Parentheses mean a routine — `app.f()` is one that takes nothing —
+    /// and three dotted parts mean a trigger (ADR-0009 §1).
+    #[test]
+    fn every_identity_round_trips_through_its_string_form() {
+        for spelling in [
+            "app.v",
+            "app.f(integer,text)",
+            // A modifier with its own comma: the argument separator and the
+            // one inside `decimal(10, 2)` are the same character, and only
+            // nesting tells them apart. Spelled as `ColumnType` spells it,
+            // because that is what wrote the key.
+            "app.f(decimal(10, 2))",
+            "app.f(decimal(10, 2),text,numeric(38, 10))",
+            "app.f()",
+            "app.orders.audit",
+        ] {
+            let parsed: ModuleId = spelling.parse().unwrap();
+            assert_eq!(parsed.to_string(), spelling);
+            assert_eq!(
+                serde_json::from_str::<ModuleId>(&serde_json::to_string(&parsed).unwrap()).unwrap(),
+                parsed,
+                "{spelling} does not survive JSON"
+            );
+        }
+        assert_eq!(id("app.v"), ModuleId::Named(n("app.v")));
+        assert!(matches!(id("app.f(int)"), ModuleId::Routine(_)));
+        assert_eq!(
+            id("app.orders.audit"),
+            ModuleId::Trigger {
+                on: n("app.orders"),
+                name: "audit".to_owned()
+            }
+        );
+        for bad in [
+            "app",
+            "a.b.c.d",
+            "app.f(",
+            "app.f(int",
+            "app..f",
+            "app.f(,)",
+        ] {
+            assert!(bad.parse::<ModuleId>().is_err(), "`{bad}` must not parse");
+        }
+    }
+
+    /// Constraint 1: two semantically identical schemas are `==`. The
+    /// declaration's spelling of a type is not part of what a routine *is*,
+    /// so `app.f(int, text)` and `app.f(int,text)` are one key — the type
+    /// parser folds whitespace and case, and the dialect folds the rest
+    /// (`normalize_routine_arg`), which is why this is not a string key.
+    #[test]
+    fn one_routine_written_two_ways_is_one_key() {
+        let mut modules = BTreeMap::new();
+        modules.insert(id("app.f(int, text)"), view("SELECT 1"));
+        modules.insert(id("app.f(INT,text)"), view("SELECT 2"));
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[&id("app.f(int,text)")].definition, "SELECT 2");
+    }
+
+    /// Two overloads are two objects with two bodies, and each carries its
+    /// own ordering edge: under a name-only key one `depends_on` entry was
+    /// shared by both.
+    #[test]
+    fn two_overloads_are_two_modules_with_their_own_dependencies() {
+        let mut schema = Schema::default();
+        schema
+            .modules
+            .insert(id("app.f(integer)"), module(ModuleKind::Function, "AS 1"));
+        schema
+            .modules
+            .insert(id("app.f(text)"), module(ModuleKind::Function, "AS 2"));
+        schema.modules.insert(id("app.v"), view("SELECT 1"));
+        assert_eq!(schema.modules.len(), 3);
+
+        let mut deps = ModuleDeps::default();
+        deps.insert(id("app.f(integer)"), BTreeSet::from([id("app.v")]));
+        assert!(check_dependencies(&schema, &deps).is_empty());
+
+        // And one that names an overload nobody declared is still caught.
+        let mut wrong = ModuleDeps::default();
+        wrong.insert(id("app.f(integer)"), BTreeSet::from([id("app.f(bigint)")]));
+        assert!(
+            check_dependencies(&schema, &wrong)[0].contains("not a declared module"),
+            "{:?}",
+            check_dependencies(&schema, &wrong)
         );
     }
 
@@ -770,40 +1198,42 @@ mod tests {
     #[test]
     fn a_depends_on_target_that_is_not_declared_is_refused() {
         let mut schema = Schema::default();
-        schema.modules.insert(n("dbo.a"), view("SELECT 1"));
-        schema.modules.insert(n("dbo.b"), view("SELECT 2"));
+        schema.modules.insert(id("dbo.a"), view("SELECT 1"));
+        schema.modules.insert(id("dbo.b"), view("SELECT 2"));
 
         let mut deps = ModuleDeps::default();
-        deps.insert(n("dbo.b"), [n("dbo.a")].into_iter().collect());
+        deps.insert(id("dbo.b"), [id("dbo.a")].into_iter().collect());
         assert!(check_dependencies(&schema, &deps).is_empty());
 
-        deps.insert(n("dbo.b"), [n("dbo.typo")].into_iter().collect());
+        deps.insert(id("dbo.b"), [id("dbo.typo")].into_iter().collect());
         assert!(
             check_dependencies(&schema, &deps)[0].contains("not a declared module"),
             "{:?}",
             check_dependencies(&schema, &deps)
         );
 
-        deps.insert(n("dbo.b"), [n("dbo.b")].into_iter().collect());
+        deps.insert(id("dbo.b"), [id("dbo.b")].into_iter().collect());
         assert!(check_dependencies(&schema, &deps)[0].contains("lists itself"));
     }
 
-    /// `on:` on a view would read as if it did something; it does not, and a
-    /// declaration that quietly means nothing is the failure mode this tool is
-    /// built to avoid.
+    /// A view under a trigger's identity would read as if the table meant
+    /// something; it does not, and a declaration that quietly means nothing is
+    /// the failure mode this tool is built to avoid. The loader refuses the
+    /// `on:` that would produce it; this is the same check one layer in, for a
+    /// state or plan that arrived as JSON.
     #[test]
     fn only_a_trigger_may_name_a_table() {
         let mut schema = Schema::default();
-        let mut v = view("SELECT 1");
-        v.on = Some(n("dbo.customer"));
-        schema.modules.insert(n("dbo.v"), v);
+        schema
+            .modules
+            .insert(trigger_id("dbo.customer", "v"), view("SELECT 1"));
         assert!(check_names(&schema)[0].contains("only a trigger"));
     }
 
     #[test]
     fn an_empty_definition_is_reported() {
         let mut schema = Schema::default();
-        schema.modules.insert(n("dbo.v"), view("   \n"));
+        schema.modules.insert(id("dbo.v"), view("   \n"));
         assert!(check_names(&schema)[0].contains("empty definition"));
     }
 }

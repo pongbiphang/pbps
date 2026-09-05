@@ -368,6 +368,57 @@ ledger or the permission checks.
   unit suite could only ever check that the SQL said what its author thought it
   said — and it did.
 
+## A round trip tested only on the simple case
+
+Two P1s on the `ModuleId` PR (#47) were the same mistake in two places: an
+identity was reduced to something shorter than itself, and the reduction was
+tested only on inputs where it happened to be lossless.
+
+`FromStr` split a routine's argument list on every comma, so
+`app.f(decimal(10, 2))` — one argument — parsed as `decimal(10` and ` 2)`. The
+round-trip test covered `app.f(integer,text)`, where flat splitting is right.
+The failure was not a refused parse in isolation: `Display` wrote that key into
+the state snapshot and the saved plan, so the artifact the tool wrote was one it
+could not read back.
+
+`declaration_file::module_path` built a trigger's filename from
+`object_name()`, which is `schema.name` — the trigger's table, half of its
+identity, was dropped on the way to disk. Two triggers named `audit` on
+different tables produced one file, `pull` wrote the second over the first, and
+the next plan would have dropped the trigger whose file had vanished. The whole
+point of the change was that those are two objects.
+
+**A third P1, the same PR, the inverse shape.** Widening a key from
+`ObjectName` to `ModuleId` made two modules with one name representable for the
+first time, and the whole-schema check still only compared modules against
+tables — it had never needed to compare them against each other, because the
+map could not hold the collision. The uniqueness was a property of the
+container, so nothing in the diff looked like a deleted check. **When a key
+gets wider, list what its narrowness was silently enforcing, and write each one
+down as a check before the widening lands.**
+
+**A fourth, the next round: the punctuation was already in the name.** The
+string form uses `.` and `(` as structure, and SQL Server lets a quoted
+identifier contain both. A view named `[audit.v1]` had always failed loudly at
+the snapshot read — `dbo.audit.v1` was no shape an `ObjectName` could take —
+and the typed key gave that string a meaning: a trigger named `v1` on
+`dbo.audit`. A parse that used to refuse now succeeded with a different
+identity, and no test noticed because none had held a name containing the
+delimiter. **When a string form gains a grammar, every input that used to be
+unparseable becomes a candidate for being parsed as something else** — list
+them, and make the round trip `to_string().parse() == self` a checked property
+where engine names enter (DECISIONS 205).
+
+**The shape.** Whenever a typed identity is flattened to a string — a map key,
+a filename, a message — test the flattening on the case where the parts are
+*not* separable by the obvious character, and on two values that must not
+collide. A round trip proved on `f(integer,text)` proves nothing about
+`f(decimal(10, 2))`; a filename proved on one trigger proves nothing about two.
+Check the sibling call sites in the same pass: the other two comma splits in
+this repo (a column list, a type's own modifier args) are safe only because
+their elements cannot nest, and that is a property worth confirming rather
+than assuming.
+
 ## Tests that pass for the wrong reason
 
 Nine so far, every one invisible in a green run. **Assert the specific failure,

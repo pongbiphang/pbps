@@ -139,6 +139,18 @@ fn read(path: &Path) -> Result<String, Vec<LoadError>> {
 /// Tables and modules share one `seen` map because SQL Server keeps them in one
 /// namespace per schema: a view named after a table is a collision the engine
 /// would only report at apply time, on a database that is already half-changed.
+/// "You declared this twice, and here is the other one."
+///
+/// One spelling for tables, modules and roles alike: which namespace a name
+/// was already taken in is decided by the caller, and the message reads the
+/// same whichever it was.
+fn already(path: &std::path::Path, what: &str, first: &std::path::Path) -> LoadError {
+    LoadError::Yaml {
+        path: path.to_owned(),
+        message: format!("{what} was already declared in `{}`", first.display()),
+    }
+}
+
 pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files).map_err(|source| {
@@ -153,7 +165,15 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
 
     let mut loaded = Loaded::default();
     let mut errs = Vec::new();
-    let mut seen: std::collections::BTreeMap<TableName, std::path::PathBuf> =
+    let mut seen_tables: std::collections::BTreeMap<TableName, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
+    // Modules are counted apart from tables, and by their whole identity:
+    // whether a table and a module may share a name is the engine's answer,
+    // not the loader's — on PostgreSQL a table `app.f` and a function
+    // `app.f(int)` are two objects (ADR-0009 §1) — and two overloads of one
+    // function are two declarations, not a file declared twice.
+    // `pbps_dialect::check_module_names` asks the engine the other question.
+    let mut seen_modules: std::collections::BTreeMap<pbps_model::ModuleId, std::path::PathBuf> =
         std::collections::BTreeMap::new();
     // Roles live in their own namespace — a role and a table may share a
     // word — so they are checked for duplicates among themselves.
@@ -169,20 +189,27 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
             }
         };
 
-        let (name, file) = match file {
-            LoadedFile::Table(t) => (t.name.clone(), LoadedFile::Table(t)),
-            LoadedFile::Module(m) => (m.name.clone(), LoadedFile::Module(m)),
+        let file = match file {
+            LoadedFile::Table(t) => {
+                if let Some(first) = seen_tables.get(&t.name) {
+                    errs.push(already(&path, &format!("`{}`", t.name), first));
+                    continue;
+                }
+                seen_tables.insert(t.name.clone(), path);
+                LoadedFile::Table(t)
+            }
+            LoadedFile::Module(m) => {
+                if let Some(first) = seen_modules.get(&m.id) {
+                    errs.push(already(&path, &format!("`{}`", m.id), first));
+                    continue;
+                }
+                seen_modules.insert(m.id.clone(), path);
+                LoadedFile::Module(m)
+            }
             LoadedFile::Role(r) => {
                 let mut r = *r;
                 if let Some(first) = seen_roles.get(&r.name) {
-                    errs.push(LoadError::Yaml {
-                        path: path.clone(),
-                        message: format!(
-                            "role `{}` was already declared in `{}`",
-                            r.name,
-                            first.display()
-                        ),
-                    });
+                    errs.push(already(&path, &format!("role `{}`", r.name), first));
                     continue;
                 }
                 seen_roles.insert(r.name.clone(), path);
@@ -191,30 +218,22 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
                 continue;
             }
         };
-        if let Some(first) = seen.get(&name) {
-            errs.push(LoadError::Yaml {
-                path: path.clone(),
-                message: format!("`{name}` was already declared in `{}`", first.display()),
-            });
-            continue;
-        }
-        seen.insert(name.clone(), path);
 
         match file {
             LoadedFile::Table(t) => {
                 let mut t = *t;
                 loaded.intents.append(&mut t.intents);
                 if let Some(s) = t.strategy {
-                    loaded.hints.strategies.insert(name.clone(), s);
+                    loaded.hints.strategies.insert(t.name.clone(), s);
                 }
-                loaded.schema.tables.insert(name, t.table);
+                loaded.schema.tables.insert(t.name, t.table);
             }
             LoadedFile::Module(m) => {
                 let m = *m;
                 if !m.depends_on.is_empty() {
-                    loaded.hints.module_deps.insert(name.clone(), m.depends_on);
+                    loaded.hints.module_deps.insert(m.id.clone(), m.depends_on);
                 }
-                loaded.schema.modules.insert(name, m.module);
+                loaded.schema.modules.insert(m.id, m.module);
             }
             // Merged above, in its own namespace.
             LoadedFile::Role(_) => {}
@@ -538,13 +557,13 @@ indexes:
     #[test]
     fn the_leading_key_decides_the_kind_and_the_name() {
         let m = load_module(A_VIEW);
-        assert_eq!(m.name.to_string(), "dbo.active_customer");
+        assert_eq!(m.id.to_string(), "dbo.active_customer");
         assert_eq!(m.module.kind, pbps_model::ModuleKind::View);
         assert_eq!(
             m.module.definition.trim(),
             "SELECT customer_id FROM dbo.customer"
         );
-        assert!(m.module.on.is_none());
+        assert!(m.id.attached_to().is_none());
 
         for (text, kind) in [
             (
@@ -562,6 +581,76 @@ indexes:
         ] {
             assert_eq!(load_module(text).module.kind, kind);
         }
+    }
+
+    /// The file keeps the two lines it always had — `trigger: app.audit` and
+    /// `on: app.orders` — and they fold into one identity (ADR-0009 §1). No
+    /// declaration written for the old model has to change.
+    #[test]
+    fn a_trigger_file_loads_to_an_identity_holding_its_table() {
+        let m = load_module(
+            "trigger: app.audit\non: app.orders\ndefinition: AFTER INSERT AS SELECT 1\n",
+        );
+        assert_eq!(
+            m.id,
+            pbps_model::ModuleId::Trigger {
+                on: "app.orders".parse().unwrap(),
+                name: "audit".to_owned()
+            }
+        );
+        assert_eq!(m.id.to_string(), "app.orders.audit");
+        assert_eq!(m.id.attached_to().unwrap().to_string(), "app.orders");
+    }
+
+    /// A trigger's schema is its table's — SQL Server puts it there and
+    /// PostgreSQL gives it none — so two spellings that disagree are a
+    /// declaration whose halves mean different things, not one to resolve
+    /// silently.
+    #[test]
+    fn a_trigger_named_in_another_schema_than_its_table_is_refused() {
+        let e = load_module_str(
+            Path::new("m.yml"),
+            "trigger: other.audit\non: app.orders\ndefinition: AFTER INSERT AS SELECT 1\n",
+        )
+        .expect_err("the two schemas disagree");
+        assert!(render(&e).contains("lives in the schema"), "{}", render(&e));
+        assert!(render(&e).contains("app.audit"), "{}", render(&e));
+    }
+
+    /// A signature in the name is a routine identity, and the argument types
+    /// are lifted out of it — never parsed from `definition`, which keeps its
+    /// parameter names, modes and defaults (ADR-0009 §1).
+    #[test]
+    fn a_function_declared_with_a_signature_loads_to_a_routine() {
+        let m = load_module(
+            "function: app.f(int, text)\ndefinition: (a integer, b text) RETURNS int AS $$ SELECT 1 $$\n",
+        );
+        let pbps_model::ModuleId::Routine(r) = &m.id else {
+            panic!("not a routine: {:?}", m.id);
+        };
+        assert_eq!(r.name.to_string(), "app.f");
+        assert_eq!(
+            r.args.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["int", "text"]
+        );
+        assert_eq!(m.id.to_string(), "app.f(int,text)");
+
+        // And one that takes nothing keeps its parentheses: `app.g()` is a
+        // routine, `app.g` is a name in the table namespace.
+        let none = load_module("function: app.g()\ndefinition: () RETURNS int AS $$ SELECT 1 $$\n");
+        assert!(matches!(none.id, pbps_model::ModuleId::Routine(_)));
+        assert_eq!(none.id.to_string(), "app.g()");
+    }
+
+    /// `on:` on anything but a trigger would read as if it did something.
+    #[test]
+    fn only_a_trigger_may_name_a_table_in_a_file() {
+        let e = load_module_str(
+            Path::new("m.yml"),
+            "view: dbo.v\non: dbo.customer\ndefinition: SELECT 1\n",
+        )
+        .expect_err("a view has no table");
+        assert!(render(&e).contains("only a trigger"), "{}", render(&e));
     }
 
     /// A file has to be one object. Two leading keys is not a shape the tool
@@ -636,12 +725,28 @@ indexes:
             "modules load from the same directory as tables"
         );
 
-        // Tables and modules share one namespace in the database, so they share
-        // one here: a view named after a table would fail at apply time, on a
-        // database that is already half-changed.
+        // A view named after a table loads here and is refused by the
+        // dialect, not by the loader: whether the two share a namespace is
+        // the engine's answer (ADR-0009 §1), and on PostgreSQL a table
+        // `dbo.customer` and a function `dbo.customer(int)` are two objects.
+        // `pbps_dialect::check_module_names` is where the refusal lives now,
+        // and `a_module_named_after_a_table_is_refused` in the CLI's flow
+        // tests holds `validate` to still making it.
         std::fs::write(
             dir.join("clash.yml"),
             "view: dbo.customer\ndefinition: SELECT 1\n",
+        )
+        .unwrap();
+        let with_clash = load_schema_dir(&dir).expect("the loader has no namespace rule");
+        assert_eq!(with_clash.schema.tables.len(), 2);
+        assert_eq!(with_clash.schema.modules.len(), 2);
+        std::fs::remove_file(dir.join("clash.yml")).unwrap();
+
+        // Two files declaring one module, though, is the loader's own
+        // question, and the answer does not depend on any engine.
+        std::fs::write(
+            dir.join("v2.yml"),
+            "view: dbo.active_customer\ndefinition: SELECT 2\n",
         )
         .unwrap();
         let e = load_schema_dir(&dir).unwrap_err();
@@ -650,7 +755,7 @@ indexes:
             "{}",
             render(&e)
         );
-        std::fs::remove_file(dir.join("clash.yml")).unwrap();
+        std::fs::remove_file(dir.join("v2.yml")).unwrap();
 
         // File names carry no meaning, so two files declaring one table must be
         // rejected.

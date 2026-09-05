@@ -63,7 +63,13 @@ use crate::schema::Schema;
 /// take `types` for the type the column has now, and hold a retyped cell to
 /// the old type's spelling of a value the engine has already converted
 /// (DECISIONS 149).
-pub const CURRENT_VERSION: u32 = 4;
+/// Bumped to 5 with the state's own bump to 6: a saved plan carries a
+/// `Schema` and a `ChangeSet`, and both spell a module's identity the new way
+/// (ADR-0009 §1, DECISIONS 203). An older `apply` reading this file would take
+/// a trigger's three-part key for a name it cannot parse; a newer one reading
+/// an older file would take `app.audit` for a view. Neither is a partial reading, so
+/// the number moves.
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -486,11 +492,10 @@ mod tests {
 
         let mut module = serde_json::to_value(plan_over(ChangeSet {
             changes: vec![PlannedChange::new(Change::CreateModule {
-                name: TableName::new("dbo", "active_customer"),
+                id: crate::ModuleId::Named(TableName::new("dbo", "active_customer")),
                 module: Box::new(Module {
                     kind: ModuleKind::View,
                     description: None,
-                    on: None,
                     definition: "SELECT 1 AS id".into(),
                 }),
             })],
