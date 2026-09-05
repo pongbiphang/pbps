@@ -659,11 +659,12 @@ fn run() -> anyhow::Result<()> {
                     // file the deployment gate approves, read back by `explain
                     // --plan --format json`. Adding a second typed rendering
                     // would give a reviewer two documents to disagree about.
-                    refuse(
+                    let plan = report::placeholder("plan.json");
+                    refuse(&format!(
                         "--format json describes findings, and `plan --db` produces a plan.\n\
-                         Write it with --out <plan.json> and read it with \
-                         `pbps explain --plan <plan.json> --format json`",
-                    )?;
+                         Write it with --out {plan} and read it with \
+                         `pbps explain --plan {plan} --format json`"
+                    ))?;
                 }
                 let target = output::or_unanswerable(
                     "plan",

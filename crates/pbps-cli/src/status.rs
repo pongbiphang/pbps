@@ -469,7 +469,10 @@ fn record_staged(
         "a staged apply stopped after {completed} of {total} statement(s); continue it with \
          `pbps apply --staged --resume --env {} --plan ... --checksum {}`",
         crate::report::env_arg(environment),
-        checksum.unwrap_or("<approved-checksum>")
+        checksum.map_or_else(
+            || crate::report::placeholder("approved-checksum"),
+            str::to_owned
+        )
     );
     if let Some(failure) = failure {
         append_detail(&mut detail, &failure);
@@ -698,9 +701,10 @@ fn status_finding(environment: &str, state: &'static str, detail: Option<&str>) 
         // Named, for the same reason as `doctor`'s: `apply` requires a target,
         // and `status` reports on several environments at once.
         finding = finding.remedy(format!(
-            "pbps apply --env {} --plan <plan.json> --checksum <approved-checksum> \
-             --staged --resume",
+            "pbps apply --env {} --plan {} --checksum {} --staged --resume",
             crate::report::env_arg(environment),
+            crate::report::placeholder("plan.json"),
+            crate::report::placeholder("approved-checksum"),
         ));
     }
     finding
@@ -998,7 +1002,7 @@ mod tests {
         record_drift(&mut r, 7, "prod&rm");
         let detail = r.detail.unwrap();
         assert!(
-            detail.contains("--env <environment>"),
+            detail.contains("--env \"<environment>\""),
             "an unquotable name must not be interpolated: {detail}"
         );
     }

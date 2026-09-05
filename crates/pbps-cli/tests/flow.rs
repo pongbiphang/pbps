@@ -2651,7 +2651,7 @@ fn the_approval_command_explain_prints_carries_a_target() {
     assert!(line.contains("--plan"), "{line}");
     // A redacted --db label is not a connection string and must never be
     // printed as though it were; the placeholder is the honest form.
-    assert!(line.contains("--env <environment>"), "{line}");
+    assert!(line.contains("--env \"<environment>\""), "{line}");
 }
 
 /// A project with no environments is the shape a consumer meets first, and it
@@ -3577,13 +3577,13 @@ fn an_unquotable_plan_path_is_shown_rather_than_inlined() {
         .lines()
         .find(|l| l.trim_start().starts_with("pbps "))
         .unwrap_or_else(|| panic!("no command in:\n{out}"));
-    assert!(command.contains("<plan path>"), "{command}");
+    assert!(command.contains("\"<plan path>\""), "{command}");
     assert!(
         !command.contains("a&b"),
         "the path must not be inlined at all: {command}"
     );
     // And it is shown, so the reviewer can still act on it.
-    assert!(out.contains("<plan path> is:"), "{out}");
+    assert!(out.contains("\"<plan path>\" is:"), "{out}");
     assert!(out.contains("a&b"), "{out}");
 
     let v: serde_json::Value = serde_json::from_str(&stdout(&d.run(&[
@@ -5157,12 +5157,12 @@ fn a_plan_path_that_is_not_utf8_becomes_the_placeholder() {
         .find(|l| l.trim_start().starts_with("pbps apply"))
         .unwrap_or_else(|| panic!("no approval command in:\n{out}"));
     assert!(
-        line.contains("<plan path>"),
+        line.contains("\"<plan path>\""),
         "a path that cannot be spelled must not be advertised: {line}"
     );
     // And the literal is still shown, on a line of its own, so the reader can
     // see what was read even though it cannot be pasted.
-    assert!(out.contains("<plan path> is:"), "{out}");
+    assert!(out.contains("\"<plan path>\" is:"), "{out}");
 }
 
 // ---- Thirty-first review round ----
