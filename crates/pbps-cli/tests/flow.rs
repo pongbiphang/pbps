@@ -135,32 +135,74 @@ fn after_test_on_server(connection: &str, sql: &str) {
     let _ = try_on_server(connection, sql);
 }
 
-/// A database of this test's own, and the connection string that reaches it.
+/// A database of this test's own, dropped when the guard goes out of scope.
 ///
-/// The four tests that used to reach for `docker exec` all worked in whatever
-/// database `PBPS_TEST_DB` names — shared with every other test in the file.
-/// That was invisible while they were skipping; the moment they ran, the ledger
-/// entries and the tables they leave behind made *other* tests fail, and which
-/// ones depended on the order. The suite already answers this: a test that
-/// writes state takes a database of its own (DECISIONS 198).
-fn own_database(server: &str, slug: &str) -> (String, String) {
-    let name = format!("pbps_cli_{slug}_{}", std::process::id());
-    on_server(server, &format!("CREATE DATABASE [{name}];"));
-    let connection = format!("{server};Database={name}");
-    (name, connection)
+/// A test that writes state takes a database of its own, or the ledger entries
+/// and tables it leaves behind make *other* tests fail — which ones depending
+/// on the order they ran in (DECISIONS 198). Eleven tests were doing that by
+/// hand, and each hand-rolled copy carried the same two defects (199): the
+/// connection string was built by appending to `PBPS_TEST_DB` verbatim, so a
+/// trailing separator made `;;`, which the driver rejects as an empty key; and
+/// the drop was the test's last statement, so an assertion that panicked
+/// leaked the database. 58 of them had accumulated on the shared container.
+struct OwnDatabase {
+    server: String,
+    name: String,
+    connection: String,
 }
 
-/// Tolerant, like every other teardown here: the assertions have run, and a
-/// database left behind is cleaned up by the next run of the same test — the
-/// name carries the pid, and `CREATE DATABASE` would fail loudly if it clashed.
-fn drop_own_database(server: &str, name: &str) {
-    after_test_on_server(
-        server,
-        &format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
-             DROP DATABASE [{name}];"
-        ),
-    );
+impl OwnDatabase {
+    /// Creates it. Panics if it cannot: a test that cannot arrange its state
+    /// has not passed.
+    fn new(server: &str, slug: &str) -> Self {
+        let name = format!("pbps_cli_{slug}_{}", std::process::id());
+        on_server(server, &format!("CREATE DATABASE [{name}];"));
+        Self {
+            server: server.to_owned(),
+            connection: with_key(server, "Database", &name),
+            name,
+        }
+    }
+
+    /// What to pass to `--db`.
+    fn connection(&self) -> &str {
+        &self.connection
+    }
+
+    /// For the tests that still spell `USE [{name}]` in their own statements.
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for OwnDatabase {
+    /// Runs on the unwinding path too, which is the point: the drop used to be
+    /// the test's last statement and was skipped by every failure.
+    ///
+    /// Tolerant, and it has to stay that way twice over: a panic here would
+    /// replace whatever the test found, and a panic *while* unwinding aborts
+    /// the process, taking the rest of the suite with it.
+    fn drop(&mut self) {
+        after_test_on_server(
+            &self.server,
+            &format!(
+                "ALTER DATABASE [{}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                 DROP DATABASE [{}];",
+                self.name, self.name
+            ),
+        );
+    }
+}
+
+/// Appends one key to a connection string, with exactly one separator.
+///
+/// `format!("{server};Database={name}")` was written out eleven times, and
+/// `PBPS_TEST_DB` may legitimately end in `;` — an ADO.NET string is a list of
+/// `key=value;` — which made `;;Database=`. The driver reads that as a key with
+/// no name and refuses the whole string, so every one of those tests created
+/// its database and then failed to connect to it (DECISIONS 199).
+fn with_key(connection: &str, key: &str, value: &str) -> String {
+    format!("{};{key}={value}", connection.trim().trim_end_matches(';'))
 }
 
 fn try_on_server(connection: &str, sql: &str) -> Result<(), String> {
@@ -3379,7 +3421,8 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let (db_name, connection) = own_database(&server, "explainlock");
+    let own = OwnDatabase::new(&server, "explainlock");
+    let connection = own.connection().to_owned();
     let d = Demo::new("explainlock");
     d.table(ONE_COLUMN);
     d.commit();
@@ -3422,8 +3465,6 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
     ]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let _ = d.run(&["unlock", "--db", &connection]);
-
-    drop_own_database(&server, &db_name);
 
     assert_eq!(v["data"]["target"]["state"], "locked", "{v}");
     assert!(
@@ -3473,7 +3514,8 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let (db_name, connection) = own_database(&server, "doctorlock");
+    let own = OwnDatabase::new(&server, "doctorlock");
+    let connection = own.connection().to_owned();
     let d = Demo::new("doctorlock");
     d.table(ONE_COLUMN);
     d.commit();
@@ -3490,8 +3532,6 @@ fn doctor_does_not_report_ready_while_the_lock_is_held() {
     let o = d.run(&["doctor", "--db", &connection, "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let _ = d.run(&["unlock", "--db", &connection]);
-    drop_own_database(&server, &db_name);
-
     assert_eq!(
         v["result"], "findings",
         "a held lock is not a clean report: {v}"
@@ -4197,7 +4237,8 @@ fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let (db_name, connection) = own_database(&server, "verifyidentity");
+    let own = OwnDatabase::new(&server, "verifyidentity");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("verifyidentity");
     d.table("table: dbo.ident_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
@@ -4222,8 +4263,6 @@ fn verify_calls_an_unexpressible_live_difference_drift_not_unreachable() {
     );
 
     let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
-    drop_own_database(&server, &db_name);
-
     let v: serde_json::Value = serde_json::from_str(&stdout(&o))
         .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
     assert_eq!(
@@ -4831,7 +4870,8 @@ fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let (db_name, connection) = own_database(&server, "verifyboth");
+    let own = OwnDatabase::new(&server, "verifyboth");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("verifyboth");
     d.table("table: dbo.both_drift\ncolumns:\n  id: {type: bigint, nullable: false, identity: [1, 1]}\n");
@@ -4857,8 +4897,6 @@ fn verify_keeps_the_expressible_drift_beside_an_unexpressible_one() {
     );
 
     let o = d.run(&["verify", "--db", &connection, "--format", "json"]);
-    drop_own_database(&server, &db_name);
-
     let v: serde_json::Value = serde_json::from_str(&stdout(&o))
         .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {}", stdout(&o)));
     assert_eq!(code(&o), FINDING, "{v}");
@@ -5388,7 +5426,8 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_renamedata_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "renamedata");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5399,13 +5438,7 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("renamedata-live");
     d.table(
@@ -5456,15 +5489,6 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["plan", "--db", &connection]);
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        let _ = c
-            .execute(&format!(
-                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-            ))
-            .await;
-    });
 }
 
 /// A declared text the engine reads back differently — `"1.5"` in a
@@ -5478,18 +5502,8 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_spelling_{}", std::process::id());
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let own = OwnDatabase::new(&server, "spelling");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("spelling-live");
     let declared = |pct: &str, since: &str, extra_rows: &str| {
@@ -5546,15 +5560,6 @@ fn a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is
         "{}",
         stderr(&o)
     );
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// `plan --db` and `bootstrap` hand statements to a database that is not a
@@ -5614,7 +5619,8 @@ fn a_delete_beside_a_type_change_in_the_same_revision_applies() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_retype_delete_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "retype_delete");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5625,13 +5631,7 @@ fn a_delete_beside_a_type_change_in_the_same_revision_applies() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let declared = |ty: &str| {
         format!(
@@ -5692,15 +5692,6 @@ data:
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// A schema name is the one name in a declaration with no identity behind
@@ -5716,18 +5707,8 @@ fn a_schema_name_the_database_spells_differently_is_refused() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_schemacase_{}", std::process::id());
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let own = OwnDatabase::new(&server, "schemacase");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("schemacase-live");
     d.table(
@@ -5784,15 +5765,6 @@ fn a_schema_name_the_database_spells_differently_is_refused() {
         "the accepted spelling has to converge: {}",
         stdout(&o)
     );
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// Users, roles and application roles share one namespace in SQL Server; a
@@ -5806,7 +5778,8 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_rolename_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "rolename");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5817,13 +5790,7 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
     sql("CREATE USER shadow WITHOUT LOGIN;");
 
     let d = Demo::new("rolename-live");
@@ -6052,15 +6019,6 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
             .is_some_and(|d| d.contains("auditor") && d.contains("GRANT OPTION")),
         "{v}"
     );
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// A dropped role's members are listed at plan time so a reviewer sees who
@@ -6078,7 +6036,8 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_nestedroles_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "nestedroles");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6102,13 +6061,7 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
             rows[0].try_get_at::<i32>(0).unwrap().unwrap()
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("nestedroles-live");
     d.table(
@@ -6161,15 +6114,6 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
     ]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert_eq!(roles(), 0, "both roles are gone");
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// added between `plan --db` and `apply` is invisible to the checksum. The
@@ -6183,7 +6127,8 @@ fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_roledrop_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "roledrop");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6208,13 +6153,7 @@ fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
             rows[0].try_get_at::<i32>(0).unwrap().unwrap()
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("roledrop-live");
     d.table(
@@ -6278,15 +6217,6 @@ fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
     ]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert_eq!(members(), 0, "the role is gone");
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .expect("drop database");
-    });
 }
 
 /// The connected half of ADR-0004, end to end through the real binary: the
@@ -6301,7 +6231,8 @@ fn reference_data_round_trips_through_a_real_target() {
     };
     // A database of its own, so the shared server's `master` never holds the
     // lookup table, and two runs cannot meet in it.
-    let name = format!("pbps_cli_refdata_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "refdata");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6312,13 +6243,7 @@ fn reference_data_round_trips_through_a_real_target() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     // `seq` is the engine's column: a declaration cannot set it and an UPDATE
     // cannot change it, so it is never read back and never compared — read
@@ -6528,15 +6453,6 @@ data:
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(!stderr(&o).contains("rows"), "{}", stderr(&o));
     assert!(strict.dir.join("schema").join("dbo.t.yml").is_file());
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        let _ = c
-            .execute(&format!(
-                "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-            ))
-            .await;
-    });
 }
 
 // ---- Roles and grants, ADR-0005 ----
@@ -7117,18 +7033,8 @@ fn a_created_table_with_a_foreign_key_applies() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_newfk_{}", std::process::id());
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let own = OwnDatabase::new(&server, "newfk");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("newfk");
     d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\n");
@@ -7180,15 +7086,6 @@ fn a_created_table_with_a_foreign_key_applies() {
     // And the environment it recorded is the one it left: no drift.
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .ok();
-    });
 }
 
 /// A plan that **reshapes a table already there**, applied for real: a column
@@ -7209,18 +7106,8 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_reshape_{}", std::process::id());
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let own = OwnDatabase::new(&server, "reshape");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("reshape");
     std::fs::write(
@@ -7289,15 +7176,6 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
     // And the environment it recorded is the one it left: no drift.
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .ok();
-    });
 }
 
 /// A plan that returns a declared cell to its column's default, applied for
@@ -7312,18 +7190,8 @@ fn a_cell_returned_to_its_default_applies() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_todefault_{}", std::process::id());
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let own = OwnDatabase::new(&server, "todefault");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("todefault");
     let declared = |label: &str| {
@@ -7374,15 +7242,6 @@ fn a_cell_returned_to_its_default_applies() {
     );
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!(
-            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await
-        .ok();
-    });
 }
 
 /// `apply` records the database read back, not the plan applied to the old
@@ -7403,7 +7262,8 @@ fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_during_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "during");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -7414,13 +7274,7 @@ fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("apply-during");
     d.table(
@@ -7632,16 +7486,6 @@ data:
         r[0].try_get_at::<i32>(0).unwrap().unwrap()
     });
     assert_eq!(permissions, 1, "the trigger's revoke must have rolled back");
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        let _ = c
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
-                 DROP DATABASE [{name}];"
-            ))
-            .await;
-    });
 }
 
 /// A plan a policy refuses writes nothing at all — the identity file included.
@@ -9353,18 +9197,12 @@ fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_grantrename_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "grantrename");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("grantrename-live");
     d.table("table: dbo.old\ncolumns:\n  code: {type: varchar(20), nullable: false}\n");
@@ -9446,16 +9284,6 @@ fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
         r[0].try_get_at::<i32>(0).unwrap().unwrap()
     });
     assert_eq!(held, 1, "the grant follows the rename");
-
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        let _ = c
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
-                 DROP DATABASE [{name}];"
-            ))
-            .await;
-    });
 }
 
 /// A staged apply notices a change that lands between two of its reads.
@@ -9470,7 +9298,8 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
     let Ok(server) = std::env::var("PBPS_TEST_DB") else {
         panic!("PBPS_TEST_DB is not set");
     };
-    let name = format!("pbps_cli_stagedmove_{}", std::process::id());
+    let own = OwnDatabase::new(&server, "stagedmove");
+    let name = own.name().to_owned();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -9481,13 +9310,7 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        c.execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .expect("create database");
-    });
-    let connection = format!("{server};Database={name}");
+    let connection = own.connection().to_owned();
 
     let d = Demo::new("stagedmove-live");
     let rows = |rows: &str| {
@@ -9619,14 +9442,67 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["verify", "--db", &connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
 
-    rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
-        let _ = c
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
-                 DROP DATABASE [{name}];"
-            ))
-            .await;
+/// `PBPS_TEST_DB` may legitimately end in `;` — an ADO.NET connection string is
+/// a list of `key=value;` — and eleven tests appended `;Database=…` to it
+/// verbatim, producing `;;`, which the driver refuses as a key with no name.
+/// Every one of them created its database and then could not connect to it
+/// (DECISIONS 199).
+///
+/// No server needed: the defect is in the string.
+#[test]
+fn appending_a_key_leaves_exactly_one_separator() {
+    let base = "Server=localhost,14330;User Id=sa;Password=x;TrustServerCertificate=true";
+    let expected = format!("{base};Database=db");
+    assert_eq!(with_key(base, "Database", "db"), expected);
+    assert_eq!(with_key(&format!("{base};"), "Database", "db"), expected);
+    assert_eq!(with_key(&format!("{base};;;"), "Database", "db"), expected);
+    // Trailing whitespace comes with an environment variable set from a file.
+    assert_eq!(with_key(&format!("{base}; \n"), "Database", "db"), expected);
+    // A separator inside the string is not a trailing one, and stays.
+    assert!(with_key(base, "Database", "db").contains("sa;Password=x"));
+}
+
+/// The other half of the same helper: the database goes away when the test that
+/// owns it panics.
+///
+/// The drop used to be the test's last statement, so every failing live test
+/// leaked one — 58 had accumulated on the shared container when this was found.
+/// `Drop` runs while unwinding, which is exactly the path that was missing
+/// (DECISIONS 199).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_panicking_test_leaves_no_database_behind() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let exists = |name: &str| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let rows = c
+                .query(&format!(
+                    "SELECT COUNT(*) FROM sys.databases WHERE name = N'{name}';"
+                ))
+                .await
+                .expect("count");
+            rows[0].try_get_at::<i32>(0).unwrap().unwrap() > 0
+        })
+    };
+
+    // Derived exactly as the guard derives it, so the assertion afterwards can
+    // ask about the database the panicking scope owned.
+    let name = format!("pbps_cli_panicleak_{}", std::process::id());
+    let taken = std::panic::catch_unwind(|| {
+        let own = OwnDatabase::new(&server, "panicleak");
+        assert!(exists(own.name()), "the guard creates it");
+        panic!("what an assertion failure does");
     });
+
+    assert!(taken.is_err(), "the panic must not be swallowed");
+    assert!(!exists(&name), "`{name}` outlived the test that owned it");
 }

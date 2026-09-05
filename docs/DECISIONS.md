@@ -2881,3 +2881,25 @@ SPEC is in sync with all of these.
     its own, as every other state-writing live test here already does. Teardown
     stays tolerant: after the assertions, a failed `DROP` hides nothing, while a
     panic there would replace the failure the test actually found.
+
+199. **One helper owns a per-test database, and a guard drops it.** 198 gave
+    four live tests a database of their own by copying what eleven others did
+    by hand, and the copy inherited both defects the hand-rolled shape carries.
+
+    The connection string was built as `format!("{server};Database={name}")`
+    with `PBPS_TEST_DB` verbatim. An ADO.NET string is a list of `key=value;`,
+    so a trailing separator is legal and makes `;;`, which tiberius refuses:
+    "Key must not be empty". Measured — every one of those tests creates its
+    database and then cannot connect to it. `with_key` trims the trailing
+    separator and any whitespace, and is the only place a key is appended.
+
+    The drop was each test's last statement, so an assertion that panicked
+    skipped it, and the name carries the pid, so the next run created a
+    differently named database rather than reclaiming the old one. Counted on
+    the shared container: 58 left behind. `OwnDatabase` drops in `Drop`, which
+    runs while unwinding. The teardown stays tolerant for a second reason
+    there: a panic during unwinding aborts the process and would take the rest
+    of the suite with it.
+
+    Both halves are pinned by tests that fail when reverted — the string one
+    without a server, since the defect is in the string.
