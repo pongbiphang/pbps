@@ -238,7 +238,12 @@ The steps:
    yet committed, and step 6 would replace it (**measured**: a version
    staged and a different one in the working tree left the staged blob
    unreachable from the index after the refresh, with `git status` clean).
-   Under the lock, what step 1 saw is what step 6 finds.
+   The entry must also carry no `skip-worktree` or `assume-unchanged` flag
+   (`git ls-files -v` shows them as `S` and `h`): step 6's `--cacheinfo`
+   writes a plain entry and would clear either (**measured**: `S a h b`
+   became `H a H b`), and a path the user has told `git` to leave alone is
+   not one the UI should quietly bring back. Under the lock, what step 1
+   saw is what step 6 finds.
 2. It writes the edited files, and stores each as a blob:
    `git hash-object -w -- <path>`.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
@@ -323,7 +328,14 @@ without `--literal-pathspecs`; a file named `-A` made `git add -N -A` mark
 every untracked file; and `schéma.json` came back C-quoted from `ls-tree`
 without `-z`.
 
-The push is bounded to that one commit, and to it by name. Before composing,
+The push is bounded to that one commit, to it by name, and to one
+destination. A remote may carry several push URLs, and `git push` sends to
+every one of them while `ls-remote`, the witness and the lease each speak to
+one (**measured**: two `pushurl`s, two destinations listed by `git remote
+get-url --push --all`, and a push reaches both, so a lease can hold at the
+first and fail at the second after the first has published). The UI
+requires that command to name exactly one URL, and refuses the remote
+otherwise, listing them. Before composing,
 the UI reads the remote's tip for the branch (`git ls-remote <remote>
 refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
 showing the unpushed commits and the commands instead: a refspec bounds the
@@ -379,9 +391,19 @@ identity, the credential helper and the remote configuration are all things
 the user's `git` already honours and a library has to re-read and
 re-implement — each one a way for a commit made from the UI to differ from a
 commit made from the shell, which is the difference an auditor is entitled to
-ask about. A `git` that prompts — for a passphrase, for a credential — gets
-no terminal from the UI and fails; the page then shows the command to run by
-hand, which is SPEC §6.4's rule for the CLI applied unchanged.
+ask about. A `git` that would prompt — for a passphrase, for a credential —
+must fail rather than wait, and taking away the terminal is not enough for
+that: a credential helper, `GIT_ASKPASS`, `SSH_ASKPASS` or a pinentry can put
+up a window of its own or block with no terminal at all (**measured**: with
+`GIT_TERMINAL_PROMPT=0`, `git credential fill` still ran the program
+`GIT_ASKPASS` named). So every `git` the UI runs gets `GIT_TERMINAL_PROMPT=0`,
+`GIT_ASKPASS` and `SSH_ASKPASS` pointed at a program that exits non-zero
+(**measured**: `git` then fails at once with `unable to read askpass
+response`), `SSH_ASKPASS_REQUIRE=never`, and a deadline: a subprocess still
+running when it expires is killed with its process group, and the page shows
+the command to run by hand, which is SPEC §6.4's rule for the CLI applied
+unchanged. The deadline is what bounds the helpers the environment cannot
+reach, such as a pinentry the user's `gpg-agent` chooses.
 
 ### 6. A `pbps-ui` crate that sees no model, reached through `pbps ui`
 
