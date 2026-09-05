@@ -479,6 +479,30 @@ fn object_permissions_sql<'a>(
     (sql, params)
 }
 
+/// The most parameters one bound statement may carry.
+///
+/// SQL Server refuses an RPC with more than 2,100 parameters, and a bound
+/// statement travels as `sp_executesql`, which spends two of those on its
+/// own `@stmt` and `@params`: 2,098 user parameters are accepted and 2,099
+/// are refused, measured on the pinned image (the live test
+/// `a_query_may_bind_two_fewer_parameters_than_the_server_names`). Named
+/// here rather than read off the driver, which documents the server's
+/// number, because the limit is the server's and the driver is not this
+/// crate's to name (constraint 9).
+const MAX_PARAMETERS: usize = 2098;
+
+/// How many objects fit in one statement beside `perms` permission slots,
+/// at two slots per object. Every object list is asked in pieces of this
+/// size: a foreign-key list or a role's grants past about a thousand objects
+/// made one statement that the server refused, and `doctor` reported an
+/// estate it could have checked as unreadable.
+fn objects_per_statement(perms: usize) -> usize {
+    // Bounded below at one so a permission list that alone filled the
+    // statement would still fail loudly on the server instead of looping
+    // forever here; this crate's own lists are a handful of names.
+    ((MAX_PARAMETERS.saturating_sub(perms)) / 2).max(1)
+}
+
 async fn object_permissions(
     conn: &mut Conn,
     objects: &[ObjectName],
@@ -486,22 +510,23 @@ async fn object_permissions(
     existing: Existing,
 ) -> Result<BTreeMap<ObjectName, BTreeSet<String>>, DbError> {
     let mut out: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
-    // `VALUES ()` is not T-SQL: nothing to ask when nothing is named.
-    if objects.is_empty() {
-        return Ok(out);
-    }
-    let (sql, params) = object_permissions_sql(objects, perms, existing);
-    for row in &conn.query_with(&sql, &params).await? {
-        let schema: &str = get(row, "schema")?;
-        let object: &str = get(row, "object")?;
-        let permission: &str = get(row, "permission")?;
-        // A NULL means the securable did not parse, which `QUOTENAME` on each
-        // part rules out for a name the catalog can hold. Read as "not held"
-        // rather than skipped, for the reason the schema query gives.
-        let held: i32 = row.try_get("held")?.unwrap_or(0);
-        let entry = out.entry(ObjectName::new(schema, object)).or_default();
-        if held != 0 {
-            entry.insert(permission.trim().to_ascii_uppercase());
+    // `VALUES ()` is not T-SQL: nothing to ask when nothing is named — and
+    // `chunks(n)` over an empty list yields nothing, so the loop agrees.
+    for chunk in objects.chunks(objects_per_statement(perms.len())) {
+        let (sql, params) = object_permissions_sql(chunk, perms, existing);
+        for row in &conn.query_with(&sql, &params).await? {
+            let schema: &str = get(row, "schema")?;
+            let object: &str = get(row, "object")?;
+            let permission: &str = get(row, "permission")?;
+            // A NULL means the securable did not parse, which `QUOTENAME` on
+            // each part rules out for a name the catalog can hold. Read as
+            // "not held" rather than skipped, for the reason the schema query
+            // gives.
+            let held: i32 = row.try_get("held")?.unwrap_or(0);
+            let entry = out.entry(ObjectName::new(schema, object)).or_default();
+            if held != 0 {
+                entry.insert(permission.trim().to_ascii_uppercase());
+            }
         }
     }
     Ok(out)
@@ -1097,6 +1122,38 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// One statement per chunk, each within the server's parameter limit,
+    /// and every object asked about exactly once across the chunks. At two
+    /// slots per object, a list past about a thousand names used to become
+    /// one statement the server refused.
+    #[test]
+    fn a_long_object_list_is_asked_in_statements_within_the_parameter_limit() {
+        let perms = ["SELECT", "REFERENCES", "CONTROL"];
+        let objects: Vec<ObjectName> = (0..1_100)
+            .map(|i| ObjectName::new("app", format!("t{i}")))
+            .collect();
+        let per = objects_per_statement(perms.len());
+        let chunks: Vec<&[ObjectName]> = objects.chunks(per).collect();
+        assert!(chunks.len() > 1, "1,100 objects must not fit one statement");
+        let mut seen = 0;
+        for chunk in &chunks {
+            let (sql, params) = object_permissions_sql(chunk, &perms, Existing::OrNot);
+            assert!(
+                params.len() <= MAX_PARAMETERS,
+                "{} params: {sql}",
+                params.len()
+            );
+            assert_eq!(params.len(), perms.len() + 2 * chunk.len());
+            seen += chunk.len();
+        }
+        assert_eq!(seen, objects.len(), "every object is in exactly one chunk");
+        // And the largest chunk is as large as the limit allows: one slot
+        // more per object would cross it.
+        assert!(perms.len() + 2 * (per + 1) > MAX_PARAMETERS, "per={per}");
+        // A list that fits is one statement, as before.
+        assert_eq!(objects[..10].chunks(per).count(), 1);
     }
 
     /// The role permissions are asked for only of a project that declares a
