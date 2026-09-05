@@ -4532,14 +4532,7 @@ async fn preflight(
     // runs first (ADR-0002). The catalog is queried before anything executes, so
     // it still sees the dependency — and reporting it would refuse a plan whose
     // own first statement removes the obstacle.
-    let dropped: std::collections::BTreeSet<String> = plan
-        .changes
-        .changes
-        .iter()
-        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|p| p.change.module_id())
-        .map(ToString::to_string)
-        .collect();
+    let dropped = dropped_referrer_names(&plan.changes);
 
     let mut blocked = Vec::new();
     for target in rename_targets {
@@ -4763,6 +4756,23 @@ async fn finish_transaction<T>(
 fn with_provenance(root: &std::path::Path, mut snapshot: StateSnapshot) -> StateSnapshot {
     snapshot.git_sha = db::git_sha(root);
     snapshot
+}
+
+/// The modules this plan drops, spelled as the catalog spells a referrer.
+///
+/// `rename_impact` names a referrer `schema.name` from `sys.objects`, and a
+/// trigger's `ModuleId` is `schema.table.name` — so the id's own string form
+/// matched nothing, a trigger this plan drops before the rename stayed in the
+/// report, and a schema-bound one refused the plan whose first statement
+/// removes it. The object name is what the catalog has (ADR-0009 §1).
+fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
+    changes
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+        .filter_map(|p| p.change.module_id())
+        .map(|id| id.object_name().to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -5032,6 +5042,35 @@ mod tests {
         let e = refuse(&revoking, &before, &before)
             .expect_err("the revoke this plan asked for did not take");
         assert!(e.contains("role app"), "{e}");
+    }
+
+    /// The rename impact report names a referrer as the catalog does,
+    /// `schema.name`; a trigger this plan drops has to be looked up under that
+    /// spelling, not under its id's, or the drop excuses nothing.
+    #[test]
+    fn a_dropped_trigger_is_excused_from_the_rename_impact_under_its_catalog_name() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                    id: "dbo.t.audit".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::Trigger,
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
+                    id: "dbo.v".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::AlterModule {
+                    id: "dbo.kept".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1".to_owned(),
+                    }),
+                }),
+            ],
+        };
+        let names: Vec<String> = dropped_referrer_names(&changes).into_iter().collect();
+        assert_eq!(names, ["dbo.audit", "dbo.v"]);
     }
 
     /// A dropped routine takes its own grants and no other's: where routines
