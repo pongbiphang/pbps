@@ -108,26 +108,6 @@ so it is *less* recourse than the stale crate, not more. Dialect plugins are
 declined separately: no stable Rust ABI, and a plugin API would freeze
 `ChangeSet` while the model still moves.
 
-### Review findings deferred past PR #10
-
-Answered on the PR but not fixed there, because the closing rounds of its
-review fixed only what the apply guard promises (SPEC 7.6) or what refuses a
-valid plan. Each is small and real.
-
-- `Policies::check` trims `error`, `warning` and `note` before comparing (via
-  `Severity::from_str`) but compares `off` untrimmed, so a quoted `" off "`
-  is reported as `policy.invalid` rather than disabling the rule. Trim it in
-  every `off` comparison, with a test for the quoted spelling.
-- A staged refusal *at a checkpoint* ends "`pbps verify` shows what it is",
-  and it does not: the checkpoint has already recorded the database with the
-  change in it, `record_failed_apply` clones that checkpoint into the failed
-  entry, and `verify` compares against the newest entry — so the database
-  reads clean. (The closing read's refusal is right to say it: the last
-  checkpoint does not hold a change that landed after it.) The refusal's own
-  list is the record of what moved; the checkpoint message should say so and
-  point at `pbps status`, which shows the failed entry's reason, rather than
-  at `verify`. A unit test on `StagedRead::Checkpoint`'s message pins it.
-
 ## Roadmap
 
 **Phase 3.1 is complete** — the usability foundation of SPEC 14, and every P0 row
