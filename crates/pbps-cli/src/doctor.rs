@@ -631,7 +631,7 @@ fn target_arg(d: &EnvDiagnosis) -> String {
         // Quoted: an environment name is a YAML map key, so `US West` is valid
         // and interpolated verbatim becomes two arguments.
         Some(name) => format!("--env {}", crate::report::env_arg(name)),
-        None => "--db <connection string>".to_owned(),
+        None => format!("--db {}", crate::report::placeholder("connection string")),
     }
 }
 
@@ -688,9 +688,10 @@ fn env_findings(d: &EnvDiagnosis, declares_modules: bool) -> Vec<output::Finding
                 ),
             )
             .remedy(format!(
-                "pbps apply {} --plan <plan.json> --checksum <approved-checksum> \
-                 --staged --resume",
-                target_arg(d)
+                "pbps apply {} --plan {} --checksum {} --staged --resume",
+                target_arg(d),
+                crate::report::placeholder("plan.json"),
+                crate::report::placeholder("approved-checksum"),
             )),
         ),
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
@@ -1044,10 +1045,38 @@ mod tests {
                 assert!(!r.contains("--env"), "{state}: {r}");
                 // And what replaces it is the flag this caller used, with the
                 // string itself left out: it carries the password.
-                assert!(r.contains("--db <connection string>"), "{state}: {r}");
+                assert!(r.contains("--db \"<connection string>\""), "{state}: {r}");
                 assert!(!r.contains("localhost,14330/app"), "{state}: {r}");
             }
         }
+    }
+
+    /// Every placeholder a remedy carries is quoted: bare, `<plan.json>` is a
+    /// redirection when pasted, and `--checksum <approved-checksum>` left a
+    /// file called `--checksum` behind (measured with bash 5).
+    #[test]
+    fn no_remedy_carries_a_placeholder_a_shell_would_redirect() {
+        for env in [None, Some("prod"), Some("US West"), Some("prod&rm")] {
+            for state in [
+                "uninitialized",
+                "mid-deployment",
+                "locked",
+                "lock-unknown",
+                "unreachable",
+            ] {
+                for r in remedies(&diagnosed(env, state)) {
+                    assert!(
+                        !crate::report::has_bare_placeholder(&r),
+                        "{env:?} {state}: {r}"
+                    );
+                }
+            }
+        }
+        let staged = remedies(&diagnosed(None, "mid-deployment"));
+        assert!(
+            staged[0].contains("--plan \"<plan.json>\" --checksum \"<approved-checksum>\""),
+            "{staged:?}"
+        );
     }
 
     /// The other half: an `--env` target keeps the name, quoted, because an

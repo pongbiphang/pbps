@@ -25,18 +25,8 @@ use anyhow::Context as _;
 use pbps_dialect::Dialect;
 use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
-use crate::report::shell_arg;
+use crate::report::{placeholder, shell_arg};
 use crate::{db, output, report};
-
-/// What stands in for an environment the reviewer has to supply.
-///
-/// A generated placeholder, never a value, so it is exempt from [`shell_arg`] —
-/// quoting it would make it read as a literal directory called `<environment>`.
-const ENV_PLACEHOLDER: &str = "<environment>";
-
-/// Stands in for a plan path no shell-quoting can carry across POSIX shells,
-/// PowerShell and `cmd` alike. The real path is printed beneath the command.
-const PLAN_PLACEHOLDER: &str = "<plan path>";
 
 /// What `explain` found, for `--format json`.
 ///
@@ -71,7 +61,7 @@ pub struct Explanation {
 
     /// Set only when the plan path could not be spelled safely for every shell
     /// this line is read in, and `approve_with` therefore carries a
-    /// `<plan path>` placeholder. The value is the path, verbatim.
+    /// `"<plan path>"` placeholder. The value is the path, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_path: Option<String>,
     pub probes: Vec<String>,
@@ -271,7 +261,7 @@ fn explain(
     let plan_arg = path
         .to_str()
         .and_then(shell_arg)
-        .unwrap_or_else(|| PLAN_PLACEHOLDER.to_owned());
+        .unwrap_or_else(|| placeholder("plan path"));
 
     // An offline plan has no approval command, because there is nothing to
     // approve: `apply` refuses a `Preview` structurally, whatever target and
@@ -286,11 +276,11 @@ fn explain(
         // printed as if it were, so that case gets the placeholder too.
         let mut approve = format!(
             "pbps apply --env {} --plan {} --checksum {}",
-            // The placeholder is generated, not user input, and must stay
-            // visibly a placeholder rather than become a quoted string.
+            // A placeholder rather than a value, so it is not `shell_arg`'s
+            // to quote — `placeholder` spells it for every shell at once.
             match env {
-                Some(name) => shell_arg(name).unwrap_or_else(|| ENV_PLACEHOLDER.to_owned()),
-                None => ENV_PLACEHOLDER.to_owned(),
+                Some(name) => shell_arg(name).unwrap_or_else(|| placeholder("environment")),
+                None => placeholder("environment"),
             },
             plan_arg,
             plan.checksum()
@@ -313,7 +303,10 @@ fn explain(
         }
         approve
     } else {
-        format!("pbps plan --env {ENV_PLACEHOLDER} --out {plan_arg}")
+        format!(
+            "pbps plan --env {} --out {plan_arg}",
+            placeholder("environment")
+        )
     };
 
     Ok(Explanation {
@@ -333,7 +326,7 @@ fn explain(
         role_count,
         risks,
         approve_with: approve,
-        plan_path: (plan_arg == PLAN_PLACEHOLDER).then_some(literal),
+        plan_path: (plan_arg == placeholder("plan path")).then_some(literal),
         probes: dialect
             .preflight(cs)
             .into_iter()
@@ -607,9 +600,10 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     ));
     if let Some(literal) = &e.plan_path {
         out.push_str(&format!(
-            "\n  <plan path> is:\n    {literal}\n  \
+            "\n  {} is:\n    {literal}\n  \
              Quote it the way your own shell needs — it contains characters that no\n  \
-             single spelling is safe for in POSIX shells, PowerShell and cmd alike.\n"
+             single spelling is safe for in POSIX shells, PowerShell and cmd alike.\n",
+            placeholder("plan path")
         ));
     }
     out
