@@ -32,7 +32,8 @@ checksum-pinned, and state lives in the database itself.
 - Do not tell me something is finished until it is.
 - Treat quiet as quiet, not as convergence. A reviewer running out of credits is
   not a clean bill of health.
-- Never merge. The merge decision is mine.
+- Never merge, except an issue PR that has finished the issue loop below.
+  Every other merge decision is mine.
 - Recurring background work (CI watches, check-ins) is welcome; keep the notes
   it carries accurate, and stop it when the work is done.
 
@@ -74,9 +75,22 @@ checksum-pinned, and state lives in the database itself.
   a review only if its `Reviewed commit:` is the pushed head. Never push a
   docs-only commit to move the count.
 - On stopping: kill the watch, post no further `@codex review`, and report the
-  count and every finding left unaddressed.
-- Mark the draft ready only at merge time, as the last step. Never add "one more
-  round" — more review is a new instruction.
+  count and every finding left unaddressed. An issue PR then enters the issue
+  loop; any other PR waits for me.
+- Never add "one more round" — more review is a new instruction.
+
+## The issue loop
+
+- After three consecutive reviews with no P1, mark the issue PR ready. That
+  triggers one more review; wait for it.
+- No P1 in that review: merge with a merge commit (`gh pr merge --merge`),
+  delete the branch, remove the worktree. A P1: the count resets — back to the
+  review loop, still as a draft.
+- Wait for CI on `master` to pass after the merge. Red CI is the next task, not
+  the next issue.
+- Green CI: take the next issue, following "Taking an issue".
+- Report at each merge: the review count, the merge commit, and every finding
+  deferred to an issue.
 
 ## How to be right here
 
