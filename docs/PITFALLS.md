@@ -511,6 +511,31 @@ second `CREATE TABLE` fails naming a table the declarations do not contain.
 to it — the failure is loud and names itself. The two are found the same way,
 and only one way: declare the out-of-range value and read the catalog back.
 
+## A blanket refusal removed, and only part of it replaced
+
+The PostgreSQL crate refused every table outright while the type catalogue was
+unbuilt. Building the catalogue turned that one refusal into a real
+`validate_table` — and the replacement covered the schema name, the table name,
+the column names and the column types, because those are what the step was
+about. It did not cover the primary key's name, the keys of `unique`,
+`foreign_keys`, `checks` and `indexes`, nor any rule about `identity:`. Every
+one of those had been refused the day before, by the blanket, and was silently
+admitted the day after.
+
+Nothing in the diff looked wrong. The new code was strictly more useful than
+what it replaced, and each thing it checked, it checked correctly. The gap only
+exists relative to what the blanket used to cover, and a diff does not show
+that.
+
+**The shape:** a coarse refusal is replaced by a precise one, and the precise
+one is written from the feature that motivated it rather than from the set the
+coarse one held. Anything the blanket covered incidentally is now permitted.
+
+**How to avoid it:** when you delete a refusal, enumerate what it was refusing —
+not what you are about to allow — and account for every item. Here that means
+every name the object owns and every field of the declaration, not only the
+ones the current step reads.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

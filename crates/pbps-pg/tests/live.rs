@@ -891,3 +891,94 @@ async fn an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change() {
         "an exact decimal into a binary float is a change that needs approval"
     );
 }
+
+/// The identity rule, asked of the engine rather than of the documentation.
+///
+/// `validate` refuses an `identity:` on anything but the three integers, and
+/// refuses it beside a `default:` or a `nullable: true`. Each of those is a
+/// sentence this engine prints, so each is asked here in the form the emitter
+/// would produce: if the dialect and the engine ever part company, the pair
+/// that disagrees is named.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
+    let mut conn = connect().await;
+    let table = "pbps_live_identity";
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+
+    for declared in [
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric(10,0)",
+        "numeric",
+        "text",
+        "uuid",
+        "real",
+        "double precision",
+    ] {
+        let engine = conn
+            .execute(&format!(
+                "CREATE TABLE {table} (id {declared} GENERATED ALWAYS AS IDENTITY)"
+            ))
+            .await;
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+
+        let mut declaration = pbps_model::Table::default();
+        let mut column = pbps_model::Column::new(declared.parse::<ColumnType>().expect("parses"));
+        // An identity is NOT NULL on both sides, and `Column::new` is nullable.
+        column.nullable = false;
+        column.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        declaration.columns.insert("id".to_owned(), column);
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+
+        assert_eq!(
+            engine.is_ok(),
+            found.is_empty(),
+            "`{declared}` as an identity: the engine {}, and pbps says {found:?}",
+            if engine.is_ok() { "took it" } else { "refused" }
+        );
+    }
+
+    // The refusals that are not about the type. Each is the engine's, and each
+    // is what `validate` says without connecting.
+    for (definition, refused) in [
+        ("id integer NULL GENERATED ALWAYS AS IDENTITY", "nullable"),
+        (
+            "id integer DEFAULT 7 GENERATED ALWAYS AS IDENTITY",
+            "a default",
+        ),
+        (
+            "id integer GENERATED ALWAYS AS IDENTITY (INCREMENT BY 0)",
+            "an increment of zero",
+        ),
+    ] {
+        let engine = conn
+            .execute(&format!("CREATE TABLE {table} ({definition})"))
+            .await;
+        assert!(engine.is_err(), "the engine took {refused}");
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+    }
+
+    // And the rule that is SQL Server's alone: that dialect refuses a second
+    // IDENTITY column, this engine takes one per column. `validate` carries no
+    // such rule here, and this is what says so.
+    conn.execute(&format!(
+        "CREATE TABLE {table} (a integer GENERATED ALWAYS AS IDENTITY, \
+         b integer GENERATED ALWAYS AS IDENTITY)"
+    ))
+    .await
+    .expect("two identity columns in one table");
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+}

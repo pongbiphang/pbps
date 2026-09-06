@@ -82,6 +82,54 @@ impl Unbuilt {
 ///   table the declarations do not contain.
 const MAX_IDENT_BYTES: usize = 63;
 
+/// What this engine refuses about an `identity:`, each measured on 18.6.
+///
+/// `validate` is where a declaration should fail, and until the catalogue
+/// existed this could not be asked: `validate_table` refused every table
+/// outright, so nothing reached the question.
+fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
+    let Some(identity) = declared.identity else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: "postgres",
+        message,
+    };
+    if !types::can_be_identity(&declared.ty) {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
+             identity column type must be smallint, integer, or bigint. A `numeric` is refused \
+             here even with a scale of zero, where SQL Server admits one.",
+            declared.ty
+        )));
+    }
+    // `GENERATED ... AS IDENTITY` implies NOT NULL, and saying both is
+    // `conflicting NULL/NOT NULL declarations`.
+    if declared.nullable {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:`, so it cannot be nullable: the engine refuses \
+             the pair as conflicting NULL/NOT NULL declarations."
+        )));
+    }
+    // `INCREMENT must not be zero`, and it is worth saying why rather than
+    // quoting: a step of zero hands every row the same value.
+    if identity.increment == 0 {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:` with an increment of 0, which never advances: \
+             the engine refuses it as INCREMENT must not be zero."
+        )));
+    }
+    // `both default and identity specified for column`.
+    if declared.default.is_some() {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:` and a `default:`. The engine refuses both on \
+             one column, and the identity is the one that supplies the value."
+        )));
+    }
+    found
+}
+
 /// The PostgreSQL dialect.
 pub struct Postgres;
 
@@ -187,6 +235,24 @@ impl Dialect for Postgres {
                 found.push(e);
             }
         }
+        // Every other name the table owns, which the engine truncates at the
+        // same limit and which the emitter has to spell just as often: the
+        // primary key's, and the keys of the four maps.
+        let owned = table
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_deref())
+            .into_iter()
+            .chain(table.unique.keys().map(String::as_str))
+            .chain(table.foreign_keys.keys().map(String::as_str))
+            .chain(table.checks.keys().map(String::as_str))
+            .chain(table.indexes.keys().map(String::as_str));
+        for object in owned {
+            if let Err(e) = self.quote_ident(object) {
+                found.push(e);
+            }
+        }
+
         for (column_name, column) in &table.columns {
             if let Err(e) = self.quote_ident(column_name) {
                 found.push(e);
@@ -200,7 +266,9 @@ impl Dialect for Postgres {
             }
             if let Err(e) = types::normalize(&column.ty) {
                 found.push(e);
+                continue;
             }
+            found.extend(identity_problems(column_name, column));
         }
         found
     }
@@ -435,6 +503,122 @@ mod tests {
             Postgres
                 .validate_table(&"app.t".parse().unwrap(), &ok)
                 .is_empty()
+        );
+    }
+
+    /// The names a table owns are not only its own and its columns'. Each of
+    /// these is emitted as an identifier and truncated by the server at the
+    /// same limit, so `validate` has to ask about all of them or a plan fails
+    /// on a name it printed itself.
+    #[test]
+    fn validating_a_table_refuses_every_owned_name_the_emitter_could_not_spell() {
+        let long = "a".repeat(MAX_IDENT_BYTES + 1);
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some(long.clone()),
+            columns: vec!["id".to_owned()],
+        });
+        table.unique.insert(
+            long.clone(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["id".to_owned()],
+            },
+        );
+        table.checks.insert(
+            long.clone(),
+            pbps_model::CheckConstraint {
+                expression: "id > 0".to_owned(),
+            },
+        );
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        // The primary key, the unique constraint and the check: three names.
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|e| matches!(e, DialectError::UnquotableIdent(_))),
+            "{found:?}"
+        );
+    }
+
+    /// Measured on 18.6, and the engine says it in so many words: `identity
+    /// column type must be smallint, integer, or bigint`. A `numeric` is
+    /// refused even with a scale of zero, which is where SQL Server's rule and
+    /// this one part company.
+    #[test]
+    fn an_identity_is_refused_on_a_type_this_engine_will_not_carry_one_on() {
+        for (declared, accepted) in [
+            ("smallint", true),
+            ("integer", true),
+            ("bigint", true),
+            ("numeric(10,0)", false),
+            ("numeric", false),
+            ("text", false),
+            ("uuid", false),
+            ("real", false),
+        ] {
+            let mut table = Table::default();
+            let mut column = pbps_model::Column::new(ty(declared));
+            column.nullable = false;
+            column.identity = Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            table.columns.insert("id".to_owned(), column);
+            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            assert_eq!(
+                found.is_empty(),
+                accepted,
+                "`{declared}` as an identity: {found:?}"
+            );
+            if !accepted {
+                assert!(
+                    found[0]
+                        .to_string()
+                        .contains("smallint, integer, or bigint")
+                );
+            }
+        }
+    }
+
+    /// The three the engine refuses for a reason that is not the type:
+    /// `conflicting NULL/NOT NULL declarations`, `both default and identity
+    /// specified for column`, and `INCREMENT must not be zero`. Each is a rule
+    /// the shipped SQL Server dialect carries too; the one that does *not*
+    /// cross over is "only one IDENTITY per table", which this engine allows.
+    #[test]
+    fn an_identity_that_is_nullable_or_defaulted_or_never_advances_is_refused() {
+        let mut table = Table::default();
+        let mut column = pbps_model::Column::new(ty("integer"));
+        column.nullable = true;
+        column.default = Some("7".to_owned());
+        column.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 0,
+        });
+        table.columns.insert("id".to_owned(), column.clone());
+        // A second identity column, which this engine takes: it must not add a
+        // refusal of its own, only the three this one already earns.
+        table.columns.insert("other".to_owned(), {
+            let mut c = pbps_model::Column::new(ty("bigint"));
+            c.nullable = false;
+            c.identity = Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            c
+        });
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().any(|e| e.to_string().contains("nullable")));
+        assert!(found.iter().any(|e| e.to_string().contains("`default:`")));
+        assert!(
+            found
+                .iter()
+                .any(|e| e.to_string().contains("never advances"))
         );
     }
 

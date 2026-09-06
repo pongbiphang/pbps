@@ -406,6 +406,16 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
     Ok(())
 }
 
+/// Whether a column of this type may carry an `identity:`.
+///
+/// **Measured on 18.6**, and the engine says it in so many words: `identity
+/// column type must be smallint, integer, or bigint`. Not the shape of its SQL
+/// Server counterpart, which admits a `decimal` with scale zero — here
+/// `numeric(10,0)` is refused like any other.
+pub fn can_be_identity(ty: &ColumnType) -> bool {
+    normalize(ty).is_ok_and(|t| matches!(t.base.as_str(), "smallint" | "integer" | "bigint"))
+}
+
 // ---------------------------------------------------------------------------
 // Risk
 // ---------------------------------------------------------------------------
