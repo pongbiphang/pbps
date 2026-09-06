@@ -65,6 +65,21 @@ pub enum DbError {
         code: Option<String>,
     },
 
+    /// The server was reached and is not the session the connection string
+    /// requires (`target_session_attrs`).
+    ///
+    /// Its own variant because it is the one connection failure that is not
+    /// about *reaching* a server: `cannot reach {addr}` would be false, and the
+    /// fix is to point the string at a different server rather than to open a
+    /// port. It does not make the three of ADR-0014 §3 into four — those three
+    /// are how a socket can fail, and this is a server that answered.
+    #[error("`{addr}` is a {found} session, and this connection string requires {wanted}")]
+    WrongSession {
+        addr: String,
+        wanted: &'static str,
+        found: &'static str,
+    },
+
     /// A catalog row did not have the shape the query promised — a bug in the
     /// introspection SQL, not bad data in the database.
     #[error("unexpected row shape: {0}")]
@@ -97,6 +112,7 @@ impl DbError {
             DbError::BadConnectionString(_)
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
+            | DbError::WrongSession { .. }
             | DbError::BadRow(_) => None,
         }
     }

@@ -3581,3 +3581,29 @@ SPEC is in sync with all of these.
       naming a table the declarations do not contain. The SQL Server
       counterpart counts **characters** (128), so copying its shape would have
       been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
+      been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
+
+231. **`target_session_attrs` is reproduced at the seam, not refused and not
+    dropped.** `Config::connect` runs a `SHOW transaction_read_only` probe
+    *after* the handshake; this seam calls `connect_raw` — which is what keeps
+    the three connection failures three (ADR-0014 §3) — and inherits none of
+    it. Dropped silently, a string saying "never a writable primary" would have
+    got one and run DDL on it.
+
+    Reproduced rather than refused, unlike `hostaddr` and multiple hosts in 229,
+    and the difference is which failure each choice risks: refusing
+    `target_session_attrs=read-write` would refuse a string that works, and
+    refusing a valid input is the one thing this project's review rules put
+    first. The probe is fifteen lines and needs nothing new.
+
+    It gets its own `DbError::WrongSession`, because it is the one connection
+    failure that is not about *reaching* a server — `cannot reach {addr}` would
+    be false, and the fix is a different server rather than an open port. That
+    does not make ADR-0014's three into four: those three are how a socket can
+    fail, and this is a server that answered.
+
+    What the seam still drops is in issue #113: `keepalives`, `tcp_user_timeout`
+    and `connect_timeout` are applied by the driver's own `connect_socket` and
+    by nothing here. Left there rather than fixed with this one, because
+    honouring them needs a new dependency and refusing them refuses strings that
+    work — a choice, not a bug fix.

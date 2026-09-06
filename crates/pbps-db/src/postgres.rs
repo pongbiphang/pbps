@@ -95,9 +95,84 @@ impl Conn {
             // second failure beside the real one.
             let _ = connection.await;
         });
-        Ok(Self {
+        let mut conn = Self {
             client,
             _driver: driver,
+        };
+        // The endpoint is spelled again rather than kept: `addr` is moved into
+        // whichever of the two connect errors above fires.
+        conn.require_session(config.get_target_session_attrs(), &format!("{host}:{port}"))
+            .await?;
+        Ok(conn)
+    }
+
+    /// Enforces `target_session_attrs`, which `connect_raw` does not.
+    ///
+    /// `Config::connect` runs this probe itself, *after* the handshake; this
+    /// seam calls `connect_raw` — which is what keeps the three connection
+    /// failures three — and inherits none of it. Dropping the constraint
+    /// silently would point DDL at a primary the connection string excluded.
+    ///
+    /// Reproduced rather than refused: `target_session_attrs=read-write` is an
+    /// ordinary thing to write in front of a replica set, and refusing it would
+    /// refuse a string that works. `SHOW transaction_read_only` is the question
+    /// the driver asks and the one libpq asks.
+    ///
+    /// The only other thing `Config::connect` does past `connect_raw` is record
+    /// a socket config for `CancelToken`. Nothing here cancels a query and no
+    /// token is ever built, so there is nothing to reproduce.
+    async fn require_session(
+        &mut self,
+        wanted: tokio_postgres::config::TargetSessionAttrs,
+        addr: &str,
+    ) -> Result<(), DbError> {
+        use tokio_postgres::config::TargetSessionAttrs;
+
+        if wanted == TargetSessionAttrs::Any {
+            return Ok(());
+        }
+        // `if` rather than `match`: the enum is `#[non_exhaustive]`, so a match
+        // needs a wildcard arm, and a wildcard over a foreign enum is the
+        // shape `wildcard_enum_match_arm` exists to refuse.
+        let wanted_read_only = if wanted == TargetSessionAttrs::ReadOnly {
+            true
+        } else if wanted == TargetSessionAttrs::ReadWrite {
+            false
+        } else {
+            // A value a later driver added, which this seam has never checked.
+            // An unchecked constraint must not read as a satisfied one.
+            return Err(DbError::BadConnectionString(format!(
+                "`target_session_attrs` is set to {wanted:?}, which this build \
+                 does not know how to check"
+            )));
+        };
+        let rows = self.query("SHOW transaction_read_only").await?;
+        let answer = rows.first().map(|r| r.str_at(0)).transpose()?.flatten();
+        let read_only = match answer {
+            Some("on") => true,
+            Some("off") => false,
+            // Absent, empty and unreadable are three different things, and none
+            // of them is "the session is acceptable".
+            Some(other) => {
+                return Err(DbError::BadRow(format!(
+                    "`SHOW transaction_read_only` answered `{other}`, which is \
+                     neither `on` nor `off`"
+                )));
+            }
+            None => {
+                return Err(DbError::BadRow(
+                    "`SHOW transaction_read_only` returned no row".to_owned(),
+                ));
+            }
+        };
+        if read_only == wanted_read_only {
+            return Ok(());
+        }
+        let name = |read_only: bool| if read_only { "read-only" } else { "read-write" };
+        Err(DbError::WrongSession {
+            addr: addr.to_owned(),
+            wanted: name(wanted_read_only),
+            found: name(read_only),
         })
     }
 

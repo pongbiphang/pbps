@@ -30,11 +30,14 @@ use pbps_pg::Postgres;
 /// The driver is named here once, as it is on the SQL Server side: every test
 /// in this file speaks to the container `scripts/live-tests-pg.sh` starts.
 async fn connect() -> Conn {
-    let connection = std::env::var("PBPS_TEST_PG_DB")
-        .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh");
-    Conn::connect(Driver::Postgres, &connection)
+    Conn::connect(Driver::Postgres, &conn_str())
         .await
         .expect("connect to the live server")
+}
+
+fn conn_str() -> String {
+    std::env::var("PBPS_TEST_PG_DB")
+        .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh")
 }
 
 /// The error from a connection that must not succeed.
@@ -128,6 +131,7 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
         DbError::BadConnectionString(_)
         | DbError::ConnectTimeout { .. }
         | DbError::Driver { .. }
+        | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a refused socket is not {error:?}"),
     }
 }
@@ -192,6 +196,7 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::Driver { .. }
+        | DbError::WrongSession { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
     }
     let waited = started.elapsed();
@@ -398,4 +403,54 @@ async fn the_engine_and_the_dialect_agree_on_what_a_name_becomes() {
     assert!(Postgres.quote_ident(&long[..63]).is_ok());
     assert!(Postgres.quote_ident(&"ä".repeat(32)).is_err());
     assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
+}
+
+/// `target_session_attrs` is a constraint on *which server*, and this seam has
+/// to enforce it itself: `Config::connect` runs the probe after the handshake,
+/// and `connect_raw` — which is what keeps the three connection failures three
+/// — does not. Dropped silently, a string saying "never a writable primary"
+/// would have got one, and DDL would have run on it.
+///
+/// Both directions, on one server: the session's own
+/// `default_transaction_read_only` is what `SHOW transaction_read_only`
+/// reports, so the connection string can make the same server either kind.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_session_the_connection_string_excludes_is_refused() {
+    let writable = conn_str();
+    let read_only = format!("{writable} options='-c default_transaction_read_only=on'");
+
+    for (connection, wanted) in [(&writable, "read-write"), (&read_only, "read-only")] {
+        Conn::connect(
+            Driver::Postgres,
+            &format!("{connection} target_session_attrs={wanted}"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a {wanted} session satisfies target_session_attrs: {e}"));
+    }
+
+    for (connection, wanted, found) in [
+        (&writable, "read-only", "read-write"),
+        (&read_only, "read-write", "read-only"),
+    ] {
+        let error = refusal(&format!("{connection} target_session_attrs={wanted}")).await;
+        match &error {
+            DbError::WrongSession {
+                wanted: asked,
+                found: got,
+                ..
+            } => {
+                assert_eq!(*asked, wanted);
+                assert_eq!(*got, found);
+            }
+            DbError::BadConnectionString(_)
+            | DbError::Connect { .. }
+            | DbError::ConnectTimeout { .. }
+            | DbError::Driver { .. }
+            | DbError::BadRow(_) => panic!("a session mismatch is not {error:?}"),
+        }
+        // Reached, not unreachable: the message must not read as a network
+        // failure, because the fix is a different server and not an open port.
+        assert!(!error.to_string().contains("cannot reach"), "{error}");
+    }
 }
