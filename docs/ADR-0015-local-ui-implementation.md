@@ -194,8 +194,12 @@ the way step 3 below writes one (`git ls-tree -r -z <tip>` and `git
 cat-file --batch`, regular-file entries only, under
 `<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3 states),
 lays the working tree's version of each listed file over it from bytes
-read through the file's handle whose hash is the id the page carries, and
-runs the CLI's own intent command there — `pbps rename <from> <to>
+read through the file's handle whose hash is the id the page carries —
+and *removes* from it each listed file the working tree no longer has, a
+`D` in that listing, because a table or a role is dropped or renamed by
+deleting or renaming its declaration file, and a snapshot that still held
+the old file would give the command nothing that disappeared to resolve
+— and runs the CLI's own intent command there — `pbps rename <from> <to>
 --no-input --project <that directory>/<the project's path>` and its
 siblings, with no `--format`, which the intent commands do not take
 (**measured**: `rename --format json` exited 2 with `unexpected argument
@@ -207,8 +211,14 @@ given, the ids file among them, found by hashing the snapshot against `git
 ls-tree` — the same set a CLI user commits after `pbps rename`. The
 declaration files already hold their bytes in the working tree, so step 2
 places nothing for them and step 1's check that each still hashes to the
-page's id is the whole of their handling; what the command changed is
-placed as step 2 describes. The browser never composes a declaration or an
+page's id is the whole of their handling; a deleted one must still be
+absent (the no-follow lookup through its directory handle fails with
+`ENOENT`) and is removed from the tree and the index rather than set, `git
+update-index --force-remove -- <path>` in both of step 3's indexes, the
+form that removes the entry whatever the working tree holds (**measured**:
+after it the written tree lacked the path, and with the commit on the
+branch and the prepared index installed, `git status` was clean); what the
+command changed is placed as step 2 describes. The browser never composes a declaration or an
 ids-file line: the identity mapping a rename records comes from
 `pbps_diff::resolve`, which the intent command runs and the UI cannot, and
 a UI that chose the uid itself could write an ids file that is internally
