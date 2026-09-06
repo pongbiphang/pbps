@@ -268,8 +268,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    carrying both showed as `s`), and a path the user has told `git` to
    leave alone is not one the UI should quietly bring back. Under the
    lock, what step 1 saw is what step 6 finds.
-2. It writes each edited file beside its path and puts it in place with an
-   atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
+2. It writes each edited file beside its path, gives it the mode the tip's
+   entry has — executable for `100755`, since the exchange swaps the
+   files' metadata with them and a `0644` temporary would leave a `100755`
+   path reported modified under `core.fileMode` — and puts it in place
+   with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
    `renamex_np(RENAME_SWAP)` — then hashes the file that came *out*: if
    it is the blob the page was shown, the old version is discarded; if it
    is not, an editor saved between step 1's check and the exchange, the
