@@ -10,8 +10,8 @@ use pbps_db::{Conn, DbError, FromColumn, Row};
 use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
-    Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
-    RawModule, RawTable, assemble,
+    IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
+    RawKeyColumn, RawModule, RawTable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the `__pbps_` filter drops this
@@ -76,9 +76,14 @@ SELECT cc.parent_object_id AS object_id, cc.name, cc.definition
 /// PK- and UNIQUE-backing indexes are already covered by `KEY_COLUMNS`;
 /// hypothetical indexes are the tuning wizard's ghosts. Included columns sort
 /// after key columns so the assembler sees keys in key order first.
+///
+/// `i.type` travels whole rather than collapsed into a clustered flag. Read as
+/// `type = 1` and nothing else, every other physical kind — XML (3), spatial
+/// (4), columnstore (5, 6), hash (7) — answered "not clustered" and was adopted
+/// as the ordinary rowstore index it is not. The code is what lets the
+/// assembler say which kind it left out.
 const INDEX_COLUMNS: &str = "\
-SELECT i.object_id, i.name, i.is_unique,
-       CONVERT(bit, CASE WHEN i.type = 1 THEN 1 ELSE 0 END) AS is_clustered,
+SELECT i.object_id, i.name, i.is_unique, i.type AS index_type,
        i.filter_definition,
        col.name AS column_name, ic.is_included_column, ic.is_descending_key
   FROM sys.indexes i
@@ -225,7 +230,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             object_id: get(&row, "object_id")?,
             index_name: get::<&str>(&row, "name")?.to_owned(),
             is_unique: get(&row, "is_unique")?,
-            is_clustered: get(&row, "is_clustered")?,
+            kind: IndexKind::from_type_code(get::<u8>(&row, "index_type")?),
             filter: opt::<&str>(&row, "filter_definition")?.map(str::to_owned),
             column: get::<&str>(&row, "column_name")?.to_owned(),
             is_included: get(&row, "is_included_column")?,

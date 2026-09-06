@@ -434,6 +434,75 @@ async fn pull_warns_about_what_it_cannot_express() {
     );
 }
 
+/// A columnstore or XML index has the same catalog shape as a rowstore one and
+/// is not `type = 1`, so the clustered flag alone called it an ordinary index
+/// and `pull` wrote it into the declarations as one — bootstrapping a B-tree
+/// where the database had a columnstore, or a `CREATE INDEX` the engine cannot
+/// run. The engine is asked here because the shape of the catalog rows these
+/// indexes produce is the whole question (issue #89).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_a_plain_one() {
+    let mut db = TestDb::create("kinds").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.wide (id int NOT NULL, note nvarchar(50) NULL);
+             CREATE NONCLUSTERED COLUMNSTORE INDEX ncci_wide ON dbo.wide (id, note);
+             CREATE INDEX ix_wide_note ON dbo.wide (note);",
+        )
+        .await
+        .expect("create wide");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.archive (id int NOT NULL, note nvarchar(50) NULL);
+             CREATE CLUSTERED COLUMNSTORE INDEX cci_archive ON dbo.archive;",
+        )
+        .await
+        .expect("create archive");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.docs (
+                 id int NOT NULL CONSTRAINT pk_docs PRIMARY KEY CLUSTERED,
+                 doc xml NULL
+             );
+             CREATE PRIMARY XML INDEX pxi_docs ON dbo.docs (doc);",
+        )
+        .await
+        .expect("create docs");
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let indexes = |schema: &str, table: &str| {
+        pulled.schema.tables[&TableName::new(schema, table)]
+            .indexes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // The negative case: the one kind the model does hold is still adopted.
+    assert_eq!(indexes("dbo", "wide"), ["ix_wide_note"]);
+    assert!(indexes("dbo", "archive").is_empty());
+    assert!(indexes("dbo", "docs").is_empty());
+
+    let said = pulled.warnings.join("\n");
+    for (name, kind) in [
+        ("ncci_wide", "columnstore"),
+        ("cci_archive", "columnstore"),
+        ("pxi_docs", "XML"),
+    ] {
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains(name) && w.contains(kind)),
+            "{name} was not reported as {kind}: {said}"
+        );
+    }
+}
+
 /// ADR-0002: modules are not managed, but a pull that does not even see them
 /// tells the user the database is covered when half of it is not.
 #[tokio::test]
