@@ -232,7 +232,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    remote's tip for that branch, under the rules below. It requires each path
    it is about to edit to still hold what the page was shown: the page's
    request carries the blob id of the file it read, step 1 hashes the file
-   as it is now (`git hash-object --no-filters -- <path>`, no `-w`) and
+   as it is now (bytes read through the handle, `git hash-object
+   --no-filters --stdin`, no `-w`) and
    refuses if the two differ — the locks stop `git`, not an editor saving
    the same file, and the browser's copy would otherwise overwrite newer
    work (**measured**: the page's id and the id after an editor's save
@@ -312,7 +313,14 @@ locked-copy `update-index` ran it), so every `git` also takes
    lists what is there and how to clear it. Where that directory is on
    another filesystem and
    the move fails, the file stays beside the path under its temporary
-   name and the page says so. Step 1's comparison and this write cannot
+   name and the page says so. Every hash the UI takes of a working-tree
+   file — here, in step 1, and of the swapped-out file — is taken over
+   bytes read through the no-follow handle of step 1, fed to `git
+   hash-object --stdin`, never by handing `git` the path to reopen: a
+   directory component swapped for a link between the handle's opening
+   and a reopen by name would have `git` read an outside file and put its
+   bytes into the commit, while the UI had installed its own through the
+   handle. Step 1's comparison and this write cannot
    be made one operation, so the exchange makes the write reversible
    instead: nothing is overwritten, only swapped, and what was swapped
    out is inspected and then kept (**measured**: the exchange put the UI's bytes at
@@ -337,8 +345,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    the one at stake here, and step 3 of #64 measures it, since nothing on
    Windows has been measured for this ADR. A platform with none of these
    refuses to compose rather than overwrite a file it cannot prove is the
-   one the page saw. Each file is then stored as a blob exactly as written:
-   `git hash-object -w --no-filters -- <path>`.
+   one the page saw. Each file is then stored as a blob exactly as written,
+   from the bytes the UI holds: `git hash-object -w --no-filters --stdin`.
    Without the flag
    `hash-object` runs the path's `clean` filter like `git add` does — a
    program from `.gitattributes` and the configuration that neither
