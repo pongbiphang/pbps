@@ -235,9 +235,15 @@ step made in the CLI user's own order, in this order:
   the rest of this list means by *the declarations* and *the ids file*.
 - **The listing.** `git status --porcelain -z --untracked-files=all
   --ignored=matching -- <the declarations> <the ids file>`: the pathspec
-  is those two and never the project directory, so that a modified
-  `README` or anything else the user has open beside the declarations is
-  neither laid over the snapshot nor committed with the intent;
+  is those two and never the project directory, and of what it returns
+  the UI keeps only the files the CLI itself reads — a path under the
+  declarations directory whose extension is `.yml` or `.yaml`, which is
+  what `pbps_load` collects walking that directory, and the ids file at
+  exactly its path — so that a `README`, an editor's stray file or a
+  source file the user has open beside the declarations is neither laid
+  over the snapshot nor committed with the intent, which matters most
+  under the supported `schema_dir: .`, where the pathspec is the whole
+  project;
   `--untracked-files=all` because `status.showUntrackedFiles=no` in the
   user's configuration would otherwise hide the new side of a file-based
   rename (**measured**: under it the listing held the deleted old path
@@ -830,23 +836,35 @@ just made (**measured**: interrupted there, `git status` reported `MM` for
 the path, and deleting the lock left it reporting the same). The gap
 cannot be closed — a ref and an index are two files — so it is made
 recoverable instead, and so is every earlier interval, since a crash
-during step 2 leaves a placed file and a held lock with nothing on disk
-to say so. The record is written before the first placement and grows
-with the compose. The UI creates
-`<git-dir>/pbps-ui/composing/<random>.json`, flushing it and its
-directory at each write, and writes a phase into it before it does the
-thing that phase names — never after, so that the record is at worst one
-step ahead of the disk and never behind it:
+anywhere from step 0 leaves a lock, and one during step 2 a placed file
+too, with nothing on disk to say whose they are. The record is therefore
+the compose's first act, before any lock exists, and it grows with it.
+The UI creates `<git-dir>/pbps-ui/composing/<random>.json`, flushing it
+and its directory at each write, and writes a phase into it before it
+does the thing that phase names — never after, so that the record is at
+worst one step ahead of the disk and never behind it:
 
-- `placing`, before step 2 touches the first path, holding the record's
-  own id, the branch and the tip it leased, and, for each path as it is
-  placed, the temporary name beside it — the name a `link()` was made
-  from, or the one the exchange put the old file under.
-- `composed`, before step 5, adding the commit's id and the hash of the
-  prepared `<index>.lock`, and the entry step 3 recorded for each path.
+- `locking`, before step 0 creates a single file, holding the record's
+  own id alone, so that the locks it is about to make are already
+  attributable; the hash of `<index>.lock` is written to the record as
+  soon as the copy exists, and again whenever the UI rewrites that file.
+- `placing`, before step 2 touches the first path, adding the branch and
+  the tip step 1 recorded, and, for each path as it is placed, the
+  temporary name beside it — the name a `link()` was made from, or the
+  one the exchange put the old file under.
+- `composed`, before step 5, adding the commit's id and the entry step 3
+  recorded for each path. Every file step 2 wrote is flushed before this
+  phase is written — the replacement's contents through its handle, and
+  each directory an exchange, a `link()` or a rename changed — because
+  what makes the interval recoverable is that the tree on disk is the one
+  the record describes, and a machine that stopped with the branch moved
+  and the placements still in a cache would be recovered into a checkout
+  holding the old bytes.
 - `installed`, before the cleanup, once the rename has happened.
 
 Step 6 removes the record, last, after the cleanup below. A record found
+in `locking` has nothing placed and is finished by removing the locks it
+names and the record. A record found
 in `placing` or `composed` with the branch still at the leased tip is a
 compose that never reached its `update-ref`: the UI undoes step 2 from
 the names in the record, exactly as a refusal in those steps does, and
@@ -854,14 +872,23 @@ removes the record. A record in `composed` with the branch at the
 commit, or in `installed`, is the interval steps 5 and 6 span, and is
 finished as below.
 
-Every lock the UI creates carries the record's id as its content, written
-before the lock is relied on, which is what makes a lock reclaimable
-after a crash: `git` refuses a lock file whatever is inside it
-(**measured**: with `HEAD.lock` and a branch's lock holding a line of
-text, `symbolic-ref` and `update-ref` both failed with `File exists`,
-while reading the ref still worked), so the content is free for the UI to
-use and is the only way to tell its own leftover lock from a lock another
-`git` is holding right now.
+Each *ref* lock the UI creates — `HEAD.lock` and the branch's — carries
+the record's id as its content, written before the lock is relied on,
+which is what makes it reclaimable after a crash: `git` refuses a lock
+file whatever is inside it (**measured**: with `HEAD.lock` and a branch's
+lock holding a line of text, `symbolic-ref` and `update-ref` both failed
+with `File exists`, while reading the ref still worked), and those two
+files are empty in `git`'s own use, so their content is free for the UI
+and is the only way to tell its own leftover lock from a lock another
+`git` is holding right now. `<index>.lock` is not one of them: it is a
+copy of the index and is read and installed as one, and a byte added to
+it stops being an index at all (**measured**: with the record's id
+appended to the copy, `update-index` refused it, `index uses … extension,
+which we do not understand`). Its ownership is established by hash
+instead — the record holds the hash of that file as the UI last wrote it,
+from the copy step 0 makes to the version step 3 prepares, written to the
+record before each is relied on — so a lock whose hash is the record's is
+the UI's own and any other is a running `git`'s.
 
 At launch, and before it offers to compose, the UI reads every record it
 finds and acts only where the evidence is unambiguous. The locks a crash
