@@ -991,6 +991,46 @@ mod tests {
         );
     }
 
+    /// A repeated intent stays harmless when it is *inside* a contest.
+    ///
+    /// Saying one true thing twice is not a conflict, and the guard collapses
+    /// the repeats before counting claimants — but collapsing them for the
+    /// count must not collapse them for the accounting. Here `old1 -> new` is
+    /// stated twice and loses the contest to `old2 -> new`, so `old1` is still
+    /// in the identity file when the sweep runs; the copy whose index was
+    /// dropped reached it and was reported as a likely typo beside the
+    /// conflict.
+    #[test]
+    fn a_repeated_intent_inside_a_contest_is_not_also_a_typo() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old1", "old2"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let claim = |from: &str| Intent::RenameColumn {
+            table: t("dbo.t"),
+            from: from.into(),
+            to: "new".into(),
+        };
+        let errs = resolve(
+            &s,
+            &ids,
+            &[claim("old2"), claim("old1"), claim("old1")],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+        // And the contest is still reported once, over the distinct claimants:
+        // the repeat is one statement, however many times it was written.
+        assert!(
+            matches!(&errs[0], Blocker::ConflictingRenameIntents { intents, .. }
+                if intents.len() == 2),
+            "{errs:?}"
+        );
+    }
+
     // ---- roles (ADR-0005) ----
 
     fn with_roles(spec: &[(&str, &[&str])], roles: &[&str]) -> Schema {

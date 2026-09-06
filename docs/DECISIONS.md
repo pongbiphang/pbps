@@ -4237,9 +4237,17 @@ SPEC is in sync with all of these.
     discards the whole `Resolution` when it returns `Err`, while skipping it
     leaves every *other* intent of that kind unmatched, so an unrelated and
     perfectly matchable rename or drop beside the contest was reported as
-    "matches nothing … likely a typo". The contending intents themselves are
-    marked used for the same reason: the sweep must not be told twice, and the
-    second telling is the misleading one.
+    "matches nothing … likely a typo".
+
+    **The contenders are excluded from that sweep by equality, not by
+    bookkeeping.** Marking their indexes used was the first answer and it was
+    defeated twice — once by the early return that stranded their neighbours,
+    once by the repeat-collapsing that dropped an index before it was recorded.
+    Three rounds, three ways for an index to go missing, one shape: an intent
+    can be reported as contested *and* as a likely typo. The sweep now skips
+    every intent a `ConflictingRenameIntents` names, so the two are mutually
+    exclusive by construction and there is no fourth way. A property held by a
+    check beats one held by four call sites remembering to record something.
 
     **Identical intents are not a conflict.** The same rename reaches `resolve`
     twice whenever a `renamed_from` annotation is also answered at the

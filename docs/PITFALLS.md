@@ -780,6 +780,16 @@ correct annotation a likely typo. **A check that has found something should add
 to the report, not subtract from the work** — unless the work would write
 something, and here it never does.
 
+**Three rounds, three ways to lose the same index.** The misleading half was
+suppressed by recording each contending intent's position in a `used` set, and
+that record was defeated twice more: by the early return above, which stranded
+the *neighbours* rather than the contenders, and by collapsing repeated intents
+before their positions were recorded, which stranded one copy of a claimant
+already inside the conflict. The fix that ended it was not a fourth patch but a
+move: the sweep now asks whether a conflict already names this intent, by
+equality. **When the same defect returns with a new way to lose the bookkeeping,
+stop mending the bookkeeping and derive the answer from the thing itself.**
+
 ## Tests that pass for the wrong reason
 
 Eleven so far, every one invisible in a green run. **Assert the specific failure,
