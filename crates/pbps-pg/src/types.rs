@@ -444,11 +444,18 @@ enum Family {
         fixed: bool,
     },
     Bytea,
-    /// Date and time, described by which components it stores.
+    /// Date and time, described by which components it stores and how far its
+    /// date part reaches.
+    ///
+    /// The reach is not decoration: measured, a `date` runs to 5874897 AD and a
+    /// `timestamp` stops at 294276 AD, so `'300000-01-01'::date` into a
+    /// `timestamp` is `date out of range for timestamp`. `last_year` is `None`
+    /// for the types that hold no date at all.
     Temporal {
         has_date: bool,
         has_time: bool,
         has_offset: bool,
+        last_year: Option<i64>,
     },
     /// `interval`, which carries a seconds precision the engine converts
     /// between. The unmodified type is `interval(6)` in every way that matters
@@ -599,11 +606,16 @@ fn family(t: &ColumnType) -> Family {
         Some(TypeArg::Max | TypeArg::Ident(_)) | None => Len::Unbounded,
     };
     let integer = |max: i128| Family::Exact(Exact::Integer { max });
-    let temporal = |has_date, has_time, has_offset| Family::Temporal {
+    let temporal = |has_date, has_time, has_offset, last_year| Family::Temporal {
         has_date,
         has_time,
         has_offset,
+        last_year,
     };
+    // Measured on 18.6: `'5874897-01-01'::date` is accepted and
+    // `'294276-12-31'::date::timestamp` is the last one that converts.
+    const DATE_LAST_YEAR: Option<i64> = Some(5_874_897);
+    const STAMP_LAST_YEAR: Option<i64> = Some(294_276);
 
     match t.base.as_str() {
         "smallint" => integer(i128::from(i16::MAX)),
@@ -636,11 +648,11 @@ fn family(t: &ColumnType) -> Family {
             fixed: false,
         },
         "bytea" => Family::Bytea,
-        "date" => temporal(true, false, false),
-        "time without time zone" => temporal(false, true, false),
-        "time with time zone" => temporal(false, true, true),
-        "timestamp without time zone" => temporal(true, true, false),
-        "timestamp with time zone" => temporal(true, true, true),
+        "date" => temporal(true, false, false, DATE_LAST_YEAR),
+        "time without time zone" => temporal(false, true, false, None),
+        "time with time zone" => temporal(false, true, true, None),
+        "timestamp without time zone" => temporal(true, true, false, STAMP_LAST_YEAR),
+        "timestamp with time zone" => temporal(true, true, true, STAMP_LAST_YEAR),
         "interval" => Family::Interval {
             precision: int_arg(0).unwrap_or(MAX_INTERVAL_PRECISION),
         },
@@ -758,11 +770,13 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_date: ad,
                 has_time: at,
                 has_offset: ao,
+                last_year: ay,
             },
             Family::Temporal {
                 has_date: bd,
                 has_time: bt,
                 has_offset: bo,
+                last_year: by,
             },
         ) => {
             if !temporal_cast_exists((ad, at, ao), (bd, bt, bo)) {
@@ -775,7 +789,19 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             // machines writes two different instants — which is also why
             // ADR-0012 §4 measured it rewriting under one session and not the
             // other.
-            safe_if((!ad || bd) && (!at || bt) && ao == bo)
+            //
+            // And the target's calendar has to reach as far as the source's.
+            // Measured, a `date` runs to 5874897 AD where a `timestamp` stops
+            // at 294276 AD, so `'300000-01-01'` is a row that makes the change
+            // fail — `date out of range for timestamp` — after a `Safe`
+            // classification had waved it past the gate.
+            let reaches = match (ay, by) {
+                // The source holds no date, so there is none to lose.
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => a <= b,
+            };
+            safe_if((!ad || bd) && (!at || bt) && ao == bo && reaches)
         }
 
         // Measured: `interval '30 hours'` into `time` is accepted and stores
@@ -791,6 +817,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_date: false,
                 has_time: true,
                 has_offset: false,
+                ..
             },
         )
         | (
@@ -798,6 +825,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_date: false,
                 has_time: true,
                 has_offset: false,
+                ..
             },
             Family::Interval { .. },
         ) => TypeChangeRisk::Narrowing,
@@ -1196,7 +1224,6 @@ mod tests {
             ("varchar(20)", "text"),
             ("char(5)", "varchar(9)"),
             ("numeric(10,2)", "numeric(12,2)"),
-            ("date", "timestamp"),
             ("jsonb", "json"),
         ] {
             assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
@@ -1374,6 +1401,24 @@ mod tests {
             TypeChangeRisk::Narrowing
         );
         assert_eq!(risk("interval", "interval(3)"), TypeChangeRisk::Narrowing);
+    }
+
+    /// A `date` reaches further than a `timestamp`, so adding a time to it is
+    /// not a widening. Measured on 18.6: `'5874897-01-01'::date` is accepted,
+    /// `'294276-12-31'::date::timestamp` is the last one that converts, and
+    /// `'300000-01-01'::date::timestamp` is `date out of range for timestamp`.
+    ///
+    /// This leaves no change between two date-or-time types classified `Safe`
+    /// except a type to itself, which is the honest answer: every one of them
+    /// drops a component, moves with the session's time zone, or runs off the
+    /// end of the calendar.
+    #[test]
+    fn a_date_reaches_further_than_a_timestamp_so_it_is_not_widened_by_one() {
+        assert_eq!(risk("date", "timestamp"), TypeChangeRisk::Narrowing);
+        assert_eq!(risk("date", "timestamptz"), TypeChangeRisk::Narrowing);
+        // A type to itself is still a change of nothing.
+        assert_eq!(risk("date", "date"), TypeChangeRisk::Safe);
+        assert_eq!(risk("timestamp", "timestamp"), TypeChangeRisk::Safe);
     }
 
     /// Gaining or losing a time zone is never a widening, however it looks.

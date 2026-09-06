@@ -4085,9 +4085,22 @@ SPEC is in sync with all of these.
       integer-part exponent is `p - s` and it is kept **signed**; clamping it at
       "no integer part" made two different capacities compare equal.
 
+    The round after that found the same shape in the date types, where the
+    property standing in for the answer was *which components a type stores*:
+
+    - **A `date` reaches further than a `timestamp`.** Measured,
+      `'5874897-01-01'::date` is accepted, `'294276-12-31'` is the last date
+      that converts, and `'300000-01-01'::date::timestamp` is `date out of range
+      for timestamp`. Adding a time to a date looks like the textbook widening
+      and is not one. With that, **no change between two date-or-time types is
+      `Safe` except a type to itself** — each of the rest drops a component,
+      moves with the session's time zone, or runs off the end of the calendar.
+
     Every one was `Safe`, which is the class that bypasses the gate entirely, so
     every one was a plan approved by nobody that fails or silently changes data
-    at the apply. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
+    at the apply. The common shape is worth naming: each rule described a type
+    by *one* of its properties — its digit count, its components, its width —
+    and each time the property was true and not the whole answer. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
     `decimal(10,0)` into `int` is `Arithmetic overflow error converting
     expression to data type int`, and `decimal(2,1)` into `real` stores
     `1.000000014901161e-001`. That is issue #135; it is a shipped dialect and a

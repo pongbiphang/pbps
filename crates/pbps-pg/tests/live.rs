@@ -793,6 +793,9 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         ("interval(3)", "interval", "'1.234 sec'"),
         ("numeric(10,2)", "numeric(12,2)", "12345678.90"),
         ("numeric(10,2)", "numeric(10,4)", "12345678.90"),
+        // A `date` runs to 5874897 AD and a `timestamp` stops at 294276 AD.
+        ("date", "timestamp without time zone", "'300000-01-01'"),
+        ("date", "timestamp without time zone", "'2026-01-02'"),
         ("character varying(10)", "character varying(20)", "'abc'"),
         (
             "character varying(20)",

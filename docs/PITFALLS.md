@@ -459,10 +459,13 @@ emitted. The repair is one predicate all three call.
 the caller the finding happened to name.** A rule that lives in three places is
 three chances to be measured once and fixed once.
 
-## A count of digits standing in for what the type holds
+## One property of a type standing in for what it holds
 
-Two instances, one review round, both in a classification that decides whether
-a change needs a human's approval — and both in the direction that skips one.
+Four instances over three review rounds, all in the classification that decides
+whether a change needs a human's approval, and all in the direction that skips
+one. Each rule named a real property of the type — its digit count, its
+significant digits, its components — and each time the property was true and
+not the whole answer.
 
 - **`numeric(10,0)` and `integer` are both "ten digits".** Measured,
   `9999999999` into an `integer` is `integer out of range`; on SQL Server,
@@ -474,7 +477,12 @@ a change needs a human's approval — and both in the direction that skips one.
   trip through text agrees the value survived; ten of them sum to `1.0000001`
   where the exact sum is `1.0`.
 
-Both rules read as obviously correct, and a test written by the same hand asks
+- **"it stores every component the other one does" is not "it holds every
+  value".** A `date` runs to 5874897 AD and a `timestamp` stops at 294276 AD,
+  so adding a time to a date — the textbook widening — fails on
+  `'300000-01-01'` with `date out of range for timestamp`.
+
+Every one reads as obviously correct, and a test written by the same hand asks
 the same question the rule does. **What catches them is a row at the boundary,
 on a real server**: the largest value the source holds, and a value the target
 cannot represent, with the promise asserted as *the statement runs and the value
