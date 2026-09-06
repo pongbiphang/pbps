@@ -24,9 +24,11 @@
 //! checklist in front of a human for exactly that reason.
 
 use pbps_db::{Conn, DbError};
+use pbps_dialect::DialectError;
 use pbps_model::{Change, ColumnRef, ObjectName, TableName};
 
 use crate::catalog::{get, opt};
+use crate::emit::qualified;
 
 /// What is being renamed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,12 +224,52 @@ SELECT 'foreign key', fk.name
   FROM sys.foreign_keys fk WHERE fk.parent_object_id = OBJECT_ID(@P1)
 ORDER BY kind, name;";
 
+/// Why a rename's impact could not be reported.
+///
+/// Two failures, kept apart, because the whole point of this module is that an
+/// empty report means "nothing depends on this". A name that cannot be quoted
+/// and a query that could not run are both *unknown*, and neither may arrive
+/// at the caller wearing the shape of "no dependants".
+#[derive(Debug, thiserror::Error)]
+pub enum ImpactError {
+    #[error(transparent)]
+    Query(#[from] DbError),
+
+    /// The target's own name cannot be written as an identifier.
+    #[error(transparent)]
+    Name(#[from] DialectError),
+}
+
+/// The name every one of these queries hands to `OBJECT_ID`.
+///
+/// Its own function so the choice is visible and testable without a server:
+/// the argument is one string built once and bound to `@P1` five times, so
+/// getting it wrong is not five bugs but one, and it cannot be checked by
+/// reading the query text.
+fn object_id_argument(target: &RenameTarget) -> Result<String, DialectError> {
+    qualified(target.table())
+}
+
 /// Queries every impact of one rename.
 pub async fn rename_impact(
     conn: &mut Conn,
     target: &RenameTarget,
-) -> Result<ImpactReport, DbError> {
-    let table = target.table().to_string();
+) -> Result<ImpactReport, ImpactError> {
+    // `OBJECT_ID` *parses* its argument as a name, so it is given the quoted
+    // form and not `TableName`'s `Display`. A name with a space, a period or a
+    // bracket in it makes the bare form return NULL, and every one of these
+    // queries then joins against NULL and matches nothing — so the report came
+    // back empty, which reads as "nothing depends on this". The `blocking`
+    // list goes with it, and a rename `sp_rename` will refuse because of a
+    // SCHEMABINDING view is waved through to fail at apply.
+    //
+    // `preflight` and `doctor` already pass the quoted form (the latter builds
+    // it server-side with `QUOTENAME`); this was the one place that did not.
+    //
+    // `@P2` is deliberately *not* quoted: `COLUMNPROPERTY` takes a column name
+    // as a plain string, not as a name to parse, and bracketing it there would
+    // break the one query that works today.
+    let table = object_id_argument(target)?;
     let mut report = ImpactReport {
         target: target.to_string(),
         ..Default::default()
@@ -365,6 +407,54 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().unwrap()
+    }
+
+    /// `OBJECT_ID` parses its argument as a name, so a name that needs quoting
+    /// has to arrive quoted. The bare form returns NULL, every query joins
+    /// against NULL, and the report comes back empty — which reads as "nothing
+    /// depends on this" and takes the `blocking` list with it.
+    #[test]
+    fn the_object_id_argument_is_quoted_so_a_name_needing_it_still_resolves() {
+        let plain = object_id_argument(&RenameTarget::Table(tname("dbo.customer"))).unwrap();
+        assert_eq!(plain, "[dbo].[customer]");
+
+        // The three characters that make the bare form parse as something
+        // else: a space ends the name, a period splits it, a bracket is
+        // quoting syntax. Built with `TableName::new` rather than parsed,
+        // because that is how such a name actually arrives — `assemble` builds
+        // them straight from the catalog, and `from_str` would refuse the one
+        // with a period as three segments.
+        for name in ["a b", "a.b", "a]b"] {
+            let table = TableName::new("dbo", name);
+            let arg = object_id_argument(&RenameTarget::Table(table)).unwrap();
+            assert!(arg.starts_with("[dbo].["), "{arg}");
+            assert!(arg.ends_with(']'), "{arg}");
+            // The bare form is what returned NULL. It must not be what is sent.
+            assert_ne!(arg, format!("dbo.{name}"));
+        }
+        // A bracket is doubled rather than passed through, or the argument
+        // ends early inside `OBJECT_ID` just as it would in code position.
+        assert_eq!(
+            object_id_argument(&RenameTarget::Table(TableName::new("dbo", "a]b"))).unwrap(),
+            "[dbo].[a]]b]"
+        );
+
+        // A column target names its table, not the column: `@P1` locates the
+        // object and `@P2` carries the column separately.
+        let column = object_id_argument(&RenameTarget::Column(
+            "dbo.cust omer.email".parse().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(column, "[dbo].[cust omer]");
+    }
+
+    /// A name that cannot be an identifier is not a report with no rows in it.
+    /// The two arms of `ImpactError` exist so that neither reaches a caller
+    /// looking like an empty report.
+    #[test]
+    fn a_name_that_cannot_be_quoted_is_an_error_and_not_an_empty_report() {
+        let empty = TableName::new("dbo", "");
+        assert!(object_id_argument(&RenameTarget::Table(empty)).is_err());
     }
 
     /// A module rename reaches the plan as a drop plus a create, so the drop is
