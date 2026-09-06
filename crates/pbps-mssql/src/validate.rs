@@ -25,11 +25,47 @@ fn invalid(message: impl Into<String>) -> DialectError {
     }
 }
 
+/// The permissions SQL Server has, among the words the model spells
+/// (ADR-0010 §6, DECISIONS 210). Measured on SQL Server 2025:
+/// `sys.fn_builtin_permissions(DEFAULT)` names none of the other five —
+/// `usage`, `create`, `truncate`, `trigger`, `maintain` — in any class, and
+/// `GRANT USAGE ON dbo.t TO r` is not even a failed grant but a parse error
+/// (Msg 102, "Incorrect syntax near 'USAGE'"), the same for each of the five
+/// on an object and on a schema. Three places apply this one table:
+/// `validate` refuses the word, `emit` will not render it, and the catalog
+/// read-back reports it rather than fold it — so a word the model holds and
+/// this engine lacks cannot reach a statement or a declaration by any path.
+pub(crate) const PERMISSIONS: [Permission; 8] = [
+    Permission::Select,
+    Permission::Insert,
+    Permission::Update,
+    Permission::Delete,
+    Permission::References,
+    Permission::Execute,
+    Permission::Alter,
+    Permission::ViewDefinition,
+];
+
+/// Whether SQL Server has `p` at all, on any securable.
+pub(crate) fn has_permission(p: Permission) -> bool {
+    PERMISSIONS.contains(&p)
+}
+
+/// The words this engine has, for a message.
+pub(crate) fn permission_words() -> String {
+    PERMISSIONS
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Every problem with a role (ADR-0005): the names it uses have to be ones
-/// this dialect can write into `GRANT` and `CREATE ROLE`, and each permission
-/// has to be one the engine defines on what the target *is*. `public` and the
-/// fixed database roles are the engine's own and cannot be created, dropped or
-/// renamed; declaring one would plan a statement the engine refuses.
+/// this dialect can write into `GRANT` and `CREATE ROLE`, each permission has
+/// to be one this engine has at all (ADR-0010 §6), and then one the engine
+/// defines on what the target *is*. `public` and the fixed database roles are
+/// the engine's own and cannot be created, dropped or renamed; declaring one
+/// would plan a statement the engine refuses.
 pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     let mut errs = Vec::new();
     if let Err(e) = ident::quote(name) {
@@ -65,6 +101,17 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 errs.push(e);
             }
         }
+        // A word the model spells for the other engine (ADR-0010 §6). Refused
+        // by name, on any target — the engine's parser stops at the word (Msg
+        // 102) before it looks at the securable — and left out of the kind
+        // check below, which would otherwise report the same grant twice.
+        for p in permissions.iter().filter(|p| !has_permission(**p)) {
+            errs.push(invalid(format!(
+                "role `{name}`: `{}` on `{target}` is not a permission SQL Server has; it is                  PostgreSQL's (ADR-0010 §6), and this engine takes {}",
+                p.as_str(),
+                permission_words()
+            )));
+        }
         // `GRANT EXECUTE` on a table, `GRANT SELECT` on a procedure: the
         // engine refuses each (Msg 4606), and in a staged apply the grants
         // run after the other changes, so it would refuse it on a database
@@ -84,7 +131,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
             )));
             continue;
         };
-        for p in permissions {
+        for p in permissions.iter().filter(|p| has_permission(**p)) {
             if !applicable.contains(p) {
                 errs.push(invalid(format!(
                     "`{}` does not apply to `{object}`, {}: the engine refuses that GRANT; {} \
@@ -1490,6 +1537,53 @@ mod tests {
     }
 
     // ---- roles (ADR-0005) ----
+
+    /// The model spells PostgreSQL's five too (ADR-0010 §6); this engine has
+    /// none of them, on any securable — measured, `GRANT USAGE` is a parse
+    /// error before the target is looked at — so each is refused by name,
+    /// once, on an object and on a schema alike, and the kind check does not
+    /// report the same grant a second time.
+    #[test]
+    fn a_permission_this_engine_lacks_is_refused_by_name_on_any_target() {
+        use pbps_model::Permission;
+        let mut schema = Schema::default();
+        let (t_name, t) = base_table();
+        schema.tables.insert(t_name, t);
+        let errors = |target: &str, ps: &[Permission]| {
+            let mut role = Role::default();
+            role.grants
+                .insert(target.parse().unwrap(), ps.iter().copied().collect());
+            super::role("r", &role, &schema)
+        };
+        for p in [
+            Permission::Usage,
+            Permission::Create,
+            Permission::Truncate,
+            Permission::Trigger,
+            Permission::Maintain,
+        ] {
+            for target in ["dbo.customer", "schema::dbo"] {
+                let errs = errors(target, &[p]);
+                assert_eq!(errs.len(), 1, "{target} {p:?}: {errs:?}");
+                let msg = errs[0].to_string();
+                assert!(
+                    msg.contains(&format!("`{}` on `{target}`", p.as_str()))
+                        && msg.contains("PostgreSQL's")
+                        && msg.contains("view-definition"),
+                    "{msg}"
+                );
+            }
+        }
+        // Beside a word the engine has: one finding, for the one word.
+        let errs = errors("dbo.customer", &[Permission::Select, Permission::Usage]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].to_string().contains("`usage`"), "{errs:?}");
+        // And the engine's own eight are still its own.
+        for p in super::PERMISSIONS {
+            assert!(super::has_permission(p), "{p:?}");
+        }
+        assert!(errors("schema::dbo", &super::PERMISSIONS).is_empty());
+    }
 
     #[test]
     fn a_built_in_role_cannot_be_declared_and_an_ordinary_one_can() {

@@ -38,7 +38,7 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -52,6 +52,10 @@ pub const SCHEMA_VERSION: u32 = 6;
 // 6: each rule's entry in `policies.rules` is that rule's own shape — its
 //    own parameters and no others — where all ten shared one. An editor
 //    stops completing `rows` into a naming rule (DECISIONS 188).
+// 7: a grant's permissions are the closed list the loader accepts, where they
+//    were any string — and the list is the union of the engines' (ADR-0010
+//    §6, DECISIONS 210). An editor completes `usage` and stops accepting
+//    `contrl`.
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {
@@ -210,6 +214,30 @@ mod tests {
         for word in ["no_action", "cascade", "set_null", "set_default"] {
             assert!(actions.contains(word), "{actions}");
         }
+    }
+
+    /// A grant's permissions are the words `Permission` spells — all of them,
+    /// both engines' (ADR-0010 §6) — and nothing else: an editor that accepted
+    /// any string blessed `contrl`, and one listing a single engine's words
+    /// would refuse a PostgreSQL project's `usage`. Which word a dialect lacks
+    /// is `validate`'s finding.
+    #[test]
+    fn the_schema_lists_every_permission_and_no_other_word() {
+        let v = schema(SchemaKind::Declaration);
+        let items = &v["$defs"]["RoleDto"]["properties"]["grants"]["additionalProperties"]["items"];
+        let listed: Vec<&str> = items["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a grant's permissions are not a closed list: {items}"))
+            .iter()
+            .map(|v| v.as_str().expect("a permission is a string"))
+            .collect();
+        let all: Vec<&str> = pbps_model::Permission::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+        assert_eq!(listed, all, "{items}");
+        assert!(listed.contains(&"usage") && listed.contains(&"view-definition"));
+        assert!(!listed.contains(&"control"));
     }
 
     /// The rule ids a project writes come from the catalogue the checker

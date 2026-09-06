@@ -1,6 +1,8 @@
 # ADR-0010: Privileges on PostgreSQL — the role is not the portable unit
 
-- Status: proposed. Phase 5 design; nothing is built.
+- Status: accepted. The model changes of §3 and §6 (DECISIONS 210–211) are
+  applied; the rest is design until the PostgreSQL crate. This decided the
+  format before the dialect is written.
 - Date: 2026-09-04
 - Related: docs/SPEC.md §5, §8.1, §8.2, §12, open questions 7 and 9;
   [ADR-0005](ADR-0005-roles-and-grants.md), which this revisits;
@@ -441,3 +443,25 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
 Phase 5, ahead of the emitter, for the same reason as ADR-0009: the parts that
 touch `Permission`, `GrantTarget` and the ids file are format, and format is the
 most expensive thing in this project to change late (SPEC §12).
+
+## Amendment — what landing §3 and §6 changed
+
+- **SQL Server refuses the five words in three places, from one table**
+  (DECISIONS 210). §6 named `validate_role`; landing it, the emitter and the
+  catalog read-back turned out to be the same shape — each had read "parses as
+  a `Permission`" as "is this engine's", which the union broke. Measured while
+  landing: on SQL Server each of the five is a parse error on `GRANT` (Msg 102,
+  before the securable is looked at), and `sys.fn_builtin_permissions` names
+  none of them in any class, so the read-back cannot meet one today; it filters
+  anyway, because the day the catalog grows a word the model spells is the day
+  a `pull` writes a role `validate` refuses.
+- **`maintain` is not gated on the server version by the model.** The Limits
+  entry stands: the model has no server version, so the PostgreSQL dialect's
+  `validate_role` refuses `maintain` below 17 the way `plan --db` gates on SQL
+  Server's edition — a connected check, not a format one.
+- **The editor schema lists the union** (schema version 7), not one engine's
+  words: which word a project's engine lacks is `validate`'s finding.
+- **`manages_roles` has no reader yet** (DECISIONS 211). SQL Server answers
+  `true` and the CLI's role-existence paths are unchanged; the reading — refuse
+  a missing role with the `CREATE ROLE` to run, make `drop-role` revoke and
+  stop — lands with the dialect that first answers `false`.

@@ -142,11 +142,20 @@ impl From<GrantTarget> for String {
     }
 }
 
-/// An object-level permission this tool models (ADR-0005).
+/// An object-level permission this tool models (ADR-0005, ADR-0010 §6).
 ///
-/// A closed set. `DENY` is excluded outright, and permissions not listed here
-/// (`CONTROL`, `TAKE OWNERSHIP`, `IMPERSONATE`) are reported by `pull` as left
-/// alone rather than quietly folded into something they are not.
+/// A closed set, and the **union** of what the supported engines grant, not
+/// any one engine's list: inviolable constraint 1 needs one model in which two
+/// semantically identical schemas compare equal, so the dialect stays outside
+/// this type and `Dialect::validate_role` refuses the words its engine lacks
+/// (DECISIONS 210). The first eight are SQL Server's; `usage`, `create`,
+/// `truncate`, `trigger` and `maintain` are PostgreSQL's, which has no `alter`
+/// and no `view-definition`. `DENY` is excluded outright, and permissions not
+/// listed here (`CONTROL`, `TAKE OWNERSHIP`, `IMPERSONATE`) are reported by
+/// `pull` as left alone rather than quietly folded into something they are not.
+///
+/// New words are appended: the derived order is the order `fmt` writes a
+/// grant's permissions in, and inserting one would reorder every role file.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -160,6 +169,11 @@ pub enum Permission {
     Execute,
     Alter,
     ViewDefinition,
+    Usage,
+    Create,
+    Truncate,
+    Trigger,
+    Maintain,
 }
 
 impl Permission {
@@ -174,10 +188,15 @@ impl Permission {
             Permission::Execute => "execute",
             Permission::Alter => "alter",
             Permission::ViewDefinition => "view-definition",
+            Permission::Usage => "usage",
+            Permission::Create => "create",
+            Permission::Truncate => "truncate",
+            Permission::Trigger => "trigger",
+            Permission::Maintain => "maintain",
         }
     }
 
-    pub const ALL: [Permission; 8] = [
+    pub const ALL: [Permission; 13] = [
         Permission::Select,
         Permission::Insert,
         Permission::Update,
@@ -186,6 +205,11 @@ impl Permission {
         Permission::Execute,
         Permission::Alter,
         Permission::ViewDefinition,
+        Permission::Usage,
+        Permission::Create,
+        Permission::Truncate,
+        Permission::Trigger,
+        Permission::Maintain,
     ];
 }
 
@@ -345,6 +369,44 @@ mod tests {
         let e = "control".parse::<Permission>().unwrap_err();
         assert!(e.contains("control"), "{e}");
         assert!(e.contains("select"), "the available set is named: {e}");
+    }
+
+    /// The set is the union of the engines' (ADR-0010 §6): PostgreSQL's five
+    /// parse and render like SQL Server's eight, in the declaration spelling
+    /// and the engine's, and the ones an engine lacks are its dialect's to
+    /// refuse — not the model's, which would put the dialect inside it.
+    #[test]
+    fn every_permission_of_either_engine_parses_and_renders_by_its_own_word() {
+        for p in Permission::ALL {
+            assert_eq!(p.as_str().parse::<Permission>().unwrap(), p);
+            assert_eq!(
+                p.as_str()
+                    .to_ascii_uppercase()
+                    .parse::<Permission>()
+                    .unwrap(),
+                p,
+                "the engine's spelling"
+            );
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
+            assert_eq!(serde_json::from_str::<Permission>(&json).unwrap(), p);
+        }
+        for (word, p) in [
+            ("usage", Permission::Usage),
+            ("create", Permission::Create),
+            ("truncate", Permission::Truncate),
+            ("trigger", Permission::Trigger),
+            ("maintain", Permission::Maintain),
+        ] {
+            assert_eq!(word.parse::<Permission>().unwrap(), p);
+        }
+        assert_eq!(Permission::ALL.len(), 13);
+        // Still outside: PostgreSQL's `connect`, `temporary` and `set` are
+        // database-level, and SQL Server's `control` is not a grant this tool
+        // will ever write (ADR-0005).
+        for word in ["connect", "temporary", "set", "control"] {
+            assert!(word.parse::<Permission>().is_err(), "{word}");
+        }
     }
 
     fn schema_with_table() -> Schema {

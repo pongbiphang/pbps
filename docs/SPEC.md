@@ -421,10 +421,18 @@ grants:
   a role is each environment's own reality, never declared, compared or
   touched. Logins and users are server-level and out of scope.
 - **Grants are data**: a target — `schema.object`, or `schema::name` for a
-  whole schema — to a set of `select`, `insert`, `update`, `delete`,
-  `references`, `execute`, `alter`, `view-definition`. `DENY` is excluded;
-  column-level grants and permissions outside that set are reported by `pull`
-  and left alone.
+  whole schema — to a set of permissions. The set is the union of what the
+  supported engines grant ([ADR-0010 §6](ADR-0010-postgres-privileges.md)):
+  `select`, `insert`, `update`, `delete`, `references`, `execute`, `alter`,
+  `view-definition`, `usage`, `create`, `truncate`, `trigger`, `maintain`. A
+  word the project's engine lacks is refused by `validate`, by name: SQL
+  Server has none of the last five, PostgreSQL has no `alter` and no
+  `view-definition`. `DENY` is excluded; column-level grants and permissions
+  outside the set are reported by `pull` and left alone.
+- **Whether the role itself is the tool's to create and drop is the engine's
+  answer** (`Dialect::manages_roles`, ADR-0010 §3): yes on SQL Server, where a
+  database role is inside the database; no on PostgreSQL, where a role is a
+  cluster object and the tool manages only what it is granted here.
 - **A grant's target must be declared** — the foreign-key-target rule applied
   to permissions — or be a `schema::` target. `validate` refuses the rest.
 - **Roles carry identity.** Drop + add would destroy membership, which the

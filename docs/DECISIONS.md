@@ -3117,3 +3117,45 @@ SPEC is in sync with all of these.
     could not move. The shape is in the format now, with a round-trip test,
     so the PostgreSQL crate adds the recording and the rebuild decision and
     changes no format.
+
+## Phase 5 prep — permissions (ADR-0010 §3, §6)
+
+210. **`Permission` is the union of the engines' words, and each dialect
+    refuses the ones its engine lacks — in three places, from one table.**
+    `usage`, `create`, `truncate`, `trigger` and `maintain` join SQL Server's
+    eight; `alter` and `view-definition` stay, and become PostgreSQL's to
+    refuse. Not a per-dialect enum, for the reason ADR-0010 §6 gives:
+    inviolable constraint 1 needs one model in which two identical schemas
+    compare equal, and a dialect inside the type would break that. The new
+    words are appended, because the derived order is the order `fmt` writes a
+    grant's permissions in, and inserting one would rewrite every role file.
+    On SQL Server the engine's set is one constant, `validate::PERMISSIONS`,
+    and three consumers apply it: `validate_role` refuses a word by name on
+    any target (the engine's parser stops at the word before it looks at the
+    securable — measured, `GRANT USAGE ON dbo.t TO r` and each of the other
+    four, on an object and on a schema, are Msg 102 "Incorrect syntax", not
+    Msg 4606), `emit` returns `Unsupported` rather than render a statement
+    that parser would stop at, and the catalog read-back reports a parsed
+    word the engine lacks as unexpressible rather than fold it into a role.
+    The third is belt and braces: measured, `sys.fn_builtin_permissions`
+    names none of the five in any class, so SQL Server cannot return one
+    today — but a model that spells more words than the engine has is a new
+    shape, and the read-back is the one consumer where "parses" used to mean
+    "is this engine's". The editor schema lists the union (schema version 7):
+    an editor that accepted any string blessed `contrl`, and one listing a
+    single engine's words would refuse a PostgreSQL project's `usage`; which
+    word a dialect lacks is `validate`'s finding, not the editor's.
+211. **Role existence is a dialect capability, `Dialect::manages_roles`, and
+    SQL Server's answer is `true`.** A SQL Server database role lives inside
+    the one database the tool is connected to, so ADR-0005 manages its
+    existence and nothing here moves. A PostgreSQL role is a cluster object,
+    granted in every database of the cluster and visible from each; a tool
+    whose blast radius is one database must not own an object whose blast
+    radius is the cluster (ADR-0010 §3). That dialect will answer `false`, and
+    on it `plan --db` refuses a declared role the cluster lacks with the
+    `CREATE ROLE` to run by hand, while `drop-role` revokes the declared
+    grants and leaves the `DROP ROLE` to a human. Nothing reads the answer
+    yet — the CLI's role-existence paths are written for one engine — and
+    the reading lands with the dialect that first answers `false`, where the
+    live suite can watch it. Grants are managed either way: the capability is
+    about the principal, not what it holds.

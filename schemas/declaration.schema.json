@@ -511,7 +511,22 @@
           "additionalProperties": {
             "type": "array",
             "items": {
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "select",
+                "insert",
+                "update",
+                "delete",
+                "references",
+                "execute",
+                "alter",
+                "view-definition",
+                "usage",
+                "create",
+                "truncate",
+                "trigger",
+                "maintain"
+              ]
             }
           },
           "default": {}
@@ -523,6 +538,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 6,
+  "x-pbps-schema-version": 7,
   "x-pbps-tool-version": "0.0.0"
 }

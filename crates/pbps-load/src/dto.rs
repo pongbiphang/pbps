@@ -61,8 +61,29 @@ pub struct RoleDto {
 
     /// Target to permissions. Order carries no meaning; `fmt` sorts both.
     #[serde(default)]
-    #[schemars(with = "BTreeMap<String, Vec<String>>")]
+    #[schemars(schema_with = "grants_schema")]
     pub grants: BTreeMap<String, Vec<Spanned<String>>>,
+}
+
+/// The `grants` map as the editor sees it: any target, and a permission list
+/// closed over the words the loader converts into. Built from
+/// `Permission::ALL` rather than derived on `Permission`, which the model
+/// keeps free of `JsonSchema` (see `ReferentialAction`, the one exception);
+/// listing the words here by hand would recreate the drift the generation
+/// exists to prevent. The list is the union of the engines' (ADR-0010 §6) —
+/// which word a dialect refuses is `validate`'s finding, not the editor's.
+fn grants_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let words: Vec<&str> = pbps_model::Permission::ALL
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string", "enum": words }
+        }
+    })
 }
 
 /// One view, procedure, function or trigger (ADR-0002).

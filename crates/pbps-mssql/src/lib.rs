@@ -90,6 +90,13 @@ impl Dialect for Mssql {
         validate::role(name, role, schema)
     }
 
+    /// A SQL Server database role is scoped to the database this connection
+    /// names, so it is the tool's to create, rename and drop (ADR-0005) —
+    /// today's answer, kept (ADR-0010 §3, DECISIONS 211).
+    fn manages_roles(&self) -> bool {
+        true
+    }
+
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(change, strategy)
     }
@@ -136,5 +143,12 @@ mod tests {
         let tx = Mssql.transaction_framing();
         assert!(tx.begin.contains("SET XACT_ABORT ON"));
         assert!(tx.rollback.starts_with("IF @@TRANCOUNT > 0"));
+    }
+
+    /// Role existence is a dialect capability since ADR-0010 §3, and this
+    /// engine's answer did not move: a database role is inside the database.
+    #[test]
+    fn sql_server_roles_are_the_tools_to_create_and_drop() {
+        assert!(Mssql.manages_roles());
     }
 }
