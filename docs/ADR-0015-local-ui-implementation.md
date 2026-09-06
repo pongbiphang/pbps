@@ -912,37 +912,46 @@ locked-copy `update-index` ran it), so every `git` also takes
    and keeps the placed file where that tip holds exactly what step 3
    recorded, and undoes step 2 for the path where it does not — which on
    the `HEAD`-moved-away path is the ordinary case, since the UI's
-   commit is on a branch nobody is standing on. Each path is left at
-   what the branch it is on records. Four shapes of that path take no
-   rule of their own, having one already: a `HEAD` detached in the gap
-   rather than redirected names a commit its own lock holds still, and
-   has no branch to lock or to ask about; an unborn target —
-   `symbolic-ref` takes a branch that does not exist (**measured**: it
-   was accepted, and `rev-parse HEAD` and `ls-tree HEAD` then failed
-   with `unknown revision` and `Not a valid object name`) — has no tip,
-   so its entry set is empty, no path matches it, and step 2 is undone
-   for all of them; a target that resolves to something no tree can be
-   read from — `HEAD` takes a tag naming a blob as readily as one naming
-   a commit (**measured** on git 2.43: `ls-tree` then failed with
-   `fatal: not a tree object`, where an annotated tag over a commit
-   peeled and listed the entry) — has no entry set either, and is
-   answered the same way; and a target whose lock cannot be created has
-   another `git` mid-transaction on it, where the UI decides nothing by
-   a tip it cannot hold still and undoes step 2 for every path, which
-   asks no tip at all. Step 1's record stays the recursive answer, which
-   this rule does not make safe: an intermediate retargeted before step
-   5's checks changes what `symbolic-ref HEAD` answers, so the check
-   fails and lands here, while one retargeted after them is caught by
-   nothing and is #140. The page then names the commit, the tip the
-   branch actually holds, and every path with what became of it, since
-   the user's index is the one they had and only they can say which of
-   the two states they want. **Measured** both ways: undisturbed, the
-   check passed and the index was installed clean; with a `symbolic-ref`
-   to a sibling in the gap, the check failed, the branch held the
-   commit, and the sibling's ref and index were left alone by git. What
-   the working tree keeps there is the rule above and not that
-   measurement: the sibling's tip does not hold the placed bytes, so
-   step 2 is undone for every such path.
+   commit is on a branch nobody is standing on. Each path is left where
+   the UI found it — the bytes step 2 saved, from the tree the checkout
+   was on when the compose began — and not at what the deciding ref
+   records, which undoing a placement cannot do: where `HEAD` was
+   redirected, those bytes read as a difference against the ref the
+   checkout is on now (**measured** on git 2.43: with `f` at `from-a` on
+   the original branch and `from-b` on the one `HEAD` was redirected to,
+   placing, redirecting and undoing the placement left `f` at `from-a`
+   and `status --short` reported `M  f`, the user's own index still
+   being the original branch's). Reconciling that is the user's checkout
+   to make and not the UI's, which undoes what it did and claims nothing
+   further. Four shapes of that path take no rule of their own, having
+   one already: a `HEAD` detached in the gap rather than redirected
+   names a commit its own lock holds still, and has no branch to lock or
+   to ask about; an unborn target — `symbolic-ref` takes a branch that
+   does not exist (**measured**: it was accepted, and `rev-parse HEAD`
+   and `ls-tree HEAD` then failed with `unknown revision` and `Not a
+   valid object name`) — has no tip, so its entry set is empty, no path
+   matches it, and step 2 is undone for all of them; a target that
+   resolves to something no tree can be read from — `HEAD` takes a tag
+   naming a blob as readily as one naming a commit (**measured** on git
+   2.43: `ls-tree` then failed with `fatal: not a tree object`, where an
+   annotated tag over a commit peeled and listed the entry) — has no
+   entry set either, and is answered the same way; and a target whose
+   lock cannot be created has another `git` mid-transaction on it, where
+   the UI decides nothing by a tip it cannot hold still and undoes step
+   2 for every path, which asks no tip at all. Step 1's record stays the
+   recursive answer, which this rule does not make safe: an intermediate
+   retargeted before step 5's checks changes what `symbolic-ref HEAD`
+   answers, so the check fails and lands here, while one retargeted
+   after them is caught by nothing and is #140. The page then names the
+   commit, the tip the branch actually holds, and every path with what
+   became of it, since the user's index is the one they had and only
+   they can say which of the two states they want. **Measured** both
+   ways: undisturbed, the check passed and the index was installed
+   clean; with a `symbolic-ref` to a sibling in the gap, the check
+   failed, the branch held the commit, and the sibling's ref and index
+   were left alone by git. What the working tree keeps there is the rule
+   above and not that measurement: the sibling's tip does not hold the
+   placed bytes, so step 2 is undone for every such path.
 6. It installs the locked copy of the index that step 3 prepared by
    renaming `<index>.lock` to `<index>`, which is exactly the commit step
    of `git`'s own lock. Now
@@ -1041,22 +1050,22 @@ compose someone is running right now, in this UI or another launched
 beside it: nothing of it is reclaimed, nothing is rolled back, and this
 UI refuses to compose while it stands, because every lock and every
 leftover it would otherwise recognise as its own kind may be that
-compose's, in use this instant. That includes the branch lock holding the
-record's commit, which a live `update-ref` writes and an interrupted one
-leaves behind identically; only a record whose process is gone gets the
-treatment below. The locks a crash
-left behind are still on disk, so it does not create them again: it reads
-`HEAD.lock` and the branch's lock and continues only where each is either
-absent, and can be created, or already holds this record's id, in which
-case it is the record's own and is used as it stands and removed with the
-others at the end. In the `composed` phase there is a second kind of
-leftover it can account for: `update-ref` takes both locks itself, which
-is why the UI gives up `HEAD.lock` for that one command, so a stop inside
-it leaves locks `git` wrote rather than the UI. `git` writes the new
-value into the branch's lock and leaves `HEAD.lock` empty (**measured**,
-from a `reference-transaction` hook in the `prepared` phase: the branch's
-lock held the new commit's id and `HEAD.lock` was empty), so a branch
-lock holding exactly the record's commit id is that interrupted
+compose's, in use this instant. That includes the branch lock holding
+the record's commit, which a live `update-ref` writes and an interrupted
+one leaves behind identically; only a record whose process is gone gets
+the treatment below. The locks a crash left behind are still on disk, so
+it does not create them again: it reads `HEAD.lock` and the branch's
+lock and continues only where each is either absent, and can be created,
+or already holds this record's id, in which case it is the record's own
+and is used as it stands and removed with the others at the end. In the
+`composed` phase there is a second kind of leftover it can account for:
+`update-ref` takes both locks itself, which is why the UI gives up
+`HEAD.lock` for that one command, so a stop inside it leaves locks `git`
+wrote rather than the UI. `git` writes the new value into the branch's
+lock and leaves `HEAD.lock` empty (**measured**, from a
+`reference-transaction` hook in the `prepared` phase: the branch's lock
+held the new commit's id and `HEAD.lock` was empty), so a branch lock
+holding exactly the record's commit id is that interrupted
 transaction's, and where it is, an empty `HEAD.lock` beside it is the
 same transaction's too; both are reclaimed like the UI's own. A lock
 holding anything else belongs to a running `git`, and the UI reports and
@@ -1066,35 +1075,40 @@ rollback can hold one lock more: where the checks after `update-ref`
 failed, the deciding ref's, which the record names before it is
 published, so a leftover holding this record's id is the UI's own and
 goes with the rest, and one holding anything else is a running `git`'s.
-For the rest it requires all of
-what step 5 required after its own `update-ref`: that `HEAD` is still
-symbolic to the record's branch, that the branch is still a direct ref
-and not a symbolic one, and that it still names the record's commit.
-`index.lock` does not cover `HEAD` (**measured**, in step 0), so a
-process that died after `update-ref` released `HEAD.lock` leaves a window
-in which a `symbolic-ref` can move `HEAD` to another branch, and an index
-built for the record's branch installed onto that one would be a
-staged difference nobody made. Where all of that holds, the UI finishes what was interrupted, from
-whichever side of the rename the crash left it on: the prepared index is
-`<index>.lock` where that file is still there and still hashes to what
-the record says, and is `<index>` itself where the lock is gone and the
-installed index hashes to it, since the rename copies no bytes and the
-installed index is the prepared one (**measured**: the file's hash before
-and after the rename was the same). The lock's absence is
-therefore not a refusal but the evidence that the rename already
-happened, which is the one thing the record cannot say about itself,
-being written before the rename and removed after the cleanup. So the UI
-renames where there is something to rename, and in either case then does
-the cleanup step 2 owed — the `link()` source unlinked, each swapped-out file moved
-under `previous/` — done by name from the record and skipped where the
-name is already gone, so that running it twice is running it once, and
-only then the record removed. Where neither file hashes to the record's
-index it changes nothing, and the same where `HEAD` or the branch has
-moved: an index that is neither the prepared one nor a lock the UI can
-account for is another `git`'s work, and a moved `HEAD` or branch is a
-state only the user can judge. In each of those it shows the record,
-`HEAD`, the branch's actual tip, and the commands. A record is
-never deleted except by the step that completes it or by the user.
+Every lock the record proves its own is released whatever the outcome
+below, that one included: the process that took it is gone, so it holds
+nothing together and only stops every other `git` on that ref, where
+what the outcome below weighs is the files and the refs, which the
+record still describes and the page still shows. For the rest it
+requires all of what step 5 required after its own `update-ref`: that
+`HEAD` is still symbolic to the record's branch, that the branch is
+still a direct ref and not a symbolic one, and that it still names the
+record's commit. `index.lock` does not cover `HEAD` (**measured**, in
+step 0), so a process that died after `update-ref` released `HEAD.lock`
+leaves a window in which a `symbolic-ref` can move `HEAD` to another
+branch, and an index built for the record's branch installed onto that
+one would be a staged difference nobody made. Where all of that holds,
+the UI finishes what was interrupted, from whichever side of the rename
+the crash left it on: the prepared index is `<index>.lock` where that
+file is still there and still hashes to what the record says, and is
+`<index>` itself where the lock is gone and the installed index hashes
+to it, since the rename copies no bytes and the installed index is the
+prepared one (**measured**: the file's hash before and after the rename
+was the same). The lock's absence is therefore not a refusal but the
+evidence that the rename already happened, which is the one thing the
+record cannot say about itself, being written before the rename and
+removed after the cleanup. So the UI renames where there is something to
+rename, and in either case then does the cleanup step 2 owed — the
+`link()` source unlinked, each swapped-out file moved under `previous/`
+— done by name from the record and skipped where the name is already
+gone, so that running it twice is running it once, and only then the
+record removed. Where neither file hashes to the record's index it
+changes nothing, and the same where `HEAD` or the branch has moved: an
+index that is neither the prepared one nor a lock the UI can account for
+is another `git`'s work, and a moved `HEAD` or branch is a state only
+the user can judge. In each of those it shows the record, `HEAD`, the
+branch's actual tip, and the commands. A record is never deleted except
+by the step that completes it or by the user.
 
 **Measured** on git 2.43, with staging, message-editing, pushing and pre-push
 hooks all installed: `commit-tree` made a commit holding `a` alone with the
