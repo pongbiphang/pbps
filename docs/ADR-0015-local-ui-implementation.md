@@ -853,16 +853,26 @@ locked-copy `update-index` ran it), so every `git` also takes
    resolves to decides instead — under that branch's own lock, taken here
    the way the others are (`<git-common-dir>/refs/heads/<target>.lock`,
    created exclusively) and discarded with them. The name it locks is the
-   one `git symbolic-ref HEAD` answers and the tip it reads is `git
-   rev-parse refs/heads/<target>`, both of the ref at the end of the chain
-   and not of an alias at its head: a branch can itself be symbolic, and a
-   lock on an alias holds the alias while another worktree moves what it
-   points at (**measured** on git 2.43: with `HEAD` symbolic to `b`, `b` to
-   `c` and `c` to `d`, `symbolic-ref HEAD` answered `refs/heads/d` where
-   `--no-recurse` answered `refs/heads/b`; and with the alias's lock held,
-   an `update-ref` of the ref at the end went through and moved what
-   `rev-parse HEAD` read, while that ref's own lock refused it with `cannot
-   lock ref`). `HEAD` cannot have moved again, its own lock being held once
+   one `git symbolic-ref --no-recurse HEAD` answers, the ref `HEAD` names
+   *directly*, and not the branch at the end of a chain, which is what the
+   bare command gives, dereferencing recursively by default (**measured**
+   on git 2.43: with `HEAD` symbolic to `b` and `b` to `d`, `symbolic-ref
+   HEAD` answered `refs/heads/d` where `--no-recurse` answered
+   `refs/heads/b`). Locking the end of a chain leaves every link in it
+   unlocked, and a link is a ref another worktree writes: **measured**,
+   with `HEAD.lock` and `d.lock` both held, `symbolic-ref refs/heads/b
+   refs/heads/e` went through and `rev-parse HEAD` moved from `d`'s tip to
+   `e`'s, while `b`'s own lock refused it. So the UI locks the one ref
+   `HEAD` names, asks under that lock that it is a direct one (`git
+   symbolic-ref refs/heads/<target>` must fail, as step 1 asks of the
+   branch it composes on and for the same reason), and reads the tip from
+   that name (`git rev-parse refs/heads/<target>`) rather than through
+   `HEAD`, so that the value it decides by is the value its lock holds;
+   between `HEAD`'s lock and that one nothing is left unlocked to move. A
+   target that is itself symbolic is not chased: every link would have to
+   be locked and asked again to hold one tip still, so it decides nothing,
+   and step 2 is undone for every path — the answer the shapes below share.
+   `HEAD` cannot have moved again either, its own lock being held once
    more; the branch it names can, and being checked out is no protection:
    **measured** on git 2.43, a plain `update-ref` from another worktree
    moved a branch a sibling had checked out, and that sibling then reported
@@ -880,26 +890,24 @@ locked-copy `update-index` ran it), so every `git` also takes
    file where that tip holds exactly what step 3 recorded, and undoes step
    2 for the path where it does not — which on the `HEAD`-moved-away path
    is the ordinary case, since the UI's commit is on a branch nobody is
-   standing on. Each path is left at what the branch it is on records. Four
-   shapes of that path take no rule of their own, having one already: a
-   `HEAD` detached in the gap rather than redirected names a commit its own
-   lock holds still and has no branch to lock; an unborn target —
-   `symbolic-ref` takes a branch that does not exist (**measured**: it was
-   accepted, and `rev-parse HEAD` and `ls-tree HEAD` then failed with
-   `unknown revision` and `Not a valid object name`) — has no tip, so its
-   entry set is empty, no path matches it, and step 2 is undone for all of
-   them; a target that has become symbolic in the gap between its name
-   being read and its lock being taken, which is why the UI asks again
-   under that lock that it is a direct ref (`git symbolic-ref
-   refs/heads/<target>` must fail, as step 1 asks of the branch it composes
-   on and for the same reason), holds no tip the lock keeps still and is
-   answered the same way; and a target whose lock cannot be created has
+   standing on. Each path is left at what the branch it is on records.
+   Three shapes of that path take no rule of their own, having one already:
+   a `HEAD` detached in the gap rather than redirected names a commit its
+   own lock holds still, and has no branch to lock or to ask about; an
+   unborn target — `symbolic-ref` takes a branch that does not exist
+   (**measured**: it was accepted, and `rev-parse HEAD` and `ls-tree HEAD`
+   then failed with `unknown revision` and `Not a valid object name`) — has
+   no tip, so its entry set is empty, no path matches it, and step 2 is
+   undone for all of them; and a target whose lock cannot be created has
    another `git` mid-transaction on it, where the UI decides nothing by a
    tip it cannot hold still and undoes step 2 for every path, which asks no
-   tip at all. The page then names the commit, the tip the branch actually
-   holds, and every path with what became of it, since the user's index is
-   the one they had and only they can say which of the two states they
-   want. **Measured** both ways: undisturbed, the check passed and the
+   tip at all. Step 1's record stays the recursive answer: an intermediate
+   retargeted during the compose changes what `symbolic-ref HEAD` says, so
+   step 5's own check fails and lands here, which is the path that needs
+   the direct name. The page then names the commit, the tip the branch
+   actually holds, and every path with what became of it, since the user's
+   index is the one they had and only they can say which of the two states
+   they want. **Measured** both ways: undisturbed, the check passed and the
    index was installed clean; with a `symbolic-ref` to a sibling in the
    gap, the check failed, the branch held the commit, and the sibling's ref
    and index were left alone by git. What the working tree keeps there is
