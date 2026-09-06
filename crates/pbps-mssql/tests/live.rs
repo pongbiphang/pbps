@@ -503,17 +503,16 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
     }
 }
 
-/// A grant whose securable the connection cannot name comes back as a
-/// permission row with a NULL joined name, and dropping that row made `pull`
-/// write a role narrower than the database holds (issue #93). The engine is
-/// asked here because whether such a row arrives at all is the whole question:
-/// a permission on a system object is the deterministic way to produce one —
-/// its `major_id` lives in `sys.system_objects`, so the catalog query's LEFT
-/// JOIN against `sys.objects` yields no name, the same shape an object the
-/// account holds nothing on produces.
+/// A permission row whose joined securable name is NULL is reported, not
+/// dropped (issue #93) — but a grant on a *system* object must not become one
+/// of those: its `major_id` is absent from `sys.objects` and present in
+/// `sys.all_objects`, so the narrower join called an ordinary
+/// `GRANT SELECT ON sys.objects` unnameable, and a reported grant with no
+/// target refuses every connected command. The engine is asked because which
+/// catalog view holds the row is the whole question.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
-async fn a_grant_whose_securable_has_no_readable_name_is_reported_not_dropped() {
+async fn a_grant_on_a_system_object_is_named_and_not_reported_as_unnameable() {
     let mut db = TestDb::create("nameless").await;
     db.conn
         .execute(
@@ -530,25 +529,26 @@ async fn a_grant_whose_securable_has_no_readable_name_is_reported_not_dropped() 
         .expect("introspect");
     db.drop().await;
 
-    // The negative case: the grant that can be named is still adopted.
-    let targets: Vec<String> = pulled.schema.roles["app_reader"]
-        .grants
-        .keys()
-        .map(ToString::to_string)
-        .collect();
-    assert_eq!(targets, ["dbo.customer"], "{:?}", pulled.unexpressible);
     let said = pulled
         .unexpressible
         .iter()
         .map(|u| u.what.clone())
         .collect::<Vec<_>>()
         .join("\n");
+    let targets: Vec<String> = pulled.schema.roles["app_reader"]
+        .grants
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    // Both are named: the ordinary table, and the system object the managed-set
+    // filter will discard downstream as somebody else's.
+    assert_eq!(targets, ["dbo.customer", "sys.objects"], "{said}");
     assert!(
-        pulled
+        !pulled
             .unexpressible
             .iter()
             .any(|u| u.role == "app_reader" && u.what.contains("cannot name")),
-        "the grant on the unnameable securable vanished instead of being reported: {said}"
+        "a grant the catalog can name was reported as unnameable: {said}"
     );
 }
 

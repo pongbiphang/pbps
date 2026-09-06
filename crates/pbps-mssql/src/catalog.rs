@@ -143,12 +143,21 @@ SELECT p.name
 /// not hold, so the assembler can report each rather than have it silently
 /// absent — a `GRANT CONTROL TO role` that the read never saw compared equal
 /// on the grants it did see (DECISIONS 105).
+///
+/// The securable is resolved through `sys.all_objects`, not `sys.objects`: a
+/// grant on a system object — `GRANT SELECT ON sys.objects`, `GRANT EXECUTE ON
+/// sys.sp_executesql` — has a `major_id` that only `sys.all_objects` holds, and
+/// against `sys.objects` alone it came back nameless. A nameless securable is
+/// reported rather than dropped, so such a grant, on an object no project
+/// manages, would refuse every connected command; named, the managed-set filter
+/// discards it the way it discards any other grant on somebody else's object.
+/// What stays nameless is then only what this connection may not see.
 const PERMISSIONS: &str = "\
 SELECT pr.name AS role_name, dp.class, dp.class_desc, dp.permission_name, dp.state, dp.minor_id,
        COALESCE(os.name, ss.name) AS schema_name, o.name AS object_name
   FROM sys.database_permissions dp
   JOIN sys.database_principals pr ON pr.principal_id = dp.grantee_principal_id
-  LEFT JOIN sys.objects o ON dp.class = 1 AND o.object_id = dp.major_id
+  LEFT JOIN sys.all_objects o ON dp.class = 1 AND o.object_id = dp.major_id
   LEFT JOIN sys.schemas os ON os.schema_id = o.schema_id
   LEFT JOIN sys.schemas ss ON dp.class = 3 AND ss.schema_id = dp.major_id
  WHERE pr.type = 'R' AND pr.is_fixed_role = 0 AND pr.name <> 'public'
