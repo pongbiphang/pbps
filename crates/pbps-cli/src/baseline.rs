@@ -69,10 +69,11 @@ pub fn load(
             let text = std::fs::read_to_string(path).map_err(|e| {
                 anyhow::anyhow!("cannot read baseline file `{}`: {e}", path.display())
             })?;
-            let snap: StateSnapshot = serde_json::from_str(&text).map_err(|e| {
-                anyhow::anyhow!("baseline file `{}` is malformed: {e}", path.display())
-            })?;
-            snap.check_version()
+            // `from_json`, not `from_str` then `check_version`: a snapshot
+            // from a version this build does not read is refused by its
+            // version and the remedy that goes with it, rather than by
+            // whichever field of its older shape serde reached first.
+            let snap = StateSnapshot::from_json(&text)
                 .map_err(|e| anyhow::anyhow!("baseline file `{}`: {e}", path.display()))?;
             Ok(Baseline {
                 schema: snap.schema,
