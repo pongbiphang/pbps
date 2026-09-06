@@ -517,7 +517,10 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         }
 
         (Family::Binary { len: al, fixed: af }, Family::Binary { len: bl, fixed: bf }) => {
-            if !af && bf {
+            // Growing a fixed binary also appends zero bytes: the payload and
+            // its hash change even though SQL Server compares it equal to the
+            // old value. Capacity alone cannot establish byte preservation.
+            if bf && (!af || al != bl) {
                 return TypeChangeRisk::Narrowing;
             }
             safe_if(al.fits_in(bl))
@@ -827,6 +830,23 @@ mod tests {
             risk("varbinary(10)", "binary(20)"),
             TypeChangeRisk::Narrowing
         );
+    }
+
+    #[test]
+    fn fixed_binary_growth_requires_approval_for_the_added_padding_bytes() {
+        for (from, to, expected) in [
+            ("binary(8)", "binary(16)", TypeChangeRisk::Narrowing),
+            ("binary(16)", "binary(8)", TypeChangeRisk::Narrowing),
+            ("binary(8)", "binary(8)", TypeChangeRisk::Safe),
+            ("varbinary(8)", "binary(8)", TypeChangeRisk::Narrowing),
+            ("varbinary(8)", "binary(16)", TypeChangeRisk::Narrowing),
+            ("binary(8)", "varbinary(16)", TypeChangeRisk::Safe),
+            ("varbinary(8)", "varbinary(16)", TypeChangeRisk::Safe),
+            ("binary(8)", "varbinary(4)", TypeChangeRisk::Narrowing),
+            ("char(8)", "char(16)", TypeChangeRisk::Safe),
+        ] {
+            assert_eq!(risk(from, to), expected, "{from} -> {to}");
+        }
     }
 
     #[test]

@@ -6553,3 +6553,66 @@ async fn sysname_risk_matches_the_engines_length_boundary() {
     }
     db.drop().await;
 }
+
+/// SQL equality can ignore the extra zero bytes, so compare the bytes sent
+/// back to the application and their hash when judging whether data changed.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn fixed_binary_growth_changes_the_payload_and_requires_approval() {
+    use pbps_dialect::TypeChangeRisk;
+
+    let mut db = TestDb::create("binary_padding").await;
+    for (from, to, padded, risk) in [
+        ("binary(8)", "binary(16)", true, TypeChangeRisk::Narrowing),
+        ("binary(8)", "varbinary(16)", false, TypeChangeRisk::Safe),
+        ("varbinary(8)", "varbinary(16)", false, TypeChangeRisk::Safe),
+    ] {
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.binary_payload (v {from} NULL); \
+             INSERT dbo.binary_payload VALUES (0x0102030405060708); \
+             ALTER TABLE dbo.binary_payload ALTER COLUMN v {to} NULL;"
+            ))
+            .await
+            .expect("alter binary payload");
+        let rows = db
+            .conn
+            .query(
+                "SELECT CONVERT(varchar(max),v,2), DATALENGTH(v), \
+             CASE WHEN HASHBYTES('SHA2_256',v) = HASHBYTES('SHA2_256',0x0102030405060708) \
+                  THEN 1 ELSE 0 END, \
+             CASE WHEN v = 0x0102030405060708 THEN 1 ELSE 0 END \
+             FROM dbo.binary_payload;",
+            )
+            .await
+            .unwrap();
+        let payload: &str = rows[0].try_get_at(0).unwrap().unwrap();
+        let bytes: i32 = rows[0].try_get_at(1).unwrap().unwrap();
+        let same_hash: i32 = rows[0].try_get_at(2).unwrap().unwrap();
+        let equal: i32 = rows[0].try_get_at(3).unwrap().unwrap();
+        assert_eq!(
+            payload,
+            if padded {
+                "01020304050607080000000000000000"
+            } else {
+                "0102030405060708"
+            }
+        );
+        assert_eq!(bytes, if padded { 16 } else { 8 });
+        assert_eq!(same_hash, i32::from(!padded));
+        assert_eq!(
+            equal, 1,
+            "SQL equality alone does not prove byte preservation"
+        );
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            risk,
+            "{from} -> {to}"
+        );
+        db.conn
+            .execute("DROP TABLE dbo.binary_payload;")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}
