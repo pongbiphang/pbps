@@ -854,7 +854,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    way the others are (`<git rev-parse --git-path <target>>.lock`, created
    exclusively, which is the files backend's protocol whatever the ref is —
    **measured**: a lock at a tag's path made `update-ref` of that tag fail
-   with `cannot lock ref`), and discarded with them. Where that lock file
+   with `cannot lock ref`), and written into the record before it is
+   published, as every lock here is, so a crash in the rollback leaves one
+   the record can name; it is discarded with them. Where that lock file
    goes, `git` is asked, as step 0 asks it for the index and for `HEAD`,
    because not every ref is shared: a per-worktree one — `refs/worktree/*`,
    `refs/bisect/*`, `refs/rewritten/*` — lives under the worktree's own
@@ -906,30 +908,35 @@ locked-copy `update-index` ran it), so every `git` also takes
    file where that tip holds exactly what step 3 recorded, and undoes step
    2 for the path where it does not — which on the `HEAD`-moved-away path
    is the ordinary case, since the UI's commit is on a branch nobody is
-   standing on. Each path is left at what the branch it is on records.
-   Three shapes of that path take no rule of their own, having one already:
-   a `HEAD` detached in the gap rather than redirected names a commit its
-   own lock holds still, and has no branch to lock or to ask about; an
-   unborn target — `symbolic-ref` takes a branch that does not exist
+   standing on. Each path is left at what the branch it is on records. Four
+   shapes of that path take no rule of their own, having one already: a
+   `HEAD` detached in the gap rather than redirected names a commit its own
+   lock holds still, and has no branch to lock or to ask about; an unborn
+   target — `symbolic-ref` takes a branch that does not exist
    (**measured**: it was accepted, and `rev-parse HEAD` and `ls-tree HEAD`
    then failed with `unknown revision` and `Not a valid object name`) — has
    no tip, so its entry set is empty, no path matches it, and step 2 is
-   undone for all of them; and a target whose lock cannot be created has
-   another `git` mid-transaction on it, where the UI decides nothing by a
-   tip it cannot hold still and undoes step 2 for every path, which asks no
-   tip at all. Step 1's record stays the recursive answer, which this rule
-   does not make safe: an intermediate retargeted before step 5's checks
-   changes what `symbolic-ref HEAD` answers, so the check fails and lands
-   here, while one retargeted after them is caught by nothing and is #140.
-   The page then names the commit, the tip the branch actually holds, and
-   every path with what became of it, since the user's index is the one
-   they had and only they can say which of the two states they want.
-   **Measured** both ways: undisturbed, the check passed and the index was
-   installed clean; with a `symbolic-ref` to a sibling in the gap, the
-   check failed, the branch held the commit, and the sibling's ref and
-   index were left alone by git. What the working tree keeps there is the
-   rule above and not that measurement: the sibling's tip does not hold the
-   placed bytes, so step 2 is undone for every such path.
+   undone for all of them; a target that resolves to something no tree can
+   be read from — `HEAD` takes a tag naming a blob as readily as one naming
+   a commit (**measured** on git 2.43: `ls-tree` then failed with `fatal:
+   not a tree object`, where an annotated tag over a commit peeled and
+   listed the entry) — has no entry set either, and is answered the same
+   way; and a target whose lock cannot be created has another `git`
+   mid-transaction on it, where the UI decides nothing by a tip it cannot
+   hold still and undoes step 2 for every path, which asks no tip at all.
+   Step 1's record stays the recursive answer, which this rule does not
+   make safe: an intermediate retargeted before step 5's checks changes
+   what `symbolic-ref HEAD` answers, so the check fails and lands here,
+   while one retargeted after them is caught by nothing and is #140. The
+   page then names the commit, the tip the branch actually holds, and every
+   path with what became of it, since the user's index is the one they had
+   and only they can say which of the two states they want. **Measured**
+   both ways: undisturbed, the check passed and the index was installed
+   clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
+   the branch held the commit, and the sibling's ref and index were left
+   alone by git. What the working tree keeps there is the rule above and
+   not that measurement: the sibling's tip does not hold the placed bytes,
+   so step 2 is undone for every such path.
 6. It installs the locked copy of the index that step 3 prepared by
    renaming `<index>.lock` to `<index>`, which is exactly the commit step
    of `git`'s own lock. Now
@@ -1045,10 +1052,14 @@ lock held the new commit's id and `HEAD.lock` was empty), so a branch
 lock holding exactly the record's commit id is that interrupted
 transaction's, and where it is, an empty `HEAD.lock` beside it is the
 same transaction's too; both are reclaimed like the UI's own. A lock
-holding anything else belongs to a running
-`git`, and the UI reports and changes nothing. For a record still in
-`placing` or `composed` that is the whole of what it needs, since the
-rollback touches no ref. For the rest it requires all of
+holding anything else belongs to a running `git`, and the UI reports and
+changes nothing. For a record still in `placing` that is the whole of
+what it needs, since its rollback touches no ref. In `composed` the
+rollback can hold one lock more: where the checks after `update-ref`
+failed, the deciding ref's, which the record names before it is
+published, so a leftover holding this record's id is the UI's own and
+goes with the rest, and one holding anything else is a running `git`'s.
+For the rest it requires all of
 what step 5 required after its own `update-ref`: that `HEAD` is still
 symbolic to the record's branch, that the branch is still a direct ref
 and not a symbolic one, and that it still names the record's commit.
