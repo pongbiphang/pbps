@@ -839,39 +839,59 @@ locked-copy `update-index` ran it), so every `git` also takes
    exists and is where `update-ref` put it, but the checkout is no longer
    at it, so step 6 does not happen and nothing is pushed: the locks are
    discarded and the index is as it was. What becomes of the placed files
-   is decided by the tip of the branch the checkout is *on*, read under the
-   lock before anything else is undone, never by the assumption that it is
-   the UI's commit. The two failures are not one failure, and treating them
-   alike is what the earlier rule got wrong. Where the branch moved and
-   `HEAD` still names it, the checkout is still on that branch and its
-   actual tip decides — a sibling worktree's `update-ref` or `reset` leaves
-   it at something else entirely, and reading the UI's commit there kept
-   the files on a premise that had stopped being true. Where `HEAD` names
-   another branch, the placed files belong to *that* checkout now, and the
-   branch the UI advanced has nothing to say about them: the tip `HEAD`
-   resolves to decides instead. Reading the advanced branch in both cases
-   kept every placed file on the `symbolic-ref` path, against a branch
-   nobody is standing on (**measured** on git 2.43: after redirecting
-   `HEAD`, advancing the original branch and retaining the replacement
-   bytes, the sibling checkout reported the file modified). So the UI reads
-   the deciding tip's whole entry for each edited path (`git ls-tree -z
-   <tip> -- <path>`: the mode and the object id, not the id alone, since
-   the same blob at `100755` is a file the placed one does not match, and
-   a `120000` or `160000` entry with that id is not a file at all) and
-   keeps the placed file where that tip holds exactly what step 3 recorded,
-   and undoes step 2 for the path where it does not — which on the
-   `HEAD`-moved-away path is the ordinary case, since the UI's commit is on
-   a branch nobody is standing on. Each path is left at what the branch it
-   is on records. The page then names the commit, the tip the
-   branch actually holds, and every path with what became of it, since
-   the user's index is the one they had and only they can say which of
-   the two states they want. **Measured**
-   both ways: undisturbed, the check passed and the index was installed
-   clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
-   the branch held the commit, and the sibling's ref and index were left
-   alone by git. What the working tree keeps there is the rule above and
-   not that measurement: the sibling's tip does not hold the placed bytes,
-   so step 2 is undone for every such path.
+   is decided by the tip of the branch the checkout is *on*, held still
+   while it decides, never by the assumption that it is the UI's commit.
+   The two failures are not one failure, and treating them alike is what
+   the earlier rule got wrong. Where the branch moved and `HEAD` still
+   names it, the checkout is still on that branch and its actual tip
+   decides — a sibling worktree's `update-ref` or `reset` leaves it at
+   something else entirely, and reading the UI's commit there kept the
+   files on a premise that had stopped being true — and the lock holding
+   that tip still is the one already taken. Where `HEAD` names another
+   branch, the placed files belong to *that* checkout now and the branch
+   the UI advanced has nothing to say about them, so the tip `HEAD`
+   resolves to decides instead — under that branch's own lock, taken here
+   the way the others are (`<git-common-dir>/refs/heads/<target>.lock`,
+   created exclusively) and discarded with them. `HEAD` cannot have moved
+   again, its own lock being held once more; the branch it names can, and
+   being checked out is no protection: **measured** on git 2.43, a plain
+   `update-ref` from another worktree moved a branch a sibling had
+   checked out, and that sibling then reported the path modified, while
+   with the branch's lock held it failed with `cannot lock ref`. A placed
+   file kept against a tip that moved after it was read is the error this
+   step is correcting, not a smaller one. Reading the advanced branch in
+   both cases kept every placed file on the `symbolic-ref` path, against
+   a branch nobody is standing on (**measured** on git 2.43: after
+   redirecting `HEAD`, advancing the original branch and retaining the
+   replacement bytes, the sibling checkout reported the file modified).
+   So the UI reads the deciding tip's whole entry for each edited path
+   (`git ls-tree -z <tip> -- <path>`: the mode and the object id, not the
+   id alone, since the same blob at `100755` is a file the placed one
+   does not match, and a `120000` or `160000` entry with that id is not a
+   file at all) and keeps the placed file where that tip holds exactly
+   what step 3 recorded, and undoes step 2 for the path where it does not
+   — which on the `HEAD`-moved-away path is the ordinary case, since the
+   UI's commit is on a branch nobody is standing on. Each path is left at
+   what the branch it is on records. Three shapes of that path take no
+   rule of their own, having one already: a `HEAD` detached in the gap
+   rather than redirected names a commit its own lock holds still and has
+   no branch to lock; an unborn target — `symbolic-ref` takes a branch
+   that does not exist (**measured**: it was accepted, and `rev-parse
+   HEAD` and `ls-tree HEAD` then failed with `unknown revision` and `Not
+   a valid object name`) — has no tip, so its entry set is empty, no path
+   matches it, and step 2 is undone for all of them; and a target whose
+   lock cannot be created has another `git` mid-transaction on it, where
+   the UI decides nothing by a tip it cannot hold still and undoes step 2
+   for every path, which asks no tip at all. The page then names the
+   commit, the tip the branch actually holds, and every path with what
+   became of it, since the user's index is the one they had and only they
+   can say which of the two states they want. **Measured** both ways:
+   undisturbed, the check passed and the index was installed clean; with a
+   `symbolic-ref` to a sibling in the gap, the check failed, the branch
+   held the commit, and the sibling's ref and index were left alone by git.
+   What the working tree keeps there is the rule above and not that
+   measurement: the sibling's tip does not hold the placed bytes, so step 2
+   is undone for every such path.
 6. It installs the locked copy of the index that step 3 prepared by
    renaming `<index>.lock` to `<index>`, which is exactly the commit step
    of `git`'s own lock. Now
