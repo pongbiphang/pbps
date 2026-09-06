@@ -1494,7 +1494,7 @@ fn refuse_unplanned_movement(
         &after.tables,
         named,
         |name: &TableName, was: &pbps_model::Table, now: &pbps_model::Table| {
-            was == undo.apply(now, name).as_ref()
+            undo.apply(was, name) == undo.apply(now, name)
         },
         &mut moved,
     );
@@ -1707,9 +1707,16 @@ fn refuse_unplanned_movement(
             // the rename leaves, exactly as the differ does when it decides
             // not to emit the restatement in the first place. What may be
             // rewritten and what may not is `Renames::apply`'s business.
-            // The later read, back in the spelling the earlier one uses, so
-            // the constraints this plan's renames carry compare equal without
-            // any change of its own restating them.
+            // Both reads back in the spelling that precedes this plan, so
+            // the constraints its renames carry compare equal without any
+            // change of its own restating them.
+            //
+            // Both, not the later one alone: a staged run's closing check
+            // compares two checkpoints, and by then the earlier of them
+            // already carries the rename. Undoing is idempotent on a name the
+            // plan does not rename, so a read from either side of a statement
+            // lands in the same spelling.
+            let was = &undo.apply(was, name);
             let now = &undo.apply(now, now_name);
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
@@ -5464,6 +5471,21 @@ mod tests {
             Settled::SoFar,
         );
         e.expect("the control: the same read with nothing else moved");
+
+        // The closing read of a staged run compares two checkpoints, and by
+        // then *both* carry the rename: `previous` is the checkpoint the last
+        // statement left. Rewinding only the later one would leave the earlier
+        // under the new spelling and refuse to close a run that has committed
+        // every statement it was asked to.
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renames,
+            &table("a2", "b2"),
+            &table("a2", "b2"),
+            "prod",
+            Settled::Closing,
+        )
+        .expect("two reads that both carry the renames");
 
         // The negative case: a constraint spelled a way no rename of this plan
         // produces is movement, at a checkpoint as much as at the end.
