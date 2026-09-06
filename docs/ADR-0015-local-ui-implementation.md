@@ -245,7 +245,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    and any difference is a transformation that would leave the installed
    path modified (**measured**: with `*.json ident` and `$Id$` in the file,
    `filter` was `unspecified` and the two ids differed). It
-   requires the path to be a regular file or absent — never a symlink:
+   requires the path to be a regular file or absent — never a symlink,
+   and never *under* one: every component of the path from the worktree
+   root is checked with `lstat` and none may be a link, and every file
+   operation the UI makes is done through directory handles opened from
+   the root with `O_NOFOLLOW` (`openat2` with `RESOLVE_BENEATH` on Linux),
+   because a tracked directory replaced by a link to a directory outside
+   the worktree leaves the leaf a regular file with matching index and tip
+   entries (**measured**: `ls-files` and `ls-tree` both still said
+   `100644` while `hash-object` read the outside file), and step 2 would
+   have exchanged and discarded a file the "outside the worktree" rule
+   promised never to touch. The leaf itself must not be a link either:
    `git hash-object` follows a link and hashes the target's content
    (**measured**: the link `a` hashed as `a`'s content, where `git add`
    stores the link text at mode `120000`), so a linked declaration file
@@ -290,8 +300,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    editor had meanwhile created was refused), so a file that appeared in
    the window is never replaced. On Windows, which has no exchange, the
    existing file is opened denying every other writer and deleter
-   (`FILE_SHARE_READ` alone), hashed through that handle, and — if it is
-   still the page's version — rewritten through the same handle, so that a
+   (`FILE_SHARE_READ` alone), hashed through that handle, refused if the
+   handle reports more than one link (`GetFileInformationByHandle`'s link
+   count) — the in-place write changes the file object every hard link
+   shares, where the exchange replaces one directory entry — and, if it is
+   still the page's version, rewritten through the same handle, so that a
    save cannot land between the check and the write because the editor
    cannot open the file for writing until the handle closes; a new file is
    created with `CREATE_NEW`, which fails if the name exists. That
