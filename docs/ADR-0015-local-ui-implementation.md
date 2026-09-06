@@ -224,7 +224,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    `git symbolic-ref HEAD refs/heads/<sibling>` went through, and with
    `HEAD.lock` held it failed with `Unable to create 'HEAD.lock'`.
 1. It records the branch `HEAD` is symbolic to and its tip (`git
-   symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), and the
+   symbolic-ref HEAD`, `git rev-parse refs/heads/<branch>`), refusing a
+   branch that is itself a symbolic ref (`git symbolic-ref
+   refs/heads/<branch>` answers instead of failing): `update-ref` would
+   move the ref it points to while the lock of step 5 holds the alias, so
+   the branch the UI locks must be the branch that moves. It records the
    remote's tip for that branch, under the rules below. It requires each path
    it is about to edit to still hold what the page was shown: the page's
    request carries the blob id of the file it read, step 1 hashes the file
@@ -289,7 +293,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    tip entry's, the user changed the executable bit in the working tree,
    which the blob does not carry and the exchange would have silently
    reset. In either case the two are exchanged back and the compose is
-   refused with what differs shown. If both match, the old version is
+   refused with what differs shown — and so is every path exchanged
+   before it, in reverse order, since an intent may edit more than one
+   file and a refusal that left some of them replaced would be a partial
+   edit nobody asked for; the retained copies below are made only after
+   every path has passed, so at that point nothing has been let go and the
+   exchanges back restore the tree exactly. If both match, the old version is
    still not deleted: an editor that opened the file before the exchange
    holds a descriptor to that inode and may write through it after the
    hash, and an unlinked inode would take that save with it. The
