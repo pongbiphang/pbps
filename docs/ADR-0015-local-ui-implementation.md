@@ -182,7 +182,8 @@ dbo.customer.national_id --reason <text>`, and the table and role forms —
 exactly as a user would type them. The UI writes the recorded tip out as a
 snapshot the way step 3 below writes one (`git ls-tree -r -z <tip>` and
 `git cat-file --batch`, regular-file entries only, under
-`<git-dir>/pbps-ui/intent/<random>/`), runs the CLI's own intent command
+`<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3
+states), runs the CLI's own intent command
 there — `pbps rename <from> <to> --no-input --format json --project <that
 directory>/<the project's path>` and its siblings — and takes as the
 replacement bytes every regular file the command left different from the
@@ -570,7 +571,23 @@ locked-copy `update-index` ran it), so every `git` also takes
    `cat-file` runs none (**measured**: under `*.json filter=up` with a
    `smudge` that left a marker, `checkout-index -a --prefix` and
    `archive` both left it, `cat-file --batch` and `cat-file blob` did
-   not). Which rules `validate` enforces is SPEC's and unchanged here.
+   not). A tree's names are bytes `git` stores, not paths it has
+   checked: `mktree` refuses a name with a slash in it but accepts an
+   entry named `..`, and a tree entry so named nests, so `ls-tree -r -z`
+   hands back `../file` as a name (**measured**: a tree holding a
+   subtree named `..` was made, `ls-tree -r` printed `../file`, and only
+   `fsck` complained, `hasDotdot`), and a snapshot writer that joined
+   such a name to its directory would write outside it — into the
+   repository, the index or the working tree — before any guard of step
+   1 ran. Both snapshot writers, here and in the intent snapshot above,
+   therefore split every name on `/` and refuse the compose if any
+   component is empty, `.`, `..`, or, on Windows, contains `\` or is a
+   drive or device name, and create every directory and file relative
+   to a handle on the snapshot directory (`mkdirat`, `openat` with
+   `O_CREAT | O_EXCL | O_NOFOLLOW`; the relative `NtCreateFile` of step
+   2 on Windows), never by joining the name to a path, so that a name
+   which passed the check still cannot reach past the handle. Which
+   rules `validate` enforces is SPEC's and unchanged here.
    Then, with the tree known to be one `validate` accepts, the same
    entries are written into the locked copy of the user's index —
    `GIT_INDEX_FILE=<index>.lock git update-index --add --cacheinfo
