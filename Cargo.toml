@@ -62,8 +62,15 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # — the property ADR-0014's Limits names `tiberius 0.12` as lacking — so it is
 # made explicitly, against the one `rustls` already in this tree.
 tokio-postgres = { version = "0.7", default-features = false }
-tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# `aws-lc-rs`, not `ring`, and the reason is measured rather than preferred:
+# `tiberius-ng` resolves `rustls` with its default provider, so asking for
+# `ring` here compiled **both** into the binary. rustls then cannot determine a
+# process-level provider and panics the moment a `ClientConfig::builder()` runs
+# — which the PostgreSQL live suite hit on its first connection, and which no
+# amount of building or `cargo deny` could have shown. One provider in the tree
+# is the shape that cannot fail that way (DECISIONS 228).
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
 
 serde_json = { version = "1", features = ["preserve_order"] }

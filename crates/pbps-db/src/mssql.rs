@@ -5,7 +5,7 @@
 //! one file. With a second driver the rule becomes **one file per driver**:
 //! nothing outside this module and its PostgreSQL sibling names either one, and
 //! `lib.rs` dispatches between them without knowing what is underneath
-//! (DECISIONS 214).
+//! (DECISIONS 225).
 
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
@@ -127,7 +127,7 @@ fn as_sql<'a>(param: &'a Param<'a>) -> &'a dyn tiberius::ToSql {
 /// them. The set was measured by the compiler rather than by reading the source
 /// — a first count by eye found three and missed `bool`, `i16` and `u8`, which
 /// reach the seam through `get(&row, "…")` with the type inferred from the
-/// struct field it lands in and never spelled at the call site (DECISIONS 214).
+/// struct field it lands in and never spelled at the call site (DECISIONS 225).
 impl Row {
     pub(crate) fn str_by_name<'a>(&'a self, col: &str) -> Result<Option<&'a str>, DbError> {
         Ok(self.0.try_get::<&str, _>(col)?)

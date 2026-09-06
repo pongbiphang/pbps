@@ -16,7 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 # One driver per module, named nowhere else in the workspace: `tiberius` in
-# `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 214).
+# `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 225).
 tiberius.workspace = true
 tokio-util.workspace = true
 tokio-postgres.workspace = true

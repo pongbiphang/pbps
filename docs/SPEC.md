@@ -1393,7 +1393,8 @@ pbps/
     pbps-dialect/   The Dialect trait plus shared helpers
     pbps-mssql/     MSSQL: type normalization, SQL generation, introspection,
                     dependency queries
-    pbps-pg/        PostgreSQL (Phase 5)
+    pbps-pg/        PostgreSQL: the dialect, as far as Phase 5 has built it;
+                    every part that is not built refuses by name
     pbps-db/        Connection abstraction, __pbps_state access, locking
     pbps-docs/      Documentation and ERD rendering (9.4); pure, no dialect
     pbps-cli/       clap, interactive prompts, diagnostic output
@@ -1507,6 +1508,16 @@ The live suite carries the other half of that division of labour. `cargo-deny`
 can say a dependency is unsafe; only a real engine can say a *replacement* is
 safe, which is why the driver question in open question 10 is settled here and
 not by a version number.
+
+There are two live suites now, one per engine — `scripts/live-tests.sh` and
+`scripts/live-tests-pg.sh`, each against its own image **pinned by digest**, and
+each a CI job of its own. Separate, because they answer questions about two
+different engines and a developer changing one dialect should not have to start
+the other. The PostgreSQL suite earned its place before there was a PostgreSQL
+dialect to test: on its first connection to a real server it found that the seam
+**panicked** rather than connecting — two rustls crypto providers compiled in and
+no process default to choose between them — which building, linting and
+`cargo deny` all reported as green (DECISIONS 228).
 
 ---
 

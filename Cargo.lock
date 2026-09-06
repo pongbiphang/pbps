@@ -1323,8 +1323,10 @@ dependencies = [
 name = "pbps-pg"
 version = "0.0.0"
 dependencies = [
+ "pbps-db",
  "pbps-dialect",
  "pbps-model",
+ "tokio",
 ]
 
 [[package]]
@@ -1586,7 +1588,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",

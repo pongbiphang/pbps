@@ -23,7 +23,9 @@
 
 use std::borrow::Cow;
 
-use pbps_dialect::{Dialect, DialectError, Probe, Statement, TransactionFraming, TypeChangeRisk};
+use pbps_dialect::{
+    Dialect, DialectError, Lexicon, Probe, Statement, TransactionFraming, TypeChangeRisk,
+};
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, Role, Schema, Strategy, Table, TableName,
 };
@@ -48,6 +50,18 @@ pub struct Mssql;
 impl Dialect for Mssql {
     fn name(&self) -> &'static str {
         types::DIALECT
+    }
+
+    /// `[…]` and `"…"` both quote an identifier here, and neither of
+    /// PostgreSQL's two extensions to the string literal exists: there is no
+    /// `E'…'`, and `$` is an ordinary identifier character (`total$`) and the
+    /// opener of a money literal (`$1.00`), never a dollar-quote tag.
+    fn lexicon(&self) -> Lexicon {
+        Lexicon {
+            quoted_identifiers: &[('[', ']'), ('"', '"')],
+            escape_strings: false,
+            dollar_quoted_strings: false,
+        }
     }
 
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
@@ -150,5 +164,30 @@ mod tests {
     #[test]
     fn sql_server_roles_are_the_tools_to_create_and_drop() {
         assert!(Mssql.manages_roles());
+    }
+
+    /// The scanner became a parameter in ADR-0011 Amendment 2, and the answers
+    /// this engine gets must be the ones it got before. A bracket is a name
+    /// here, and neither of PostgreSQL's two extensions to the string literal
+    /// exists — an `E` before a quote is an alias, and a `$` is a character in
+    /// a name or the front of a money literal.
+    #[test]
+    fn a_bracket_holds_a_name_and_the_postgres_string_syntaxes_are_ordinary_code() {
+        assert_ne!(
+            Mssql.normalize_definition("SELECT [a  b] FROM t"),
+            Mssql.normalize_definition("SELECT [a b] FROM t")
+        );
+        assert_eq!(
+            Mssql.normalize_definition(r"SELECT E'it\'s  here'"),
+            r"SELECT E'it\'s here'"
+        );
+        assert_eq!(
+            Mssql.normalize_definition("SELECT $tag$a  b$tag$"),
+            "SELECT $tag$a b$tag$"
+        );
+        assert_eq!(
+            Mssql.normalize_definition("SELECT   $1.00  +  total$"),
+            "SELECT $1.00 + total$"
+        );
     }
 }

@@ -24,7 +24,7 @@
 //! [`postgres`] names `tokio_postgres`, and nothing else in the workspace names
 //! either. This module dispatches between them and holds no driver type: that
 //! is what keeps `&mut Conn` meaning the same thing at all 22 call sites in
-//! `pbps-mssql` that already had it (DECISIONS 214).
+//! `pbps-mssql` that already had it (DECISIONS 225).
 
 use pbps_dialect::TransactionFraming;
 pub mod ledger;
@@ -131,7 +131,7 @@ pub enum Row {
 /// `get(&row, "max_length")` with the type inferred from the struct field it
 /// lands in and never spelled at the call site. What this buys is a read surface
 /// as deliberate as the bind surface: a column of some other type now needs a
-/// line here, which is the point (DECISIONS 214).
+/// line here, which is the point (DECISIONS 225).
 ///
 /// The set is not engine-neutral, and pretending otherwise would be the bug it
 /// exists to prevent. `u8` is SQL Server's `tinyint`, read for a column's
@@ -312,7 +312,7 @@ pub enum Driver {
 ///
 /// An enum rather than a trait object or a type parameter, decided with both
 /// implementations in hand as ADR-0007 decision 3 asks. What each of the three
-/// would have cost is in DECISIONS 214; the short of it is that the enum is the
+/// would have cost is in DECISIONS 225; the short of it is that the enum is the
 /// only one of them that leaves `&mut Conn` meaning the same thing at the 22
 /// call sites that already had it, and that it is the shape [`Param`] chose in
 /// this same file, for this same reason, before there was a second driver.

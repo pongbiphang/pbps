@@ -411,7 +411,8 @@ not have.
 
 The unit suite is structurally unable to find these. Run
 `scripts/live-tests.sh` when touching the emitter, the catalog queries, the
-ledger or the permission checks.
+ledger or the permission checks, and `scripts/live-tests-pg.sh` when touching
+the PostgreSQL crate, the connection seam or anything it depends on.
 
 - Foreign-key ordering between two newly created tables.
 - `EXEC()` rejecting function calls in its argument.
@@ -440,6 +441,19 @@ after applying it. **When a design document says "the same code path runs on
 the shipped engine, unmeasured", that sentence is a test that has not been
 written yet** — run it before the design lands, because the fix for the future
 engine is the fix for the present one.
+
+**A dependency's default features can panic a seam that compiles, lints and
+audits clean.** `pbps-db` asked for `rustls` with `ring` while `tiberius-ng`
+resolves the same `rustls` with its own default provider, so **both** were
+compiled in. rustls then cannot determine a process-level provider and
+**panics** — not errs — inside `ClientConfig::builder()`, which runs inside a
+connection, where nothing can report it. `cargo build`, `cargo clippy` and
+`cargo deny` were all green; the first PostgreSQL live test to open a real
+connection was what said so, and it said so before there was a PostgreSQL
+dialect to test (DECISIONS 228). Two rules come out of it: **name the provider,
+never take the process default**, and **a new TLS or crypto dependency is a
+live-suite change**, because nothing offline can tell you which providers your
+dependency tree ended up with.
 
 ## A round trip tested only on the simple case
 

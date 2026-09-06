@@ -212,9 +212,21 @@ fn tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbError> {
         )));
     }
     roots.add_parsable_certificates(native.certs);
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // The provider is named, not looked up. `ClientConfig::builder()` asks
+    // rustls for the *process* default, which exists only when exactly one
+    // provider is compiled in — and it panics rather than erring when that is
+    // not so. A panic inside a connection is not a failure this seam can
+    // report, and which providers end up in the tree is decided by a
+    // dependency's default features rather than by anything here. `tiberius`
+    // names its own for the same reason, and this is the same answer on the
+    // other side of the seam (DECISIONS 228).
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| DbError::BadConnectionString(format!("this build has no usable TLS: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
 }
 

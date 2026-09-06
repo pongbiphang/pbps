@@ -21,7 +21,7 @@
 
 use std::borrow::Cow;
 
-use pbps_dialect::{Dialect, DialectError, Statement, TransactionFraming, TypeChangeRisk};
+use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
 /// A part of the dialect that Phase 5 has not built yet.
@@ -64,12 +64,64 @@ impl Unbuilt {
     }
 }
 
+/// The `serial` family: spellings that are not types (ADR-0011 Amendment 3).
+///
+/// Refused rather than normalized, and the reason is the contract on
+/// [`Dialect::normalize_type`] — its output is what introspection reads back
+/// for a column declared that way. PostgreSQL expands each of these into an
+/// integer column plus an owned sequence and reads the column back as that
+/// integer type, so no normalization can make the declared spelling equal the
+/// one that comes back. Left alone it is a schema that differs from itself on
+/// every run: the permanent phantom change.
+///
+/// The replacement is named in the refusal, because ADR-0010 §7 measured that
+/// it also disposes of a second problem: an identity column needs no sequence
+/// privilege, and a `serial` one does (`ERROR: permission denied for sequence
+/// ser_id_seq`). Measured on PostgreSQL 18.6 by the live suite in this crate,
+/// which is where the read-back spellings below come from (DECISIONS 227).
+fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> {
+    let base = ty.base.to_ascii_lowercase();
+    let reads_back = match base.as_str() {
+        "smallserial" | "serial2" => "smallint",
+        "bigserial" | "serial8" => "bigint",
+        "serial" | "serial4" => "integer",
+        // Not one of them, and that is the answer: this function refuses a
+        // closed list and normalizes nothing.
+        _ => return None,
+    };
+    let at = column.map_or_else(String::new, |name| format!("column `{name}`: "));
+    Some(DialectError::Invalid {
+        dialect: "postgres",
+        message: format!(
+            "{at}`{declared}` is a macro, not a type. The column is created as `{reads_back}` \
+             with an owned sequence, and `{reads_back}` is what introspection reads back, so a \
+             declared `{declared}` would differ from itself on every run. Declare \
+             `{reads_back}` with an `identity:` instead, which this engine emits as \
+             GENERATED ... AS IDENTITY and which needs no sequence privilege.",
+            declared = ty.base,
+        ),
+    })
+}
+
 /// The PostgreSQL dialect.
 pub struct Postgres;
 
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    /// `"…"` alone quotes an identifier: `[` is an array subscript, which is
+    /// code, and reading it as a quote made a reindent inside `a[1 + 2]` read
+    /// as a changed module. Both extensions to the string literal are here —
+    /// `E'…'`, where `\'` does not close the string, and `$tag$…$tag$`, which
+    /// nothing inside it can close early (ADR-0011 Amendment 2).
+    fn lexicon(&self) -> Lexicon {
+        Lexicon {
+            quoted_identifiers: &[('"', '"')],
+            escape_strings: true,
+            dollar_quoted_strings: true,
+        }
     }
 
     /// PostgreSQL runs DDL inside a transaction, and a failed statement aborts
@@ -85,7 +137,13 @@ impl Dialect for Postgres {
         }
     }
 
-    fn normalize_type(&self, _ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    /// The catalogue is step 2, so almost everything here is still a refusal —
+    /// but the contract this method carries rules one family of spellings out
+    /// for good, and that refusal is not "not built yet". See [`refuse_serial`].
+    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+        if let Some(refusal) = refuse_serial(ty, None) {
+            return Err(refusal);
+        }
         Err(Unbuilt::TypeCatalogue.refuse())
     }
 
@@ -120,8 +178,18 @@ impl Dialect for Postgres {
         Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
     }
 
-    fn validate_table(&self, _name: &TableName, _table: &Table) -> Vec<DialectError> {
-        vec![Unbuilt::TypeCatalogue.refuse()]
+    /// Every column is checked for the one thing this crate can already answer.
+    /// A `serial` has to be refused **by name** rather than swallowed by "the
+    /// type catalogue is not built yet": the second sends its reader away to
+    /// wait for a release, and the first is a declaration to change today.
+    fn validate_table(&self, _name: &TableName, table: &Table) -> Vec<DialectError> {
+        let mut found: Vec<_> = table
+            .columns
+            .iter()
+            .filter_map(|(name, column)| refuse_serial(&column.ty, Some(name.as_str())))
+            .collect();
+        found.push(Unbuilt::TypeCatalogue.refuse());
+        found
     }
 
     fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
@@ -190,6 +258,104 @@ mod tests {
         assert_eq!(Postgres.quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
         assert!(Postgres.quote_ident("").is_err());
         assert!(Postgres.quote_ident("a\0b").is_err());
+    }
+
+    /// The three rows of ADR-0011 Amendment 2's table, through this dialect.
+    /// Each was measured against the engine, and each of the first two is the
+    /// **silent** failure: two definitions returning different strings compared
+    /// equal, so the change was never planned at all.
+    #[test]
+    fn a_definition_is_scanned_with_this_engines_literals_and_not_sql_servers() {
+        // `$tag$…$tag$` holds data, and no escape can close it early.
+        assert_ne!(
+            Postgres.normalize_definition("SELECT $tag$a  b$tag$"),
+            Postgres.normalize_definition("SELECT $tag$a b$tag$")
+        );
+        // `\'` does not close an `E'…'` string: measured, `E'it\'s  here'` is
+        // one ten-character literal.
+        assert_ne!(
+            Postgres.normalize_definition(r"SELECT E'it\'s  here'"),
+            Postgres.normalize_definition(r"SELECT E'it\'s here'")
+        );
+        // A `[` is a subscript here, so a reindent inside one is not a change.
+        assert_eq!(
+            Postgres.normalize_definition("SELECT a[1  +  2] FROM t"),
+            Postgres.normalize_definition("SELECT a[1 + 2] FROM t")
+        );
+        // And a plain literal is still data, as on any engine.
+        assert_ne!(
+            Postgres.normalize_definition("SELECT 'a  b'"),
+            Postgres.normalize_definition("SELECT 'a b'")
+        );
+    }
+
+    /// `serial` is refused, not normalized, and the refusal says what to write
+    /// instead. Normalizing it to anything would produce a schema that differs
+    /// from itself on every run (ADR-0011 Amendment 3).
+    #[test]
+    fn a_serial_column_is_refused_by_name_and_never_normalized() {
+        for (declared, reads_back) in [
+            ("serial", "integer"),
+            ("serial4", "integer"),
+            ("SERIAL", "integer"),
+            ("smallserial", "smallint"),
+            ("serial2", "smallint"),
+            ("bigserial", "bigint"),
+            ("serial8", "bigint"),
+        ] {
+            let error = Postgres
+                .normalize_type(&ty(declared))
+                .expect_err("a macro is not a type");
+            let message = error.to_string();
+            assert!(message.contains("macro, not a type"), "{message}");
+            assert!(message.contains(reads_back), "{message}");
+            assert!(message.contains("identity:"), "{message}");
+            // Not the "come back after the next release" refusal: no build of
+            // this dialect will ever normalize one.
+            assert!(!message.contains("does not implement"), "{message}");
+        }
+    }
+
+    /// The closed list is the point: a type whose name merely starts with the
+    /// same letters is the catalogue's business, not this refusal's.
+    #[test]
+    fn a_type_that_is_not_in_the_serial_family_is_left_to_the_catalogue() {
+        for spelling in ["integer", "serialized", "bigserialx", "text"] {
+            let message = Postgres
+                .normalize_type(&ty(spelling))
+                .expect_err("the catalogue is not built")
+                .to_string();
+            assert!(message.contains("does not implement"), "{message}");
+        }
+    }
+
+    /// A declaration is refused where a user is looking at it — beside the
+    /// column, at validate time — and not only where the catalogue is asked.
+    #[test]
+    fn validating_a_table_names_the_serial_column() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".to_owned(), pbps_model::Column::new(ty("serial")));
+        table
+            .columns
+            .insert("note".to_owned(), pbps_model::Column::new(ty("text")));
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let serial: Vec<_> = found
+            .iter()
+            .map(ToString::to_string)
+            .filter(|m| m.contains("macro, not a type"))
+            .collect();
+        assert_eq!(serial.len(), 1, "{found:?}");
+        assert!(serial[0].contains("column `id`"), "{}", serial[0]);
+        // The catalogue is still unbuilt, and saying so is not optional: a
+        // table that validates clean here would be the silent wrong answer.
+        assert!(
+            found
+                .iter()
+                .any(|e| e.to_string().contains("does not implement")),
+            "{found:?}"
+        );
     }
 
     fn ty(s: &str) -> ColumnType {
