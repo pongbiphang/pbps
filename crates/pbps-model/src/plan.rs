@@ -436,6 +436,48 @@ mod tests {
     }
 
     #[test]
+    fn unknown_scope_and_finding_fields_in_saved_plans_are_refused() {
+        let mut plan = plan_over(ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateRole {
+                name: "app_reader".into(),
+                uid: "r_a1b2c3".parse().unwrap(),
+            })],
+        });
+        plan.data.insert(
+            TableName::new("dbo", "customer"),
+            crate::DataScope {
+                mode: crate::DataMode::Ensure,
+                keys: [crate::RowKey("1".into())].into_iter().collect(),
+            },
+        );
+        plan.changes.changes[0].findings.push(crate::Finding::new(
+            "naming.role",
+            crate::Severity::Warning,
+            "example",
+            Some("role app_reader".into()),
+        ));
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SavedPlan>(json.clone()).unwrap(),
+            plan
+        );
+        for (pointer, field) in [
+            ("/data/dbo.customer", "kyes"),
+            ("/changes/changes/0/findings/0", "subjet"),
+        ] {
+            let mut malformed = json.clone();
+            malformed.pointer_mut(pointer).unwrap()[field] = serde_json::json!({});
+            let error = serde_json::from_value::<SavedPlan>(malformed)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("unknown field `{field}`")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_plan_fields_are_refused() {
         let mut json = serde_json::to_value(plan_over(ChangeSet::default())).unwrap();
         json["approved"] = serde_json::Value::Bool(true);

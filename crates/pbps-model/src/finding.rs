@@ -57,6 +57,7 @@ impl FromStr for Severity {
 
 /// One thing a rule found.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     /// The rule's id (`naming.column`, `change.expand-contract`): stable, and
     /// what a `policies:` block re-weights or suppresses by.

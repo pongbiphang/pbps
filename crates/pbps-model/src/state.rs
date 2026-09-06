@@ -550,6 +550,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_role_fields_in_the_ledger_are_malformed_state() {
+        let mut schema = Schema::default();
+        schema
+            .roles
+            .insert("app_reader".into(), crate::Role::default());
+        let snapshot = StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "tester");
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            StateSnapshot::from_json(&json.to_string()).unwrap(),
+            snapshot
+        );
+        json["schema"]["roles"]["app_reader"]["grnats"] = serde_json::json!({
+            "dbo.customer": ["select"]
+        });
+        let error = StateSnapshot::read_json(&json.to_string()).unwrap_err();
+        assert!(matches!(error, Unreadable::Malformed(_)), "{error}");
+        assert!(
+            error.to_string().contains("unknown field `grnats`"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
