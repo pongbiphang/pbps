@@ -56,10 +56,44 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// an older version keeps whatever name it was given.
 fn default_constraint_name(table: &TableName, column: &str) -> String {
     let full = format!("DF_{}_{}", table.name, column);
-    if full.chars().count() <= MAX_IDENT_CHARS {
+    if utf16_units(&full) <= MAX_IDENT_CHARS {
         return full;
     }
     shortened_default_constraint_name(table, column)
+}
+
+/// An identifier's length in the unit the server measures it in.
+///
+/// `MAX_IDENT_CHARS` is the number 128; the unit is **UTF-16 code units**, not
+/// characters. `sysname` is `nvarchar(128)`, and `nvarchar` counts units — a
+/// character above U+FFFF occupies two. This is measured rather than assumed:
+/// [`crate::state::truncate_reason`] records an `NVARCHAR(4)` refusing two
+/// emoji plus one ASCII letter with Msg 2628.
+///
+/// Every name here is budgeted in that stricter unit, so a name this module
+/// generates is one both [`quote`] and the server accept. Counting characters
+/// instead would have made the shortening *worse* than the refusal it
+/// replaces: a table and a column of 64 emoji each fit `sysname` on their own,
+/// so the joined name reaches the cut, and a 128-character cut of it is about
+/// 235 units — accepted by `plan` and refused at `apply`, which moves the
+/// failure from the cheap end to the expensive one.
+///
+/// `quote` itself still counts characters. That is the same distinction on
+/// names the *user* wrote rather than on the ones generated here, so it is
+/// tracked separately and not changed under this one.
+fn utf16_units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The longest prefix of `s` that fits `units`, never splitting a character.
+fn cut_to_utf16(s: &str, units: usize) -> String {
+    let mut used = 0;
+    s.chars()
+        .take_while(|ch| {
+            used += ch.len_utf16();
+            used <= units
+        })
+        .collect()
 }
 
 /// The digest, in hex characters, appended to a shortened name.
@@ -94,18 +128,17 @@ fn shortened_default_constraint_name(table: &TableName, column: &str) -> String 
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    // "DF_" + table + "_" + column + "_" + digest.
-    let budget = MAX_IDENT_CHARS - "DF_".chars().count() - 2 - DEFAULT_NAME_DIGEST_CHARS;
-    let (table_len, column_len) = share(budget, table.name.chars().count(), column.chars().count());
+    // "DF_" + table + "_" + column + "_" + digest. The digest and the fixed
+    // parts are ASCII, so their unit count is their length.
+    let budget = MAX_IDENT_CHARS - "DF_".len() - 2 - DEFAULT_NAME_DIGEST_CHARS;
+    let (table_units, column_units) = share(budget, utf16_units(&table.name), utf16_units(column));
 
-    // `chars().take(..)`, never a byte slice: the limit is in characters and
-    // a byte cut would split one.
-    let short_table: String = table.name.chars().take(table_len).collect();
-    let short_column: String = column.chars().take(column_len).collect();
+    let short_table = cut_to_utf16(&table.name, table_units);
+    let short_column = cut_to_utf16(column, column_units);
     format!("DF_{short_table}_{short_column}_{digest}")
 }
 
-/// Splits `budget` characters between two parts that do not both fit.
+/// Splits `budget` UTF-16 units between two parts that do not both fit.
 ///
 /// A part shorter than its half is kept whole and lends the surplus to the
 /// other, so a 120-character table with a 3-character column keeps 112
@@ -1733,6 +1766,47 @@ mod tests {
             altered[0].contains(&format!("ADD CONSTRAINT [{name}] DEFAULT (1) FOR")),
             "{}",
             altered[0]
+        );
+    }
+
+    /// The limit is the width of `sysname`, and `nvarchar` counts UTF-16 code
+    /// units, so a character above U+FFFF costs two. Counting characters made
+    /// the shortening *worse* than the refusal it replaces: the cut name was
+    /// accepted by `plan` and refused by the server at `apply`, which is the
+    /// expensive end to learn it at.
+    #[test]
+    fn a_shortened_name_fits_the_width_the_server_measures_not_the_character_count() {
+        // Each of these is 64 characters and 128 UTF-16 units, so each fits
+        // `sysname` on its own and the joined name reaches the cut.
+        let table = TableName::new("dbo", "\u{1f600}".repeat(64));
+        let column = "\u{1f601}".repeat(64);
+
+        let name = default_constraint_name(&table, &column);
+        assert!(quote(&name).is_ok(), "{name}");
+        assert!(
+            name.encode_utf16().count() <= MAX_IDENT_CHARS,
+            "{} units",
+            name.encode_utf16().count()
+        );
+        // The character count alone would have passed here while the name was
+        // nearly twice the width the server allows.
+        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+
+        // The cut never splits a character, so what is left is still the
+        // characters it came from.
+        assert!(name.starts_with("DF_\u{1f600}"), "{name}");
+
+        // And the entry check is in units too: this one is 69 characters, so
+        // a character count would have returned it whole at 133 units.
+        let short_column = default_constraint_name(&table, "a");
+        assert!(
+            short_column.encode_utf16().count() <= MAX_IDENT_CHARS,
+            "{} units",
+            short_column.encode_utf16().count()
+        );
+        assert!(
+            format!("DF_{}_a", table.name).chars().count() <= MAX_IDENT_CHARS,
+            "the character count has to be under the limit, or this proves nothing"
         );
     }
 
