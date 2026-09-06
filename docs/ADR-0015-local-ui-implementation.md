@@ -249,7 +249,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    agree: the first hashes what check-in would store, the second the file,
    and any difference is a transformation that would leave the installed
    path modified (**measured**: with `*.json ident` and `$Id$` in the file,
-   `filter` was `unspecified` and the two ids differed). It
+   `filter` was `unspecified` and the two ids differed). The same pair of
+   hashes is taken of the *replacement* bytes (`hash-object --stdin
+   --path <path>` against `--stdin --no-filters`), because an attribute
+   that leaves the old content alone can still act on the new: a file
+   without a marker passed, and the same file with `$Id: forged $` written
+   into it did not (**measured**). It
    requires the path to be a regular file or absent — never a symlink,
    and never *under* one: every component of the path from the worktree
    root is checked with `lstat` and none may be a link, and every file
@@ -320,7 +325,18 @@ locked-copy `update-index` ran it), so every `git` also takes
    directory component swapped for a link between the handle's opening
    and a reopen by name would have `git` read an outside file and put its
    bytes into the commit, while the UI had installed its own through the
-   handle. Step 1's comparison and this write cannot
+   handle. A handle is proof of where a directory *was*: after every
+   exchange the UI compares `fstat` of the directory handle with a fresh
+   no-follow lookup of the same path from the root, and if they no longer
+   name one directory — the ancestor was renamed away and another put in
+   its place — the exchange is undone through the same handle and the
+   compose refused, since the UI's bytes would otherwise sit in a
+   directory the worktree no longer contains while the commit named the
+   path. A rename after that comparison is a race the UI detects but
+   cannot prevent, as nothing on these platforms locks a directory against
+   being moved: what it leaves is a path `git status` reports missing and
+   a retained copy of what was there, never a lost file, and the Limits
+   section says so. Step 1's comparison and this write cannot
    be made one operation, so the exchange makes the write reversible
    instead: nothing is overwritten, only swapped, and what was swapped
    out is inspected and then kept (**measured**: the exchange put the UI's bytes at
@@ -641,6 +657,13 @@ What this ADR reasons about and has not measured, in the order the steps of
   assumes the DBA who will not run five commands still has `git` installed,
   because the checkout they are looking at came from somewhere. A machine
   without one gets the commands to run by hand and no worse.
+- **An ancestor directory moved during a compose.** Nothing on Linux,
+  macOS or Windows locks a directory against being renamed by another
+  process, so decision 5 detects the move after each exchange and refuses,
+  and a move after that detection leaves a path `git status` reports
+  missing beside a retained copy. Step 4 measures how narrow that window
+  is and whether `RESOLVE_BENEATH` on the exchange itself (Linux 5.6+)
+  closes it.
 - **DNS rebinding through browsers that pass a numeric `Host` unchanged.**
   Decision 3's `Host` check is the standard answer; step 3's tests send the
   cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
