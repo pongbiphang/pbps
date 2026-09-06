@@ -28,6 +28,12 @@ use crate::{db, output};
 /// whole database, they are what `state show` and `state export` will be for,
 /// and a timeline that carried them would send megabytes to a page that draws
 /// a list of dates.
+///
+/// The fields that come from the recorded state are optional, and the ones
+/// beside them are not, because a row whose state this build cannot read is
+/// still a row: an environment upgraded across a state-format change keeps
+/// entries older than `OLDEST_READABLE_VERSION`, and `unreadable` is what says
+/// so on the row rather than in place of the whole history.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct LedgerRow {
     pub id: i64,
@@ -35,12 +41,21 @@ pub struct LedgerRow {
     /// The server's clock, not the client's (`pbps_db::LedgerEntry`).
     pub applied_at: String,
 
-    /// `apply`, `baseline`, `bootstrap`, `staged` or `failed`.
-    pub kind: &'static str,
+    /// `apply`, `baseline`, `bootstrap`, `staged` or `failed`, read from the
+    /// ledger's own column rather than from the recorded state, so it is there
+    /// whether or not that state can be read.
+    pub kind: String,
 
     /// The version of the recorded state's own format. A consumer that renders
     /// a field a later version added has to know which entries can hold it.
-    pub state_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_version: Option<u32>,
+
+    /// Why the recorded state could not be read, when it could not — an entry
+    /// older than this build understands, or one that does not parse. Set
+    /// exactly when the fields taken from that state are absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
 
     pub operator: String,
 
@@ -60,8 +75,10 @@ pub struct LedgerRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staged: Option<StagedRow>,
 
-    pub tables: usize,
-    pub modules: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modules: Option<usize>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -90,24 +107,32 @@ pub struct StateListData {
     pub entries: Vec<LedgerRow>,
 }
 
-fn row(entry: pbps_db::LedgerEntry) -> LedgerRow {
-    let snapshot = entry.snapshot;
-    LedgerRow {
+fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
+    // The projected columns are the row; the recorded state only adds to it.
+    let mut out = LedgerRow {
         id: entry.id,
         applied_at: entry.applied_at,
-        kind: snapshot.kind.as_str(),
-        state_version: snapshot.version,
-        operator: snapshot.operator,
-        git_sha: snapshot.git_sha,
-        plan_checksum: snapshot.plan_checksum,
-        reason: snapshot.reason,
-        staged: snapshot.staged.map(|s| StagedRow {
+        kind: entry.kind,
+        state_version: None,
+        unreadable: entry.unreadable,
+        operator: entry.operator,
+        git_sha: entry.git_sha,
+        plan_checksum: entry.plan_checksum,
+        reason: entry.reason,
+        staged: None,
+        tables: None,
+        modules: None,
+    };
+    if let Some(snapshot) = entry.snapshot {
+        out.state_version = Some(snapshot.version);
+        out.staged = snapshot.staged.map(|s| StagedRow {
             completed: s.completed,
             total: s.total,
-        }),
-        tables: snapshot.schema.tables.len(),
-        modules: snapshot.schema.modules.len(),
+        });
+        out.tables = Some(snapshot.schema.tables.len());
+        out.modules = Some(snapshot.schema.modules.len());
     }
+    out
 }
 
 /// `pbps state list` — the environment's history, newest first.
@@ -133,7 +158,7 @@ pub fn cmd_state_list(
             db::connect(target).await,
         )?;
 
-        let (initialized, entries) = match pbps_mssql::state::history(&mut conn, limit).await {
+        let (initialized, entries) = match pbps_mssql::state::timeline(&mut conn, limit).await {
             Ok(entries) => (true, entries),
             // Not an error: a database this tool has never written to has no
             // history, and saying so is the answer. It is *not* an empty
@@ -154,6 +179,20 @@ pub fn cmd_state_list(
         };
 
         let mut findings = Vec::new();
+        // Named one by one, and as a warning rather than a note: a row this
+        // build cannot read is a gap in what the page can show, and a reader
+        // who is told nothing would take the missing counts for zero.
+        for e in entries.iter().filter(|e| e.unreadable.is_some()) {
+            let why = e.unreadable.as_deref().unwrap_or_default();
+            findings.push(output::Finding::warning(
+                "state.entry-unreadable",
+                format!(
+                    "{}: entry #{} was recorded by a version this build cannot read ({why}); \
+                     its date, kind and operator are shown and the rest is left out",
+                    target.label, e.id
+                ),
+            ));
+        }
         if !initialized {
             findings.push(
                 output::Finding::note(
@@ -189,8 +228,11 @@ pub fn cmd_state_list(
         if json {
             return output::Report::new("state list", findings, Some(&data)).emit_json();
         }
+        // The findings to stderr and the table to stdout, as the other
+        // commands split them: the table is what a reader pipes, and a
+        // warning inside it would arrive as a row.
         if !findings.is_empty() {
-            print!("{}", output::human(&findings));
+            eprint!("{}", output::human(&findings));
         }
         print!("{}", render(&data));
         Ok(())
@@ -217,7 +259,7 @@ fn render(data: &StateListData) -> String {
                 e.applied_at.clone(),
                 match &e.staged {
                     Some(s) => format!("{} {}/{}", e.kind, s.completed, s.total),
-                    None => e.kind.to_owned(),
+                    None => e.kind.clone(),
                 },
                 e.operator.clone(),
                 e.git_sha
@@ -226,7 +268,13 @@ fn render(data: &StateListData) -> String {
                     // what a reviewer pastes back; the full sha is in the JSON.
                     .map(|s| s.chars().take(7).collect())
                     .unwrap_or_else(|| "-".to_owned()),
-                e.reason.clone().unwrap_or_default(),
+                match (&e.reason, &e.unreadable) {
+                    // The reason is the row's own text; an unreadable entry
+                    // has none of its own and says why instead of nothing.
+                    (Some(r), _) => r.clone(),
+                    (None, Some(_)) => "(recorded by a newer or older format)".to_owned(),
+                    (None, None) => String::new(),
+                },
             ]
         })
         .collect();

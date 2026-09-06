@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Nineteen instances so far. **Absent, empty and unreadable are three different
+Twenty instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -38,6 +38,12 @@ things, and only one of them is good news.**
   scope every later command rebuilds from that schema forgot it, and the first
   `verify` refused an untouched database as a policy violation. It is a partial
   schema inside the managed set, and the recorders now refuse it as one.
+- An entry in the ledger this build **cannot parse** failing the whole read:
+  `state list` returned `Err` on the first unreadable row, so one row written
+  by a version older than `OLDEST_READABLE_VERSION` erased every newer entry
+  above it — the list a person opened the command to see. The row is carried
+  now, with the ledger's own columns and the reason (DECISIONS 217). The rule
+  holds one level down: it is about a row as much as about a table.
 - An unlock failure **after a command had already failed** dropped on the floor:
   `apply` reported its own error and left `__pbps_lock` held with no word about
   it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`

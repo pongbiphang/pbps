@@ -48,6 +48,42 @@ pub struct LedgerEntry {
     pub snapshot: StateSnapshot,
 }
 
+/// One ledger row as a *timeline* reads it: the projected columns always, and
+/// the recorded state only if this build can read it.
+///
+/// Separate from [`LedgerEntry`] because the two answer different questions.
+/// An entry is the state itself, and a reader that cannot parse it has nothing
+/// to work with — `latest` is right to refuse. A timeline is the list of what
+/// happened, and every row of it exists whether or not this build understands
+/// the snapshot inside: an environment upgraded across a state-format change
+/// keeps rows older than `OLDEST_READABLE_VERSION`, and letting one of them
+/// erase the history above it would answer "when was this database last
+/// applied to?" with an error (SPEC §14.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineEntry {
+    pub id: i64,
+
+    /// The server's clock, as [`LedgerEntry::applied_at`].
+    pub applied_at: String,
+
+    /// The `kind` column, which is projected beside `state_json` precisely so
+    /// it can be read without parsing it.
+    pub kind: String,
+
+    pub git_sha: Option<String>,
+    pub plan_checksum: Option<String>,
+    pub operator: String,
+    pub reason: Option<String>,
+
+    /// The recorded state, when this build can read it.
+    pub snapshot: Option<StateSnapshot>,
+
+    /// Why it could not be read, when it could not. Exactly one of this and
+    /// `snapshot` is set, which is what keeps "not readable" from arriving as
+    /// "nothing was recorded".
+    pub unreadable: Option<String>,
+}
+
 /// Who holds `__pbps_lock`, and since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockInfo {

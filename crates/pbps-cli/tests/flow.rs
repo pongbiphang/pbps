@@ -10070,6 +10070,9 @@ fn state_list_returns_the_history_newest_first_in_the_published_shape() {
     // for both.
     assert_eq!(entries[0]["tables"], 1, "{v}");
     assert_eq!(entries[1]["tables"], 0, "{v}");
+    // Readable entries carry no `unreadable`, which is what makes its presence
+    // on another row mean something.
+    assert!(entries[0].get("unreadable").is_none(), "{v}");
     // The recorded schema itself is not in a timeline: it is the whole
     // database, and `state show` is what will hand it over.
     assert!(entries[0].get("schema").is_none(), "{v}");
@@ -10129,6 +10132,25 @@ fn state_list_refuses_a_limit_of_zero() {
         "the message names the flag and the value: {}",
         stderr(&o)
     );
+    // And the other end, for the same reason in the other direction: the count
+    // reaches the server as a signed integer, and `as i32` turned four billion
+    // into -1 — a query the server refuses, reported as a failure to read the
+    // history rather than as the typo it is.
+    let huge = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "4294967295",
+    ]);
+    assert_eq!(code(&huge), 2, "{}", stderr(&huge));
+    assert!(
+        stderr(&huge).contains("2147483647"),
+        "the message names the boundary: {}",
+        stderr(&huge)
+    );
+
     // And one is accepted, so the refusal is the boundary and not the flag.
     let one = d.run(&[
         "state",
@@ -10143,6 +10165,98 @@ fn state_list_refuses_a_limit_of_zero() {
         2,
         "a limit of one is a question, not a usage error: {}",
         stderr(&one)
+    );
+}
+
+/// One entry this build cannot read does not erase the history above it.
+///
+/// An environment upgraded across a state-format change keeps rows older than
+/// `OLDEST_READABLE_VERSION`. Reading the timeline through the same reader
+/// `latest` uses made one such row fail the whole call, so an environment with
+/// a valid current baseline answered "when was this last applied to?" with an
+/// error. The row is carried instead, with its projected columns and the
+/// reason its state could not be read.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "stateold");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("stateold");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "current"])),
+        0
+    );
+
+    // A row from before this build's oldest readable version, inserted the way
+    // an upgrade leaves one: the projected columns are ordinary, and only the
+    // recorded state is unreadable.
+    let old = pbps_model::state::OLDEST_READABLE_VERSION - 1;
+    on_server(
+        &connection,
+        &format!(
+            "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason)              VALUES ('apply', NULL, NULL, N'{{\"version\": {old}, \"kind\": \"apply\",              \"schema\": {{}}, \"ids\": {{}}, \"operator\": \"someone\"}}', N'someone', N'from before');"
+        ),
+    );
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "an unreadable row is a row, not a failure: {}",
+        stderr(&o)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "both rows are listed: {v}");
+
+    // The newest row is the old one, and it is carried with what the ledger's
+    // own columns hold.
+    let (old_row, current) = (&entries[0], &entries[1]);
+    assert!(old_row["unreadable"].is_string(), "{v}");
+    assert_eq!(old_row["kind"], "apply", "the projected column: {v}");
+    assert_eq!(old_row["operator"], "someone", "{v}");
+    assert_eq!(old_row["reason"], "from before", "{v}");
+    // Nothing from inside the state it could not read, and no zero standing in
+    // for it: absent, not empty.
+    assert!(old_row.get("tables").is_none(), "{v}");
+    assert!(old_row.get("state_version").is_none(), "{v}");
+
+    // The readable row is untouched beside it.
+    assert!(current.get("unreadable").is_none(), "{v}");
+    assert_eq!(current["kind"], "baseline", "{v}");
+    assert_eq!(current["tables"], 0, "{v}");
+
+    // And the reader is told, once per row, rather than left to notice the
+    // missing fields.
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["state.entry-unreadable"], "{v}");
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(&validator, "state list", &o);
+
+    // The human view says so too, rather than printing a blank line.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 0, "{}", stderr(&human));
+    assert!(
+        stderr(&human).contains("entry #2") && stderr(&human).contains("cannot read"),
+        "the warning names the row: {}",
+        stderr(&human)
+    );
+    // The table itself stays a table, so a reader can pipe it.
+    assert!(
+        stdout(&human).starts_with("ID") && stdout(&human).contains("someone"),
+        "{}",
+        stdout(&human)
     );
 }
 

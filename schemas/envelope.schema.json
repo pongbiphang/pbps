@@ -1024,7 +1024,7 @@
       ]
     },
     "LedgerRow": {
-      "description": "One ledger row, without opening its recorded schema.\n\nThe snapshot's `schema` and `ids` are deliberately not here: they are the\nwhole database, they are what `state show` and `state export` will be for,\nand a timeline that carried them would send megabytes to a page that draws\na list of dates.",
+      "description": "One ledger row, without opening its recorded schema.\n\nThe snapshot's `schema` and `ids` are deliberately not here: they are the\nwhole database, they are what `state show` and `state export` will be for,\nand a timeline that carried them would send megabytes to a page that draws\na list of dates.\n\nThe fields that come from the recorded state are optional, and the ones\nbeside them are not, because a row whose state this build cannot read is\nstill a row: an environment upgraded across a state-format change keeps\nentries older than `OLDEST_READABLE_VERSION`, and `unreadable` is what says\nso on the row rather than in place of the whole history.",
       "type": "object",
       "properties": {
         "id": {
@@ -1036,14 +1036,24 @@
           "type": "string"
         },
         "kind": {
-          "description": "`apply`, `baseline`, `bootstrap`, `staged` or `failed`.",
+          "description": "`apply`, `baseline`, `bootstrap`, `staged` or `failed`, read from the\nledger's own column rather than from the recorded state, so it is there\nwhether or not that state can be read.",
           "type": "string"
         },
         "state_version": {
           "description": "The version of the recorded state's own format. A consumer that renders\na field a later version added has to know which entries can hold it.",
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
           "minimum": 0
+        },
+        "unreadable": {
+          "description": "Why the recorded state could not be read, when it could not — an entry\nolder than this build understands, or one that does not parse. Set\nexactly when the fields taken from that state are absent.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "operator": {
           "type": "string"
@@ -1079,12 +1089,18 @@
           ]
         },
         "tables": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0
         },
         "modules": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0
         }
@@ -1093,10 +1109,7 @@
         "id",
         "applied_at",
         "kind",
-        "state_version",
-        "operator",
-        "tables",
-        "modules"
+        "operator"
       ]
     },
     "StagedRow": {

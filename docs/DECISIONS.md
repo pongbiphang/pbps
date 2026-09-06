@@ -3284,3 +3284,35 @@ SPEC is in sync with all of these.
     false`, a note plus `initialized: true`, and `unanswerable` with no `data`
     at all — three answers, as the repository's rule for absent, empty and
     unreadable requires.
+
+216. **A `--limit` too large saturates; it does not wrap and does not refuse.**
+    `TOP (n)` takes a signed 32-bit count and the flag takes a `u32`, so
+    `--limit 4294967295` cast with `as` became `TOP (-1)` and the server
+    refused the whole query. A number meaning "more than there could ever be"
+    turning into an error is the wrong answer twice over: the caller asked for
+    everything and got nothing, and the message named a syntax error rather
+    than a limit.
+
+    Two guards, because they fail differently. The flag's parser refuses `0`
+    and anything above `i32::MAX`, so a person who types a number the ledger
+    cannot mean is told so by name. The reader saturates, because it is a
+    library function whose caller need not be the CLI, and "as many as the
+    server can return" is the only reading of a count larger than any table.
+
+217. **An entry this build cannot read is carried, not thrown.** `state list`
+    reads rows written by every version that ever touched the environment,
+    including ones older than `OLDEST_READABLE_VERSION`. Parsing each row into
+    a `StateSnapshot` and returning `Err` on the first failure meant one
+    unreadable row erased the whole timeline above it — the newest entries, the
+    ones a person is looking at the list to find.
+
+    So the reader projects the ledger's own columns (id, time, kind, operator,
+    provenance) and treats the recorded state as optional: a row that will not
+    parse, or whose version this build does not read, keeps every column the
+    ledger stores and carries the reason in `unreadable`, with a
+    `state.entry-unreadable` finding naming the row. `history` keeps the
+    stricter contract — a caller asking for states wants states — and the two
+    doc comments point at each other.
+
+    This is the repository's absent/empty/unreadable rule applied one level
+    down: it holds for a row as much as for a ledger.

@@ -424,7 +424,7 @@ enum StateCommand {
         #[command(flatten)]
         target: TargetArgs,
 
-        /// How many entries to show; at least 1
+        /// How many entries to show; 1 or more
         ///
         /// Zero is refused rather than accepted as "none": `TOP (0)` returns
         /// no rows against a full ledger, and the command reads an empty
@@ -433,10 +433,16 @@ enum StateCommand {
         /// reading is sound exactly while at least one row was asked for, so
         /// the flag is what guarantees it (SPEC §9.8; absent, empty and
         /// unreadable are three answers).
+        ///
+        /// The top of the range is `TOP`'s own: the count reaches the server
+        /// as a signed integer, and a number the server cannot hold is
+        /// refused here rather than saturated behind the user's back — asking
+        /// for four billion entries is a typo, and answering it with fifty is
+        /// worse than saying so.
         #[arg(
             long,
             default_value_t = pbps_db::ledger::DEFAULT_KEEP,
-            value_parser = clap::value_parser!(u32).range(1..),
+            value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
         )]
         limit: u32,
 
