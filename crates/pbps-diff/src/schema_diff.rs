@@ -1259,6 +1259,58 @@ mod tests {
             ]
         );
     }
+    /// The invariant the SQL Server preflight reads, stated as a property
+    /// rather than as a list.
+    ///
+    /// For a non-key column, **absent from `types` means `IDENTITY`**, and
+    /// `pbps_mssql::preflight` uses exactly that to tell a column an insert
+    /// leaves at NULL from one the engine assigns. Projecting NULL for an
+    /// identity column made two inserted rows identical there, so a unique
+    /// constraint over it reported a duplicate the engine would never produce
+    /// and a valid plan was refused.
+    ///
+    /// So narrowing `types` for some other reason has to fail here. The test
+    /// above pins the list this table produces; this one pins what the list
+    /// *means*, which is the part a reader updating the list would otherwise
+    /// step over.
+    #[test]
+    fn an_inserts_types_name_every_non_key_column_except_the_identity_ones() {
+        use pbps_model::{Column, ColumnType, Row, Table, Value};
+        use std::collections::BTreeSet;
+        use std::str::FromStr;
+        let mut t = Table::default();
+        let mut col = |name: &str, ty: &str, identity: bool| {
+            let mut c = Column::new(ColumnType::from_str(ty).unwrap());
+            if identity {
+                c.identity = Some(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                });
+            }
+            t.columns.insert(name.to_owned(), c);
+        };
+        col("code", "varchar(10)", false);
+        col("label", "nvarchar(50)", false);
+        col("seq", "int", true);
+        let mut row = Row::default();
+        row.0.insert("label".into(), Value::Text("spelled".into()));
+
+        let (_, types) = omitted_defaults(&t, "code", &row);
+        let expected: BTreeSet<String> = t
+            .columns
+            .iter()
+            .filter(|(c, spec)| c.as_str() != "code" && spec.identity.is_none())
+            .map(|(c, _)| c.clone())
+            .collect();
+        assert_eq!(types.keys().cloned().collect::<BTreeSet<_>>(), expected);
+
+        // The negative half, which is the one the preflight actually reads: a
+        // spelled column is present, and the identity column is the absence.
+        assert!(types.contains_key("label"));
+        assert!(!types.contains_key("seq"));
+        assert!(!types.contains_key("code"));
+    }
+
     use super::*;
     use crate::identity::Context;
     use indexmap::IndexMap;
