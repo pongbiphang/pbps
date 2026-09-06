@@ -3159,3 +3159,33 @@ SPEC is in sync with all of these.
     the reading lands with the dialect that first answers `false`, where the
     live suite can watch it. Grants are managed either way: the capability is
     about the principal, not what it holds.
+
+212. **Among the modules that share a routine's name, only `depends_on:`
+    orders.** The identifier scan of ADR-0002 finds a reference by qualified
+    name, and where a kind overloads, a name is not an identity (ADR-0009 §1
+    says so of the scan itself). So `app.f` in a routine's body matched every
+    `app.f(...)`: each overload got an automatic edge to all its siblings, and
+    a body that mentions its own name — a recursive overload, or two that call
+    each other one way — made a cycle of them. `creation_order` then fell back
+    to name order, so `app.f(integer)` came before `app.f(text)` even where
+    `depends_on:` said the opposite, and the escape hatch could not repair it:
+    it adds an edge and cannot remove one.
+
+    `creation_order` now takes no automatic edge from a routine to a module
+    with the same referenced name. Two things follow, and both are chosen:
+
+    - **A reference to an overloaded name from any other module still orders
+      that module after every overload.** The scan cannot tell which one is
+      meant, and creating a caller before one of them fails; over-ordering
+      costs a position in the plan, under-ordering costs a failed apply.
+    - **A routine that genuinely references a same-named module of another
+      kind needs `depends_on:`.** PostgreSQL lets a view `app.f` and a
+      function `app.f(integer)` coexist (ADR-0009 §1: views share `pg_class`
+      with tables, routines do not), and the scan cannot tell that reference
+      from a sibling's. The rarer case pays, and it pays with the hatch that
+      exists for what a scan cannot see.
+
+    No dialect overloads yet — MSSQL answers `overloads → false` — so nothing
+    in the plan changes today. The rule is here rather than in the PostgreSQL
+    crate because it is about what a *name-based scan* can know, which is the
+    model's question and not an engine's.
