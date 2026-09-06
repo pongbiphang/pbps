@@ -620,7 +620,16 @@ pub trait Dialect {
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError>;
 
     /// Judges how safe a type change is. The caller is responsible for calling
-    /// [`normalize_type`](Dialect::normalize_type) first.
+    /// [`normalize_type`](Dialect::normalize_type) first — **and the
+    /// implementation must not depend on it having happened.**
+    ///
+    /// The second half is not belt and braces. One caller cannot honour the
+    /// first: `validate_saved_plan` re-derives a plan file's risks *because the
+    /// file may have been edited*, so the types it passes are spelled however
+    /// the editor liked. Unnormalized, an alias reads as a change between two
+    /// unrelated types and blocks a plan that changes nothing, and an omitted
+    /// argument reads as the wrong type and can let a narrowing past the gate.
+    /// Both dialects therefore normalize again here, which costs nothing.
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
 
     /// The canonical form of an unquoted identifier in this dialect.

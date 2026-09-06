@@ -545,6 +545,36 @@ not what you are about to allow — and account for every item. Here that means
 every name the object owns and every field of the declaration, not only the
 ones the current step reads.
 
+## The second implementation did not inherit the first one's scar
+
+`Dialect::type_change_risk` documents that the caller normalizes the types
+first. The SQL Server dialect normalizes them again anyway, with a comment
+saying why: *a dialect that only works when it is called correctly is a trap,
+and normalizing twice is free.* The PostgreSQL dialect, written from the trait,
+did not — the trait is where the contract is written, and the contract says the
+caller does it.
+
+One caller cannot. `validate_saved_plan` re-derives a plan file's risks
+*because the file may have been edited*, so its types are spelled however the
+editor liked. Measured on the unguarded version: `int -> integer` came back
+`Incompatible` and would block a plan that changes nothing, and
+`character(5) -> character` came back `Safe` — an argument-free `character`
+looks unbounded and is `character(1)` — which is a narrowing walking past the
+gate.
+
+**The shape:** a precondition stated on an interface, defended in the first
+implementation and re-stated nowhere. The scar is in the older implementation's
+comment, not in the trait, so the next implementation is written against the
+contract and repeats the bug. This is the failure the phased dialects invite
+most: eight more steps of #76 each re-implement methods SQL Server has already
+been burned by.
+
+**How to avoid it:** when a defensive measure exists in one implementation and
+not in the interface, move the *reason* to the interface. The trait now says
+the implementation must not depend on the caller having normalized, and names
+the caller that cannot. Reading the sibling implementation beside the trait is
+the other half, and it is what a call-site sweep is for.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

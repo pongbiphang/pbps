@@ -184,7 +184,25 @@ impl Dialect for Postgres {
     }
 
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
-        types::change_risk(from, to)
+        // Normalized again here, as the SQL Server dialect does and for the
+        // same reason: the trait says the caller normalizes first, but a
+        // dialect that only works when it is called correctly is a trap, and
+        // normalizing twice is free.
+        //
+        // The caller that does not is `validate_saved_plan`, which re-derives
+        // the risks of a plan file **because it may have been edited**, and an
+        // edited file spells its types however the editor liked. Unnormalized,
+        // `int -> integer` reads as `Incompatible` and blocks a plan that
+        // changes nothing, and `character(5) -> character` reads as `Safe`
+        // because an argument-free `character` looks unbounded — it is
+        // `character(1)`, and that is a narrowing walking past the gate.
+        //
+        // A type that cannot normalize keeps its declared form, which no
+        // family claims and every pair therefore calls `Incompatible`: the
+        // conservative answer, and the one `validate` has already refused the
+        // table for.
+        let normalized = |t: &ColumnType| types::normalize(t).unwrap_or_else(|_| t.clone());
+        types::change_risk(&normalized(from), &normalized(to))
     }
 
     /// Unquoted identifiers fold to **lower** case, where SQL Server folds to
@@ -672,6 +690,40 @@ mod tests {
                 found.is_empty(),
                 accepted,
                 "`{declared}` starting at {seed} by {increment}: {found:?}"
+            );
+        }
+    }
+
+    /// The classification is asked of the normalized types even when the
+    /// caller forgot, because one caller cannot remember: `validate_saved_plan`
+    /// re-derives a plan file's risks precisely because the file may have been
+    /// edited, and an editor writes whatever spelling it likes.
+    ///
+    /// Both directions are here. The alias that reads as `Incompatible` blocks
+    /// a plan that changes nothing; the omitted argument that reads as `Safe`
+    /// walks a narrowing past the gate.
+    #[test]
+    fn a_risk_is_judged_on_the_normalized_types_even_if_the_caller_forgot() {
+        for (from, to, expected) in [
+            // `character` is `character(1)`, not an unbounded string.
+            ("character(5)", "character", TypeChangeRisk::Narrowing),
+            ("char(5)", "char(10)", TypeChangeRisk::Safe),
+            // Aliases, which name the same type and change nothing.
+            ("int", "integer", TypeChangeRisk::Safe),
+            ("integer", "int", TypeChangeRisk::Safe),
+            ("numeric(10,2)", "decimal(10,2)", TypeChangeRisk::Safe),
+            // And a real narrowing that the alias spelling used to hide.
+            ("varchar(50)", "varchar(10)", TypeChangeRisk::Narrowing),
+            ("int8", "int4", TypeChangeRisk::Narrowing),
+            // A type no catalogue claims stays refused rather than becoming
+            // safe by falling through to a family.
+            ("serial", "integer", TypeChangeRisk::Incompatible),
+            ("nonesuch", "integer", TypeChangeRisk::Incompatible),
+        ] {
+            assert_eq!(
+                Postgres.type_change_risk(&ty(from), &ty(to)),
+                expected,
+                "`{from}` -> `{to}`"
             );
         }
     }
