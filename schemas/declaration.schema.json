@@ -512,20 +512,27 @@
             "type": "array",
             "items": {
               "type": "string",
-              "enum": [
-                "select",
-                "insert",
-                "update",
-                "delete",
-                "references",
-                "execute",
-                "alter",
-                "view-definition",
-                "usage",
-                "create",
-                "truncate",
-                "trigger",
-                "maintain"
+              "anyOf": [
+                {
+                  "enum": [
+                    "select",
+                    "insert",
+                    "update",
+                    "delete",
+                    "references",
+                    "execute",
+                    "alter",
+                    "view-definition",
+                    "usage",
+                    "create",
+                    "truncate",
+                    "trigger",
+                    "maintain"
+                  ]
+                },
+                {
+                  "pattern": "^\\s*([Ss][Ee][Ll][Ee][Cc][Tt]|[Ii][Nn][Ss][Ee][Rr][Tt]|[Uu][Pp][Dd][Aa][Tt][Ee]|[Dd][Ee][Ll][Ee][Tt][Ee]|[Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee][Ss]|[Ee][Xx][Ee][Cc][Uu][Tt][Ee]|[Aa][Ll][Tt][Ee][Rr]|[Vv][Ii][Ee][Ww][-_ ][Dd][Ee][Ff][Ii][Nn][Ii][Tt][Ii][Oo][Nn]|[Uu][Ss][Aa][Gg][Ee]|[Cc][Rr][Ee][Aa][Tt][Ee]|[Tt][Rr][Uu][Nn][Cc][Aa][Tt][Ee]|[Tt][Rr][Ii][Gg][Gg][Ee][Rr]|[Mm][Aa][Ii][Nn][Tt][Aa][Ii][Nn])\\s*$"
+                }
               ]
             }
           },

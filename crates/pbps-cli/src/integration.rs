@@ -223,21 +223,107 @@ mod tests {
     /// is `validate`'s finding.
     #[test]
     fn the_schema_lists_every_permission_and_no_other_word() {
-        let v = schema(SchemaKind::Declaration);
-        let items = &v["$defs"]["RoleDto"]["properties"]["grants"]["additionalProperties"]["items"];
-        let listed: Vec<&str> = items["enum"]
+        let listed = completed_permissions();
+        let all: Vec<String> = pbps_model::Permission::ALL
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect();
+        assert_eq!(listed, all);
+        assert!(
+            listed.iter().any(|w| w == "usage") && listed.iter().any(|w| w == "view-definition")
+        );
+        assert!(!listed.iter().any(|w| w == "control"));
+    }
+
+    /// The `items` schema for a grant's permissions.
+    fn permission_items() -> serde_json::Value {
+        schema(SchemaKind::Declaration)["$defs"]["RoleDto"]["properties"]["grants"]
+            ["additionalProperties"]["items"]
+            .clone()
+    }
+
+    /// The closed list an editor completes from: the canonical words, the ones
+    /// `fmt` writes.
+    fn completed_permissions() -> Vec<String> {
+        let items = permission_items();
+        let branches = items["anyOf"]
             .as_array()
-            .unwrap_or_else(|| panic!("a grant's permissions are not a closed list: {items}"))
+            .unwrap_or_else(|| panic!("a grant's permissions have no branches: {items}"));
+        let listed = branches
             .iter()
-            .map(|v| v.as_str().expect("a permission is a string"))
-            .collect();
-        let all: Vec<&str> = pbps_model::Permission::ALL
+            .find_map(|b| b["enum"].as_array())
+            .unwrap_or_else(|| panic!("no branch completes from a closed list: {items}"));
+        listed
             .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(listed, all, "{items}");
-        assert!(listed.contains(&"usage") && listed.contains(&"view-definition"));
-        assert!(!listed.contains(&"control"));
+            .map(|v| v.as_str().expect("a permission is a string").to_owned())
+            .collect()
+    }
+
+    /// The branch that says which spellings validate, compiled.
+    fn accepted_spellings() -> regex_lite::Regex {
+        let items = permission_items();
+        let pattern = items["anyOf"]
+            .as_array()
+            .and_then(|b| b.iter().find_map(|b| b["pattern"].as_str()))
+            .unwrap_or_else(|| panic!("no branch says which spellings are accepted: {items}"));
+        regex_lite::Regex::new(pattern).expect("the schema's pattern is a regex")
+    }
+
+    /// Every spelling the loader folds into a permission has to validate, or a
+    /// schema-aware editor flags what `pbps validate` accepts — and the editor
+    /// is what a user reads first. `Permission::from_str` folds case and reads
+    /// `_` or a space where the canonical word has `-`, so that a user who
+    /// types what the engine prints is not corrected (ADR-0010 §6). The
+    /// spellings are enumerated from `Permission::ALL`, so the schema cannot
+    /// drift from the loader.
+    #[test]
+    fn every_spelling_the_loader_accepts_validates_against_the_schema() {
+        use std::str::FromStr;
+        let re = accepted_spellings();
+        for permission in pbps_model::Permission::ALL {
+            let word = permission.as_str();
+            for spelling in [
+                word.to_owned(),
+                word.to_ascii_uppercase(),
+                word.replace('-', "_"),
+                word.replace('-', " "),
+                word.to_ascii_uppercase().replace('-', " "),
+                format!("  {word}  "),
+            ] {
+                // Both halves: asserting only the pattern would let the test
+                // pass over a spelling the loader does not actually take.
+                assert_eq!(
+                    pbps_model::Permission::from_str(&spelling),
+                    Ok(permission),
+                    "the loader reads `{spelling}`"
+                );
+                assert!(re.is_match(&spelling), "the schema takes `{spelling}`");
+            }
+        }
+    }
+
+    /// The half that still refuses. A pattern that took the near misses would
+    /// autocomplete correctly and validate nothing — which is where this
+    /// started: a `grants` list that accepted any string blessed `contrl`.
+    #[test]
+    fn a_word_the_loader_refuses_does_not_validate_against_the_schema() {
+        use std::str::FromStr;
+        let re = accepted_spellings();
+        for word in [
+            "contrl",
+            "control",
+            "sel ect",
+            "view--definition",
+            "view-definitions",
+            "viewdefinition",
+            "",
+        ] {
+            assert!(
+                pbps_model::Permission::from_str(word).is_err(),
+                "the loader refuses `{word}`"
+            );
+            assert!(!re.is_match(word), "the schema refuses `{word}`");
+        }
     }
 
     /// The rule ids a project writes come from the catalogue the checker

@@ -66,24 +66,70 @@ pub struct RoleDto {
 }
 
 /// The `grants` map as the editor sees it: any target, and a permission list
-/// closed over the words the loader converts into. Built from
-/// `Permission::ALL` rather than derived on `Permission`, which the model
-/// keeps free of `JsonSchema` (see `ReferentialAction`, the one exception);
-/// listing the words here by hand would recreate the drift the generation
-/// exists to prevent. The list is the union of the engines' (ADR-0010 §6) —
-/// which word a dialect refuses is `validate`'s finding, not the editor's.
+/// over the words the loader accepts. Built from `Permission::ALL` rather than
+/// derived on `Permission`, which the model keeps free of `JsonSchema` (see
+/// `ReferentialAction`, the one exception); listing the words here by hand
+/// would recreate the drift the generation exists to prevent. The list is the
+/// union of the engines' (ADR-0010 §6) — which word a dialect refuses is
+/// `validate`'s finding, not the editor's.
+///
+/// Two branches, because the schema has two jobs and one list cannot do both.
+/// `Permission::from_str` folds case and reads `_` or a space where the
+/// canonical word has `-`, so that a user who types what the engine prints
+/// (`VIEW DEFINITION`, `view_definition`) is not corrected. A closed list of
+/// the canonical words alone would have an editor flag those, which the loader
+/// accepts — so the pattern branch says what is accepted, and the `enum`
+/// branch, listing only what `fmt` writes, is what an editor completes from
+/// (DECISIONS 213).
 fn grants_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let words: Vec<&str> = pbps_model::Permission::ALL
         .iter()
         .map(|p| p.as_str())
         .collect();
+    let accepted = format!(
+        r"^\s*({})\s*$",
+        words
+            .iter()
+            .map(|w| spellings_of(w))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
     schemars::json_schema!({
         "type": "object",
         "additionalProperties": {
             "type": "array",
-            "items": { "type": "string", "enum": words }
+            "items": {
+                "type": "string",
+                "anyOf": [
+                    { "enum": words },
+                    { "pattern": accepted }
+                ]
+            }
         }
     })
+}
+
+/// One permission word as a regular expression matching every spelling
+/// `Permission::from_str` folds into it.
+///
+/// Written out per character rather than with a flag: JSON Schema's patterns
+/// are ECMA-262, which has no inline `(?i)`, and a schema that carried one
+/// would be a pattern every validator reads differently. `-` admits the two
+/// separators the fold also accepts, and the leading and trailing `\s*` of the
+/// caller stand for its `trim`.
+fn spellings_of(word: &str) -> String {
+    word.chars()
+        .map(|c| match c {
+            '-' => "[-_ ]".to_owned(),
+            c if c.is_ascii_alphabetic() => {
+                format!("[{}{}]", c.to_ascii_uppercase(), c)
+            }
+            // No word has one today — `every_permission_word_is_lowercase_ascii`
+            // holds the assumption — and a character class is the spelling that
+            // stays literal for the widest set of characters if one appears.
+            c => format!("[{c}]"),
+        })
+        .collect()
 }
 
 /// One view, procedure, function or trigger (ADR-0002).
@@ -412,5 +458,32 @@ mod tests {
         for arm in ["\"null\"", "\"boolean\"", "\"integer\"", "\"string\""] {
             assert!(text.contains(arm), "{arm} missing from {text}");
         }
+    }
+
+    /// `spellings_of` writes a character class per letter and leaves anything
+    /// else as one; a word carrying a regex metacharacter would reach the
+    /// pattern as syntax. No word does, and this is where that stops being an
+    /// assumption.
+    #[test]
+    fn every_permission_word_is_lowercase_ascii() {
+        for permission in pbps_model::Permission::ALL {
+            let word = permission.as_str();
+            assert!(
+                word.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "`{word}` is not lowercase ASCII and `-`"
+            );
+        }
+    }
+
+    /// The pattern is the loader's fold written out: a letter matches either
+    /// case, a `-` matches the two separators the fold also reads, and the
+    /// caller's `\s*` stands for its `trim`.
+    #[test]
+    fn a_word_becomes_a_class_per_letter_and_the_separators_it_folds() {
+        assert_eq!(super::spellings_of("usage"), "[Uu][Ss][Aa][Gg][Ee]");
+        assert_eq!(
+            super::spellings_of("view-definition"),
+            "[Vv][Ii][Ee][Ww][-_ ][Dd][Ee][Ff][Ii][Nn][Ii][Tt][Ii][Oo][Nn]"
+        );
     }
 }
