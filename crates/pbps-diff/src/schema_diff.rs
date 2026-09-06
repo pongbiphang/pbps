@@ -2637,8 +2637,17 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        let rename = kinds.iter().position(|k| *k == "RenameTable");
-        let drop = kinds.iter().position(|k| *k == "DropColumn");
+        // Each position is unwrapped before they are compared. Left as
+        // `Option`s, a plan that stopped emitting the rename would satisfy
+        // `None < Some(_)` and pass — the absent rename is the very failure
+        // this is here to catch, so it must not be the one shape that slips
+        // through.
+        let Some(rename) = kinds.iter().position(|k| *k == "RenameTable") else {
+            panic!("no RenameTable in {kinds:?}");
+        };
+        let Some(drop) = kinds.iter().position(|k| *k == "DropColumn") else {
+            panic!("no DropColumn in {kinds:?}");
+        };
         assert!(rename < drop, "{kinds:?}");
     }
 
