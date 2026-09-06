@@ -358,8 +358,19 @@ locked-copy `update-index` ran it), so every `git` also takes
    refused with what differs shown — and so is every path placed before
    it, in reverse order: an exchanged path is exchanged back, which puts
    the replacement under its temporary name, and a path `link()` created
-   has that name unlinked, which leaves its inode under the temporary
-   name it was linked from; since an intent may edit more than one file,
+   has its entry *renamed* to a fresh temporary name beside it
+   (`renameat` within the directory handle), never unlinked, because the
+   entry may no longer be the UI's inode: an editor that saves by writing
+   a temporary and renaming it over the path leaves its own inode there,
+   with the UI's still under the temporary it was linked from, and an
+   `unlinkat` of the path would take the editor's only name with it
+   (**measured**: after such a rename-over, the path held a different
+   inode with a link count of one; renaming the entry beside the path
+   left the path absent, the editor's bytes under the new temporary name
+   and the UI's under the old one). A rename moves whatever the entry
+   holds, so it needs no check of whose inode that is, and a check would
+   in any case be a moment older than the unlink it guarded. Since an
+   intent may edit more than one file,
    a refusal that left some of them replaced would be a partial edit
    nobody asked for. The replacements are then retained under
    `<git-dir>/pbps-ui/previous/` exactly as a swapped-out original is
@@ -367,11 +378,13 @@ locked-copy `update-index` ran it), so every `git` also takes
    never deleted: an editor that opened the replacement in the window it
    was at the path holds its inode and may save through it, and a rollback
    that unlinked the last name would take that save with it, which is the
-   loss the retention exists to prevent. The UI unlinks a name only while
-   the inode has another — the path's, once step 5 has moved the branch,
-   for the temporary a `link()` was made from, so that the new file has
-   one name and `git status` shows nothing untracked; the temporary's,
-   for a linked name undone. The swapped-out files stay beside their paths
+   loss the retention exists to prevent. The UI unlinks one name only:
+   the temporary a `link()` was made from, once step 5 has moved the
+   branch, so that the new file has one name, at the path, and `git
+   status` shows nothing untracked — a name the UI itself created
+   exclusively, holding the inode the path holds. Every other name it
+   takes away, it takes by exchange or rename, into a temporary name or
+   the retention directory. The swapped-out files stay beside their paths
    under their temporary names until step 5 has moved the branch, and the
    retained copies below are made only then: until that point nothing has
    been let go, and every refusal before it — a path failing a check here,
@@ -412,8 +425,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    `lstat` of `dir/link/sub` named the sibling's directory) — and if
    they no longer name one directory — the ancestor
    was renamed away and another put in its place — the exchange is undone
-   through the same handle, a linked name is unlinked through it
-   (`unlinkat`, its inode staying under the temporary name), and the
+   through the same handle, a linked name is renamed through it to a
+   temporary name beside it as a rollback does, and the
    compose refused, since the UI's bytes would
    otherwise sit in a directory the worktree no longer contains while the
    commit named the path. `link()` needs this check as much as the
@@ -421,8 +434,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    directory is (**measured**: with the handle open, the directory renamed
    out of the tree and another created at its path, `link()` through the
    handle succeeded and put the file in the moved directory, the fresh
-   lookup named a different inode from the handle, and `unlinkat` through
-   the handle removed it again). A rename after that comparison is a race the UI detects but
+   lookup named a different inode from the handle, and a rename through
+   the handle took the name away again). A rename after that comparison is a race the UI detects but
    cannot prevent, as nothing on these platforms locks a directory against
    being moved: what it leaves is a path `git status` reports missing and
    a retained copy of what was there, never a lost file, and the Limits
@@ -467,8 +480,10 @@ locked-copy `update-index` ran it), so every `git` also takes
    before the branch has moved restores the file by writing those bytes
    back through the same handle, which nothing else could have opened for
    writing in between; a name `CREATE_NEW` made is retained and its
-   directory entry deleted through the handle (`FILE_DISPOSITION_INFO`)
-   the way a linked name is unlinked. That
+   directory entry deleted through the handle (`FILE_DISPOSITION_INFO`),
+   which is safe there as an unlink is not on Linux, because the handle,
+   held with `FILE_SHARE_READ` alone, stops an editor renaming its own
+   file over the name while the UI holds it. That
    in-place write is not crash-atomic, which is a different property from
    the one at stake here. Nothing on Windows has been measured for this
    ADR: step 3 of #64 measures every claim in this paragraph on a Windows
