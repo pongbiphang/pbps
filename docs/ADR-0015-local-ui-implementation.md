@@ -376,7 +376,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    retained copies below are made only then: until that point nothing has
    been let go, and every refusal before it — a path failing a check here,
    a `hash-object`, `write-tree` or `commit-tree` failing in steps 2 to 4,
-   a signature the user's configuration cannot make, or step 5's
+   `validate` refusing the tree or the locked index copy refusing an
+   entry in step 3, a signature the user's configuration cannot make, or
+   step 5's
    compare-and-swap refusing because the branch moved — undoes step 2 the
    same way, exchanges back and unlinks in reverse order, and restores
    the tree exactly. The compose action promises a tree that matches a
@@ -485,16 +487,7 @@ locked-copy `update-index` ran it), so every `git` also takes
    text and `--no-filters` stored the file). The declarations are this
    tool's own format, LF and UTF-8 by rule, so what the UI wrote is what
    the commit should hold. Whether it *is* a declaration is the CLI's
-   question, not the UI's: before any blob is stored, the UI runs `pbps
-   validate --format json --no-input` in the checkout, as decision 1 runs
-   every command, and a failing envelope rolls step 2 back and shows its
-   findings. The bytes came from the browser, and ADR-0006 keeps the one
-   validation path in the CLI, so the CLI is asked, after placement,
-   about the files as they will be committed. It validates the checkout
-   as it stands, so an uncommitted edit of the user's own that fails
-   refuses the compose too, with the findings the shell would print;
-   reasoned, not measured, since which rules `validate` enforces is
-   SPEC's and unchanged here.
+   question, not the UI's, and step 3 asks it of the tree it writes.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
    tree, sets the entry for each edited path to that blob at the mode the
    path had at the tip — for a path the tip does not hold, the mode `git
@@ -510,7 +503,41 @@ locked-copy `update-index` ran it), so every `git` also takes
    <mode>,<blob>,<path>`, `git write-tree`. `--add` because a new path is not
    in the tree that was read (**measured**: without it, `cannot add to the
    index - missing --add option?`, exit 128). The user's own index is not
-   read here.
+   read here. That tree is what the commit will hold, so it is what `pbps
+   validate` is run on: the UI writes it out under
+   `<git-dir>/pbps-ui/validate/<random>/` itself, from `git ls-tree -r -z
+   <tree>` and `git cat-file --batch`, regular-file entries only, and runs
+   `pbps validate --format json --no-input --project <that
+   directory>/<the project's path in the worktree>`, as decision 1 runs
+   every command; a failing envelope rolls step 2 back and shows its
+   findings. The bytes came from the browser, and ADR-0006 keeps the one
+   validation path in the CLI, so the CLI is asked — about the tree, not
+   the checkout: an editor can rewrite a placed file while `validate`
+   reads the checkout, and a check that read the editor's bytes would
+   have passed the browser's. The snapshot is written by the UI rather
+   than by `git checkout-index --prefix` or `git archive` because both
+   run the `smudge` program of a path's `filter` attribute and
+   `cat-file` runs none (**measured**: under `*.json filter=up` with a
+   `smudge` that left a marker, `checkout-index -a --prefix` and
+   `archive` both left it, `cat-file --batch` and `cat-file blob` did
+   not). Which rules `validate` enforces is SPEC's and unchanged here.
+   Then, with the tree known to be one `validate` accepts, the same
+   entries are written into the locked copy of the user's index —
+   `GIT_INDEX_FILE=<index>.lock git update-index --add --cacheinfo
+   <mode>,<blob>,<path>` — now rather than in step 6, because that write
+   can fail where the temporary index's did not: a staged entry of the
+   user's own can occupy a new path's directory as a file, or its name as
+   a directory, and `update-index` refuses the entry rather than replace
+   the user's (**measured**: with `schema/new` staged as a file, adding
+   `schema/new/x.json` to a copy of that index failed with `appears as
+   both a file and as a directory`, exit 128, while the same entry went
+   into an index read from the tip; a staged `schema/dir/f` refused
+   `schema/dir` the same way). Step 1's check covers the edited paths'
+   own entries, not their neighbours, so the refusal has to come from the
+   write itself, and it has to come before step 5 moves the branch, which
+   is why the copy is prepared here and only installed there. `--replace`
+   would let the entries through by dropping the user's staged ones,
+   which is the work step 1 refuses to touch.
 4. It makes the commit from that tree, on that parent, with that message:
    `git commit-tree <tree> -p <tip> -m <message>`. The commit is what was
    previewed *by construction* — those paths, those blobs, that parent, that
@@ -570,10 +597,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
    the branch held the commit, the sibling was untouched, and the index was
    left alone.
-6. It writes the same entries into the locked copy of the index —
-   `GIT_INDEX_FILE=<index>.lock git update-index --add --cacheinfo
-   <mode>,<blob>,<path>` — and installs it by renaming `<index>.lock` to
-   `<index>`, which is exactly the commit step of `git`'s own lock. Now
+6. It installs the locked copy of the index that step 3 prepared by
+   renaming `<index>.lock` to `<index>`, which is exactly the commit step
+   of `git`'s own lock. Now
    `git status` is clean for what the UI did and untouched for everything
    else, and the entries replaced were the tip's, as step 1 established and
    the lock preserved.
