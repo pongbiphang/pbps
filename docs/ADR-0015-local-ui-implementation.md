@@ -629,9 +629,32 @@ locked-copy `update-index` ran it), so every `git` also takes
    tool's own format, LF and UTF-8 by rule, so what the UI wrote is what
    the commit should hold. Whether it *is* a declaration is the CLI's
    question, not the UI's, and step 3 asks it of the tree it writes.
+   Both snapshots hold every entry of the project's subtree, and both
+   refuse the compose when one of them is not a regular file — a
+   `120000` link or a `160000` gitlink — because `pbps_load` walks the
+   declarations directory with `read_dir` and reads what it finds through
+   the link, so a snapshot that dropped the entry would give the intent
+   command and `validate` a schema the committed tree does not have, and
+   one that wrote the link's text as a file would give them a
+   declaration nobody wrote (**measured**: a tracked link to a
+   declaration is a `120000` entry whose blob is the target's name).
+   Refusing is the whole of the support: a linked declaration is a
+   layout this UI does not compose for, the shell's commands work as
+   before, and the Limits section says so.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
-   tree, sets the entry for each edited path to that blob at the mode the
-   path had at the tip — for a path the tip does not hold, the mode `git
+   tree and sets the entry for each edited path to that blob. The mode is
+   the tip's for a path step 2 placed, since the exchange refuses a
+   working-tree mode that differs from it; but for a *listed* file, which
+   keeps the bytes and the mode the user gave it, the mode is the one `git
+   add` would record — the execute bit `fstat` reports through the file's
+   handle in step 1, or `100644` when `core.fileMode` is false — because
+   the user may have changed that bit along with the content, or instead
+   of it, and the tip's mode would leave the path modified after a compose
+   that was supposed to leave `git status` clean (**measured**: a tracked
+   declaration given an execute bit and committed at the tip's `100644`
+   had `git status` reporting it modified, committed at `100755` it was
+   clean, and `git add` recorded `100755`). For a path the tip does not
+   hold, the mode is likewise the one `git
    add` would give the file step 2 found there: `100755` when it existed
    untracked with an execute bit and `core.fileMode` is true, `100644`
    otherwise, since a fixed `100644` leaves the commit disagreeing with
@@ -648,7 +671,7 @@ locked-copy `update-index` ran it), so every `git` also takes
    validate` is run on: the UI writes it out under
    `<git-dir>/pbps-ui/validate/<random>/` itself, from `git ls-tree -r -z
    <tree> -- <project>` and `git cat-file --batch`, the project's subtree
-   and regular-file entries only, and runs
+   only, and runs
    `pbps validate --format json --no-input --project <that
    directory>/<the project's path in the worktree>`, as decision 1 runs
    every command; a failing envelope rolls step 2 back and shows its
@@ -748,10 +771,20 @@ locked-copy `update-index` ran it), so every `git` also takes
    Both locks are held through step 6. If either check fails, the commit
    exists and is where `update-ref` put it, but the checkout is no longer
    at it, so step 6 does not happen and nothing is pushed: the locks are
-   discarded, the index is as it was, the placed files stay — they are
-   what the branch's new tip holds, and exchanging them back would leave
-   the branch recording an edit the tree no longer shows — and the page
-   says where the commit is and what moved. **Measured**
+   discarded and the index is as it was. What becomes of the placed files
+   is decided by the tip the branch *actually* names under the lock, read
+   before anything else is undone, never by the assumption that it is the
+   UI's commit — a `symbolic-ref` in the gap leaves the branch at that
+   commit, but a sibling worktree's `update-ref` or `reset` leaves it at
+   something else entirely, and the earlier rule kept the files on a
+   premise that had stopped being true. So the UI reads that tip's blob
+   for each edited path (`git ls-tree -z <tip> -- <path>`) and keeps the
+   placed file where the tip holds exactly what was placed, and undoes
+   step 2 for the path where it does not, leaving each path at what the
+   branch it is on records. The page then names the commit, the tip the
+   branch actually holds, and every path with what became of it, since
+   the user's index is the one they had and only they can say which of
+   the two states they want. **Measured**
    both ways: undisturbed, the check passed and the index was installed
    clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
    the branch held the commit, the sibling was untouched, and the index was
@@ -1020,6 +1053,12 @@ What this ADR reasons about and has not measured, in the order the steps of
 - **What the page needs from `apply`.** The Placement section names two
   answers; step 2 picks one after listing what the page actually renders after
   an apply.
+- **A declaration reached through a symbolic link.** `pbps_load` follows
+  one; decision 5's snapshots cannot hold one without either dropping a
+  declaration or inventing one, so a project whose subtree holds a
+  `120000` or `160000` entry is refused with the entry named. Supporting
+  it means deciding what a commit of a link's target should mean, which
+  is a question for when someone has such a layout.
 - **A project whose declarations or ids file lie outside its directory.**
   Decision 5 snapshots the project's subtree and asks `doctor` where the
   inputs are; a `schema_dir` or `ids_file` that resolves outside the
