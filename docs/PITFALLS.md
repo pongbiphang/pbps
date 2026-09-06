@@ -459,6 +459,28 @@ emitted. The repair is one predicate all three call.
 the caller the finding happened to name.** A rule that lives in three places is
 three chances to be measured once and fixed once.
 
+## A count of digits standing in for what the type holds
+
+Two instances, one review round, both in a classification that decides whether
+a change needs a human's approval — and both in the direction that skips one.
+
+- **`numeric(10,0)` and `integer` are both "ten digits".** Measured,
+  `9999999999` into an `integer` is `integer out of range`; on SQL Server,
+  `decimal(10,0)` into `int` is `Arithmetic overflow`. The integer types are not
+  powers of ten, and a digit count cannot say so.
+- **"the digits fit in the float" is not "the float holds the value".** `0.1` in
+  a `real` is `0.10000000149011612`. The engine prints the shortest decimal that
+  reads back as the same float, so `0.1::real::text` is `0.1` and every round
+  trip through text agrees the value survived; ten of them sum to `1.0000001`
+  where the exact sum is `1.0`.
+
+Both rules read as obviously correct, and a test written by the same hand asks
+the same question the rule does. **What catches them is a row at the boundary,
+on a real server**: the largest value the source holds, and a value the target
+cannot represent, with the promise asserted as *the statement runs and the value
+does not change*. A classification cannot be checked against itself, and the
+second one cannot be checked against the engine's own printing either.
+
 ## The engine accepted the declaration and stored a different one
 
 Not an error, not a warning worth the name, and not visible again until the

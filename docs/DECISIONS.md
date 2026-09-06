@@ -4050,3 +4050,36 @@ SPEC is in sync with all of these.
     `Incompatible` that the engine accepts refuses a plan that would have
     worked, and a pair called `Narrowing` that the engine refuses fails half way
     through an apply, after the changes before it have run.
+
+239. **`Safe` is decided by what a type *holds*, not by how many digits it
+    has.** Two rules that look right and are not, both found by review on the
+    PostgreSQL catalogue (#131) and both measured:
+
+    - **A digit count is not a magnitude.** `numeric(10,0)` and `integer` are
+      both "ten digits", and `9999999999` into an `integer` is `integer out of
+      range`. The same holds for `numeric(5,0)` into `smallint` and
+      `numeric(19,0)` into `bigint`. The integer types are not powers of ten, so
+      the classification carries the largest value each one holds and compares
+      *that*.
+    - **A decimal that prints back is not a decimal the float holds.** `0.1` in
+      a `real` is `0.10000000149011612`, and ten of them sum to `1.0000001`
+      where the exact sum is `1.0`. The engine renders the shortest decimal that
+      reads back as the same float, so `0.1::real::text` is `0.1` and every
+      round trip through text says the value survived. So the question is
+      whether the float holds the value **exactly** — no fraction, and no gap
+      below its magnitude, which is 2^24 for `real` and 2^53 for `double
+      precision`. Measured: `16777217` into a `real` reads back as `16777200`.
+
+    Both were `Safe`, which is the class that bypasses the gate entirely, so
+    both were a plan approved by nobody that fails or silently changes data at
+    the apply. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
+    `decimal(10,0)` into `int` is `Arithmetic overflow error converting
+    expression to data type int`, and `decimal(2,1)` into `real` stores
+    `1.000000014901161e-001`. That is issue #135; it is a shipped dialect and a
+    change to it needs its own measurements.
+
+    The general lesson is the one the live suite is built around: a
+    classification cannot be checked against itself. What catches these is a row
+    at the boundary — the largest value the source holds, and a value the target
+    cannot represent — put through a real server, with `Safe` asserted as *the
+    statement runs and the value does not change*.

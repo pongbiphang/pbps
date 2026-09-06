@@ -420,15 +420,28 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
 /// against a real server and asserts this file agrees with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
-    /// Exact numeric, described by how many digits fit either side of the
-    /// point. `None` is unbounded — bare `numeric`, which holds anything.
+    /// Exact numeric, described by the largest integer part it can hold and by
+    /// how many digits it keeps after the point. `None` is unbounded — bare
+    /// `numeric`, which holds anything.
+    ///
+    /// A **magnitude** and not a digit count, because the integer types are not
+    /// powers of ten and the difference is a lost row: `numeric(10,0)` and
+    /// `integer` are both "ten digits", and measured, `9999999999` into an
+    /// `integer` is `integer out of range`.
     Exact {
-        int_digits: Option<i64>,
+        max_int: Option<i128>,
         scale: Option<i64>,
     },
-    /// Approximate numeric, described by significant decimal digits.
+    /// Approximate numeric, described by the largest integer it holds
+    /// **exactly** — 2^24 for `real`, 2^53 for `double precision`.
+    ///
+    /// Not a count of decimal digits, and that is the same correction one step
+    /// further: a decimal that survives the engine's own printing is not a
+    /// decimal the float holds. Measured, `0.1` stored in a `real` is
+    /// `0.10000000149011612`, and ten of them sum to `1.0000001` where the
+    /// exact sum is `1.0`.
     Approx {
-        digits: i64,
+        max_exact_int: i128,
     },
     Bool,
     /// A string, described by its length and whether it is blank-padded to a
@@ -444,7 +457,12 @@ enum Family {
         has_time: bool,
         has_offset: bool,
     },
-    Interval,
+    /// `interval`, which carries a seconds precision the engine converts
+    /// between. The unmodified type is `interval(6)` in every way that matters
+    /// here, so it is spelled as one.
+    Interval {
+        precision: i64,
+    },
     Uuid,
     /// `json` and `jsonb` are one family and not one type: the conversion
     /// between them loses data in one direction only.
@@ -477,6 +495,17 @@ impl Len {
     }
 }
 
+/// `10^n` as a magnitude, or `None` when it is larger than any type here can
+/// hold. `numeric`'s precision goes to 1000 and its scale to -1000, so the
+/// exponent reaches 2000 and an unchecked `pow` would wrap — into a *small*
+/// number, which would call an enormous type narrow enough to fit anywhere.
+fn pow10(n: i64) -> Option<i128> {
+    if n < 0 {
+        return Some(0);
+    }
+    u32::try_from(n).ok().and_then(|n| 10_i128.checked_pow(n))
+}
+
 fn family(t: &ColumnType) -> Family {
     let int_arg = |i: usize| match t.args.get(i) {
         Some(TypeArg::Int(n)) => Some(*n),
@@ -486,9 +515,9 @@ fn family(t: &ColumnType) -> Family {
         Some(TypeArg::Int(n)) => Len::Bounded(*n),
         Some(TypeArg::Max | TypeArg::Ident(_)) | None => Len::Unbounded,
     };
-    let exact = |int_digits, scale| Family::Exact {
-        int_digits: Some(int_digits),
-        scale: Some(scale),
+    let exact = |max_int: i128| Family::Exact {
+        max_int: Some(max_int),
+        scale: Some(0),
     };
     let temporal = |has_date, has_time, has_offset| Family::Temporal {
         has_date,
@@ -497,19 +526,29 @@ fn family(t: &ColumnType) -> Family {
     };
 
     match t.base.as_str() {
-        "smallint" => exact(5, 0),
-        "integer" => exact(10, 0),
-        "bigint" => exact(19, 0),
+        "smallint" => exact(i128::from(i16::MAX)),
+        "integer" => exact(i128::from(i32::MAX)),
+        "bigint" => exact(i128::from(i64::MAX)),
         // `numeric(p, s)` holds `p` significant digits with `s` of them after
-        // the point, so `p - s` in front of it. A negative scale means the
-        // stored value is rounded to a power of ten *above* the point, and the
-        // same subtraction gives the right answer for it.
+        // the point, so its integer part reaches `10^(p - s) - 1`. A negative
+        // scale rounds the stored value to a power of ten *above* the point,
+        // and the same subtraction bounds it — not exactly, but from above,
+        // which errs towards asking for an approval rather than towards waving
+        // a change through. A scale larger than the precision is legal here and
+        // leaves no integer part at all, which is what the floor at zero is.
         "numeric" => Family::Exact {
-            int_digits: int_arg(0).map(|p| p - int_arg(1).unwrap_or(0)),
+            max_int: int_arg(0)
+                .and_then(|p| pow10(p - int_arg(1).unwrap_or(0)).map(|v| (v - 1).max(0))),
             scale: int_arg(1),
         },
-        "real" => Family::Approx { digits: 6 },
-        "double precision" => Family::Approx { digits: 15 },
+        // 2^24 and 2^53: the largest integers with no gap below them. Measured,
+        // `16777217` into a `real` reads back as `16777200`.
+        "real" => Family::Approx {
+            max_exact_int: 1 << 24,
+        },
+        "double precision" => Family::Approx {
+            max_exact_int: 1 << 53,
+        },
         "boolean" => Family::Bool,
         "character" => Family::Text { len, fixed: true },
         "character varying" => Family::Text { len, fixed: false },
@@ -523,7 +562,9 @@ fn family(t: &ColumnType) -> Family {
         "time with time zone" => temporal(false, true, true),
         "timestamp without time zone" => temporal(true, true, false),
         "timestamp with time zone" => temporal(true, true, true),
-        "interval" => Family::Interval,
+        "interval" => Family::Interval {
+            precision: int_arg(0).unwrap_or(MAX_INTERVAL_PRECISION),
+        },
         "uuid" => Family::Uuid,
         "json" => Family::Json { binary: false },
         "jsonb" => Family::Json { binary: true },
@@ -588,37 +629,52 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     match (a, b) {
         (
             Family::Exact {
-                int_digits: ai,
+                max_int: ai,
                 scale: asc,
             },
             Family::Exact {
-                int_digits: bi,
+                max_int: bi,
                 scale: bsc,
             },
         ) => {
-            // Both halves have to grow: losing integer digits overflows, losing
+            // Both halves have to grow: losing magnitude overflows, losing
             // scale rounds. `None` is unbounded, so it holds everything on the
             // target side and is held by nothing on the source side.
-            let fits = |from: Option<i64>, to: Option<i64>| match (from, to) {
-                (_, None) => true,
-                (None, Some(_)) => false,
-                (Some(x), Some(y)) => x <= y,
-            };
+            //
+            // The magnitude is the half that has to be a number rather than a
+            // digit count. `numeric(10,0)` and `integer` are both ten digits,
+            // and measured, `9999999999` into an `integer` is `integer out of
+            // range` — a plan that passed the gate and fails at the apply.
+            fn fits<T: Ord>(from: Option<T>, to: Option<T>) -> bool {
+                match (from, to) {
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                    (Some(x), Some(y)) => x <= y,
+                }
+            }
             safe_if(fits(ai, bi) && fits(asc, bsc))
         }
 
-        // An exact value survives a float only if every digit it can hold still
-        // fits in the float's significant digits.
+        // An exact value survives a binary float only if the float holds it
+        // **exactly**: no fraction, and no gap below its magnitude.
+        //
+        // Not "do the decimal digits fit", which is what the count of
+        // significant digits would ask. Measured: `0.1` in a `real` is
+        // `0.10000000149011612`, and ten of them sum to `1.0000001` where the
+        // exact sum is `1.0` — the engine's own printing rounds the single
+        // value back to `0.1` and hides it, and the arithmetic does not.
         (
             Family::Exact {
-                int_digits: Some(int_digits),
+                max_int: Some(max_int),
                 scale: Some(scale),
             },
-            Family::Approx { digits },
-        ) => safe_if(int_digits + scale <= digits),
+            Family::Approx { max_exact_int },
+        ) => safe_if(scale <= 0 && max_int <= max_exact_int),
         // Unbounded `numeric` into a float always rounds.
         (Family::Exact { .. }, Family::Approx { .. }) => TypeChangeRisk::Narrowing,
-        (Family::Approx { digits: a }, Family::Approx { digits: b }) => safe_if(b >= a),
+        (Family::Approx { max_exact_int: a }, Family::Approx { max_exact_int: b }) => {
+            safe_if(b >= a)
+        }
         // A float into an exact type rounds, measured: `1.5` becomes `2`.
         (Family::Approx { .. }, Family::Exact { .. }) => TypeChangeRisk::Narrowing,
 
@@ -646,7 +702,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             | Family::Bool
             | Family::Bytea
             | Family::Temporal { .. }
-            | Family::Interval
+            | Family::Interval { .. }
             | Family::Uuid
             | Family::Json { .. },
             Family::Text { .. },
@@ -685,7 +741,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         // rule phrased as "anything with a time part" would call two refusals
         // a narrowing.
         (
-            Family::Interval,
+            Family::Interval { .. },
             Family::Temporal {
                 has_date: false,
                 has_time: true,
@@ -698,8 +754,14 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_time: true,
                 has_offset: false,
             },
-            Family::Interval,
+            Family::Interval { .. },
         ) => TypeChangeRisk::Narrowing,
+
+        // One `interval` into another is a question about the seconds
+        // precision, which the engine will convert either way. Measured:
+        // `interval(0)` into `interval(6)` keeps `00:00:01`, and `interval(6)`
+        // into `interval(0)` turns `00:00:01.234567` into `00:00:01`.
+        (Family::Interval { precision: a }, Family::Interval { precision: b }) => safe_if(b >= a),
 
         // `json -> jsonb` is the direction that loses: measured,
         // `{"a": 1,  "a": 2}` becomes `{"a": 2}` — duplicate keys, key order
@@ -722,7 +784,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             | Family::Text { .. }
             | Family::Bytea
             | Family::Temporal { .. }
-            | Family::Interval
+            | Family::Interval { .. }
             | Family::Uuid
             | Family::Json { .. }
             | Family::Unknown,
@@ -1140,6 +1202,88 @@ mod tests {
                 "`{from}` -> `{to}`"
             );
         }
+    }
+
+    /// A digit count is not a magnitude, and the integer types are not powers
+    /// of ten. `numeric(10,0)` and `integer` both hold ten digits, and measured,
+    /// `9999999999` into an `integer` is `integer out of range` — a change the
+    /// gate would have waved through, failing at the apply after the changes
+    /// before it had run.
+    #[test]
+    fn an_exact_type_is_measured_by_what_it_holds_and_not_by_its_digits() {
+        for (from, to) in [
+            ("numeric(10,0)", "integer"),
+            ("numeric(5,0)", "smallint"),
+            ("numeric(19,0)", "bigint"),
+        ] {
+            assert_eq!(
+                risk(from, to),
+                TypeChangeRisk::Narrowing,
+                "`{from}` -> `{to}`"
+            );
+        }
+        // And the row below each boundary still fits, so this is a bound and
+        // not a blanket refusal. Measured: `999999999` survives.
+        for (from, to) in [
+            ("numeric(9,0)", "integer"),
+            ("numeric(4,0)", "smallint"),
+            ("numeric(18,0)", "bigint"),
+            ("bigint", "numeric(19,0)"),
+        ] {
+            assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
+        }
+    }
+
+    /// An exact value survives a binary float only if the float holds it
+    /// exactly. Measured: `0.1` in a `real` is `0.10000000149011612`, and ten
+    /// of them sum to `1.0000001` where the exact sum is `1.0`. The engine's
+    /// own printing rounds a single value back to `0.1` and hides it, which is
+    /// why "does it round-trip through `::text`" is the wrong question.
+    #[test]
+    fn an_exact_type_reaches_a_float_safely_only_when_the_float_holds_it_exactly() {
+        for (from, to) in [
+            // A fraction is not a binary fraction.
+            ("numeric(2,1)", "real"),
+            ("numeric(2,1)", "double precision"),
+            ("numeric(10,2)", "double precision"),
+            // Measured: `16777217` into a `real` reads back as `16777200`, and
+            // `9007199254740993` into a `double precision` as
+            // `9007199254740990`.
+            ("integer", "real"),
+            ("bigint", "double precision"),
+        ] {
+            assert_eq!(
+                risk(from, to),
+                TypeChangeRisk::Narrowing,
+                "`{from}` -> `{to}`"
+            );
+        }
+        for (from, to) in [
+            ("smallint", "real"),
+            ("numeric(5,0)", "real"),
+            ("integer", "double precision"),
+            ("smallint", "double precision"),
+            ("real", "double precision"),
+        ] {
+            assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
+        }
+    }
+
+    /// A family that drops an argument answers the same for two types the
+    /// engine tells apart. `interval` carries a seconds precision, and dropping
+    /// it sent `interval(0) -> interval(6)` — a widening the engine performs
+    /// without blinking — through to `Incompatible`, refusing a valid plan.
+    #[test]
+    fn an_interval_keeps_its_precision_in_the_judgement() {
+        assert_eq!(risk("interval(0)", "interval(6)"), TypeChangeRisk::Safe);
+        assert_eq!(risk("interval(3)", "interval"), TypeChangeRisk::Safe);
+        // Measured: `00:00:01.234567` into `interval(0)` becomes `00:00:01`,
+        // and into `interval(3)` becomes `00:00:01.235`.
+        assert_eq!(
+            risk("interval(6)", "interval(0)"),
+            TypeChangeRisk::Narrowing
+        );
+        assert_eq!(risk("interval", "interval(3)"), TypeChangeRisk::Narrowing);
     }
 
     /// Gaining or losing a time zone is never a widening, however it looks.

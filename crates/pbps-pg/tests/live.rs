@@ -744,3 +744,136 @@ async fn an_interval_precision_the_engine_would_quietly_reduce_is_refused() {
         .await
         .expect("drop");
 }
+
+/// What `Safe` promises, against real rows: the statement runs, and the value
+/// that comes out is the value that went in.
+///
+/// The matrix above uses empty tables, which is the right shape for
+/// `Incompatible` and blind to everything else — a classification can be wrong
+/// about a boundary value without a single pair changing category. Each row
+/// here carries the value that finds the boundary, and the assertion is one
+/// implication: **if the dialect says `Safe`, nothing may fail and nothing may
+/// change.** Narrowing is not asserted the other way round; that a change *can*
+/// lose is not a promise that this row does.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
+    let mut conn = connect().await;
+    let table = format!("pbps_safe_{}", std::process::id());
+
+    // (from, to, a value at the edge of `from`).
+    let cases = [
+        // Ten digits either side, and one of them stops at 2147483647.
+        ("numeric(10,0)", "integer", "9999999999"),
+        ("numeric(9,0)", "integer", "999999999"),
+        ("numeric(5,0)", "smallint", "99999"),
+        ("numeric(4,0)", "smallint", "9999"),
+        ("numeric(19,0)", "bigint", "9999999999999999999"),
+        // The first integer a binary float cannot hold.
+        ("integer", "real", "16777217"),
+        ("smallint", "real", "32767"),
+        ("numeric(5,0)", "real", "99999"),
+        ("bigint", "double precision", "9007199254740993"),
+        ("integer", "double precision", "2147483647"),
+        // The seconds precision the family used to drop.
+        ("interval(0)", "interval(6)", "'1 sec'"),
+        ("interval(6)", "interval(0)", "'1.234567 sec'"),
+        ("interval", "interval(3)", "'1.234567 sec'"),
+        ("interval(3)", "interval", "'1.234 sec'"),
+        ("numeric(10,2)", "numeric(12,2)", "12345678.90"),
+        ("numeric(10,2)", "numeric(10,4)", "12345678.90"),
+        ("character varying(10)", "character varying(20)", "'abc'"),
+        (
+            "character varying(20)",
+            "character varying(10)",
+            "'abcdefghijklmnop'",
+        ),
+    ];
+
+    for (from, to, value) in cases {
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+        conn.execute(&format!("CREATE TABLE {table} (c {from})"))
+            .await
+            .unwrap_or_else(|e| panic!("create `{from}`: {e}"));
+        conn.execute(&format!("INSERT INTO {table} VALUES ({value})"))
+            .await
+            .unwrap_or_else(|e| panic!("insert {value} into `{from}`: {e}"));
+        let before = text(&mut conn, &format!("SELECT c::text FROM {table}")).await;
+
+        let altered = conn
+            .execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
+            .await
+            .is_ok();
+        let after = if altered {
+            Some(text(&mut conn, &format!("SELECT c::text FROM {table}")).await)
+        } else {
+            None
+        };
+
+        let normalize = |s: &str| {
+            Postgres
+                .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+                .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
+        };
+        if Postgres.type_change_risk(&normalize(from), &normalize(to)) == TypeChangeRisk::Safe {
+            assert_eq!(
+                after.as_deref(),
+                Some(before.as_str()),
+                "`{from}` -> `{to}` is called Safe, and `{value}` did not survive it"
+            );
+        }
+    }
+
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+}
+
+/// The loss a value's own printing hides.
+///
+/// `0.1` in a `real` prints as `0.1`, because the engine renders the shortest
+/// decimal that reads back as the same float — so the test above, and every
+/// round trip through `::text`, says the value survived. It did not: the stored
+/// number is `0.10000000149011612`, and the arithmetic says so. This is why the
+/// classification asks whether the float holds the value **exactly** rather
+/// than whether its digits fit.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change() {
+    let mut conn = connect().await;
+
+    // What the engine stores, seen through a wider type rather than through
+    // the printing that rounds it back.
+    let stored = text(
+        &mut conn,
+        "SELECT (0.1::numeric(2,1)::real::double precision)::text",
+    )
+    .await;
+    assert_eq!(stored, "0.10000000149011612");
+    // And it is not academic: ten of them do not add up.
+    let summed = text(
+        &mut conn,
+        "SELECT SUM(c)::text FROM (SELECT 0.1::real AS c FROM generate_series(1, 10)) s",
+    )
+    .await;
+    let exact = text(
+        &mut conn,
+        "SELECT SUM(c)::text FROM (SELECT 0.1::numeric(2,1) AS c FROM generate_series(1, 10)) s",
+    )
+    .await;
+    assert_eq!(summed, "1.0000001");
+    assert_eq!(exact, "1.0");
+
+    let normalize = |s: &str| {
+        Postgres
+            .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+            .expect("normalizes")
+    };
+    assert_eq!(
+        Postgres.type_change_risk(&normalize("numeric(2,1)"), &normalize("real")),
+        TypeChangeRisk::Narrowing,
+        "an exact decimal into a binary float is a change that needs approval"
+    );
+}
