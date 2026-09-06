@@ -234,7 +234,7 @@ step made in the CLI user's own order, in this order:
   and joins it to the checkout's, and those two checkout paths are what
   the rest of this list means by *the declarations* and *the ids file*.
 - **The listing.** `git status --porcelain -z --untracked-files=all
-  --ignored=matching -- <the declarations> <the ids file>`: the pathspec
+  --ignored -- <the declarations> <the ids file>`: the pathspec
   is those two and never the project directory, and of what it returns
   the UI keeps only the files the CLI itself reads — a path under the
   declarations directory whose extension is `.yml` or `.yaml`, which is
@@ -247,10 +247,18 @@ step made in the CLI user's own order, in this order:
   `--untracked-files=all` because `status.showUntrackedFiles=no` in the
   user's configuration would otherwise hide the new side of a file-based
   rename (**measured**: under it the listing held the deleted old path
-  alone, and with the flag both); and `--ignored=matching` because a new
+  alone, and with the flag both); and `--ignored`, which is
+  `--ignored=traditional`, because a new
   declaration matched by `.gitignore` or `.git/info/exclude` is listed by
-  neither (**measured**: it appeared only with the flag, as `!!`), and
-  the compose is refused, naming the file, if any `!!` entry is listed —
+  neither flag alone, and because with `--untracked-files=all` this mode
+  names the ignored *files* where `--ignored=matching` names the ignored
+  directory and stops there — a rule like `schema/generated/` would
+  otherwise hide every declaration under it behind one record the filter
+  below then discards (**measured**: with that rule and a new `.yml`
+  beneath it, `--ignored=matching` listed `!! schema/generated/` however
+  the untracked flag was set, and `--ignored` with `-uall` listed
+  `!! schema/generated/new.yml`). The
+  compose is refused, naming the file, if any `!!` entry is listed —
   the intent command would see a working tree the commit cannot hold, and
   the shell's `git add` would refuse the file too. The page shows the
   listing with the blob id of each file as read.
@@ -339,15 +347,24 @@ locked-copy `update-index` ran it), so every `git` also takes
 0. The UI takes the index lock the way `git` does: it asks where the index
    is — `git rev-parse --git-path index`, because in a linked worktree
    `.git` is a file and the index lives under the main repository's
-   `worktrees/<name>/` (**measured**) — creates `<index>.lock` beside it
-   exclusively, as a copy of the index, and refuses to compose if the file
-   already exists — another `git` is mid-operation. Every `git` that would
+   `worktrees/<name>/` (**measured**) — and puts `<index>.lock` beside it
+   as a copy of the index, refusing to compose if the file already exists,
+   since another `git` is then mid-operation. Every lock file here is
+   made whole under a temporary name beside its place, flushed, written
+   into the record, and only then *published* by `link()`, which creates
+   the name if it does not exist and fails with `EEXIST` if something
+   made it first: a lock is therefore never seen in a state the record
+   cannot account for, where creating the file first and identifying it
+   afterwards would leave a crash in that gap holding a lock nobody can
+   claim — the UI would read it as another `git`'s and refuse forever,
+   and so would every ordinary `git` command. Every `git` that would
    change the index or switch the checkout fails on that file until it is
    gone (**measured**: `git add` and `git switch` both exited 128 with
    `Unable to create '.git/index.lock': File exists`). The
    lock is held through step 6; on any failure it is deleted without being
    installed, and the index is as it was. It takes `HEAD`'s lock the same
-   way — an empty `<git-path HEAD>.lock`, created exclusively — because the
+   way — `<git-path HEAD>.lock`, holding the record's id, published the
+   same way — because the
    index lock does not cover `HEAD`: **measured**, with `index.lock` held,
    `git symbolic-ref HEAD refs/heads/<sibling>` went through, and with
    `HEAD.lock` held it failed with `Unable to create 'HEAD.lock'`.
