@@ -254,13 +254,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    same holds for the transformations built into `git` — `ident`, and the
    end-of-line conversion `text`, `eol` and `core.autocrlf` ask for — so
    with no filter program left to run, step 1 also requires `git
-   hash-object -- <path>` and `git hash-object --no-filters -- <path>` to
-   agree: the first hashes what check-in would store, the second the file,
-   and any difference is a transformation that would leave the installed
-   path modified (**measured**: with `*.json ident` and `$Id$` in the file,
-   `filter` was `unspecified` and the two ids differed). The same pair of
-   hashes is taken of the *replacement* bytes (`hash-object --stdin
-   --path <path>` against `--stdin --no-filters`), because an attribute
+   hash-object --stdin --path <path>` and `git hash-object --stdin
+   --no-filters`, both fed the bytes read through the file's handle, to
+   agree: the first hashes what check-in would store for that name, the
+   second the bytes, and any difference is a transformation that would
+   leave the installed path modified (**measured**: with `*.json ident`
+   and `$Id$` in the file, `filter` was `unspecified` and the two ids
+   differed). Neither takes the path as a file to open: a name handed to
+   `git` is walked again from the root, through whatever a component has
+   become since the handle was opened, which is the reopen-by-name step 2
+   refuses for every hash it takes. The same pair of
+   hashes is taken of the *replacement* bytes (the same two commands), because an attribute
    that leaves the old content alone can still act on the new: a file
    without a marker passed, and the same file with `$Id: forged $` written
    into it did not (**measured**). Both of these attribute checks answer
@@ -453,7 +457,16 @@ locked-copy `update-index` ran it), so every `git` also takes
    still the page's version, rewritten through the same handle, so that a
    save cannot land between the check and the write because the editor
    cannot open the file for writing until the handle closes; a new file is
-   created with `CREATE_NEW`, which fails if the name exists. That
+   created with `CREATE_NEW`, which fails if the name exists. An in-place
+   write has no swapped-out inode to fall back on, so the retention and
+   the rollback are done the other way round: the bytes read through the
+   handle for the hash are written under `<git-dir>/pbps-ui/previous/`
+   *before* the rewrite, the handle is held through step 5, and a refusal
+   before the branch has moved restores the file by writing those bytes
+   back through the same handle, which nothing else could have opened for
+   writing in between; a name `CREATE_NEW` made is retained and its
+   directory entry deleted through the handle (`FILE_DISPOSITION_INFO`)
+   the way a linked name is unlinked. That
    in-place write is not crash-atomic, which is a different property from
    the one at stake here. Nothing on Windows has been measured for this
    ADR: step 3 of #64 measures every claim in this paragraph on a Windows
