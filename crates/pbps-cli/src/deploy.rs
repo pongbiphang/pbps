@@ -1457,25 +1457,29 @@ fn refuse_unplanned_movement(
         }
     }
 
-    // The renames this plan performs, keyed by the names the *before* side
-    // spells everything with, so a base-side table can be brought forward to
-    // the shape the rename leaves.
-    let mut renames = pbps_model::Renames::default();
+    // This plan's renames, backwards: the name each renamed thing had, keyed
+    // by the name it ends with. The later of the two reads is brought back to
+    // the earlier spelling with it, and then compared as it always was.
+    //
+    // Backwards rather than forwards, and part by part rather than whole,
+    // because a staged run is checked after every statement: at a checkpoint
+    // some of the renames have happened and some have not, so neither read is
+    // in one spelling. A child with two foreign keys to two separately renamed
+    // parents is carried for one and not the other. Undoing what *has*
+    // happened needs no knowledge of what has not (the same reason `settled`
+    // exists, DECISIONS 161).
+    let mut undo = pbps_model::Renames::default();
     for (from, to) in &renamed {
-        renames.rename_table((*from).clone(), (*to).clone());
+        undo.rename_table((*to).clone(), (*from).clone());
     }
     // A `RenameColumn` carries its table's *declared* name — the one the
-    // rename leaves it under — so it is taken back to the before-side spelling
-    // first. A plan that renames a table and a column of it in one revision is
-    // the case that needs it.
-    let was_called: BTreeMap<&TableName, &TableName> =
-        renamed.iter().map(|(from, to)| (*to, *from)).collect();
+    // rename leaves it under — which is already the key this map wants. And
+    // `order_key` runs the table renames (class 1) before the column renames
+    // (class 2), so at every read a table whose column has been renamed is
+    // already under its new name: the key is never a spelling that did not
+    // exist yet.
     for ((table, to), from) in &renamed_columns {
-        let base_table = was_called.get(table).copied().unwrap_or(table);
-        renames.rename_column(
-            pbps_model::ColumnRef::new((*base_table).clone(), *from),
-            *to,
-        );
+        undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
     }
 
     let mut moved = Vec::new();
@@ -1483,18 +1487,14 @@ fn refuse_unplanned_movement(
     // A child's foreign key follows the parent it references through
     // `sp_rename` — the referenced table and its columns are both rewritten by
     // the engine — so the child's shape moves with no change of this plan on
-    // it and nothing to excuse it with. Either spelling is accepted, not the
-    // rebased one alone: a staged run is checked after every statement, so a
-    // read taken between two renames finds one done and the other not, and
-    // demanding the end state at a checkpoint would stop a valid deployment
-    // (the same reason `settled` exists).
+    // it and nothing to excuse it with.
     compare(
         "",
         &before.tables,
         &after.tables,
         named,
         |name: &TableName, was: &pbps_model::Table, now: &pbps_model::Table| {
-            was == now || renames.apply(was, name).as_ref() == now
+            was == undo.apply(now, name).as_ref()
         },
         &mut moved,
     );
@@ -1707,10 +1707,10 @@ fn refuse_unplanned_movement(
             // the rename leaves, exactly as the differ does when it decides
             // not to emit the restatement in the first place. What may be
             // rewritten and what may not is `Renames::apply`'s business.
-            // The same table with the renames this plan performs applied. A
-            // part is unmoved if it matches either this or the read before it:
-            // at a checkpoint some of the renames have not run.
-            let carried = renames.apply(was, name);
+            // The later read, back in the spelling the earlier one uses, so
+            // the constraints this plan's renames carry compare equal without
+            // any change of its own restating them.
+            let now = &undo.apply(now, now_name);
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
             let no_names = BTreeSet::new();
@@ -1759,10 +1759,7 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
-            if !keys.contains(now_name)
-                && was.primary_key != now.primary_key
-                && carried.primary_key != now.primary_key
-            {
+            if !keys.contains(now_name) && was.primary_key != now.primary_key {
                 moved.push(format!("{now_name} has a different primary key"));
             }
             // By definition, not by name. A constraint dropped and recreated
@@ -1777,42 +1774,18 @@ fn refuse_unplanned_movement(
             // constraints in separate namespaces (DECISIONS 168).
             use pbps_model::Part;
             let (n, s, m) = (now_name, moved_parts, &mut moved);
-            named_alike(
-                n,
-                Part::Unique,
-                "unique",
-                [&was.unique, &carried.unique],
-                &now.unique,
-                s,
-                m,
-            );
+            named_alike(n, Part::Unique, "unique", &was.unique, &now.unique, s, m);
             named_alike(
                 n,
                 Part::ForeignKey,
                 "foreign key",
-                [&was.foreign_keys, &carried.foreign_keys],
+                &was.foreign_keys,
                 &now.foreign_keys,
                 s,
                 m,
             );
-            named_alike(
-                n,
-                Part::Check,
-                "check",
-                [&was.checks, &carried.checks],
-                &now.checks,
-                s,
-                m,
-            );
-            named_alike(
-                n,
-                Part::Index,
-                "index",
-                [&was.indexes, &carried.indexes],
-                &now.indexes,
-                s,
-                m,
-            );
+            named_alike(n, Part::Check, "check", &was.checks, &now.checks, s, m);
+            named_alike(n, Part::Index, "index", &was.indexes, &now.indexes, s, m);
         }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
@@ -2327,25 +2300,17 @@ fn named_alike<V: PartialEq>(
     table: &TableName,
     part: pbps_model::Part,
     kind: &str,
-    // The read before this one, and that same read with the plan's renames
-    // applied. A part is unmoved if it matches either: in a staged run a
-    // checkpoint falls between two renames, so some parts are still spelled
-    // the old way and some the new.
-    was: [&BTreeMap<String, V>; 2],
+    was: &BTreeMap<String, V>,
     now: &BTreeMap<String, V>,
     skip: &BTreeSet<(pbps_model::Part, &str)>,
     moved: &mut Vec<String>,
 ) {
-    let names: BTreeSet<&String> = was[0]
-        .keys()
-        .chain(was[1].keys())
-        .chain(now.keys())
-        .collect();
+    let names: BTreeSet<&String> = was.keys().chain(now.keys()).collect();
     for name in names {
         if skip.contains(&(part, name.as_str())) {
             continue;
         }
-        if was.iter().all(|w| w.get(name) != now.get(name)) {
+        if was.get(name) != now.get(name) {
             moved.push(format!(
                 "{table} {kind} `{name}` is not as the plan left it"
             ));
@@ -5331,6 +5296,82 @@ mod tests {
             e.contains("role app is not what the plan was approved over"),
             "{e}"
         );
+    }
+
+    /// A table the plan never mentions can be a hybrid at a checkpoint too,
+    /// and it is not enough for the *table* to match one spelling or the
+    /// other.
+    ///
+    /// A child with two foreign keys to two separately renamed parents has one
+    /// of them carried and one not after the first statement. Compared whole,
+    /// it matches neither the read before it nor that read with every rename
+    /// applied, and the checkpoint reported a table the plan does not touch as
+    /// unplanned movement.
+    ///
+    /// The comparison therefore brings the *later* read back to the earlier
+    /// spelling part by part, which has no whole-table state to be wrong
+    /// about.
+    #[test]
+    fn a_checkpoint_accepts_a_child_carried_only_halfway() {
+        use pbps_model::{Change, ChangeSet, ForeignKey, PlannedChange, Table};
+
+        let child = |first: &str, second: &str| {
+            let mut t = Table::default();
+            for (n, parent) in [("fk_one", first), ("fk_two", second)] {
+                t.foreign_keys.insert(
+                    n.into(),
+                    ForeignKey {
+                        columns: vec!["pid".into()],
+                        references_table: parent.parse().unwrap(),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            }
+            let mut s = Schema::default();
+            s.tables.insert("dbo.child".parse().unwrap(), t);
+            s
+        };
+
+        let renames = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.one".parse().unwrap(),
+                    to: "dbo.one_x".parse().unwrap(),
+                }),
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    from: "dbo.two".parse().unwrap(),
+                    to: "dbo.two_x".parse().unwrap(),
+                }),
+            ],
+        };
+
+        // The first parent has been renamed and the second has not: the child
+        // is spelled one way for one key and the other way for the other.
+        refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renames,
+            &child("dbo.one", "dbo.two"),
+            &child("dbo.one_x", "dbo.two"),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect("a child carried only halfway");
+
+        // The negative case: a parent this plan never names is movement.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renames,
+            &child("dbo.one", "dbo.two"),
+            &child("dbo.one_x", "dbo.elsewhere"),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("a parent no rename of this plan produces");
+        assert!(format!("{e:#}").contains("dbo.child"), "{e:#}");
     }
 
     /// A staged run is checked after **every** statement, with the whole plan
