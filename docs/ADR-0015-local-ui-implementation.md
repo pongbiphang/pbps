@@ -187,13 +187,24 @@ declarations, pushes the intent, calls `pbps_diff::resolve` and writes the
 result; **measured**: against a declaration that still held the old name,
 `pbps rename` exited 2 with "this intent matches nothing"). So the working
 tree is where the intent is, and the compose is the CLI user's own last
-step made in the CLI user's own order: the page lists the project's
-modified declaration files (`git status --porcelain -z
---untracked-files=all -- <project>`, the flag because
+step made in the CLI user's own order. The UI writes a snapshot of the
+recorded tip (below), asks the CLI where that project keeps its inputs
+(below), and only then lists the modified declaration files — `git status
+--porcelain -z --untracked-files=all -- <declarations directory>
+<ids file>`, the pathspec being what `doctor` answered, never the
+project directory, so that a modified `README` or anything else the user
+has open beside the declarations is neither laid over the snapshot nor
+committed with the intent; the flag because
 `status.showUntrackedFiles=no` in the user's configuration would otherwise
 hide the new side of a file-based rename — **measured**: under it the
-listing held the deleted old path alone, and with the flag both) with
-the blob id of each as read, the UI writes a snapshot of the recorded tip
+listing held the deleted old path alone, and with the flag both. The
+page shows that listing with the blob id of each file as read, and the
+compose is refused if `pbps.yml` itself is modified in the working tree
+(`git status --porcelain -z -- <project_file>` not empty), because the
+snapshot holds the tip's configuration and the working tree's would
+answer the questions below differently; the user commits the
+configuration first, as they would before running `pbps rename`. For the
+snapshot the UI writes
 the way step 3 below writes one (`git ls-tree -r -z <tip> -- <project>`
 and `git cat-file --batch`, the project's subtree only — a monorepo's
 other gigabytes are not the project's inputs, and `ls-tree` scoped by
@@ -218,7 +229,8 @@ command pointed at the snapshot would otherwise read the live declarations
 and write the live ids file before any of the protocol below had begun,
 and `validate` in step 3 would check live bytes instead of the tree; a
 project whose inputs lie outside its directory is one this UI does not
-compose for, and the Limits section says so. Then it runs the CLI's own
+compose for, and the Limits section says so; the listing above is taken
+from these answers, after this check. Then it runs the CLI's own
 intent command there — `pbps rename <from> <to>
 --no-input --project <that directory>/<the project's path>` and its
 siblings, with no `--format`, which the intent commands do not take
@@ -428,7 +440,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    give it — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
    `renamex_np(RENAME_SWAP)` — then hashes the file that came *out* and
-   reads back the whole of its metadata: if the blob is not the one the
+   reads back the whole of its metadata, and does the same for the file
+   that went *in*, through the descriptor the temporary was written and
+   read back through, which the exchange leaves bound to the inode now at
+   the path (**measured**: after the exchange, `fstat` of that descriptor
+   named the inode `stat` of the path named, and it read the new bytes
+   back), refusing if its bytes are no longer the held bytes or its
+   metadata no longer what was copied — a temporary is a name beside the
+   path for the length of a compose, and a process that wrote to it after
+   the read-back and before the exchange would otherwise have its bytes
+   at the path under a commit made from the UI's: if the blob that came
+   out is not the one the
    page was shown, an editor saved between step 1's check and the
    exchange; if the mode is not the tip entry's, the user changed the
    executable bit in the working tree, which the blob does not carry and
