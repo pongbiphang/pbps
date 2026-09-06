@@ -268,7 +268,14 @@ step made in the CLI user's own order, in this order:
   ls-tree` — the same set a CLI user commits after `pbps rename`. The
   listed files already hold their bytes in the working tree, so step 2
   places nothing for them and step 1's check that each still hashes to
-  the page's id is the whole of their handling; a deleted one must still
+  the page's id is the whole of their handling — unless the command
+  rewrote one of them, which is what happens to an ids file the user had
+  already edited: the overlay put the working tree's version into the
+  snapshot, the command read that and wrote its own, and those are the
+  bytes a CLI user would have in front of them, so the command's output
+  wins for any path in both sets and step 2 places it like any other file
+  it changed, step 1's check having established that the path still holds
+  what the page read; a deleted one must still
   be absent (the no-follow lookup through its directory handle fails with
   `ENOENT`) and is removed from the tree and the index rather than set,
   `git update-index --force-remove -- <path>` in both of step 3's indexes,
@@ -527,8 +534,14 @@ locked-copy `update-index` ran it), so every `git` also takes
    entry in step 3, a signature the user's configuration cannot make, or
    step 5's
    compare-and-swap refusing because the branch moved — undoes step 2 the
-   same way, exchanges back and unlinks in reverse order, and restores
-   the tree exactly. The compose action promises a tree that matches a
+   same way and in reverse order, exchanging an exchanged path back and
+   renaming a created path's entry to a temporary name beside it, never
+   unlinking: what a rollback takes away it takes by exchange or rename,
+   for the reason the created-path rule gives — the entry may be an
+   editor's inode by then, and an unlink would take its only name — and
+   the one name the UI ever unlinks is the temporary its own `link()` was
+   made from, after step 5. Restoring the tree is therefore restoring
+   every path to what it held, with anything displaced kept beside it. The compose action promises a tree that matches a
    new commit on the branch, and a tree changed without that commit is a
    working-tree edit nobody made; the commit object a refused step 5
    leaves in the store names no ref and is pruned as garbage. If both match, the old version is
@@ -816,16 +829,30 @@ leaves every composed path staged as a reversion of the commit that was
 just made (**measured**: interrupted there, `git status` reported `MM` for
 the path, and deleting the lock left it reporting the same). The gap
 cannot be closed — a ref and an index are two files — so it is made
-recoverable instead. Before step 5 the UI writes
-`<git-dir>/pbps-ui/composing/<random>.json` and flushes it and its
-directory: its own id, the branch, the tip it leased, the commit's id,
-the hash of the prepared `<index>.lock` as it stands, and, for every
-edited path,
-the entry step 3 recorded and the temporary name beside it — the name a
-`link()` was made from, or the one the exchange put the old file under —
-so that the record names every file the compose still has to account for.
-Step 6 removes the record, last, after the rename and after the cleanup
-below.
+recoverable instead, and so is every earlier interval, since a crash
+during step 2 leaves a placed file and a held lock with nothing on disk
+to say so. The record is written before the first placement and grows
+with the compose. The UI creates
+`<git-dir>/pbps-ui/composing/<random>.json`, flushing it and its
+directory at each write, and writes a phase into it before it does the
+thing that phase names — never after, so that the record is at worst one
+step ahead of the disk and never behind it:
+
+- `placing`, before step 2 touches the first path, holding the record's
+  own id, the branch and the tip it leased, and, for each path as it is
+  placed, the temporary name beside it — the name a `link()` was made
+  from, or the one the exchange put the old file under.
+- `composed`, before step 5, adding the commit's id and the hash of the
+  prepared `<index>.lock`, and the entry step 3 recorded for each path.
+- `installed`, before the cleanup, once the rename has happened.
+
+Step 6 removes the record, last, after the cleanup below. A record found
+in `placing` or `composed` with the branch still at the leased tip is a
+compose that never reached its `update-ref`: the UI undoes step 2 from
+the names in the record, exactly as a refusal in those steps does, and
+removes the record. A record in `composed` with the branch at the
+commit, or in `installed`, is the interval steps 5 and 6 span, and is
+finished as below.
 
 Every lock the UI creates carries the record's id as its content, written
 before the lock is relied on, which is what makes a lock reclaimable
@@ -843,7 +870,9 @@ left behind are still on disk, so it does not create them again: it reads
 absent, and can be created, or already holds this record's id, in which
 case it is the record's own and is used as it stands and removed with the
 others at the end; a lock holding anything else belongs to a running
-`git`, and the UI reports and changes nothing. Then it requires all of
+`git`, and the UI reports and changes nothing. For a record still in
+`placing` or `composed` that is the whole of what it needs, since the
+rollback touches no ref. For the rest it requires all of
 what step 5 required after its own `update-ref`: that `HEAD` is still
 symbolic to the record's branch, that the branch is still a direct ref
 and not a symbolic one, and that it still names the record's commit.
