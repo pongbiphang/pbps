@@ -621,6 +621,14 @@ the suite may run as root **and** runs on Windows.
 - An opt-in test must **skip** when its variable is unset, not panic. Copying
   the `panic!` used for `PBPS_TEST_DB` — which CI always sets — turned "this
   test is not enabled here" into a red job.
+- **A `cfg`-gated test takes its imports and helpers with it.** A test that is
+  Linux-only because it depends on Linux's behaviour is right to be absent
+  elsewhere, but the `use` it needs is not: `-D warnings` turns an import
+  nothing uses into an **error on the other platform only**, which the
+  developer's own machine cannot see. Gate the import with the same `cfg`, and
+  check it by flipping the gate to a platform that is not this one
+  (`target_os = "windows"` here) and building the workspace — the compiler then
+  removes exactly what the other platform removes.
 - **A check run being green on the head commit does not mean the pull request
   can see it.** A check run reaches a PR through the *check suite* that holds
   it, and GitHub associates a suite with the PR only when the run's event is

@@ -582,6 +582,10 @@ mod tests {
 
 #[cfg(test)]
 mod socket_tests {
+    // Gated with the tests that use it. Two of the three are Linux-only, and
+    // `-D warnings` turns an import nothing uses into an error — on the other
+    // platform only, which is a failure this machine cannot see.
+    #[cfg(target_os = "linux")]
     use std::net::SocketAddr;
     use std::time::Duration;
 
