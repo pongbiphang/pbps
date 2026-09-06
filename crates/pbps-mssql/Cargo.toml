@@ -12,6 +12,10 @@ pbps-model.workspace = true
 pbps-dialect.workspace = true
 pbps-db.workspace = true
 serde_json.workspace = true
+# The generated default-constraint name is cut to fit and carries a digest of
+# the qualified column so two cuts stay distinct. The same checksum the plan
+# pinning already uses, rather than a second hash in the tree.
+sha2.workspace = true
 thiserror.workspace = true
 tiberius.workspace = true
 

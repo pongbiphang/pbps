@@ -25,7 +25,7 @@ use pbps_model::{
     UniqueConstraint, Value,
 };
 
-use crate::ident::{literal, quote};
+use crate::ident::{MAX_IDENT_CHARS, literal, quote};
 use crate::types::{self, DIALECT};
 
 type Sql = Result<Vec<Statement>, DialectError>;
@@ -40,8 +40,121 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// SQL Server will invent one if we do not, but an invented name is unstable
 /// across environments, and a plan that reads `DROP CONSTRAINT
 /// DF__customer__stat__3B75D760` tells its reviewer nothing.
+///
+/// # Why it can be shortened, and why it must be
+///
+/// A table name and a column name may each legally be 128 characters, so
+/// `DF_{table}_{column}` can exceed the limit while every name the user wrote
+/// is valid. Refusing there refuses a valid plan, naming an identifier that
+/// appears nowhere in the user's YAML and that they cannot shorten without
+/// renaming their table.
+///
+/// This name is `pbps`'s own, so its shape is `pbps`'s to choose, and nothing
+/// downstream reads it back: [`drop_default_block`] looks the name up from the
+/// catalog rather than reconstructing it, precisely because a column adopted
+/// through `pull` carries a name `pbps` never chose. A constraint created by
+/// an older version keeps whatever name it was given.
 fn default_constraint_name(table: &TableName, column: &str) -> String {
-    format!("DF_{}_{}", table.name, column)
+    let full = format!("DF_{}_{}", table.name, column);
+    if utf16_units(&full) <= MAX_IDENT_CHARS {
+        return full;
+    }
+    shortened_default_constraint_name(table, column)
+}
+
+/// An identifier's length in the unit the server measures it in.
+///
+/// `MAX_IDENT_CHARS` is the number 128; the unit is **UTF-16 code units**, not
+/// characters. `sysname` is `nvarchar(128)`, and `nvarchar` counts units — a
+/// character above U+FFFF occupies two. This is measured rather than assumed:
+/// [`crate::state::truncate_reason`] records an `NVARCHAR(4)` refusing two
+/// emoji plus one ASCII letter with Msg 2628.
+///
+/// Every name here is budgeted in that stricter unit, so a name this module
+/// generates is one both [`quote`] and the server accept. Counting characters
+/// instead would have made the shortening *worse* than the refusal it
+/// replaces: a table and a column of 64 emoji each fit `sysname` on their own,
+/// so the joined name reaches the cut, and a 128-character cut of it is about
+/// 235 units — accepted by `plan` and refused at `apply`, which moves the
+/// failure from the cheap end to the expensive one.
+///
+/// `quote` itself still counts characters. That is the same distinction on
+/// names the *user* wrote rather than on the ones generated here, so it is
+/// tracked separately and not changed under this one.
+fn utf16_units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The longest prefix of `s` that fits `units`, never splitting a character.
+fn cut_to_utf16(s: &str, units: usize) -> String {
+    let mut used = 0;
+    s.chars()
+        .take_while(|ch| {
+            used += ch.len_utf16();
+            used <= units
+        })
+        .collect()
+}
+
+/// The digest, in hex characters, appended to a shortened name.
+///
+/// 64 bits rather than the 32 that would do: two truncations colliding would
+/// be two constraints asking for one name, which the server refuses at apply
+/// with a duplicate-object error — a loud failure, but one produced by a plan
+/// that looked fine to its reviewer. The four characters this costs come out
+/// of parts that are already truncated.
+const DEFAULT_NAME_DIGEST_CHARS: usize = 16;
+
+/// `DF_<table>_<column>_<digest>`, cut to fit and stable across runs.
+///
+/// The digest is over the **qualified** column, so the two halves of the name
+/// that were truncated away still separate two columns that now share a
+/// prefix. It is seeded with NUL between the parts: NUL is the one character
+/// [`quote`] refuses outright, so no name can contain one and no two different
+/// triples can spell the same seed.
+fn shortened_default_constraint_name(table: &TableName, column: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(table.schema.as_bytes());
+    hasher.update([0]);
+    hasher.update(table.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(column.as_bytes());
+    let digest = hasher.finalize();
+    let digest: String = digest
+        .iter()
+        .take(DEFAULT_NAME_DIGEST_CHARS / 2)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    // "DF_" + table + "_" + column + "_" + digest. The digest and the fixed
+    // parts are ASCII, so their unit count is their length.
+    let budget = MAX_IDENT_CHARS - "DF_".len() - 2 - DEFAULT_NAME_DIGEST_CHARS;
+    let (table_units, column_units) = share(budget, utf16_units(&table.name), utf16_units(column));
+
+    let short_table = cut_to_utf16(&table.name, table_units);
+    let short_column = cut_to_utf16(column, column_units);
+    format!("DF_{short_table}_{short_column}_{digest}")
+}
+
+/// Splits `budget` UTF-16 units between two parts that do not both fit.
+///
+/// A part shorter than its half is kept whole and lends the surplus to the
+/// other, so a 120-character table with a 3-character column keeps 112
+/// characters of table rather than being cut to half the budget for no reason.
+fn share(budget: usize, first: usize, second: usize) -> (usize, usize) {
+    if first + second <= budget {
+        return (first, second);
+    }
+    let half = budget / 2;
+    if first <= half {
+        (first, budget - first)
+    } else if second <= half {
+        (budget - second, second)
+    } else {
+        (half, budget - half)
+    }
 }
 
 /// The `WITH (ONLINE = ON)` suffix, where the statement takes one.
@@ -1611,6 +1724,147 @@ mod tests {
             "{}",
             sql[0]
         );
+    }
+
+    /// A table name and a column name may each legally be 128 characters, so
+    /// the name built from both can exceed the limit while every name the user
+    /// wrote is valid. Refusing there refused a valid plan over an identifier
+    /// that appears nowhere in their YAML.
+    #[test]
+    fn a_generated_default_name_too_long_to_quote_is_shortened_not_refused() {
+        let long_table = "t".repeat(MAX_IDENT_CHARS);
+        let long_column = "c".repeat(MAX_IDENT_CHARS);
+        let table = TableName::new("dbo", long_table.clone());
+
+        let name = default_constraint_name(&table, &long_column);
+        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+        // The point of the length check is that `quote` accepts it. Asserting
+        // the count alone would pass for a name `quote` still refuses.
+        assert!(quote(&name).is_ok(), "{name}");
+        assert!(name.starts_with("DF_"), "{name}");
+
+        // Both call sites reach it: the column list of a `CREATE TABLE`, and
+        // the `ADD CONSTRAINT` of a default change.
+        let mut column = Column::new(ty("int")).not_null();
+        column.default = Some("0".into());
+        let mut t = Table::default();
+        t.columns.insert(long_column.clone(), column);
+        let created = sql_of(&Change::CreateTable {
+            uid: uid("t_k7x2mq"),
+            name: table.clone(),
+            table: Box::new(t),
+        });
+        assert!(created[0].contains(&format!("CONSTRAINT [{name}] DEFAULT (0)")));
+
+        let altered = sql_of(&Change::AlterColumnDefault {
+            uid: uid("c_k7x2mq"),
+            column: ColumnRef::new(table.clone(), long_column.clone()),
+            from: Some("0".into()),
+            to: Some("1".into()),
+        });
+        assert!(
+            altered[0].contains(&format!("ADD CONSTRAINT [{name}] DEFAULT (1) FOR")),
+            "{}",
+            altered[0]
+        );
+    }
+
+    /// The limit is the width of `sysname`, and `nvarchar` counts UTF-16 code
+    /// units, so a character above U+FFFF costs two. Counting characters made
+    /// the shortening *worse* than the refusal it replaces: the cut name was
+    /// accepted by `plan` and refused by the server at `apply`, which is the
+    /// expensive end to learn it at.
+    #[test]
+    fn a_shortened_name_fits_the_width_the_server_measures_not_the_character_count() {
+        // Each of these is 64 characters and 128 UTF-16 units, so each fits
+        // `sysname` on its own and the joined name reaches the cut.
+        let table = TableName::new("dbo", "\u{1f600}".repeat(64));
+        let column = "\u{1f601}".repeat(64);
+
+        let name = default_constraint_name(&table, &column);
+        assert!(quote(&name).is_ok(), "{name}");
+        assert!(
+            name.encode_utf16().count() <= MAX_IDENT_CHARS,
+            "{} units",
+            name.encode_utf16().count()
+        );
+        // The character count alone would have passed here while the name was
+        // nearly twice the width the server allows.
+        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+
+        // The cut never splits a character, so what is left is still the
+        // characters it came from.
+        assert!(name.starts_with("DF_\u{1f600}"), "{name}");
+
+        // And the entry check is in units too: this one is 69 characters, so
+        // a character count would have returned it whole at 133 units.
+        let short_column = default_constraint_name(&table, "a");
+        assert!(
+            short_column.encode_utf16().count() <= MAX_IDENT_CHARS,
+            "{} units",
+            short_column.encode_utf16().count()
+        );
+        assert!(
+            format!("DF_{}_a", table.name).chars().count() <= MAX_IDENT_CHARS,
+            "the character count has to be under the limit, or this proves nothing"
+        );
+    }
+
+    /// Shortening is only worth having if the name is the same every time and
+    /// different for different columns: an unstable name would change the plan
+    /// its checksum pins, and a shared one would be two constraints asking for
+    /// one name, refused at apply.
+    #[test]
+    fn a_shortened_default_name_is_stable_and_distinguishes_what_it_truncates() {
+        let table = TableName::new("dbo", "t".repeat(MAX_IDENT_CHARS));
+        let first = format!("{}_a", "c".repeat(MAX_IDENT_CHARS - 2));
+        let second = format!("{}_b", "c".repeat(MAX_IDENT_CHARS - 2));
+
+        let a = default_constraint_name(&table, &first);
+        assert_eq!(a, default_constraint_name(&table, &first));
+        // The characters that differ are past the cut, so only the digest
+        // separates these two.
+        assert_ne!(a, default_constraint_name(&table, &second));
+
+        // The same table name in another schema is another table, and its
+        // constraint is another object.
+        let elsewhere = TableName::new("app", "t".repeat(MAX_IDENT_CHARS));
+        assert_ne!(a, default_constraint_name(&elsewhere, &first));
+    }
+
+    /// The shortening must not reach a name that already fits, or every
+    /// existing plan would be rewritten by upgrading.
+    #[test]
+    fn a_generated_default_name_that_fits_is_left_exactly_as_it_was() {
+        assert_eq!(
+            default_constraint_name(&tname("dbo.customer"), "status"),
+            "DF_customer_status"
+        );
+        // Exactly at the limit: "DF_" + 62 + "_" + 62 == 128.
+        let table = TableName::new("dbo", "t".repeat(62));
+        let column = "c".repeat(62);
+        let name = default_constraint_name(&table, &column);
+        assert_eq!(name.chars().count(), MAX_IDENT_CHARS);
+        assert_eq!(name, format!("DF_{}_{}", "t".repeat(62), "c".repeat(62)));
+
+        // One more character, and it is cut rather than refused.
+        let over = default_constraint_name(&table, &"c".repeat(63));
+        assert!(over.chars().count() <= MAX_IDENT_CHARS, "{over}");
+        assert!(over.len() < format!("DF_{}_{}", "t".repeat(62), "c".repeat(63)).len());
+    }
+
+    /// A part shorter than its half keeps all of itself. Halving both would
+    /// throw away 50 characters of a table name to make room for a column
+    /// name that is three characters long.
+    #[test]
+    fn shortening_spends_the_budget_on_the_part_that_needs_it() {
+        let table = TableName::new("dbo", "t".repeat(MAX_IDENT_CHARS));
+        let name = default_constraint_name(&table, "id");
+        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+        assert!(name.contains("_id_"), "{name}");
+        // Far more than half the budget went to the table.
+        let kept = name.chars().filter(|c| *c == 't').count();
+        assert!(kept > MAX_IDENT_CHARS / 2, "{name}");
     }
 
     #[test]
