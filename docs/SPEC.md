@@ -1225,13 +1225,13 @@ Every read-only command — `plan` (offline, including `--check`), `validate`,
 `--format human|json`
 and, in JSON, emits one envelope. `plan --db` is deliberately outside that set:
 it connects, reads the ledger and writes the deployment artifact, and what a
-reviewer reads *from* that artifact is `explain` (DECISIONS 214).
+reviewer reads *from* that artifact is `explain` (DECISIONS 215).
 
 The envelope's own schema is published, generated from the types the commands
 serialize: `pbps schema --kind envelope`, and `schemas/envelope.schema.json` in
 the repository. One document, with a branch per command selected by the
 `command` field, so a consumer reads that field and then knows what `data` is
-(DECISIONS 213).
+(DECISIONS 214).
 
 ```json
 {

@@ -3232,7 +3232,7 @@ SPEC is in sync with all of these.
 
 ## Phase 6 — the envelope contract (ADR-0015, #64 step 2)
 
-213. **The envelope's schema is published as one document with a branch per
+214. **The envelope's schema is published as one document with a branch per
     command, selected by `command`.** SPEC §9.8's shape has been a Rust type
     and an example since Phase 3.1; ADR-0015 decision 1 makes it the whole
     contract between the UI and the tool, and a contract nothing publishes is
@@ -3255,7 +3255,7 @@ SPEC is in sync with all of these.
     without a line in that list, or a line without the flag, is a failing test
     rather than an envelope nothing describes.
 
-214. **`plan --db` stays outside the envelope set.** #64 asked whether the
+215. **`plan --db` stays outside the envelope set.** #64 asked whether the
     connected plan should join it now that a UI will trigger one (step 5).
 
     It does not, and the reason is the one SPEC §9.8 already gives: `plan --db`
@@ -3271,7 +3271,7 @@ SPEC is in sync with all of these.
     with `explain --plan --format json`. ADR-0015 decision 1's list of what
     speaks the envelope is exact and unchanged.
 
-215. **`state list` carries the ledger's columns, never the recorded schema.**
+216. **`state list` carries the ledger's columns, never the recorded schema.**
     The timeline the UI draws needs an id, a time, a kind, an operator and the
     provenance fields; the snapshot's `schema` and `ids` are the whole database
     twice over. A payload that carried them would send megabytes to a page
@@ -3285,7 +3285,7 @@ SPEC is in sync with all of these.
     at all — three answers, as the repository's rule for absent, empty and
     unreadable requires.
 
-216. **A `--limit` too large saturates; it does not wrap and does not refuse.**
+217. **A `--limit` too large saturates; it does not wrap and does not refuse.**
     `TOP (n)` takes a signed 32-bit count and the flag takes a `u32`, so
     `--limit 4294967295` cast with `as` became `TOP (-1)` and the server
     refused the whole query. A number meaning "more than there could ever be"
@@ -3299,7 +3299,7 @@ SPEC is in sync with all of these.
     library function whose caller need not be the CLI, and "as many as the
     server can return" is the only reading of a count larger than any table.
 
-217. **An entry this build cannot read is carried, not thrown.** `state list`
+218. **An entry this build cannot read is carried, not thrown.** `state list`
     reads rows written by every version that ever touched the environment,
     including ones older than `OLDEST_READABLE_VERSION`. Parsing each row into
     a `StateSnapshot` and returning `Err` on the first failure meant one
@@ -3313,12 +3313,12 @@ SPEC is in sync with all of these.
     `state.entry-unreadable` finding naming the row. `history` keeps the
     stricter contract — a caller asking for states wants states — and the two
     doc comments point at each other. (The one finding id named here became
-    two in 221, once the two ways a row can be unreadable were told apart.)
+    two in 222, once the two ways a row can be unreadable were told apart.)
 
     This is the repository's absent/empty/unreadable rule applied one level
     down: it holds for a row as much as for a ledger.
 
-218. **Presence is asked by attempting the statement, never by `OBJECT_ID`.**
+219. **Presence is asked by attempting the statement, never by `OBJECT_ID`.**
     `is_initialized` asked the catalog whether `dbo.__pbps_state` exists. The
     lock reader had asked the same way and was fixed one shape earlier; the
     ledger reader was not swept with it.
@@ -3340,7 +3340,7 @@ SPEC is in sync with all of these.
     years of it. All six inherit the fix with no signature change, and both
     outside callers already routed an error correctly.
 
-219. **An `unanswerable` envelope exits 1, and never 2.** `state list`'s
+220. **An `unanswerable` envelope exits 1, and never 2.** `state list`'s
     ledger-read failure built its own findings and returned `Found::reported()`,
     which `main` maps to `EXIT_FINDING`. The JSON said the question could not be
     answered while the exit code said there was something to act on — decision
@@ -3351,7 +3351,7 @@ SPEC is in sync with all of these.
     That is the general rule: a command that reaches for `Found` on a path where
     it also emits `unanswerable` has routed a tool failure to the wrong person.
 
-220. **A table cell is escaped for the terminal; the JSON keeps the original.**
+221. **A table cell is escaped for the terminal; the JSON keeps the original.**
     `state list --format human` lays its columns out by counting characters, and
     `operator` and `reason` are free text: `--reason $'ticket-9\nwhy'` reaches
     the ledger as written, and a `failed` entry can carry a driver's multi-line
@@ -3371,7 +3371,7 @@ SPEC is in sync with all of these.
     rule the repository keeps arriving at: prefer making the bad value
     unrepresentable over checking for it at the sites that happen to hold it now.
 
-221. **"Older than this build reads" and "damaged" are two answers, not one.**
+222. **"Older than this build reads" and "damaged" are two answers, not one.**
     `timeline_from_row` parses the recorded state and then version-checks it,
     and both failures were carried as a string. The warning built from that
     string said the entry "was recorded by a version this build cannot read" —
@@ -3390,11 +3390,19 @@ SPEC is in sync with all of these.
     the two is true of every row, and the struct that could hold both needed a
     comment saying it never would.
 
-    **Measured, and it corrected the story in 217.** Writing a version-6-shaped
-    state by hand does not reach the version check at all — serde fails on the
-    schema's missing fields first, and the row is `Malformed`. In practice a
-    row *below* the readable range is damage to this build, and
-    `UnsupportedVersion` is what a *newer* pbps leaves behind: same shape, later
-    stamp. The test fixture builds it that way, by copying a real row and
-    raising its `version` with `JSON_MODIFY`, because the hand-written fixture
-    that preceded it passed while proving the wrong thing.
+    **One reader, not two.** The version-before-shape order `from_json` was
+    given for #50 is exactly what this needs, so `StateSnapshot::read_json` *is*
+    that reader with its failure typed, and `from_json` is `read_json` with the
+    two flattened into the one sentence a reader of a single state wants. A
+    second copy of the ordering in the ledger crate would have been a second
+    place to get it wrong.
+
+    That ordering is also what makes the distinction worth drawing. Without it,
+    an old row fails on whichever field of its older shape serde reaches first
+    and is `Malformed` — measured, on a base before it, and it had a fixture of
+    this test passing while proving the wrong thing. With it there are three
+    cases and the reader gets all three right: below the range is
+    `UnsupportedVersion` and says which command fixes it; unparseable is
+    `Malformed`; and a *readable* version carrying an unknown field is
+    `Malformed` too, because within a version this build reads, a field it does
+    not know is a hand-edited or corrupt row. The live test carries one of each.

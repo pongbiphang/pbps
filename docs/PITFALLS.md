@@ -33,7 +33,7 @@ things, and only one of them is good news.**
   permission on `__pbps_state` was told the database had never been touched —
   `doctor` saying `uninitialized`, `explain` offering `bootstrap`, `state list`
   drawing an empty history. Presence is attempted now, not asked: 208 absent,
-  229 hidden (DECISIONS 218).
+  229 hidden (DECISIONS 219).
 - `validate --since` reading a failed `ls-tree` as "no declarations at that
   revision", which calls every table new. From a project in a subdirectory it
   was empty every time: the pathspec lacked the `--full-tree` its sibling
@@ -47,15 +47,14 @@ things, and only one of them is good news.**
   `state list` returned `Err` on the first unreadable row, so one row written
   by a version older than `OLDEST_READABLE_VERSION` erased every newer entry
   above it — the list a person opened the command to see. The row is carried
-  now, with the ledger's own columns and the reason (DECISIONS 217). The rule
+  now, with the ledger's own columns and the reason (DECISIONS 218). The rule
   holds one level down: it is about a row as much as about a table.
 - Two *unreadables* flattened into one: a ledger row whose JSON does not parse
   and a row recorded by a version outside the readable range were carried as the
   same string, and the warning built from it said "recorded by a version this
   build cannot read" for both. The damaged row's operator was sent looking for
-  an upgrade. Typed apart now (DECISIONS 221) — and the fixture that was meant
-  to cover the version case had itself been failing to parse, so the branch it
-  claimed to test had never run.
+  an upgrade that does not exist for a damaged row. Typed apart now (DECISIONS
+  222).
 - An unlock failure **after a command had already failed** dropped on the floor:
   `apply` reported its own error and left `__pbps_lock` held with no word about
   it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`
@@ -96,7 +95,7 @@ the branch emitted an `unanswerable` envelope and then returned `Found`, so the
 JSON said "no answer" while the exit code said "act on this". A command that
 reaches for `Found` on a path that also emits `unanswerable` has contradicted
 itself; going through `or_unanswerable` leaves one thing producing both
-(DECISIONS 219).
+(DECISIONS 220).
 
 ### 4. A fix that generalises one step too far
 
@@ -300,7 +299,7 @@ notices; it was wrong in the one dimension the command exists to report, the
 number of times this database was deployed to.
 
 Escape for the terminal, keep the original in the JSON, and do it for **every**
-cell rather than for the fields that are free text this week (DECISIONS 220).
+cell rather than for the fields that are free text this week (DECISIONS 221).
 The same question is worth asking of any rendering whose layout is computed
 from its content.
 
@@ -495,8 +494,16 @@ than assuming.
 
 ## Tests that pass for the wrong reason
 
-Nine so far, every one invisible in a green run. **Assert the specific failure,
+Ten so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
+
+A fixture for "a state recorded by a version this build cannot read", written
+by hand at that version, was not one: the reader parsed the shape before the
+version, so it failed on a missing field and exercised the *malformed* branch
+instead. The test asserted the wording of a warning it was never producing for
+the reason it named. `StateSnapshot::from_json` reading the version first (#50)
+makes the case reachable, and the fixture now carries one row of each of the
+three ways a state can be unreadable rather than one row asserted about twice.
 
 - A plan fixture that failed at deserialization instead of at the emitter.
 - `plan`'s identity check firing before its baseline load.

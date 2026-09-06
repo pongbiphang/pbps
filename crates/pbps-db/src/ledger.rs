@@ -80,36 +80,7 @@ pub struct TimelineEntry {
     /// A `Result` rather than a snapshot beside an optional reason: exactly one
     /// of the two is true of every row, and a struct able to hold both — or
     /// neither — needs a comment where a type does the same work.
-    pub state: Result<StateSnapshot, Unreadable>,
-}
-
-/// Why a ledger row's recorded state could not be read.
-///
-/// Two failures with two different remedies, and a message that flattened them
-/// sent an operator with a damaged ledger looking for a newer pbps. A state
-/// outside the readable version range is read by changing the build (or by
-/// accepting the ledger's own columns, which is what a timeline shows anyway);
-/// a state that does not parse is damage, and there is no version of this tool
-/// that reads it (DECISIONS 221).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unreadable {
-    /// The state parsed and named a format outside
-    /// `OLDEST_READABLE_VERSION..=CURRENT_VERSION`. The message is
-    /// `StateSnapshot::check_version`'s, which already names the direction and
-    /// the remedy.
-    UnsupportedVersion(String),
-
-    /// The state did not parse: the row itself is damaged.
-    Malformed(String),
-}
-
-impl Unreadable {
-    /// The failure's own words, whichever it is.
-    pub fn detail(&self) -> &str {
-        match self {
-            Self::UnsupportedVersion(m) | Self::Malformed(m) => m,
-        }
-    }
+    pub state: Result<StateSnapshot, pbps_model::Unreadable>,
 }
 
 /// Who holds `__pbps_lock`, and since when.

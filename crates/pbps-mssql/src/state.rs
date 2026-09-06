@@ -12,9 +12,7 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
-use pbps_db::ledger::{
-    LedgerEntry, LedgerError, LockInfo, TimelineEntry, Unreadable, ids_to_prune,
-};
+use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
 use pbps_db::{Conn, DbError};
 use pbps_model::StateSnapshot;
 
@@ -146,7 +144,7 @@ const PROBE_STATE: &str = "SELECT TOP (0) 1 AS present FROM dbo.__pbps_state;";
 /// `doctor` that says `uninitialized`, an `explain` that offers `bootstrap`,
 /// and a `state list` that reports an empty history. The statement separates
 /// them: 208 when the table is absent, 229 when it is there and hidden, and
-/// every other failure stays a failure (DECISIONS 218).
+/// every other failure stays a failure (DECISIONS 219).
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     match conn.query(PROBE_STATE).await {
         Ok(_) => Ok(true),
@@ -188,7 +186,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// A row whose recorded state this build cannot read is carried with its
 /// reason rather than failing the call: an environment upgraded across a
 /// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
-/// one of them must not erase the history above it (DECISIONS 217).
+/// one of them must not erase the history above it (DECISIONS 218).
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
@@ -203,7 +201,7 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
 ///
 /// Saturating rather than `as`, which wraps: `--limit 4294967295` became `-1`
 /// and the server refused the query, so a number too large to mean anything
-/// turned into a failure rather than into "all of them" (DECISIONS 216).
+/// turned into a failure rather than into "all of them" (DECISIONS 217).
 fn top(limit: u32) -> i32 {
     i32::try_from(limit).unwrap_or(i32::MAX)
 }
@@ -365,17 +363,13 @@ fn timeline_from_row(row: &pbps_db::Row) -> Result<TimelineEntry, LedgerError> {
     let id: i64 = get(row, "id")?;
     let state_json: &str = get(row, "state_json")?;
 
-    // Parsed, then version-checked, and either failure is carried on the row
-    // rather than returned: this is the one reader whose answer is the list
-    // itself. The two failures stay apart, because their remedies do
-    // (DECISIONS 221).
-    let state = match serde_json::from_str::<StateSnapshot>(state_json) {
-        Ok(s) => match s.check_version() {
-            Ok(()) => Ok(s),
-            Err(message) => Err(Unreadable::UnsupportedVersion(message)),
-        },
-        Err(e) => Err(Unreadable::Malformed(e.to_string())),
-    };
+    // `read_json`, the same reader `entry_from_row` uses through `from_json`:
+    // the version before the shape, so an older row is refused by its version
+    // rather than by whichever field of its older shape serde reached first.
+    // The failure is carried on the row rather than returned — this is the one
+    // reader whose answer is the list itself — and the two kinds stay apart,
+    // because their remedies do (DECISIONS 222).
+    let state = StateSnapshot::read_json(state_json);
 
     Ok(TimelineEntry {
         id,

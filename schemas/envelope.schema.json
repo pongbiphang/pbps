@@ -1049,7 +1049,7 @@
           "minimum": 0
         },
         "unreadable": {
-          "description": "Why the recorded state could not be read, when it could not. Set exactly\nwhen the fields taken from that state are absent, and typed rather than\na sentence, because the two cases send an operator to different places\n(DECISIONS 221).",
+          "description": "Why the recorded state could not be read, when it could not. Set exactly\nwhen the fields taken from that state are absent, and typed rather than\na sentence, because the two cases send an operator to different places\n(DECISIONS 222).",
           "anyOf": [
             {
               "$ref": "#/$defs/Unreadable"
@@ -1219,6 +1219,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 8,
+  "x-pbps-schema-version": 9,
   "x-pbps-tool-version": "0.0.0"
 }

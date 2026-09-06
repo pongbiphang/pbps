@@ -212,4 +212,4 @@ token, reads no credential itself, and commits through the user's own `git`.
 The steps are in issue #64. Step 1 is that ADR. Step 2 froze what the page
 reads: the envelope's schema is published and checked against real output, and
 `state list` gives the ledger timeline `status`'s newest-entry row cannot
-(DECISIONS 213-215).
+(DECISIONS 214-216).

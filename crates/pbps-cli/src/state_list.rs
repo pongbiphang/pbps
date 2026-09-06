@@ -54,7 +54,7 @@ pub struct LedgerRow {
     /// Why the recorded state could not be read, when it could not. Set exactly
     /// when the fields taken from that state are absent, and typed rather than
     /// a sentence, because the two cases send an operator to different places
-    /// (DECISIONS 221).
+    /// (DECISIONS 222).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<Unreadable>,
 
@@ -152,10 +152,10 @@ fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
             out.tables = Some(snapshot.schema.tables.len());
             out.modules = Some(snapshot.schema.modules.len());
         }
-        Err(pbps_db::Unreadable::UnsupportedVersion(detail)) => {
+        Err(pbps_model::Unreadable::UnsupportedVersion(detail)) => {
             out.unreadable = Some(Unreadable::UnsupportedVersion { detail });
         }
-        Err(pbps_db::Unreadable::Malformed(detail)) => {
+        Err(pbps_model::Unreadable::Malformed(detail)) => {
             out.unreadable = Some(Unreadable::Malformed { detail });
         }
     }
@@ -190,14 +190,14 @@ pub fn cmd_state_list(
             // Not an error: a database this tool has never written to has no
             // history, and saying so is the answer. It is *not* an empty
             // history — the finding below is what keeps the two apart, and a
-            // ledger that exists but cannot be read is neither (DECISIONS 218).
+            // ledger that exists but cannot be read is neither (DECISIONS 219).
             Err(pbps_db::LedgerError::NotInitialized) => None,
             // Reached the server and could not read the ledger: a tool
             // failure, which exits 1. Never `Found` — that is exit 2, the code
             // reserved for a difference this command established, and an
             // envelope whose result is `unanswerable` beside an exit code
             // meaning "there are findings" routes the failure to the wrong
-            // person (DECISIONS 219). `or_unanswerable` is what every
+            // person (DECISIONS 220). `or_unanswerable` is what every
             // other step here uses, for the same reason.
             Err(e) => Some(output::or_unanswerable(
                 "state list",
@@ -218,18 +218,18 @@ pub fn cmd_state_list(
         // who is told nothing would take the missing counts for zero. Two ids,
         // because the two failures are two different jobs for whoever reads
         // them — one is a build to change, the other a damaged row
-        // (DECISIONS 221).
+        // (DECISIONS 222).
         for e in &entries {
             let (id, what) = match &e.state {
                 Ok(_) => continue,
-                Err(pbps_db::Unreadable::UnsupportedVersion(detail)) => (
+                Err(pbps_model::Unreadable::UnsupportedVersion(detail)) => (
                     "state.entry-unsupported-version",
                     format!(
                         "was recorded in a state format this build does not read ({})",
                         one_line(detail)
                     ),
                 ),
-                Err(pbps_db::Unreadable::Malformed(detail)) => (
+                Err(pbps_model::Unreadable::Malformed(detail)) => (
                     "state.entry-malformed",
                     format!(
                         "has a recorded state that does not parse, so the row is damaged ({})",
@@ -302,7 +302,7 @@ pub fn cmd_state_list(
 /// newline in it" but says something false about how many times this database
 /// was deployed to. Control characters are shown escaped rather than dropped,
 /// because what was recorded is the point of the column, and `--format json`
-/// still carries the original (DECISIONS 220).
+/// still carries the original (DECISIONS 221).
 fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -473,7 +473,7 @@ mod tests {
     ///
     /// One placeholder for both meant a damaged row was labelled a format
     /// problem, which sends an operator looking for an upgrade that does not
-    /// exist (DECISIONS 221).
+    /// exist (DECISIONS 222).
     #[test]
     fn the_detail_column_names_which_kind_of_unreadable_a_row_is() {
         let unreadable = |u: Unreadable| {

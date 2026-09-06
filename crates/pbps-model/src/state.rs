@@ -265,6 +265,17 @@ impl StateSnapshot {
     /// is a hand-edited or corrupt row, and "absent, empty and unreadable are
     /// three different things".
     pub fn from_json(json: &str) -> Result<Self, String> {
+        Self::read_json(json).map_err(|e| e.to_string())
+    }
+
+    /// [`from_json`](Self::from_json) with its two failures kept apart.
+    ///
+    /// A reader whose answer is a *list* of states — `state list` — shows the
+    /// row either way and has to say which happened, because the remedies are
+    /// different and one of them does not exist: there is no build of pbps that
+    /// reads a truncated row (DECISIONS 222). `from_json` is this with the two
+    /// flattened into the one sentence a reader of a single state wants.
+    pub fn read_json(json: &str) -> Result<Self, Unreadable> {
         /// The envelope: the version, and deliberately nothing else.
         ///
         /// Unknown fields are allowed here — they are the rest of the snapshot.
@@ -276,9 +287,50 @@ impl StateSnapshot {
         }
 
         let envelope: Envelope =
-            serde_json::from_str(json).map_err(|e| format!("malformed: {e}"))?;
-        check_version_number(envelope.version)?;
-        serde_json::from_str(json).map_err(|e| format!("malformed: {e}"))
+            serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
+        check_version_number(envelope.version).map_err(Unreadable::UnsupportedVersion)?;
+        serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))
+    }
+}
+
+/// Why a recorded state could not be read.
+///
+/// Two failures with two different remedies, and a message that flattened them
+/// sent an operator with a damaged ledger looking for a newer pbps. A state
+/// outside the readable version range is read by changing the build; a state
+/// that does not parse is damage, and there is no version of this tool that
+/// reads it (DECISIONS 222).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unreadable {
+    /// The state named a version outside
+    /// `OLDEST_READABLE_VERSION..=CURRENT_VERSION`. The message is
+    /// [`check_version_number`]'s, which names the direction and the remedy.
+    UnsupportedVersion(String),
+
+    /// The state did not parse: either the envelope this reader needs before it
+    /// can ask about the version, or — within a version it does read — the
+    /// strict parse that refuses an unknown field.
+    Malformed(String),
+}
+
+impl Unreadable {
+    /// The failure's own words, whichever it is.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::UnsupportedVersion(m) | Self::Malformed(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    /// The one sentence [`StateSnapshot::from_json`] has always given, so that
+    /// telling the two apart changed no message a reader of a single state
+    /// sees.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion(m) => write!(f, "{m}"),
+            Self::Malformed(m) => write!(f, "malformed: {m}"),
+        }
     }
 }
 

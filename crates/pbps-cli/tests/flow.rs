@@ -10256,7 +10256,7 @@ fn state_list_refuses_a_limit_of_zero() {
 /// That reason is typed: a state format this build does not read is a build to
 /// change, and a state that does not parse is a damaged row. Told the first
 /// about the second, an operator goes looking for a newer pbps that does not
-/// exist (DECISIONS 221), so both rows are here and each is asserted against
+/// exist (DECISIONS 222), so both rows are here and each is asserted against
 /// the other'"'"'s wording.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
@@ -10274,30 +10274,40 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
         0
     );
 
-    // A row a *newer* pbps left behind: the baseline's own state with its
-    // version stamp raised past this build's. Copied from a real row rather
-    // than written by hand, because a hand-written one fails to parse before
-    // the version is ever looked at — which is the whole distinction under
-    // test, and what an earlier version of this fixture got wrong.
-    let newer = pbps_model::state::CURRENT_VERSION + 1;
+    // Row 2: from before this build's oldest readable version. The reader takes
+    // the version out of the envelope before parsing the shape, so this is a
+    // version answer and not "unknown field `on`" — which is what makes it
+    // worth writing by hand rather than copying a current row.
+    let old = pbps_model::state::OLDEST_READABLE_VERSION - 1;
     on_server(
         &connection,
         &format!(
             "INSERT INTO dbo.__pbps_state \
                  (kind, git_sha, plan_checksum, state_json, operator, reason) \
-             SELECT 'apply', NULL, NULL, \
-                    JSON_MODIFY(state_json, '$.version', CAST({newer} AS int)), \
-                    N'someone', N'from before' \
-               FROM dbo.__pbps_state WHERE id = 1;"
+             VALUES ('apply', NULL, NULL, \
+                     N'{{\"version\": {old}, \"kind\": \"apply\", \"operator\": \"someone\"}}', \
+                     N'someone', N'from before');"
         ),
     );
 
-    // And a row whose recorded state is not JSON at all — damage, which no
-    // version of this tool reads.
+    // Row 3: a state that is not JSON at all — damage, which no version of this
+    // tool reads.
     on_server(
         &connection,
         "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason) \
          VALUES ('apply', NULL, NULL, N'{not json', N'someone-else', NULL);",
+    );
+    // Row 4: a *readable* version carrying a field this build does not know.
+    // The version says yes and the strict parse says no, and the answer has to
+    // be damage rather than a version problem — the case that tells the reader
+    // apart from one that looks only at the stamp.
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason) \
+         SELECT 'apply', NULL, NULL, JSON_MODIFY(state_json, '$.surprise', 'x'), \
+                N'a-third', N'hand-edited' \
+           FROM dbo.__pbps_state WHERE id = 1;",
     );
 
     let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
@@ -10309,10 +10319,16 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entries = v["data"]["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 3, "every row is listed: {v}");
+    assert_eq!(entries.len(), 4, "every row is listed: {v}");
 
-    // Newest first: the damaged row, the old-format row, the baseline.
-    let (damaged, old_row, current) = (&entries[0], &entries[1], &entries[2]);
+    // Newest first: the hand-edited row, the unparseable one, the old-format
+    // one, the baseline.
+    let (edited, damaged, old_row, current) = (&entries[0], &entries[1], &entries[2], &entries[3]);
+    assert_eq!(
+        edited["unreadable"]["kind"], "malformed",
+        "a readable version with an unknown field is a damaged row, not a \
+         version problem: {v}"
+    );
     assert_eq!(
         damaged["unreadable"]["kind"], "malformed",
         "a row that does not parse is damage, not a version: {v}"
@@ -10357,7 +10373,11 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
         .collect();
     assert_eq!(
         ids,
-        vec!["state.entry-malformed", "state.entry-unsupported-version"],
+        vec![
+            "state.entry-malformed",
+            "state.entry-malformed",
+            "state.entry-unsupported-version"
+        ],
         "one id per cause, in the ledger's order: {v}"
     );
 
