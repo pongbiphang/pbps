@@ -289,7 +289,16 @@ step made in the CLI user's own order, in this order:
   bytes a CLI user would have in front of them, so the command's output
   wins for any path in both sets and step 2 places it like any other file
   it changed, step 1's check having established that the path still holds
-  what the page read; a deleted one must still
+  what the page read. That check is taken again, for every listed file
+  the command did not rewrite, immediately before step 5: the path is
+  opened afresh through its directory handle, and its identity and its
+  hash must both be what step 1 saw, or the compose is refused and step 2
+  undone. Nothing places these files, so nothing else would notice an
+  editor saving one between step 1 and the commit, and the commit would
+  then hold bytes the working tree no longer has — the same failure the
+  exchange's read-back catches for a placed path, on the only paths that
+  have no exchange. The window this leaves is the one already named for
+  every other path: what happens after the last look; a deleted one must still
   be absent (the no-follow lookup through its directory handle fails with
   `ENOENT`) and is removed from the tree and the index rather than set,
   `git update-index --force-remove -- <path>` in both of step 3's indexes,
@@ -856,9 +865,14 @@ recoverable instead, and so is every earlier interval, since a crash
 anywhere from step 0 leaves a lock, and one during step 2 a placed file
 too, with nothing on disk to say whose they are. The record is therefore
 the compose's first act, before any lock exists, and it grows with it.
-The UI creates `<git-dir>/pbps-ui/composing/<random>.json`, flushing it
-and its directory at each write, and writes a phase into it before it
-does the thing that phase names — never after, so that the record is at
+The UI creates `<git-dir>/pbps-ui/composing/<random>.json` and writes a
+phase into it before it does the thing that phase names. Each version of
+that file is complete before it is the record: it is written under a
+fresh name beside it, flushed, renamed over the record, and the
+directory flushed — never edited in place, since a stop in the middle of
+a rewrite would leave the one piece of evidence recovery has as
+half of one version and half of another, at a moment when locks are held
+and files may be placed. The rename is what publishes it — never after, so that the record is at
 worst one step ahead of the disk and never behind it:
 
 - `locking`, before step 0 creates a single file, holding the record's
@@ -913,7 +927,17 @@ left behind are still on disk, so it does not create them again: it reads
 `HEAD.lock` and the branch's lock and continues only where each is either
 absent, and can be created, or already holds this record's id, in which
 case it is the record's own and is used as it stands and removed with the
-others at the end; a lock holding anything else belongs to a running
+others at the end. In the `composed` phase there is a second kind of
+leftover it can account for: `update-ref` takes both locks itself, which
+is why the UI gives up `HEAD.lock` for that one command, so a stop inside
+it leaves locks `git` wrote rather than the UI. `git` writes the new
+value into the branch's lock and leaves `HEAD.lock` empty (**measured**,
+from a `reference-transaction` hook in the `prepared` phase: the branch's
+lock held the new commit's id and `HEAD.lock` was empty), so a branch
+lock holding exactly the record's commit id is that interrupted
+transaction's, and where it is, an empty `HEAD.lock` beside it is the
+same transaction's too; both are reclaimed like the UI's own. A lock
+holding anything else belongs to a running
 `git`, and the UI reports and changes nothing. For a record still in
 `placing` or `composed` that is the whole of what it needs, since the
 rollback touches no ref. For the rest it requires all of
