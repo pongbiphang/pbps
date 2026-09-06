@@ -35,6 +35,7 @@ use crate::name::NameError;
 /// One database role: what it is granted. Its name is the key in
 /// [`crate::Schema::roles`] (constraint 2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Role {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -304,6 +305,24 @@ mod tests {
     use crate::name::TableName;
     use crate::schema::{Column, Schema, Table};
     use crate::types::ColumnType;
+
+    #[test]
+    fn unknown_role_fields_are_refused_instead_of_defaulting_grants() {
+        for json in [
+            r#"{"grnats": {}}"#,
+            r#"{"grants": {}, "descripton": "reader"}"#,
+        ] {
+            let error = serde_json::from_str::<Role>(json).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{error}");
+            assert!(
+                error.contains("grnats") || error.contains("descripton"),
+                "{error}"
+            );
+        }
+        for json in ["{}", r#"{"grants": {}}"#] {
+            assert_eq!(serde_json::from_str::<Role>(json).unwrap(), Role::default());
+        }
+    }
 
     #[test]
     fn a_target_is_an_object_or_a_whole_schema() {

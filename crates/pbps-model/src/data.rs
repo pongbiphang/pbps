@@ -257,6 +257,7 @@ pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Ce
 /// from a recorded state, and it is what turns "the table holds these rows"
 /// into a [`TableData`] the differ can compare.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataScope {
     pub mode: DataMode,
     /// The declared keys. For an `exact` table they are informational — every

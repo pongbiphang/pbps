@@ -15,5 +15,9 @@ sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
 
+[dev-dependencies]
+# Parse source for the persisted-struct guard; never linked into the binary.
+syn = { version = "2", features = ["full"] }
+
 [lints]
 workspace = true
