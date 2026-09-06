@@ -288,13 +288,10 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
     let id: i64 = get(row, "id")?;
     let state_json: &str = get(row, "state_json")?;
-    let snapshot: StateSnapshot =
-        serde_json::from_str(state_json).map_err(|e| LedgerError::BadEntry {
-            id,
-            message: e.to_string(),
-        })?;
-    snapshot
-        .check_version()
+    // `from_json`, not `from_str` then `check_version`: an entry written by an
+    // older pbps is refused by its version and the remedy that goes with it,
+    // rather than by whichever field of its older shape serde reached first.
+    let snapshot = StateSnapshot::from_json(state_json)
         .map_err(|message| LedgerError::BadEntry { id, message })?;
     Ok(LedgerEntry {
         id,
