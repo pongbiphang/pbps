@@ -274,8 +274,20 @@ locked-copy `update-index` ran it), so every `git` also takes
    and never *under* one: every component of the path from the worktree
    root is checked with `lstat` and none may be a link, and every file
    operation the UI makes is done through directory handles opened from
-   the root with `O_NOFOLLOW` (`openat2` with `RESOLVE_BENEATH` on Linux),
-   because a tracked directory replaced by a link to a directory outside
+   the root so that no component is followed as a link — on Linux one
+   `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, elsewhere one
+   `openat` per component from the previous component's handle, each with
+   `O_DIRECTORY | O_NOFOLLOW`. `O_NOFOLLOW` guards the last component only,
+   and `RESOLVE_BENEATH` guards the worktree's boundary, not the path: a
+   link *inside* the worktree is followed under it (**measured** on Linux
+   6.6: with `dir/link` a link to a sibling directory, `openat2` of
+   `dir/link/sub` with `O_NOFOLLOW` and `RESOLVE_BENEATH` opened the
+   sibling's `sub`, and with `RESOLVE_NO_SYMLINKS` added it failed with
+   `ELOOP`, while a path with no link opened under both), so the `lstat`
+   walk above is what is checked and the open is what enforces it, and
+   the open would otherwise write one directory's file while the commit
+   named another's path. A tracked directory replaced by a link to a
+   directory outside
    the worktree leaves the leaf a regular file with matching index and tip
    entries (**measured**: `ls-files` and `ls-tree` both still said
    `100644` while `hash-object` read the outside file), and step 2 would
@@ -342,9 +354,18 @@ locked-copy `update-index` ran it), so every `git` also takes
    it, in reverse order: an exchanged path is exchanged back, a path
    `link()` created is unlinked, since an intent may edit more than one
    file and a refusal that left some of them replaced would be a partial
-   edit nobody asked for; the retained copies below are made only after
-   every path has passed, so at that point nothing has been let go and the
-   exchanges back restore the tree exactly. If both match, the old version is
+   edit nobody asked for. The swapped-out files stay beside their paths
+   under their temporary names until step 5 has moved the branch, and the
+   retained copies below are made only then: until that point nothing has
+   been let go, and every refusal before it — a path failing a check here,
+   a `hash-object`, `write-tree` or `commit-tree` failing in steps 2 to 4,
+   a signature the user's configuration cannot make, or step 5's
+   compare-and-swap refusing because the branch moved — undoes step 2 the
+   same way, exchanges back and unlinks in reverse order, and restores
+   the tree exactly. The compose action promises a tree that matches a
+   new commit on the branch, and a tree changed without that commit is a
+   working-tree edit nobody made; the commit object a refused step 5
+   leaves in the store names no ref and is pruned as garbage. If both match, the old version is
    still not deleted: an editor that opened the file before the exchange
    holds a descriptor to that inode and may write through it after the
    hash, and an unlinked inode would take that save with it. The
@@ -366,8 +387,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    bytes into the commit, while the UI had installed its own through the
    handle. A handle is proof of where a directory *was*: after every
    exchange, and after every `link()` below, the UI compares `fstat` of
-   the directory handle with a fresh no-follow lookup of the same path
-   from the root, and if they no longer name one directory — the ancestor
+   the directory handle with `fstat` of a fresh handle to the same path,
+   opened from the root the same no-link way as the first — a lookup by
+   name would follow a link put in the middle of the path since (**measured**:
+   `lstat` of `dir/link/sub` named the sibling's directory) — and if
+   they no longer name one directory — the ancestor
    was renamed away and another put in its place — the exchange is undone
    through the same handle, a linked name is unlinked through it
    (`unlinkat`), and the compose refused, since the UI's bytes would
@@ -455,7 +479,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    UI never locked — 
    that refuses if anything moved the branch in between (ref locks are not
    the index lock; **measured**, the update went through with the index lock
-   held), and the one step that changes the checkout. `update-ref` takes
+   held) — a refusal here undoes step 2 as described there, since the tree
+   would otherwise hold an edit no commit records — and the one step that
+   changes the checkout. `update-ref` takes
    `HEAD`'s lock itself when `HEAD` names the branch it moves (**measured**:
    with `HEAD.lock` held it failed with `cannot lock ref 'HEAD'`), so the
    UI releases `HEAD.lock` for this one command and takes it back right
@@ -483,8 +509,10 @@ locked-copy `update-index` ran it), so every `git` also takes
    Both locks are held through step 6. If either check fails, the commit
    exists and is where `update-ref` put it, but the checkout is no longer
    at it, so step 6 does not happen and nothing is pushed: the locks are
-   discarded, the index is as it was, and the page says where the commit is
-   and what moved. **Measured**
+   discarded, the index is as it was, the placed files stay — they are
+   what the branch's new tip holds, and exchanging them back would leave
+   the branch recording an edit the tree no longer shows — and the page
+   says where the commit is and what moved. **Measured**
    both ways: undisturbed, the check passed and the index was installed
    clean; with a `symbolic-ref` to a sibling in the gap, the check failed,
    the branch held the commit, the sibling was untouched, and the index was
@@ -717,8 +745,8 @@ What this ADR reasons about and has not measured, in the order the steps of
   and refuses,
   and a move after that detection leaves a path `git status` reports
   missing beside a retained copy. Step 4 measures how narrow that window
-  is and whether `RESOLVE_BENEATH` on the exchange itself (Linux 5.6+)
-  closes it.
+  is and whether resolving the exchange's own paths with `openat2`'s
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (Linux 5.6+) closes it.
 - **DNS rebinding through browsers that pass a numeric `Host` unchanged.**
   Decision 3's `Host` check is the standard answer; step 3's tests send the
   cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
