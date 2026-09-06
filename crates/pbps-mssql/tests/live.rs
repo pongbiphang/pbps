@@ -1799,9 +1799,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         "{base_no_credentials};User Id={login};Password={password};Database={}",
         db.name
     );
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
 
     // The premise, measured: `ALTER` on the schema lets this login change the
     // table's shape and still refuses every row statement on it. Three
@@ -1860,7 +1858,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("grant the DML on the table");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &exact).await;
     assert!(
         !held.schemas["app"].contains("INSERT"),
@@ -1891,7 +1889,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("grant the schema and deny the table");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &exact).await;
     assert!(
         held.schemas["app"].contains("INSERT"),
@@ -1934,7 +1932,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("revoke the schema DML");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &unbuilt).await;
     assert_eq!(
         named_gaps(&held),

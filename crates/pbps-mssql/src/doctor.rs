@@ -146,7 +146,7 @@ pub enum Needed {
     DataInsert,
 
     /// Needed on each table whose declaration would have a row **corrected**
-    /// in it (DECISIONS 225).
+    /// in it (DECISIONS 235).
     ///
     /// Separate from [`Needed::DataInsert`] because a declaration can insert
     /// without ever updating. An `UPDATE` is built only from the columns a row

@@ -183,9 +183,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // about (the ledger lives there) and the declarations themselves are
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
-    let referenced = referenced_tables(project, &managed_schemas);
-    let granted = grant_targets(project);
-    let data = data_tables(project);
+    let declared = Declared {
+        referenced: referenced_tables(project, &managed_schemas),
+        granted: grant_targets(project),
+        data: data_tables(project),
+        schemas: managed_schemas,
+    };
 
     if !project.ids_file().exists() {
         findings.push(
@@ -246,10 +249,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     name.as_deref(),
                     target.connection(),
                     target.driver(),
-                    &managed_schemas,
-                    &referenced,
-                    &granted,
-                    &data,
+                    &declared,
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
@@ -290,10 +290,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     Some(&name),
                     &conn,
                     db::driver_for(project.config.dialect),
-                    &managed_schemas,
-                    &referenced,
-                    &granted,
-                    &data,
+                    &declared,
                 )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
@@ -537,16 +534,30 @@ fn append_cause(slot: &mut Option<String>, cause: String) {
     }
 }
 
+/// What the permission check needs from the declarations, read once for the
+/// whole estate.
+///
+/// One value rather than four parameters travelling together: they are derived
+/// from the same load, are handed on unchanged to every environment, and a
+/// fifth would otherwise be a fifth argument to thread through each call site.
+struct Declared {
+    /// The schemas this project manages.
+    schemas: Vec<String>,
+    /// Foreign-key targets outside them.
+    referenced: Vec<pbps_model::ObjectName>,
+    /// What the managed roles are granted on (ADR-0005).
+    granted: pbps_mssql::doctor::GrantTargets,
+    /// The tables that declare rows, and what each demands (ADR-0004).
+    data: pbps_mssql::doctor::DataTables,
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
     env_name: Option<&str>,
     connection: &str,
     driver: pbps_db::Driver,
-    schemas: &[String],
-    referenced: &[pbps_model::ObjectName],
-    granted: &pbps_mssql::doctor::GrantTargets,
-    data: &pbps_mssql::doctor::DataTables,
+    declared: &Declared,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
@@ -595,7 +606,15 @@ async fn examine(
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted, data).await {
+    match pbps_mssql::doctor::permissions(
+        &mut conn,
+        &declared.schemas,
+        &declared.referenced,
+        &declared.granted,
+        &declared.data,
+    )
+    .await
+    {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()
