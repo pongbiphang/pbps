@@ -3429,3 +3429,22 @@ SPEC is in sync with all of these.
     Covering a command is not covering its payload's nested types, and the
     envelope validation now runs `doctor` against a real environment, where the
     two fields are absent because the news is good.
+
+224. **The published envelope pins its own version, as it pins the command.**
+    Each branch already fixed `command` with a `const`, because that is the
+    field `oneOf` selects on. `schema_version` was left as a plain integer, so
+    this document — the one a consumer written against envelope version 1
+    validates with — accepted an envelope from a later version whose extra
+    fields it does not describe.
+
+    SPEC §9.8 says what that field is for: it is the version of the envelope
+    alone, and it "moves when a consumer would have to change". A schema that
+    accepts any value there says "fine" about the one case the field exists to
+    refuse, which is this repository's oldest mistake in a new place — a reader
+    told "not readable" and answering "nothing wrong".
+
+    Pinned, a version bump is a validation error the consumer already has a
+    branch for, at the moment the envelope arrives, rather than a payload
+    silently read as something it is not. It also makes the bump a deliberate
+    act on this side: `output::SCHEMA_VERSION` moves, the checked-in schema
+    moves with it, and the drift test refuses to let one move without the other.

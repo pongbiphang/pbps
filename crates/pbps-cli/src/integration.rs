@@ -135,11 +135,24 @@ fn envelope_schema() -> serde_json::Value {
             }
             obj.remove("$schema");
             obj.remove("title");
-            // Pinned to the one value that selects this branch. Without the
-            // constant every branch would match every envelope and `oneOf`
+            // Two constants, for two different reasons.
+            //
+            // `command` is pinned to the one value that selects this branch.
+            // Without it every branch would match every envelope and `oneOf`
             // would reject all of them for matching more than one.
+            //
+            // `schema_version` is pinned because of what SPEC §9.8 says the
+            // field is: the version of the envelope alone, which "moves when a
+            // consumer would have to change". Left as a plain integer, this
+            // document accepted an envelope from a later version whose extra
+            // fields it does not know — the schema saying "fine" about exactly
+            // the case the field exists to refuse (DECISIONS 224).
             if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
                 props.insert("command".to_owned(), serde_json::json!({ "const": $name }));
+                props.insert(
+                    "schema_version".to_owned(),
+                    serde_json::json!({ "const": crate::output::SCHEMA_VERSION }),
+                );
             }
 
             let def = format!("envelope.{}", $name.replace(' ', "-"));

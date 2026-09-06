@@ -9825,6 +9825,41 @@ fn every_offline_envelope_matches_the_published_schema() {
     );
 }
 
+/// The published schema refuses an envelope from a version it does not describe.
+///
+/// SPEC §9.8 says `schema_version` is the version of the envelope alone and
+/// that it moves when a consumer would have to change. A schema that accepted
+/// any integer there said "fine" about precisely the case the field exists to
+/// refuse: a later envelope, with fields this document does not describe, read
+/// by a consumer written against this one. Pinned, the mismatch is a validation
+/// error the consumer already handles rather than a silent misreading.
+#[test]
+fn an_envelope_from_a_later_version_is_refused_by_this_schema() {
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    let d = Demo::new("envelope-version");
+    d.table("table: dbo.t\ncolumns:\n  id: { type: int, nullable: false }\nprimary_key: [id]\n");
+    d.commit();
+
+    let o = d.run(&["validate", "--format", "json"]);
+    let mut v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("JSON");
+    // The premise: as emitted, it validates.
+    validator
+        .validate(&v)
+        .expect("the envelope this build emits");
+
+    let now = v["schema_version"].as_u64().expect("a version");
+    v["schema_version"] = serde_json::json!(now + 1);
+    assert!(
+        validator.validate(&v).is_err(),
+        "a later envelope must not validate against this document: {v}"
+    );
+    // And not merely because the number changed: the same envelope with the
+    // version it was emitted with is accepted again, so the refusal is the
+    // version and nothing else.
+    v["schema_version"] = serde_json::json!(now);
+    validator.validate(&v).expect("unchanged again");
+}
+
 /// Every command name in the schema is one this binary can produce, and every
 /// command that emits an envelope is in the schema.
 ///

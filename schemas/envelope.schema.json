@@ -172,9 +172,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -281,9 +279,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -350,9 +346,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -548,9 +542,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -714,9 +706,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -831,9 +821,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -955,9 +943,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"
@@ -1182,9 +1168,7 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
+          "const": 1
         },
         "tool_version": {
           "type": "string"

@@ -1261,7 +1261,9 @@ environment rows) rather than replacing the envelope.
 `id` is stable and is the identifier a later `policies:` block raises or lowers
 the severity of (14.1), so it must survive a reworded message. `schema_version`
 is the version of the envelope alone; it moves when a consumer would have to
-change, which the tool version does not.
+change, which the tool version does not. The published schema pins it with a
+`const`, so an envelope from a version that document does not describe fails
+validation rather than being read as one it does (DECISIONS 224).
 
 `result` is `ok`, `findings` or **`unanswerable`** — the same three-way split as
 the exit codes below, and for the same reason. A pipe loses the producer's
