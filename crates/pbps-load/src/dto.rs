@@ -86,8 +86,9 @@ fn grants_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema
         .iter()
         .map(|p| p.as_str())
         .collect();
+    let padding = whitespace_class();
     let accepted = format!(
-        r"^\s*({})\s*$",
+        "^{padding}*({}){padding}*$",
         words
             .iter()
             .map(|w| spellings_of(w))
@@ -109,14 +110,41 @@ fn grants_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema
     })
 }
 
+/// The characters `str::trim` removes, as a regular-expression class.
+///
+/// Not `\s`. JSON Schema's patterns are ECMA-262, whose `\s` is neither a
+/// subset nor a superset of Rust's `char::is_whitespace`: it leaves out U+0085,
+/// which `trim` removes, and takes in U+FEFF, which `trim` leaves in place. A
+/// pattern written with `\s` would therefore refuse a padded declaration the
+/// loader accepts *and* accept one it refuses — both halves of "the schema is
+/// the loader" broken by the same two characters (DECISIONS 172, 213).
+///
+/// Scanned out of `char::is_whitespace` rather than listed, so the class is
+/// whatever `trim` does on the compiler that built this binary and cannot go
+/// stale against a later Unicode table.
+///
+/// The characters go in literally rather than as escapes, because the two
+/// readers of this pattern share no escape syntax: ECMA-262 spells U+1680
+/// `\u1680` and has no `\x{...}`, the `regex` family spells it `\x{1680}` and
+/// has no `\u`. A literal character is one both read, and JSON's own escaping
+/// keeps the ASCII control characters printable in the published file. None of
+/// the set is a regular-expression metacharacter, so none needs escaping
+/// inside the class.
+fn whitespace_class() -> String {
+    let mut class = String::from("[");
+    class.extend((char::MIN..=char::MAX).filter(|c| c.is_whitespace()));
+    class.push(']');
+    class
+}
+
 /// One permission word as a regular expression matching every spelling
 /// `Permission::from_str` folds into it.
 ///
 /// Written out per character rather than with a flag: JSON Schema's patterns
 /// are ECMA-262, which has no inline `(?i)`, and a schema that carried one
 /// would be a pattern every validator reads differently. `-` admits the two
-/// separators the fold also accepts, and the leading and trailing `\s*` of the
-/// caller stand for its `trim`.
+/// separators the fold also accepts, and the leading and trailing whitespace
+/// class the caller wraps this in stands for its `trim`.
 fn spellings_of(word: &str) -> String {
     word.chars()
         .map(|c| match c {
@@ -475,9 +503,43 @@ mod tests {
         }
     }
 
+    /// The class the pattern pads with holds exactly the characters `trim`
+    /// removes, and each of them literally.
+    ///
+    /// The exactness is the point in both directions: a character missing from
+    /// it makes the schema refuse a declaration the loader accepts, and one
+    /// too many makes it bless a declaration the loader refuses. This is where
+    /// `\s` would fail — it is short U+0085 and long U+FEFF — so the class is
+    /// compared against `char::is_whitespace` itself, which is the question
+    /// `trim` asks.
+    #[test]
+    fn the_padding_class_holds_exactly_the_characters_trim_removes() {
+        let class = super::whitespace_class();
+        let inside = class
+            .strip_prefix('[')
+            .and_then(|c| c.strip_suffix(']'))
+            .expect("the padding is a character class");
+        let expected: String = (char::MIN..=char::MAX)
+            .filter(|c| c.is_whitespace())
+            .collect();
+        assert_eq!(inside, expected);
+        assert!(
+            inside.contains('\u{85}'),
+            "U+0085, which ECMA-262 `\\s` omits"
+        );
+        assert!(
+            !inside.contains('\u{feff}'),
+            "U+FEFF, which ECMA-262 `\\s` takes and `trim` does not"
+        );
+        // A metacharacter would change what the class matches rather than being
+        // one of its members; none of the set is one today, and the class is
+        // written without escaping on that basis.
+        assert!(!inside.contains(['\\', ']', '^', '-']));
+    }
+
     /// The pattern is the loader's fold written out: a letter matches either
     /// case, a `-` matches the two separators the fold also reads, and the
-    /// caller's `\s*` stands for its `trim`.
+    /// caller's whitespace class stands for its `trim`.
     #[test]
     fn a_word_becomes_a_class_per_letter_and_the_separators_it_folds() {
         assert_eq!(super::spellings_of("usage"), "[Uu][Ss][Aa][Gg][Ee]");

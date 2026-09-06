@@ -3212,3 +3212,20 @@ SPEC is in sync with all of these.
     `Permission::ALL`, so neither can drift from the loader, and the tests
     assert each spelling against `Permission::from_str` as well as against the
     pattern — a pattern nothing runs is a claim, not a check.
+
+    The padding is not `\s` either, for the same reason at a smaller scale.
+    ECMA-262's `\s` is neither a subset nor a superset of Rust's
+    `char::is_whitespace`, which is what `trim` asks: it omits U+0085, which
+    `trim` removes, and includes U+FEFF, which `trim` leaves in place. Written
+    with `\s` the schema would have broken *both* halves of 172 at once —
+    refusing a padded declaration `validate` accepts, and blessing one it
+    refuses — two characters wide in each direction. The class is scanned out
+    of `char::is_whitespace` and written with literal characters, because the
+    two readers of this pattern share no escape syntax: ECMA-262 spells U+1680
+    `\u1680` and has no `\x{...}`, and the `regex` family the tests run it with
+    is the mirror image. A literal character is what both read.
+
+    `SCHEMA_VERSION` goes to 8, for the reason it exists: version 7 published a
+    closed list that refused `SELECT`, and this one accepts it. A consumer
+    keying on that number to cache or select an artifact could not otherwise
+    tell the two apart, which is the drift detection the field is for.

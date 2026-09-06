@@ -38,7 +38,7 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -56,6 +56,12 @@ pub const SCHEMA_VERSION: u32 = 7;
 //    were any string — and the list is the union of the engines' (ADR-0010
 //    §6, DECISIONS 210). An editor completes `usage` and stops accepting
 //    `contrl`.
+// 8: a grant's permission is every spelling `Permission::from_str` folds, not
+//    the canonical word alone. The closed list version 7 published refused
+//    `SELECT` and `view_definition`, which the loader accepts, so an editor
+//    notices in the way that matters: it stops flagging a valid file
+//    (DECISIONS 213). A consumer keying on this number could not otherwise
+//    tell the widened grammar from the version-7 enum.
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {
@@ -299,6 +305,47 @@ mod tests {
                 );
                 assert!(re.is_match(&spelling), "the schema takes `{spelling}`");
             }
+        }
+    }
+
+    /// The padding the schema allows is what `trim` removes.
+    ///
+    /// The trap this pins is `\s`: JSON Schema's patterns are ECMA-262, whose
+    /// `\s` leaves out U+0085 — which `trim` removes — and takes in U+FEFF,
+    /// which `trim` leaves in place. Writing the pattern with it would have
+    /// broken both halves of "the schema is the loader" (DECISIONS 172) at
+    /// once: refusing a padded declaration `pbps validate` accepts, and
+    /// blessing one it refuses. The padding characters are enumerated from
+    /// `char::is_whitespace`, which is what `trim` asks, so the set follows a
+    /// later Unicode table wherever `trim` goes; `dto.rs` pins the published
+    /// class against the same predicate, character for character.
+    #[test]
+    fn the_schema_pads_a_permission_with_what_trim_removes_and_nothing_else() {
+        use std::str::FromStr;
+        let re = accepted_spellings();
+        let refused = [
+            // The two ECMA-262 `\s` would have got wrong, and three more
+            // characters an editor's user could mistake for a space.
+            '\u{feff}', '\u{200b}', '\u{180e}', '\u{2060}', '-',
+        ];
+        for c in (char::MIN..=char::MAX)
+            .filter(|c| c.is_whitespace())
+            .chain(refused)
+        {
+            let padded = format!("{c}select{c}");
+            let loader = pbps_model::Permission::from_str(&padded).is_ok();
+            assert_eq!(
+                loader,
+                c.is_whitespace(),
+                "`trim` and `is_whitespace` disagree about U+{:04X}",
+                c as u32
+            );
+            assert_eq!(
+                re.is_match(&padded),
+                loader,
+                "the schema and the loader disagree about U+{:04X} as padding",
+                c as u32
+            );
         }
     }
 
