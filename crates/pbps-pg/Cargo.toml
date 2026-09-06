@@ -1,0 +1,22 @@
+[package]
+name = "pbps-pg"
+description = "PongBiphang Schema - the PostgreSQL dialect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbps-model.workspace = true
+pbps-dialect.workspace = true
+
+# The live suite connects, so it needs the seam — as a dev-dependency, because
+# nothing in this crate holds a connection yet. Introspection (Phase 5 step 3)
+# is what promotes it.
+[dev-dependencies]
+pbps-db.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
+
+[lints]
+workspace = true

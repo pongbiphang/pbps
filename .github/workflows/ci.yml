@@ -131,6 +131,47 @@ jobs:
       # test schedule.
       - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1
 
+  # The PostgreSQL half of SPEC 11.5, and at this phase a small one: the crate
+  # holds a connected boundary and two lexical rules, so those are what it
+  # measures (issue #75). It found something no other job could — the seam
+  # panicked on its first real connection because two rustls crypto providers
+  # were compiled in — which is the argument for having it before there is a
+  # dialect to test.
+  #
+  # Its own job rather than a step in `live`: that one already runs a SQL
+  # Server, and a second engine on the same runner is the pressure the startup
+  # crashes in docs/PITFALLS.md suggest is worth not adding.
+  live-pg:
+    needs: quick
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Pinned by digest, for the reason the SQL Server one is: PostgreSQL
+        # 18.6 (Debian 18.6-1.pgdg13+2). Bump deliberately, and run
+        # `scripts/live-tests-pg.sh` against the new digest before pushing it.
+        image: postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        env:
+          POSTGRES_PASSWORD: "Pbps!Ci12345"
+          POSTGRES_DB: pbps_test
+        ports:
+          - 54320:5432
+        # This image has a health check hook, so no wait loop stands in for one.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pbps_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Thirty seconds of this is one test waiting out `CONNECT_TIMEOUT` on
+      # purpose: a firewall that drops rather than refuses is a category of its
+      # own, and what proves the wait is bounded is waiting it out.
+      - run: cargo test -p pbps-pg --test live -- --ignored
+
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection
   # string. It shipped broken for exactly that reason — the cleanup guard
@@ -189,7 +230,7 @@ jobs:
   # `failure` could land after the run that superseded it reported success.
   gate:
     name: ci-gate
-    needs: [quick, windows, live, dev-rehearsal, msrv]
+    needs: [quick, windows, live, live-pg, dev-rehearsal, msrv]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:

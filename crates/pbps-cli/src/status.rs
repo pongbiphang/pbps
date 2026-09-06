@@ -159,6 +159,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
         };
         let mut row = rt.block_on(one(
             &connection,
+            db::driver_for(project.config.dialect),
             name,
             &checked_at,
             project.config.unmanaged,
@@ -202,11 +203,12 @@ async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
 
 async fn one(
     connection: &str,
+    driver: pbps_db::Driver,
     name: &str,
     checked_at: &str,
     unmanaged: pbps_config::Unmanaged,
 ) -> EnvStatus {
-    let mut conn = match Conn::connect(connection).await {
+    let mut conn = match Conn::connect(driver, connection).await {
         Ok(c) => c,
         Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
     };

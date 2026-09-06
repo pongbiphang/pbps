@@ -18,6 +18,7 @@ pbps-load.workspace = true
 pbps-diff.workspace = true
 pbps-dialect.workspace = true
 pbps-mssql.workspace = true
+pbps-pg.workspace = true
 pbps-db.workspace = true
 pbps-policy.workspace = true
 pbps-docs.workspace = true

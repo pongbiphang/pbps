@@ -592,7 +592,7 @@ fn run() -> anyhow::Result<()> {
                     )),
                 );
             }
-            (Some(db), None) => explain::Target::Reachable(db::target_from_connection(db)),
+            (Some(db), None) => explain::Target::Connection(db.clone()),
             (None, Some(_)) => explain::Target::from(
                 Project::discover(&start)
                     .map_err(anyhow::Error::from)
@@ -1320,6 +1320,13 @@ pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
 fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     match project.config.dialect {
         DialectName::Mssql => Ok(Box::new(pbps_mssql::Mssql)),
+        // The crate exists (`pbps-pg`) and the connection seam can reach a
+        // PostgreSQL server, but the parts a command needs — the type
+        // catalogue, introspection, the emitter — arrive in Phase 5 steps 2 to
+        // 4. Refused here, as one answer about the project, rather than let
+        // every table produce a finding of its own further down: what is
+        // missing is the tool's, and a finding named `dbo.t` says it is the
+        // declaration's.
         DialectName::Postgres => bail!(
             "the postgres dialect is not implemented yet (it is Phase 5; docs/STATUS.md names the \
              current phase); this project's pbps.yml selects it"

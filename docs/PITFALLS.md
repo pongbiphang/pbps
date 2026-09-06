@@ -407,11 +407,33 @@ It survived because **every `--dev` test passed a connection string**: the
 docker path had no automated coverage at all. Reading found it; running could
 not have.
 
+## One rule, spelled in three places
+
+The definition scanner asks "does the identifier before this character end
+here?" three times: before a `$` that might open a tag, before the `E` of an
+escape string, and inside the tag itself. A review round measured PostgreSQL's
+answer — the grammar is over **bytes**, `[A-Za-z\200-\377_0-9\$]`, so every
+non-ASCII character continues a name — and fixed the one helper the finding
+named. The other two kept asking Rust's `char::is_alphanumeric`, which says
+that `á` spelled `a` then U+0301 ends a name. The next review found both.
+
+Neither failed loudly. With `á$tag$` the scanner opened a literal where the
+engine had a name, closed it at the real literal's opener, and then collapsed
+the literal's body as code; with `áE'a\'` it armed the backslash rule over a
+plain string and ran past the quote that ends it. Both end the same way: two
+module definitions that differ compare equal, and a real change is never
+emitted. The repair is one predicate all three call.
+
+**When a measurement corrects a rule, give the rule one home — do not correct
+the caller the finding happened to name.** A rule that lives in three places is
+three chances to be measured once and fixed once.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run
 `scripts/live-tests.sh` when touching the emitter, the catalog queries, the
-ledger or the permission checks.
+ledger or the permission checks, and `scripts/live-tests-pg.sh` when touching
+the PostgreSQL crate, the connection seam or anything it depends on.
 
 - Foreign-key ordering between two newly created tables.
 - `EXEC()` rejecting function calls in its argument.
@@ -440,6 +462,37 @@ after applying it. **When a design document says "the same code path runs on
 the shipped engine, unmeasured", that sentence is a test that has not been
 written yet** — run it before the design lands, because the fix for the future
 engine is the fix for the present one.
+
+**A dependency's default features can panic a seam that compiles, lints and
+audits clean.** `pbps-db` asked for `rustls` with `ring` while `tiberius-ng`
+resolves the same `rustls` with its own default provider, so **both** were
+compiled in. rustls then cannot determine a process-level provider and
+**panics** — not errs — inside `ClientConfig::builder()`, which runs inside a
+connection, where nothing can report it. `cargo build`, `cargo clippy` and
+`cargo deny` were all green; the first PostgreSQL live test to open a real
+connection was what said so, and it said so before there was a PostgreSQL
+dialect to test (DECISIONS 228). Two rules come out of it: **name the provider,
+never take the process default**, and **a new TLS or crypto dependency is a
+live-suite change**, because nothing offline can tell you which providers your
+dependency tree ended up with.
+
+## A comment that describes a check the code does not make
+
+Two in one review round, in code written the same week:
+
+- `pbps-db::postgres::endpoint` fell back to `localhost` for a connection
+  string it could not read, under a comment saying the connection would then
+  "fail to connect saying so, instead of silently reaching a different host".
+  It did the second thing: a machine configured with a Unix socket is the
+  machine with a server on `localhost:5432`.
+- `pbps-pg`'s `quote_ident` carried "the engine's own limit is bytes, not
+  characters" and enforced no limit at all, while the SQL Server counterpart it
+  was written from enforces one.
+
+A comment stating a rule reads, to the next person and to the reviewer skimming
+for one, as a rule that is applied. **When a comment names a limit or a
+guarantee, the line that enforces it should be the next one** — and when it
+cannot be, the comment has to say that the check is somewhere else and where.
 
 ## A round trip tested only on the simple case
 
@@ -589,6 +642,14 @@ the suite may run as root **and** runs on Windows.
 - An opt-in test must **skip** when its variable is unset, not panic. Copying
   the `panic!` used for `PBPS_TEST_DB` — which CI always sets — turned "this
   test is not enabled here" into a red job.
+- **A `cfg`-gated test takes its imports and helpers with it.** A test that is
+  Linux-only because it depends on Linux's behaviour is right to be absent
+  elsewhere, but the `use` it needs is not: `-D warnings` turns an import
+  nothing uses into an **error on the other platform only**, which the
+  developer's own machine cannot see. Gate the import with the same `cfg`, and
+  check it by flipping the gate to a platform that is not this one
+  (`target_os = "windows"` here) and building the workspace — the compiler then
+  removes exactly what the other platform removes.
 - **A check run being green on the head commit does not mean the pull request
   can see it.** A check run reaches a PR through the *check suite* that holds
   it, and GitHub associates a suite with the PR only when the run's event is

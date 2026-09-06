@@ -67,7 +67,9 @@ pinned by digest there and in CI), or set
 `PBPS_TEST_DB` and `cargo test -p pbps-mssql --test live -- --ignored`. The
 script also runs `pbps-cli`'s ignored tests, which include the `plan --dev`
 rehearsal. They are `#[ignore]`d so the ordinary suite stays offline; CI has a
-dedicated job. When touching the emitter, the catalog queries or the ledger, run
+dedicated job. PostgreSQL has its own suite and its own job:
+`scripts/live-tests-pg.sh`, or set `PBPS_TEST_PG_DB` and
+`cargo test -p pbps-pg --test live -- --ignored`. When touching the emitter, the catalog queries or the ledger, run
 them — they have caught four bugs the unit suite structurally could not: FK
 ordering between two new tables; `EXEC()` rejecting function calls in its
 argument; `sql_expression_dependencies` returning one row per referenced
@@ -192,8 +194,21 @@ permission widening of ADR-0010 §6 (DECISIONS 210–211): `Permission` is the
 union of the engines' words, SQL Server refuses the five it lacks from one
 table in `validate`, `emit` and the read-back, role existence is a dialect
 capability SQL Server answers `true` to, and the editor schema lists the words
-(schema version 7). With that, the three model-format steps of Phase 5 are in;
-what remains is the PostgreSQL crate itself.
+(schema version 7). With that, the three model-format steps of Phase 5 are in.
+
+The crate itself has started: step 1 of ten (issue #75) makes the **connected**
+boundary polymorphic — `pbps_db::Conn` is an enum over `tiberius` and
+`tokio_postgres`, one module per driver, and the 22 `pbps-mssql` functions that
+take `&mut Conn` are untouched (DECISIONS 225). `pbps-pg` exists, holds no
+driver, and refuses by name for every part not yet built. Two long-standing
+seam defects landed with it: `normalize_definition` now takes each engine's own
+lexis instead of inheriting SQL Server's scanner (DECISIONS 226), and
+`normalize_type` has a stated contract under which `serial` is refused rather
+than normalized (DECISIONS 227). A PostgreSQL live suite runs against a
+digest-pinned server, and found on its first connection that the seam panicked
+where two rustls providers were compiled in (DECISIONS 228). What remains is
+steps 2 to 10: the type catalogue, introspection, the emitter, modules, roles,
+reference data, the ledger, probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

@@ -24,6 +24,13 @@ pub struct Target {
     /// environments (SPEC 9.2), so it can only be offered to a caller who named
     /// one (DECISIONS 196).
     environment: Option<String>,
+    /// Which driver speaks to it.
+    ///
+    /// Carried on the target rather than looked up at each `connect`, because
+    /// a target *is* "this database, reached this way", and the two answers
+    /// have to come from the same `pbps.yml`. Resolved once in [`target`],
+    /// where the project is already in hand.
+    driver: pbps_db::Driver,
 }
 
 impl Target {
@@ -31,9 +38,26 @@ impl Target {
         &self.connection
     }
 
+    pub fn driver(&self) -> pbps_db::Driver {
+        self.driver
+    }
+
     /// `Some` only when this target is an environment `pbps.yml` configures.
     pub fn environment(&self) -> Option<&str> {
         self.environment.as_deref()
+    }
+}
+
+/// Which driver a dialect is spoken over.
+///
+/// The one place the two vocabularies meet. `pbps-db` holds no SQL and does not
+/// read `pbps.yml`, so it names the drivers it can speak and this match says
+/// which belongs to which dialect — exhaustively, so a third engine cannot be
+/// added to `DialectName` without an answer here.
+pub const fn driver_for(dialect: DialectName) -> pbps_db::Driver {
+    match dialect {
+        DialectName::Mssql => pbps_db::Driver::Mssql,
+        DialectName::Postgres => pbps_db::Driver::Postgres,
     }
 }
 
@@ -50,11 +74,13 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
             label: redact(conn),
             connection: conn.to_owned(),
             environment: None,
+            driver: driver_for(project.config.dialect),
         }),
         (None, Some(name)) => Ok(Target {
             label: name.to_owned(),
             connection: project.connection_string(name)?,
             environment: Some(name.to_owned()),
+            driver: driver_for(project.config.dialect),
         }),
         (None, None) => bail!(
             "this command needs a database: pass --db {} or --env {}",
@@ -70,13 +96,17 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
 /// checkout, so it cannot go through [`target`], which needs a `Project` to
 /// resolve an `--env` name. There is nothing to resolve here — a connection
 /// string is already the answer.
-pub fn target_from_connection(connection: &str) -> Target {
+pub fn target_from_connection(connection: &str, driver: pbps_db::Driver) -> Target {
     Target {
         label: redact(connection),
         connection: connection.to_owned(),
         // A connection string names no environment, and there may be no
         // `pbps.yml` here at all.
         environment: None,
+        // Which is why the driver is passed in: with no project to read, the
+        // only thing that knows which engine this plan was computed for is the
+        // plan, and `explain` resolves it from there before building a target.
+        driver,
     }
 }
 
@@ -117,7 +147,7 @@ pub fn redact(connection: &str) -> String {
 /// deliberately not added here, because the callers that want it in a *finding*
 /// (`verify`, `doctor`) compose it themselves with the redacted form.
 pub async fn connect(target: &Target) -> anyhow::Result<pbps_db::Conn> {
-    pbps_db::Conn::connect(target.connection())
+    pbps_db::Conn::connect(target.driver(), target.connection())
         .await
         .context("cannot connect to the database")
 }

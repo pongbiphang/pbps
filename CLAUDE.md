@@ -39,7 +39,8 @@ checksum-pinned, and state lives in the database itself.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
 - Before every push, run locally what CI runs: `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets` warning-free, `cargo test --workspace
-  --all-targets`, and `scripts/live-tests.sh`. All green, then push.
+  --all-targets`, `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`. All
+  green, then push.
 - Push the issue branch without asking. Never push to `master` or to another
   issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is

@@ -266,5 +266,16 @@ than its last.
 Phase 5, with the first PostgreSQL commits. None of the three is large; all
 three are the kind of thing that becomes expensive once a second dialect has
 been written against the wrong version. Amendment 1 and the nesting half of
-Amendment 2 have since landed ahead of the crate, in the seam-preparation PR
-(DECISIONS 193–195); the rest waits for the engine that needs it.
+Amendment 2 landed ahead of the crate, in the seam-preparation PR
+(DECISIONS 193–195). **The rest landed with Phase 5 step 1** (issue #75): the
+shared scanner takes each engine's lexis (DECISIONS 226) and `normalize_type`'s
+contract is on the trait with `serial` refused under it (DECISIONS 227). Both
+are measured against PostgreSQL 18.6 by the live suite in `pbps-pg`, so the
+scanner's answers and the engine's are asserted together — a normalizer that is
+self-consistent and wrong about the engine is the failure this page records.
+
+One thing this page decided is implemented a step to the side of its wording,
+and DECISIONS 226 says why: `normalize_definition` keeps a default, but a
+required `Dialect::lexicon` is what feeds it. The trap named here — a dialect
+silently inheriting another engine's answer — is closed by the requirement, and
+a default with no engine in it is not the overriding this page ruled out.

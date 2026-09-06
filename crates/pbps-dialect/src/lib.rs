@@ -65,6 +65,18 @@ pub enum DialectError {
     #[error("the identifier `{0}` cannot be written into SQL safely")]
     UnquotableIdent(String),
 
+    /// A part of a dialect this build has not implemented **yet**.
+    ///
+    /// Distinct from [`DialectError::Unsupported`], and the distinction is the
+    /// whole reason it exists: "this database has no such feature" and "pbps
+    /// cannot do this here yet" send a reader to two different places, and a
+    /// dialect arriving one step at a time (Phase 5) would otherwise have to
+    /// tell the first lie to report the second. Returning an empty answer
+    /// instead is the one thing neither may do — a plan that applies cleanly
+    /// and changes nothing is the silent wrong answer.
+    #[error("the {dialect} dialect does not implement {part} yet")]
+    NotBuilt { dialect: &'static str, part: String },
+
     /// A declaration that parses but that this dialect will not accept — a
     /// primary key over a column that does not exist, an IDENTITY on a type that
     /// cannot carry one. Distinct from [`DialectError::Unsupported`], which says
@@ -250,49 +262,57 @@ impl Probe {
     }
 }
 
-/// Dialect knowledge that needs no database connection.
-pub trait Dialect {
-    fn name(&self) -> &'static str;
-
-    /// Expands aliases and fills in omitted default arguments, so that two
-    /// semantically identical spellings become the same value.
+/// What the shared definition scanner has to know about one engine's lexis.
+///
+/// Not a table of delimiters. Two of the three failures ADR-0011 Amendment 2
+/// measured were **termination rules** — where a region ends, not where it
+/// begins — and a table of delimiters alone would have fixed only the third
+/// (DECISIONS 226).
+///
+/// What is *not* a field here is as deliberate as what is. A `'…'` string
+/// closed by a doubled quote, `--` running to the end of its line, and
+/// `/*…*/` that **nests** are shared because both engines were measured and
+/// both answered the same — `SELECT /* a /* b */ c */ 1` returns `1` on either.
+/// A field no implementation varies is a field nobody maintains, and the
+/// abstraction worth having is the one two implementations draw (ADR-0014).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lexicon {
+    /// Every opener of a quoted identifier, with the character that closes it.
     ///
-    /// This step is a precondition for diff being correct: unless `INTEGER` and
-    /// `int` converge on one value first, every run reports a type change.
-    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError>;
+    /// This is where the two engines part company over a character they both
+    /// use: `[` is SQL Server's identifier quote and PostgreSQL's array
+    /// subscript. Read as a quote where it is a subscript, a reindent inside
+    /// `a[1 + 2]` reads as a changed module; read as code where it is a quote,
+    /// the spacing in `[a  b]` — which is part of a name — is folded away.
+    pub quoted_identifiers: &'static [(char, char)],
 
-    /// Judges how safe a type change is. The caller is responsible for calling
-    /// [`normalize_type`](Dialect::normalize_type) first.
-    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
+    /// Whether `E'…'` is an escape string, in which a backslash escapes the
+    /// character after it, so `\'` does **not** close the literal.
+    ///
+    /// Specific to `E'…'` because `standard_conforming_strings` is `on` by
+    /// default: in a plain literal the backslash is literal and the quote that
+    /// follows it does close the string.
+    pub escape_strings: bool,
 
-    /// The canonical form of an unquoted identifier in this dialect.
-    ///
-    /// PostgreSQL folds to lowercase; SQL Server keeps it as written. Name
-    /// comparison must go through this, or names read back by introspection will
-    /// not line up with the declarations and drift detection will cry wolf daily.
-    fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str>;
+    /// Whether `$tag$…$tag$` is a string literal — closed only by its own tag,
+    /// with no escape sequences inside it at all.
+    pub dollar_quoted_strings: bool,
+}
 
-    /// Quotes an identifier for embedding in SQL.
-    fn quote_ident(&self, ident: &str) -> Result<String, DialectError>;
+impl Lexicon {
+    /// Standard SQL and nothing past it: `"` quotes an identifier and `'`
+    /// quotes a string. The honest description for a dialect that is not any
+    /// real database.
+    pub const ANSI: Self = Self {
+        quoted_identifiers: &[('"', '"')],
+        escape_strings: false,
+        dollar_quoted_strings: false,
+    };
 
-    /// The comparison form of a module definition (ADR-0002).
-    ///
-    /// # Why this is normalization and not parsing
-    ///
-    /// SPEC §8.2's rule stands: the database is the normalizer, and after an
-    /// apply the stored text is read back so that both sides of the drift check
-    /// live in the engine's own space. This is the *other* comparison — the
-    /// declaration against the baseline — where the two texts were written by
-    /// different hands and only whitespace and line endings may separate them.
-    /// Anything still different after this is re-emitted as `CREATE OR ALTER`,
-    /// which is idempotent and lossless: the cost of a false positive is
-    /// restating one definition.
-    ///
-    /// Case is deliberately **kept**. Two definitions differing only in the case
-    /// of a keyword are still two different texts to the engine's stored form,
-    /// and folding case here would also fold it inside string literals, where
-    /// it means something.
-    fn normalize_definition(&self, definition: &str) -> String {
+    /// The comparison form of a module definition, for the dialect this
+    /// describes. See [`Dialect::normalize_definition`], which is this with the
+    /// engine's own lexis already supplied.
+    pub fn normalize_definition(&self, definition: &str) -> String {
         // What the scanner is in the middle of. Layout is only layout in
         // `Code`: inside a literal or a quoted identifier the spacing is data,
         // and after `--` the *line ending* is what stops the comment, so
@@ -300,7 +320,29 @@ pub trait Dialect {
         // two bodies that run differently compare equal.
         enum At {
             Code,
-            Quoted(char),
+            /// A quoted identifier, or a plain `'…'` string. A doubled closer
+            /// needs no special case: the first one closes the region and the
+            /// second opens it again, and everything between them is copied
+            /// either way.
+            Quoted {
+                close: char,
+            },
+            /// An `E'…'` string, in which a backslash escapes the character
+            /// after it. The doubled quote *does* need a special case here:
+            /// leaving and re-entering through `Code` would come back as a
+            /// plain `Quoted`, and a backslash in the second half would then
+            /// close the literal early.
+            Escape {
+                after_backslash: bool,
+            },
+            /// A `$tag$…$tag$` string. `open` and `len` locate the opening tag
+            /// in the input, and `pushed` counts the bytes written since it, so
+            /// that the opener cannot close the region it opened.
+            Dollar {
+                open: usize,
+                len: usize,
+                pushed: usize,
+            },
             Line,
             /// Block comments nest, in T-SQL and in PostgreSQL alike —
             /// measured, `SELECT /* a /* b */ c */ 1` returns 1 on both —
@@ -316,19 +358,60 @@ pub trait Dialect {
         let mut out = String::with_capacity(definition.len());
         let mut in_space = false;
         let mut at = At::Code;
+        // The one thing a `char_indices` loop cannot do is consume more than
+        // one character: an opening `$tag$` and a doubled quote both do.
+        let mut consumed_to = 0usize;
         let text = definition.trim();
         let bytes = text.as_bytes();
 
         for (i, ch) in text.char_indices() {
+            if i < consumed_to {
+                continue;
+            }
             match at {
-                At::Quoted(q) => {
-                    // A doubled `''` needs no special case: the first closes the
-                    // literal and the second opens it again, and everything
-                    // between them is copied either way.
-                    if if q == '[' { ch == ']' } else { ch == q } {
+                At::Quoted { close } => {
+                    if ch == close {
                         at = At::Code;
                     }
                     out.push(ch);
+                }
+                At::Escape { after_backslash } => {
+                    out.push(ch);
+                    at = if after_backslash {
+                        // Whatever it was, the backslash has already spoken for
+                        // it — including a `\\`, whose second half must not
+                        // escape the quote that may follow it.
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    } else if ch == '\\' {
+                        At::Escape {
+                            after_backslash: true,
+                        }
+                    } else if ch == '\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            out.push('\'');
+                            consumed_to = i + 2;
+                            At::Escape {
+                                after_backslash: false,
+                            }
+                        } else {
+                            At::Code
+                        }
+                    } else {
+                        At::Escape {
+                            after_backslash: false,
+                        }
+                    };
+                }
+                At::Dollar { open, len, pushed } => {
+                    out.push(ch);
+                    let pushed = pushed + ch.len_utf8();
+                    at = if pushed >= len && out.ends_with(&text[open..open + len]) {
+                        At::Code
+                    } else {
+                        At::Dollar { open, len, pushed }
+                    };
                 }
                 At::Line => {
                     if ch == '\n' {
@@ -399,18 +482,190 @@ pub trait Dialect {
                         out.push(' ');
                     }
                     in_space = false;
+                    // A `$` opens a literal only when it opens a *tag*. On an
+                    // engine without dollar quoting, and on one where the run
+                    // of characters after the `$` is not a tag, it is ordinary
+                    // code — which is what keeps SQL Server's `$` identifiers
+                    // and money literals reading as code here.
+                    if self.dollar_quoted_strings
+                        && ch == '$'
+                        && !continues_identifier(text, i)
+                        && let Some(len) = dollar_tag(&text[i..])
+                    {
+                        out.push_str(&text[i..i + len]);
+                        consumed_to = i + len;
+                        at = At::Dollar {
+                            open: i,
+                            len,
+                            pushed: 0,
+                        };
+                        continue;
+                    }
                     let next = bytes.get(i + ch.len_utf8()).copied();
-                    at = match (ch, next) {
-                        ('-', Some(b'-')) => At::Line,
-                        ('/', Some(b'*')) => At::Block { depth: 1, seen: 0 },
-                        ('\'' | '"' | '[', _) => At::Quoted(ch),
-                        _ => At::Code,
+                    at = if ch == '-' && next == Some(b'-') {
+                        At::Line
+                    } else if ch == '/' && next == Some(b'*') {
+                        At::Block { depth: 1, seen: 0 }
+                    } else if ch == '\'' {
+                        if self.escape_strings && opens_escape_string(text, i) {
+                            At::Escape {
+                                after_backslash: false,
+                            }
+                        } else {
+                            At::Quoted { close: '\'' }
+                        }
+                    } else if let Some(&(_, close)) = self
+                        .quoted_identifiers
+                        .iter()
+                        .find(|&&(open, _)| open == ch)
+                    {
+                        At::Quoted { close }
+                    } else {
+                        At::Code
                     };
                     out.push(ch);
                 }
             }
         }
         out
+    }
+}
+
+/// The length in bytes of the `$tag$` that `s` opens with, if it opens with one.
+///
+/// The tag follows the rules of an unquoted identifier and may not contain a
+/// `$`, so `$1.00` and a SQL Server identifier like `total$` are not tags —
+/// which is why this is a question and not an assumption.
+fn dollar_tag(s: &str) -> Option<usize> {
+    for (j, c) in s[1..].char_indices() {
+        if c == '$' {
+            return Some(j + 2);
+        }
+        // The tag follows the identifier grammar, minus the `$` that ends it
+        // and minus a digit in first place: `dolq_start [A-Za-z\200-\377_]`,
+        // `dolq_cont` the same plus the digits.
+        if !continues_ident(c) || (j == 0 && c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether `c` is a character PostgreSQL counts as part of an unquoted
+/// identifier once one has started.
+///
+/// The engine's grammar is over **bytes**, not Unicode classes (DECISIONS 233):
+/// `ident_cont [A-Za-z\200-\377_0-9\$]`. Every byte of a non-ASCII character is
+/// ≥ 0x80, so "not ASCII" is the whole of that half. `char::is_alphanumeric` is
+/// a different set and a smaller one, and the difference is not exotic: `á`
+/// spelled `a` then U+0301 continues an identifier for the engine and ends one
+/// for Rust. Measured on 18.6 — `á$tag$` is one name, and `áE'a\'` is that name
+/// applied to the two-character string `a\`, not an escape string.
+///
+/// The rule is PostgreSQL's, and both callers are behind a PostgreSQL-only
+/// flag: SQL Server has neither dollar quoting nor escape strings, so its scan
+/// never asks the question.
+fn continues_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
+}
+
+/// Whether the character at `at` continues an identifier instead of starting a
+/// token of its own.
+///
+/// `$` is a legal identifier character in both engines, so `a$b$c` is one name
+/// and not a name followed by a dollar-quoted string. Without this the `$b$` in
+/// the middle would open a literal that the rest of the definition never
+/// closes.
+fn continues_identifier(text: &str, at: usize) -> bool {
+    text[..at].chars().next_back().is_some_and(continues_ident)
+}
+
+/// Whether the quote at `at` is the one in an `E'…'`.
+///
+/// The `E` has to be a token of its own: `note'x'` is an identifier followed by
+/// a plain string, and reading its final `e` as the escape prefix would arm the
+/// backslash rule over a literal that has no such rule.
+fn opens_escape_string(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    let mut chars = before.chars().rev();
+    match chars.next() {
+        Some('e' | 'E') => !chars.next().is_some_and(continues_ident),
+        Some(_) | None => false,
+    }
+}
+
+/// Dialect knowledge that needs no database connection.
+pub trait Dialect {
+    fn name(&self) -> &'static str;
+
+    /// Expands aliases and fills in omitted default arguments, so that two
+    /// semantically identical spellings become the same value.
+    ///
+    /// This step is a precondition for diff being correct: unless `INTEGER` and
+    /// `int` converge on one value first, every run reports a type change.
+    ///
+    /// # The contract (ADR-0011 Amendment 3)
+    ///
+    /// Normalization is **idempotent**, and its output is **what introspection
+    /// reads back for a column declared that way**. A spelling for which that is
+    /// impossible is an error, not something to normalize.
+    ///
+    /// The second half is the one that had to be written down. PostgreSQL's
+    /// `serial` is the proof: it is a macro, not a type — the column is created
+    /// as `integer` with an owned sequence, and `integer` is what comes back.
+    /// Normalized to anything at all it produces a schema that differs from
+    /// itself on every single run, which is the permanent phantom change. The
+    /// contract makes that a refusal instead, and the refusal names what to
+    /// declare in its place (DECISIONS 227).
+    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError>;
+
+    /// Judges how safe a type change is. The caller is responsible for calling
+    /// [`normalize_type`](Dialect::normalize_type) first.
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
+
+    /// The canonical form of an unquoted identifier in this dialect.
+    ///
+    /// PostgreSQL folds to lowercase; SQL Server keeps it as written. Name
+    /// comparison must go through this, or names read back by introspection will
+    /// not line up with the declarations and drift detection will cry wolf daily.
+    fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str>;
+
+    /// Quotes an identifier for embedding in SQL.
+    fn quote_ident(&self, ident: &str) -> Result<String, DialectError>;
+
+    /// This engine's lexis, for the definition scanner (ADR-0011 Amendment 2).
+    ///
+    /// Required, and deliberately so. [`normalize_definition`] used to carry a
+    /// default that was really one engine's scanner wearing a neutral name: it
+    /// opened a quoted region on `[`, which is SQL Server's identifier quote
+    /// and PostgreSQL's array subscript, and it knew neither `E'…'` nor
+    /// `$tag$…$tag$`. Two of the three failures that caused were **silent** —
+    /// two definitions returning different strings compared equal, so the
+    /// change was never planned at all. A dialect can no longer get
+    /// normalization without saying what its literals are.
+    ///
+    /// [`normalize_definition`]: Dialect::normalize_definition
+    fn lexicon(&self) -> Lexicon;
+
+    /// The comparison form of a module definition (ADR-0002).
+    ///
+    /// # Why this is normalization and not parsing
+    ///
+    /// SPEC §8.2's rule stands: the database is the normalizer, and after an
+    /// apply the stored text is read back so that both sides of the drift check
+    /// live in the engine's own space. This is the *other* comparison — the
+    /// declaration against the baseline — where the two texts were written by
+    /// different hands and only whitespace and line endings may separate them.
+    /// Anything still different after this is re-emitted as `CREATE OR ALTER`,
+    /// which is idempotent and lossless: the cost of a false positive is
+    /// restating one definition.
+    ///
+    /// Case is deliberately **kept**. Two definitions differing only in the case
+    /// of a keyword are still two different texts to the engine's stored form,
+    /// and folding case here would also fold it inside string literals, where
+    /// it means something.
+    fn normalize_definition(&self, definition: &str) -> String {
+        self.lexicon().normalize_definition(definition)
     }
 
     /// Checks whether this dialect supports the features the module uses.
@@ -788,10 +1043,6 @@ mod tests {
             d.normalize_definition("SELECT 'a  b'"),
             d.normalize_definition("SELECT 'a b'")
         );
-        assert_ne!(
-            d.normalize_definition("SELECT [a  b] FROM t"),
-            d.normalize_definition("SELECT [a b] FROM t")
-        );
         // Layout around the literal is still layout.
         assert_eq!(
             d.normalize_definition("SELECT   'a  b'\n  FROM t"),
@@ -802,6 +1053,185 @@ mod tests {
         assert_ne!(
             d.normalize_definition("SELECT 'it''s  here'"),
             d.normalize_definition("SELECT 'it''s here'")
+        );
+    }
+
+    /// SQL Server's lexis, as `pbps-mssql` states it. Kept here so the scanner
+    /// can be exercised against both shapes; each crate pins its own answers.
+    const T_SQL: Lexicon = Lexicon {
+        quoted_identifiers: &[('[', ']'), ('"', '"')],
+        escape_strings: false,
+        dollar_quoted_strings: false,
+    };
+
+    /// PostgreSQL's, as `pbps-pg` states it.
+    const PG: Lexicon = Lexicon {
+        quoted_identifiers: &[('"', '"')],
+        escape_strings: true,
+        dollar_quoted_strings: true,
+    };
+
+    /// The row of ADR-0011 Amendment 2's table that points the other way from
+    /// the rest: one character, opposite meanings, and a shared default could
+    /// only have been wrong for one of the two engines.
+    #[test]
+    fn a_bracket_is_a_quote_on_one_engine_and_a_subscript_on_the_other() {
+        // A name is not layout.
+        assert_ne!(
+            T_SQL.normalize_definition("SELECT [a  b] FROM t"),
+            T_SQL.normalize_definition("SELECT [a b] FROM t")
+        );
+        // A subscript is code, and a reindent inside one is not a change.
+        assert_eq!(
+            PG.normalize_definition("SELECT a[1  +  2] FROM t"),
+            PG.normalize_definition("SELECT a[1 + 2] FROM t")
+        );
+    }
+
+    /// A dollar-quoted string has no escapes at all, so nothing inside it can
+    /// end it early and nothing inside it is layout. Read as code — which is
+    /// what a scanner that does not know the syntax does — two bodies that
+    /// return different strings compare equal and the change is never planned.
+    #[test]
+    fn spacing_inside_a_dollar_quoted_string_is_data() {
+        assert_ne!(
+            PG.normalize_definition("SELECT $tag$a  b$tag$"),
+            PG.normalize_definition("SELECT $tag$a b$tag$")
+        );
+        // The tagless spelling, and a nested `$` that is not the closing tag.
+        assert_ne!(
+            PG.normalize_definition("SELECT $$a  b$$"),
+            PG.normalize_definition("SELECT $$a b$$")
+        );
+        assert_eq!(
+            PG.normalize_definition("SELECT $a$x  $b$  y$a$"),
+            "SELECT $a$x  $b$  y$a$"
+        );
+        // The tag grammar is the engine's, which is over bytes: any character
+        // outside ASCII is a tag character, including one `char::is_alphanumeric`
+        // refuses. Measured on 18.6, `$á$` with a combining acute — `a` then
+        // U+0301 — is a literal, and reading it as code folded the spacing
+        // inside it away, which is the silent failure again.
+        assert_ne!(
+            PG.normalize_definition("SELECT $a\u{301}$x  y$a\u{301}$"),
+            PG.normalize_definition("SELECT $a\u{301}$x y$a\u{301}$")
+        );
+        // The same grammar decides where the *preceding* identifier ends, and
+        // a name it continues swallows the `$` that would have opened a tag.
+        // Measured on 18.6, `á$tag$` is one identifier — so here the first
+        // `$tag$` is part of a name and the second opens the literal, which is
+        // where the two spellings differ.
+        assert_ne!(
+            PG.normalize_definition("SELECT a\u{301}$tag$ + $tag$x  y$tag$"),
+            PG.normalize_definition("SELECT a\u{301}$tag$ + $tag$x y$tag$")
+        );
+        // Layout *around* one is still layout.
+        assert_eq!(
+            PG.normalize_definition("SELECT   $tag$a  b$tag$\n  FROM t"),
+            "SELECT $tag$a  b$tag$ FROM t"
+        );
+    }
+
+    /// A `$` is only a literal when it opens a tag. The tag follows the rules
+    /// of an unquoted identifier, so a money literal and an identifier with a
+    /// `$` in it are code — on the engine that has dollar quoting as much as on
+    /// the one that has not.
+    #[test]
+    fn a_dollar_that_opens_no_tag_is_code() {
+        for l in [PG, T_SQL] {
+            assert_eq!(
+                l.normalize_definition("SELECT   $1.00  + x"),
+                "SELECT $1.00 + x"
+            );
+            assert_eq!(
+                l.normalize_definition("SELECT total$   FROM t"),
+                "SELECT total$ FROM t"
+            );
+            // Unterminated: it never becomes a tag, so the rest stays code.
+            assert_eq!(l.normalize_definition("SELECT $tag  x"), "SELECT $tag x");
+            // Two of them, with something between that is no tag.
+            assert_eq!(
+                l.normalize_definition("SELECT $1.00  +  $2.00"),
+                "SELECT $1.00 + $2.00"
+            );
+            assert_eq!(
+                l.normalize_definition("SELECT price$  ,  qty$  FROM t"),
+                "SELECT price$ , qty$ FROM t"
+            );
+            // `$` inside a name is part of the name, not an opener: measured,
+            // PostgreSQL lexes `a$b$c` as one identifier.
+            assert_eq!(
+                l.normalize_definition("SELECT a$b$c  ,  d  FROM t"),
+                "SELECT a$b$c , d FROM t"
+            );
+            // A tag may not start with a digit, on either engine.
+            assert_eq!(
+                l.normalize_definition("SELECT $1x$a  b$1x$"),
+                "SELECT $1x$a b$1x$"
+            );
+        }
+    }
+
+    /// `\'` does not close an `E'…'` string, so the spacing after it is still
+    /// inside the literal. Measured against the engine (ADR-0011 Amendment 2):
+    /// `E'it\'s  here'` is one ten-character string.
+    #[test]
+    fn a_backslash_escaped_quote_does_not_close_an_escape_string() {
+        assert_ne!(
+            PG.normalize_definition(r"SELECT E'it\'s  here'"),
+            PG.normalize_definition(r"SELECT E'it\'s here'")
+        );
+        // `\\` is a literal backslash, so the quote after it *does* close.
+        assert_eq!(
+            PG.normalize_definition(r"SELECT E'a\\'   ,   'b  c'"),
+            r"SELECT E'a\\' , 'b  c'"
+        );
+        // A doubled quote inside one stays inside it: leaving and re-entering
+        // as a plain literal would disarm the backslash for the second half.
+        assert_ne!(
+            PG.normalize_definition(r"SELECT E'a''b\'c  d'"),
+            PG.normalize_definition(r"SELECT E'a''b\'c d'")
+        );
+    }
+
+    /// The `E` has to be a token of its own. `note'x'` is an identifier and a
+    /// plain string, where a backslash is an ordinary character — arming the
+    /// escape rule there would run the literal past the quote that ends it.
+    #[test]
+    fn an_identifier_ending_in_e_does_not_arm_the_escape_rule() {
+        assert_eq!(
+            PG.normalize_definition(r"SELECT note'a\'   ,   x  y"),
+            r"SELECT note'a\' , x y"
+        );
+        // Nor does an `E` that is not touching the quote.
+        assert_eq!(
+            PG.normalize_definition(r"SELECT E   'a\'   ,   x  y"),
+            r"SELECT E 'a\' , x y"
+        );
+        // "Is this `E` a token of its own" is the same question about where
+        // the identifier before it ends, so it is the same grammar. Measured
+        // on 18.6: with `á` spelled `a` then U+0301, `áE'a\'` is the name `áe`
+        // applied to the plain two-character string `a\` — the `E` stays in
+        // the name, and arming the escape rule here ran the literal past its
+        // closer and folded the spacing of the next one away.
+        assert_eq!(
+            PG.normalize_definition("SELECT a\u{301}E'a\\'   ,   'p  q'"),
+            "SELECT a\u{301}E'a\\' , 'p  q'"
+        );
+    }
+
+    /// The engine that has neither extension must scan exactly as it did
+    /// before they existed: `E` is an alias, `$` is a character in a name, and
+    /// a backslash escapes nothing.
+    #[test]
+    fn an_engine_without_the_extensions_reads_them_as_ordinary_code() {
+        assert_eq!(
+            T_SQL.normalize_definition(r"SELECT E'it\'s  here'"),
+            r"SELECT E'it\'s here'"
+        );
+        assert_eq!(
+            T_SQL.normalize_definition("SELECT $tag$a  b$tag$"),
+            "SELECT $tag$a b$tag$"
         );
     }
 
@@ -890,6 +1320,9 @@ mod tests {
     impl Dialect for OverloadingDialect {
         fn name(&self) -> &'static str {
             "overloading"
+        }
+        fn lexicon(&self) -> Lexicon {
+            Lexicon::ANSI
         }
         fn transaction_framing(&self) -> TransactionFraming {
             MinimalDialect.transaction_framing()
@@ -1113,6 +1546,12 @@ pub struct MinimalDialect;
 impl Dialect for MinimalDialect {
     fn name(&self) -> &'static str {
         "minimal"
+    }
+
+    /// Standard SQL, for the same reason as the transaction framing below: a
+    /// dialect that is not any real database may not claim one's brackets.
+    fn lexicon(&self) -> Lexicon {
+        Lexicon::ANSI
     }
 
     /// Standard SQL, which is all a dialect that is not any real database can

@@ -32,6 +32,17 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+/// Opens a connection to the live SQL Server this suite runs against.
+///
+/// The driver is named here, once, rather than at each call site below: every
+/// test in this file speaks to the container `scripts/live-tests.sh` starts,
+/// and repeating that fact at each of them would say nothing the file header
+/// does not already say. The PostgreSQL live suite is `pbps-pg`'s own, started
+/// by `scripts/live-tests-pg.sh`.
+async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbError> {
+    pbps_db::Conn::connect(pbps_db::Driver::Mssql, connection).await
+}
+
 fn conn_str() -> String {
     std::env::var("PBPS_TEST_DB").expect(
         "PBPS_TEST_DB is not set; these tests need a live SQL Server (see scripts/live-tests.sh)",
@@ -48,7 +59,7 @@ impl TestDb {
     async fn create(tag: &str) -> TestDb {
         // The pid keeps two concurrent `cargo test` runs apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
-        let mut conn = Conn::connect(&conn_str()).await.expect("connect");
+        let mut conn = connect_live(&conn_str()).await.expect("connect");
         conn.execute(&format!("CREATE DATABASE [{name}];"))
             .await
             .expect("create database");
@@ -1376,9 +1387,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         db.name
     );
 
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
@@ -1411,7 +1420,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
@@ -1440,7 +1449,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke alter");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     // As a project that manages `app`, so the gap can only be the ledger's own
     // creation requirement and not the ordinary managed-schema `ALTER`.
     let held = pbps_mssql::doctor::permissions(
@@ -1478,7 +1487,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("grant on the ledger objects");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
@@ -1507,7 +1516,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute(&format!("USE [{0}]; DROP TABLE dbo.__pbps_state;", db.name))
         .await
         .expect("drop the state table");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["dbo".to_owned()],
@@ -1566,7 +1575,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke alter again");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
@@ -1638,7 +1647,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     drop(lp);
     let name = db.name.clone();
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -1714,9 +1723,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
 
     // The premise: an owner is clean, and is clean *without* the shortcut —
     // its scoped answers come back full on their own.
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
@@ -1739,7 +1746,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         .execute(&format!("DENY ALTER ON SCHEMA::app TO [{login}];"))
         .await
         .expect("deny");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
@@ -1772,7 +1779,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
 
     drop(lp);
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -1850,9 +1857,7 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
         db.name
     );
 
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     // The premise, stated rather than assumed: the catalog really does hide the
     // table from this principal, so the old guard really would have said absent.
     let hidden = lp
@@ -1878,7 +1883,7 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
         .execute("DROP TABLE dbo.__pbps_lock;")
         .await
         .expect("drop the lock table");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         pbps_mssql::state::lock_holder(&mut lp)
             .await
@@ -1888,7 +1893,7 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
 
     drop(lp);
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -1960,9 +1965,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
         db.name
     );
 
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     // The premise, stated rather than assumed: the catalog really does hide the
     // ledger from this principal, so the old guard really would have said absent.
     let hidden = lp
@@ -2003,7 +2006,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
         "{base_no_credentials};User Id={login};Password={password};Database={}",
         fresh.name
     );
-    let mut none = Conn::connect(&as_login_fresh).await.expect("connect");
+    let mut none = connect_live(&as_login_fresh).await.expect("connect");
     assert!(
         !pbps_mssql::state::is_initialized(&mut none)
             .await
@@ -2015,7 +2018,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
     drop(none);
     fresh.drop().await;
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -2102,9 +2105,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         db.name
     );
 
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     // The premise: with no foreign key out of `app`, this login is ready. If it
     // were not, the assertion below would pass for the wrong reason.
     let held = pbps_mssql::doctor::permissions(
@@ -2147,7 +2148,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         ))
         .await
         .expect("grant on the object");
-    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
         &["app".to_owned()],
@@ -2164,7 +2165,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
 
     drop(lp);
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -3415,7 +3416,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
 
     // Another connection, as an application would: the row is rewritten
     // after the plan was reviewed and before the delete runs.
-    let mut other = Conn::connect(&conn_str()).await.expect("second connection");
+    let mut other = connect_live(&conn_str()).await.expect("second connection");
     other
         .execute(&format!("USE [{}];", db.name))
         .await
@@ -3436,7 +3437,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
         "{err}"
     );
 
-    let mut c = Conn::connect(&conn_str()).await.expect("connect");
+    let mut c = connect_live(&conn_str()).await.expect("connect");
     c.execute(&format!("USE [{}];", db.name))
         .await
         .expect("use");
@@ -3521,7 +3522,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
 
     // Another connection, as an application would: a child row arrives and
     // commits between the probe and the delete.
-    let mut other = Conn::connect(&conn_str()).await.expect("second connection");
+    let mut other = connect_live(&conn_str()).await.expect("second connection");
     other
         .execute(&format!("USE [{}];", db.name))
         .await
@@ -3545,7 +3546,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     );
 
     let count = |sql: &'static str| async {
-        let mut c = Conn::connect(&conn_str()).await.expect("connect");
+        let mut c = connect_live(&conn_str()).await.expect("connect");
         c.execute(&format!("USE [{}];", db.name))
             .await
             .expect("use");
@@ -3860,7 +3861,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     let label_of = |code: &'static str| {
         let db_name = db_name.clone();
         async move {
-            let mut c = Conn::connect(&conn_str()).await.expect("connect");
+            let mut c = connect_live(&conn_str()).await.expect("connect");
             c.execute(&format!("USE [{db_name}];")).await.expect("use");
             let rows = c
                 .query(&format!(
@@ -5154,9 +5155,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         "{as_login};User Id={login};Password={password};Database={}",
         db.name
     );
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
 
     // The control: with no role declared, this account is ready.
     let held = pbps_mssql::doctor::permissions(
@@ -5316,7 +5315,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
 
     drop(lp);
     db.drop().await;
-    let mut master = Conn::connect(&conn_str()).await.expect("connect");
+    let mut master = connect_live(&conn_str()).await.expect("connect");
     let _ = master
         .execute(&format!("USE master; DROP LOGIN [{login}];"))
         .await;

@@ -244,6 +244,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &label,
                     name.as_deref(),
                     target.connection(),
+                    target.driver(),
                     &managed_schemas,
                     &referenced,
                     &granted,
@@ -286,6 +287,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &name,
                     Some(&name),
                     &conn,
+                    db::driver_for(project.config.dialect),
                     &managed_schemas,
                     &referenced,
                     &granted,
@@ -499,6 +501,7 @@ async fn examine(
     name: &str,
     env_name: Option<&str>,
     connection: &str,
+    driver: pbps_db::Driver,
     schemas: &[String],
     referenced: &[pbps_model::ObjectName],
     granted: &pbps_mssql::doctor::GrantTargets,
@@ -511,7 +514,7 @@ async fn examine(
         env_name.map(ToOwned::to_owned),
         "unreachable",
     );
-    let mut conn = match Conn::connect(connection).await {
+    let mut conn = match Conn::connect(driver, connection).await {
         Ok(c) => c,
         Err(e) => {
             // `redact` has already reduced the label; the driver's own message

@@ -19,8 +19,11 @@ pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact
+pbps-pg        PostgreSQL: the same responsibilities as pbps-mssql, as far as
+               Phase 5 has built them. Everything unbuilt refuses by name
 pbps-db        Connections plus transaction framing. Owns "there is a network";
-               ledger types and prune policy, no T-SQL.
+               ledger types and prune policy, no engine's SQL. One module per
+               driver, and nothing outside them names one.
                Driver isolation: see constraint 9
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
@@ -62,3 +65,7 @@ has a home, the entry links there instead of repeating its content.
 9. See the driver isolation rule in
    [ADR-0007 decision 5](ADR-0007-connection-strategy.md#decision) and its
    [measured limits in ADR-0014](ADR-0014-driver-seam-tested.md#the-claim-under-test).
+   With two drivers it reads **one file per driver**: `pbps-db::mssql` names
+   `tiberius`, `pbps-db::postgres` names `tokio_postgres`, and nothing else in
+   the workspace names either — `pbps-db::Conn` dispatches between them and
+   holds no driver type ([decision 225](DECISIONS.md)).

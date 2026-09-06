@@ -101,6 +101,16 @@ pub struct TargetState {
 pub enum Target {
     None,
     Reachable(db::Target),
+    /// A bare `--db` connection string, before the plan has said which engine
+    /// it was computed for.
+    ///
+    /// Two states rather than one because the order is forced: `explain` may
+    /// run in a directory with no `pbps.yml`, so the driver can only come from
+    /// the plan — and the plan is read inside [`cmd_explain`], after the
+    /// command line has already been matched. Carrying the string until then is
+    /// what keeps this command's promise to a reviewer holding nothing but a
+    /// file.
+    Connection(String),
     Unresolved(anyhow::Error),
 }
 
@@ -109,6 +119,31 @@ impl From<anyhow::Result<db::Target>> for Target {
         match r {
             Ok(t) => Target::Reachable(t),
             Err(e) => Target::Unresolved(e),
+        }
+    }
+}
+
+/// A target once the plan has said which engine it was computed for.
+///
+/// The same three states as [`Target`] minus the one that still holds a bare
+/// string, so that everything downstream of [`Target::resolve`] cannot be
+/// handed an unresolved connection at all. A fourth arm reading "this should
+/// not happen" would be the alternative, and a state that cannot exist beats a
+/// branch that checks for it.
+enum Resolved {
+    None,
+    Reachable(db::Target),
+    Unresolved(anyhow::Error),
+}
+
+impl Target {
+    /// Turns a bare `--db` string into a target, now that the driver is known.
+    fn resolve(self, driver: pbps_db::Driver) -> Resolved {
+        match self {
+            Target::None => Resolved::None,
+            Target::Connection(c) => Resolved::Reachable(db::target_from_connection(&c, driver)),
+            Target::Reachable(t) => Resolved::Reachable(t),
+            Target::Unresolved(e) => Resolved::Unresolved(e),
         }
     }
 }
@@ -135,13 +170,15 @@ pub fn cmd_explain(
     // Same envelope as an unreadable plan: this build cannot explain the file,
     // so it did not answer. Without this a plan naming an engine this binary has
     // no dialect for left stdout empty.
-    let dialect = output::or_unanswerable_at(
+    let (driver, dialect) = output::or_unanswerable_at(
         "explain",
         json,
         "plan.unsupported-dialect",
         path,
         dialect_of(&plan),
     )?;
+    // Now that the plan has named its engine, a bare `--db` becomes a target.
+    let target = target.resolve(driver);
     output::or_unanswerable_at(
         "explain",
         json,
@@ -208,9 +245,9 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
 /// A plan names its own engine (`SavedPlan::dialect`) precisely so a plan
 /// computed for one and applied to another is nonsense the file can catch;
 /// reading it here is the same check, made earlier and without a connection.
-fn dialect_of(plan: &SavedPlan) -> anyhow::Result<Box<dyn Dialect>> {
+fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dialect>)> {
     match plan.dialect.as_str() {
-        "mssql" => Ok(Box::new(pbps_mssql::Mssql)),
+        "mssql" => Ok((pbps_db::Driver::Mssql, Box::new(pbps_mssql::Mssql))),
         other => {
             anyhow::bail!("this plan was computed for `{other}`, which this build cannot explain")
         }
@@ -221,7 +258,7 @@ fn explain(
     plan: &SavedPlan,
     dialect: &dyn Dialect,
     path: &std::path::Path,
-    target: &Target,
+    target: &Resolved,
     env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
     let cs = &plan.changes;
@@ -334,11 +371,11 @@ fn explain(
             .collect(),
         statement_count: crate::statements(cs, dialect)?.len(),
         target: match target {
-            Target::None => None,
-            Target::Reachable(t) => Some(target_state(t)?),
+            Resolved::None => None,
+            Resolved::Reachable(t) => Some(target_state(t)?),
             // Reported, not fatal, and phrased as what it is: the environment
             // was never reached because it was never resolved.
-            Target::Unresolved(e) => Some(TargetState {
+            Resolved::Unresolved(e) => Some(TargetState {
                 environment: env.unwrap_or("the given target").to_owned(),
                 state: "unconfigured",
                 detail: Some(format!("{e:#}")),
@@ -373,7 +410,7 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
         }
     };
     let checked = rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(target.connection()).await?;
+        let mut conn = pbps_db::Conn::connect(target.driver(), target.connection()).await?;
         // The lock first. This used to ask about initialization first, because
         // `lock_holder` selected from `__pbps_lock` unconditionally and a
         // never-initialized database has neither table — so asking it first

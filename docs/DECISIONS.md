@@ -3448,3 +3448,240 @@ SPEC is in sync with all of these.
     silently read as something it is not. It also makes the bump a deliberate
     act on this side: `output::SCHEMA_VERSION` moves, the checked-in schema
     moves with it, and the drift test refuses to let one move without the other.
+## Phase 5 — the connected boundary and the PostgreSQL crate (ADR-0011, ADR-0014)
+
+225. **`Conn` becomes an enum over two drivers — not a trait object, not a type
+    parameter.** ADR-0014 ruled out deciding *how* while there was one real
+    driver ("the useful abstraction is the one drawn from two implementations
+    that both exist"); this is the second, so the deferral ends. Measured on
+    `4abb917`, the enum leaves all 22 `pbps-mssql` functions that take
+    `conn: &mut Conn` untouched. A trait object needs `async fn` in a
+    dyn-compatible trait, which Rust has not got — so hand-rolled boxed futures
+    or a new dependency, to abstract over exactly two implementations that both
+    live in this workspace. Generics spread a type parameter across those 22
+    functions and everything calling them, and the dialect is a runtime value
+    out of `pbps.yml`, so the dispatch would only move to the CLI. The enum is
+    also what `Param` chose in this same file, for this same reason, before
+    there was a second driver.
+
+    The cost is the `FromColumn` blanket impl: two of them, one per driver,
+    overlap and coherence refuses them. The closed set that replaces it is
+    `&str`, `i32`, `i64`, `i16`, `u8` and `bool` — **from the compiler, not
+    from reading the source.** Counted by eye it looked like three, because
+    `bool`, `i16` and `u8` reach the seam through `get(&row, "max_length")`
+    with the type inferred from the struct field and never spelled at the call
+    site. The set is not engine-neutral either: `u8` is SQL Server's `tinyint`,
+    and PostgreSQL's arm refuses it rather than inventing a conversion.
+
+    ADR-0007 decision 5's "exactly one file" becomes **one file per driver**:
+    `pbps-db::mssql` names `tiberius`, `pbps-db::postgres` names
+    `tokio_postgres`, and nothing else in the workspace names either.
+    `DbError::Driver` stops carrying one driver's error type and carries text
+    plus an optional code, so the seam's own error names no driver.
+
+226. **`normalize_definition` takes a description of the engine's literals, and
+    every dialect must supply one.** The default was one engine's scanner
+    wearing a neutral name: it opened a quoted region on `'`, `"` or `[`, and
+    knew neither `E'…'` nor `$tag$…$tag$` (ADR-0011 Amendment 2). Two of the
+    three failures that caused were **silent** — two definitions returning
+    different strings compared equal, so the change was never planned at all,
+    which is what `whitespace_inside_a_literal_is_data` exists to prevent on
+    SQL Server and what arrived on PostgreSQL through the shared default.
+
+    `Dialect::lexicon` is required; `normalize_definition` keeps a default that
+    is the shared scanner driven by it. The ADR says the default is removed,
+    and the reason it gives is that "a new dialect cannot silently inherit
+    another engine's answer" — which a required `lexicon` secures, without each
+    dialect restating the call. What the ADR ruled out was *leaving the default
+    in place and overriding it in the PostgreSQL dialect*; a default with no
+    engine in it is not that.
+
+    The description carries **termination rules, not only delimiters**, because
+    two of the three failures were termination rules: `\'` does not close an
+    `E'…'` string, and a `$tag$` region ends only at its own tag. A table of
+    delimiters would have fixed the third alone. What is *not* a field is
+    equally deliberate — the doubled-quote string, the `--` comment and the
+    **nesting** `/*…*/` are shared because both engines were measured and both
+    answered the same.
+
+    Two rules keep a `$` from opening a literal that is not there: a tag
+    follows the rules of an unquoted identifier (so `$1.00` is money, not a
+    tag), and a `$` that continues an identifier opens nothing (measured,
+    PostgreSQL lexes `a$b$c` as one name). The bracket row of the ADR's table
+    is fixed as a side effect and not as a compromise: `[` is a quote in SQL
+    Server's lexicon and absent from PostgreSQL's, so a reindent inside
+    `a[1 + 2]` stops reading as a changed module.
+
+227. **`normalize_type`'s contract is stated on the trait, and the `serial`
+    family is refused rather than normalized.** The contract: normalization is
+    idempotent, **and its output is what introspection reads back for a column
+    declared that way**; a spelling for which that is impossible is an error.
+    Measured on PostgreSQL 18.6, `smallserial`, `serial` and `bigserial` read
+    back as `smallint`, `integer` and `bigint`, each with an owned
+    `<table>_<col>_seq`. No normalization makes the declared spelling equal the
+    read-back one, so left alone it is a schema that differs from itself on
+    every run — the permanent phantom change.
+
+    The refusal is `Invalid`, not `NotBuilt`: "the type catalogue is not built
+    yet" sends its reader away to wait for a release, and this one is a
+    declaration to change today. It is raised at `validate_table` as well as at
+    `normalize_type`, naming the column, and it names what to declare instead —
+    which per ADR-0010 §7 also disposes of the sequence-grant problem, since an
+    identity column needs no sequence privilege and a `serial` one does.
+
+228. **One rustls crypto provider in the tree, and the connector names it
+    anyway.** Asking for `ring` while `tiberius-ng` resolves `rustls` with its
+    own default compiled **both** providers in. rustls then cannot determine a
+    process-level provider and **panics** — not errs — the first time a
+    `ClientConfig::builder()` runs, which is inside a connection, where the
+    seam has no way to report it. Nothing caught this: it builds, it lints, and
+    `cargo deny` is green; the PostgreSQL live suite hit it on its first
+    connection to a real server, which is the argument for that suite existing
+    before there is a dialect to test.
+
+    So the PostgreSQL TLS stack takes `aws-lc-rs`, the one already in the tree,
+    and `pbps-db::postgres` builds its config with `builder_with_provider`
+    rather than the process default — the same shape `tiberius` uses on the
+    other side of the seam. One provider makes the ambiguity impossible; naming
+    it makes a future second provider unable to change which one this connector
+    uses, or to reintroduce the panic.
+    uses, or to reintroduce the panic.
+
+229. **The connection seam dials one TCP endpoint, and refuses every string
+    that means anything else.** `Conn::connect` opens the socket itself, which
+    is what keeps `Connect` and `ConnectTimeout` two errors instead of one
+    (ADR-0014 §3) — so it has to choose a host and a port, and libpq strings can
+    name things that choice cannot honour: a Unix socket path, a `hostaddr` the
+    driver would dial while `host` is what TLS checks, or several hosts to try
+    in turn. Each of those is now a `BadConnectionString` that says which.
+
+    It was a silent fallback to `localhost:5432`, with a comment claiming the
+    connection would then "fail to connect saying so". It would not: a machine
+    configured with a Unix socket is exactly the machine with a server on
+    `localhost:5432`, so the fallback **succeeded**, against a different
+    endpoint under a different authentication method. Supporting these properly
+    is a feature and belongs to whoever needs it; guessing is not the smaller
+    version of it.
+
+230. **Identifier rules are the engine's, measured, and neither is inherited
+    from the SQL Server side.** Two of them, both silent when wrong, both
+    pinned by the live suite against PostgreSQL 18.6:
+
+    - **Case folding is ASCII-only.** `CREATE TABLE AÄ` makes the relation
+      `aÄ`, not `aä` — the server downcases byte by byte and leaves the high
+      bit alone. Rust's `to_lowercase` is Unicode-aware and folded one
+      character too many, so a declaration would have been keyed as a name
+      introspection never returns: drift no apply can settle, and a `CREATE`
+      that makes an object under a name nobody asked for.
+    - **The length limit is 63 *bytes*, and it is enforced here because the
+      server does not enforce it.** It truncates and says so in a `NOTICE`
+      nothing reads. Measured: a longer name records itself at one length and
+      reads back at another, and two names differing only after byte 63 collide
+      — the second `CREATE TABLE` fails with `relation … already exists`,
+      naming a table the declarations do not contain. The SQL Server
+      counterpart counts **characters** (128), so copying its shape would have
+      been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
+      been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.
+
+231. **`target_session_attrs` is reproduced at the seam, not refused and not
+    dropped.** `Config::connect` runs a `SHOW transaction_read_only` probe
+    *after* the handshake; this seam calls `connect_raw` — which is what keeps
+    the three connection failures three (ADR-0014 §3) — and inherits none of
+    it. Dropped silently, a string saying "never a writable primary" would have
+    got one and run DDL on it.
+
+    Reproduced rather than refused, unlike `hostaddr` and multiple hosts in 229,
+    and the difference is which failure each choice risks: refusing
+    `target_session_attrs=read-write` would refuse a string that works, and
+    refusing a valid input is the one thing this project's review rules put
+    first. The probe is fifteen lines and needs nothing new.
+
+    It gets its own `DbError::WrongSession`, because it is the one connection
+    failure that is not about *reaching* a server — `cannot reach {addr}` would
+    be false, and the fix is a different server rather than an open port. That
+    does not make ADR-0014's three into four: those three are how a socket can
+    fail, and this is a server that answered.
+
+    What the seam still drops is in issue #113: `keepalives`, `tcp_user_timeout`
+    and `connect_timeout` are applied by the driver's own `connect_socket` and
+    by nothing here. Left there rather than fixed with this one, because
+    honouring them needs a new dependency and refusing them refuses strings that
+    work — a choice, not a bug fix.
+    work — a choice, not a bug fix.
+
+232. **Opening the socket is one function, shared by both drivers, and it gives
+    every resolved address a chance inside one budget.** `TcpStream::connect(host)`
+    resolves the name and tries the addresses **in turn**, returning the last
+    error, so a timeout wrapped around it bounds the *whole loop*: one address
+    that drops packets spends the entire budget and a healthy second address is
+    never tried. A dual-stack endpoint whose IPv6 address is black-holed is the
+    ordinary case of that, and reporting a server that is up as unreachable
+    refuses work — the failure this project's review rules put first.
+
+    `open_socket` resolves first and tries each address itself. The budget is
+    divided as it is spent — each attempt gets what is left over how many
+    addresses are left — so the total is still `CONNECT_TIMEOUT` however many
+    there are, an address that refuses at once hands its share to the rest, and
+    the last one gets the remainder. Fixed shares would make a slow-but-
+    answering server fail behind a dead one, and a full budget each would make
+    `CONNECT_TIMEOUT` mean *N* times what it says.
+
+    A refusal from some address outranks the clock. `Connect` names something
+    with a fix the reader can act on, and only when no address answered at all
+    is this the dropped-packets case that `ConnectTimeout` describes.
+
+    In `pbps-db` itself rather than in either driver, because "there is a
+    network" is this crate's (ARCHITECTURE) — and because the defect was on both
+    sides of the seam. `pbps-db::mssql` had the same line, and fixing only the
+    engine under review is how a shape becomes a second finding.
+
+    The tests build the black hole out of a listening socket whose accept queue
+    is full, and take the address list and the budget as parameters: resolution
+    order is the operating system's, and a test that depends on it passes or
+    fails by luck. What is *not* pinned by a failing test is the resolution half
+    on its own — a hostname resolving to two addresses this test controls is not
+    portable (`localhost` is one address on some machines and two on others), so
+    the loop is pinned and the resolving is read.
+
+233. **A dollar-quote tag follows the engine's grammar, which is over bytes.**
+    PostgreSQL's lexer spells it `dolq_start [A-Za-z\200-\377_]` and
+    `dolq_cont` the same plus the digits: **any** byte with the high bit set is
+    a tag character. `char::is_alphanumeric` is a different and smaller set —
+    measured on 18.6, `$á$` written as `a` and a combining acute is a tag the
+    engine accepts, and Rust classifies U+0301 as neither letter nor number.
+    Refusing it there scanned the literal's body as code and folded its spacing
+    away: the silent failure of 226 again, one level down, arriving through the
+    rule written to prevent it.
+
+    "Not ASCII" is the whole of the high-bit half, so the test is
+    `is_ascii_alphabetic() || '_' || !is_ascii()`, plus the digits after the
+    first character. A Unicode class is the wrong tool for a grammar written in
+    bytes, however much it looks like the right one.
+
+234. **A TLS stack is built only when the connection may use one, and ALPN is
+    offered only for direct SSL.** Two halves of the same mistake: doing TLS
+    work that the connection string has already ruled out, and not doing the
+    TLS work it asks for.
+
+    Building the stack reads the host's certificate store, and `tls()` refuses
+    when that cannot be read — deliberately, because a trust store that failed
+    to load is not an empty one. Under `sslmode=disable` that refused a
+    connection over certificates it was never going to look at, on exactly the
+    minimal image SPEC §11.3's single static binary is for. `connect` now
+    branches, and the disabled path hands the driver `NoTls`.
+
+    The other half is ALPN. **Measured on PostgreSQL 18.6**: a direct SSL
+    connection that offers no ALPN is refused — `received direct SSL connection
+    request without ALPN protocol negotiation extension` in the server log —
+    while the TLS handshake itself *completes*, so the failure lands after it
+    and reads as the connection dropping rather than as a protocol requirement.
+    Neither `tokio-postgres` nor `tokio-postgres-rustls` sets it, so
+    `sslnegotiation=direct` could not connect at all. Offered only for `Direct`,
+    because the `SSLRequest` negotiation the default uses asks for none and
+    libpq offers none there either.
+
+    Both are pinned by unit tests over the parsed config rather than by the live
+    suite. The suite's server has TLS off, as CI's does, and giving it a
+    certificate this client trusts is its own piece of work; what is measured
+    here was measured with `openssl s_client` against the same image and is
+    written down above rather than asserted.

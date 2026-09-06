@@ -7,6 +7,17 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// Opens a connection to the live SQL Server this suite runs against.
+///
+/// The driver is named here, once, rather than at each call site below: every
+/// test in this file speaks to the container `scripts/live-tests.sh` starts,
+/// and repeating that fact at each of them would say nothing the file header
+/// does not already say. The PostgreSQL live suite is `pbps-pg`'s own, started
+/// by `scripts/live-tests-pg.sh`.
+async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbError> {
+    pbps_db::Conn::connect(pbps_db::Driver::Mssql, connection).await
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 struct Demo {
@@ -211,7 +222,7 @@ fn try_on_server(connection: &str, sql: &str) -> Result<(), String> {
         .build()
         .map_err(|e| format!("no runtime: {e}"))?;
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(connection)
+        let mut conn = connect_live(connection)
             .await
             .map_err(|e| format!("cannot reach the server under test: {e}"))?;
         conn.execute(sql)
@@ -4718,7 +4729,7 @@ fn status_reports_a_lock_held_over_an_empty_ledger() {
     .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         // Whatever an earlier test left: this asserts about an *empty* ledger.
         let _ = conn
             .execute(
@@ -4765,7 +4776,7 @@ fn status_reports_a_lock_held_over_an_empty_ledger() {
         .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = pbps_mssql::state::unlock(&mut conn).await;
         let _ = conn
             .execute("DROP TABLE dbo.__pbps_state; DROP TABLE dbo.__pbps_lock;")
@@ -4829,7 +4840,7 @@ fn status_reports_a_lock_that_outlived_its_state_table() {
     .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
@@ -4874,7 +4885,7 @@ fn status_reports_a_lock_that_outlived_its_state_table() {
         .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         // Also the negative case for `unlock`, which guarded on the *state*
         // table and so could not release a lock that outlived it.
         assert!(
@@ -4929,7 +4940,7 @@ fn status_says_nothing_about_a_lock_on_a_database_with_no_ledger() {
     .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
@@ -5063,7 +5074,7 @@ fn doctor_and_explain_see_a_lock_that_outlived_its_state_table() {
     .unwrap();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;",
@@ -5096,7 +5107,7 @@ fn doctor_and_explain_see_a_lock_that_outlived_its_state_table() {
     let explain_human = run(&["explain", "--plan", plan.to_str().unwrap(), "--env", "test"]);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = pbps_mssql::state::unlock(&mut conn).await;
         let _ = conn.execute("DROP TABLE dbo.__pbps_lock;").await;
     });
@@ -5538,7 +5549,7 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -5731,7 +5742,7 @@ fn a_delete_beside_a_type_change_in_the_same_revision_applies() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -5890,7 +5901,7 @@ fn a_role_named_like_a_user_is_refused_before_anything_runs() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -6148,13 +6159,13 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
     let roles = || -> i32 {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             let rows = c
                 .query(&format!(
                     "USE [{name}]; SELECT COUNT(*) FROM sys.database_principals \
@@ -6239,13 +6250,13 @@ fn a_member_added_after_planning_refuses_the_role_drop_before_anything_runs() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
     let members = || -> i32 {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             let rows = c
                 .query(&format!(
                     "USE [{name}]; SELECT COUNT(*) FROM sys.database_role_members rm \
@@ -6414,7 +6425,7 @@ fn reference_data_round_trips_through_a_real_target() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -7487,7 +7498,7 @@ fn a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -7587,7 +7598,7 @@ data:
     // And nothing of the plan stayed: not its own row, and not the trigger's.
     let rows = |table: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let mut c = connect_live(&connection).await.expect("connect");
             let r = c
                 .query(&format!("SELECT COUNT(*) FROM {table};"))
                 .await
@@ -7645,7 +7656,7 @@ data:
     );
     assert_eq!(rows("dbo.t"), 1, "the plan's insert must have rolled back");
     let untouched: i32 = rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let mut c = connect_live(&connection).await.expect("connect");
         let r = c
             .query("SELECT COUNT(*) FROM dbo.t WHERE code = 'first' AND note = N'kept';")
             .await
@@ -7691,7 +7702,7 @@ data:
     // Rolled back whole: the grant the trigger took is back, and the grant the
     // plan wanted to add never landed.
     let permissions: i32 = rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let mut c = connect_live(&connection).await.expect("connect");
         let r = c
             .query(
                 "SELECT COUNT(*) FROM sys.database_permissions p \
@@ -7868,7 +7879,7 @@ fn snapshot_and_baseline_refuse_a_held_deployment_lock() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;",
@@ -7894,7 +7905,7 @@ fn snapshot_and_baseline_refuse_a_held_deployment_lock() {
     }
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         pbps_mssql::state::unlock(&mut conn).await.unwrap();
         conn.execute("DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;")
             .await
@@ -7931,7 +7942,7 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
     d.commit();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;")
             .await;
@@ -7973,7 +7984,7 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
     assert_eq!(code(&applied), 1, "{}", stdout(&applied));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn)
             .await
             .unwrap()
@@ -8026,7 +8037,7 @@ fn a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded() {
     d.commit();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute("IF OBJECT_ID(N'dbo.pbps_deny_state', N'TR') IS NOT NULL DROP TRIGGER dbo.pbps_deny_state;")
             .await;
@@ -8059,7 +8070,7 @@ fn a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded() {
     let checksum = plan_checksum(&plan);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "CREATE TRIGGER dbo.pbps_deny_state ON dbo.__pbps_state INSTEAD OF INSERT AS \
              BEGIN THROW 51000, 'ledger insert denied by test', 1; END;",
@@ -8079,7 +8090,7 @@ fn a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded() {
     assert_eq!(code(&applied), 1, "{}", stdout(&applied));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("DROP TRIGGER dbo.pbps_deny_state;").await.unwrap();
         let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
         assert!(!pulled.schema.tables[&"dbo.pbps_atomic_ledger".parse().unwrap()]
@@ -8119,7 +8130,7 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;")
             .await;
@@ -8138,7 +8149,7 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
         0
     );
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("ALTER TABLE dbo.pbps_computed_drift ADD twice AS (id * 2);")
             .await
             .unwrap();
@@ -8176,7 +8187,7 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     assert_eq!(report["data"][0]["state"], "drift", "{report}");
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "DROP TABLE dbo.pbps_computed_drift; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
         )
@@ -8208,7 +8219,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.pbps_dep_leaf', N'V') IS NOT NULL DROP VIEW dbo.pbps_dep_leaf;",
@@ -8233,7 +8244,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
     let boot = d.run(&["bootstrap", "--db", &connection]);
     assert_eq!(code(&boot), 0, "{}", stderr(&boot));
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let state = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(state.snapshot.module_deps.len(), 1);
     });
@@ -8292,7 +8303,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
     assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "DROP VIEW dbo.pbps_dep_leaf; DROP VIEW dbo.pbps_dep_base; \
              DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
@@ -8323,7 +8334,7 @@ fn status_reports_the_unmanaged_error_policy() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn.execute("IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock;").await;
         let _ = conn.execute("IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;").await;
         conn.execute(
@@ -8350,7 +8361,7 @@ fn status_reports_the_unmanaged_error_policy() {
     )
     .unwrap();
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("CREATE TABLE dbo.pbps_status_unmanaged (id int NOT NULL);")
             .await
             .unwrap();
@@ -8373,7 +8384,7 @@ fn status_reports_the_unmanaged_error_policy() {
     }));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "DROP TABLE dbo.pbps_status_unmanaged; DROP TABLE dbo.pbps_status_managed; \
              DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
@@ -8402,7 +8413,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.[pbps_unreadable.policy_secret]', N'P') IS NOT NULL \
@@ -8444,7 +8455,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     )
     .unwrap();
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "CREATE PROCEDURE dbo.[pbps_unreadable.policy_secret] WITH ENCRYPTION AS SELECT 1;",
         )
@@ -8530,7 +8541,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     // after this catalog change both the completed report and its alert are
     // required.
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("ALTER TABLE dbo.pbps_unreadable_policy ADD drifted int NULL;")
             .await
             .unwrap();
@@ -8553,7 +8564,7 @@ fn verify_and_status_reject_an_unreadable_unmanaged_module() {
     assert!(drift_hook.exists(), "managed drift did not fire on_drift");
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "DROP PROCEDURE dbo.[pbps_unreadable.policy_secret]; \
              DROP TABLE dbo.pbps_unreadable_policy; \
@@ -8580,7 +8591,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.pbps_plan_b', N'V') IS NOT NULL DROP VIEW dbo.pbps_plan_b;",
@@ -8613,7 +8624,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
 
     let interrupted_checksum = "a".repeat(64);
     let checkpoint = rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         let mut checkpoint = latest.snapshot;
         checkpoint.kind = pbps_model::StateKind::Staged;
@@ -8678,7 +8689,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         );
 
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            let mut conn = connect_live(&connection).await.unwrap();
             let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
             assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
             assert_eq!(
@@ -8692,7 +8703,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
     }
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
         assert!(
             !pulled
@@ -8737,7 +8748,7 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
     d.commit();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let _ = conn
             .execute(
                 "IF OBJECT_ID(N'dbo.pbps_block_unlock', N'TR') IS NOT NULL \
@@ -8780,7 +8791,7 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
     let checksum = plan_checksum(&plan);
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "CREATE TRIGGER dbo.pbps_block_unlock ON dbo.__pbps_lock INSTEAD OF DELETE AS \
              BEGIN THROW 51000, 'unlock denied by test', 1; END;",
@@ -8815,7 +8826,7 @@ fn an_unlock_failure_does_not_relabel_a_successful_apply() {
     );
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Apply);
         assert_eq!(hook["ledger_entry"], latest.id);
@@ -8864,7 +8875,7 @@ fn durable_record_commands_report_success_before_an_unlock_failure() {
          BEGIN THROW 51000, 'unlock denied by test', 1; END;";
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "IF OBJECT_ID(N'dbo.pbps_block_unlock', N'TR') IS NOT NULL \
              DROP TRIGGER dbo.pbps_block_unlock; \
@@ -8904,7 +8915,7 @@ fn durable_record_commands_report_success_before_an_unlock_failure() {
     assert!(stderr(&baselined).contains("unlock denied by test"));
 
     let baseline_id = rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Baseline);
         conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
@@ -8925,7 +8936,7 @@ fn durable_record_commands_report_success_before_an_unlock_failure() {
     assert!(stderr(&snapshotted).contains("unlock denied by test"));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert!(latest.id > baseline_id);
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Apply);
@@ -8959,7 +8970,7 @@ fn durable_record_commands_report_success_before_an_unlock_failure() {
     assert!(stderr(&bootstrapped).contains("unlock denied by test"));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Bootstrap);
         let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
@@ -9025,7 +9036,7 @@ fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
          IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
          IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
         conn.execute(
             "CREATE TABLE dbo.pbps_declared_unreadable (id int NOT NULL); \
@@ -9052,7 +9063,7 @@ fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
         );
         assert!(!err.contains("not declared"), "{args:?}: {err}");
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            let mut conn = connect_live(&connection).await.unwrap();
             assert!(
                 pbps_mssql::state::latest(&mut conn)
                     .await
@@ -9121,7 +9132,7 @@ fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
     assert_eq!(code(&clean), 0, "{}", stderr(&clean));
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
             "EXEC('ALTER PROCEDURE dbo.pbps_declared_later WITH ENCRYPTION AS SELECT 2;');",
         )
@@ -9158,7 +9169,7 @@ fn a_declared_module_the_catalog_cannot_read_is_never_recorded() {
     );
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
     });
 }
@@ -9194,7 +9205,7 @@ fn bootstrap_refuses_a_declared_table_the_projection_left_out() {
          IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
          IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
         // Its own batch: a type is not visible to the batch that creates it.
         conn.execute("CREATE TYPE dbo.pbps_boot_udt FROM int;")
@@ -9218,7 +9229,7 @@ fn bootstrap_refuses_a_declared_table_the_projection_left_out() {
     );
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         // Refused before the transaction, so no failure audit — and no empty
         // "newest state" for a database that is not empty.
         assert!(
@@ -9280,7 +9291,7 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
          IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NOT NULL DROP TABLE dbo.__pbps_lock; \
          IF OBJECT_ID(N'dbo.__pbps_state', N'U') IS NOT NULL DROP TABLE dbo.__pbps_state;";
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
         conn.execute("CREATE TABLE dbo.pbps_unlock_failure (id int NOT NULL);")
             .await
@@ -9305,13 +9316,13 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
     // then fails to release.
     let block = || {
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            let mut conn = connect_live(&connection).await.unwrap();
             conn.execute(BLOCK_UNLOCK).await.unwrap();
         })
     };
     let clear = || {
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+            let mut conn = connect_live(&connection).await.unwrap();
             conn.execute("DROP TRIGGER dbo.pbps_block_unlock;")
                 .await
                 .unwrap();
@@ -9334,7 +9345,7 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
     };
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("ALTER TABLE dbo.pbps_unlock_failure ADD drifted int NULL;")
             .await
             .unwrap();
@@ -9364,7 +9375,7 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
         "{hook}"
     );
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
     });
@@ -9376,7 +9387,7 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
     clear();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute("CREATE TABLE dbo.pbps_unlock_stray (id int NOT NULL);")
             .await
             .unwrap();
@@ -9394,7 +9405,7 @@ fn an_unreleased_lock_after_a_failed_command_is_reported() {
     clear();
 
     rt.block_on(async {
-        let mut conn = pbps_db::Conn::connect(&connection).await.unwrap();
+        let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(RESET).await.unwrap();
     });
 }
@@ -9487,7 +9498,7 @@ fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
     // And the grant really did travel, which is the engine fact the guard
     // now depends on.
     let held: i32 = rt.block_on(async {
-        let mut c = pbps_db::Conn::connect(&connection).await.expect("connect");
+        let mut c = connect_live(&connection).await.expect("connect");
         let r = c
             .query(
                 "SELECT COUNT(*) FROM sys.database_permissions p \
@@ -9522,7 +9533,7 @@ fn a_staged_apply_stops_at_a_change_that_is_not_its_own() {
         .unwrap();
     let sql = |sql: &str| {
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             c.execute(&format!("USE [{name}]; {sql}")).await.expect(sql);
         })
     };
@@ -9699,7 +9710,7 @@ fn a_panicking_test_leaves_no_database_behind() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut c = pbps_db::Conn::connect(&server).await.expect("connect");
+            let mut c = connect_live(&server).await.expect("connect");
             let rows = c
                 .query(&format!(
                     "SELECT COUNT(*) FROM sys.databases WHERE name = N'{name}';"
@@ -10011,7 +10022,7 @@ fn state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_serv
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let mut conn = connect_live(&connection).await.expect("connect");
             pbps_mssql::state::lock(&mut conn, "state-list-test")
                 .await
                 .expect("lock");
@@ -10083,7 +10094,7 @@ fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let mut conn = connect_live(&connection).await.expect("connect");
             pbps_mssql::state::lock(&mut conn, "state-list-broken")
                 .await
                 .expect("lock");
