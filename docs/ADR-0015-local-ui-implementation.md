@@ -284,13 +284,22 @@ locked-copy `update-index` ran it), so every `git` also takes
    path reported modified under `core.fileMode` — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
    `renamex_np(RENAME_SWAP)` — then hashes the file that came *out*: if
-   it is the blob the page was shown, the old version is discarded; if it
-   is not, an editor saved between step 1's check and the exchange, the
-   two are exchanged back, and the compose is refused with the newer
-   content shown. Step 1's comparison and this write cannot be made one
-   operation, so the exchange makes the write reversible instead: nothing
-   is overwritten, only swapped, and what was swapped out is inspected
-   before it is let go (**measured**: the exchange put the UI's bytes at
+   it is not the blob the page was shown, an editor saved between step 1's
+   check and the exchange, the two are exchanged back, and the compose is
+   refused with the newer content shown. If it is, the old version is
+   still not deleted: an editor that opened the file before the exchange
+   holds a descriptor to that inode and may write through it after the
+   hash, and an unlinked inode would take that save with it. The
+   swapped-out file is instead moved under `<git-dir>/pbps-ui/previous/`
+   with the path and the time in its name, kept there until the next
+   compose of the same path, and named on the page beside the commit; a
+   late write lands in a file the user can find, not in one that no
+   longer has a name. Where that directory is on another filesystem and
+   the move fails, the file stays beside the path under its temporary
+   name and the page says so. Step 1's comparison and this write cannot
+   be made one operation, so the exchange makes the write reversible
+   instead: nothing is overwritten, only swapped, and what was swapped
+   out is inspected and then kept (**measured**: the exchange put the UI's bytes at
    the path and the page's bytes in the swapped-out file, with the
    page's bytes intact to be compared). A path that is absent — a new
    declaration — has nothing to exchange with and is placed with `link()`,
