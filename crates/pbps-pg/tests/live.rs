@@ -328,3 +328,74 @@ async fn a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns() {
         .await
         .expect("drop");
 }
+
+/// The two identifier rules, measured rather than assumed. Both were review
+/// findings on this PR and both are silent when wrong: a name the tool folds or
+/// keeps differently from the engine is a declaration introspection can never
+/// match, so the drift report never goes quiet and the `CREATE` makes an object
+/// under a name nobody asked for.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_engine_and_the_dialect_agree_on_what_a_name_becomes() {
+    let mut conn = connect().await;
+    let pid = std::process::id();
+
+    // Case folding is ASCII-only: the server downcases byte by byte and leaves
+    // anything with the high bit set alone.
+    let declared = format!("AÄfold{pid}");
+    conn.execute(&format!("DROP TABLE IF EXISTS {declared}"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("CREATE TABLE {declared} (c int)"))
+        .await
+        .expect("create");
+    let named = text(
+        &mut conn,
+        &format!(
+            "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n \
+             ON n.oid = c.relnamespace WHERE n.nspname = 'public' \
+             AND strpos(c.relname, 'fold{pid}') > 0"
+        ),
+    )
+    .await;
+    assert_eq!(
+        named,
+        Postgres.fold_ident(&declared),
+        "the engine folded the name differently from the dialect"
+    );
+    conn.execute(&format!("DROP TABLE {declared}"))
+        .await
+        .expect("drop");
+
+    // 63 bytes is the limit, and past it the server truncates rather than
+    // refusing — with a NOTICE nothing here reads.
+    let mut long = format!("t{pid}"); // distinct per run, inside the first 63
+    while long.len() < 64 {
+        long.push('b');
+    }
+    assert_eq!(long.len(), 64);
+    conn.execute(&format!("CREATE TABLE \"{long}\" (c int)"))
+        .await
+        .expect("create");
+    let kept = text(
+        &mut conn,
+        &format!(
+            "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n \
+             ON n.oid = c.relnamespace WHERE n.nspname = 'public' \
+             AND strpos(c.relname, 't{pid}b') = 1"
+        ),
+    )
+    .await;
+    assert_eq!(kept.len(), 63, "{kept}");
+    assert_ne!(kept, long, "the server kept a name it in fact truncated");
+    conn.execute(&format!("DROP TABLE \"{kept}\""))
+        .await
+        .expect("drop");
+
+    // So the dialect refuses the name the server would silently rewrite, and
+    // takes the one it would keep. Bytes, not characters: 32 `ä` is 64 bytes.
+    assert!(Postgres.quote_ident(&long).is_err());
+    assert!(Postgres.quote_ident(&long[..63]).is_ok());
+    assert!(Postgres.quote_ident(&"ä".repeat(32)).is_err());
+    assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
+}

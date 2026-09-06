@@ -3545,3 +3545,39 @@ SPEC is in sync with all of these.
     other side of the seam. One provider makes the ambiguity impossible; naming
     it makes a future second provider unable to change which one this connector
     uses, or to reintroduce the panic.
+    uses, or to reintroduce the panic.
+
+229. **The connection seam dials one TCP endpoint, and refuses every string
+    that means anything else.** `Conn::connect` opens the socket itself, which
+    is what keeps `Connect` and `ConnectTimeout` two errors instead of one
+    (ADR-0014 §3) — so it has to choose a host and a port, and libpq strings can
+    name things that choice cannot honour: a Unix socket path, a `hostaddr` the
+    driver would dial while `host` is what TLS checks, or several hosts to try
+    in turn. Each of those is now a `BadConnectionString` that says which.
+
+    It was a silent fallback to `localhost:5432`, with a comment claiming the
+    connection would then "fail to connect saying so". It would not: a machine
+    configured with a Unix socket is exactly the machine with a server on
+    `localhost:5432`, so the fallback **succeeded**, against a different
+    endpoint under a different authentication method. Supporting these properly
+    is a feature and belongs to whoever needs it; guessing is not the smaller
+    version of it.
+
+230. **Identifier rules are the engine's, measured, and neither is inherited
+    from the SQL Server side.** Two of them, both silent when wrong, both
+    pinned by the live suite against PostgreSQL 18.6:
+
+    - **Case folding is ASCII-only.** `CREATE TABLE AÄ` makes the relation
+      `aÄ`, not `aä` — the server downcases byte by byte and leaves the high
+      bit alone. Rust's `to_lowercase` is Unicode-aware and folded one
+      character too many, so a declaration would have been keyed as a name
+      introspection never returns: drift no apply can settle, and a `CREATE`
+      that makes an object under a name nobody asked for.
+    - **The length limit is 63 *bytes*, and it is enforced here because the
+      server does not enforce it.** It truncates and says so in a `NOTICE`
+      nothing reads. Measured: a longer name records itself at one length and
+      reads back at another, and two names differing only after byte 63 collide
+      — the second `CREATE TABLE` fails with `relation … already exists`,
+      naming a table the declarations do not contain. The SQL Server
+      counterpart counts **characters** (128), so copying its shape would have
+      been wrong in both directions: 32 `ä` is 32 characters and 64 bytes.

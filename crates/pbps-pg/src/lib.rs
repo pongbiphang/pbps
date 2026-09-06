@@ -103,6 +103,24 @@ fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> 
     })
 }
 
+/// PostgreSQL's limit on one identifier: 63 bytes, which is `NAMEDATALEN - 1`.
+///
+/// **Bytes, not characters** — the SQL Server counterpart counts characters
+/// (`ident::MAX_IDENT_CHARS`), and copying that shape here would have been
+/// wrong in both directions. Measured on 18.6: 32 `ä` is 64 bytes and comes
+/// back as 31 of them, truncated on a character boundary.
+///
+/// Enforced rather than left to the server, because the server does not refuse
+/// a longer name — it truncates it and says so in a `NOTICE` nothing here
+/// reads. Measured, both halves of that:
+///
+/// - a name that survives records itself at one length and reads back at
+///   another, which is a drift report that never goes quiet;
+/// - two names differing only after byte 63 **collide** — the second
+///   `CREATE TABLE` fails with `relation "aaa…" already exists`, naming a
+///   table the declarations do not contain.
+const MAX_IDENT_BYTES: usize = 63;
+
 /// The PostgreSQL dialect.
 pub struct Postgres;
 
@@ -155,12 +173,25 @@ impl Dialect for Postgres {
     }
 
     /// Unquoted identifiers fold to **lower** case, where SQL Server folds to
-    /// nothing at all. Measured, and the first thing in this crate that is a
-    /// real answer rather than a refusal, because the loader needs it before
-    /// anything connects.
+    /// nothing at all — and only the ASCII letters fold. The first thing in
+    /// this crate that is a real answer rather than a refusal, because the
+    /// loader needs it before anything connects.
+    ///
+    /// Measured on PostgreSQL 18.6 with `server_encoding` UTF8:
+    /// `CREATE TABLE AÄ` makes the relation **`aÄ`**, not `aä`. The server
+    /// downcases byte by byte and leaves anything with the high bit set alone,
+    /// so a Unicode-aware `to_lowercase` folds one character too many — and a
+    /// name that folds differently from the engine's is a declaration
+    /// introspection can never match. That is drift no apply can settle, and a
+    /// `CREATE` that makes an object under a name nobody asked for.
+    ///
+    /// ASCII-only is also the conservative answer for the encodings this cannot
+    /// see: the server's own rule is ASCII-only for every multibyte encoding,
+    /// and the folding happens in the loader, where there is no connection to
+    /// ask.
     fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str> {
         if ident.bytes().any(|b| b.is_ascii_uppercase()) {
-            Cow::Owned(ident.to_lowercase())
+            Cow::Owned(ident.to_ascii_lowercase())
         } else {
             Cow::Borrowed(ident)
         }
@@ -173,6 +204,12 @@ impl Dialect for Postgres {
             return Err(DialectError::UnquotableIdent(ident.to_owned()));
         }
         if ident.contains('\0') {
+            return Err(DialectError::UnquotableIdent(ident.to_owned()));
+        }
+        // The limit is enforced here because the server does not enforce it:
+        // it **truncates** and says so in a `NOTICE` that nothing reads. See
+        // [`MAX_IDENT_BYTES`].
+        if ident.len() > MAX_IDENT_BYTES {
             return Err(DialectError::UnquotableIdent(ident.to_owned()));
         }
         Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
@@ -247,6 +284,41 @@ mod tests {
         assert_eq!(Postgres.fold_ident("CUSTOMER"), "customer");
         // Already lower: borrowed, not copied.
         assert!(matches!(Postgres.fold_ident("customer"), Cow::Borrowed(_)));
+    }
+
+    /// And it folds the ASCII letters **only**. Measured on 18.6,
+    /// `CREATE TABLE AÄ` makes the relation `aÄ`: the server leaves every byte
+    /// with the high bit set alone. A Unicode-aware fold would key the
+    /// declaration as `aä`, which introspection never returns.
+    #[test]
+    fn folding_leaves_every_letter_the_engine_leaves() {
+        assert_eq!(Postgres.fold_ident("AÄ"), "aÄ");
+        assert_eq!(Postgres.fold_ident("STRASSE"), "strasse");
+        assert_eq!(Postgres.fold_ident("Straße"), "straße");
+        // A name with no ASCII upper case at all is untouched, and borrowed.
+        assert!(matches!(Postgres.fold_ident("Ä"), Cow::Borrowed(_)));
+        assert_eq!(Postgres.fold_ident("Ä"), "Ä");
+    }
+
+    /// The server truncates a long identifier instead of refusing it, and says
+    /// so only in a `NOTICE`. Refusing here is what keeps the model and the
+    /// server naming the same object.
+    #[test]
+    fn a_name_the_server_would_truncate_is_refused_by_bytes_not_characters() {
+        assert!(Postgres.quote_ident(&"a".repeat(MAX_IDENT_BYTES)).is_ok());
+        assert!(
+            Postgres
+                .quote_ident(&"a".repeat(MAX_IDENT_BYTES + 1))
+                .is_err()
+        );
+        // 31 `ä` is 62 bytes and legal; 32 is 64 bytes and is not — measured,
+        // the engine cuts it back to 31 on a character boundary. Counted as
+        // characters this would have been the other way round.
+        let long = "ä".repeat(32);
+        assert_eq!(long.chars().count(), 32);
+        assert_eq!(long.len(), 64);
+        assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
+        assert!(Postgres.quote_ident(&long).is_err());
     }
 
     /// Quoting is what stops a name from being read as syntax, so the

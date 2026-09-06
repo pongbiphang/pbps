@@ -455,6 +455,24 @@ never take the process default**, and **a new TLS or crypto dependency is a
 live-suite change**, because nothing offline can tell you which providers your
 dependency tree ended up with.
 
+## A comment that describes a check the code does not make
+
+Two in one review round, in code written the same week:
+
+- `pbps-db::postgres::endpoint` fell back to `localhost` for a connection
+  string it could not read, under a comment saying the connection would then
+  "fail to connect saying so, instead of silently reaching a different host".
+  It did the second thing: a machine configured with a Unix socket is the
+  machine with a server on `localhost:5432`.
+- `pbps-pg`'s `quote_ident` carried "the engine's own limit is bytes, not
+  characters" and enforced no limit at all, while the SQL Server counterpart it
+  was written from enforces one.
+
+A comment stating a rule reads, to the next person and to the reviewer skimming
+for one, as a rule that is applied. **When a comment names a limit or a
+guarantee, the line that enforces it should be the next one** — and when it
+cannot be, the comment has to say that the check is somewhere else and where.
+
 ## A round trip tested only on the simple case
 
 Two P1s on the `ModuleId` PR (#47) were the same mistake in two places: an

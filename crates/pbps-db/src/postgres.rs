@@ -62,7 +62,7 @@ impl Conn {
         let config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
-        let (host, port) = endpoint(&config);
+        let (host, port) = endpoint(&config)?;
         let addr = format!("{host}:{port}");
 
         // Opening the socket here rather than letting the driver do it is what
@@ -157,34 +157,66 @@ impl Conn {
     }
 }
 
-/// The host and port the two connect errors name, and TLS verifies against.
+/// The one TCP endpoint this seam will dial, or a refusal that names why it
+/// will not dial anything.
 ///
 /// From the parsed `Config`'s host and port lists rather than from one string,
 /// which is the same dialect knowledge that puts parsing behind `connect`
 /// (ADR-0014 §3).
-fn endpoint(config: &Config) -> (String, u16) {
-    let host = config
-        .get_hosts()
-        .iter()
-        // `if let` rather than a match with a wildcard: `Host` carries a Unix
-        // variant on some platforms and not others, so a wildcard arm is
-        // unreachable on one of them and required on the other, and no single
-        // lint expectation is right for both.
-        //
-        // A Unix socket is skipped rather than guessed at: this seam opens a
-        // `TcpStream`, so a config naming only a socket path falls to the
-        // default below and fails to connect saying so, instead of silently
-        // reaching a different host.
-        .find_map(|h| {
-            if let tokio_postgres::config::Host::Tcp(name) = h {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "localhost".to_owned());
+///
+/// A `Result`, and that is a correction. This used to fall back to `localhost`
+/// for anything it did not recognise, with a comment claiming the connection
+/// would then "fail to connect saying so". It would not: `localhost:5432` is
+/// exactly where a machine configured with a Unix socket keeps a real server,
+/// so the fallback reached a different endpoint under a different
+/// authentication method and reported **success**. "This endpoint" and "some
+/// endpoint" are two different things, and a guess is not one of them.
+fn endpoint(config: &Config) -> Result<(String, u16), DbError> {
+    // `hostaddr` is what the driver would dial, leaving `host` for TLS and for
+    // the error text. This seam opens the socket itself, so honouring one and
+    // not the other would dial a server the diagnostics do not name.
+    if !config.get_hostaddrs().is_empty() {
+        return Err(DbError::BadConnectionString(
+            "`hostaddr` is not supported: pbps opens the socket itself, so the \
+             address it dials has to be the one its errors name and TLS verifies \
+             against. Give `host` alone."
+                .to_owned(),
+        ));
+    }
+    let hosts = config.get_hosts();
+    if hosts.len() > 1 {
+        return Err(DbError::BadConnectionString(format!(
+            "this connection string names {} hosts; pbps connects to exactly one. \
+             Trying them in turn is the driver's own failover, and this seam opens \
+             the socket itself so that a refused connection and a dropped one stay \
+             two different errors. Name one host.",
+            hosts.len()
+        )));
+    }
+    let Some(host) = hosts.first() else {
+        return Err(DbError::BadConnectionString(
+            "this connection string names no host".to_owned(),
+        ));
+    };
+    // A `match` with a `cfg`-gated arm rather than an `if let`: `Host::Unix`
+    // exists only on Unix, so an `if let Host::Tcp(_)` is irrefutable on
+    // Windows — a warning there and nowhere else, under a CI that denies them.
+    // This shape is exhaustive on both platforms and wildcards on neither.
+    let name = match host {
+        tokio_postgres::config::Host::Tcp(name) => name.clone(),
+        #[cfg(unix)]
+        tokio_postgres::config::Host::Unix(path) => {
+            return Err(DbError::BadConnectionString(format!(
+                "the Unix socket `{}` cannot be used: pbps opens a `TcpStream` \
+                 itself, so that a refused connection and a firewall that drops \
+                 packets stay two different errors. Give `host=<name>` and a TCP \
+                 port.",
+                path.display()
+            )));
+        }
+    };
     let port = config.get_ports().first().copied().unwrap_or(5432);
-    (host, port)
+    Ok((name, port))
 }
 
 /// The TLS stack, chosen here rather than pinned by the driver.
@@ -312,5 +344,55 @@ impl Row {
             "column `{column}` was read as an unsigned byte, which PostgreSQL has \
              no type for; the query asking for it is wrong"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint_of(connection: &str) -> Result<(String, u16), DbError> {
+        endpoint(&connection.parse::<Config>().expect("a config parses"))
+    }
+
+    /// The ordinary case, and the two things the seam takes from the config
+    /// rather than from the string: the host and port an error will name.
+    #[test]
+    fn a_single_tcp_host_is_the_endpoint_and_the_port_defaults() {
+        assert_eq!(
+            endpoint_of("host=db.example port=6543 user=u").expect("an endpoint"),
+            ("db.example".to_owned(), 6543)
+        );
+        assert_eq!(
+            endpoint_of("host=db.example user=u").expect("an endpoint"),
+            ("db.example".to_owned(), 5432)
+        );
+    }
+
+    /// Everything this seam cannot dial is **refused**, not redirected. Each of
+    /// these used to fall through to `localhost:5432`, which on the machines
+    /// that write them is a real server — so pbps would have connected to a
+    /// different endpoint, under a different authentication method, and called
+    /// it success.
+    #[test]
+    fn an_endpoint_this_seam_cannot_dial_is_refused_and_never_guessed() {
+        for connection in [
+            #[cfg(unix)]
+            "host=/var/run/postgresql user=u",
+            "hostaddr=10.0.0.5 host=db.example user=u",
+            "host=first.example,second.example user=u",
+        ] {
+            let error = endpoint_of(connection).expect_err(connection);
+            assert!(
+                matches!(error, DbError::BadConnectionString(_)),
+                "{connection}: {error:?}"
+            );
+            // Never the fallback that made this a bug: the message has to say
+            // what is wrong with the string, not name a host nobody asked for.
+            assert!(
+                !error.to_string().contains("localhost"),
+                "{connection}: {error}"
+            );
+        }
     }
 }
