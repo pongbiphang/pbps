@@ -1468,8 +1468,29 @@ fn refuse_unplanned_movement(
     // parents is carried for one and not the other. Undoing what *has*
     // happened needs no knowledge of what has not (the same reason `settled`
     // exists, DECISIONS 161).
+    //
+    // A rename is undone only where the two names cannot be confused. If a
+    // read holds *both* spellings, the vacated name has been taken by
+    // something else — another session creating a table under it, or adding a
+    // column back — and rewinding would collapse two identities into one:
+    // a foreign key repointed at the impostor would compare equal to one
+    // still on the original, and SPEC 7.6's promise that an untouched object's
+    // change is caught at the first checkpoint after it lands would be broken.
+    // Left un-rewound, the two spellings simply differ and the read is
+    // refused, which is the safe direction for an ambiguity that a
+    // name-keyed read cannot resolve. The cost is a plan that renames a table
+    // and creates another under the vacated name in one revision: its
+    // untouched children report as moved. Splitting that revision is the
+    // answer, and refusing beats recording another session's write as this
+    // plan's own.
+    let holds = |s: &Schema, a: &TableName, b: &TableName| {
+        s.tables.contains_key(a) && s.tables.contains_key(b)
+    };
     let mut undo = pbps_model::Renames::default();
     for (from, to) in &renamed {
+        if holds(before, from, to) || holds(after, from, to) {
+            continue;
+        }
         undo.rename_table((*to).clone(), (*from).clone());
     }
     // A `RenameColumn` carries its table's *declared* name — the one the
@@ -1478,7 +1499,15 @@ fn refuse_unplanned_movement(
     // (class 2), so at every read a table whose column has been renamed is
     // already under its new name: the key is never a spelling that did not
     // exist yet.
+    let holds_column = |s: &Schema, table: &TableName, a: &str, b: &str| {
+        s.tables
+            .get(table)
+            .is_some_and(|t| t.columns.contains_key(a) && t.columns.contains_key(b))
+    };
     for ((table, to), from) in &renamed_columns {
+        if holds_column(before, table, from, to) || holds_column(after, table, from, to) {
+            continue;
+        }
         undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
     }
 
@@ -5356,17 +5385,53 @@ mod tests {
             ],
         };
 
+        // The parents themselves, so the reads are the shape a real one has:
+        // whether a name has been reused is decided by what each read holds.
+        let with = |first: &str, second: &str, parents: &[&str]| {
+            let mut s = child(first, second);
+            for t in parents {
+                s.tables.insert(t.parse().unwrap(), Table::default());
+            }
+            s
+        };
+
         // The first parent has been renamed and the second has not: the child
         // is spelled one way for one key and the other way for the other.
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &renames,
-            &child("dbo.one", "dbo.two"),
-            &child("dbo.one_x", "dbo.two"),
+            &with("dbo.one", "dbo.two", &["dbo.one", "dbo.two"]),
+            &with("dbo.one_x", "dbo.two", &["dbo.one_x", "dbo.two"]),
             "prod",
             Settled::SoFar,
         )
         .expect("a child carried only halfway");
+
+        // The alias: another session creates a *different* table under the
+        // name the rename vacated, and repoints the untouched child at it.
+        // Undoing collapses the two identities — the checkpoint's `dbo.one_x`
+        // and the closing read's `dbo.one` both rewind to `dbo.one` — and a
+        // real retarget of a table the plan does not touch would be recorded
+        // as the plan's own result, which SPEC 7.6 promises to catch. Holding
+        // both spellings in one read is what says the name has been reused, so
+        // that rename is not undone at all and the difference stands.
+        let e = refuse_unplanned_movement(
+            &pbps_mssql::Mssql,
+            &renames,
+            // The checkpoint the last statement left: both renames done.
+            &with("dbo.one_x", "dbo.two_x", &["dbo.one_x", "dbo.two_x"]),
+            // The read after it: a new `dbo.one` exists and the child points
+            // at it.
+            &with(
+                "dbo.one",
+                "dbo.two_x",
+                &["dbo.one", "dbo.one_x", "dbo.two_x"],
+            ),
+            "prod",
+            Settled::SoFar,
+        )
+        .expect_err("a child repointed at a new table under the vacated name");
+        assert!(format!("{e:#}").contains("dbo.child"), "{e:#}");
 
         // The negative case: a parent this plan never names is movement.
         let e = refuse_unplanned_movement(
