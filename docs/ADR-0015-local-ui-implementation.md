@@ -850,35 +850,43 @@ locked-copy `update-index` ran it), so every `git` also takes
    that tip still is the one already taken. Where `HEAD` names another
    branch, the placed files belong to *that* checkout now and the branch
    the UI advanced has nothing to say about them, so the tip `HEAD`
-   resolves to decides instead — under that branch's own lock, taken here
-   the way the others are (`<git-common-dir>/refs/heads/<target>.lock`,
-   created exclusively) and discarded with them. The name it locks is the
-   one `git symbolic-ref --no-recurse HEAD` answers, the ref `HEAD` names
-   *directly*, and not the branch at the end of a chain, which is what the
-   bare command gives, dereferencing recursively by default (**measured**
-   on git 2.43: with `HEAD` symbolic to `b` and `b` to `d`, `symbolic-ref
-   HEAD` answered `refs/heads/d` where `--no-recurse` answered
-   `refs/heads/b`). Locking the end of a chain leaves every link in it
-   unlocked, and a link is a ref another worktree writes: **measured**,
-   with `HEAD.lock` and `d.lock` both held, `symbolic-ref refs/heads/b
-   refs/heads/e` went through and `rev-parse HEAD` moved from `d`'s tip to
-   `e`'s, while `b`'s own lock refused it. So the UI locks the one ref
-   `HEAD` names, asks under that lock that it is a direct one (`git
-   symbolic-ref refs/heads/<target>` must fail, as step 1 asks of the
+   resolves to decides instead — under that ref's own lock, taken here the
+   way the others are (`<git-common-dir>/<target>.lock`, created
+   exclusively, which is the files backend's protocol whatever the ref is —
+   **measured**: a lock at a tag's path made `update-ref` of that tag fail
+   with `cannot lock ref`) and discarded with them. The name it locks is
+   the one `git symbolic-ref --no-recurse HEAD` answers, the ref `HEAD`
+   names *directly*, and not the branch at the end of a chain, which is
+   what the bare command gives, dereferencing recursively by default
+   (**measured** on git 2.43: with `HEAD` symbolic to `b` and `b` to `d`,
+   `symbolic-ref HEAD` answered `refs/heads/d` where `--no-recurse`
+   answered `refs/heads/b`). The name is taken whole and not assumed to be
+   a branch: `HEAD` can be pointed at any ref under `refs/` (**measured**
+   on git 2.43: `symbolic-ref HEAD refs/tags/t` and `symbolic-ref HEAD
+   refs/remotes/origin/main` were both accepted, a name outside `refs/` was
+   refused with `Refusing to point HEAD outside of refs/`, and `status
+   --porcelain=v2` then reported `# branch.head (null)`), and the placed
+   files sit in that working tree all the same. Locking the end of a chain
+   leaves every link in it unlocked, and a link is a ref another worktree
+   writes: **measured**, with `HEAD.lock` and `d.lock` both held,
+   `symbolic-ref refs/heads/b refs/heads/e` went through and `rev-parse
+   HEAD` moved from `d`'s tip to `e`'s, while `b`'s own lock refused it. So
+   the UI locks the one ref `HEAD` names, asks under that lock that it is a
+   direct one (`git symbolic-ref <target>` must fail, as step 1 asks of the
    branch it composes on and for the same reason), and reads the tip from
-   that name (`git rev-parse refs/heads/<target>`) rather than through
-   `HEAD`, so that the value it decides by is the value its lock holds;
-   between `HEAD`'s lock and that one nothing is left unlocked to move. A
-   target that is itself symbolic is not chased: every link would have to
-   be locked and asked again to hold one tip still, so it decides nothing,
-   and step 2 is undone for every path — the answer the shapes below share.
-   `HEAD` cannot have moved again either, its own lock being held once
-   more; the branch it names can, and being checked out is no protection:
-   **measured** on git 2.43, a plain `update-ref` from another worktree
-   moved a branch a sibling had checked out, and that sibling then reported
-   the path modified. A placed file kept against a tip that moved after it
-   was read is the error this step is correcting, not a smaller one.
-   Reading the advanced branch in both cases kept every placed file on the
+   that name (`git rev-parse <target>`) rather than through `HEAD`, so that
+   the value it decides by is the value its lock holds; between `HEAD`'s
+   lock and that one nothing is left unlocked to move. A target that is
+   itself symbolic is not chased: every link would have to be locked and
+   asked again to hold one tip still, so it decides nothing, and step 2 is
+   undone for every path — the answer the shapes below share. `HEAD` cannot
+   have moved again either, its own lock being held once more; the ref it
+   names can, and being checked out is no protection: **measured** on git
+   2.43, a plain `update-ref` from another worktree moved a branch a
+   sibling had checked out, and that sibling then reported the path
+   modified. A placed file kept against a tip that moved after it was read
+   is the error this step is correcting, not a smaller one. Reading the
+   advanced branch in both cases kept every placed file on the
    `symbolic-ref` path, against a branch nobody is standing on
    (**measured** on git 2.43: after redirecting `HEAD`, advancing the
    original branch and retaining the replacement bytes, the sibling
