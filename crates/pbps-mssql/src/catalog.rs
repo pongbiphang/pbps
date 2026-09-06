@@ -11,7 +11,7 @@ use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
     IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawTable, assemble,
+    RawKeyColumn, RawModule, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the `__pbps_` filter drops this
@@ -268,13 +268,26 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
     for row in conn.query(PERMISSIONS).await? {
         let class: u8 = get(&row, "class")?;
-        // A permission on an object the catalog has no schema for (a dropped
-        // object's orphaned row) has nothing to be declared against. Any
-        // other class has no schema to begin with and is carried as is.
-        let schema = match opt::<&str>(&row, "schema_name")? {
-            Some(schema) => schema.to_owned(),
-            None if matches!(class, 1 | 3) => continue,
-            None => String::new(),
+        // The joined name is NULL for two reasons that the row cannot tell
+        // apart, and neither is "there is nothing here": an object this
+        // connection may not see yields no name while its permission row
+        // still arrives, and so would a dropped object's orphaned row. The
+        // grant is being read either way and its securable cannot be named,
+        // so it travels as unreadable and the assembler reports it. Dropped
+        // here, `pull` wrote a role narrower than the database holds.
+        let securable = match (class, opt::<&str>(&row, "schema_name")?) {
+            (1, Some(schema)) => match opt::<&str>(&row, "object_name")? {
+                Some(name) => Securable::Object {
+                    schema: schema.to_owned(),
+                    name: name.to_owned(),
+                },
+                None => Securable::Unreadable,
+            },
+            (3, Some(schema)) => Securable::Schema(schema.to_owned()),
+            (1 | 3, None) => Securable::Unreadable,
+            // Every other class names nothing a declaration could hold, and
+            // has no schema to begin with.
+            _ => Securable::Unnamed,
         };
         raw.permissions.push(crate::introspect::RawPermission {
             role: get::<&str>(&row, "role_name")?.to_owned(),
@@ -282,8 +295,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             class_desc: get::<&str>(&row, "class_desc")?.trim().to_owned(),
             permission: get::<&str>(&row, "permission_name")?.trim().to_owned(),
             state: get::<&str>(&row, "state")?.to_owned(),
-            schema,
-            object: opt::<&str>(&row, "object_name")?.map(str::to_owned),
+            securable,
             minor_id: get(&row, "minor_id")?,
         });
     }

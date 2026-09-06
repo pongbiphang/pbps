@@ -179,6 +179,35 @@ pub struct RawRole {
     pub name: String,
 }
 
+/// What a permission is on, as far as the catalog could name it.
+///
+/// A class 1 or class 3 row whose joined name came back NULL used to be
+/// dropped, on the reading that it was a dropped object's orphaned row. There
+/// is a second reading, and it is the common one: `sys.objects` and
+/// `sys.schemas` are subject to metadata visibility, so an object the
+/// connected principal holds nothing on — or has `DENY VIEW DEFINITION` on —
+/// yields a NULL name while its `sys.database_permissions` row still arrives.
+/// The grant exists and is being read; only its securable cannot be named. Read
+/// as an absence, `pull` wrote a role narrower than the database holds and the
+/// next `plan` proposed a `REVOKE` of a permission nobody removed — absent,
+/// empty and unreadable being three different things.
+///
+/// Neither reading can be told from the other in the joined row, and neither
+/// changes what the tool may do: a securable it cannot name is one it cannot
+/// compare, so it is reported rather than dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Securable {
+    /// Class 1: an object, in the schema that owns it.
+    Object { schema: String, name: String },
+    /// Class 3: a schema.
+    Schema(String),
+    /// Class 1 or 3 whose name the connection could not read.
+    Unreadable,
+    /// A class with no name to read: the database itself, and the classes the
+    /// model does not hold (a type, an assembly, another principal).
+    Unnamed,
+}
+
 /// One permission row of `sys.database_permissions` granted to a role, on an
 /// object or a schema.
 #[derive(Debug, Clone)]
@@ -196,10 +225,8 @@ pub struct RawPermission {
     pub permission: String,
     /// `G` granted, `W` granted with grant option, `D` denied, `R` revoked.
     pub state: String,
-    /// The schema the object is in, or the schema itself for class 3.
-    pub schema: String,
-    /// The object's name; `None` for a schema-level permission.
-    pub object: Option<String>,
+    /// What the permission is on, as far as the catalog could name it.
+    pub securable: Securable,
     /// `sys.database_permissions.minor_id`: non-zero for a column-level
     /// permission, which the model does not hold.
     pub minor_id: i32,
@@ -888,16 +915,39 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(role) = schema.roles.get_mut(&p.role) else {
             continue;
         };
-        let target = match (p.class, &p.object) {
-            (1, Some(object)) => {
-                pbps_model::GrantTarget::Object(ObjectName::new(p.schema.clone(), object.clone()))
+        let target = match (&p.securable, p.class) {
+            (Securable::Object { schema, name }, _) => {
+                pbps_model::GrantTarget::Object(ObjectName::new(schema.clone(), name.clone()))
             }
-            (3, _) => pbps_model::GrantTarget::Schema(p.schema.clone()),
+            (Securable::Schema(schema), _) => pbps_model::GrantTarget::Schema(schema.clone()),
+            // The grant is there and readable; only its securable is not. It
+            // cannot be named, so it cannot be compared, so it is reported —
+            // dropped, it made `pull` write a role narrower than the database
+            // holds and the next `plan` revoke what nobody removed.
+            (Securable::Unreadable, _) => {
+                unexpressible.push(Unexpressible {
+                    role: p.role.clone(),
+                    target: None,
+                    what: format!(
+                        "role {}: {} is on {} this connection cannot name (the catalog \
+                         returned no name for it, which is what a securable the account \
+                         holds nothing on looks like); the declarations cannot express it",
+                        p.role,
+                        p.permission,
+                        if p.class == 3 {
+                            "a schema"
+                        } else {
+                            "an object"
+                        }
+                    ),
+                });
+                continue;
+            }
             // The database itself (`CONTROL`, `CREATE TABLE`), a type, an
             // assembly, another principal: nothing a declaration can name,
             // and a role that gained one out of band has changed even when
             // every grant the model does hold still matches (DECISIONS 105).
-            (0, _) => {
+            (Securable::Unnamed, 0) => {
                 unexpressible.push(Unexpressible {
                     role: p.role.clone(),
                     target: None,
@@ -948,8 +998,18 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                      express it",
                     p.role,
                     p.permission,
-                    p.schema,
-                    p.object.as_deref().unwrap_or_default()
+                    match &p.securable {
+                        Securable::Object { schema, .. } | Securable::Schema(schema) => schema,
+                        // Neither reaches here: both are reported above,
+                        // before a target exists to be spelled.
+                        Securable::Unreadable | Securable::Unnamed => "",
+                    },
+                    match &p.securable {
+                        Securable::Object { name, .. } => name,
+                        // A schema target has no object half, and the other
+                        // two are reported above.
+                        Securable::Schema(_) | Securable::Unreadable | Securable::Unnamed => "",
+                    }
                 ),
             });
             continue;
@@ -1174,8 +1234,13 @@ mod tests {
             .into(),
             permission: "SELECT".into(),
             state: "G".into(),
-            schema: "dbo".into(),
-            object: object.map(str::to_owned),
+            securable: match object {
+                Some(name) => Securable::Object {
+                    schema: "dbo".into(),
+                    name: name.to_owned(),
+                },
+                None => Securable::Schema("dbo".into()),
+            },
             minor_id: 0,
         };
         raw.permissions.push(grant(Some("customer"), 1));
@@ -1213,8 +1278,10 @@ mod tests {
             class_desc: "OBJECT_OR_COLUMN".into(),
             permission: permission.into(),
             state: "G".into(),
-            schema: "dbo".into(),
-            object: Some("customer".into()),
+            securable: Securable::Object {
+                schema: "dbo".into(),
+                name: "customer".into(),
+            },
             minor_id: 0,
         };
         raw.permissions.push(grant("SELECT"));
@@ -1251,8 +1318,10 @@ mod tests {
             class_desc: "OBJECT_OR_COLUMN".into(),
             permission: "SELECT".into(),
             state: "G".into(),
-            schema: "dbo".into(),
-            object: Some(object.to_owned()),
+            securable: Securable::Object {
+                schema: "dbo".into(),
+                name: object.to_owned(),
+            },
             minor_id: 0,
         };
         raw.permissions.push(grant("customer"));
@@ -1307,8 +1376,10 @@ mod tests {
             class_desc: "OBJECT_OR_COLUMN".into(),
             permission: permission.into(),
             state: state.into(),
-            schema: "dbo".into(),
-            object: Some("customer".into()),
+            securable: Securable::Object {
+                schema: "dbo".into(),
+                name: "customer".into(),
+            },
             minor_id: 0,
         };
         raw.permissions.push(grant("SELECT", "G"));
@@ -1344,6 +1415,70 @@ mod tests {
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
+    /// The row arrives, the grant is real, and only its securable has no
+    /// name: dropped as if it were not there, `pull` wrote a role narrower
+    /// than the database holds and the next `plan` proposed a `REVOKE` of a
+    /// permission nobody removed (issue #93).
+    #[test]
+    fn a_grant_whose_securable_cannot_be_named_is_reported_not_dropped() {
+        let mut raw = one_table_catalog();
+        raw.roles.push(RawRole {
+            name: "app_reader".into(),
+        });
+        let grant = |permission: &str, class: u8, securable: Securable| RawPermission {
+            role: "app_reader".into(),
+            class,
+            class_desc: if class == 1 {
+                "OBJECT_OR_COLUMN"
+            } else {
+                "SCHEMA"
+            }
+            .into(),
+            permission: permission.into(),
+            state: "G".into(),
+            securable,
+            minor_id: 0,
+        };
+        raw.permissions
+            .push(grant("SELECT", 1, Securable::Unreadable));
+        raw.permissions
+            .push(grant("EXECUTE", 3, Securable::Unreadable));
+        // The negative case: a grant whose securable the catalog did name is
+        // still the role's, and costs no report.
+        raw.permissions.push(grant(
+            "SELECT",
+            1,
+            Securable::Object {
+                schema: "dbo".into(),
+                name: "customer".into(),
+            },
+        ));
+
+        let p = assemble(&raw);
+        let targets: Vec<String> = p.schema.roles["app_reader"]
+            .grants
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(targets, ["dbo.customer"]);
+        assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
+        assert!(p.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(
+            p.unexpressible.iter().all(|u| u.target.is_none()),
+            "there is no name to scope the report by: {:?}",
+            p.unexpressible
+        );
+        let what: Vec<&str> = p.unexpressible.iter().map(|u| u.what.as_str()).collect();
+        assert!(
+            what[0].contains("SELECT is on an object this connection cannot name"),
+            "{what:?}"
+        );
+        assert!(
+            what[1].contains("EXECUTE is on a schema this connection cannot name"),
+            "{what:?}"
+        );
+    }
+
     /// A permission at the database, or on a class the model does not hold,
     /// has no target a declaration can name — and a role that gained one has
     /// changed even when its object grants still match (DECISIONS 105).
@@ -1359,8 +1494,7 @@ mod tests {
             class_desc: class_desc.into(),
             permission: permission.into(),
             state: "G".into(),
-            schema: String::new(),
-            object: None,
+            securable: Securable::Unnamed,
             minor_id: 0,
         };
         raw.permissions.push(grant(0, "DATABASE", "CREATE TABLE"));
