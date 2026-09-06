@@ -7,6 +7,7 @@ members = [
     "crates/pbps-diff",
     "crates/pbps-dialect",
     "crates/pbps-mssql",
+    "crates/pbps-pg",
     "crates/pbps-docs",
     "crates/pbps-db",
     "crates/pbps-policy",
@@ -16,7 +17,6 @@ members = [
 # spike: the Phase 0 YAML crate evaluation; removed once the choice is settled
 exclude = ["spikes/yaml-span"]
 
-# pbps-pg arrives in Phase 5
 
 [workspace.package]
 version = "0.0.0"
@@ -33,6 +33,7 @@ pbps-load    = { path = "crates/pbps-load" }
 pbps-diff    = { path = "crates/pbps-diff" }
 pbps-dialect = { path = "crates/pbps-dialect" }
 pbps-mssql   = { path = "crates/pbps-mssql" }
+pbps-pg      = { path = "crates/pbps-pg" }
 pbps-docs    = { path = "crates/pbps-docs" }
 pbps-db      = { path = "crates/pbps-db" }
 pbps-policy  = { path = "crates/pbps-policy" }
@@ -54,6 +55,16 @@ tiberius   = { package = "tiberius-ng", version = "0.13", default-features = fal
 # refuses would otherwise leave a pipeline waiting out the OS retry.
 tokio      = { version = "1", features = ["net", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+
+# PostgreSQL (Phase 5, ADR-0007 decision 5 / ADR-0014). Pure Rust like the SQL
+# Server driver, so §11.3's single static binary still needs nothing installed
+# on the host. TLS is the caller's choice here rather than pinned by the driver
+# — the property ADR-0014's Limits names `tiberius 0.12` as lacking — so it is
+# made explicitly, against the one `rustls` already in this tree.
+tokio-postgres = { version = "0.7", default-features = false }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 
 serde_json = { version = "1", features = ["preserve_order"] }
 

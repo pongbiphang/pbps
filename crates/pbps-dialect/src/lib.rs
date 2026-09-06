@@ -65,6 +65,18 @@ pub enum DialectError {
     #[error("the identifier `{0}` cannot be written into SQL safely")]
     UnquotableIdent(String),
 
+    /// A part of a dialect this build has not implemented **yet**.
+    ///
+    /// Distinct from [`DialectError::Unsupported`], and the distinction is the
+    /// whole reason it exists: "this database has no such feature" and "pbps
+    /// cannot do this here yet" send a reader to two different places, and a
+    /// dialect arriving one step at a time (Phase 5) would otherwise have to
+    /// tell the first lie to report the second. Returning an empty answer
+    /// instead is the one thing neither may do — a plan that applies cleanly
+    /// and changes nothing is the silent wrong answer.
+    #[error("the {dialect} dialect does not implement {part} yet")]
+    NotBuilt { dialect: &'static str, part: String },
+
     /// A declaration that parses but that this dialect will not accept — a
     /// primary key over a column that does not exist, an IDENTITY on a type that
     /// cannot carry one. Distinct from [`DialectError::Unsupported`], which says

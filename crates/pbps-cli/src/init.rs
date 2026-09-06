@@ -160,7 +160,8 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 )
             })?;
             let pulled = db::runtime()?.block_on(async {
-                let mut conn = pbps_db::Conn::connect(&connection).await?;
+                let mut conn =
+                    pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
                 pbps_mssql::catalog::introspect(&mut conn).await
             })?;
             let ids = mint_ids(&pulled.schema, &root)?;

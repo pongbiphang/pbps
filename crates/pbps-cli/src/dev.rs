@@ -190,7 +190,12 @@ async fn run(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
-    let mut conn = Conn::connect(connection)
+    // SQL Server, named rather than threaded through: the rehearsal runs
+    // against the throwaway container this module starts, and that container is
+    // `mcr.microsoft.com/mssql/server` on port 1433. When `--dev` learns to
+    // rehearse on PostgreSQL, this is one of the two places that has to say so
+    // — the other is `DevServer` below.
+    let mut conn = Conn::connect(pbps_db::Driver::Mssql, connection)
         .await
         .context("cannot reach the dev database")?;
 
@@ -542,7 +547,7 @@ impl Container {
         let rt = db::runtime()?;
         loop {
             if rt.block_on(async {
-                match Conn::connect(&self.connection).await {
+                match Conn::connect(pbps_db::Driver::Mssql, &self.connection).await {
                     Ok(mut c) => c.query("SELECT 1 AS ok;").await.is_ok(),
                     Err(_) => false,
                 }

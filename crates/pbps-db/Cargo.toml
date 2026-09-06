@@ -10,13 +10,22 @@ repository.workspace = true
 [dependencies]
 pbps-model.workspace = true
 # For `TransactionFraming` only: the text of begin/commit/rollback is the
-# dialect's, so this crate holds no T-SQL (ADR-0014 §2).
+# dialect's, so this crate holds no engine SQL (ADR-0014 §2).
 pbps-dialect.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tiberius.workspace = true
 tokio.workspace = true
+# One driver per module, named nowhere else in the workspace: `tiberius` in
+# `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 214).
+tiberius.workspace = true
 tokio-util.workspace = true
+tokio-postgres.workspace = true
+# TLS for the PostgreSQL driver, chosen here because `tokio-postgres` leaves it
+# to the caller — the property ADR-0014's Limits name `tiberius 0.12` as
+# lacking. The same `rustls` the other driver already resolves.
+tokio-postgres-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 
 [lints]
 workspace = true
