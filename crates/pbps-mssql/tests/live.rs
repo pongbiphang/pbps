@@ -36,8 +36,9 @@ use pbps_mssql::Mssql;
 ///
 /// The driver is named here, once, rather than at each call site below: every
 /// test in this file speaks to the container `scripts/live-tests.sh` starts,
-/// and repeating that fact 24 times would say nothing the file header does not
-/// already say. A PostgreSQL live suite is Phase 5 step 10 and gets its own.
+/// and repeating that fact at each of them would say nothing the file header
+/// does not already say. The PostgreSQL live suite is `pbps-pg`'s own, started
+/// by `scripts/live-tests-pg.sh`.
 async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbError> {
     pbps_db::Conn::connect(pbps_db::Driver::Mssql, connection).await
 }
@@ -1964,9 +1965,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
         db.name
     );
 
-    let mut lp = Conn::connect(&as_login)
-        .await
-        .expect("connect as the login");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
     // The premise, stated rather than assumed: the catalog really does hide the
     // ledger from this principal, so the old guard really would have said absent.
     let hidden = lp
@@ -2007,7 +2006,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
         "{base_no_credentials};User Id={login};Password={password};Database={}",
         fresh.name
     );
-    let mut none = Conn::connect(&as_login_fresh).await.expect("connect");
+    let mut none = connect_live(&as_login_fresh).await.expect("connect");
     assert!(
         !pbps_mssql::state::is_initialized(&mut none)
             .await
@@ -2019,7 +2018,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
     drop(none);
     fresh.drop().await;
     db.drop().await;
-    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let mut admin = connect_live(&conn_str()).await.expect("connect");
     let _ = admin
         .execute(&format!(
             "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"

@@ -11,8 +11,9 @@ use std::process::{Command, Output};
 ///
 /// The driver is named here, once, rather than at each call site below: every
 /// test in this file speaks to the container `scripts/live-tests.sh` starts,
-/// and repeating that fact 67 times would say nothing the file header does not
-/// already say. A PostgreSQL live suite is Phase 5 step 10 and gets its own.
+/// and repeating that fact at each of them would say nothing the file header
+/// does not already say. The PostgreSQL live suite is `pbps-pg`'s own, started
+/// by `scripts/live-tests-pg.sh`.
 async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbError> {
     pbps_db::Conn::connect(pbps_db::Driver::Mssql, connection).await
 }
@@ -10021,7 +10022,7 @@ fn state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_serv
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let mut conn = connect_live(&connection).await.expect("connect");
             pbps_mssql::state::lock(&mut conn, "state-list-test")
                 .await
                 .expect("lock");
@@ -10093,7 +10094,7 @@ fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            let mut conn = connect_live(&connection).await.expect("connect");
             pbps_mssql::state::lock(&mut conn, "state-list-broken")
                 .await
                 .expect("lock");
