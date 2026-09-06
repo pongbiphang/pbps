@@ -24,6 +24,8 @@ use std::borrow::Cow;
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
+mod types;
+
 /// A part of the dialect that Phase 5 has not built yet.
 ///
 /// One place, so that "what is missing" is a list rather than a habit, and so
@@ -32,7 +34,6 @@ use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 /// pbps cannot do, and it does not pretend the answer is "nothing to do".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
-    TypeCatalogue,
     Introspection,
     Emitter,
     Modules,
@@ -45,7 +46,6 @@ pub enum Unbuilt {
 impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
-            Unbuilt::TypeCatalogue => "the type catalogue (Phase 5 step 2)",
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
             Unbuilt::Emitter => "generating statements (Phase 5 step 4)",
             Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
@@ -62,45 +62,6 @@ impl Unbuilt {
             part: self.step().to_owned(),
         }
     }
-}
-
-/// The `serial` family: spellings that are not types (ADR-0011 Amendment 3).
-///
-/// Refused rather than normalized, and the reason is the contract on
-/// [`Dialect::normalize_type`] — its output is what introspection reads back
-/// for a column declared that way. PostgreSQL expands each of these into an
-/// integer column plus an owned sequence and reads the column back as that
-/// integer type, so no normalization can make the declared spelling equal the
-/// one that comes back. Left alone it is a schema that differs from itself on
-/// every run: the permanent phantom change.
-///
-/// The replacement is named in the refusal, because ADR-0010 §7 measured that
-/// it also disposes of a second problem: an identity column needs no sequence
-/// privilege, and a `serial` one does (`ERROR: permission denied for sequence
-/// ser_id_seq`). Measured on PostgreSQL 18.6 by the live suite in this crate,
-/// which is where the read-back spellings below come from (DECISIONS 227).
-fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> {
-    let base = ty.base.to_ascii_lowercase();
-    let reads_back = match base.as_str() {
-        "smallserial" | "serial2" => "smallint",
-        "bigserial" | "serial8" => "bigint",
-        "serial" | "serial4" => "integer",
-        // Not one of them, and that is the answer: this function refuses a
-        // closed list and normalizes nothing.
-        _ => return None,
-    };
-    let at = column.map_or_else(String::new, |name| format!("column `{name}`: "));
-    Some(DialectError::Invalid {
-        dialect: "postgres",
-        message: format!(
-            "{at}`{declared}` is a macro, not a type. The column is created as `{reads_back}` \
-             with an owned sequence, and `{reads_back}` is what introspection reads back, so a \
-             declared `{declared}` would differ from itself on every run. Declare \
-             `{reads_back}` with an `identity:` instead, which this engine emits as \
-             GENERATED ... AS IDENTITY and which needs no sequence privilege.",
-            declared = ty.base,
-        ),
-    })
 }
 
 /// PostgreSQL's limit on one identifier: 63 bytes, which is `NAMEDATALEN - 1`.
@@ -155,21 +116,12 @@ impl Dialect for Postgres {
         }
     }
 
-    /// The catalogue is step 2, so almost everything here is still a refusal —
-    /// but the contract this method carries rules one family of spellings out
-    /// for good, and that refusal is not "not built yet". See [`refuse_serial`].
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-        if let Some(refusal) = refuse_serial(ty, None) {
-            return Err(refusal);
-        }
-        Err(Unbuilt::TypeCatalogue.refuse())
+        types::normalize(ty)
     }
 
-    fn type_change_risk(&self, _from: &ColumnType, _to: &ColumnType) -> TypeChangeRisk {
-        // Not a refusal, because the signature has nowhere to put one — so it
-        // answers with the class that stops a plan rather than the one that
-        // waves it through. An unbuilt catalogue must never read as "safe".
-        TypeChangeRisk::Narrowing
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+        types::change_risk(from, to)
     }
 
     /// Unquoted identifiers fold to **lower** case, where SQL Server folds to
@@ -215,18 +167,26 @@ impl Dialect for Postgres {
         Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
     }
 
-    /// Every column is checked for the one thing this crate can already answer.
-    /// A `serial` has to be refused **by name** rather than swallowed by "the
-    /// type catalogue is not built yet": the second sends its reader away to
-    /// wait for a release, and the first is a declaration to change today.
+    /// Every column's type, through the catalogue.
+    ///
+    /// A `serial` is refused **by name** here rather than by the same message
+    /// the catalogue gives elsewhere, because this is where a user is looking
+    /// at the declaration: the refusal names the column to change, and the one
+    /// from `normalize_type` cannot.
+    ///
+    /// Returns every problem rather than the first — a schema with three
+    /// unspellable columns should need one pass, not three.
     fn validate_table(&self, _name: &TableName, table: &Table) -> Vec<DialectError> {
-        let mut found: Vec<_> = table
+        table
             .columns
             .iter()
-            .filter_map(|(name, column)| refuse_serial(&column.ty, Some(name.as_str())))
-            .collect();
-        found.push(Unbuilt::TypeCatalogue.refuse());
-        found
+            .filter_map(
+                |(name, column)| match types::refuse_serial(&column.ty, Some(name)) {
+                    Some(named) => Some(named),
+                    None => types::normalize(&column.ty).err(),
+                },
+            )
+            .collect()
     }
 
     fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
@@ -244,7 +204,6 @@ mod tests {
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
-            Unbuilt::TypeCatalogue,
             Unbuilt::Introspection,
             Unbuilt::Emitter,
             Unbuilt::Modules,
@@ -267,13 +226,14 @@ mod tests {
     /// error, and the type is what makes that so.
     #[test]
     fn an_unbuilt_emitter_is_an_error_and_not_an_empty_plan() {
-        let risk = Postgres.type_change_risk(&ty("int"), &ty("bigint"));
-        assert_eq!(
-            risk,
-            TypeChangeRisk::Narrowing,
-            "an unbuilt catalogue must not answer `Safe`"
-        );
-        assert!(Postgres.normalize_type(&ty("int")).is_err());
+        let change = Change::DropTable {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: "app.t".parse().expect("a table name parses"),
+        };
+        let refusal = Postgres
+            .emit(&change, Strategy::default())
+            .expect_err("nothing can be emitted yet");
+        assert!(refusal.to_string().contains("Phase 5 step 4"), "{refusal}");
     }
 
     /// Unquoted identifiers fold down, not away: this is the difference from
@@ -392,12 +352,16 @@ mod tests {
     /// same letters is the catalogue's business, not this refusal's.
     #[test]
     fn a_type_that_is_not_in_the_serial_family_is_left_to_the_catalogue() {
-        for spelling in ["integer", "serialized", "bigserialx", "text"] {
+        for spelling in ["integer", "text"] {
+            assert!(Postgres.normalize_type(&ty(spelling)).is_ok(), "{spelling}");
+        }
+        for spelling in ["serialized", "bigserialx"] {
             let message = Postgres
                 .normalize_type(&ty(spelling))
-                .expect_err("the catalogue is not built")
+                .expect_err("the catalogue does not hold it")
                 .to_string();
-            assert!(message.contains("does not implement"), "{message}");
+            assert!(message.contains("has no type"), "{message}");
+            assert!(!message.contains("macro, not a type"), "{message}");
         }
     }
 
@@ -420,14 +384,24 @@ mod tests {
             .collect();
         assert_eq!(serial.len(), 1, "{found:?}");
         assert!(serial[0].contains("column `id`"), "{}", serial[0]);
-        // The catalogue is still unbuilt, and saying so is not optional: a
-        // table that validates clean here would be the silent wrong answer.
-        assert!(
-            found
-                .iter()
-                .any(|e| e.to_string().contains("does not implement")),
-            "{found:?}"
-        );
+        // And the `text` column beside it is fine, so the refusal names the
+        // one declaration to change rather than the whole table.
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// A column the catalogue cannot spell is reported here too, where a user
+    /// is looking at the declaration — `validate` is the command that exists
+    /// to say so before anything connects.
+    #[test]
+    fn validating_a_table_reports_every_type_it_cannot_spell() {
+        let mut table = Table::default();
+        for (name, ty_) in [("a", "widget"), ("b", "timestamp(3)"), ("c", "integer")] {
+            table
+                .columns
+                .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));
+        }
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     fn ty(s: &str) -> ColumnType {

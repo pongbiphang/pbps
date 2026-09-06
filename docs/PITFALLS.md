@@ -459,6 +459,28 @@ emitted. The repair is one predicate all three call.
 the caller the finding happened to name.** A rule that lives in three places is
 three chances to be measured once and fixed once.
 
+## The engine accepted the declaration and stored a different one
+
+Not an error, not a warning worth the name, and not visible again until the
+next run reports a change nobody made. Measured on PostgreSQL 18.6:
+
+| Declared | Stored | How you find out |
+|---|---|---|
+| an identifier of 64 bytes | truncated to 63 | a `NOTICE` nothing reads |
+| `interval(7)` | `interval(6)` | nothing at all |
+| `time(7)`, `timestamp(7)` | `time(6)`, `timestamp(6)` | nothing at all |
+
+Each one records itself at one value and reads back at another, so the drift
+report never goes quiet and no plan can settle it — and each is *accepted*,
+which is why none of them shows up in a test that only checks statements
+succeed. Two names differing after byte 63 go further and **collide**: the
+second `CREATE TABLE` fails naming a table the declarations do not contain.
+
+**The rule.** A dialect enforces the engine's limits itself wherever the engine
+*adjusts* rather than refuses. Where the engine refuses, the limit may be left
+to it — the failure is loud and names itself. The two are found the same way,
+and only one way: declare the out-of-range value and read the catalog back.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

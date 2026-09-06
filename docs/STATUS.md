@@ -206,8 +206,25 @@ lexis instead of inheriting SQL Server's scanner (DECISIONS 226), and
 `normalize_type` has a stated contract under which `serial` is refused rather
 than normalized (DECISIONS 227). A PostgreSQL live suite runs against a
 digest-pinned server, and found on its first connection that the seam panicked
-where two rustls providers were compiled in (DECISIONS 228). What remains is
-steps 2 to 10: the type catalogue, introspection, the emitter, modules, roles,
+where two rustls providers were compiled in (DECISIONS 228).
+
+Step 2 of ten (issue #77) is the **type catalogue**: what the engine spells
+back, and how safe it is to change one type into another. Every row was
+measured on the pinned server and the live suite re-measures it — each declared
+spelling created and read back through `format_type`, and a twenty-by-twenty
+matrix of `ALTER COLUMN ... TYPE` on an empty table, which is what defines
+`Incompatible` (DECISIONS 240, 243). The catalogue is closed and its bounds are
+the engine's rather than SQL Server's, including two the engine does not
+enforce for you. Two declarations are refused for a reason that is not about
+PostgreSQL at all: an array, and a precision on `time` or `timestamp`, which
+this engine spells inside the name (`timestamp(3) with time zone`) and a
+`ColumnType` has nowhere to put — the model change that lifts both is issue
+#130 (DECISIONS 242). ADR-0012 §3's boundary is written down with the catalogue
+rather than with the estimate that will use it: `integer -> bigint` rewrites a
+million-row table under a lock that blocks readers and is still `Safe`, because
+risk is about loss and never about duration (DECISIONS 241).
+
+What remains is steps 3 to 10: introspection, the emitter, modules, roles,
 reference data, the ledger, probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
