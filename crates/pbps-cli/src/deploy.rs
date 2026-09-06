@@ -1496,7 +1496,7 @@ fn refuse_unplanned_movement(
     // A `RenameColumn` carries its table's *declared* name — the one the
     // rename leaves it under — which is already the key this map wants. And
     // `order_key` runs the table renames (class 1) before the column renames
-    // (class 2), so at every read a table whose column has been renamed is
+    // (class 3), so at every read a table whose column has been renamed is
     // already under its new name: the key is never a spelling that did not
     // exist yet.
     let holds_column = |s: &Schema, table: &TableName, a: &str, b: &str| {

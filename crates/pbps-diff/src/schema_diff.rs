@@ -1185,14 +1185,15 @@ fn diff_modules(
 
 /// The order of application.
 ///
-/// Renames come first, so every later step can use current names. Dropping
-/// constraints and indexes must precede dropping columns, since they may
-/// reference those columns; adding them must follow adding columns.
+/// The table rename comes first, so every later step can use current names,
+/// and the constraint and index drops come next: they must precede both the
+/// column renames they would otherwise block and the column drops they
+/// reference. Adding them back must follow adding columns.
 /// Inserting a class shifts every class below it, and these ordinals are
 /// quoted in prose that uses them to justify behaviour: DECISIONS 140, 146,
-/// 151 and 174, `docs/PITFALLS.md`, and `preflight.rs`. A new class means
-/// renumbering those in the same commit — a stale ordinal there reads as a
-/// statement about the code and is not checked against it.
+/// 151, 174 and 237, `docs/PITFALLS.md`, `preflight.rs` and `deploy.rs`. A new
+/// class means renumbering those in the same commit — a stale ordinal there
+/// reads as a statement about the code and is not checked against it.
 fn order_key(c: &Change) -> u8 {
     match c {
         // Modules go first and last, and both ends are load-bearing. A
@@ -1205,6 +1206,26 @@ fn order_key(c: &Change) -> u8 {
         Change::DropRole { .. } => 0,
         // A table rename, and a role rename that depends on nothing here.
         Change::RenameTable { .. } | Change::RenameRole { .. } => 1,
+        // Before the column renames, and after the table rename that gives
+        // these drops the name they use.
+        //
+        // The engine refuses `sp_rename` on a column a check constraint or a
+        // filtered index's predicate names — 15336 for the check, 5074 with
+        // 4922 behind it for the index, measured — so for those two the drop
+        // is what makes the rename possible, and running it after was a valid,
+        // reviewed plan the engine would not perform. The re-add stays in the
+        // constraint class far below, where the new spelling can be written.
+        //
+        // The whole group moves, not the two kinds that need it. Measured, a
+        // rename is never blocked by a constraint that does not name the
+        // column, so moving the rest costs nothing — and the alternative is
+        // asking which columns a check's expression names, which this tool
+        // deliberately never parses (DECISIONS 174). `DropForeignKey`'s rank
+        // travels with them and still puts it ahead of the key it references.
+        Change::DropIndex { .. }
+        | Change::DropUnique { .. }
+        | Change::DropForeignKey { .. }
+        | Change::DropCheck { .. } => 2,
         // A class of its own, after the table renames: `sp_rename` on a column
         // names the table, and `resolve_columns` iterates the *declared*
         // schema, so a `RenameColumn` always carries the post-rename table.
@@ -1216,27 +1237,25 @@ fn order_key(c: &Change) -> u8 {
         // so the two were sorted against two different names for one table and
         // the alphabet decided: `dbo.customers` -> `dbo.clients` put the
         // column rename first, against a table that did not exist yet.
-        Change::RenameColumn { .. } => 2,
+        Change::RenameColumn { .. } => 3,
         // After the renames, so a revoke names the role and the object as
-        // they now are; before the drops, though a revoke on an object this
-        // plan drops is never emitted (see `diff_roles`).
-        Change::Revoke { .. } => 3,
-        Change::DropIndex { .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. } => 3,
-        Change::DropColumn { .. } => 4,
-        Change::DropTable { .. } => 5,
-        Change::CreateTable { .. } => 6,
-        Change::AddColumn { .. } => 7,
+        // they now are. It shared a class with the drops above until they
+        // moved ahead of the renames; it has the opposite need, so it stayed
+        // and took a class of its own. A revoke on an object this plan drops
+        // is never emitted (see `diff_roles`).
+        Change::Revoke { .. } => 4,
+        Change::DropColumn { .. } => 5,
+        Change::DropTable { .. } => 6,
+        Change::CreateTable { .. } => 7,
+        Change::AddColumn { .. } => 8,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 8,
-        Change::SetColumnDeprecated { .. } => 9,
+        | Change::AlterColumnDefault { .. } => 9,
+        Change::SetColumnDeprecated { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
-        Change::InsertRow { .. } | Change::UpdateRow { .. } => 10,
+        Change::InsertRow { .. } | Change::UpdateRow { .. } => 11,
         // Rows leave after every insert and update, and after the foreign keys
         // that could block them are gone. No single order satisfies every
         // shape — a delete-then-insert on a table with a UNIQUE elsewhere
@@ -1247,20 +1266,20 @@ fn order_key(c: &Change) -> u8 {
         // at the old one when the old one goes, and `ON DELETE CASCADE` takes
         // the child with it, after which the update touches zero rows and
         // nothing says so.
-        Change::DeleteRow { .. } => 11,
+        Change::DeleteRow { .. } => 12,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
-        | Change::AddIndex { .. } => 12,
-        Change::CreateModule { .. } | Change::AlterModule { .. } => 13,
+        | Change::AddIndex { .. } => 13,
+        Change::CreateModule { .. } | Change::AlterModule { .. } => 14,
         // A grant names an object, so it comes after every object exists —
         // and after the role does.
-        Change::CreateRole { .. } => 14,
-        Change::Grant { .. } => 15,
+        Change::CreateRole { .. } => 15,
+        Change::Grant { .. } => 16,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
-        Change::SetDataMode { .. } => 16,
+        Change::SetDataMode { .. } => 17,
     }
 }
 /// The defaults an inserted row is left to: every column the row omits, the
@@ -2651,7 +2670,7 @@ mod tests {
     /// column's table as the declaration does, because by the time the drop
     /// runs the rename has already happened.
     ///
-    /// `order_key` puts `RenameTable` at 1 and `DropColumn` at 4, so the
+    /// `order_key` puts `RenameTable` at 1 and `DropColumn` at 5, so the
     /// statements are emitted in that order. Built from the base side's
     /// `ColumnRef` — which every sibling change in that loop is not — the plan
     /// read `sp_rename 'dbo.customers', 'clients'` and then
@@ -3304,13 +3323,159 @@ mod tests {
         assert_eq!(
             kinds(&cs),
             [
-                "RenameColumn",
                 "DropCheck",
                 "DropUnique",
+                "RenameColumn",
                 "AddCheck",
                 "AddUnique"
             ],
             "{cs:?}"
+        );
+    }
+
+    /// A check constraint is dropped **before** the rename it blocks.
+    ///
+    /// `sp_rename` on a column a check names is refused outright — 15336,
+    /// `the object participates in enforced dependencies` (measured) — so the
+    /// drop and re-add #123 leaves in place is not enough on its own: it has
+    /// to happen in that order. With `DropCheck` after `RenameColumn` the plan
+    /// renamed first and the engine refused the statement, which is a valid,
+    /// reviewed plan refused.
+    ///
+    /// The re-add stays where it was, in the constraint class after the
+    /// renames, which is where the new expression can be written.
+    #[test]
+    fn a_check_is_dropped_before_the_rename_it_blocks() {
+        let mut base_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+        ]);
+        base_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "old > 0".into(),
+            },
+        );
+        let mut want_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+        ]);
+        want_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "new > 0".into(),
+            },
+        );
+
+        let cs = run(
+            &schema_of("dbo.t", base_t),
+            &schema_of("dbo.t", want_t),
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropCheck", "RenameColumn", "AddCheck"],
+            "the check has to be gone before the engine will rename the column"
+        );
+    }
+
+    /// The same for a filtered index, which the engine refuses with 5074,
+    /// `the index is dependent on column`, and 4922 behind it, `one or more
+    /// objects access this column`. A driver sees the first, `TRY`/`CATCH` the
+    /// last; both are the same refusal.
+    ///
+    /// The predicate is opaque text this tool never rewrites, so the two sides
+    /// differ on it and the drop-and-add is real; only its order was wrong.
+    #[test]
+    fn a_filtered_index_is_dropped_before_the_rename_it_blocks() {
+        let ix = |column: &str| Index {
+            columns: vec![IndexColumn {
+                name: column.into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: Some(format!("[{column}] IS NOT NULL")),
+        };
+        let mut base_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+        ]);
+        base_t.indexes.insert("ix_t".into(), ix("old"));
+        let mut want_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+        ]);
+        want_t.indexes.insert("ix_t".into(), ix("new"));
+
+        let cs = run(
+            &schema_of("dbo.t", base_t),
+            &schema_of("dbo.t", want_t),
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropIndex", "RenameColumn", "AddIndex"],
+            "the filtered index has to be gone before the rename"
+        );
+    }
+
+    /// And the drops still come *after* the table rename, because they name
+    /// the table: measured, a table rename is not blocked by either a check or
+    /// a filtered index, so there is nothing to gain by moving them ahead of
+    /// it — and a drop emitted before `sp_rename` would name a table that no
+    /// longer exists, which is the shape #118 fixed.
+    #[test]
+    fn the_drops_that_unblock_a_rename_still_follow_the_table_rename() {
+        let mut base_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+        ]);
+        base_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "old > 0".into(),
+            },
+        );
+        let mut want_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+        ]);
+        want_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "new > 0".into(),
+            },
+        );
+
+        let cs = run(
+            &schema_of("dbo.customers", base_t),
+            &schema_of("dbo.clients", want_t),
+            &[
+                Intent::RenameTable {
+                    from: "dbo.customers".parse().unwrap(),
+                    to: "dbo.clients".parse().unwrap(),
+                },
+                Intent::RenameColumn {
+                    table: "dbo.clients".parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["RenameTable", "DropCheck", "RenameColumn", "AddCheck"],
+            "the drop names the table, so it follows the rename that gives it \
+             that name"
         );
     }
 
@@ -3353,8 +3518,11 @@ mod tests {
 
         assert_eq!(
             kinds(&cs),
-            ["RenameColumn", "DropIndex", "DropColumn"],
-            "an index must be dropped before the column it references"
+            ["DropIndex", "RenameColumn", "DropColumn"],
+            "an index must be dropped before the column it references, and the \
+             whole drop class now runs before the column renames — this index \
+             blocks neither, which is the point: the ordering is uniform, not \
+             conditional on what a constraint happens to name"
         );
     }
 
@@ -4160,6 +4328,49 @@ mod tests {
             );
             // And the grant comes after the create, which comes after the drop.
             assert!(drop < create && create < grant, "{drop} {create} {grant}");
+        }
+
+        /// A revoke still follows the column renames, though the constraint
+        /// drops it used to share an ordering class with have moved ahead of
+        /// them.
+        ///
+        /// The drops moved because the engine refuses a rename while a check
+        /// or a filtered index names the column. A revoke has the opposite
+        /// need — it names the object as the renames leave it — so it could
+        /// not travel with them and took a class of its own. This is the
+        /// negative case for that split: nothing about the move may drag the
+        /// revoke forward with it.
+        #[test]
+        fn a_revoke_stays_behind_the_renames_the_drops_moved_ahead_of() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "app",
+                role(&[("dbo.customer", &[Permission::Insert])]),
+            )]);
+            let mut declared = side(&[("r_aaaaaa", "app", role(&[]))]);
+            // And a column of that table is renamed in the same plan.
+            let t = declared
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse::<TableName>().unwrap())
+                .unwrap();
+            t.columns.clear();
+            t.columns
+                .insert("row_id".to_owned(), Column::new("int".parse().unwrap()));
+            declared.1.columns.insert(
+                "c_aaaaaa".parse().unwrap(),
+                "dbo.customer.row_id".parse().unwrap(),
+            );
+
+            // `describe` names the role changes; a column rename falls to its
+            // discriminant, which is all this test needs from it.
+            let k = kinds(&base, &declared);
+            let at = |s: &str| {
+                k.iter()
+                    .position(|c| c.starts_with(s))
+                    .unwrap_or_else(|| panic!("{s} in {k:?}"))
+            };
+            assert!(at("Discriminant") < at("revoke"), "{k:?}");
         }
 
         /// The ordering: a revoke after the renames it may depend on, a grant
