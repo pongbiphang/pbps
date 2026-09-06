@@ -196,10 +196,18 @@ step made in the CLI user's own order, in this order:
   still names each entry from the worktree root (**measured**) — regular-file
   entries only, under `<git-dir>/pbps-ui/intent/<random>/`, under the path
   rules step 3 states). It holds the tip's `pbps.yml`, so the compose is
-  refused first if `pbps.yml` is modified in the working tree (`git status
-  --porcelain -z -- <project_file>` not empty): the working tree's
-  configuration would answer the next question differently, and the user
-  commits the configuration first, as they would before `pbps rename`.
+  refused first unless the working tree's `pbps.yml` is that same file:
+  its bytes, read through its handle, must hash to the tip's entry and
+  that entry must be a regular file at the mode the file has, and `git
+  ls-files -v -- <project_file>` must answer `H`. Not `git status`, which
+  the user's own index flags can silence: a `pbps.yml` marked
+  `--assume-unchanged` or `--skip-worktree` is absent from the porcelain
+  listing however much it differs (**measured**: with the file edited,
+  `status` listed it, and under each flag listed nothing, while
+  `ls-files -v` said `h` and `S` and the file's hash differed from the
+  tip's). The working tree's configuration would answer the next question
+  differently, and the user commits the configuration first, as they would
+  before `pbps rename`.
 - **Where the inputs are.** The UI asks the CLI, in the snapshot: `pbps
   doctor --format json --no-input --project <snapshot project>`, whose
   envelope carries `declarations` and `identity_file` as the CLI resolved
@@ -777,9 +785,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    UI's commit — a `symbolic-ref` in the gap leaves the branch at that
    commit, but a sibling worktree's `update-ref` or `reset` leaves it at
    something else entirely, and the earlier rule kept the files on a
-   premise that had stopped being true. So the UI reads that tip's blob
-   for each edited path (`git ls-tree -z <tip> -- <path>`) and keeps the
-   placed file where the tip holds exactly what was placed, and undoes
+   premise that had stopped being true. So the UI reads that tip's whole
+   entry for each edited path (`git ls-tree -z <tip> -- <path>`: the mode
+   and the object id, not the id alone, since the same blob at `100755`
+   is a file the placed one does not match, and a `120000` or `160000`
+   entry with that id is not a file at all) and keeps the placed file
+   where the tip holds exactly what step 3 recorded, and undoes
    step 2 for the path where it does not, leaving each path at what the
    branch it is on records. The page then names the commit, the tip the
    branch actually holds, and every path with what became of it, since
@@ -795,6 +806,30 @@ locked-copy `update-index` ran it), so every `git` also takes
    `git status` is clean for what the UI did and untouched for everything
    else, and the entries replaced were the tip's, as step 1 established and
    the lock preserved.
+
+Steps 5 and 6 are two durable writes with a gap between them, and a
+process killed or a machine stopped in that gap leaves the branch at the
+new commit, the working tree holding the placed files, and the index at
+its old contents — a state whose ordinary remedy makes it worse: deleting
+the leftover `<index>.lock`, which is what one does with a stale lock,
+leaves every composed path staged as a reversion of the commit that was
+just made (**measured**: interrupted there, `git status` reported `MM` for
+the path, and deleting the lock left it reporting the same). The gap
+cannot be closed — a ref and an index are two files — so it is made
+recoverable instead. Before step 5 the UI writes
+`<git-dir>/pbps-ui/composing/<random>.json` and flushes it and its
+directory: the branch, the tip it leased, the commit's id, every edited
+path, and the hash of the prepared `<index>.lock` as it stands. Step 6
+removes that record after the rename. At launch, and before it offers to
+compose, the UI reads every record it finds and acts only where the
+evidence is unambiguous: where the branch names the record's commit and
+`<index>.lock` is still there and still hashes to what the record says,
+it finishes what was interrupted — the same rename, the same result —
+and says on the page that it did; in every other case it changes nothing
+and shows the record, the branch's actual tip, and the commands, because
+a lock that has changed is another `git`'s, and a branch that has moved
+is a state only the user can judge. A record is never deleted except by
+the step that completes it or by the user.
 
 **Measured** on git 2.43, with staging, message-editing, pushing and pre-push
 hooks all installed: `commit-tree` made a commit holding `a` alone with the
