@@ -176,17 +176,33 @@ impl Dialect for Postgres {
     ///
     /// Returns every problem rather than the first — a schema with three
     /// unspellable columns should need one pass, not three.
-    fn validate_table(&self, _name: &TableName, table: &Table) -> Vec<DialectError> {
-        table
-            .columns
-            .iter()
-            .filter_map(
-                |(name, column)| match types::refuse_serial(&column.ty, Some(name)) {
-                    Some(named) => Some(named),
-                    None => types::normalize(&column.ty).err(),
-                },
-            )
-            .collect()
+    fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
+        let mut found = Vec::new();
+        // The names first, and this is not a formality: `quote_ident` refuses
+        // an identifier over [`MAX_IDENT_BYTES`], so a table this method called
+        // clean is one the emitter cannot spell. `validate` is the command that
+        // exists to say so before anything connects.
+        for part in [&name.schema, &name.name] {
+            if let Err(e) = self.quote_ident(part) {
+                found.push(e);
+            }
+        }
+        for (column_name, column) in &table.columns {
+            if let Err(e) = self.quote_ident(column_name) {
+                found.push(e);
+            }
+            if let Some(named) = types::refuse_serial(&column.ty, Some(column_name)) {
+                found.push(named);
+                // Everything below asks a question about the type, and asking
+                // it of one the catalogue has already refused is noise on top
+                // of the real error.
+                continue;
+            }
+            if let Err(e) = types::normalize(&column.ty) {
+                found.push(e);
+            }
+        }
+        found
     }
 
     fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
@@ -387,6 +403,39 @@ mod tests {
         // And the `text` column beside it is fine, so the refusal names the
         // one declaration to change rather than the whole table.
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// A name the emitter cannot spell is a table `validate` must not call
+    /// clean. The limit is `quote_ident`'s, and it is enforced nowhere else:
+    /// the server truncates instead of refusing, so a declaration that got
+    /// past here would make an object under a name nobody asked for.
+    #[test]
+    fn validating_a_table_refuses_a_name_the_emitter_could_not_spell() {
+        let long = "a".repeat(MAX_IDENT_BYTES + 1);
+        let mut table = Table::default();
+        table
+            .columns
+            .insert(long.clone(), pbps_model::Column::new(ty("integer")));
+        let found = Postgres.validate_table(&TableName::new(long.clone(), long.clone()), &table);
+        // The schema, the table and the column: three names, three refusals.
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|e| matches!(e, DialectError::UnquotableIdent(_))),
+            "{found:?}"
+        );
+
+        // And a table whose names all fit is clean, so this is a limit and not
+        // a blanket refusal.
+        let mut ok = Table::default();
+        ok.columns
+            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        assert!(
+            Postgres
+                .validate_table(&"app.t".parse().unwrap(), &ok)
+                .is_empty()
+        );
     }
 
     /// A column the catalogue cannot spell is reported here too, where a user

@@ -4051,7 +4051,7 @@ SPEC is in sync with all of these.
     worked, and a pair called `Narrowing` that the engine refuses fails half way
     through an apply, after the changes before it have run.
 
-240. **`Safe` is decided by what a type *holds*, not by how many digits it
+241. **`Safe` is decided by what a type *holds*, not by how many digits it
     has.** Two rules that look right and are not, both found by review on the
     PostgreSQL catalogue (#131) and both measured:
 
