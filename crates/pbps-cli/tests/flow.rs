@@ -5889,6 +5889,93 @@ fn a_rename_and_a_column_drop_in_one_revision_apply_together() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// One revision that renames a table **and** one of its columns, applied.
+///
+/// The engine is the honest witness for the same reason as the case above:
+/// the bug produced a statement it rejects, not a wrong result. `sp_rename`
+/// on a column names the table, and a `RenameColumn` always carries the
+/// post-rename table because `resolve_columns` iterates the declared schema.
+/// Sharing an ordering class with `RenameTable` — whose `subject()` is the
+/// **old** name — left the alphabet to separate them, and
+/// `"dbo.clients" < "dbo.customers"` put the column first:
+/// `sp_rename 'dbo.clients.old', 'new', 'COLUMN'` against a table still
+/// called `dbo.customers`.
+///
+/// Measured with the fix reverted, the engine answers `Either the parameter
+/// @objname is ambiguous or the claimed @objtype (COLUMN) is wrong` (15248) —
+/// not an `Invalid object name`, because `sp_rename` resolves the whole
+/// three-part name itself. Worth writing down: the message names the
+/// *objtype* and reads like a bad call, so nothing in it points at ordering.
+///
+/// The names here are chosen for that: the table's new name sorts before its
+/// old one, which is the direction no existing test covered.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_table_and_one_of_its_columns_renamed_in_one_revision_apply_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "renamepair");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("renamepair-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.customers.yml"),
+        "table: dbo.customers\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         old: {type: int}\nprimary_key: {name: pk_customers, columns: [id]}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // Both renames are declaration annotations, so one resolve sees both and
+    // the plan carries them together.
+    std::fs::remove_file(d.dir.join("schema/dbo.customers.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.clients.yml"),
+        "table: dbo.clients\nrenamed_from: dbo.customers\ncolumns:\n  \
+         id: {type: int, nullable: false}\n  new: {type: int, renamed_from: old}\n\
+         primary_key: {name: pk_customers, columns: [id]}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    // The ids file carries both renames now, so the annotations are spent.
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the column rename must name a table that already exists: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The database really is in the declared shape, not merely un-errored.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// A declared text the engine reads back differently — `"1.5"` in a
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected

@@ -2322,15 +2322,15 @@ SPEC is in sync with all of these.
     catches a module this plan is about to write that the catalog cannot read
     back (491edd9). One read refuses over the union, which is the same thing —
     and a `debug_assert` records that the union is the watched set.
-    **The probe.** `order_key` runs every row change (9, 10) before every
-    constraint a plan adds (11), and `AddCheck`'s probe counted the rows
+    **The probe.** `order_key` runs every row change (10, 11) before every
+    constraint a plan adds (12), and `AddCheck`'s probe counted the rows
     standing now. A plan that deletes its own violations and then tightens was
     refused for violations that will be gone; a plan that writes violating
     rows was told there were none. The ordering is what draws the boundary,
     and it is worth stating: **only a probe whose statement sorts after the
     row changes has this problem.** `AlterColumnType`, `AlterColumnNullability`
-    and `AddColumn` all sort before them (6-8), so reading the current table
-    is exactly right for those. At 11 with `AddCheck` sit `AddUnique` and
+    and `AddColumn` all sort before them (7-9), so reading the current table
+    is exactly right for those. At 12 with `AddCheck` sit `AddUnique` and
     `SetPrimaryKey`, which have it too.
     The check's own fix cannot be the foreign key's. `rows_after` builds the
     rows a plan will leave *for a named column list*, because a foreign key's
