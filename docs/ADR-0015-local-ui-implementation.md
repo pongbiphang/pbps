@@ -191,8 +191,15 @@ step made in the CLI user's own order. The UI writes a snapshot of the
 recorded tip (below), asks the CLI where that project keeps its inputs
 (below), and only then lists the modified declaration files — `git status
 --porcelain -z --untracked-files=all -- <declarations directory>
-<ids file>`, the pathspec being what `doctor` answered, never the
-project directory, so that a modified `README` or anything else the user
+<ids file>`, the pathspec being `doctor`'s two answers carried back to
+the checkout — `doctor` was run in the snapshot and answers with paths
+under `<git-dir>/pbps-ui/intent/<random>/` (**measured**: the envelope
+carried `declarations` and `identity_file` as the CLI resolved them from
+the project it was given), so the UI takes each relative to the
+snapshot's project directory, which the check below has already
+established it lies under, and joins that to the checkout's; handed to
+`git status` as they came they would name a place under `.git` — never
+the project directory, so that a modified `README` or anything else the user
 has open beside the declarations is neither laid over the snapshot nor
 committed with the intent; the flag because
 `status.showUntrackedFiles=no` in the user's configuration would otherwise
