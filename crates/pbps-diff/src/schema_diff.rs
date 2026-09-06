@@ -404,7 +404,18 @@ fn diff_columns(
         if !declared_cols.contains_key(uid) {
             changes.push(Change::DropColumn {
                 uid: uid.clone(),
-                column: base_ref.clone(),
+                // The **declared** table, with the column's base name. Only
+                // the table is renamed here — a column this plan drops is
+                // absent from the declarations, so it has no rename intent
+                // and the database still knows it by the base name.
+                //
+                // `base_ref` carries the pre-rename table, and every sibling
+                // in this loop is built from `declared_table_name`. Taken
+                // whole it emitted `sp_rename 'dbo.customers', 'clients'`
+                // and then `ALTER TABLE [dbo].[customers] DROP COLUMN ...`,
+                // because `order_key` runs the rename first: a valid,
+                // reviewed plan refused by the engine.
+                column: declared_table_name.column(base_ref.name.clone()),
             });
         }
     }
@@ -2554,6 +2565,81 @@ mod tests {
                 .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
             "{blockers:?}"
         );
+    }
+
+    /// A plan that renames a table **and** drops one of its columns names the
+    /// column's table as the declaration does, because by the time the drop
+    /// runs the rename has already happened.
+    ///
+    /// `order_key` puts `RenameTable` at 1 and `DropColumn` at 3, so the
+    /// statements are emitted in that order. Built from the base side's
+    /// `ColumnRef` — which every sibling change in that loop is not — the plan
+    /// read `sp_rename 'dbo.customers', 'clients'` and then
+    /// `ALTER TABLE [dbo].[customers] DROP COLUMN [doomed]`, which the engine
+    /// refuses with `Invalid object name`. A valid, reviewed plan, refused.
+    ///
+    /// The column's *own* name stays the base one: a column this plan drops is
+    /// absent from the declarations, so nothing renames it and the database
+    /// still knows it by that name.
+    #[test]
+    fn a_dropped_column_names_the_table_the_rename_has_already_produced() {
+        let base = schema_of(
+            "dbo.customers",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("doomed", Column::new(ty("int"))),
+            ]),
+        );
+        let declared = schema_of("dbo.clients", table(&[("id", Column::new(ty("int")))]));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "dbo.customers".parse().unwrap(),
+                    to: "dbo.clients".parse().unwrap(),
+                },
+                // Spelled with the *declared* table: `resolve_columns`
+                // iterates the declarations, and the table rename is already
+                // applied to the ids by the time it runs. Which is the same
+                // reason the change below must carry that name.
+                Intent::DropColumn {
+                    column: "dbo.clients.doomed".parse().unwrap(),
+                    reason: "no longer used".into(),
+                },
+            ],
+        );
+
+        let Some(Change::DropColumn { column, .. }) = cs
+            .changes
+            .iter()
+            .map(|c| &c.change)
+            .find(|c| matches!(c, Change::DropColumn { .. }))
+        else {
+            panic!("no DropColumn in {cs:?}");
+        };
+        assert_eq!(
+            column.table,
+            "dbo.clients".parse::<TableName>().unwrap(),
+            "the drop must name the table the rename has already produced"
+        );
+        assert_eq!(column.name, "doomed", "the column itself is not renamed");
+
+        // And the rename really does sort first, which is what makes the name
+        // above the only correct one — the assertion is worthless if the
+        // ordering ever reverses.
+        let kinds: Vec<&str> = cs
+            .changes
+            .iter()
+            .map(|c| match &c.change {
+                Change::RenameTable { .. } => "RenameTable",
+                Change::DropColumn { .. } => "DropColumn",
+                _ => "other",
+            })
+            .collect();
+        let rename = kinds.iter().position(|k| *k == "RenameTable");
+        let drop = kinds.iter().position(|k| *k == "DropColumn");
+        assert!(rename < drop, "{kinds:?}");
     }
 
     #[test]

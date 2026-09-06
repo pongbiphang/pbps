@@ -5795,6 +5795,100 @@ fn a_renamed_data_table_is_planned_against_the_rows_it_still_holds() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// One revision that renames a table **and** drops a column of it, applied.
+///
+/// The engine is the honest witness here, because the bug produced a statement
+/// it rejects rather than a wrong result: `order_key` runs the `sp_rename`
+/// first, so a `DropColumn` carrying the pre-rename table emitted
+/// `ALTER TABLE [dbo].[customers] DROP COLUMN [doomed]` against a table that
+/// was already `dbo.clients`, and `apply` died on `Invalid object name`. The
+/// whole transaction rolled back — loud, not silent — but a valid, reviewed
+/// plan was refused, and nothing in `plan.sql` looked wrong to a reviewer
+/// reading it before the rename registered.
+///
+/// A unit test pins the name the change carries; only this pins that the
+/// statements it produces run in the order the plan puts them in.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_rename_and_a_column_drop_in_one_revision_apply_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "renamedrop");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("renamedrop-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.customers.yml"),
+        "table: dbo.customers\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         doomed: {type: int}\nprimary_key: {name: pk_customers, columns: [id]}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The revision: the table gains a new name and loses a column, in one plan.
+    //
+    // The rename rides on the declaration's `renamed_from` rather than on
+    // `pbps rename-table`, because every intent command resolves identity in
+    // full before it writes: `rename-table` on its own is refused for the
+    // column that has just disappeared, and `drop` on its own for the table.
+    // The annotation reaches the same resolve as the drop intent, which is the
+    // only way to get both changes into one plan — the shape this bug lived in.
+    std::fs::remove_file(d.dir.join("schema/dbo.customers.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.clients.yml"),
+        "table: dbo.clients\nrenamed_from: dbo.customers\ncolumns:\n  \
+         id: {type: int, nullable: false}\nprimary_key: {name: pk_customers, \
+         columns: [id]}\n",
+    )
+    .unwrap();
+    // Spelled with the table's *new* name: identity resolution runs the table
+    // rename first, so by the time the column is looked for the ids already
+    // carry `dbo.clients` — which is the same reason the emitted drop has to
+    // name it that way.
+    let o = d.run(&["drop", "dbo.clients.doomed", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // The ids file now carries the rename, so the annotation has done its work
+    // and `fmt` strips it. Left in place it is only a warning, but the
+    // declarations a reviewer reads should be the canonical ones.
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the rename and the drop must apply together: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The database really is in the declared shape, not merely un-errored.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// A declared text the engine reads back differently — `"1.5"` in a
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected
