@@ -1123,13 +1123,19 @@ table in a given schema. `SELECT` appears twice because it is needed in two
 places for two reasons:
 the probes count rows in managed tables, and reading the recorded state is a
 read of two tables in `dbo`. `INSERT`, `UPDATE` and `DELETE` are asked for on
-each managed schema whose tables declare rows, and on no other: `ALTER ON
-SCHEMA` confers no DML, and a `data:` block makes the emitter write all three
-against the managed tables — so an account granted the rest of this list passed
-readiness and then died on the first row, under `--staged` after earlier
-checkpoints had committed. `DELETE` is asked for only where a table declares
-`mode: exact`; `ensure` never emits one (ADR-0004), and demanding it would ask
-for row-removal rights on the table that mode was chosen to keep pbps out of.
+each **table** that declares rows, and on no other: `ALTER ON SCHEMA` confers
+no DML, and a `data:` block makes the emitter write all three against the
+managed tables — so an account granted the rest of this list passed readiness
+and then died on the first row, under `--staged` after earlier checkpoints had
+committed. On the table rather than its schema because that is where the engine
+authorizes the statement: a grant on the one table that carries declared rows
+answers 0 at schema scope, and a `DENY` on that table answers 1 there while the
+statement fails. Falling back to the schema only while the table does not exist
+yet, like the ledger's writes. What each table asks for is what its declaration
+can emit: `DELETE` only under `mode: exact` — `ensure` never emits one
+(ADR-0004), and demanding it would ask for row-removal rights on the table that
+mode was chosen to keep pbps out of — and `INSERT`/`UPDATE` only where a row is
+declared, since an `ensure` block with none manages no row at all.
 The ledger's schema is not treated as a managed one
 — a project that declares nothing in `dbo` never touches a `dbo` table and must
 not be asked for `ALTER` there. Asking for all of

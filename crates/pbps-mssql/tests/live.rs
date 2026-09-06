@@ -1393,7 +1393,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["dbo".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1427,7 +1427,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["dbo".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1459,7 +1459,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["app".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1496,7 +1496,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["dbo".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1526,7 +1526,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["dbo".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1586,7 +1586,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["app".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1616,7 +1616,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["App".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1639,7 +1639,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         &["nowhere".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1664,13 +1664,46 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let _ = name;
 }
 
-/// Reference data needs DML that `ALTER ON SCHEMA` does not confer, measured
-/// on the engine rather than reasoned about.
+/// The readiness question for one project's declared data tables, asked the
+/// way `doctor` asks it.
+async fn data_permissions(
+    conn: &mut Conn,
+    data: &pbps_mssql::doctor::DataTables,
+) -> pbps_mssql::doctor::Held {
+    pbps_mssql::doctor::permissions(
+        conn,
+        &["app".to_owned()],
+        &[],
+        &pbps_mssql::doctor::GrantTargets::default(),
+        data,
+    )
+    .await
+    .expect("read permissions")
+}
+
+/// The gaps as the report spells them, sorted so an assertion names the whole
+/// set rather than whichever one came first.
+fn named_gaps(held: &pbps_mssql::doctor::Held) -> Vec<String> {
+    let mut out: Vec<String> = pbps_mssql::doctor::missing(held)
+        .iter()
+        .map(|g| format!("{} on {}", g.permission, g.securable()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Reference data needs DML that `ALTER ON SCHEMA` does not confer, and it is
+/// authorized on the **table** — both measured on the engine rather than
+/// reasoned about.
 ///
-/// This is the shape no unit test can settle. The claim the check rests on is
-/// about SQL Server — that an account granted everything `doctor` asked of a
-/// project with no `data:` block still cannot write a declared row — and the
-/// only way to know it is to hold exactly those grants and try the statement.
+/// This is the shape no unit test can settle. Three claims here are about SQL
+/// Server: that an account granted everything `doctor` asked of a project with
+/// no `data:` block still cannot write a declared row; that a grant on the
+/// table alone satisfies the object question and not the schema one; and that
+/// a `DENY` on the table refuses the statement while the schema grant still
+/// answers 1. The only way to know any of them is to hold the grants and try
+/// the statement.
+///
 /// The managed schema here is `app`, not `dbo`: the ledger's own `INSERT` and
 /// `DELETE` on `dbo` would otherwise cover the very gap this is about.
 #[tokio::test]
@@ -1761,71 +1794,53 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         );
     }
 
-    // With no `data:` block the account is ready, which is what makes the next
-    // assertion about reference data and not about a grant this test forgot.
-    let held = pbps_mssql::doctor::permissions(
-        &mut lp,
-        &["app".to_owned()],
-        &[],
-        &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
-    )
-    .await
-    .expect("read permissions");
+    // With no `data:` block the account is ready, which is what makes every
+    // assertion below about reference data and not about a grant this test
+    // forgot.
+    let none = pbps_mssql::doctor::DataTables::new();
+    let held = data_permissions(&mut lp, &none).await;
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(
         gaps.is_empty(),
         "a project declaring no row was reported as missing: {gaps:?}"
     );
 
-    // Declaring rows in `app`, the three refusals above become three gaps —
-    // the report the operator needed before `apply` took the lock.
-    let data: pbps_mssql::doctor::DataSchemas = [("app".to_owned(), pbps_model::DataMode::Exact)]
-        .into_iter()
-        .collect();
-    let held = pbps_mssql::doctor::permissions(
-        &mut lp,
-        &["app".to_owned()],
-        &[],
-        &pbps_mssql::doctor::GrantTargets::default(),
-        &data,
-    )
-    .await
-    .expect("read permissions");
-    let mut named: Vec<String> = pbps_mssql::doctor::missing(&held)
-        .iter()
-        .map(|g| format!("{} on {}", g.permission, g.securable()))
-        .collect();
-    named.sort();
+    // Declaring rows in `app.t`, the three refusals above become three gaps,
+    // on the table — the report the operator needed before `apply` took the
+    // lock.
+    let exact: pbps_mssql::doctor::DataTables = [(
+        "app.t".parse().unwrap(),
+        pbps_mssql::doctor::DataDemand::WriteAndRemove,
+    )]
+    .into_iter()
+    .collect();
+    let held = data_permissions(&mut lp, &exact).await;
     assert_eq!(
-        named,
+        named_gaps(&held),
         [
-            "DELETE on SCHEMA::[app]",
-            "INSERT on SCHEMA::[app]",
-            "UPDATE on SCHEMA::[app]",
+            "DELETE on OBJECT::[app].[t]",
+            "INSERT on OBJECT::[app].[t]",
+            "UPDATE on OBJECT::[app].[t]",
         ],
         "{held:?}"
     );
 
-    // Granted exactly what the report named, the account is ready and the row
-    // statements run — the remedy is the whole one, not most of it.
+    // Granted on the **table** and nowhere wider — the shape a careful DBA
+    // reaches for, and the one a schema-scoped question calls a gap. The
+    // account is ready and the row statements run.
     db.conn
         .execute(&format!(
-            "USE [{0}]; GRANT INSERT, UPDATE, DELETE ON SCHEMA::app TO [{login}];",
+            "USE [{0}]; GRANT INSERT, UPDATE, DELETE ON app.t TO [{login}];",
             db.name
         ))
         .await
-        .expect("grant the DML");
+        .expect("grant the DML on the table");
     let mut lp = Conn::connect(&as_login).await.expect("reconnect");
-    let held = pbps_mssql::doctor::permissions(
-        &mut lp,
-        &["app".to_owned()],
-        &[],
-        &pbps_mssql::doctor::GrantTargets::default(),
-        &data,
-    )
-    .await
-    .expect("read permissions");
+    let held = data_permissions(&mut lp, &exact).await;
+    assert!(
+        !held.schemas["app"].contains("INSERT"),
+        "the premise: nothing is held on the schema: {held:?}"
+    );
     let gaps = pbps_mssql::doctor::missing(&held);
     assert!(gaps.is_empty(), "{gaps:?}");
     for statement in [
@@ -1837,6 +1852,76 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
             .await
             .unwrap_or_else(|e| panic!("`{statement}` was still refused: {e}"));
     }
+
+    // The converse, and the worse direction: the whole schema granted with the
+    // one table denied. A schema-scoped question answers 1 and would report
+    // ready; the statement really fails. Only the object question sees it.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             REVOKE INSERT, UPDATE, DELETE ON app.t FROM [{login}]; \
+             GRANT INSERT, UPDATE, DELETE ON SCHEMA::app TO [{login}]; \
+             DENY INSERT ON app.t TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the schema and deny the table");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = data_permissions(&mut lp, &exact).await;
+    assert!(
+        held.schemas["app"].contains("INSERT"),
+        "the premise: the schema grant stands: {held:?}"
+    );
+    assert!(
+        lp.execute("INSERT INTO app.t (code, label) VALUES ('c', N'C');")
+            .await
+            .is_err(),
+        "the premise: the DENY really refuses the statement"
+    );
+    assert_eq!(
+        named_gaps(&held),
+        ["INSERT on OBJECT::[app].[t]"],
+        "{held:?}"
+    );
+
+    // A table this deployment has still to create: no object to ask about, so
+    // the question falls back to its schema — every first deployment of a
+    // project that seeds rows. `app` carries the DML here, so it is ready.
+    let unbuilt: pbps_mssql::doctor::DataTables = [(
+        "app.unbuilt".parse().unwrap(),
+        pbps_mssql::doctor::DataDemand::WriteAndRemove,
+    )]
+    .into_iter()
+    .collect();
+    let held = data_permissions(&mut lp, &unbuilt).await;
+    assert!(
+        held.data_objects.is_empty(),
+        "a table that is not there has no object row: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(gaps.is_empty(), "the schema grant covers it: {gaps:?}");
+
+    // And with the schema's DML gone, that same fallback is what reports the
+    // gap — at the schema, the only place a grant can sit before the table
+    // exists.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; REVOKE INSERT, UPDATE, DELETE ON SCHEMA::app FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke the schema DML");
+    let mut lp = Conn::connect(&as_login).await.expect("reconnect");
+    let held = data_permissions(&mut lp, &unbuilt).await;
+    assert_eq!(
+        named_gaps(&held),
+        [
+            "DELETE on SCHEMA::[app]",
+            "INSERT on SCHEMA::[app]",
+            "UPDATE on SCHEMA::[app]",
+        ],
+        "{held:?}"
+    );
 
     drop(lp);
     // Best-effort, like the other login tests here: the server may still count
@@ -1924,7 +2009,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &["app".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -1948,7 +2033,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         &["app".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -2310,7 +2395,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &["app".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -2326,7 +2411,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &["app".to_owned()],
         &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -2353,7 +2438,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         &["app".to_owned()],
         &["shared.parent".parse().unwrap()],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -5363,7 +5448,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &["dbo".to_owned()],
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -5385,7 +5470,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &["dbo".to_owned()],
         &[],
         &targets,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -5467,7 +5552,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &["dbo".to_owned()],
         &[],
         &managed,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -5501,7 +5586,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &["dbo".to_owned()],
         &[],
         &nowhere,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -5528,7 +5613,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &["dbo".to_owned()],
         &[],
         &managed,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -6052,7 +6137,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
         &["dbo".to_owned()],
         std::slice::from_ref(&bracket),
         &targets,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions");
@@ -6124,7 +6209,7 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
         &["dbo".to_owned()],
         &objects,
         &targets,
-        &pbps_mssql::doctor::DataSchemas::new(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("a list past one statement's worth of parameters must still be read");

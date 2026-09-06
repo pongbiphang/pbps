@@ -3685,41 +3685,74 @@ SPEC is in sync with all of these.
     certificate this client trusts is its own piece of work; what is measured
     here was measured with `openssl s_client` against the same image and is
     written down above rather than asserted.
-235. **Reference data is asked for its own DML, and `exact` alone is asked for
-    `DELETE`.** `ALTER ON SCHEMA` confers no `INSERT`, `UPDATE` or `DELETE`,
-    and a `data:` block makes the emitter write all three against the
-    **managed** tables. Neither appeared in `doctor`'s list at that scope: the
-    `INSERT` and `DELETE` on it were `Needed::Ledger`, on the two `dbo` tables,
-    and `UPDATE` was absent altogether. So an account granted exactly the list
-    `doctor` printed passed readiness with exit 0, `apply` took the lock and
-    ran the DDL, and the first row died on "INSERT permission was denied" —
-    under `--staged`, after earlier checkpoints had already committed, which is
-    the failure this command exists to prevent.
+235. **Reference data is asked for its own DML, on the table, and only for
+    what its declaration can emit.** `ALTER ON SCHEMA` confers no `INSERT`,
+    `UPDATE` or `DELETE`, and a `data:` block makes the emitter write all three
+    against the **managed** tables. Neither appeared in `doctor`'s list at any
+    scope that covered them: the `INSERT` and `DELETE` on it were
+    `Needed::Ledger`, on the two `dbo` tables, and `UPDATE` was absent
+    altogether. So an account granted exactly the list `doctor` printed passed
+    readiness with exit 0, `apply` took the lock and ran the DDL, and the first
+    row died on "INSERT permission was denied" — under `--staged`, after
+    earlier checkpoints had already committed, which is the failure this
+    command exists to prevent.
 
-    Demanded of a project that declares rows and of no other, for the reason
-    `Needed::RoleAdmin` is: whether the project needs it is visible in the
-    declarations `doctor` already reads, and DML on a schema someone else's
-    application owns is not a permission to ask for on spec. This is the second
-    entry on the list to depend on what the project declares, and the same rule
-    holds it — a schema that declares no row is asked for none of the three.
+    **Asked on the table, not on its schema.** The first version of this asked
+    at schema scope, because that is what the issue suggested and what the
+    `Managed` entries beside it do. Measured on the pinned image, it is wrong
+    in both directions:
 
-    `DELETE` is split from the other two because the two modes differ in
-    exactly it. `exact` says the declared rows are the whole table, so an
-    undeclared row is a `DELETE`; `ensure` never emits one — that is the
-    promise the mode makes to a table the application also writes to
-    (ADR-0004). An `ensure`-only schema asked for `DELETE` would be asked for
-    row-removal rights on the very table the mode was chosen to keep pbps out
-    of, which is the "make it db_owner" pressure this list refuses everywhere
-    else. Within a schema the demand is the union of what its tables need, so
-    one `exact` table among `ensure` ones still asks.
+    | held | `OBJECT` | `SCHEMA` | statement runs |
+    | --- | --- | --- | --- |
+    | `GRANT INSERT ON app.t` alone | 1 | 0 | yes |
+    | `GRANT INSERT ON SCHEMA::app` + `DENY INSERT ON app.t` | 0 | 1 | no |
 
-    The claim underneath it was measured rather than reasoned about, as the
-    three earlier permission mistakes here had to be: a login holding exactly
-    the pre-change list can `ALTER TABLE app.t` and is refused all three row
-    statements on it (`declared_rows_need_dml_that_alter_on_the_schema_does_not_confer`).
+    The first row is a careful DBA granting on exactly the table that carries
+    declared rows — reported as a gap they do not have, which is the
+    "make it db_owner" pressure this list exists to refuse, and the same
+    mistake `Needed::Ledger` was moved to object scope to fix. The second is
+    worse and is this entry's own bug one securable out: `doctor` says ready
+    and `apply` dies on the first row.
 
-    A data schema the database does not have stays a `schema.absent` finding
-    and produces no permission gap. Nothing was asked about it — there is no
-    securable to ask about — and "unasked" is not "holds nothing"; reporting a
-    gap there would fire on every first deployment of a project that seeds
-    rows, naming a securable no `GRANT` can reach yet.
+    The `Managed` entries stay at schema scope and that is not the same shape:
+    `ALTER` and the probes' `SELECT` are needed on every table in the schema,
+    including the ones the plan is about to create, so there is no finite list
+    of objects to ask about. Reference data has one — the tables that declare
+    rows — which is what makes the narrower question askable at all.
+
+    Before the table exists there is no object to ask about (`HAS_PERMS_BY_NAME`
+    on a name the catalog does not hold answers 0, also measured), so the
+    question falls back to the table's schema — the only place a grant *can*
+    sit in advance of the deployment that creates the table. That is the
+    ledger's shape exactly, dedup included: five tables in one schema that all
+    fall back to it produce one gap per permission, not five.
+
+    **Demanded of a project that declares rows and of no other**, for the
+    reason `Needed::RoleAdmin` is: whether the project needs it is visible in
+    the declarations `doctor` already reads, and DML on a table someone else's
+    application also writes to is not a permission to ask for on spec.
+
+    **And only for what the declaration can emit.** What a table demands is
+    read off its `data:` block alone, which is all `doctor` can see — it never
+    looks at a plan:
+
+    | `mode` | declares a row | demands |
+    | --- | --- | --- |
+    | `exact` | yes | `INSERT`, `UPDATE`, `DELETE` |
+    | `exact` | no — "this table must be empty" | `DELETE` |
+    | `ensure` | yes | `INSERT`, `UPDATE` |
+    | `ensure` | no | nothing; the table is not asked about |
+
+    `ensure` never emits a `DELETE` — that is the promise the mode makes to a
+    table the application also writes to (ADR-0004) — so asking for one would
+    demand row-removal rights on the very table that mode was chosen to keep
+    pbps out of. And an `ensure` block with no declared row manages no row at
+    all: it can neither insert nor correct anything, so it is asked for
+    nothing. `DataDemand` is three variants rather than two flags precisely so
+    that the fourth combination, "declares rows and demands nothing", cannot be
+    written down: it is an absence from the map instead.
+
+    A data table whose *schema* the database does not have produces no gap at
+    all. Nothing was asked about it — there is no securable to ask about — and
+    "unasked" is not "holds nothing"; `absent_schemas` reports it, and
+    inventing a gap there would name a securable no `GRANT` can reach yet.

@@ -2564,16 +2564,21 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
     );
 }
 
-/// The wiring, end to end: `doctor` reads the `data:` block out of the
-/// declarations and asks for the DML that block needs, on the schema that
-/// declares it.
+/// The wiring, end to end: `doctor` reads each table's `data:` block out of
+/// the declarations and asks for the DML that block can actually emit, at the
+/// securable the engine authorizes it on.
 ///
-/// The dialect's unit tests pin what `missing` does once it is told a schema
-/// carries rows, and its live suite pins that `ALTER ON SCHEMA` really confers
-/// no DML on a real server. Neither can tell whether the CLI ever *looks* at
+/// The dialect's unit tests pin what `missing` does once it is told which
+/// tables carry rows, and its live suite pins what a real server says about
+/// object and schema scope. Neither can tell whether the CLI ever *looks* at
 /// `data:` — an argument left at its default here would keep every one of them
 /// green while `doctor` went on printing "ready" for an account that cannot
 /// write a single declared row.
+///
+/// Four declarations against one login, because what is demanded is read off
+/// the declaration alone: a table absent from the database falls back to its
+/// schema, the same table present is asked on the object, an `ensure` block
+/// with no row is asked for nothing, and no block at all likewise.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
@@ -2641,25 +2646,31 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     .unwrap();
     d.commit();
 
-    let o = Command::new(BIN)
-        .arg("--project")
-        .arg(&d.dir)
-        .args(["doctor", "--format", "json"])
-        .env(&var, &as_login)
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    let env = &v["data"]["environments"][0];
-    let mut named: Vec<String> = env["missing_permissions"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no permission list: {v}"))
-        .iter()
-        .map(|g| g.as_str().unwrap_or_default().to_owned())
-        .collect();
-    named.sort();
-    // Exactly three, and each on the schema that declares the rows: the account
-    // holds everything else, so anything more would be a demand this list has
-    // not earned and anything less is the gap that reaches `apply`.
+    // The declarations, and `doctor`'s answer for whatever they currently say.
+    let gaps = || {
+        let o = Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["doctor", "--format", "json"])
+            .env(&var, &as_login)
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let mut named: Vec<String> = v["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {v}"))
+            .iter()
+            .map(|g| g.as_str().unwrap_or_default().to_owned())
+            .collect();
+        named.sort();
+        (named, code(&o), v)
+    };
+
+    // The table is not in the database yet — every first deployment of a
+    // project that seeds rows — so the question falls back to its schema, the
+    // only place a grant can sit that early. Exactly three, because the
+    // account holds everything else.
+    let (named, exit, v) = gaps();
     assert_eq!(named.len(), 3, "{v}");
     for (gap, permission) in named.iter().zip(["DELETE", "INSERT", "UPDATE"]) {
         assert!(
@@ -2668,29 +2679,46 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
         );
     }
     // And it is a finding the pipeline can block on, not a note.
-    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+    assert_eq!(exit, FINDING, "{v}");
 
-    // The same declarations without the `data:` block ask for none of it: the
-    // demand follows what the project declares, which is the whole reason it
-    // can be made at all.
+    // With the table there, the same three move to the object — where SQL
+    // Server authorizes the statement, and where a careful DBA's grant sits.
+    on_server(
+        db.connection(),
+        "CREATE TABLE app.t (code varchar(20) NOT NULL CONSTRAINT pk_t PRIMARY KEY);",
+    );
+    let (named, exit, v) = gaps();
+    assert_eq!(named.len(), 3, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT", "UPDATE"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on OBJECT::[app].[t] — ")),
+            "{v}"
+        );
+    }
+    assert_eq!(exit, FINDING, "{v}");
+
+    // `mode: ensure` with no declared row manages no row at all: nothing is
+    // ever inserted, corrected or removed, so nothing is asked for. The
+    // demand follows what the declaration can actually emit, not the mere
+    // presence of a `data:` block.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: ensure\n  rows: {}\n",
+    );
+    let (named, _, v) = gaps();
+    assert!(
+        named.is_empty(),
+        "an `ensure` block with no row must not be asked for DML: {v}"
+    );
+
+    // And no `data:` block at all, the overwhelmingly common case.
     d.table(
         "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
          primary_key: {name: pk_t, columns: [code]}\n",
     );
-    let o = Command::new(BIN)
-        .arg("--project")
-        .arg(&d.dir)
-        .args(["doctor", "--format", "json"])
-        .env(&var, &as_login)
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert_eq!(
-        v["data"]["environments"][0]["missing_permissions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0,
+    let (named, _, v) = gaps();
+    assert!(
+        named.is_empty(),
         "a project declaring no row must not be asked for DML: {v}"
     );
 
