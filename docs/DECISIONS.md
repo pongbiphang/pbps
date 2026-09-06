@@ -3189,3 +3189,43 @@ SPEC is in sync with all of these.
     in the plan changes today. The rule is here rather than in the PostgreSQL
     crate because it is about what a *name-based scan* can know, which is the
     model's question and not an engine's.
+
+213. **The declaration schema says what the loader accepts, and completes from
+    what `fmt` writes.** `Permission::from_str` folds case and reads `_` or a
+    space where the canonical word has `-`, so that a user who types what the
+    engine prints (`VIEW DEFINITION`, `view_definition`) is not corrected
+    (ADR-0010 §6). The editor schema listed the canonical words alone, so a
+    schema-aware editor flagged `dbo.t: [SELECT]` while `pbps validate`
+    accepted it — the editor stricter than the loader, and the editor is what
+    a user reads first.
+
+    The `items` schema is now two branches. A `pattern` says which spellings
+    validate; an `enum` of the canonical words is what an editor completes
+    from. One list could not do both: a closed list wide enough to accept
+    every spelling would offer all of them as completions, and the word `fmt`
+    writes would be one suggestion among four.
+
+    The pattern is written out per character — `[Ss][Ee][Ll]...` — rather than
+    with a case-insensitive flag, because JSON Schema's patterns are ECMA-262,
+    which has no inline `(?i)`; a schema carrying one would be a pattern every
+    validator reads differently. Both branches are generated from
+    `Permission::ALL`, so neither can drift from the loader, and the tests
+    assert each spelling against `Permission::from_str` as well as against the
+    pattern — a pattern nothing runs is a claim, not a check.
+
+    The padding is not `\s` either, for the same reason at a smaller scale.
+    ECMA-262's `\s` is neither a subset nor a superset of Rust's
+    `char::is_whitespace`, which is what `trim` asks: it omits U+0085, which
+    `trim` removes, and includes U+FEFF, which `trim` leaves in place. Written
+    with `\s` the schema would have broken *both* halves of 172 at once —
+    refusing a padded declaration `validate` accepts, and blessing one it
+    refuses — two characters wide in each direction. The class is scanned out
+    of `char::is_whitespace` and written with literal characters, because the
+    two readers of this pattern share no escape syntax: ECMA-262 spells U+1680
+    `\u1680` and has no `\x{...}`, and the `regex` family the tests run it with
+    is the mirror image. A literal character is what both read.
+
+    `SCHEMA_VERSION` goes to 8, for the reason it exists: version 7 published a
+    closed list that refused `SELECT`, and this one accepts it. A consumer
+    keying on that number to cache or select an artifact could not otherwise
+    tell the two apart, which is the drift detection the field is for.

@@ -729,6 +729,7 @@ dependencies = [
  "pbps-model",
  "pbps-mssql",
  "pbps-policy",
+ "regex-lite",
  "schemars",
  "serde",
  "serde_json",

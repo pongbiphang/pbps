@@ -38,6 +38,9 @@ workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The schema's permission pattern is asserted by running it, not by reading it:
+# a pattern nothing executes is a claim about what an editor will accept.
+regex-lite.workspace = true
 pbps-load.workspace = true
 # The plan-file fixtures carry a version, and a fixture that pins it by hand
 # goes stale the moment the format moves; the constant is the tool's own.
