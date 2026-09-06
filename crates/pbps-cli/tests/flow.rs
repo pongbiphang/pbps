@@ -10243,7 +10243,8 @@ fn state_list_refuses_a_limit_of_zero() {
     );
 }
 
-/// One entry this build cannot read does not erase the history above it.
+/// One entry this build cannot read does not erase the history above it, and
+/// the two ways it can be unreadable stay apart.
 ///
 /// An environment upgraded across a state-format change keeps rows older than
 /// `OLDEST_READABLE_VERSION`. Reading the timeline through the same reader
@@ -10251,6 +10252,12 @@ fn state_list_refuses_a_limit_of_zero() {
 /// a valid current baseline answered "when was this last applied to?" with an
 /// error. The row is carried instead, with its projected columns and the
 /// reason its state could not be read.
+///
+/// That reason is typed: a state format this build does not read is a build to
+/// change, and a state that does not parse is a damaged row. Told the first
+/// about the second, an operator goes looking for a newer pbps that does not
+/// exist (DECISIONS 221), so both rows are here and each is asserted against
+/// the other'"'"'s wording.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
@@ -10267,15 +10274,30 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
         0
     );
 
-    // A row from before this build's oldest readable version, inserted the way
-    // an upgrade leaves one: the projected columns are ordinary, and only the
-    // recorded state is unreadable.
-    let old = pbps_model::state::OLDEST_READABLE_VERSION - 1;
+    // A row a *newer* pbps left behind: the baseline's own state with its
+    // version stamp raised past this build's. Copied from a real row rather
+    // than written by hand, because a hand-written one fails to parse before
+    // the version is ever looked at — which is the whole distinction under
+    // test, and what an earlier version of this fixture got wrong.
+    let newer = pbps_model::state::CURRENT_VERSION + 1;
     on_server(
         &connection,
         &format!(
-            "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason)              VALUES ('apply', NULL, NULL, N'{{\"version\": {old}, \"kind\": \"apply\",              \"schema\": {{}}, \"ids\": {{}}, \"operator\": \"someone\"}}', N'someone', N'from before');"
+            "INSERT INTO dbo.__pbps_state \
+                 (kind, git_sha, plan_checksum, state_json, operator, reason) \
+             SELECT 'apply', NULL, NULL, \
+                    JSON_MODIFY(state_json, '$.version', CAST({newer} AS int)), \
+                    N'someone', N'from before' \
+               FROM dbo.__pbps_state WHERE id = 1;"
         ),
+    );
+
+    // And a row whose recorded state is not JSON at all — damage, which no
+    // version of this tool reads.
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason) \
+         VALUES ('apply', NULL, NULL, N'{not json', N'someone-else', NULL);",
     );
 
     let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
@@ -10287,12 +10309,31 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entries = v["data"]["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2, "both rows are listed: {v}");
+    assert_eq!(entries.len(), 3, "every row is listed: {v}");
 
-    // The newest row is the old one, and it is carried with what the ledger's
-    // own columns hold.
-    let (old_row, current) = (&entries[0], &entries[1]);
-    assert!(old_row["unreadable"].is_string(), "{v}");
+    // Newest first: the damaged row, the old-format row, the baseline.
+    let (damaged, old_row, current) = (&entries[0], &entries[1], &entries[2]);
+    assert_eq!(
+        damaged["unreadable"]["kind"], "malformed",
+        "a row that does not parse is damage, not a version: {v}"
+    );
+    assert!(
+        damaged["unreadable"]["detail"].is_string(),
+        "the parser's own words are kept: {v}"
+    );
+    assert_eq!(damaged["operator"], "someone-else", "{v}");
+    assert!(
+        damaged.get("reason").is_none(),
+        "a row with no reason has none, not an empty one: {v}"
+    );
+    assert_eq!(old_row["unreadable"]["kind"], "unsupported-version", "{v}");
+    assert!(
+        old_row["unreadable"]["detail"]
+            .as_str()
+            .expect("a detail")
+            .contains("version"),
+        "{v}"
+    );
     assert_eq!(old_row["kind"], "apply", "the projected column: {v}");
     assert_eq!(old_row["operator"], "someone", "{v}");
     assert_eq!(old_row["reason"], "from before", "{v}");
@@ -10314,7 +10355,11 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["state.entry-unreadable"], "{v}");
+    assert_eq!(
+        ids,
+        vec!["state.entry-malformed", "state.entry-unsupported-version"],
+        "one id per cause, in the ledger's order: {v}"
+    );
 
     let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
     envelope_matches_schema(&validator, "state list", &o);
@@ -10322,16 +10367,25 @@ fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
     // The human view says so too, rather than printing a blank line.
     let human = d.run(&["state", "list", "--db", &connection]);
     assert_eq!(code(&human), 0, "{}", stderr(&human));
+    let told = stderr(&human);
     assert!(
-        stderr(&human).contains("entry #2") && stderr(&human).contains("cannot read"),
-        "the warning names the row: {}",
-        stderr(&human)
+        told.contains("does not parse") && told.contains("state format this build does not read"),
+        "each row is named for what is wrong with it: {told}"
     );
-    // The table itself stays a table, so a reader can pipe it.
+    // The table itself stays a table, so a reader can pipe it, and its detail
+    // column does not tell a damaged row to go looking for an upgrade.
+    let table = stdout(&human);
     assert!(
-        stdout(&human).starts_with("ID") && stdout(&human).contains("someone"),
-        "{}",
-        stdout(&human)
+        table.starts_with("ID") && table.contains("someone"),
+        "{table}"
+    );
+    // The row's own reason wins the detail column when it has one; the row
+    // that has none says what is wrong with it instead of nothing. Which of
+    // the two placeholders is drawn is pinned offline, in this module's own
+    // tests, where both can be built without a server.
+    assert!(
+        table.contains("(recorded state is damaged)") && table.contains("from before"),
+        "{table}"
     );
 }
 

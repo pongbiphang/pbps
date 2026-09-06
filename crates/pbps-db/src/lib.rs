@@ -32,7 +32,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 pub mod ledger;
 
-pub use ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry};
+pub use ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, Unreadable};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {

@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Twenty-one instances so far. **Absent, empty and unreadable are three different
+Twenty-two instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -49,6 +49,13 @@ things, and only one of them is good news.**
   above it — the list a person opened the command to see. The row is carried
   now, with the ledger's own columns and the reason (DECISIONS 217). The rule
   holds one level down: it is about a row as much as about a table.
+- Two *unreadables* flattened into one: a ledger row whose JSON does not parse
+  and a row recorded by a version outside the readable range were carried as the
+  same string, and the warning built from it said "recorded by a version this
+  build cannot read" for both. The damaged row's operator was sent looking for
+  an upgrade. Typed apart now (DECISIONS 221) — and the fixture that was meant
+  to cover the version case had itself been failing to parse, so the branch it
+  claimed to test had never run.
 - An unlock failure **after a command had already failed** dropped on the floor:
   `apply` reported its own error and left `__pbps_lock` held with no word about
   it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`

@@ -3312,7 +3312,8 @@ SPEC is in sync with all of these.
     ledger stores and carries the reason in `unreadable`, with a
     `state.entry-unreadable` finding naming the row. `history` keeps the
     stricter contract — a caller asking for states wants states — and the two
-    doc comments point at each other.
+    doc comments point at each other. (The one finding id named here became
+    two in 221, once the two ways a row can be unreadable were told apart.)
 
     This is the repository's absent/empty/unreadable rule applied one level
     down: it holds for a row as much as for a ledger.
@@ -3369,3 +3370,31 @@ SPEC is in sync with all of these.
     Applied to every cell rather than to the two that are free text today. The
     rule the repository keeps arriving at: prefer making the bad value
     unrepresentable over checking for it at the sites that happen to hold it now.
+
+221. **"Older than this build reads" and "damaged" are two answers, not one.**
+    `timeline_from_row` parses the recorded state and then version-checks it,
+    and both failures were carried as a string. The warning built from that
+    string said the entry "was recorded by a version this build cannot read" —
+    so a row whose JSON is truncated told the operator to go and find a newer
+    pbps, which is not a thing that exists for a damaged row.
+
+    `TimelineEntry` now holds `Result<StateSnapshot, Unreadable>`, with
+    `Unreadable::UnsupportedVersion` and `Unreadable::Malformed`. The envelope
+    carries the same split as a tagged object — `{"kind": "malformed",
+    "detail": ...}` — because a page that draws "upgrade pbps" must be able to
+    decide *not* to draw it, and reading that out of a sentence is not something
+    a schema can promise. Two finding ids for the same reason: an id is what a
+    consumer keys on, and these two are different jobs.
+
+    A `Result` rather than a snapshot beside an optional reason: exactly one of
+    the two is true of every row, and the struct that could hold both needed a
+    comment saying it never would.
+
+    **Measured, and it corrected the story in 217.** Writing a version-6-shaped
+    state by hand does not reach the version check at all — serde fails on the
+    schema's missing fields first, and the row is `Malformed`. In practice a
+    row *below* the readable range is damage to this build, and
+    `UnsupportedVersion` is what a *newer* pbps leaves behind: same shape, later
+    stamp. The test fixture builds it that way, by copying a real row and
+    raising its `version` with `JSON_MODIFY`, because the hand-written fixture
+    that preceded it passed while proving the wrong thing.

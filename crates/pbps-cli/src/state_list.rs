@@ -51,11 +51,12 @@ pub struct LedgerRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_version: Option<u32>,
 
-    /// Why the recorded state could not be read, when it could not — an entry
-    /// older than this build understands, or one that does not parse. Set
-    /// exactly when the fields taken from that state are absent.
+    /// Why the recorded state could not be read, when it could not. Set exactly
+    /// when the fields taken from that state are absent, and typed rather than
+    /// a sentence, because the two cases send an operator to different places
+    /// (DECISIONS 221).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub unreadable: Option<String>,
+    pub unreadable: Option<Unreadable>,
 
     pub operator: String,
 
@@ -79,6 +80,24 @@ pub struct LedgerRow {
     pub tables: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modules: Option<usize>,
+}
+
+/// Why one row's recorded state is missing from the timeline.
+///
+/// A tagged object rather than a string: a consumer that renders "upgrade pbps"
+/// must not draw it for a row whose JSON is damaged, and reading that out of a
+/// message is not something a schema can promise.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// The state names a format this build does not read. `detail` is
+    /// `StateSnapshot::check_version`'s own message, which names the direction
+    /// and what to do about it.
+    UnsupportedVersion { detail: String },
+
+    /// The state did not parse. The row is damaged, and no version of this tool
+    /// reads it; the ledger's own columns are all there is.
+    Malformed { detail: String },
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -114,7 +133,7 @@ fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
         applied_at: entry.applied_at,
         kind: entry.kind,
         state_version: None,
-        unreadable: entry.unreadable,
+        unreadable: None,
         operator: entry.operator,
         git_sha: entry.git_sha,
         plan_checksum: entry.plan_checksum,
@@ -123,14 +142,22 @@ fn row(entry: pbps_db::TimelineEntry) -> LedgerRow {
         tables: None,
         modules: None,
     };
-    if let Some(snapshot) = entry.snapshot {
-        out.state_version = Some(snapshot.version);
-        out.staged = snapshot.staged.map(|s| StagedRow {
-            completed: s.completed,
-            total: s.total,
-        });
-        out.tables = Some(snapshot.schema.tables.len());
-        out.modules = Some(snapshot.schema.modules.len());
+    match entry.state {
+        Ok(snapshot) => {
+            out.state_version = Some(snapshot.version);
+            out.staged = snapshot.staged.map(|s| StagedRow {
+                completed: s.completed,
+                total: s.total,
+            });
+            out.tables = Some(snapshot.schema.tables.len());
+            out.modules = Some(snapshot.schema.modules.len());
+        }
+        Err(pbps_db::Unreadable::UnsupportedVersion(detail)) => {
+            out.unreadable = Some(Unreadable::UnsupportedVersion { detail });
+        }
+        Err(pbps_db::Unreadable::Malformed(detail)) => {
+            out.unreadable = Some(Unreadable::Malformed { detail });
+        }
     }
     out
 }
@@ -188,14 +215,33 @@ pub fn cmd_state_list(
         let mut findings = Vec::new();
         // Named one by one, and as a warning rather than a note: a row this
         // build cannot read is a gap in what the page can show, and a reader
-        // who is told nothing would take the missing counts for zero.
-        for e in entries.iter().filter(|e| e.unreadable.is_some()) {
-            let why = one_line(e.unreadable.as_deref().unwrap_or_default());
+        // who is told nothing would take the missing counts for zero. Two ids,
+        // because the two failures are two different jobs for whoever reads
+        // them — one is a build to change, the other a damaged row
+        // (DECISIONS 221).
+        for e in &entries {
+            let (id, what) = match &e.state {
+                Ok(_) => continue,
+                Err(pbps_db::Unreadable::UnsupportedVersion(detail)) => (
+                    "state.entry-unsupported-version",
+                    format!(
+                        "was recorded in a state format this build does not read ({})",
+                        one_line(detail)
+                    ),
+                ),
+                Err(pbps_db::Unreadable::Malformed(detail)) => (
+                    "state.entry-malformed",
+                    format!(
+                        "has a recorded state that does not parse, so the row is damaged ({})",
+                        one_line(detail)
+                    ),
+                ),
+            };
             findings.push(output::Finding::warning(
-                "state.entry-unreadable",
+                id,
                 format!(
-                    "{}: entry #{} was recorded by a version this build cannot read ({why}); \
-                     its date, kind and operator are shown and the rest is left out",
+                    "{}: entry #{} {what}; its date, kind and operator are shown \
+                     and the rest is left out",
                     target.label, e.id
                 ),
             ));
@@ -302,9 +348,15 @@ fn render(data: &StateListData) -> String {
                     .unwrap_or_else(|| "-".to_owned()),
                 match (&e.reason, &e.unreadable) {
                     // The reason is the row's own text; an unreadable entry
-                    // has none of its own and says why instead of nothing.
+                    // has none of its own and says why instead of nothing —
+                    // which of the two, because they are not the same news.
                     (Some(r), _) => r.clone(),
-                    (None, Some(_)) => "(recorded by a newer or older format)".to_owned(),
+                    (None, Some(Unreadable::UnsupportedVersion { .. })) => {
+                        "(state format not read by this build)".to_owned()
+                    }
+                    (None, Some(Unreadable::Malformed { .. })) => {
+                        "(recorded state is damaged)".to_owned()
+                    }
                     (None, None) => String::new(),
                 },
             ]
@@ -414,6 +466,57 @@ mod tests {
             lines[1].find('x'),
             Some(detail),
             "the escaped cell must not shift its row:\n{out}"
+        );
+    }
+
+    /// The detail column says which kind of unreadable a row is.
+    ///
+    /// One placeholder for both meant a damaged row was labelled a format
+    /// problem, which sends an operator looking for an upgrade that does not
+    /// exist (DECISIONS 221).
+    #[test]
+    fn the_detail_column_names_which_kind_of_unreadable_a_row_is() {
+        let unreadable = |u: Unreadable| {
+            let mut r = row_with("someone", None);
+            r.reason = None;
+            r.unreadable = Some(u);
+            r.state_version = None;
+            r.tables = None;
+            r.modules = None;
+            StateListData {
+                environment: "demo".to_owned(),
+                initialized: true,
+                limit: 50,
+                entries: vec![r],
+            }
+        };
+        let damaged = render(&unreadable(Unreadable::Malformed {
+            detail: "expected value at line 1 column 1".to_owned(),
+        }));
+        assert!(damaged.contains("(recorded state is damaged)"), "{damaged}");
+        assert!(
+            !damaged.contains("format"),
+            "a damaged row is not a format problem: {damaged}"
+        );
+
+        let old = render(&unreadable(Unreadable::UnsupportedVersion {
+            detail: "this is a version 9 state".to_owned(),
+        }));
+        assert!(
+            old.contains("(state format not read by this build)"),
+            "{old}"
+        );
+
+        // A row that has a reason of its own keeps it: the placeholder stands
+        // in for nothing, never over something.
+        let mut data = unreadable(Unreadable::Malformed {
+            detail: "x".to_owned(),
+        });
+        data.entries[0].reason = Some("ticket-9".to_owned());
+        let kept = render(&data);
+        assert!(
+            kept.contains("ticket-9") && !kept.contains("damaged"),
+            "{kept}"
         );
     }
 

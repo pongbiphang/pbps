@@ -12,7 +12,9 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
-use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
+use pbps_db::ledger::{
+    LedgerEntry, LedgerError, LockInfo, TimelineEntry, Unreadable, ids_to_prune,
+};
 use pbps_db::{Conn, DbError};
 use pbps_model::StateSnapshot;
 
@@ -365,13 +367,14 @@ fn timeline_from_row(row: &pbps_db::Row) -> Result<TimelineEntry, LedgerError> {
 
     // Parsed, then version-checked, and either failure is carried on the row
     // rather than returned: this is the one reader whose answer is the list
-    // itself.
-    let (snapshot, unreadable) = match serde_json::from_str::<StateSnapshot>(state_json) {
+    // itself. The two failures stay apart, because their remedies do
+    // (DECISIONS 221).
+    let state = match serde_json::from_str::<StateSnapshot>(state_json) {
         Ok(s) => match s.check_version() {
-            Ok(()) => (Some(s), None),
-            Err(message) => (None, Some(message)),
+            Ok(()) => Ok(s),
+            Err(message) => Err(Unreadable::UnsupportedVersion(message)),
         },
-        Err(e) => (None, Some(e.to_string())),
+        Err(e) => Err(Unreadable::Malformed(e.to_string())),
     };
 
     Ok(TimelineEntry {
@@ -386,8 +389,7 @@ fn timeline_from_row(row: &pbps_db::Row) -> Result<TimelineEntry, LedgerError> {
         plan_checksum: opt::<&str>(row, "plan_checksum")?.map(str::to_owned),
         operator: get::<&str>(row, "operator")?.to_owned(),
         reason: opt::<&str>(row, "reason")?.map(str::to_owned),
-        snapshot,
-        unreadable,
+        state,
     })
 }
 
