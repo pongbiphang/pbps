@@ -22,7 +22,7 @@ exclude = ["spikes/yaml-span"]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.89"   # required by serde-saphyr, see docs/ADR-0001
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/pongbiphang/pbps"
 authors = ["PongBiphang"]
 

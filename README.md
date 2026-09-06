@@ -195,4 +195,4 @@ manufacturing phantom git diffs.
 
 ## Licence
 
-MIT OR Apache-2.0
+Apache-2.0 — see [LICENSE](LICENSE).
