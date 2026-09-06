@@ -179,27 +179,47 @@ merge request where the hosting's URL shape is known.
 The page sends the intent, never the files: the kind of change and its
 arguments — `rename dbo.customer.customer_name full_name`, `drop
 dbo.customer.national_id --reason <text>`, and the table and role forms —
-exactly as a user would type them. The UI writes the recorded tip out as a
-snapshot the way step 3 below writes one (`git ls-tree -r -z <tip>` and
-`git cat-file --batch`, regular-file entries only, under
-`<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3
-states), runs the CLI's own intent command
-there — `pbps rename <from> <to> --no-input --format json --project <that
-directory>/<the project's path>` and its siblings — and takes as the
-replacement bytes every regular file the command left different from the
-tip's, new files included, found by hashing the snapshot against `git
-ls-tree`. Those are the paths steps 1 to 6 place and commit. The browser
-never composes a declaration or an ids-file line: the identity mapping a
-rename records comes from `pbps_diff::resolve`, which the intent command
-runs and the UI cannot, and a UI that chose the uid itself could write an
-ids file that is internally consistent and records a different identity
-transition than the one asked for — one `validate` accepts, since it checks
-the file's consistency and not what the user meant, and one a later `plan`
-reads as a drop and a create. SPEC §14.3's rule is kept as the CLI keeps
-it: the arguments are the user's decision, typed into the page instead of
-the shell, and `--no-input` declines any question the command would have
-asked, so a case it would ask about is refused and shown, never answered
-by the UI. Reasoned, not measured: which files an intent command edits is
+exactly as SPEC §6.4 prints them for the shell. An intent command does not
+edit a declaration; the user has already done that, in an editor, in the
+working tree, and the command resolves the edited declarations against the
+ids file and rewrites the ids file alone (`cmd_intent` loads the
+declarations, pushes the intent, calls `pbps_diff::resolve` and writes the
+result; **measured**: against a declaration that still held the old name,
+`pbps rename` exited 2 with "this intent matches nothing"). So the working
+tree is where the intent is, and the compose is the CLI user's own last
+step made in the CLI user's own order: the page lists the project's
+modified declaration files (`git status --porcelain -z -- <project>`) with
+the blob id of each as read, the UI writes a snapshot of the recorded tip
+the way step 3 below writes one (`git ls-tree -r -z <tip>` and `git
+cat-file --batch`, regular-file entries only, under
+`<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3 states),
+lays the working tree's version of each listed file over it from bytes
+read through the file's handle whose hash is the id the page carries, and
+runs the CLI's own intent command there — `pbps rename <from> <to>
+--no-input --project <that directory>/<the project's path>` and its
+siblings, with no `--format`, which the intent commands do not take
+(**measured**: `rename --format json` exited 2 with `unexpected argument
+'--format'`); decision 1's list of what speaks the envelope is exact, and
+for these commands the page gets the exit status and the blockers report
+of `stderr`. The paths steps 1 to 6 commit are the listed declaration files
+and every regular file the command left different from the snapshot it was
+given, the ids file among them, found by hashing the snapshot against `git
+ls-tree` — the same set a CLI user commits after `pbps rename`. The
+declaration files already hold their bytes in the working tree, so step 2
+places nothing for them and step 1's check that each still hashes to the
+page's id is the whole of their handling; what the command changed is
+placed as step 2 describes. The browser never composes a declaration or an
+ids-file line: the identity mapping a rename records comes from
+`pbps_diff::resolve`, which the intent command runs and the UI cannot, and
+a UI that chose the uid itself could write an ids file that is internally
+consistent and records a different identity transition than the one asked
+for — one `validate` accepts, since it checks the file's consistency and
+not what the user meant, and one a later `plan` reads as a drop and a
+create. SPEC §14.3's rule is kept as the CLI keeps it: the arguments are
+the user's decision, typed into the page instead of the shell, and
+`--no-input` declines any question the command would have asked, so a case
+it would ask about is refused and shown, never answered by the UI.
+Reasoned beyond the two measurements above: what an intent command edits is
 the CLI's, unchanged here; step 4 of #64 measures the snapshot round trip.
 
 The first design was the porcelain `git commit --only -m <message> --
