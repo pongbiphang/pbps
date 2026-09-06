@@ -494,7 +494,7 @@ than assuming.
 
 ## Tests that pass for the wrong reason
 
-Ten so far, every one invisible in a green run. **Assert the specific failure,
+Eleven so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
 A fixture for "a state recorded by a version this build cannot read", written
@@ -505,6 +505,12 @@ the reason it named. `StateSnapshot::from_json` reading the version first (#50)
 makes the case reachable, and the fixture now carries one row of each of the
 three ways a state can be unreadable rather than one row asserted about twice.
 
+- The envelope-schema test validated `doctor`'s output — with no environments
+  configured, so `EnvDiagnosis`, the type with the fields that vanish when the
+  news is good, was never serialized. The command was covered; the shape was
+  not, and the published schema required two fields the healthy case omits
+  (DECISIONS 223). **Covering a command is not covering its payload's nested
+  types.**
 - A plan fixture that failed at deserialization instead of at the emitter.
 - `plan`'s identity check firing before its baseline load.
 - A `pull` guard test taking the not-a-directory branch.

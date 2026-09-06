@@ -674,11 +674,11 @@
           }
         },
         "permissions_unknown": {
-          "description": "Set when the permission query itself failed, so an empty\n`missing_permissions` means \"not determined\" rather than \"none\".",
+          "description": "Set when the permission query itself failed, so an empty\n`missing_permissions` means \"not determined\" rather than \"none\".\n\n`default` beside `skip_serializing_if`, on a type that is only ever\nserialized: it is what tells `schemars` the field is optional. Without\nit the published schema *required* a field the good news omits, so the\nenvelope a healthy `doctor` prints failed its own contract\n(DECISIONS 223).",
           "type": "boolean"
         },
         "absent_schemas": {
-          "description": "Declared schemas this database does not have.\n\nA readiness problem rather than a permission one: nothing in the tool\nemits `CREATE SCHEMA`, so a plan declaring `app.customer` against a\ndatabase with no `app` fails on its first statement.",
+          "description": "Declared schemas this database does not have.\n\nA readiness problem rather than a permission one: nothing in the tool\nemits `CREATE SCHEMA`, so a plan declaring `app.customer` against a\ndatabase with no `app` fails on its first statement.\n\n`default` for the reason above.",
           "type": "array",
           "items": {
             "type": "string"
@@ -701,9 +701,7 @@
       "required": [
         "environment",
         "state",
-        "missing_permissions",
-        "permissions_unknown",
-        "absent_schemas"
+        "missing_permissions"
       ]
     },
     "envelope.doctor": {

@@ -10455,4 +10455,25 @@ fn the_connected_envelopes_match_the_published_schema() {
     envelope_matches_schema(&validator, "status", &o);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["data"][0]["environment"], "live", "{v}");
+
+    // `doctor` reads the same configured environments, and its payload is the
+    // one with fields that disappear when the news is good: an account holding
+    // every permission serializes no `permissions_unknown`, and a database with
+    // every declared schema no `absent_schemas`. A schema that required them
+    // rejected the healthy case — the one an operator sees most.
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env("PBPS_STATUS_TEST_URL", &connection)
+        .output()
+        .unwrap();
+    envelope_matches_schema(&validator, "doctor", &o);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+    assert_eq!(env["environment"], "live", "{v}");
+    assert!(
+        env.get("permissions_unknown").is_none() && env.get("absent_schemas").is_none(),
+        "the healthy case is the one that omits them: {v}"
+    );
 }

@@ -3406,3 +3406,26 @@ SPEC is in sync with all of these.
     `Malformed`; and a *readable* version carrying an unknown field is
     `Malformed` too, because within a version this build reads, a field it does
     not know is a hand-edited or corrupt row. The live test carries one of each.
+
+223. **A field `serde` may omit is a field `schemars` must call optional.**
+    `EnvDiagnosis` skips `permissions_unknown` when it is false and
+    `absent_schemas` when it is empty — the good news, which is what an
+    operator sees most. `schemars` has no way to know that: it reads
+    `skip_serializing_if` as nothing at all and lists the field under
+    `required`. So the published envelope schema rejected the healthy `doctor`
+    output, and the contract ADR-0015 decision 1 rests on was broken by the
+    first command to exercise it.
+
+    `#[serde(default, skip_serializing_if = ...)]` is the pairing that keeps
+    them honest, and it is what every other such field in the workspace already
+    carried — these two were the only pair without it, which is why the sweep
+    for this shape found nothing else. `default` on a type that is only
+    serialized reads oddly for a moment and then reads correctly: the value the
+    field takes when it is absent is exactly what `skip_serializing_if` says it
+    was.
+
+    The test that missed it was validating `doctor`'s envelope already — with
+    no environments configured, so the type in question was never serialized.
+    Covering a command is not covering its payload's nested types, and the
+    envelope validation now runs `doctor` against a real environment, where the
+    two fields are absent because the news is good.
