@@ -321,7 +321,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    page was shown, an editor saved between step 1's check and the
    exchange; if the mode is not the tip entry's, the user changed the
    executable bit in the working tree, which the blob does not carry and
-   the exchange would have silently reset; and if the permission bits,
+   the exchange would have silently reset — a path the tip does not hold
+   has no entry to compare with, so the executable bit of the file that
+   came out is instead what step 3 records for it; and if the permission bits,
    owner, group, attributes or ACL are not what the temporary copied a
    moment earlier, something changed them in that gap and the copy is
    already stale — the same comparison the copy was made from, taken
@@ -354,13 +356,20 @@ locked-copy `update-index` ran it), so every `git` also takes
    and a reopen by name would have `git` read an outside file and put its
    bytes into the commit, while the UI had installed its own through the
    handle. A handle is proof of where a directory *was*: after every
-   exchange the UI compares `fstat` of the directory handle with a fresh
-   no-follow lookup of the same path from the root, and if they no longer
-   name one directory — the ancestor was renamed away and another put in
-   its place — the exchange is undone through the same handle and the
-   compose refused, since the UI's bytes would otherwise sit in a
-   directory the worktree no longer contains while the commit named the
-   path. A rename after that comparison is a race the UI detects but
+   exchange, and after every `link()` below, the UI compares `fstat` of
+   the directory handle with a fresh no-follow lookup of the same path
+   from the root, and if they no longer name one directory — the ancestor
+   was renamed away and another put in its place — the exchange is undone
+   through the same handle, a linked name is unlinked through it
+   (`unlinkat`), and the compose refused, since the UI's bytes would
+   otherwise sit in a directory the worktree no longer contains while the
+   commit named the path. `link()` needs this check as much as the
+   exchange does: `EEXIST` guards only the leaf name, not where the
+   directory is (**measured**: with the handle open, the directory renamed
+   out of the tree and another created at its path, `link()` through the
+   handle succeeded and put the file in the moved directory, the fresh
+   lookup named a different inode from the handle, and `unlinkat` through
+   the handle removed it again). A rename after that comparison is a race the UI detects but
    cannot prevent, as nothing on these platforms locks a directory against
    being moved: what it leaves is a path `git status` reports missing and
    a retained copy of what was there, never a lost file, and the Limits
@@ -402,7 +411,15 @@ locked-copy `update-index` ran it), so every `git` also takes
    the commit should hold.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
    tree, sets the entry for each edited path to that blob at the mode the
-   path had at the tip — `100644` for a new one — and writes the tree:
+   path had at the tip — for a path the tip does not hold, the mode `git
+   add` would give the file step 2 found there: `100755` when it existed
+   untracked with an execute bit and `core.fileMode` is true, `100644`
+   otherwise, since a fixed `100644` leaves the commit disagreeing with
+   the file it was made from (**measured**: an untracked `0755` file
+   committed as `100644` had `git status` reporting it modified, `mode
+   change 100644 => 100755`, and committed as `100755` it was clean; `git
+   add` recorded `100755` for it, and `100644` under `core.fileMode`
+   false, where the `100644` commit was clean too) — and writes the tree:
    `git read-tree <tip>`, `git update-index --add --cacheinfo
    <mode>,<blob>,<path>`, `git write-tree`. `--add` because a new path is not
    in the tree that was read (**measured**: without it, `cannot add to the
@@ -687,7 +704,8 @@ What this ADR reasons about and has not measured, in the order the steps of
   without one gets the commands to run by hand and no worse.
 - **An ancestor directory moved during a compose.** Nothing on Linux,
   macOS or Windows locks a directory against being renamed by another
-  process, so decision 5 detects the move after each exchange and refuses,
+  process, so decision 5 detects the move after each exchange or `link()`
+  and refuses,
   and a move after that detection leaves a path `git status` reports
   missing beside a retained copy. Step 4 measures how narrow that window
   is and whether `RESOLVE_BENEATH` on the exchange itself (Linux 5.6+)
