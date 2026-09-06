@@ -512,7 +512,7 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
 /// catalog view holds the row is the whole question.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
-async fn a_grant_on_a_system_object_is_named_and_not_reported_as_unnameable() {
+async fn a_grant_on_a_system_object_is_reported_with_its_name_not_as_unnameable() {
     let mut db = TestDb::create("nameless").await;
     db.conn
         .execute(
@@ -529,25 +529,34 @@ async fn a_grant_on_a_system_object_is_named_and_not_reported_as_unnameable() {
         .expect("introspect");
     db.drop().await;
 
-    let said = pulled
-        .unexpressible
-        .iter()
-        .map(|u| u.what.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let said = format!("{:?}", pulled.unexpressible);
+    // The negative case: the ordinary table is adopted either way.
     let targets: Vec<String> = pulled.schema.roles["app_reader"]
         .grants
         .keys()
         .map(ToString::to_string)
         .collect();
-    // Both are named: the ordinary table, and the system object the managed-set
-    // filter will discard downstream as somebody else's.
-    assert_eq!(targets, ["dbo.customer", "sys.objects"], "{said}");
+    assert_eq!(targets, ["dbo.customer"], "{said}");
+    // The system object is not a table pbps models, so the grant on it is
+    // reported rather than adopted — but *with* its target, which is what the
+    // managed-set filter needs to discard it as somebody else's object. Named
+    // nowhere, it was a targetless report, and those refuse every command.
+    let system_grant: Vec<&pbps_mssql::introspect::Unexpressible> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| {
+            u.target
+                == Some(pbps_model::GrantTarget::Object(
+                    pbps_model::ObjectName::new("sys", "objects"),
+                ))
+        })
+        .collect();
+    assert_eq!(system_grant.len(), 1, "{said}");
     assert!(
         !pulled
             .unexpressible
             .iter()
-            .any(|u| u.role == "app_reader" && u.what.contains("cannot name")),
+            .any(|u| u.what.contains("cannot name")),
         "a grant the catalog can name was reported as unnameable: {said}"
     );
 }
