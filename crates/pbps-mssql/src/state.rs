@@ -12,7 +12,7 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
-use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, ids_to_prune};
+use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
 use pbps_db::{Conn, DbError};
 use pbps_model::StateSnapshot;
 
@@ -88,6 +88,14 @@ SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_
   FROM dbo.__pbps_state
  ORDER BY id DESC;";
 
+/// The timeline reads the projected columns, so a row whose `state_json` this
+/// build cannot parse is still a row.
+const SELECT_TIMELINE: &str = "\
+SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at,
+       kind, git_sha, plan_checksum, operator, reason, state_json
+  FROM dbo.__pbps_state
+ ORDER BY id DESC;";
+
 /// `OUTPUT INSERTED.id` rather than `SCOPE_IDENTITY()`: it is one round trip,
 /// and it cannot be confused by a trigger someone added to the ledger.
 const INSERT_STATE: &str = "\
@@ -113,21 +121,36 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     conn.execute(CREATE_LOCK).await
 }
 
+/// The cheapest statement that resolves the ledger and checks the permission to
+/// read it without returning a row. See [`is_initialized`] for why it is a
+/// statement at all.
+const PROBE_STATE: &str = "SELECT TOP (0) 1 AS present FROM dbo.__pbps_state;";
+
 /// Whether this database has a ledger at all.
 ///
 /// Every read has to ask first: querying a table that does not exist fails with
 /// "invalid object name", which tells the user nothing about what to do. The
 /// answer they need is "run baseline or bootstrap", and only this distinction
 /// can produce it.
+///
+/// # Why the statement is attempted rather than the catalog asked
+///
+/// This asked `OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL`, and it was wrong
+/// for exactly the reason [`is_missing_table`] gives about the lock table:
+/// measured against the pinned server, a principal with no permission on an
+/// existing `__pbps_state` gets NULL from `OBJECT_ID` and 0 from
+/// `HAS_PERMS_BY_NAME`, the same answers an absent table gives. So "not
+/// authorized to look" arrived at every caller as "there is no ledger" — a
+/// `doctor` that says `uninitialized`, an `explain` that offers `bootstrap`,
+/// and a `state list` that reports an empty history. The statement separates
+/// them: 208 when the table is absent, 229 when it is there and hidden, and
+/// every other failure stays a failure (DECISIONS 219).
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
-    let rows = conn
-        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL THEN 0 ELSE 1 END AS present;")
-        .await?;
-    let present: i32 = match rows.first() {
-        Some(row) => get(row, "present")?,
-        None => return Err(DbError::BadRow("`present` returned no row".into())),
-    };
-    Ok(present == 1)
+    match conn.query(PROBE_STATE).await {
+        Ok(_) => Ok(true),
+        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// The newest state, which is the environment's current baseline.
@@ -145,13 +168,42 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
 }
 
 /// The most recent `limit` entries, newest first.
+///
+/// Every one of them has to be readable: a caller asking for entries wants the
+/// states, and half a state is not one. [`timeline`] is the other question.
 pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, LedgerError> {
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
     }
-    let limit = limit as i32;
-    let rows = conn.query_with(SELECT_HISTORY, &[limit.into()]).await?;
+    let rows = conn
+        .query_with(SELECT_HISTORY, &[top(limit).into()])
+        .await?;
     rows.iter().map(entry_from_row).collect()
+}
+
+/// The most recent `limit` rows as a timeline, newest first.
+///
+/// A row whose recorded state this build cannot read is carried with its
+/// reason rather than failing the call: an environment upgraded across a
+/// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
+/// one of them must not erase the history above it (DECISIONS 218).
+pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = conn
+        .query_with(SELECT_TIMELINE, &[top(limit).into()])
+        .await?;
+    rows.iter().map(timeline_from_row).collect()
+}
+
+/// `TOP (n)` takes a signed integer, and the count is unsigned.
+///
+/// Saturating rather than `as`, which wraps: `--limit 4294967295` became `-1`
+/// and the server refused the query, so a number too large to mean anything
+/// turned into a failure rather than into "all of them" (DECISIONS 217).
+fn top(limit: u32) -> i32 {
+    i32::try_from(limit).unwrap_or(i32::MAX)
 }
 
 /// Appends one state to the ledger and returns its id.
@@ -240,7 +292,9 @@ const INVALID_OBJECT_NAME: &str = "208";
 /// is wrong: SQL Server's metadata-visibility rules hide an object from a
 /// principal with no permission on it, so `OBJECT_ID` answers NULL for a table
 /// that exists and holds a live lock. That turned "not authorized to look" into
-/// "no lock", which is the one direction this tool must never round in.
+/// "no lock", which is the one direction this tool must never round in. The
+/// ledger table had the same guard and the same fault; [`is_initialized`] now
+/// attempts a statement for this reason too.
 ///
 /// `HAS_PERMS_BY_NAME` does not separate them either — measured against a real
 /// server, it answers **0** both for an absent table and for one hidden this
@@ -305,9 +359,48 @@ fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
     })
 }
 
+fn timeline_from_row(row: &pbps_db::Row) -> Result<TimelineEntry, LedgerError> {
+    let id: i64 = get(row, "id")?;
+    let state_json: &str = get(row, "state_json")?;
+
+    // `read_json`, the same reader `entry_from_row` uses through `from_json`:
+    // the version before the shape, so an older row is refused by its version
+    // rather than by whichever field of its older shape serde reached first.
+    // The failure is carried on the row rather than returned — this is the one
+    // reader whose answer is the list itself — and the two kinds stay apart,
+    // because their remedies do (DECISIONS 222).
+    let state = StateSnapshot::read_json(state_json);
+
+    Ok(TimelineEntry {
+        id,
+        applied_at: opt::<&str>(row, "applied_at")?
+            .ok_or_else(|| DbError::BadRow("`applied_at` is unexpectedly NULL".into()))?
+            .to_owned(),
+        // The projected columns, which are what makes an unreadable row still
+        // a row worth showing.
+        kind: get::<&str>(row, "kind")?.to_owned(),
+        git_sha: opt::<&str>(row, "git_sha")?.map(str::to_owned),
+        plan_checksum: opt::<&str>(row, "plan_checksum")?.map(str::to_owned),
+        operator: get::<&str>(row, "operator")?.to_owned(),
+        reason: opt::<&str>(row, "reason")?.map(str::to_owned),
+        state,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count too large for `TOP` must become "as many as it can", never a
+    /// small number and never a negative one: wrapping would silently shorten
+    /// the timeline, which reads as "that is all there is".
+    #[test]
+    fn a_count_above_the_signed_range_saturates_rather_than_wrapping() {
+        assert_eq!(top(1), 1);
+        assert_eq!(top(i32::MAX as u32), i32::MAX);
+        assert_eq!(top(i32::MAX as u32 + 1), i32::MAX);
+        assert_eq!(top(u32::MAX), i32::MAX);
+    }
 
     /// The constant and the DDL have to agree, or the truncation is measured
     /// against a width the column does not have.

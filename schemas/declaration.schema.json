@@ -545,6 +545,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 8,
+  "x-pbps-schema-version": 9,
   "x-pbps-tool-version": "0.0.0"
 }

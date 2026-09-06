@@ -1793,6 +1793,133 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
         .await;
 }
 
+/// The ledger table has the same metadata-visibility fault the lock table had.
+///
+/// `is_initialized` asked `OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL`, and a
+/// principal with no permission on an existing ledger gets NULL from it — the
+/// answer an absent table gives. Every caller then reported the environment as
+/// never initialized: `doctor` said `uninitialized`, `explain` offered
+/// `bootstrap`, and `state list` printed an empty history for a database with
+/// years of it. Measured on this server, `HAS_PERMS_BY_NAME` answers 0 for both
+/// cases as well; only attempting the statement separates them, 208 from 229.
+///
+/// Live for the same reason as its sibling above: what the catalog hides and
+/// what the statement returns is a question only a real server answers.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
+    let mut db = TestDb::create("statevisibility").await;
+    let login = format!("pbps_sviz_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsStateVisibility!1";
+
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!("USE [{}];", db.name))
+        .await
+        .expect("use");
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    // The user exists and may connect; nothing is granted on `__pbps_state`.
+    db.conn
+        .execute(&format!("CREATE USER [{login}] FOR LOGIN [{login}];"))
+        .await
+        .expect("create the user");
+
+    let base = conn_str();
+    let base_no_credentials = base
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = format!(
+        "{base_no_credentials};User Id={login};Password={password};Database={}",
+        db.name
+    );
+
+    let mut lp = Conn::connect(&as_login)
+        .await
+        .expect("connect as the login");
+    // The premise, stated rather than assumed: the catalog really does hide the
+    // ledger from this principal, so the old guard really would have said absent.
+    let hidden = lp
+        .query(
+            "SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL THEN 0 ELSE 1 END \
+             AS present;",
+        )
+        .await
+        .expect("ask the catalog");
+    let present: i32 = hidden[0].try_get("present").expect("present").unwrap_or(1);
+    assert_eq!(present, 0, "the premise is wrong if the table is visible");
+
+    let answer = pbps_mssql::state::is_initialized(&mut lp).await;
+    assert!(
+        answer.is_err(),
+        "a ledger that cannot be read must not be reported as absent: {answer:?}"
+    );
+    // And the readers built on it report rather than shrug.
+    assert!(
+        matches!(
+            pbps_mssql::state::timeline(&mut lp, 10).await,
+            Err(pbps_db::LedgerError::Db(_))
+        ),
+        "the timeline of an unreadable ledger is an error, not an empty list"
+    );
+
+    // The other half, on a database that genuinely has no ledger: still
+    // `false`, which is what keeps a first run quiet.
+    let mut fresh = TestDb::create("statevisibilitynone").await;
+    fresh
+        .conn
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; GRANT CONTROL TO [{login}];"
+        ))
+        .await
+        .expect("create the user");
+    let as_login_fresh = format!(
+        "{base_no_credentials};User Id={login};Password={password};Database={}",
+        fresh.name
+    );
+    let mut none = Conn::connect(&as_login_fresh).await.expect("connect");
+    assert!(
+        !pbps_mssql::state::is_initialized(&mut none)
+            .await
+            .expect("an absent ledger is not an error"),
+        "an absent ledger is absent"
+    );
+
+    drop(lp);
+    drop(none);
+    fresh.drop().await;
+    db.drop().await;
+    let mut admin = Conn::connect(&conn_str()).await.expect("connect");
+    let _ = admin
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+}
+
 /// A foreign key into a schema the project does not manage.
 ///
 /// `validate` accepts one whose target is undeclared — the target is somebody

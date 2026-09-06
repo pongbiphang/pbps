@@ -9722,3 +9722,793 @@ fn a_panicking_test_leaves_no_database_behind() {
     assert!(taken.is_err(), "the panic must not be swallowed");
     assert!(!exists(&name), "`{name}` outlived the test that owned it");
 }
+
+/// The published envelope schema, as this binary produces it.
+///
+/// Read from the checked-in copy rather than regenerated: a unit test already
+/// pins the copy to the binary, so reading the file here checks the thing a
+/// consumer actually fetches — and if the two ever part, the failure names the
+/// stale file rather than appearing as a mysterious validation error.
+fn envelope_schema() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("schemas")
+        .join("envelope.schema.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+}
+
+/// Asserts that one command's JSON output is an envelope the published schema
+/// accepts.
+///
+/// The whole document, not a sample of its fields: the point of publishing a
+/// schema is that a consumer can trust every key in it, and a test that checked
+/// three of them would let the fourth drift the moment somebody adds a field
+/// without describing it.
+#[track_caller]
+fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: &Output) {
+    let text = stdout(out);
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{label}: stdout is not JSON ({e}): {text}"));
+    if let Err(e) = validator.validate(&value) {
+        panic!("{label}: the envelope does not match the published schema: {e}\n{text}");
+    }
+    // `oneOf` is satisfied by exactly one branch, and the branch is chosen by
+    // `command`. Checking the field as well is what says the *right* branch
+    // matched: a payload that happened to fit another command's shape would
+    // otherwise validate and be read as that command's.
+    assert_eq!(
+        value["command"],
+        serde_json::json!(label),
+        "{label}: the envelope names another command"
+    );
+}
+
+/// Every offline command that speaks the envelope emits one the published
+/// schema accepts.
+///
+/// This is the contract ADR-0015 decision 1 rests on: the UI parses envelopes
+/// and nothing else, so a payload that grows a field the schema does not
+/// describe is a UI that cannot read its own tool. The connected commands are
+/// covered by the live test below, and `explain` by the one after it, so that
+/// every branch of the schema is exercised by output some command actually
+/// produced.
+#[test]
+fn every_offline_envelope_matches_the_published_schema() {
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+
+    let d = Demo::new("envelope-offline");
+    d.table("table: dbo.t\ncolumns:\n  id: { type: int, nullable: false }\nprimary_key: [id]\n");
+    d.commit();
+
+    let plan = d.dir.join("p.json");
+    for (label, args) in [
+        ("validate", vec!["validate", "--format", "json"]),
+        ("fmt", vec!["fmt", "--check", "--format", "json"]),
+        ("plan", vec!["plan", "--format", "json"]),
+        ("doctor", vec!["doctor", "--format", "json"]),
+        (
+            "plan",
+            vec!["plan", "--out", plan.to_str().unwrap(), "--format", "json"],
+        ),
+        (
+            "explain",
+            vec![
+                "explain",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        ),
+    ] {
+        envelope_matches_schema(&validator, label, &d.run(&args));
+    }
+
+    // The unhappy shapes too. An envelope a command emits only when something
+    // is wrong is the one a consumer meets on its worst day, and it is exactly
+    // the shape nobody looks at while adding a field.
+    let broken = Demo::new("envelope-offline-broken");
+    broken.table("table: dbo.t\ncolumns:\n  id: { type: nonsense }\n");
+    broken.commit();
+    envelope_matches_schema(
+        &validator,
+        "validate",
+        &broken.run(&["validate", "--format", "json"]),
+    );
+    envelope_matches_schema(
+        &validator,
+        "status",
+        // No environments configured: `status`'s one-finding envelope, with no
+        // `data` at all.
+        &broken.run(&["status", "--format", "json"]),
+    );
+}
+
+/// The published schema refuses an envelope from a version it does not describe.
+///
+/// SPEC §9.8 says `schema_version` is the version of the envelope alone and
+/// that it moves when a consumer would have to change. A schema that accepted
+/// any integer there said "fine" about precisely the case the field exists to
+/// refuse: a later envelope, with fields this document does not describe, read
+/// by a consumer written against this one. Pinned, the mismatch is a validation
+/// error the consumer already handles rather than a silent misreading.
+#[test]
+fn an_envelope_from_a_later_version_is_refused_by_this_schema() {
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    let d = Demo::new("envelope-version");
+    d.table("table: dbo.t\ncolumns:\n  id: { type: int, nullable: false }\nprimary_key: [id]\n");
+    d.commit();
+
+    let o = d.run(&["validate", "--format", "json"]);
+    let mut v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("JSON");
+    // The premise: as emitted, it validates.
+    validator
+        .validate(&v)
+        .expect("the envelope this build emits");
+
+    let now = v["schema_version"].as_u64().expect("a version");
+    v["schema_version"] = serde_json::json!(now + 1);
+    assert!(
+        validator.validate(&v).is_err(),
+        "a later envelope must not validate against this document: {v}"
+    );
+    // And not merely because the number changed: the same envelope with the
+    // version it was emitted with is accepted again, so the refusal is the
+    // version and nothing else.
+    v["schema_version"] = serde_json::json!(now);
+    validator.validate(&v).expect("unchanged again");
+}
+
+/// Every command name in the schema is one this binary can produce, and every
+/// command that emits an envelope is in the schema.
+///
+/// The list in `envelope_branches!` is written by hand, and a hand-written list
+/// beside a `--format json` flag is exactly the pair that drifts: a new command
+/// ships with the flag, nothing describes its payload, and the UI meets it as a
+/// parse error. `--help` is the other side of the pair, and it is generated.
+#[test]
+fn the_schema_describes_every_command_that_emits_an_envelope() {
+    let schema = envelope_schema();
+    let described: std::collections::BTreeSet<String> = schema["oneOf"]
+        .as_array()
+        .expect("oneOf is a list")
+        .iter()
+        .map(|b| {
+            let r = b["$ref"].as_str().expect("a branch is a $ref");
+            schema["$defs"][r.trim_start_matches("#/$defs/")]["properties"]["command"]["const"]
+                .as_str()
+                .expect("each branch pins its command")
+                .to_owned()
+        })
+        .collect();
+
+    // Discovered from `--help`, not from a second list here: a command with a
+    // `--format` option that takes `json` is a command that emits an envelope,
+    // and `docs`, whose `--format` names a document format, is the one
+    // deliberate exception.
+    //
+    // Read section by section rather than by scanning the whole page: the
+    // first attempt matched any help text containing the two words, and
+    // `pbps schema` — whose `--kind` lists a value documented as "the
+    // `--format json` envelope" — came back as a command that emits one.
+    fn help(args: &[&str]) -> String {
+        String::from_utf8_lossy(
+            &Command::new(BIN)
+                .args(args)
+                .arg("--help")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned()
+    }
+
+    /// The names listed under `Commands:`, which is where clap puts
+    /// subcommands and nothing else.
+    fn subcommands(help: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in help.lines() {
+            if line.starts_with("Commands:") {
+                inside = true;
+                continue;
+            }
+            if inside && !line.starts_with("  ") {
+                break;
+            }
+            if let Some(name) = inside
+                .then(|| line.split_whitespace().next())
+                .flatten()
+                .filter(|n| *n != "help")
+            {
+                out.push(name.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Whether this command takes `--format json` — an option line, not a
+    /// mention of the words somewhere in a description.
+    fn takes_format_json(help: &str) -> bool {
+        help.lines().any(|l| l.trim_start().starts_with("--format")) && help.contains("json")
+    }
+
+    let mut emitting = std::collections::BTreeSet::new();
+    let top = help(&[]);
+    for name in subcommands(&top) {
+        if name == "docs" {
+            continue;
+        }
+        let page = help(&[&name]);
+        if takes_format_json(&page) {
+            emitting.insert(name.clone());
+        }
+        for sub in subcommands(&page) {
+            if takes_format_json(&help(&[&name, &sub])) {
+                emitting.insert(format!("{name} {sub}"));
+            }
+        }
+    }
+
+    assert_eq!(
+        described, emitting,
+        "the envelope schema and the commands with `--format json` have parted"
+    );
+}
+
+/// `state list` tells a database with no ledger apart from one with an empty
+/// ledger, and both apart from one it could not reach.
+///
+/// The three read alike in the one rendering that matters — an empty list of
+/// entries — and each is a different thing for an operator to do next: adopt
+/// the database, wait for the first apply to finish, or fix the connection.
+/// Only the findings and `initialized` keep them apart, so all three are
+/// asserted here rather than the happy path alone.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_server() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statelist");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statelist");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let json = |args: &[&str]| -> (i32, serde_json::Value) {
+        let o = d.run(args);
+        let text = stdout(&o);
+        let v = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {text}\n{}", stderr(&o)));
+        (code(&o), v)
+    };
+
+    // 1. No ledger at all: this database has never been written to.
+    let (c, v) = json(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(
+        c, 0,
+        "a database without a ledger is an answer, not a failure"
+    );
+    assert_eq!(v["result"], "ok", "{v}");
+    assert_eq!(v["data"]["initialized"], false, "{v}");
+    assert_eq!(v["data"]["entries"].as_array().unwrap().len(), 0, "{v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"state.uninitialized"), "{v}");
+
+    // 2. The ledger exists and is empty — what a first bootstrap looks like
+    // while it runs. `lock` calls `ensure_tables`, so this is the tool's own
+    // path to that state, not a hand-written table.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            pbps_mssql::state::lock(&mut conn, "state-list-test")
+                .await
+                .expect("lock");
+            pbps_mssql::state::unlock(&mut conn).await.expect("unlock");
+        });
+    }
+    let (c, v) = json(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(c, 0, "{v}");
+    assert_eq!(v["data"]["initialized"], true, "the tables exist now: {v}");
+    assert_eq!(v["data"]["entries"].as_array().unwrap().len(), 0, "{v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"state.no-entries") && !ids.contains(&"state.uninitialized"),
+        "an empty ledger is not an absent one: {v}"
+    );
+
+    // 3. Unreachable: no `data` at all, and `unanswerable` rather than a
+    // history that happens to be empty.
+    let unreachable = with_key(
+        "Server=127.0.0.1,1;TrustServerCertificate=true",
+        "User Id",
+        "sa",
+    );
+    let (c, v) = json(&[
+        "state",
+        "list",
+        "--db",
+        &with_key(&unreachable, "Password", "nope"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(c, 1, "an unreachable server is a tool failure: {v}");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert!(v.get("data").is_none(), "no history was read: {v}");
+}
+
+/// A ledger that is there and cannot be read exits 1, not 2.
+///
+/// The envelope already said `unanswerable`, and the process said 2 — the code
+/// this tool reserves for a difference it established and wants acted on. An
+/// operator whose account cannot read `__pbps_state`, or whose ledger a hand
+/// edit has damaged, would have had that routed to whoever reads findings
+/// rather than to whoever fixes the environment (decision 34). The two have to
+/// agree, so both are asserted.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statebroken");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statebroken");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    // The tool's own path to a real ledger, then one column renamed out from
+    // under the reader: the table resolves and the principal may read it, so
+    // this is "present and unreadable" rather than absent or denied — the case
+    // a test can build without a second login.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            pbps_mssql::state::lock(&mut conn, "state-list-broken")
+                .await
+                .expect("lock");
+            pbps_mssql::state::unlock(&mut conn).await.expect("unlock");
+            conn.execute(
+                "EXEC sp_rename 'dbo.__pbps_state.state_json', 'was_state_json', 'COLUMN';",
+            )
+            .await
+            .expect("rename the column out from under the reader");
+        });
+    }
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    let text = stdout(&o);
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {text}\n{}", stderr(&o)));
+    assert_eq!(
+        code(&o),
+        1,
+        "a ledger that cannot be read is a tool failure: {v}"
+    );
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert!(v.get("data").is_none(), "no history was read: {v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"state.unreadable") && !ids.contains(&"state.uninitialized"),
+        "a damaged ledger is not an absent one: {v}"
+    );
+
+    // Human mode agrees, and says so on stderr rather than printing a table.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 1, "{}", stderr(&human));
+    assert!(
+        stdout(&human).is_empty(),
+        "no table was drawn: {}",
+        stdout(&human)
+    );
+}
+
+/// A real ledger comes back newest first, with the fields a timeline is drawn
+/// from, and the envelope matches the published schema.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_returns_the_history_newest_first_in_the_published_shape() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statehist");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statehist");
+    d.table(ONE_COLUMN);
+    // Identities first: `bootstrap` builds what the ids file knows, and a
+    // project that has never planned has nothing for it to build.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Two entries of different kinds, recording different schemas, so the
+    // order, the `kind` and the per-entry counts are each asserted against
+    // something that could be wrong: the baseline adopts an empty database,
+    // and the bootstrap that follows builds the declared table into it.
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "adopting"])),
+        0
+    );
+    let built = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&built), 0, "{}", stderr(&built));
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(&validator, "state list", &o);
+
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{v}");
+    assert!(
+        entries[0]["id"].as_i64().unwrap() > entries[1]["id"].as_i64().unwrap(),
+        "newest first: {v}"
+    );
+    assert_eq!(entries[1]["kind"], "baseline", "{v}");
+    assert_eq!(entries[1]["reason"], "adopting", "{v}");
+    assert!(entries[0]["applied_at"].is_string(), "{v}");
+    assert!(entries[0]["operator"].is_string(), "{v}");
+    assert!(entries[0]["state_version"].is_number(), "{v}");
+    // Each entry counts the schema *it* recorded: the database was empty when
+    // it was adopted and holds the declared table after the bootstrap. A count
+    // taken from the declarations rather than from the entry would read `1`
+    // for both.
+    assert_eq!(entries[0]["tables"], 1, "{v}");
+    assert_eq!(entries[1]["tables"], 0, "{v}");
+    // Readable entries carry no `unreadable`, which is what makes its presence
+    // on another row mean something.
+    assert!(entries[0].get("unreadable").is_none(), "{v}");
+    // The recorded schema itself is not in a timeline: it is the whole
+    // database, and `state show` is what will hand it over.
+    assert!(entries[0].get("schema").is_none(), "{v}");
+
+    // `--limit` is the head of the history, not a different history.
+    let o = d.run(&[
+        "state",
+        "list",
+        "--db",
+        &connection,
+        "--limit",
+        "1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let one: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(one["data"]["entries"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["data"]["limit"], 1, "{one}");
+    assert_eq!(one["data"]["entries"][0]["id"], entries[0]["id"], "{one}");
+
+    // The human rendering names the same entries, so a reader of either sees
+    // the same history.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 0, "{}", stderr(&human));
+    let text = stdout(&human);
+    assert!(
+        text.contains("baseline") && text.contains("bootstrap"),
+        "{text}"
+    );
+    assert!(text.starts_with("ID"), "a header line: {text}");
+}
+
+/// `state list --limit 0` is refused, because an empty answer would be a lie.
+///
+/// `TOP (0)` returns no rows against a full ledger, and the command reads an
+/// empty result as an empty ledger — so a zero limit would have it report "a
+/// first apply has not finished" about an environment with years of history.
+/// Offline: the refusal is `clap`'s, before anything connects, which is the
+/// point — no database is needed to know that nobody means it.
+#[test]
+fn state_list_refuses_a_limit_of_zero() {
+    let d = Demo::new("statelimit");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "0",
+    ]);
+    assert_eq!(code(&o), 2, "clap refuses the value: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("--limit") && stderr(&o).contains('0'),
+        "the message names the flag and the value: {}",
+        stderr(&o)
+    );
+    // And the other end, for the same reason in the other direction: the count
+    // reaches the server as a signed integer, and `as i32` turned four billion
+    // into -1 — a query the server refuses, reported as a failure to read the
+    // history rather than as the typo it is.
+    let huge = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "4294967295",
+    ]);
+    assert_eq!(code(&huge), 2, "{}", stderr(&huge));
+    assert!(
+        stderr(&huge).contains("2147483647"),
+        "the message names the boundary: {}",
+        stderr(&huge)
+    );
+
+    // And one is accepted, so the refusal is the boundary and not the flag.
+    let one = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "1",
+    ]);
+    assert_ne!(
+        code(&one),
+        2,
+        "a limit of one is a question, not a usage error: {}",
+        stderr(&one)
+    );
+}
+
+/// One entry this build cannot read does not erase the history above it, and
+/// the two ways it can be unreadable stay apart.
+///
+/// An environment upgraded across a state-format change keeps rows older than
+/// `OLDEST_READABLE_VERSION`. Reading the timeline through the same reader
+/// `latest` uses made one such row fail the whole call, so an environment with
+/// a valid current baseline answered "when was this last applied to?" with an
+/// error. The row is carried instead, with its projected columns and the
+/// reason its state could not be read.
+///
+/// That reason is typed: a state format this build does not read is a build to
+/// change, and a state that does not parse is a damaged row. Told the first
+/// about the second, an operator goes looking for a newer pbps that does not
+/// exist (DECISIONS 222), so both rows are here and each is asserted against
+/// the other'"'"'s wording.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "stateold");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("stateold");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "current"])),
+        0
+    );
+
+    // Row 2: from before this build's oldest readable version. The reader takes
+    // the version out of the envelope before parsing the shape, so this is a
+    // version answer and not "unknown field `on`" — which is what makes it
+    // worth writing by hand rather than copying a current row.
+    let old = pbps_model::state::OLDEST_READABLE_VERSION - 1;
+    on_server(
+        &connection,
+        &format!(
+            "INSERT INTO dbo.__pbps_state \
+                 (kind, git_sha, plan_checksum, state_json, operator, reason) \
+             VALUES ('apply', NULL, NULL, \
+                     N'{{\"version\": {old}, \"kind\": \"apply\", \"operator\": \"someone\"}}', \
+                     N'someone', N'from before');"
+        ),
+    );
+
+    // Row 3: a state that is not JSON at all — damage, which no version of this
+    // tool reads.
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason) \
+         VALUES ('apply', NULL, NULL, N'{not json', N'someone-else', NULL);",
+    );
+    // Row 4: a *readable* version carrying a field this build does not know.
+    // The version says yes and the strict parse says no, and the answer has to
+    // be damage rather than a version problem — the case that tells the reader
+    // apart from one that looks only at the stamp.
+    on_server(
+        &connection,
+        "INSERT INTO dbo.__pbps_state \
+             (kind, git_sha, plan_checksum, state_json, operator, reason) \
+         SELECT 'apply', NULL, NULL, JSON_MODIFY(state_json, '$.surprise', 'x'), \
+                N'a-third', N'hand-edited' \
+           FROM dbo.__pbps_state WHERE id = 1;",
+    );
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "an unreadable row is a row, not a failure: {}",
+        stderr(&o)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4, "every row is listed: {v}");
+
+    // Newest first: the hand-edited row, the unparseable one, the old-format
+    // one, the baseline.
+    let (edited, damaged, old_row, current) = (&entries[0], &entries[1], &entries[2], &entries[3]);
+    assert_eq!(
+        edited["unreadable"]["kind"], "malformed",
+        "a readable version with an unknown field is a damaged row, not a \
+         version problem: {v}"
+    );
+    assert_eq!(
+        damaged["unreadable"]["kind"], "malformed",
+        "a row that does not parse is damage, not a version: {v}"
+    );
+    assert!(
+        damaged["unreadable"]["detail"].is_string(),
+        "the parser's own words are kept: {v}"
+    );
+    assert_eq!(damaged["operator"], "someone-else", "{v}");
+    assert!(
+        damaged.get("reason").is_none(),
+        "a row with no reason has none, not an empty one: {v}"
+    );
+    assert_eq!(old_row["unreadable"]["kind"], "unsupported-version", "{v}");
+    assert!(
+        old_row["unreadable"]["detail"]
+            .as_str()
+            .expect("a detail")
+            .contains("version"),
+        "{v}"
+    );
+    assert_eq!(old_row["kind"], "apply", "the projected column: {v}");
+    assert_eq!(old_row["operator"], "someone", "{v}");
+    assert_eq!(old_row["reason"], "from before", "{v}");
+    // Nothing from inside the state it could not read, and no zero standing in
+    // for it: absent, not empty.
+    assert!(old_row.get("tables").is_none(), "{v}");
+    assert!(old_row.get("state_version").is_none(), "{v}");
+
+    // The readable row is untouched beside it.
+    assert!(current.get("unreadable").is_none(), "{v}");
+    assert_eq!(current["kind"], "baseline", "{v}");
+    assert_eq!(current["tables"], 0, "{v}");
+
+    // And the reader is told, once per row, rather than left to notice the
+    // missing fields.
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "state.entry-malformed",
+            "state.entry-malformed",
+            "state.entry-unsupported-version"
+        ],
+        "one id per cause, in the ledger's order: {v}"
+    );
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(&validator, "state list", &o);
+
+    // The human view says so too, rather than printing a blank line.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 0, "{}", stderr(&human));
+    let told = stderr(&human);
+    assert!(
+        told.contains("does not parse") && told.contains("state format this build does not read"),
+        "each row is named for what is wrong with it: {told}"
+    );
+    // The table itself stays a table, so a reader can pipe it, and its detail
+    // column does not tell a damaged row to go looking for an upgrade.
+    let table = stdout(&human);
+    assert!(
+        table.starts_with("ID") && table.contains("someone"),
+        "{table}"
+    );
+    // The row's own reason wins the detail column when it has one; the row
+    // that has none says what is wrong with it instead of nothing. Which of
+    // the two placeholders is drawn is pinned offline, in this module's own
+    // tests, where both can be built without a server.
+    assert!(
+        table.contains("(recorded state is damaged)") && table.contains("from before"),
+        "{table}"
+    );
+}
+
+/// `verify` and `status`, the two connected envelopes, match the published
+/// schema against a real database.
+///
+/// Offline they only ever produce their unreachable shapes, and the payload a
+/// consumer actually renders — the drift report, the environment rows — is the
+/// one no offline test can reach.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_connected_envelopes_match_the_published_schema() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "envelopelive");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("envelopelive");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(
+        &validator,
+        "verify",
+        &d.run(&["verify", "--db", &connection, "--format", "json"]),
+    );
+
+    // `status` reads the configured environments rather than `--db`, so the
+    // project has to name this database to produce a row at all.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  live:\n    url_env: PBPS_STATUS_TEST_URL\n",
+    )
+    .unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env("PBPS_STATUS_TEST_URL", &connection)
+        .output()
+        .unwrap();
+    envelope_matches_schema(&validator, "status", &o);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"][0]["environment"], "live", "{v}");
+
+    // `doctor` reads the same configured environments, and its payload is the
+    // one with fields that disappear when the news is good: an account holding
+    // every permission serializes no `permissions_unknown`, and a database with
+    // every declared schema no `absent_schemas`. A schema that required them
+    // rejected the healthy case — the one an operator sees most.
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env("PBPS_STATUS_TEST_URL", &connection)
+        .output()
+        .unwrap();
+    envelope_matches_schema(&validator, "doctor", &o);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+    assert_eq!(env["environment"], "live", "{v}");
+    assert!(
+        env.get("permissions_unknown").is_none() && env.get("absent_schemas").is_none(),
+        "the healthy case is the one that omits them: {v}"
+    );
+}

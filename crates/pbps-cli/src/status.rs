@@ -24,7 +24,7 @@ use crate::{db, output};
 
 /// One environment's line. Serialized as-is for `--format json`, so anyone who
 /// wants their own web view has a stable shape to render.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct EnvStatus {
     pub environment: String,
 
@@ -71,6 +71,7 @@ pub struct EnvStatus {
     /// human summary. They are omitted from the row because the stable JSON
     /// representation already exposes them through `findings`.
     #[serde(skip)]
+    #[schemars(skip)]
     issues: Vec<StatusIssue>,
 }
 

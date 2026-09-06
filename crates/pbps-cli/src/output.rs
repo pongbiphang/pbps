@@ -35,7 +35,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// consumer can show them without the command having to fail. Nothing here is
 /// suppressed by severity — a warning that is never rendered is a warning that
 /// does not exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
@@ -51,7 +51,7 @@ pub enum Severity {
 /// on an unreadable plan printed nothing at all and exited 1 with `error: path
 /// contains invalid UTF-8 characters` — the one-envelope contract broken by the
 /// envelope itself. Holding a `String` makes that unrepresentable.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct Location {
     pub file: String,
     /// 1-based, when the diagnostic knows one.
@@ -60,7 +60,7 @@ pub struct Location {
 }
 
 /// One thing the user has to act on.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct Finding {
     /// A stable, dotted identifier: `load.semantic`, `identity.stale`,
     /// `fmt.not-canonical`.
@@ -150,7 +150,7 @@ impl Finding {
 /// process's own exit code, and a two-valued `result` made it turn `doctor`'s
 /// exit 1 into a 2 — routing an unreachable database to the author of the
 /// schema change, which is exactly what §9.8 is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     /// Nothing to act on. Exit 0.
@@ -166,7 +166,8 @@ pub enum Outcome {
 /// Generic over the payload so a command with one — `verify`'s drift report,
 /// `status`'s environment rows — carries it without inventing a second
 /// envelope. Commands with nothing but diagnostics use [`Report::plain`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[schemars(bound = "T: schemars::JsonSchema")]
 pub struct Report<T: Serialize> {
     pub schema_version: u32,
     pub tool_version: &'static str,

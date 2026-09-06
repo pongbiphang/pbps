@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Nineteen instances so far. **Absent, empty and unreadable are three different
+Twenty-two instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -28,7 +28,12 @@ things, and only one of them is good news.**
 - A lock that outlived its state table, invisible to `status`, then to `doctor`
   and `explain`.
 - A lock table the caller has **no permission to read**: metadata visibility
-  makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock".
+  makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock". The *ledger*
+  table was asked the same way and was not swept with it, so a principal with no
+  permission on `__pbps_state` was told the database had never been touched —
+  `doctor` saying `uninitialized`, `explain` offering `bootstrap`, `state list`
+  drawing an empty history. Presence is attempted now, not asked: 208 absent,
+  229 hidden (DECISIONS 219).
 - `validate --since` reading a failed `ls-tree` as "no declarations at that
   revision", which calls every table new. From a project in a subdirectory it
   was empty every time: the pathspec lacked the `--full-tree` its sibling
@@ -38,6 +43,18 @@ things, and only one of them is good news.**
   scope every later command rebuilds from that schema forgot it, and the first
   `verify` refused an untouched database as a policy violation. It is a partial
   schema inside the managed set, and the recorders now refuse it as one.
+- An entry in the ledger this build **cannot parse** failing the whole read:
+  `state list` returned `Err` on the first unreadable row, so one row written
+  by a version older than `OLDEST_READABLE_VERSION` erased every newer entry
+  above it — the list a person opened the command to see. The row is carried
+  now, with the ledger's own columns and the reason (DECISIONS 218). The rule
+  holds one level down: it is about a row as much as about a table.
+- Two *unreadables* flattened into one: a ledger row whose JSON does not parse
+  and a row recorded by a version outside the readable range were carried as the
+  same string, and the warning built from it said "recorded by a version this
+  build cannot read" for both. The damaged row's operator was sent looking for
+  an upgrade that does not exist for a damaged row. Typed apart now (DECISIONS
+  222).
 - An unlock failure **after a command had already failed** dropped on the floor:
   `apply` reported its own error and left `__pbps_lock` held with no word about
   it, so the retry failed as "locked". The same shape in `snapshot`, `baseline`
@@ -72,6 +89,13 @@ broken: the annotation converter mapped `doctor`'s exit 1 to 2, and `verify`
 folded an unexpressible live difference into the connection catch-all as
 `environment.unreachable` at exit 1 — when the database had been reached and
 the difference established, which is drift and exit 2.
+
+`state list` broke it a third way, and this one is visible without a database:
+the branch emitted an `unanswerable` envelope and then returned `Found`, so the
+JSON said "no answer" while the exit code said "act on this". A command that
+reaches for `Found` on a path that also emits `unanswerable` has contradicted
+itself; going through `or_unanswerable` leaves one thing producing both
+(DECISIONS 220).
 
 ### 4. A fix that generalises one step too far
 
@@ -265,6 +289,20 @@ the recorded state, because the first fix read them from the catalog, and the
 catalog hides a securable from an account with no permission on it: the live
 suite showed the query returning nothing for exactly the login being checked.
 
+## A cell that can end its own row
+
+`state list` draws a table whose widths are counted from the text, and the text
+is a `--reason` and an operator name — free-form, and stored verbatim. One
+newline in a reason ended the row early, and its tail was printed at column 1
+where it read as another entry. The table was not garbled in a way a reader
+notices; it was wrong in the one dimension the command exists to report, the
+number of times this database was deployed to.
+
+Escape for the terminal, keep the original in the JSON, and do it for **every**
+cell rather than for the fields that are free text this week (DECISIONS 221).
+The same question is worth asking of any rendering whose layout is computed
+from its content.
+
 ## A comment ends at a carriage return
 
 A `--` comment ends at a bare carriage return, and at nothing else that looks
@@ -456,9 +494,23 @@ than assuming.
 
 ## Tests that pass for the wrong reason
 
-Nine so far, every one invisible in a green run. **Assert the specific failure,
+Eleven so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 
+A fixture for "a state recorded by a version this build cannot read", written
+by hand at that version, was not one: the reader parsed the shape before the
+version, so it failed on a missing field and exercised the *malformed* branch
+instead. The test asserted the wording of a warning it was never producing for
+the reason it named. `StateSnapshot::from_json` reading the version first (#50)
+makes the case reachable, and the fixture now carries one row of each of the
+three ways a state can be unreadable rather than one row asserted about twice.
+
+- The envelope-schema test validated `doctor`'s output — with no environments
+  configured, so `EnvDiagnosis`, the type with the fields that vanish when the
+  news is good, was never serialized. The command was covered; the shape was
+  not, and the published schema required two fields the healthy case omits
+  (DECISIONS 223). **Covering a command is not covering its payload's nested
+  types.**
 - A plan fixture that failed at deserialization instead of at the emitter.
 - `plan`'s identity check firing before its baseline load.
 - A `pull` guard test taking the not-a-directory branch.

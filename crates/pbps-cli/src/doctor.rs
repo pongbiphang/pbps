@@ -27,7 +27,7 @@ use pbps_mssql::edition::Edition;
 use crate::{db, output};
 
 /// Everything `doctor` learned, for `--format json`.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Diagnosis {
     pub project_file: String,
     pub declarations: String,
@@ -41,7 +41,7 @@ pub struct Diagnosis {
     pub environments: Vec<EnvDiagnosis>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct EnvDiagnosis {
     pub environment: String,
     /// `ready`, `mid-deployment`, `uninitialized`, `locked`, `lock-unknown`,
@@ -64,7 +64,13 @@ pub struct EnvDiagnosis {
 
     /// Set when the permission query itself failed, so an empty
     /// `missing_permissions` means "not determined" rather than "none".
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ///
+    /// `default` beside `skip_serializing_if`, on a type that is only ever
+    /// serialized: it is what tells `schemars` the field is optional. Without
+    /// it the published schema *required* a field the good news omits, so the
+    /// envelope a healthy `doctor` prints failed its own contract
+    /// (DECISIONS 223).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub permissions_unknown: bool,
 
     /// Declared schemas this database does not have.
@@ -72,7 +78,9 @@ pub struct EnvDiagnosis {
     /// A readiness problem rather than a permission one: nothing in the tool
     /// emits `CREATE SCHEMA`, so a plan declaring `app.customer` against a
     /// database with no `app` fails on its first statement.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `default` for the reason above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absent_schemas: Vec<String>,
 
     /// Set when the version or edition could not be read, so an absent

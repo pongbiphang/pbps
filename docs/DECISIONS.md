@@ -3229,3 +3229,222 @@ SPEC is in sync with all of these.
     closed list that refused `SELECT`, and this one accepts it. A consumer
     keying on that number to cache or select an artifact could not otherwise
     tell the two apart, which is the drift detection the field is for.
+
+## Phase 6 — the envelope contract (ADR-0015, #64 step 2)
+
+214. **The envelope's schema is published as one document with a branch per
+    command, selected by `command`.** SPEC §9.8's shape has been a Rust type
+    and an example since Phase 3.1; ADR-0015 decision 1 makes it the whole
+    contract between the UI and the tool, and a contract nothing publishes is
+    one nobody can check against.
+
+    One document rather than one per command, because what a consumer holds is
+    *an envelope*: it reads `command` and only then knows what `data` is.
+    Publishing them separately would make it choose a schema before reading
+    the field that decides which one applies. Each branch pins `command` to a
+    constant, so `oneOf` picks exactly one and a payload that happens to fit
+    another command's shape is rejected rather than silently read as that
+    command's.
+
+    Every branch is generated from the type the command serializes, the way
+    the declaration and config schemas are generated from the loader's and the
+    config's types (SPEC §14.1). The list of command-to-payload pairs is
+    written once, in `envelope_branches!`, and a flow test reads the command
+    names back out of the published schema and compares them with the
+    commands `--help` says take `--format json` — so a command given the flag
+    without a line in that list, or a line without the flag, is a failing test
+    rather than an envelope nothing describes.
+
+215. **`plan --db` stays outside the envelope set.** #64 asked whether the
+    connected plan should join it now that a UI will trigger one (step 5).
+
+    It does not, and the reason is the one SPEC §9.8 already gives: `plan --db`
+    is not a read-only command. It connects, reads the ledger, and *writes the
+    deployment artifact* — the file the checksum gate pins. What a reviewer
+    reads from that artifact is `explain`, which does speak the envelope, and
+    which reads the file rather than the run that produced it. A UI that
+    rendered the producing run's own JSON would be showing a description of the
+    artifact that was not computed from the artifact, which is precisely the
+    gap the checksum exists to close.
+
+    So the UI's trigger path stays: run `plan --db`, then read the plan back
+    with `explain --plan --format json`. ADR-0015 decision 1's list of what
+    speaks the envelope is exact and unchanged.
+
+216. **`state list` carries the ledger's columns, never the recorded schema.**
+    The timeline the UI draws needs an id, a time, a kind, an operator and the
+    provenance fields; the snapshot's `schema` and `ids` are the whole database
+    twice over. A payload that carried them would send megabytes to a page
+    drawing a list of dates, and they are what `state show` and `state export`
+    are for — the second half of SPEC §14.1's row, deliberately not built here.
+
+    `initialized` sits beside `entries` because an empty list is the one
+    rendering that must never stand for "this database has no ledger" or "the
+    server could not be reached". The three are a note plus `initialized:
+    false`, a note plus `initialized: true`, and `unanswerable` with no `data`
+    at all — three answers, as the repository's rule for absent, empty and
+    unreadable requires.
+
+217. **A `--limit` too large saturates; it does not wrap and does not refuse.**
+    `TOP (n)` takes a signed 32-bit count and the flag takes a `u32`, so
+    `--limit 4294967295` cast with `as` became `TOP (-1)` and the server
+    refused the whole query. A number meaning "more than there could ever be"
+    turning into an error is the wrong answer twice over: the caller asked for
+    everything and got nothing, and the message named a syntax error rather
+    than a limit.
+
+    Two guards, because they fail differently. The flag's parser refuses `0`
+    and anything above `i32::MAX`, so a person who types a number the ledger
+    cannot mean is told so by name. The reader saturates, because it is a
+    library function whose caller need not be the CLI, and "as many as the
+    server can return" is the only reading of a count larger than any table.
+
+218. **An entry this build cannot read is carried, not thrown.** `state list`
+    reads rows written by every version that ever touched the environment,
+    including ones older than `OLDEST_READABLE_VERSION`. Parsing each row into
+    a `StateSnapshot` and returning `Err` on the first failure meant one
+    unreadable row erased the whole timeline above it — the newest entries, the
+    ones a person is looking at the list to find.
+
+    So the reader projects the ledger's own columns (id, time, kind, operator,
+    provenance) and treats the recorded state as optional: a row that will not
+    parse, or whose version this build does not read, keeps every column the
+    ledger stores and carries the reason in `unreadable`, with a
+    `state.entry-unreadable` finding naming the row. `history` keeps the
+    stricter contract — a caller asking for states wants states — and the two
+    doc comments point at each other. (The one finding id named here became
+    two in 222, once the two ways a row can be unreadable were told apart.)
+
+    This is the repository's absent/empty/unreadable rule applied one level
+    down: it holds for a row as much as for a ledger.
+
+219. **Presence is asked by attempting the statement, never by `OBJECT_ID`.**
+    `is_initialized` asked the catalog whether `dbo.__pbps_state` exists. The
+    lock reader had asked the same way and was fixed one shape earlier; the
+    ledger reader was not swept with it.
+
+    Measured against the pinned server, with a contained user holding no
+    permission on an existing `__pbps_state`: `OBJECT_ID` answers NULL and
+    `HAS_PERMS_BY_NAME` answers 0 — the same answers an absent table gives.
+    Attempting `SELECT TOP (0) 1 AS present FROM dbo.__pbps_state` separates
+    them: **208** when the table is absent, **229** when it exists and is
+    hidden, **207** when it is there with a shape this build does not know, and
+    every other failure stays a failure. `TOP (0)` still resolves the object and
+    still checks the permission, so the probe costs no rows.
+
+    Fixed in `is_initialized` itself rather than at the new call site: `latest`,
+    `history`, `timeline`, `prune`, `doctor` and `explain` all asked through it,
+    and each turned "not authorized to look" into "this database has no pbps
+    ledger" — `doctor` reporting `uninitialized`, `explain` offering
+    `bootstrap`, `state list` printing an empty history for an environment with
+    years of it. All six inherit the fix with no signature change, and both
+    outside callers already routed an error correctly.
+
+220. **An `unanswerable` envelope exits 1, and never 2.** `state list`'s
+    ledger-read failure built its own findings and returned `Found::reported()`,
+    which `main` maps to `EXIT_FINDING`. The JSON said the question could not be
+    answered while the exit code said there was something to act on — decision
+    34's two audiences, given contradictory instructions by the same run.
+
+    The branch goes through `output::or_unanswerable` like every other step in
+    the command, so the envelope and the exit code are produced by one thing.
+    That is the general rule: a command that reaches for `Found` on a path where
+    it also emits `unanswerable` has routed a tool failure to the wrong person.
+
+221. **A table cell is escaped for the terminal; the JSON keeps the original.**
+    `state list --format human` lays its columns out by counting characters, and
+    `operator` and `reason` are free text: `--reason $'ticket-9\nwhy'` reaches
+    the ledger as written, and a `failed` entry can carry a driver's multi-line
+    message. A cell holding a line break ended its row early, so the rest of the
+    row began again at column 1 and read as an entry of its own — a table that
+    did not say "this reason had a newline in it" but said something false about
+    how many times the database had been deployed to, in a command whose whole
+    output is that list.
+
+    Control characters are shown escaped (`\n`, `\r`, `\t`, `\u{7}`) rather than
+    stripped: what was recorded is the point of the column, and a silently
+    shortened reason is the same class of lie one column over. `--format json`
+    is untouched — a consumer parsing the envelope wants the bytes the operator
+    typed, and JSON has its own escaping for them.
+
+    Applied to every cell rather than to the two that are free text today. The
+    rule the repository keeps arriving at: prefer making the bad value
+    unrepresentable over checking for it at the sites that happen to hold it now.
+
+222. **"Older than this build reads" and "damaged" are two answers, not one.**
+    `timeline_from_row` parses the recorded state and then version-checks it,
+    and both failures were carried as a string. The warning built from that
+    string said the entry "was recorded by a version this build cannot read" —
+    so a row whose JSON is truncated told the operator to go and find a newer
+    pbps, which is not a thing that exists for a damaged row.
+
+    `TimelineEntry` now holds `Result<StateSnapshot, Unreadable>`, with
+    `Unreadable::UnsupportedVersion` and `Unreadable::Malformed`. The envelope
+    carries the same split as a tagged object — `{"kind": "malformed",
+    "detail": ...}` — because a page that draws "upgrade pbps" must be able to
+    decide *not* to draw it, and reading that out of a sentence is not something
+    a schema can promise. Two finding ids for the same reason: an id is what a
+    consumer keys on, and these two are different jobs.
+
+    A `Result` rather than a snapshot beside an optional reason: exactly one of
+    the two is true of every row, and the struct that could hold both needed a
+    comment saying it never would.
+
+    **One reader, not two.** The version-before-shape order `from_json` was
+    given for #50 is exactly what this needs, so `StateSnapshot::read_json` *is*
+    that reader with its failure typed, and `from_json` is `read_json` with the
+    two flattened into the one sentence a reader of a single state wants. A
+    second copy of the ordering in the ledger crate would have been a second
+    place to get it wrong.
+
+    That ordering is also what makes the distinction worth drawing. Without it,
+    an old row fails on whichever field of its older shape serde reaches first
+    and is `Malformed` — measured, on a base before it, and it had a fixture of
+    this test passing while proving the wrong thing. With it there are three
+    cases and the reader gets all three right: below the range is
+    `UnsupportedVersion` and says which command fixes it; unparseable is
+    `Malformed`; and a *readable* version carrying an unknown field is
+    `Malformed` too, because within a version this build reads, a field it does
+    not know is a hand-edited or corrupt row. The live test carries one of each.
+
+223. **A field `serde` may omit is a field `schemars` must call optional.**
+    `EnvDiagnosis` skips `permissions_unknown` when it is false and
+    `absent_schemas` when it is empty — the good news, which is what an
+    operator sees most. `schemars` has no way to know that: it reads
+    `skip_serializing_if` as nothing at all and lists the field under
+    `required`. So the published envelope schema rejected the healthy `doctor`
+    output, and the contract ADR-0015 decision 1 rests on was broken by the
+    first command to exercise it.
+
+    `#[serde(default, skip_serializing_if = ...)]` is the pairing that keeps
+    them honest, and it is what every other such field in the workspace already
+    carried — these two were the only pair without it, which is why the sweep
+    for this shape found nothing else. `default` on a type that is only
+    serialized reads oddly for a moment and then reads correctly: the value the
+    field takes when it is absent is exactly what `skip_serializing_if` says it
+    was.
+
+    The test that missed it was validating `doctor`'s envelope already — with
+    no environments configured, so the type in question was never serialized.
+    Covering a command is not covering its payload's nested types, and the
+    envelope validation now runs `doctor` against a real environment, where the
+    two fields are absent because the news is good.
+
+224. **The published envelope pins its own version, as it pins the command.**
+    Each branch already fixed `command` with a `const`, because that is the
+    field `oneOf` selects on. `schema_version` was left as a plain integer, so
+    this document — the one a consumer written against envelope version 1
+    validates with — accepted an envelope from a later version whose extra
+    fields it does not describe.
+
+    SPEC §9.8 says what that field is for: it is the version of the envelope
+    alone, and it "moves when a consumer would have to change". A schema that
+    accepts any value there says "fine" about the one case the field exists to
+    refuse, which is this repository's oldest mistake in a new place — a reader
+    told "not readable" and answering "nothing wrong".
+
+    Pinned, a version bump is a validation error the consumer already has a
+    branch for, at the moment the envelope arrives, rather than a payload
+    silently read as something it is not. It also makes the bump a deliberate
+    act on this side: `output::SCHEMA_VERSION` moves, the checked-in schema
+    moves with it, and the drift test refuses to let one move without the other.

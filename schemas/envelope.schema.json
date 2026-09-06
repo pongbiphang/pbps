@@ -1,0 +1,1206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pbps --format json envelope",
+  "description": "One envelope per read-only command (SPEC 9.8). `command` selects which branch applies, and `data` is that command's own payload.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/envelope.plan"
+    },
+    {
+      "$ref": "#/$defs/envelope.validate"
+    },
+    {
+      "$ref": "#/$defs/envelope.fmt"
+    },
+    {
+      "$ref": "#/$defs/envelope.explain"
+    },
+    {
+      "$ref": "#/$defs/envelope.doctor"
+    },
+    {
+      "$ref": "#/$defs/envelope.verify"
+    },
+    {
+      "$ref": "#/$defs/envelope.status"
+    },
+    {
+      "$ref": "#/$defs/envelope.state-list"
+    }
+  ],
+  "$defs": {
+    "Outcome": {
+      "description": "What a command ended on — the same three-way split as the exit codes.\n\nThree values, not two, because a consumer that has to re-derive \"could not\nanswer\" from the findings has re-implemented the routing rule the exit codes\nexist to carry. `scripts/findings-to-github.py` maps this straight to the\nprocess's own exit code, and a two-valued `result` made it turn `doctor`'s\nexit 1 into a 2 — routing an unreachable database to the author of the\nschema change, which is exactly what §9.8 is for.",
+      "oneOf": [
+        {
+          "description": "Nothing to act on. Exit 0.",
+          "type": "string",
+          "const": "ok"
+        },
+        {
+          "description": "The command answered and found something. Exit 2.",
+          "type": "string",
+          "const": "findings"
+        },
+        {
+          "description": "The command could not answer. Exit 1.",
+          "type": "string",
+          "const": "unanswerable"
+        }
+      ]
+    },
+    "Finding": {
+      "description": "One thing the user has to act on.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "A stable, dotted identifier: `load.semantic`, `identity.stale`,\n`fmt.not-canonical`.\n\nStable is the operative word. It is what a `policies:` block will raise\nor lower the severity of (SPEC §14.1), and what a team suppresses by,\nso it must survive a reworded message.",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "message": {
+          "description": "What is wrong, in the user's vocabulary.",
+          "type": "string"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Location"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remedy": {
+          "description": "A command to copy and paste.\n\nThe same rule as [`crate::report`]: a non-interactive run is never\nprompted, so the finding itself has to be the instructions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "severity",
+        "message"
+      ]
+    },
+    "Severity": {
+      "description": "How severely a finding should be taken.\n\n`Error` is what decides the exit code; the other two are carried so a\nconsumer can show them without the command having to fail. Nothing here is\nsuppressed by severity — a warning that is never rendered is a warning that\ndoes not exist.",
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "note"
+      ]
+    },
+    "Location": {
+      "description": "Where in the working tree a finding is.\n\nThe file is a `String`, not a `PathBuf`, and that is the whole point: serde's\n`Path` impl **fails** on a path that is not UTF-8, and a `PathBuf` here made\nthat failure the whole envelope's. `explain --plan <non-UTF-8> --format json`\non an unreadable plan printed nothing at all and exited 1 with `error: path\ncontains invalid UTF-8 characters` — the one-envelope contract broken by the\nenvelope itself. Holding a `String` makes that unrepresentable.",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based, when the diagnostic knows one.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "file"
+      ]
+    },
+    "PlanData": {
+      "description": "What `plan` produced, for `--format json`.\n\nThe changes are counted rather than listed: the typed change set is what\n`--out` writes, and `explain` is what renders it. Two spellings of the same\nlist, one of them abbreviated, is how a consumer comes to read the wrong one.",
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "type": "string"
+        },
+        "changes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "tables": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modules": {
+          "description": "Counted apart from tables: a module change's `Change::table()` is the\nmodule's own name, so folding them together called a one-view plan\n\"1 table\" (ADR-0002).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "roles": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "baseline",
+        "changes",
+        "tables",
+        "modules",
+        "roles",
+        "risks"
+      ]
+    },
+    "envelope.plan": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "plan"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "ValidateData": {
+      "description": "What `validate` counted, for `--format json`.\n\nPresent even when the run failed: a consumer showing \"3 of 40 tables are\nbroken\" needs the 40, and a payload that vanished on failure would make the\nonly interesting case the one with no context.",
+      "type": "object",
+      "properties": {
+        "dialect": {
+          "type": "string"
+        },
+        "tables": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "columns": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modules": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentityCounts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "dialect",
+        "tables",
+        "columns",
+        "modules"
+      ]
+    },
+    "IdentityCounts": {
+      "type": "object",
+      "properties": {
+        "tables": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "columns": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "tombstones": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "tables",
+        "columns",
+        "tombstones"
+      ]
+    },
+    "envelope.validate": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "validate"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValidateData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "FmtData": {
+      "description": "What `fmt` looked at, for `--format json`.",
+      "type": "object",
+      "properties": {
+        "checked": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "changed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "mode": {
+          "description": "`check` or `write`. The findings mean different things in each, and a\nconsumer must not have to infer which ran from their severity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "checked",
+        "changed",
+        "mode"
+      ]
+    },
+    "envelope.fmt": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "fmt"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FmtData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "Explanation": {
+      "description": "What `explain` found, for `--format json`.\n\nSerialized rather than re-derived by a consumer: the optional UI of ADR-0006\nrenders exactly this, and a UI that recomputed \"which risks apply\" from the\nchange list would be a second implementation of the gate's own arithmetic.",
+      "type": "object",
+      "properties": {
+        "applyable": {
+          "type": "boolean"
+        },
+        "dialect": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseline": {
+          "type": "string"
+        },
+        "mode": {
+          "description": "`transactional` or `staged`.",
+          "type": "string"
+        },
+        "checksum": {
+          "description": "The checksum `apply` will re-compute and refuse a mismatch on.",
+          "type": "string"
+        },
+        "change_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "table_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "module_count": {
+          "description": "Counted apart from tables: `Change::table()` returns a module's own name\nfor a module change, so folding them together called a one-view plan\n\"1 table\" (ADR-0002 — they are different kinds of object).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "role_count": {
+          "description": "Roles touched (ADR-0005).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiskDetail"
+          }
+        },
+        "approve_with": {
+          "description": "The exact command that approves this plan, `--allow` included — or, for\na preview, the command that produces an applyable plan instead. Which\none it is is [`Explanation::applyable`].",
+          "type": "string"
+        },
+        "plan_path": {
+          "description": "Set only when the plan path could not be spelled safely for every shell\nthis line is read in, and `approve_with` therefore carries a\n`\"<plan path>\"` placeholder. The value is the path, verbatim.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "probes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "statement_count": {
+          "description": "Statements the plan will run. Counted, not listed: the SQL is\n`plan --sql`'s job, and duplicating it here would invite a reviewer to\nread one and approve the other.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "target": {
+          "description": "Only present when a target was given.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TargetState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "applyable",
+        "dialect",
+        "created_at",
+        "baseline",
+        "mode",
+        "checksum",
+        "change_count",
+        "table_count",
+        "module_count",
+        "role_count",
+        "risks",
+        "approve_with",
+        "probes",
+        "statement_count"
+      ]
+    },
+    "RiskDetail": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "class",
+        "why",
+        "changes"
+      ]
+    },
+    "TargetState": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`ready`, `locked`, `mid-deployment`, `uninitialized`, `unreachable` or\n`unconfigured`.",
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "environment",
+        "state"
+      ]
+    },
+    "envelope.explain": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "explain"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Explanation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "Diagnosis": {
+      "description": "Everything `doctor` learned, for `--format json`.",
+      "type": "object",
+      "properties": {
+        "project_file": {
+          "type": "string"
+        },
+        "declarations": {
+          "type": "string"
+        },
+        "identity_file": {
+          "type": "string"
+        },
+        "dialect": {
+          "type": "string"
+        },
+        "tables": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modules": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "git": {
+          "description": "Whether git is available: the default baseline and the operator name both\ncome from it.",
+          "type": "boolean"
+        },
+        "environments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvDiagnosis"
+          }
+        }
+      },
+      "required": [
+        "project_file",
+        "declarations",
+        "identity_file",
+        "dialect",
+        "tables",
+        "modules",
+        "git",
+        "environments"
+      ]
+    },
+    "EnvDiagnosis": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`ready`, `mid-deployment`, `uninitialized`, `locked`, `lock-unknown`,\n`unreachable` or `unconfigured`.",
+          "type": "string"
+        },
+        "server_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "edition": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supports_online": {
+          "description": "Whether `strategy: online` can be honoured here (ADR-0003 decision 3).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_create_or_alter": {
+          "description": "Whether this server accepts `CREATE OR ALTER`, which every module\nstatement depends on (ADR-0002).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "missing_permissions": {
+          "description": "The permissions pbps needs and this account does not hold.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissions_unknown": {
+          "description": "Set when the permission query itself failed, so an empty\n`missing_permissions` means \"not determined\" rather than \"none\".\n\n`default` beside `skip_serializing_if`, on a type that is only ever\nserialized: it is what tells `schemars` the field is optional. Without\nit the published schema *required* a field the good news omits, so the\nenvelope a healthy `doctor` prints failed its own contract\n(DECISIONS 223).",
+          "type": "boolean"
+        },
+        "absent_schemas": {
+          "description": "Declared schemas this database does not have.\n\nA readiness problem rather than a permission one: nothing in the tool\nemits `CREATE SCHEMA`, so a plan declaring `app.customer` against a\ndatabase with no `app` fails on its first statement.\n\n`default` for the reason above.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "server_capabilities_unknown": {
+          "description": "Set when the version or edition could not be read, so an absent\n`supports_create_or_alter` means \"not determined\" rather than \"fine\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "environment",
+        "state",
+        "missing_permissions"
+      ]
+    },
+    "envelope.doctor": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "doctor"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Diagnosis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "DriftReport": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "environment": {
+          "description": "The environment's name, or a redacted description of the connection.\nNever a connection string — this JSON goes to a hook, and from there\nwherever the hook sends it.",
+          "type": "string"
+        },
+        "checked_at": {
+          "description": "`YYYY-MM-DDTHH:MM:SSZ`, by the checking machine's clock.",
+          "type": "string"
+        },
+        "baseline": {
+          "$ref": "#/$defs/DriftBaseline"
+        },
+        "live_checksum": {
+          "description": "The fingerprint of the database as it is now. Equal to the baseline's\nexactly when there is no drift.",
+          "type": "string"
+        },
+        "changes": {
+          "description": "What the live database has that the recorded state does not.\n\nOpaque to the published envelope schema (SPEC §9.8): the change model is\nthe tool's own vocabulary, not a format anyone writes, and deriving\n`JsonSchema` across it would publish — and freeze — every variant of\n`Change` as a contract. The report carries its own `version` for a\nconsumer that reads inside it."
+        },
+        "unmanaged": {
+          "description": "Tables in the database that pbps does not manage. Informational: their\npresence is not drift.\n\nDescribed as strings in the published schema because that is what they\nare on the wire: `TableName` serializes through `into = \"String\"`, so a\nderived description of its two fields would document a shape this JSON\nnever has.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unexpressible": {
+          "description": "Differences the differ found but has no [`Change`](crate::Change) for —\nan `IDENTITY` that was altered by hand, say.\n\nCarried *in* the report rather than raised as a separate outcome. They\nare drift: the database was reached, the catalog was read, and the two\nstates are not the same. A parallel path for them meant the `on_drift`\nhook never ran for this class, so a scheduled alert missed exactly the\ndrift nobody can fix by re-running `plan`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "version",
+        "environment",
+        "checked_at",
+        "baseline",
+        "live_checksum",
+        "changes"
+      ]
+    },
+    "DriftBaseline": {
+      "description": "The recorded state the live database was compared against.",
+      "type": "object",
+      "properties": {
+        "entry_id": {
+          "description": "The ledger row, so an operator can find it: `SELECT * FROM\ndbo.__pbps_state WHERE id = ...`.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "applied_at": {
+          "description": "When that state was recorded, by the server's clock.",
+          "type": "string"
+        },
+        "checksum": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "applied_at",
+        "checksum"
+      ]
+    },
+    "envelope.verify": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "verify"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DriftReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "EnvStatus": {
+      "description": "One environment's line. Serialized as-is for `--format json`, so anyone who\nwants their own web view has a stable shape to render.",
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "`ok`, `warning`, `policy`, `failed`, `staged`, `drift`, `uninitialized`,\n`unreachable` or `unconfigured`.",
+          "type": "string"
+        },
+        "detail": {
+          "description": "What went wrong, when something did. Never a connection string.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_entry": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "last_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "applied_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locked_by": {
+          "description": "Set when an apply is in progress, or when one died without releasing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lock_unknown": {
+          "description": "Set when the lock could not be read, so an absent `locked_by` means\n\"not determined\" rather than \"no lock held\".\n\nThe same distinction `doctor` and `explain` make, and for the same\nreason: a lock that could not be read is not an absent lock, and telling\nan operator the environment is free when nobody looked is the one answer\nthis row must never give.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checked_at": {
+          "description": "When this line was produced, by the reporting machine's clock.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment",
+        "state",
+        "checked_at"
+      ]
+    },
+    "envelope.status": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "status"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/EnvStatus"
+          }
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "StateListData": {
+      "description": "What `state list` produced, for `--format json`.",
+      "type": "object",
+      "properties": {
+        "environment": {
+          "description": "The environment's name, or a redacted description of the connection —\nnever a connection string (SPEC §8.1).",
+          "type": "string"
+        },
+        "initialized": {
+          "description": "Whether the ledger tables exist at all. `false` with no entries is a\ndatabase this tool has never written to; `true` with none is one whose\nfirst apply has not finished. The two are different problems.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "How many rows were asked for, so a reader knows whether the list is the\nwhole history or the head of it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "entries": {
+          "description": "Newest first, like the ledger's own order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LedgerRow"
+          }
+        }
+      },
+      "required": [
+        "environment",
+        "initialized",
+        "limit",
+        "entries"
+      ]
+    },
+    "LedgerRow": {
+      "description": "One ledger row, without opening its recorded schema.\n\nThe snapshot's `schema` and `ids` are deliberately not here: they are the\nwhole database, they are what `state show` and `state export` will be for,\nand a timeline that carried them would send megabytes to a page that draws\na list of dates.\n\nThe fields that come from the recorded state are optional, and the ones\nbeside them are not, because a row whose state this build cannot read is\nstill a row: an environment upgraded across a state-format change keeps\nentries older than `OLDEST_READABLE_VERSION`, and `unreadable` is what says\nso on the row rather than in place of the whole history.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "applied_at": {
+          "description": "The server's clock, not the client's (`pbps_db::LedgerEntry`).",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`apply`, `baseline`, `bootstrap`, `staged` or `failed`, read from the\nledger's own column rather than from the recorded state, so it is there\nwhether or not that state can be read.",
+          "type": "string"
+        },
+        "state_version": {
+          "description": "The version of the recorded state's own format. A consumer that renders\na field a later version added has to know which entries can hold it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unreadable": {
+          "description": "Why the recorded state could not be read, when it could not. Set exactly\nwhen the fields taken from that state are absent, and typed rather than\na sentence, because the two cases send an operator to different places\n(DECISIONS 222).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Unreadable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator": {
+          "type": "string"
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why a baseline skipped the differences, or how an attempt failed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "staged": {
+          "description": "Present only on a `staged` checkpoint: how far through the plan this\nenvironment is. Its absence is what \"not mid-deployment\" means, so it is\ncarried rather than flattened into `kind`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagedRow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tables": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "modules": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "applied_at",
+        "kind",
+        "operator"
+      ]
+    },
+    "Unreadable": {
+      "description": "Why one row's recorded state is missing from the timeline.\n\nA tagged object rather than a string: a consumer that renders \"upgrade pbps\"\nmust not draw it for a row whose JSON is damaged, and reading that out of a\nmessage is not something a schema can promise.",
+      "oneOf": [
+        {
+          "description": "The state names a format this build does not read. `detail` is\n`StateSnapshot::check_version`'s own message, which names the direction\nand what to do about it.",
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unsupported-version"
+            }
+          },
+          "required": [
+            "kind",
+            "detail"
+          ]
+        },
+        {
+          "description": "The state did not parse. The row is damaged, and no version of this tool\nreads it; the ledger's own columns are all there is.",
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "malformed"
+            }
+          },
+          "required": [
+            "kind",
+            "detail"
+          ]
+        }
+      ]
+    },
+    "StagedRow": {
+      "type": "object",
+      "properties": {
+        "completed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "completed",
+        "total"
+      ]
+    },
+    "envelope.state-list": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "state list"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateListData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    }
+  },
+  "x-pbps-schema-version": 9,
+  "x-pbps-tool-version": "0.0.0"
+}
