@@ -769,6 +769,17 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         ("numeric(5,0)", "smallint", "99999"),
         ("numeric(4,0)", "smallint", "9999"),
         ("numeric(19,0)", "bigint", "9999999999999999999"),
+        // `NaN` is a value every `numeric` holds and no integer type does, so
+        // it is the row that decides that direction whatever the widths are.
+        ("numeric(4,0)", "smallint", "'NaN'"),
+        ("numeric(9,0)", "integer", "'NaN'"),
+        // 32767 needs five digits, not four.
+        ("smallint", "numeric(5,0)", "32767"),
+        ("smallint", "numeric(4,0)", "32767"),
+        // A scale larger than the precision still bounds the value.
+        ("numeric(2,3)", "numeric(2,4)", "0.099"),
+        ("numeric(2,4)", "numeric(2,3)", "0.0099"),
+        ("numeric(2,3)", "numeric(3,3)", "0.099"),
         // The first integer a binary float cannot hold.
         ("integer", "real", "16777217"),
         ("smallint", "real", "32767"),

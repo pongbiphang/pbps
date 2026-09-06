@@ -420,18 +420,11 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
 /// against a real server and asserts this file agrees with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
-    /// Exact numeric, described by the largest integer part it can hold and by
-    /// how many digits it keeps after the point. `None` is unbounded — bare
-    /// `numeric`, which holds anything.
-    ///
-    /// A **magnitude** and not a digit count, because the integer types are not
-    /// powers of ten and the difference is a lost row: `numeric(10,0)` and
-    /// `integer` are both "ten digits", and measured, `9999999999` into an
-    /// `integer` is `integer out of range`.
-    Exact {
-        max_int: Option<i128>,
-        scale: Option<i64>,
-    },
+    /// Exact numeric. Two shapes, because the engine has two: the native
+    /// integer types hold a fixed set of whole numbers, and `numeric` holds a
+    /// decimal range **plus `NaN`** — which is the difference that decides
+    /// several of the answers below.
+    Exact(Exact),
     /// Approximate numeric, described by the largest integer it holds
     /// **exactly** — 2^24 for `real`, 2^53 for `double precision`.
     ///
@@ -474,6 +467,30 @@ enum Family {
     Unknown,
 }
 
+/// An exact numeric type, as the two shapes PostgreSQL actually has.
+///
+/// Kept apart rather than described by one set of numbers, because two of the
+/// facts that matter are true of one shape and not the other: the integer types
+/// are not powers of ten, and `numeric` holds `NaN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exact {
+    /// `smallint`, `integer`, `bigint`: every whole number up to `max`, and
+    /// nothing else. No `NaN`, no infinity.
+    ///
+    /// A magnitude and not a digit count, because these are not powers of ten:
+    /// `numeric(10,0)` and `integer` are both "ten digits", and measured,
+    /// `9999999999` into an `integer` is `integer out of range`.
+    Integer { max: i128 },
+    /// `numeric(p, s)`, described by the exponent its integer part reaches
+    /// (`p - s`, which may be **negative** — `numeric(2,3)` holds values below
+    /// `0.1`) and by the digits it keeps after the point. `None` is the
+    /// unbounded declaration, which holds everything.
+    Numeric {
+        int_digits: Option<i64>,
+        scale: Option<i64>,
+    },
+}
+
 /// A string length. `text` and a bare `character varying` are unbounded, which
 /// is why this cannot be an `i64` sentinel — a length of zero would compare the
 /// wrong way round.
@@ -500,10 +517,76 @@ impl Len {
 /// exponent reaches 2000 and an unchecked `pow` would wrap — into a *small*
 /// number, which would call an enormous type narrow enough to fit anywhere.
 fn pow10(n: i64) -> Option<i128> {
-    if n < 0 {
-        return Some(0);
+    if n <= 0 {
+        return Some(1);
     }
     u32::try_from(n).ok().and_then(|n| 10_i128.checked_pow(n))
+}
+
+/// How many decimal digits `max` is written with, which is the `p - s` a
+/// `numeric` needs in order to hold every value up to it.
+fn digits10(max: i128) -> i64 {
+    let mut digits = 1;
+    let mut rest = max / 10;
+    while rest != 0 {
+        digits += 1;
+        rest /= 10;
+    }
+    digits
+}
+
+/// Whether every value of `from` fits in `to`.
+fn exact_holds(from: Exact, to: Exact) -> bool {
+    match (from, to) {
+        (Exact::Integer { max: a }, Exact::Integer { max: b }) => a <= b,
+        // A `numeric` wide enough for the integer's largest value holds all of
+        // it, and a scale below zero would round it away.
+        (Exact::Integer { max }, Exact::Numeric { int_digits, scale }) => {
+            fits(Some(digits10(max)), int_digits) && fits(Some(0), scale)
+        }
+        // **Never**, whatever the widths. `NaN` is a value every `numeric`
+        // holds — measured, `'NaN'::numeric(4,0)` is accepted — and no integer
+        // type has one: `cannot convert NaN to smallint`. So a row nobody
+        // looked at makes the statement fail, which is exactly what the
+        // narrowing class is for.
+        (Exact::Numeric { .. }, Exact::Integer { .. }) => false,
+        (
+            Exact::Numeric {
+                int_digits: ad,
+                scale: asc,
+            },
+            Exact::Numeric {
+                int_digits: bd,
+                scale: bsc,
+            },
+        ) => fits(ad, bd) && fits(asc, bsc),
+    }
+}
+
+/// Whether a binary float that holds integers up to `max_exact_int` holds every
+/// value of `from` exactly.
+fn exact_in_float(from: Exact, max_exact_int: i128) -> bool {
+    match from {
+        Exact::Integer { max } => max <= max_exact_int,
+        // A decimal fraction is not a binary fraction, so a positive scale is
+        // out. What is left is whole numbers, and they have to fit below the
+        // mantissa's first gap. `NaN` and infinity pass through unchanged
+        // (measured), so neither is a reason to refuse this one.
+        Exact::Numeric { int_digits, scale } => {
+            scale.is_some_and(|s| s <= 0)
+                && int_digits.is_some_and(|d| pow10(d).is_some_and(|p| p - 1 <= max_exact_int))
+        }
+    }
+}
+
+/// Whether a bound holds another, where `None` is unbounded: it holds
+/// everything, and nothing but itself holds it.
+fn fits<T: Ord>(from: Option<T>, to: Option<T>) -> bool {
+    match (from, to) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(x), Some(y)) => x <= y,
+    }
 }
 
 fn family(t: &ColumnType) -> Family {
@@ -515,10 +598,7 @@ fn family(t: &ColumnType) -> Family {
         Some(TypeArg::Int(n)) => Len::Bounded(*n),
         Some(TypeArg::Max | TypeArg::Ident(_)) | None => Len::Unbounded,
     };
-    let exact = |max_int: i128| Family::Exact {
-        max_int: Some(max_int),
-        scale: Some(0),
-    };
+    let integer = |max: i128| Family::Exact(Exact::Integer { max });
     let temporal = |has_date, has_time, has_offset| Family::Temporal {
         has_date,
         has_time,
@@ -526,21 +606,20 @@ fn family(t: &ColumnType) -> Family {
     };
 
     match t.base.as_str() {
-        "smallint" => exact(i128::from(i16::MAX)),
-        "integer" => exact(i128::from(i32::MAX)),
-        "bigint" => exact(i128::from(i64::MAX)),
+        "smallint" => integer(i128::from(i16::MAX)),
+        "integer" => integer(i128::from(i32::MAX)),
+        "bigint" => integer(i128::from(i64::MAX)),
         // `numeric(p, s)` holds `p` significant digits with `s` of them after
-        // the point, so its integer part reaches `10^(p - s) - 1`. A negative
-        // scale rounds the stored value to a power of ten *above* the point,
-        // and the same subtraction bounds it — not exactly, but from above,
-        // which errs towards asking for an approval rather than towards waving
-        // a change through. A scale larger than the precision is legal here and
-        // leaves no integer part at all, which is what the floor at zero is.
-        "numeric" => Family::Exact {
-            max_int: int_arg(0)
-                .and_then(|p| pow10(p - int_arg(1).unwrap_or(0)).map(|v| (v - 1).max(0))),
+        // the point, so its integer part reaches `10^(p - s)`. The subtraction
+        // is kept **signed**: a scale larger than the precision is legal here,
+        // and `numeric(2,3)` holds values below `0.1` while `numeric(2,4)`
+        // holds values below `0.01`. Measured, `0.099` into the second is
+        // `numeric field overflow`, so collapsing both to "no integer part"
+        // would call that change safe.
+        "numeric" => Family::Exact(Exact::Numeric {
+            int_digits: int_arg(0).map(|p| p - int_arg(1).unwrap_or(0)),
             scale: int_arg(1),
-        },
+        }),
         // 2^24 and 2^53: the largest integers with no gap below them. Measured,
         // `16777217` into a `real` reads back as `16777200`.
         "real" => Family::Approx {
@@ -627,56 +706,22 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     let (a, b) = (family(from), family(to));
 
     match (a, b) {
-        (
-            Family::Exact {
-                max_int: ai,
-                scale: asc,
-            },
-            Family::Exact {
-                max_int: bi,
-                scale: bsc,
-            },
-        ) => {
-            // Both halves have to grow: losing magnitude overflows, losing
-            // scale rounds. `None` is unbounded, so it holds everything on the
-            // target side and is held by nothing on the source side.
-            //
-            // The magnitude is the half that has to be a number rather than a
-            // digit count. `numeric(10,0)` and `integer` are both ten digits,
-            // and measured, `9999999999` into an `integer` is `integer out of
-            // range` — a plan that passed the gate and fails at the apply.
-            fn fits<T: Ord>(from: Option<T>, to: Option<T>) -> bool {
-                match (from, to) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(x), Some(y)) => x <= y,
-                }
-            }
-            safe_if(fits(ai, bi) && fits(asc, bsc))
-        }
+        (Family::Exact(a), Family::Exact(b)) => safe_if(exact_holds(a, b)),
 
         // An exact value survives a binary float only if the float holds it
-        // **exactly**: no fraction, and no gap below its magnitude.
-        //
-        // Not "do the decimal digits fit", which is what the count of
-        // significant digits would ask. Measured: `0.1` in a `real` is
-        // `0.10000000149011612`, and ten of them sum to `1.0000001` where the
-        // exact sum is `1.0` — the engine's own printing rounds the single
-        // value back to `0.1` and hides it, and the arithmetic does not.
-        (
-            Family::Exact {
-                max_int: Some(max_int),
-                scale: Some(scale),
-            },
-            Family::Approx { max_exact_int },
-        ) => safe_if(scale <= 0 && max_int <= max_exact_int),
-        // Unbounded `numeric` into a float always rounds.
-        (Family::Exact { .. }, Family::Approx { .. }) => TypeChangeRisk::Narrowing,
+        // **exactly**. Not "do the decimal digits fit": measured, `0.1` in a
+        // `real` is `0.10000000149011612` and ten of them sum to `1.0000001`
+        // against an exact `1.0`, while `0.1::real::text` is `0.1` — the
+        // engine's own printing hides it, and so does every round trip through
+        // text.
+        (Family::Exact(a), Family::Approx { max_exact_int }) => {
+            safe_if(exact_in_float(a, max_exact_int))
+        }
         (Family::Approx { max_exact_int: a }, Family::Approx { max_exact_int: b }) => {
             safe_if(b >= a)
         }
         // A float into an exact type rounds, measured: `1.5` becomes `2`.
-        (Family::Approx { .. }, Family::Exact { .. }) => TypeChangeRisk::Narrowing,
+        (Family::Approx { .. }, Family::Exact(..)) => TypeChangeRisk::Narrowing,
 
         (Family::Text { len: al, fixed: af }, Family::Text { len: bl, fixed: bf }) => {
             // Variable into fixed blank-pads every existing value to the
@@ -1205,16 +1250,29 @@ mod tests {
     }
 
     /// A digit count is not a magnitude, and the integer types are not powers
-    /// of ten. `numeric(10,0)` and `integer` both hold ten digits, and measured,
-    /// `9999999999` into an `integer` is `integer out of range` — a change the
-    /// gate would have waved through, failing at the apply after the changes
-    /// before it had run.
+    /// of ten. `smallint` reaches 32767, which needs **five** digits and not
+    /// four, and `numeric(4,0)` cannot hold it.
     #[test]
     fn an_exact_type_is_measured_by_what_it_holds_and_not_by_its_digits() {
         for (from, to) in [
-            ("numeric(10,0)", "integer"),
-            ("numeric(5,0)", "smallint"),
-            ("numeric(19,0)", "bigint"),
+            ("smallint", "numeric(5,0)"),
+            ("integer", "numeric(10,0)"),
+            ("bigint", "numeric(19,0)"),
+            ("integer", "numeric"),
+            ("smallint", "integer"),
+            ("integer", "bigint"),
+        ] {
+            assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
+        }
+        // One digit narrower and the largest value no longer fits.
+        for (from, to) in [
+            ("smallint", "numeric(4,0)"),
+            ("integer", "numeric(9,0)"),
+            ("bigint", "numeric(18,0)"),
+            ("integer", "smallint"),
+            ("bigint", "integer"),
+            // A scale below zero rounds the integer away.
+            ("smallint", "numeric(10,-2)"),
         ] {
             assert_eq!(
                 risk(from, to),
@@ -1222,16 +1280,48 @@ mod tests {
                 "`{from}` -> `{to}`"
             );
         }
-        // And the row below each boundary still fits, so this is a bound and
-        // not a blanket refusal. Measured: `999999999` survives.
+    }
+
+    /// A `numeric` never reaches an integer type safely, however narrow it is.
+    /// Measured: `'NaN'::numeric(4,0)` is accepted — the precision does not
+    /// exclude it — and the change is then `cannot convert NaN to smallint`, on
+    /// a row nobody looked at, after the changes before it have run.
+    #[test]
+    fn a_numeric_never_reaches_an_integer_type_safely() {
         for (from, to) in [
-            ("numeric(9,0)", "integer"),
+            ("numeric(1,0)", "bigint"),
             ("numeric(4,0)", "smallint"),
+            ("numeric(9,0)", "integer"),
             ("numeric(18,0)", "bigint"),
-            ("bigint", "numeric(19,0)"),
+            ("numeric", "bigint"),
         ] {
-            assert_eq!(risk(from, to), TypeChangeRisk::Safe, "`{from}` -> `{to}`");
+            assert_eq!(
+                risk(from, to),
+                TypeChangeRisk::Narrowing,
+                "`{from}` -> `{to}`"
+            );
         }
+    }
+
+    /// A scale larger than the precision leaves no integer part, and the two
+    /// types are still different: `numeric(2,3)` holds values below `0.1` and
+    /// `numeric(2,4)` below `0.01`. Measured, `0.099` into the second is
+    /// `numeric field overflow`, so an integer part clamped at "none" would
+    /// have called that change safe.
+    #[test]
+    fn a_scale_larger_than_the_precision_still_bounds_the_value() {
+        assert_eq!(
+            risk("numeric(2,3)", "numeric(2,4)"),
+            TypeChangeRisk::Narrowing
+        );
+        // Measured: `0.0099` the other way becomes `0.010`.
+        assert_eq!(
+            risk("numeric(2,4)", "numeric(2,3)"),
+            TypeChangeRisk::Narrowing
+        );
+        // A wider precision at the same scale holds everything the narrower
+        // one did.
+        assert_eq!(risk("numeric(2,3)", "numeric(3,3)"), TypeChangeRisk::Safe);
     }
 
     /// An exact value survives a binary float only if the float holds it

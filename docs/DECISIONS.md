@@ -4070,9 +4070,24 @@ SPEC is in sync with all of these.
       below its magnitude, which is 2^24 for `real` and 2^53 for `double
       precision`. Measured: `16777217` into a `real` reads back as `16777200`.
 
-    Both were `Safe`, which is the class that bypasses the gate entirely, so
-    both were a plan approved by nobody that fails or silently changes data at
-    the apply. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
+    The next round found two more of the same shape, and both are about
+    `numeric` being a wider thing than its width says:
+
+    - **`NaN` is a value every `numeric` holds**, whatever its precision —
+      measured, `'NaN'::numeric(4,0)` is accepted — and no integer type has one:
+      `cannot convert NaN to smallint`. So a `numeric` never reaches an integer
+      type safely, however narrow it is, and the widths are not the question.
+      (`NaN` and infinity both pass into a float unchanged, so that direction
+      keeps its bound.)
+    - **A scale larger than the precision still bounds the value.**
+      `numeric(2,3)` holds values below `0.1` and `numeric(2,4)` below `0.01`,
+      and measured, `0.099` into the second is `numeric field overflow`. The
+      integer-part exponent is `p - s` and it is kept **signed**; clamping it at
+      "no integer part" made two different capacities compare equal.
+
+    Every one was `Safe`, which is the class that bypasses the gate entirely, so
+    every one was a plan approved by nobody that fails or silently changes data
+    at the apply. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
     `decimal(10,0)` into `int` is `Arithmetic overflow error converting
     expression to data type int`, and `decimal(2,1)` into `real` stores
     `1.000000014901161e-001`. That is issue #135; it is a shipped dialect and a
