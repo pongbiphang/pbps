@@ -96,13 +96,28 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
         dialect: "postgres",
         message,
     };
-    if !types::can_be_identity(&declared.ty) {
-        found.push(invalid(format!(
+    match types::identity_seed_range(&declared.ty, identity.increment) {
+        None => found.push(invalid(format!(
             "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
              identity column type must be smallint, integer, or bigint. A `numeric` is refused \
              here even with a scale of zero, where SQL Server admits one.",
             declared.ty
-        )));
+        ))),
+        // The seed is checked against the sequence's bounds, not the column's:
+        // see [`types::identity_seed_range`] for why those are not the same
+        // range, and for the two seeds that fit the type and are still refused.
+        Some(accepted) if !accepted.contains(&identity.seed) => found.push(invalid(format!(
+            "column `{column}` has an `identity:` with a seed of {}, and an `identity:` on `{}` \
+             counting by {} starts somewhere in {}..={}: the engine refuses the table with START \
+             value ({}) out of the sequence's own bounds.",
+            identity.seed,
+            declared.ty,
+            identity.increment,
+            accepted.start(),
+            accepted.end(),
+            identity.seed
+        ))),
+        Some(_) => {}
     }
     // `GENERATED ... AS IDENTITY` implies NOT NULL, and saying both is
     // `conflicting NULL/NOT NULL declarations`.
@@ -620,6 +635,45 @@ mod tests {
                 .iter()
                 .any(|e| e.to_string().contains("never advances"))
         );
+    }
+
+    /// The seed is bounded by the sequence, not by the column.
+    ///
+    /// Every pair here was measured on 18.6. Two of them are the point: `0` on
+    /// an `integer` fits the type by any reading and is refused, and `5`
+    /// counting down fits the type and is refused for being too *large*.
+    #[test]
+    fn an_identity_seed_outside_the_sequences_own_bounds_is_refused() {
+        for (declared, seed, increment, accepted) in [
+            ("smallint", 1, 1, true),
+            ("smallint", 32767, 1, true),
+            ("smallint", 32768, 1, false),
+            ("integer", 2_147_483_647, 1, true),
+            ("integer", 2_147_483_648, 1, false),
+            // Fits every integer type this engine will carry an identity on,
+            // and the sequence starts at 1.
+            ("integer", 0, 1, false),
+            ("integer", -5, 1, false),
+            // Counting down, the sequence runs `type_min ..= -1`.
+            ("integer", -5, -1, true),
+            ("integer", 5, -1, false),
+            ("smallint", -32768, -1, true),
+            ("smallint", -32769, -1, false),
+            ("bigint", i64::MAX, 1, true),
+            ("bigint", i64::MIN, -1, true),
+        ] {
+            let mut table = Table::default();
+            let mut column = pbps_model::Column::new(ty(declared));
+            column.nullable = false;
+            column.identity = Some(pbps_model::Identity { seed, increment });
+            table.columns.insert("id".to_owned(), column);
+            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            assert_eq!(
+                found.is_empty(),
+                accepted,
+                "`{declared}` starting at {seed} by {increment}: {found:?}"
+            );
+        }
     }
 
     /// A column the catalogue cannot spell is reported here too, where a user

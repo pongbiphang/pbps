@@ -969,6 +969,45 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
             .expect("drop");
     }
 
+    // The seed, which is bounded by the sequence behind the column and not by
+    // the column: a `0` fits every one of these types and the engine still
+    // refuses it, and counting down inverts which end is too far.
+    for (declared, seed, increment) in [
+        ("smallint", 1_i64, 1_i64),
+        ("smallint", 32767, 1),
+        ("smallint", 32768, 1),
+        ("integer", 0, 1),
+        ("integer", -5, 1),
+        ("integer", -5, -1),
+        ("integer", 5, -1),
+        ("smallint", -32768, -1),
+        ("smallint", -32769, -1),
+    ] {
+        let engine = conn
+            .execute(&format!(
+                "CREATE TABLE {table} (id {declared} GENERATED ALWAYS AS IDENTITY \
+                 (START WITH {seed} INCREMENT BY {increment}))"
+            ))
+            .await;
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+
+        let mut declaration = pbps_model::Table::default();
+        let mut column = pbps_model::Column::new(declared.parse::<ColumnType>().expect("parses"));
+        column.nullable = false;
+        column.identity = Some(pbps_model::Identity { seed, increment });
+        declaration.columns.insert("id".to_owned(), column);
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+
+        assert_eq!(
+            engine.is_ok(),
+            found.is_empty(),
+            "`{declared}` starting at {seed} by {increment}: the engine {}, and pbps says {found:?}",
+            if engine.is_ok() { "took it" } else { "refused" }
+        );
+    }
+
     // And the rule that is SQL Server's alone: that dialect refuses a second
     // IDENTITY column, this engine takes one per column. `validate` carries no
     // such rule here, and this is what says so.

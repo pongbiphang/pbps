@@ -461,11 +461,11 @@ three chances to be measured once and fixed once.
 
 ## One property of a type standing in for what it holds
 
-Four instances over three review rounds, all in the classification that decides
-whether a change needs a human's approval, and all in the direction that skips
-one. Each rule named a real property of the type — its digit count, its
-significant digits, its components — and each time the property was true and
-not the whole answer.
+Five instances over four review rounds, four of them in the classification that
+decides whether a change needs a human's approval, all in the direction that
+skips one. Each rule named a real property of the type — its digit count, its
+significant digits, its components, its range — and each time the property was
+true and not the whole answer.
 
 - **`numeric(10,0)` and `integer` are both "ten digits".** Measured,
   `9999999999` into an `integer` is `integer out of range`; on SQL Server,
@@ -481,6 +481,15 @@ not the whole answer.
   value".** A `date` runs to 5874897 AD and a `timestamp` stops at 294276 AD,
   so adding a time to a date — the textbook widening — fails on
   `'300000-01-01'` with `date out of range for timestamp`.
+
+- **"the seed fits the column" is not "the sequence will start there".** An
+  `identity:` the model can spell carries a seed and an increment and nothing
+  else, so the sequence behind it takes PostgreSQL's default bounds — `1 ..
+  type_max` counting up, `type_min .. -1` counting down. A seed of `0` fits
+  every integer type the engine will carry an identity on and is refused,
+  `START value (0) cannot be less than MINVALUE (1)`; a seed of `5` counting
+  down is refused for being too *large*. The column's range is the wrong range
+  at both ends, and it is the one a reader reaches for.
 
 Every one reads as obviously correct, and a test written by the same hand asks
 the same question the rule does. **What catches them is a row at the boundary,

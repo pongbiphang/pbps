@@ -33,6 +33,8 @@
 //! fix it — ADR-0012 §1 names that trap, and it is the reason this table has no
 //! default branch.
 
+use std::ops::RangeInclusive;
+
 use pbps_dialect::{DialectError, TypeChangeRisk};
 use pbps_model::{ColumnType, TypeArg};
 
@@ -406,14 +408,44 @@ fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
     Ok(())
 }
 
-/// Whether a column of this type may carry an `identity:`.
+/// The values a column of this type may hold, if it may carry an `identity:`
+/// at all; `None` if it may not.
+///
+/// The range and the permission are one answer rather than two, because every
+/// caller that wants the first has already had to ask the second, and a pair of
+/// functions is a pair that can disagree.
 ///
 /// **Measured on 18.6**, and the engine says it in so many words: `identity
 /// column type must be smallint, integer, or bigint`. Not the shape of its SQL
 /// Server counterpart, which admits a `decimal` with scale zero — here
 /// `numeric(10,0)` is refused like any other.
-pub fn can_be_identity(ty: &ColumnType) -> bool {
-    normalize(ty).is_ok_and(|t| matches!(t.base.as_str(), "smallint" | "integer" | "bigint"))
+pub fn identity_range(ty: &ColumnType) -> Option<RangeInclusive<i64>> {
+    match normalize(ty).ok()?.base.as_str() {
+        "smallint" => Some(i64::from(i16::MIN)..=i64::from(i16::MAX)),
+        "integer" => Some(i64::from(i32::MIN)..=i64::from(i32::MAX)),
+        "bigint" => Some(i64::MIN..=i64::MAX),
+        _ => None,
+    }
+}
+
+/// The values the sequence behind an `identity:` will accept as its start.
+///
+/// **Not the column's range**, which is the answer that looks right and is
+/// wrong in both directions. The model can spell only a seed and an increment,
+/// so the sequence gets PostgreSQL's default bounds, and those depend on which
+/// way it counts: ascending it is `1 .. type_max` — a seed of `0` fits every
+/// integer type and is still refused, `START value (0) cannot be less than
+/// MINVALUE (1)` — and descending it is `type_min .. -1`, where a seed of `5`
+/// is refused for being *too large*. Both measured on 18.6.
+///
+/// (PITFALLS, "One property of a type standing in for what it holds".)
+pub fn identity_seed_range(ty: &ColumnType, increment: i64) -> Option<RangeInclusive<i64>> {
+    let held = identity_range(ty)?;
+    Some(if increment < 0 {
+        *held.start()..=-1
+    } else {
+        1..=*held.end()
+    })
 }
 
 // ---------------------------------------------------------------------------
