@@ -5976,6 +5976,182 @@ fn a_table_and_one_of_its_columns_renamed_in_one_revision_apply_together() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// A foreign key and the key it references, added in one revision.
+///
+/// The engine is the honest witness: the bug produced a statement it refuses,
+/// not a wrong result. Both changes are in the addition class and both took
+/// `dependency_rank` 0, so `subject()` — the table name — decided, and
+/// `"dbo.order_line" < "dbo.product"` put the foreign key first:
+/// `ALTER TABLE [dbo].[order_line] ADD CONSTRAINT ... FOREIGN KEY` against a
+/// `dbo.product` with no candidate key on `sku` yet.
+///
+/// Measured with the fix reverted, the engine answers 1776: `There are no
+/// primary or candidate keys in the referenced table 'dbo.product' that match
+/// the referencing column list in the foreign key 'fk_ol_product'`.
+///
+/// The names are chosen for that — the *referencing* table sorts first, which
+/// is the direction no existing test covered. The drop direction needs the
+/// opposite pair and has a test of its own; these names make it safe by
+/// accident, which is precisely what a reverted run showed.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_foreign_key_is_added_after_the_key_it_references_live() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "fkadd");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("fkadd-live");
+    std::fs::write(d.dir.join("schema/dbo.product.yml"), PRODUCT).unwrap();
+    std::fs::write(d.dir.join("schema/dbo.order_line.yml"), ORDER_LINE).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The revision: the referenced key and the foreign key, together.
+    std::fs::write(
+        d.dir.join("schema/dbo.product.yml"),
+        format!("{PRODUCT}unique:\n  uq_product_sku: [sku]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.order_line.yml"),
+        format!(
+            "{ORDER_LINE}foreign_keys:\n  fk_ol_product:\n    columns: [sku]\n    \
+             references: dbo.product(sku)\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the key must exist before the foreign key names it: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
+/// The mirror, with the pair the other way round: a foreign key and the key it
+/// references, dropped in one revision.
+///
+/// Here the table holding the *key* sorts first — `"dbo.customer" <
+/// "dbo.order_x"` — so the old tiebreaker emitted the `DROP CONSTRAINT` of the
+/// unique before the foreign key that pins it. Measured with the fix reverted,
+/// the engine answers 3727, `Could not drop constraint`, over 3725: the
+/// constraint is being referenced by a foreign key.
+///
+/// A separate test rather than a second revision of the one above, because the
+/// two directions need opposite name orders: with `dbo.order_line` and
+/// `dbo.product` the drop happens to come out right, and a reverted run of the
+/// combined test passed while the bug was still there.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_foreign_key_is_dropped_before_the_key_it_references_live() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "fkdrop");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("fkdrop-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.customer.yml"),
+        format!("{CUSTOMER}unique:\n  uq_customer_sku: [sku]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.order_x.yml"),
+        format!(
+            "{ORDER_X}foreign_keys:\n  fk_ox_customer:\n    columns: [sku]\n    \
+             references: dbo.customer(sku)\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The revision: both go away together.
+    std::fs::write(d.dir.join("schema/dbo.customer.yml"), CUSTOMER).unwrap();
+    std::fs::write(d.dir.join("schema/dbo.order_x.yml"), ORDER_X).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive,constraint",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the foreign key must go before the key it holds down: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
+/// The referenced table of the add case, without the key the revision adds.
+const PRODUCT: &str = "table: dbo.product\ncolumns:\n  id: {type: int, nullable: false}\n  \
+                       sku: {type: varchar(20), nullable: false}\nprimary_key: \
+                       {name: pk_product, columns: [id]}\n";
+
+/// Its referencing table. The name sorts *before* `dbo.product`, which is what
+/// made the old tiebreaker wrong on the add side.
+const ORDER_LINE: &str = "table: dbo.order_line\ncolumns:\n  id: {type: int, nullable: false}\n  \
+                          sku: {type: varchar(20), nullable: false}\nprimary_key: \
+                          {name: pk_order_line, columns: [id]}\n";
+
+/// The referenced table of the drop case. This name sorts *before* its
+/// referencing table, which is what makes the drop side come out wrong.
+const CUSTOMER: &str = "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\n  \
+                        sku: {type: varchar(20), nullable: false}\nprimary_key: \
+                        {name: pk_customer, columns: [id]}\n";
+
+/// Its referencing table.
+const ORDER_X: &str = "table: dbo.order_x\ncolumns:\n  id: {type: int, nullable: false}\n  \
+                       sku: {type: varchar(20), nullable: false}\nprimary_key: \
+                       {name: pk_order_x, columns: [id]}\n";
+
 /// A declared text the engine reads back differently — `"1.5"` in a
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected

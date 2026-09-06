@@ -896,10 +896,14 @@ pub fn order_role_drops(cs: &mut ChangeSet) {
 
 /// Where a change sorts *within* its ordering class.
 ///
-/// Modules and reference rows both have a dependency order among themselves;
-/// everything else is zero and keeps the tiebreakers that were already there.
-/// In both families the removing direction is the reverse of the creating one,
-/// so a dependent goes before the thing it depends on.
+/// Modules, reference rows and foreign keys each have a dependency order among
+/// their class; everything else is zero and keeps the tiebreakers that were
+/// already there. In every family the removing direction is the reverse of the
+/// creating one, so a dependent goes before the thing it depends on.
+///
+/// Modules and rows carry a computed rank because their dependencies form a
+/// graph. A foreign key's is a two-level layering — it depends on candidate
+/// keys, and nothing depends on it — so a constant says it exactly.
 fn dependency_rank(
     change: &Change,
     create_rank: &BTreeMap<ModuleId, usize>,
@@ -925,13 +929,30 @@ fn dependency_rank(
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
         | Change::DropIndex { .. }
         | Change::SetDataMode { .. } => 0,
+        // A foreign key needs the key it references to exist, so it goes last
+        // in the addition class and first in the drop class. Measured on the
+        // pinned image, both halves are real: added before its key, the engine
+        // refuses with 1776, "There are no primary or candidate keys in the
+        // referenced table ... that match the referencing column list"; and
+        // the key cannot be dropped while the foreign key stands (3727 for a
+        // `UNIQUE` constraint, 3723 for a unique index).
+        //
+        // A constant, not a rank computed from the referenced columns, because
+        // the dependency here is a total layering rather than a graph: every
+        // supplier of a candidate key — `SetPrimaryKey`, `AddUnique` and
+        // `AddIndex`, since a foreign key may reference a plain unique index —
+        // is above every foreign key, and no foreign key supplies a key to
+        // another. Matching suppliers by name would add a way to fail (a
+        // supplier not recognised, and the ordering silently back) and buy
+        // nothing. Everything else in both classes keeps rank 0 and the
+        // tiebreaker it had.
+        Change::AddForeignKey { .. } => 1,
+        Change::DropForeignKey { .. } => -1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -1353,7 +1374,8 @@ mod tests {
     use indexmap::IndexMap;
     use pbps_dialect::MinimalDialect;
     use pbps_model::{
-        Column, ColumnType, IdsFile, Index, IndexColumn, Intent, RiskClass, Row, Uid,
+        CheckConstraint, Column, ColumnType, ForeignKey, IdsFile, Index, IndexColumn, Intent,
+        ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
     };
 
     fn ctx() -> Context {
@@ -2893,6 +2915,173 @@ mod tests {
 
     /// The order has to be safely executable: renames first, dropping constraints
     /// before dropping columns, adding constraints last.
+    /// A schema of two tables, for the foreign-key ordering cases below.
+    fn two_tables(a: (&str, Table), b: (&str, Table)) -> Schema {
+        let mut s = Schema::default();
+        s.tables.insert(a.0.parse().unwrap(), a.1);
+        s.tables.insert(b.0.parse().unwrap(), b.1);
+        s
+    }
+
+    /// A table with one `sku` column, plus whatever the caller adds.
+    fn sku_table() -> Table {
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("sku", Column::new(ty("int"))),
+        ])
+    }
+
+    fn unique(columns: &[&str]) -> UniqueConstraint {
+        UniqueConstraint {
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    fn fk(columns: &[&str], to: &str, to_columns: &[&str]) -> ForeignKey {
+        ForeignKey {
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            references_table: to.parse().unwrap(),
+            references_columns: to_columns.iter().map(|c| (*c).to_string()).collect(),
+            on_delete: ReferentialAction::default(),
+            on_update: ReferentialAction::default(),
+        }
+    }
+
+    /// A foreign key is added after the key it references, even when the
+    /// referencing table's name sorts first.
+    ///
+    /// Both changes are in the addition class and both took
+    /// `dependency_rank` 0, so `subject()` — the table name — decided:
+    /// `"dbo.order_line" < "dbo.product"` put the foreign key first, and the
+    /// engine refused it with 1776, "There are no primary or candidate keys in
+    /// the referenced table ... that match the referencing column list"
+    /// (measured on the pinned image).
+    #[test]
+    fn a_foreign_key_is_added_after_the_key_it_references() {
+        let base = two_tables(
+            ("dbo.product", sku_table()),
+            ("dbo.order_line", sku_table()),
+        );
+
+        let mut product = sku_table();
+        product
+            .unique
+            .insert("uq_product_sku".into(), unique(&["sku"]));
+        let mut order_line = sku_table();
+        order_line.foreign_keys.insert(
+            "fk_ol_product".into(),
+            fk(&["sku"], "dbo.product", &["sku"]),
+        );
+        let declared = two_tables(("dbo.product", product), ("dbo.order_line", order_line));
+
+        assert_eq!(
+            kinds(&run(&base, &declared, &[])),
+            ["AddUnique", "AddForeignKey"],
+            "the key must exist before the foreign key names it"
+        );
+    }
+
+    /// A unique **index** is a supplier too. Measured: SQL Server accepts a
+    /// foreign key referencing a plain `CREATE UNIQUE INDEX`, with no `UNIQUE`
+    /// constraint anywhere — so ranking only the constraint pair would leave
+    /// this half of it broken.
+    #[test]
+    fn a_foreign_key_is_added_after_the_unique_index_it_references() {
+        let base = two_tables(
+            ("dbo.product", sku_table()),
+            ("dbo.order_line", sku_table()),
+        );
+
+        let mut product = sku_table();
+        product.indexes.insert(
+            "ux_product_sku".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "sku".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: true,
+                filter: None,
+            },
+        );
+        let mut order_line = sku_table();
+        order_line.foreign_keys.insert(
+            "fk_ol_product".into(),
+            fk(&["sku"], "dbo.product", &["sku"]),
+        );
+        let declared = two_tables(("dbo.product", product), ("dbo.order_line", order_line));
+
+        assert_eq!(
+            kinds(&run(&base, &declared, &[])),
+            ["AddIndex", "AddForeignKey"],
+            "a unique index is a candidate key, so it must come first too"
+        );
+    }
+
+    /// The mirror: a foreign key is dropped before the key it references.
+    ///
+    /// Names chosen so the alphabet gives the wrong answer —
+    /// `"dbo.customer" < "dbo.order_x"` — which is what put the `DropUnique`
+    /// first. Measured, the engine refuses that with 3727 (and 3723 for the
+    /// index form): the constraint is being referenced by the foreign key.
+    #[test]
+    fn a_foreign_key_is_dropped_before_the_key_it_references() {
+        let mut customer = sku_table();
+        customer
+            .unique
+            .insert("uq_customer_sku".into(), unique(&["sku"]));
+        let mut order_x = sku_table();
+        order_x.foreign_keys.insert(
+            "fk_ox_customer".into(),
+            fk(&["sku"], "dbo.customer", &["sku"]),
+        );
+        let base = two_tables(("dbo.customer", customer), ("dbo.order_x", order_x));
+
+        let declared = two_tables(("dbo.customer", sku_table()), ("dbo.order_x", sku_table()));
+
+        assert_eq!(
+            kinds(&run(&base, &declared, &[])),
+            ["DropForeignKey", "DropUnique"],
+            "the referencing constraint must go before the key it holds down"
+        );
+    }
+
+    /// A check constraint has no such relation, and must not be dragged around
+    /// by the rank that orders the foreign keys.
+    ///
+    /// The negative case: with the foreign key ranked, everything else in the
+    /// class has to keep the tiebreaker it had, or the rank has quietly become
+    /// a reordering of changes that never depended on each other.
+    #[test]
+    fn a_check_constraint_keeps_the_order_its_name_gives_it() {
+        let base = two_tables(("dbo.aaa", sku_table()), ("dbo.zzz", sku_table()));
+
+        let mut aaa = sku_table();
+        aaa.checks.insert(
+            "ck_aaa".into(),
+            CheckConstraint {
+                expression: "sku > 0".into(),
+            },
+        );
+        let mut zzz = sku_table();
+        zzz.checks.insert(
+            "ck_zzz".into(),
+            CheckConstraint {
+                expression: "sku > 0".into(),
+            },
+        );
+        let declared = two_tables(("dbo.aaa", aaa), ("dbo.zzz", zzz));
+
+        let cs = run(&base, &declared, &[]);
+        let tables: Vec<String> = cs.changes.iter().map(|p| p.change.subject()).collect();
+        assert_eq!(
+            tables,
+            ["dbo.aaa", "dbo.zzz"],
+            "two unrelated checks keep the table-name tiebreaker"
+        );
+    }
+
     #[test]
     fn changes_are_ordered_for_execution() {
         let mut base_t = table(&[
