@@ -818,18 +818,36 @@ the path, and deleting the lock left it reporting the same). The gap
 cannot be closed — a ref and an index are two files — so it is made
 recoverable instead. Before step 5 the UI writes
 `<git-dir>/pbps-ui/composing/<random>.json` and flushes it and its
-directory: the branch, the tip it leased, the commit's id, every edited
-path, and the hash of the prepared `<index>.lock` as it stands. Step 6
-removes that record after the rename. At launch, and before it offers to
-compose, the UI reads every record it finds and acts only where the
-evidence is unambiguous: where the branch names the record's commit and
+directory: the branch, the tip it leased, the commit's id, the hash of
+the prepared `<index>.lock` as it stands, and, for every edited path,
+the entry step 3 recorded and the temporary name beside it — the name a
+`link()` was made from, or the one the exchange put the old file under —
+so that the record names every file the compose still has to account for.
+Step 6 removes the record, last, after the rename and after the cleanup
+below.
+
+At launch, and before it offers to compose, the UI reads every record it
+finds and acts only where the evidence is unambiguous. It takes the same
+locks in the same order as a compose — `<index>.lock` is already the
+record's, so it takes `HEAD`'s and the branch's — and requires all of
+what step 5 required after its own `update-ref`: that `HEAD` is still
+symbolic to the record's branch, that the branch is still a direct ref
+and not a symbolic one, and that it still names the record's commit.
+`index.lock` does not cover `HEAD` (**measured**, in step 0), so a
+process that died after `update-ref` released `HEAD.lock` leaves a window
+in which a `symbolic-ref` can move `HEAD` to another branch, and an index
+built for the record's branch installed onto that one would be a
+staged difference nobody made. Where all of that holds and
 `<index>.lock` is still there and still hashes to what the record says,
-it finishes what was interrupted — the same rename, the same result —
-and says on the page that it did; in every other case it changes nothing
-and shows the record, the branch's actual tip, and the commands, because
-a lock that has changed is another `git`'s, and a branch that has moved
-is a state only the user can judge. A record is never deleted except by
-the step that completes it or by the user.
+the UI finishes what was interrupted: the same rename, then the cleanup
+step 2 owed — the `link()` source unlinked, each swapped-out file moved
+under `previous/` — done by name from the record and skipped where the
+name is already gone, so that running it twice is running it once, and
+only then the record removed. In every other case it changes nothing and
+shows the record, `HEAD`, the branch's actual tip, and the commands,
+because a lock that has changed is another `git`'s, and a `HEAD` or a
+branch that has moved is a state only the user can judge. A record is
+never deleted except by the step that completes it or by the user.
 
 **Measured** on git 2.43, with staging, message-editing, pushing and pre-push
 hooks all installed: `commit-tree` made a commit holding `a` alone with the
