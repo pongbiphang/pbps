@@ -335,6 +335,27 @@ naming a file that does not exist, *after* the report had read the real one. The
 same path must stay out of `output::Location`, whose `file` is a `String` for
 this reason.
 
+## Quoted for code, then dropped into a literal
+
+`quote` and `literal` are not two spellings of "make this safe". They make a
+value safe for **two different positions**, and each is useless in the other:
+`quote` doubles `]`, `literal` doubles `'`.
+
+`drop_primary_key` and `drop_default_block` build a statement as a *string* and
+run it through `EXEC`. They passed the bracket-quoted table name to
+`OBJECT_ID(...)` through `literal` correctly, and then interpolated the same
+name raw into the `N'ALTER TABLE ... DROP CONSTRAINT '` prefix beside it. An
+apostrophe is legal in a SQL Server identifier and `pull` adopts one, so
+`dbo.o'brien` closed the literal early and the rest of the line parsed as code.
+The hostile-identifier test covered `]` only — the character the *other* helper
+handles — so it passed throughout.
+
+The tell is a `format!` whose output is a SQL string rather than SQL: inside
+one, every interpolation is in literal position, including the parts that look
+like code. Build the fragment, then hand the whole thing to `literal` — the
+shape `rows.rs` already used for its dynamic collation statement. Then a name
+cannot be interpolated raw, because there is nowhere left to interpolate it.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second
