@@ -6152,6 +6152,118 @@ const ORDER_X: &str = "table: dbo.order_x\ncolumns:\n  id: {type: int, nullable:
                        sku: {type: varchar(20), nullable: false}\nprimary_key: \
                        {name: pk_order_x, columns: [id]}\n";
 
+/// A column rename beside the constraints that name it: one statement, and
+/// the constraints come out of it intact.
+///
+/// The engine is the honest witness twice over. The plan used to carry a
+/// `SetPrimaryKey` and an index drop-and-add beside the rename, which the
+/// engine refuses outright once a foreign key references the key (3727,
+/// measured) — and short of that, asks the reviewer for `--allow destructive`
+/// on a revision that renames one column. And the reason the restatement is
+/// unnecessary is itself an engine fact: `sp_rename` carries the primary key,
+/// the unique constraint, the index's key and `INCLUDE` columns and the
+/// child's `references_table` for free. Only a live server can say that.
+///
+/// `verify` after the apply is the assertion that matters: the constraints are
+/// there, spelled the new way, without the plan having said a word about them.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_rename_leaves_the_constraints_that_name_the_column_alone() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "renamekeep");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("renamekeep-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.parent.yml"),
+        "table: dbo.parent\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         tag: {type: varchar(20), nullable: false}\n  note: {type: varchar(20)}\n\
+         primary_key: {name: pk_parent, columns: [id]}\nunique:\n  \
+         uq_parent_tag: [tag]\nindexes:\n  ix_parent_tag:\n    columns: [tag]\n    \
+         include: [note]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.child.yml"),
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         pid: {type: int, nullable: false}\nprimary_key: {name: pk_child, columns: [id]}\n\
+         foreign_keys:\n  fk_child_parent:\n    columns: [pid]\n    \
+         references: dbo.parent(id)\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // One revision, two renames: the primary key's column, which a foreign key
+    // references, and the column the unique constraint and the index cover.
+    std::fs::write(
+        d.dir.join("schema/dbo.parent.yml"),
+        "table: dbo.parent\ncolumns:\n  parent_id: {type: int, nullable: false, \
+         renamed_from: id}\n  label: {type: varchar(20), nullable: false, \
+         renamed_from: tag}\n  note: {type: varchar(20)}\n\
+         primary_key: {name: pk_parent, columns: [parent_id]}\nunique:\n  \
+         uq_parent_tag: [label]\nindexes:\n  ix_parent_tag:\n    columns: [label]\n    \
+         include: [note]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.child.yml"),
+        "table: dbo.child\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         pid: {type: int, nullable: false}\nprimary_key: {name: pk_child, columns: [id]}\n\
+         foreign_keys:\n  fk_child_parent:\n    columns: [pid]\n    \
+         references: dbo.parent(parent_id)\n",
+    )
+    .unwrap();
+    // Both renames ride on the declarations rather than on `pbps rename`,
+    // because every intent command resolves identity in full before it writes:
+    // either rename on its own is refused for the other column that has just
+    // disappeared. The annotations reach one resolve together.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    // The ids file carries both renames now, so `fmt` strips the spent
+    // annotations.
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // `--allow rename` alone: a revision that renames two columns must not ask
+    // the reviewer to approve anything else. Before the fix this needed
+    // `constraint` and `destructive` too.
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "a rename-only revision must need nothing but --allow rename: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The constraints really did follow the rename: `verify` compares the
+    // declarations against what the engine holds.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// A declared text the engine reads back differently — `"1.5"` in a
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected
