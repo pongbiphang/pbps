@@ -575,6 +575,32 @@ the implementation must not depend on the caller having normalized, and names
 the caller that cannot. Reading the sibling implementation beside the trait is
 the other half, and it is what a call-site sweep is for.
 
+## One match arm, two directions, one direction's reason
+
+`change_risk` classified `time -> interval` and `interval -> time` in a single
+arm, and the comment above it argued one of them: *`interval '30 hours'` into
+`time` is accepted and stores `06:00:00` — a day and a half is gone.* True, and
+it says nothing at all about the other direction, which is a length of time
+keeping its length. Measured, every boundary a `time` has — `00:00:00`,
+`24:00:00`, `23:59:59.999999` — reads back from an `interval` unchanged.
+
+The arm is the tell. Two orderings joined by `|` produce one answer, so the
+author writes the reason for whichever ordering they were thinking about, and
+the other rides along under it. Both were `Narrowing` here, which is the
+harmless direction to be wrong in — a gate asked for on a change that never
+loses — and the same construction with the answer `Safe` is a gate skipped.
+
+It is also not a case of "the reviewer was right and the fix is the opposite
+answer". The review asked for `time -> interval` to be `Safe`, and that is
+wrong too: measured, `12:34:56.654321` into `interval(0)` **rounds** to
+`12:34:57`, and into `interval(5)` to `12:34:56.65432`. The answer depends on
+the target's seconds precision, and neither of the two blanket answers is it.
+
+**The shape:** an arm serving two directions, justified for one. **How to
+avoid it:** an arm that matches both orderings of a pair needs its comment to
+say something about each, or it needs to be two arms. Splitting it is what
+forced the measurement that found the precision.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

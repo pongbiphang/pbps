@@ -846,13 +846,13 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             safe_if((!ad || bd) && (!at || bt) && ao == bo && reaches)
         }
 
+        // `time without time zone` and nothing else, in both of these arms:
+        // the engine converts neither `timetz` nor `timestamp` into an
+        // interval, measured, so a rule phrased as "anything with a time part"
+        // would call two refusals a conversion.
+        //
         // Measured: `interval '30 hours'` into `time` is accepted and stores
         // `06:00:00`. Nothing fails, and a day and a half is gone.
-        //
-        // `time without time zone` and nothing else: the engine converts
-        // neither `timetz` nor `timestamp` into an interval, measured, so a
-        // rule phrased as "anything with a time part" would call two refusals
-        // a narrowing.
         (
             Family::Interval { .. },
             Family::Temporal {
@@ -861,16 +861,31 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
                 has_offset: false,
                 ..
             },
-        )
-        | (
+        ) => TypeChangeRisk::Narrowing,
+
+        // The other way is a length of time keeping its length. Measured on
+        // every boundary a `time` has — `00:00:00`, `24:00:00`, and
+        // `23:59:59.999999` — each one reads back from the `interval`
+        // unchanged, and there is no value of the source that has nowhere to
+        // land.
+        //
+        // What can still lose is the seconds precision, and it is the target's
+        // alone: a `time` is always microseconds here, because a declared
+        // precision on it is refused outright (DECISIONS 241) — the model
+        // cannot spell one. Measured, `12:34:56.654321` into `interval(6)` is
+        // itself, into `interval(5)` is `12:34:56.65432`, and into
+        // `interval(0)` is `12:34:57`: it rounds rather than truncates, which
+        // makes a shorter interval lossy in the last place for almost every
+        // value rather than for the rare one.
+        (
             Family::Temporal {
                 has_date: false,
                 has_time: true,
                 has_offset: false,
                 ..
             },
-            Family::Interval { .. },
-        ) => TypeChangeRisk::Narrowing,
+            Family::Interval { precision },
+        ) => safe_if(precision >= MAX_INTERVAL_PRECISION),
 
         // One `interval` into another is a question about the seconds
         // precision, which the engine will convert either way. Measured:
@@ -1255,6 +1270,12 @@ mod tests {
     #[test]
     fn a_widening_within_a_family_is_safe() {
         for (from, to) in [
+            // A `time` is a length of time, and an `interval` that keeps every
+            // microsecond keeps it: measured, `00:00:00`, `24:00:00` and
+            // `23:59:59.999999` all read back unchanged. A bare `interval` is
+            // the full precision, so this is the common spelling.
+            ("time", "interval"),
+            ("time", "interval(6)"),
             ("smallint", "integer"),
             ("integer", "bigint"),
             ("integer", "numeric(20,0)"),
@@ -1306,7 +1327,11 @@ mod tests {
             ("timestamp", "time"),
             // Measured: `interval '30 hours'` into `time` stores `06:00:00`.
             ("interval", "time"),
-            ("time", "interval"),
+            // The other direction keeps the length; what it can lose is the
+            // last places of the seconds. Measured, `12:34:56.654321` into
+            // `interval(0)` rounds to `12:34:57`.
+            ("time", "interval(0)"),
+            ("time", "interval(5)"),
             // Measured: `{"a": 1,  "a": 2}` into `jsonb` becomes `{"a": 2}`.
             ("json", "jsonb"),
         ] {

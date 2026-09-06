@@ -786,6 +786,14 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         ("numeric(5,0)", "real", "99999"),
         ("bigint", "double precision", "9007199254740993"),
         ("integer", "double precision", "2147483647"),
+        // A `time` into an `interval` at both ends of the day and at the last
+        // microsecond, and into the precision that rounds it away.
+        ("time", "interval", "'24:00:00'"),
+        ("time", "interval", "'23:59:59.999999'"),
+        ("time", "interval", "'00:00:00'"),
+        ("time", "interval(0)", "'12:34:56.654321'"),
+        ("time", "interval(5)", "'12:34:56.654321'"),
+        ("interval", "time", "'30 hours'"),
         // The seconds precision the family used to drop.
         ("interval(0)", "interval(6)", "'1 sec'"),
         ("interval(6)", "interval(0)", "'1.234567 sec'"),
