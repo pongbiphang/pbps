@@ -196,6 +196,37 @@ default" into "omitted", and a row that spelled a value equal to its default
 compared unequal to itself on every plan. The catalog cannot know how a row
 was written; only the side reading it can (decision 67).
 
+## `sp_rename` carries almost everything, and the exceptions set the order
+
+Measured on SQL Server 2025, one column per dependency kind, each renamed on
+its own:
+
+| the column participates in | `sp_rename ... 'COLUMN'` |
+|---|---|
+| a primary key, even one a foreign key references | carried |
+| a unique constraint | carried |
+| an index key column, or an `INCLUDE` column | carried |
+| a filtered index's key column, where the predicate names another | carried |
+| a default constraint | carried |
+| **a check constraint** | **refused, 15336** |
+| **a filtered index's predicate** | **refused, 5074 then 4922** |
+| **a computed column's source** | **refused, 15336** |
+
+The carried column is why `Renames::apply` exists: restating a constraint the
+engine already moved is a plan that fights the engine. The refused column is
+why the constraint drops sort *before* the column renames: the drop is what
+makes the rename possible, and a plan that renamed first was a valid, reviewed
+plan the engine would not perform, with no declaration the user could write to
+fix it.
+
+The shape: **an ordering derived from one half of a table is wrong for the
+other half.** Both halves are the same statement here — `sp_rename` on a
+column — and only measurement separates them. And the fix is the whole group,
+not the two kinds that need it, because deciding which check names a renamed
+column means parsing the expression, which this tool never does (decision
+174). Verify a widened move costs nothing rather than narrowing it with a
+parser.
+
 ## A probe reads a state that is not there yet
 
 Two forms, and `order_key` decides which probes have the second.
@@ -224,11 +255,11 @@ one group.
 
 **The other form: the rows.** A probe attached to a change that sorts *after*
 the row changes is not asking about the table the statement will meet. Row
-changes are ranks 10 and 11; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
-`AddForeignKey` and `AddIndex` are all 12. So a plan that deletes its own
+changes are ranks 11 and 12; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
+`AddForeignKey` and `AddIndex` are all 13. So a plan that deletes its own
 violations and then tightens was refused for violations that will be gone, and
 one that writes violating rows was told there were none. `AlterColumnType`,
-`AlterColumnNullability` and `AddColumn` sort at 7-9, before the rows, so
+`AlterColumnNullability` and `AddColumn` sort at 8-10, before the rows, so
 reading the current table is exactly right for those — **the rank is the
 test**, not the intuition that "a probe should see the future".
 

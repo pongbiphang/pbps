@@ -6264,6 +6264,154 @@ fn a_rename_leaves_the_constraints_that_name_the_column_alone() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// A column a check constraint names is renamed, and the engine is the witness:
+/// with the drop after the rename it answers 15336 and the apply fails.
+///
+/// The plan is right in every other way — the check is dropped and re-added
+/// with the new spelling, because the expression is opaque text this tool
+/// never rewrites — and only the order was wrong. Nothing the user could write
+/// in the declarations fixed it; the escape was two revisions.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_column_a_check_names_is_renamed_after_the_check_is_dropped() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "ckrename");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("ckrename-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         old: {type: varchar(20), nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\n\
+         checks:\n  ck_t: \"old <> ''\"\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         new: {type: varchar(20), nullable: false, renamed_from: old}\n\
+         primary_key: {name: pk_t, columns: [id]}\nchecks:\n  ck_t: \"new <> ''\"\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,constraint,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the check must be dropped before the engine will rename the column: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
+/// The same for a filtered index, whose predicate names the renamed column.
+/// The engine's answer there is 5074, `the index is dependent on column`,
+/// with 4922 behind it — a different refusal from a different subsystem, which
+/// is why it is worth its own live case rather than a second assertion above.
+/// Which of the two a caller sees depends on the caller: the driver reports
+/// the first token, `TRY`/`CATCH` the last.
+///
+/// The index's *key* column is not the problem: measured, that one renames and
+/// the index follows. Only the predicate blocks, and the predicate is text
+/// this tool never rewrites, so the drop-and-add is real.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_column_a_filtered_index_names_is_renamed_after_the_index_is_dropped() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "ixrename");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("ixrename-live");
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         key_col: {type: int, nullable: false}\n  old: {type: int}\n\
+         primary_key: {name: pk_t, columns: [id]}\nindexes:\n  ix_t:\n    \
+         columns: [key_col]\n    where: \"old IS NOT NULL\"\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         key_col: {type: int, nullable: false}\n  new: {type: int, renamed_from: old}\n\
+         primary_key: {name: pk_t, columns: [id]}\nindexes:\n  ix_t:\n    \
+         columns: [key_col]\n    where: \"new IS NOT NULL\"\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let o = d.run(&["fmt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "rename,constraint,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the filtered index must be dropped before the engine will rename the \
+         column its predicate names: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", &connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// A declared text the engine reads back differently — `"1.5"` in a
 /// `decimal(5,2)` comes back `1.50` — would be recorded as the engine spells
 /// it and drift from the declaration on every later plan. Every connected

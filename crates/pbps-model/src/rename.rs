@@ -64,8 +64,9 @@ impl Renames {
     /// A check constraint's expression and a filtered index's predicate are
     /// **not** rewritten. They are opaque text this tool never parses, and the
     /// engine refuses `sp_rename` on a column either of them names at all
-    /// (15336 and 4922, measured), so the drop and re-add such a rename forces
-    /// is the only way it can happen — not a spelling to be reconciled away.
+    /// (15336 for the check, 5074 with 4922 behind it for the index,
+    /// measured), so the drop and re-add such a rename forces is the only way
+    /// it can happen — not a spelling to be reconciled away.
     ///
     /// `name` is the table's **pre-rename** name, because that is what the
     /// column map is keyed by.

@@ -1326,7 +1326,7 @@ SPEC is in sync with all of these.
     side's, whose absence for a column doubled as "the base has no recorded
     cell here, so hold the row to nothing". That reading is right *before* the
     write and wrong after it. When one revision adds a column and populates it
-    in the same declared row, `AddColumn` sorts at 7 and the row changes at 10,
+    in the same declared row, `AddColumn` sorts at 8 and the row changes at 11,
     so by the time the `UPDATE` runs the column exists and holds the declared
     type — but the postcondition looked the column up in the base's map, found
     nothing, and held the new cell to nothing at all. An `AFTER UPDATE`
@@ -1334,7 +1334,7 @@ SPEC is in sync with all of these.
     back and record it, and the next connected plan would propose the same
     update forever: the silence 132 exists to close, reopened for the one
     column the revision was about. The same shape hid a second case, since
-    `AlterColumnType` sorts at 8: a column retyped in the same plan had its
+    `AlterColumnType` sorts at 9: a column retyped in the same plan had its
     result compared by the rendering of the type it no longer had.
     `after_types` now carries the post-plan type wherever it differs from the
     base's — the added column and the retyped one — and the emitter resolves
@@ -1440,7 +1440,7 @@ SPEC is in sync with all of these.
     on months later is worthless anywhere a reader does not look.
 
 146. **A cell whose column this plan retypes is carried, and held by
-    nothing.** `AlterColumnType` sorts at 8 and the row changes at 10 and 11,
+    nothing.** `AlterColumnType` sorts at 9 and the row changes at 11 and 12,
     so by the time an `UPDATE` or a `DELETE` runs the engine has already
     converted the column — and the recorded text is the spelling the *old*
     type gave it. Measured on SQL Server 2025: a `decimal(5,2)` holding `1.50`
@@ -1616,8 +1616,8 @@ SPEC is in sync with all of these.
     reverted, `apply` reports success and records it.
 
 151. **The new foreign key is probed against the rows the plan will leave,
-    not the ones it finds.** `AddForeignKey` sorts at 12 and the row changes
-    at 10 and 11, so the probe — which runs before statement one — was
+    not the ones it finds.** `AddForeignKey` sorts at 13 and the row changes
+    at 11 and 12, so the probe — which runs before statement one — was
     answering about a table that will not exist in that shape by the time the
     constraint is created. Two faults, and the first is the one that matters:
     a plan that inserts the parent rows its children need, or repairs the
@@ -2322,15 +2322,15 @@ SPEC is in sync with all of these.
     catches a module this plan is about to write that the catalog cannot read
     back (491edd9). One read refuses over the union, which is the same thing —
     and a `debug_assert` records that the union is the watched set.
-    **The probe.** `order_key` runs every row change (10, 11) before every
-    constraint a plan adds (12), and `AddCheck`'s probe counted the rows
+    **The probe.** `order_key` runs every row change (11, 12) before every
+    constraint a plan adds (13), and `AddCheck`'s probe counted the rows
     standing now. A plan that deletes its own violations and then tightens was
     refused for violations that will be gone; a plan that writes violating
     rows was told there were none. The ordering is what draws the boundary,
     and it is worth stating: **only a probe whose statement sorts after the
     row changes has this problem.** `AlterColumnType`, `AlterColumnNullability`
-    and `AddColumn` all sort before them (7-9), so reading the current table
-    is exactly right for those. At 12 with `AddCheck` sit `AddUnique` and
+    and `AddColumn` all sort before them (8-10), so reading the current table
+    is exactly right for those. At 13 with `AddCheck` sit `AddUnique` and
     `SetPrimaryKey`, which have it too.
     The check's own fix cannot be the foreign key's. `rows_after` builds the
     rows a plan will leave *for a named column list*, because a foreign key's
@@ -3830,3 +3830,41 @@ SPEC is in sync with all of these.
     human. The alternative — counting unfiltered and
     calling it conservative — is not conservative at all in this direction; it
     refuses valid plans.
+237. **The constraint and index drops run before the column renames, all of
+    them.** `order_key` renamed a column first and dropped the constraints
+    around it after. For most of them that is right and #123 had just stopped
+    them being restated at all — measured, `sp_rename` carries a primary key,
+    a unique constraint, an index's key and `INCLUDE` columns and a child's
+    `references_table` for free. Two kinds it cannot carry, and there the
+    order was backwards: measured on SQL Server 2025, a rename of a column a
+    **check constraint** names is refused with 15336, and one a **filtered
+    index's predicate** names with 5074, and 4922 behind it. The plan a valid
+    revision produced —
+    rename, drop the check, add it back with the new spelling — could not run,
+    and no declaration the user could write fixed it. The escape was two
+    revisions.
+
+    **The whole group moves, not the two kinds that need it.** Moving only
+    `DropCheck` and the filtered `DropIndex` means asking which columns a
+    check's expression names, and this tool deliberately never parses that
+    expression (174). Moving all four costs nothing instead: measured, a
+    rename is never blocked by a constraint that does not name the column, so
+    `DropUnique`, `DropForeignKey` and an unfiltered `DropIndex` are as safe
+    one class earlier as one class later. They still precede `DropColumn`,
+    which is the other thing their old position was for, and
+    `DropForeignKey`'s `dependency_rank` of -1 travels with them and still
+    puts it ahead of the key it references.
+
+    **They move ahead of the column renames, not ahead of the table rename.**
+    A drop names its table, so a drop emitted before `sp_rename` on the table
+    would name a table that no longer exists — the shape #118 fixed. Measured,
+    neither a check nor a filtered index blocks a *table* rename, so there is
+    nothing to gain by going further.
+
+    **`Revoke` could not travel with them.** It shared the drops' class and
+    has the opposite need: it names the object as the renames leave it. So it
+    stayed where it was and took a class of its own, which is the negative
+    case the ordering tests pin.
+
+    The re-add stays in the constraint class far below, after the renames,
+    which is where the new spelling can be written. Only the drop moves.

@@ -515,8 +515,8 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 return Ok(Vec::new());
             };
             // The rows the statement will meet, not the rows standing now.
-            // `order_key` runs every row change (10, 11) before every
-            // constraint this plan adds (12), which is what makes the two
+            // `order_key` runs every row change (11, 12) before every
+            // constraint this plan adds (13), which is what makes the two
             // different (DECISIONS 174).
             let moved = names.moved.get(table);
             // A row this plan writes cannot be spelled against an arbitrary
@@ -2625,8 +2625,8 @@ mod tests {
         assert_eq!(probed(vec![retype, index(&["email"], true, None)]), 1);
     }
 
-    /// `order_key` runs every row change (10, 11) before every constraint
-    /// this plan adds (12), so the rows an `ADD CHECK` will meet are not the
+    /// `order_key` runs every row change (11, 12) before every constraint
+    /// this plan adds (13), so the rows an `ADD CHECK` will meet are not the
     /// rows standing now. Counting the current ones blocked a plan that
     /// deletes its own violations first, and said nothing about the rows the
     /// plan is about to write (DECISIONS 174).
