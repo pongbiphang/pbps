@@ -3349,3 +3349,23 @@ SPEC is in sync with all of these.
     the command, so the envelope and the exit code are produced by one thing.
     That is the general rule: a command that reaches for `Found` on a path where
     it also emits `unanswerable` has routed a tool failure to the wrong person.
+
+220. **A table cell is escaped for the terminal; the JSON keeps the original.**
+    `state list --format human` lays its columns out by counting characters, and
+    `operator` and `reason` are free text: `--reason $'ticket-9\nwhy'` reaches
+    the ledger as written, and a `failed` entry can carry a driver's multi-line
+    message. A cell holding a line break ended its row early, so the rest of the
+    row began again at column 1 and read as an entry of its own — a table that
+    did not say "this reason had a newline in it" but said something false about
+    how many times the database had been deployed to, in a command whose whole
+    output is that list.
+
+    Control characters are shown escaped (`\n`, `\r`, `\t`, `\u{7}`) rather than
+    stripped: what was recorded is the point of the column, and a silently
+    shortened reason is the same class of lie one column over. `--format json`
+    is untouched — a consumer parsing the envelope wants the bytes the operator
+    typed, and JSON has its own escaping for them.
+
+    Applied to every cell rather than to the two that are free text today. The
+    rule the repository keeps arriving at: prefer making the bad value
+    unrepresentable over checking for it at the sites that happen to hold it now.

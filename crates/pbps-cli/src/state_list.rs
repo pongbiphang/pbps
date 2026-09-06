@@ -190,7 +190,7 @@ pub fn cmd_state_list(
         // build cannot read is a gap in what the page can show, and a reader
         // who is told nothing would take the missing counts for zero.
         for e in entries.iter().filter(|e| e.unreadable.is_some()) {
-            let why = e.unreadable.as_deref().unwrap_or_default();
+            let why = one_line(e.unreadable.as_deref().unwrap_or_default());
             findings.push(output::Finding::warning(
                 "state.entry-unreadable",
                 format!(
@@ -246,6 +246,31 @@ pub fn cmd_state_list(
     })
 }
 
+/// One line, whatever the ledger holds.
+///
+/// `operator` and `reason` are free text — `--reason $'ticket\nwhy'`, or a
+/// driver's multi-line failure copied into a `failed` entry — and the table's
+/// columns are laid out by counting characters. A cell holding a line break
+/// ends its row early, so the rest of it starts again at column 1 and reads as
+/// an entry of its own: a rendering that does not say "this reason had a
+/// newline in it" but says something false about how many times this database
+/// was deployed to. Control characters are shown escaped rather than dropped,
+/// because what was recorded is the point of the column, and `--format json`
+/// still carries the original (DECISIONS 220).
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The table an operator reads.
 ///
 /// Widths are computed rather than fixed: an operator's name and a reason are
@@ -283,6 +308,9 @@ fn render(data: &StateListData) -> String {
                     (None, None) => String::new(),
                 },
             ]
+            // Every cell, not the two that are free text today: a column that
+            // cannot hold a line break is a column no later edit can break.
+            .map(|cell| one_line(&cell))
         })
         .collect();
 
@@ -313,4 +341,86 @@ fn render(data: &StateListData) -> String {
         line(r, &mut out);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_with(operator: &str, reason: Option<&str>) -> LedgerRow {
+        LedgerRow {
+            id: 1,
+            applied_at: "2026-09-06T10:00:00.000".to_owned(),
+            kind: "apply".to_owned(),
+            state_version: Some(1),
+            unreadable: None,
+            operator: operator.to_owned(),
+            git_sha: Some("0123456789abcdef".to_owned()),
+            plan_checksum: None,
+            reason: reason.map(str::to_owned),
+            staged: None,
+            tables: Some(1),
+            modules: Some(0),
+        }
+    }
+
+    /// A row is one line of the table, whatever text the ledger holds.
+    ///
+    /// `--reason $'ticket-9\nwhy'` reaches the ledger as written. Copied into a
+    /// cell it ended the row early, and the rest appeared at column 1 — an
+    /// entry the database does not have, in a command whose whole output is a
+    /// count of entries.
+    #[test]
+    fn a_reason_with_a_line_break_is_still_one_row() {
+        let data = StateListData {
+            environment: "demo".to_owned(),
+            initialized: true,
+            limit: 50,
+            entries: vec![
+                row_with("someone", Some("ticket-9\nexplained at length")),
+                row_with("some\tone", Some("plain")),
+            ],
+        };
+        let out = render(&data);
+        assert_eq!(
+            out.lines().count(),
+            3,
+            "one header and two rows, not four lines:\n{out}"
+        );
+        assert!(out.contains("ticket-9\\nexplained"), "{out}");
+        assert!(out.contains("some\\tone"), "{out}");
+        // The escape is visible, not a dropped character: the reason is the
+        // reason the row exists.
+        assert!(!out.contains("ticket-9explained"), "{out}");
+    }
+
+    /// The columns still line up once a cell has been escaped, because the
+    /// width is measured on what is printed rather than on what was recorded.
+    #[test]
+    fn column_widths_are_measured_on_the_escaped_text() {
+        let data = StateListData {
+            environment: "demo".to_owned(),
+            initialized: true,
+            limit: 50,
+            entries: vec![
+                row_with("a\nb", Some("x")),
+                row_with("wideoperator", Some("y")),
+            ],
+        };
+        let out = render(&data);
+        let lines: Vec<&str> = out.lines().collect();
+        let detail = lines[0].find("DETAIL").expect("header has DETAIL");
+        assert_eq!(
+            lines[1].find('x'),
+            Some(detail),
+            "the escaped cell must not shift its row:\n{out}"
+        );
+    }
+
+    /// A control character with no short escape is shown, not dropped.
+    #[test]
+    fn an_unprintable_character_is_shown_rather_than_dropped() {
+        assert_eq!(one_line("a\u{7}b"), "a\\u{7}b");
+        assert_eq!(one_line("plain"), "plain");
+    }
 }

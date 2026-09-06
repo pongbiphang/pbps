@@ -283,6 +283,20 @@ the recorded state, because the first fix read them from the catalog, and the
 catalog hides a securable from an account with no permission on it: the live
 suite showed the query returning nothing for exactly the login being checked.
 
+## A cell that can end its own row
+
+`state list` draws a table whose widths are counted from the text, and the text
+is a `--reason` and an operator name — free-form, and stored verbatim. One
+newline in a reason ended the row early, and its tail was printed at column 1
+where it read as another entry. The table was not garbled in a way a reader
+notices; it was wrong in the one dimension the command exists to report, the
+number of times this database was deployed to.
+
+Escape for the terminal, keep the original in the JSON, and do it for **every**
+cell rather than for the fields that are free text this week (DECISIONS 220).
+The same question is worth asking of any rendering whose layout is computed
+from its content.
+
 ## A comment ends at a carriage return
 
 A `--` comment ends at a bare carriage return, and at nothing else that looks
