@@ -251,17 +251,38 @@ impl SavedPlan {
 /// and identity travel together everywhere else in this tool (see
 /// [`crate::StateSnapshot`]), and they travel together here.
 ///
-/// Determinism comes from the model's collections being `BTreeMap` / `BTreeSet`
-/// (the one `IndexMap` is column order, which is itself meaningful). Without
-/// that, this function would return a different answer for the same database on
-/// every run and the drift check would be a coin flip.
+/// Determinism comes from the model's collections being `BTreeMap` / `BTreeSet`.
+/// Without that, this function would return a different answer for the same
+/// database on every run and the drift check would be a coin flip.
+///
+/// The one exception is `Table::columns`, an `IndexMap` whose order is the
+/// column layout of `CREATE TABLE`; it is sorted by name here, and only here,
+/// so that this answers the same question `Schema`'s own `==` answers
+/// (DECISIONS 238). Serialized in declaration order it did not: a column
+/// dropped and re-added by hand comes back last, and the differ — which
+/// compares with `==`, and so ignores order — reported no changes while this
+/// checksum said the environment had moved. `verify` then named the drift and
+/// listed nothing that drifted, and `plan --db` refused with no forward path
+/// but a re-baseline. The order itself is still recorded in `state_json` and
+/// still decides what `CREATE TABLE` emits from the declarations; it is only
+/// not part of this fingerprint.
 pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
+    // By value, not by reference: the sort is the canonical form this hash is
+    // taken over, and the caller's schema — the recorded snapshot, or the one
+    // just read from the catalog — keeps the order it came in with.
+    let mut canonical = schema.clone();
+    for table in canonical.tables.values_mut() {
+        table.columns.sort_unstable_keys();
+    }
     #[derive(serde::Serialize)]
     struct Fingerprint<'a> {
         schema: &'a Schema,
         ids: &'a IdsFile,
     }
-    digest_of(&Fingerprint { schema, ids })
+    digest_of(&Fingerprint {
+        schema: &canonical,
+        ids,
+    })
 }
 
 /// The fingerprint of a plan, for the ledger.
@@ -320,6 +341,26 @@ mod tests {
         s
     }
 
+    /// One table whose columns are declared in the order given.
+    fn schema_of(columns: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for c in columns {
+            map.insert(
+                (*c).to_string(),
+                Column::new("nvarchar(200)".parse::<ColumnType>().unwrap()),
+            );
+        }
+        let mut s = Schema::default();
+        s.tables.insert(
+            TableName::new("dbo", "customer"),
+            Table {
+                columns: map,
+                ..Default::default()
+            },
+        );
+        s
+    }
+
     fn ids_with(uid: &str) -> IdsFile {
         let mut ids = IdsFile::default();
         ids.tables.insert(
@@ -364,6 +405,63 @@ mod tests {
         let a = state_checksum(&schema_with("nvarchar(255)"), &IdsFile::default());
         let b = state_checksum(&schema_with("nvarchar(100)"), &IdsFile::default());
         assert_ne!(a, b);
+    }
+
+    /// The two rules that answer "has this environment moved" must answer it
+    /// the same way. `Schema`'s `==` ignores column order; a fingerprint that
+    /// did not made a hand-made drop-and-re-add of one column — which comes
+    /// back last — into drift the differ could not name and no plan could
+    /// resolve (DECISIONS 238).
+    #[test]
+    fn column_order_does_not_change_the_state_checksum() {
+        let ids = ids_with("t_a1b2c3");
+        let one = schema_of(&["id", "note", "email"]);
+        let other = schema_of(&["id", "email", "note"]);
+        assert_eq!(one, other, "equality already ignores column order");
+        assert_eq!(state_checksum(&one, &ids), state_checksum(&other, &ids));
+    }
+
+    /// Sorting the keys must not sort away a difference. The same three
+    /// columns under a fourth name, and one column fewer, are both changes the
+    /// checksum has to keep seeing.
+    #[test]
+    fn a_renamed_or_dropped_column_still_changes_the_state_checksum() {
+        let ids = ids_with("t_a1b2c3");
+        let base = state_checksum(&schema_of(&["id", "note", "email"]), &ids);
+        assert_ne!(
+            base,
+            state_checksum(&schema_of(&["id", "notes", "email"]), &ids),
+            "a renamed column"
+        );
+        assert_ne!(
+            base,
+            state_checksum(&schema_of(&["id", "note"]), &ids),
+            "a dropped column"
+        );
+    }
+
+    /// The plan is the other artifact, and its checksum pins the SQL that will
+    /// run: `CREATE TABLE` emits the columns in the order the table carries
+    /// them, so two plans that would emit two different statements must stay
+    /// two different plans.
+    #[test]
+    fn column_order_still_changes_a_plans_own_checksum() {
+        let created = |order: &[&str]| {
+            plan_over(ChangeSet {
+                changes: vec![PlannedChange::new(Change::CreateTable {
+                    uid: "t_a1b2c3".parse().unwrap(),
+                    name: TableName::new("dbo", "customer"),
+                    table: Box::new(
+                        schema_of(order)
+                            .tables
+                            .remove(&TableName::new("dbo", "customer"))
+                            .unwrap(),
+                    ),
+                })],
+            })
+            .checksum()
+        };
+        assert_ne!(created(&["id", "note"]), created(&["note", "id"]));
     }
 
     /// A rename recorded in the ids file with no schema change still moves the
