@@ -176,6 +176,31 @@ output spells it (`rename dbo.customer.customer_name full_name`), and shows
 the diff before the commit, the branch after the push, and a link to the
 merge request where the hosting's URL shape is known.
 
+The page sends the intent, never the files: the kind of change and its
+arguments — `rename dbo.customer.customer_name full_name`, `drop
+dbo.customer.national_id --reason <text>`, and the table and role forms —
+exactly as a user would type them. The UI writes the recorded tip out as a
+snapshot the way step 3 below writes one (`git ls-tree -r -z <tip>` and
+`git cat-file --batch`, regular-file entries only, under
+`<git-dir>/pbps-ui/intent/<random>/`), runs the CLI's own intent command
+there — `pbps rename <from> <to> --no-input --format json --project <that
+directory>/<the project's path>` and its siblings — and takes as the
+replacement bytes every regular file the command left different from the
+tip's, new files included, found by hashing the snapshot against `git
+ls-tree`. Those are the paths steps 1 to 6 place and commit. The browser
+never composes a declaration or an ids-file line: the identity mapping a
+rename records comes from `pbps_diff::resolve`, which the intent command
+runs and the UI cannot, and a UI that chose the uid itself could write an
+ids file that is internally consistent and records a different identity
+transition than the one asked for — one `validate` accepts, since it checks
+the file's consistency and not what the user meant, and one a later `plan`
+reads as a drop and a create. SPEC §14.3's rule is kept as the CLI keeps
+it: the arguments are the user's decision, typed into the page instead of
+the shell, and `--no-input` declines any question the command would have
+asked, so a case it would ask about is refused and shown, never answered
+by the UI. Reasoned, not measured: which files an intent command edits is
+the CLI's, unchanged here; step 4 of #64 measures the snapshot round trip.
+
 The first design was the porcelain `git commit --only -m <message> --
 <paths>`, with the commit read back afterwards and pushed only if it matched
 the preview. It is refused, and the record of why is worth keeping, because
@@ -247,7 +272,16 @@ locked-copy `update-index` ran it), so every `git` also takes
    for no attribute, `hash-object --stdin --path` ran the clean program
    all the same, and a pass-through program left the filtered and raw ids
    equal; `--all` listed `filter: unspecified` for that path and nothing
-   for a path with no attribute). A clean filter
+   for a path with no attribute). The same listing is taken with
+   `--source <tip>` (git 2.40 and later), and the two must be equal:
+   every attribute check here reads the working tree's `.gitattributes`,
+   while the commit is built on the tip and carries the tip's, so a
+   `.gitattributes` edit not yet committed makes them two different
+   questions, and a `filter` or `ident` rule removed locally would pass
+   the working-tree checks and leave the commit transforming the path in
+   every other checkout (**measured**: with `*.json ident` at the tip and
+   the working-tree `.gitattributes` emptied, `check-attr --all` listed
+   nothing for the path and `--source HEAD` listed `ident: set`). A clean filter
    is a program neither `core.hooksPath` nor `core.fsmonitor` reaches, and
    a blob stored around it leaves `git status` reporting the path modified
    the moment it is committed, since `git` compares through the filter. The
@@ -525,11 +559,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    `pbps validate --format json --no-input --project <that
    directory>/<the project's path in the worktree>`, as decision 1 runs
    every command; a failing envelope rolls step 2 back and shows its
-   findings. The bytes came from the browser, and ADR-0006 keeps the one
+   findings. The bytes are an intent command's, but the tree that holds
+   them on the tip is the UI's assembly, and ADR-0006 keeps the one
    validation path in the CLI, so the CLI is asked — about the tree, not
    the checkout: an editor can rewrite a placed file while `validate`
    reads the checkout, and a check that read the editor's bytes would
-   have passed the browser's. The snapshot is written by the UI rather
+   have passed the UI's. The snapshot is written by the UI rather
    than by `git checkout-index --prefix` or `git archive` because both
    run the `smudge` program of a path's `filter` attribute and
    `cat-file` runs none (**measured**: under `*.json filter=up` with a
@@ -673,8 +708,31 @@ otherwise, listing them, and uses *that URL* — not the remote's name — for
 `ls-remote` and the push alike, since the name resolves to the fetch URL
 for the first and to the push URL for the second, and a
 `pushurl` that differs from the fetch URL would have the checks look at one
-server and the push go to another. Before composing,
-the UI reads the remote's tip for the branch (`git ls-remote <push-url>
+server and the push go to another. The URL is handed to `git` as a remote
+that exists only in the environment of the two processes that use it —
+`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=remote.pbps-ui.url`,
+`GIT_CONFIG_VALUE_0=<push-url>` — and named `pbps-ui` on their command
+lines, never written on a command line or into the configuration file
+(**measured**: `ls-remote pbps-ui` and `push pbps-ui` under that
+environment reached the URL, the configuration file did not mention the
+name, and without the environment the name resolved to nothing;
+overriding the *existing* remote's `url` the same way did not work, since
+the key is multi-valued and the override was appended after the fetch
+URL). A URL may carry a credential, and `git remote get-url` prints one
+verbatim (**measured**: `https://tok3n@…` came back as typed) where `git`'s
+transport strips it from its own diagnostics (**measured**: `ls-remote`
+and `push` against that URL reported `unable to access
+'https://127.0.0.1:1/x.git/'`); a command line is readable by every user
+of the machine through `/proc/<pid>/cmdline` and the environment by the
+process's owner alone (**measured**: `/proc/<pid>/environ` is mode
+`0400`), which is who can already read the configuration file. So the
+URL stays in the UI process, and every URL the page is shown — the list
+on refusal, the destination named after a push, the commands offered for
+the shell — is shown with its userinfo removed, everything between the
+scheme's `//` and an `@`, and every line of `git` output relayed to the
+page passes through the same removal, in case a helper is less careful
+than the transport. Before composing,
+the UI reads the remote's tip for the branch (`git ls-remote pbps-ui
 refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
 showing the unpushed commits and the commands instead: a refspec bounds the
 destination ref, not the range, and **measured**, a branch one unrelated
@@ -682,7 +740,7 @@ commit ahead had that commit published under the intent commit by
 `HEAD:refs/heads/<branch>`. A branch the remote does not have yet — the first
 push of a feature branch, the common case — is published *before* composing,
 as its own step the page names as such: `git push --no-verify
---no-follow-tags --recurse-submodules=no <push-url>
+--no-follow-tags --recurse-submodules=no pbps-ui
 <tip>:refs/heads/<branch>` with an empty lease (`--force-with-lease=
 refs/heads/<branch>:`) — the same flags as the final push, since
 `push.followTags=true` would otherwise send every annotated tag reachable
@@ -710,7 +768,7 @@ with it), and `--no-follow-tags`; never a bare `git push`, which under
 ```
 git push --no-verify --no-follow-tags --recurse-submodules=no \
     --force-with-lease=refs/heads/<branch>:<tip> \
-    <push-url> <oid>:refs/heads/<branch>
+    pbps-ui <oid>:refs/heads/<branch>
 ```
 
 Both pushes — this one and the one that publishes a new branch — take
