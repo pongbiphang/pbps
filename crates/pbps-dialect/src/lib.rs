@@ -541,21 +541,32 @@ fn dollar_tag(s: &str) -> Option<usize> {
         if c == '$' {
             return Some(j + 2);
         }
-        // PostgreSQL's grammar for a tag is over **bytes**, not Unicode
-        // classes (DECISIONS 233): `dolq_start [A-Za-z\200-\377_]` and
-        // `dolq_cont` the same
-        // plus the digits. Every byte of a non-ASCII character is ≥ 0x80, so
-        // "not ASCII" is the whole of that half. `char::is_alphanumeric` is a
-        // different set and a smaller one — measured on 18.6, `$á$` with a
-        // combining acute is a tag the engine accepts, and refusing it here
-        // scanned the literal body as code and folded its spacing away.
-        let ok =
-            c.is_ascii_alphabetic() || c == '_' || !c.is_ascii() || (j > 0 && c.is_ascii_digit());
-        if !ok {
+        // The tag follows the identifier grammar, minus the `$` that ends it
+        // and minus a digit in first place: `dolq_start [A-Za-z\200-\377_]`,
+        // `dolq_cont` the same plus the digits.
+        if !continues_ident(c) || (j == 0 && c.is_ascii_digit()) {
             return None;
         }
     }
     None
+}
+
+/// Whether `c` is a character PostgreSQL counts as part of an unquoted
+/// identifier once one has started.
+///
+/// The engine's grammar is over **bytes**, not Unicode classes (DECISIONS 233):
+/// `ident_cont [A-Za-z\200-\377_0-9\$]`. Every byte of a non-ASCII character is
+/// ≥ 0x80, so "not ASCII" is the whole of that half. `char::is_alphanumeric` is
+/// a different set and a smaller one, and the difference is not exotic: `á`
+/// spelled `a` then U+0301 continues an identifier for the engine and ends one
+/// for Rust. Measured on 18.6 — `á$tag$` is one name, and `áE'a\'` is that name
+/// applied to the two-character string `a\`, not an escape string.
+///
+/// The rule is PostgreSQL's, and both callers are behind a PostgreSQL-only
+/// flag: SQL Server has neither dollar quoting nor escape strings, so its scan
+/// never asks the question.
+fn continues_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
 
 /// Whether the character at `at` continues an identifier instead of starting a
@@ -566,10 +577,7 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// the middle would open a literal that the rest of the definition never
 /// closes.
 fn continues_identifier(text: &str, at: usize) -> bool {
-    text[..at]
-        .chars()
-        .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    text[..at].chars().next_back().is_some_and(continues_ident)
 }
 
 /// Whether the quote at `at` is the one in an `E'…'`.
@@ -581,9 +589,7 @@ fn opens_escape_string(text: &str, at: usize) -> bool {
     let before = &text[..at];
     let mut chars = before.chars().rev();
     match chars.next() {
-        Some('e' | 'E') => !chars
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$'),
+        Some('e' | 'E') => !chars.next().is_some_and(continues_ident),
         Some(_) | None => false,
     }
 }
@@ -1110,6 +1116,15 @@ mod tests {
             PG.normalize_definition("SELECT $a\u{301}$x  y$a\u{301}$"),
             PG.normalize_definition("SELECT $a\u{301}$x y$a\u{301}$")
         );
+        // The same grammar decides where the *preceding* identifier ends, and
+        // a name it continues swallows the `$` that would have opened a tag.
+        // Measured on 18.6, `á$tag$` is one identifier — so here the first
+        // `$tag$` is part of a name and the second opens the literal, which is
+        // where the two spellings differ.
+        assert_ne!(
+            PG.normalize_definition("SELECT a\u{301}$tag$ + $tag$x  y$tag$"),
+            PG.normalize_definition("SELECT a\u{301}$tag$ + $tag$x y$tag$")
+        );
         // Layout *around* one is still layout.
         assert_eq!(
             PG.normalize_definition("SELECT   $tag$a  b$tag$\n  FROM t"),
@@ -1192,6 +1207,16 @@ mod tests {
         assert_eq!(
             PG.normalize_definition(r"SELECT E   'a\'   ,   x  y"),
             r"SELECT E 'a\' , x y"
+        );
+        // "Is this `E` a token of its own" is the same question about where
+        // the identifier before it ends, so it is the same grammar. Measured
+        // on 18.6: with `á` spelled `a` then U+0301, `áE'a\'` is the name `áe`
+        // applied to the plain two-character string `a\` — the `E` stays in
+        // the name, and arming the escape rule here ran the literal past its
+        // closer and folded the spacing of the next one away.
+        assert_eq!(
+            PG.normalize_definition("SELECT a\u{301}E'a\\'   ,   'p  q'"),
+            "SELECT a\u{301}E'a\\' , 'p  q'"
         );
     }
 

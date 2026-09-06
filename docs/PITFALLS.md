@@ -407,6 +407,27 @@ It survived because **every `--dev` test passed a connection string**: the
 docker path had no automated coverage at all. Reading found it; running could
 not have.
 
+## One rule, spelled in three places
+
+The definition scanner asks "does the identifier before this character end
+here?" three times: before a `$` that might open a tag, before the `E` of an
+escape string, and inside the tag itself. A review round measured PostgreSQL's
+answer — the grammar is over **bytes**, `[A-Za-z\200-\377_0-9\$]`, so every
+non-ASCII character continues a name — and fixed the one helper the finding
+named. The other two kept asking Rust's `char::is_alphanumeric`, which says
+that `á` spelled `a` then U+0301 ends a name. The next review found both.
+
+Neither failed loudly. With `á$tag$` the scanner opened a literal where the
+engine had a name, closed it at the real literal's opener, and then collapsed
+the literal's body as code; with `áE'a\'` it armed the backslash rule over a
+plain string and ran past the quote that ends it. Both end the same way: two
+module definitions that differ compare equal, and a real change is never
+emitted. The repair is one predicate all three call.
+
+**When a measurement corrects a rule, give the rule one home — do not correct
+the caller the finding happened to name.** A rule that lives in three places is
+three chances to be measured once and fixed once.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run
