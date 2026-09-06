@@ -187,89 +187,101 @@ declarations, pushes the intent, calls `pbps_diff::resolve` and writes the
 result; **measured**: against a declaration that still held the old name,
 `pbps rename` exited 2 with "this intent matches nothing"). So the working
 tree is where the intent is, and the compose is the CLI user's own last
-step made in the CLI user's own order. The UI writes a snapshot of the
-recorded tip (below), asks the CLI where that project keeps its inputs
-(below), and only then lists the modified declaration files — `git status
---porcelain -z --untracked-files=all -- <declarations directory>
-<ids file>`, the pathspec being `doctor`'s two answers carried back to
-the checkout — `doctor` was run in the snapshot and answers with paths
-under `<git-dir>/pbps-ui/intent/<random>/` (**measured**: the envelope
-carried `declarations` and `identity_file` as the CLI resolved them from
-the project it was given), so the UI takes each relative to the
-snapshot's project directory, which the check below has already
-established it lies under, and joins that to the checkout's; handed to
-`git status` as they came they would name a place under `.git` — never
-the project directory, so that a modified `README` or anything else the user
-has open beside the declarations is neither laid over the snapshot nor
-committed with the intent; the flag because
-`status.showUntrackedFiles=no` in the user's configuration would otherwise
-hide the new side of a file-based rename — **measured**: under it the
-listing held the deleted old path alone, and with the flag both. The
-page shows that listing with the blob id of each file as read, and the
-compose is refused if `pbps.yml` itself is modified in the working tree
-(`git status --porcelain -z -- <project_file>` not empty), because the
-snapshot holds the tip's configuration and the working tree's would
-answer the questions below differently; the user commits the
-configuration first, as they would before running `pbps rename`. For the
-snapshot the UI writes
-the way step 3 below writes one (`git ls-tree -r -z <tip> -- <project>`
-and `git cat-file --batch`, the project's subtree only — a monorepo's
-other gigabytes are not the project's inputs, and `ls-tree` scoped by
-path still names each entry from the worktree root (**measured**) —
-regular-file entries only, under
-`<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3 states),
-lays the working tree's version of each listed file over it from bytes
-read through the file's handle whose hash is the id the page carries —
-and *removes* from it each listed file the working tree no longer has, a
-`D` in that listing, because a table or a role is dropped or renamed by
-deleting or renaming its declaration file, and a snapshot that still held
-the old file would give the command nothing that disappeared to resolve
-— then asks the CLI where that snapshot's project keeps its inputs — `pbps
-doctor --format json --no-input --project <snapshot project>`, whose
-envelope carries `declarations` and `identity_file` as the CLI resolved
-them (**measured**: with an absolute `schema_dir` in `pbps.yml`, both came
-back absolute and outside the project) — and refuses the compose unless
-both lie under the snapshot's project directory, since
-`Project::schema_dir` and `Project::ids_file` join the configured path to
-the root and a configured absolute path discards the root: an intent
-command pointed at the snapshot would otherwise read the live declarations
-and write the live ids file before any of the protocol below had begun,
-and `validate` in step 3 would check live bytes instead of the tree; a
-project whose inputs lie outside its directory is one this UI does not
-compose for, and the Limits section says so; the listing above is taken
-from these answers, after this check. Then it runs the CLI's own
-intent command there — `pbps rename <from> <to>
---no-input --project <that directory>/<the project's path>` and its
-siblings, with no `--format`, which the intent commands do not take
-(**measured**: `rename --format json` exited 2 with `unexpected argument
-'--format'`); decision 1's list of what speaks the envelope is exact, and
-for these commands the page gets the exit status and the blockers report
-of `stderr`. The paths steps 1 to 6 commit are the listed declaration files
-and every regular file the command left different from the snapshot it was
-given, the ids file among them, found by hashing the snapshot against `git
-ls-tree` — the same set a CLI user commits after `pbps rename`. The
-declaration files already hold their bytes in the working tree, so step 2
-places nothing for them and step 1's check that each still hashes to the
-page's id is the whole of their handling; a deleted one must still be
-absent (the no-follow lookup through its directory handle fails with
-`ENOENT`) and is removed from the tree and the index rather than set, `git
-update-index --force-remove -- <path>` in both of step 3's indexes, the
-form that removes the entry whatever the working tree holds (**measured**:
-after it the written tree lacked the path, and with the commit on the
-branch and the prepared index installed, `git status` was clean); what the
-command changed is placed as step 2 describes. The browser never composes a declaration or an
-ids-file line: the identity mapping a rename records comes from
-`pbps_diff::resolve`, which the intent command runs and the UI cannot, and
-a UI that chose the uid itself could write an ids file that is internally
-consistent and records a different identity transition than the one asked
-for — one `validate` accepts, since it checks the file's consistency and
-not what the user meant, and one a later `plan` reads as a drop and a
-create. SPEC §14.3's rule is kept as the CLI keeps it: the arguments are
-the user's decision, typed into the page instead of the shell, and
-`--no-input` declines any question the command would have asked, so a case
-it would ask about is refused and shown, never answered by the UI.
-Reasoned beyond the two measurements above: what an intent command edits is
-the CLI's, unchanged here; step 4 of #64 measures the snapshot round trip.
+step made in the CLI user's own order, in this order:
+
+- **The snapshot.** The UI writes the recorded tip out the way step 3
+  below writes a tree (`git ls-tree -r -z <tip> -- <project>` and `git
+  cat-file --batch`, the project's subtree only — a monorepo's other
+  gigabytes are not the project's inputs, and `ls-tree` scoped by path
+  still names each entry from the worktree root (**measured**) — regular-file
+  entries only, under `<git-dir>/pbps-ui/intent/<random>/`, under the path
+  rules step 3 states). It holds the tip's `pbps.yml`, so the compose is
+  refused first if `pbps.yml` is modified in the working tree (`git status
+  --porcelain -z -- <project_file>` not empty): the working tree's
+  configuration would answer the next question differently, and the user
+  commits the configuration first, as they would before `pbps rename`.
+- **Where the inputs are.** The UI asks the CLI, in the snapshot: `pbps
+  doctor --format json --no-input --project <snapshot project>`, whose
+  envelope carries `declarations` and `identity_file` as the CLI resolved
+  them from the project it was given (**measured**: with an absolute
+  `schema_dir` in `pbps.yml`, both came back absolute and outside the
+  project). It refuses the compose unless both lie under the snapshot's
+  project directory, since `Project::schema_dir` and `Project::ids_file`
+  join the configured path to the root and a configured absolute path
+  discards the root: an intent command pointed at the snapshot would
+  otherwise read the live declarations and write the live ids file before
+  any of the protocol below had begun, and `validate` in step 3 would check
+  live bytes instead of the tree; a project whose inputs lie outside its
+  directory is one this UI does not compose for, and the Limits section
+  says so. This `doctor` is spawned with an environment holding nothing a
+  connection string could be read from — `PATH` and `HOME` alone — because
+  `doctor` otherwise examines every configured environment before it
+  answers, and a slow or unreachable server would hold up, or under the
+  UI's deadline kill, a compose that needs nothing but `git`
+  (**measured**: with the environment's variable set to an unreachable
+  server `doctor` tried the connection and reported `Connection refused`;
+  with it unset it reported the variable unset, connected to nothing, and
+  carried both paths, exit 0). The two answers name places in the
+  snapshot; the UI takes each relative to the snapshot's project directory
+  and joins it to the checkout's, and those two checkout paths are what
+  the rest of this list means by *the declarations* and *the ids file*.
+- **The listing.** `git status --porcelain -z --untracked-files=all
+  --ignored=matching -- <the declarations> <the ids file>`: the pathspec
+  is those two and never the project directory, so that a modified
+  `README` or anything else the user has open beside the declarations is
+  neither laid over the snapshot nor committed with the intent;
+  `--untracked-files=all` because `status.showUntrackedFiles=no` in the
+  user's configuration would otherwise hide the new side of a file-based
+  rename (**measured**: under it the listing held the deleted old path
+  alone, and with the flag both); and `--ignored=matching` because a new
+  declaration matched by `.gitignore` or `.git/info/exclude` is listed by
+  neither (**measured**: it appeared only with the flag, as `!!`), and
+  the compose is refused, naming the file, if any `!!` entry is listed —
+  the intent command would see a working tree the commit cannot hold, and
+  the shell's `git add` would refuse the file too. The page shows the
+  listing with the blob id of each file as read.
+- **The overlay.** The UI lays the working tree's version of each listed
+  file over the snapshot, from bytes read through the file's handle whose
+  hash is the id the page carries, and *removes* from the snapshot each
+  listed file the working tree no longer has, a `D` in the listing,
+  because a table or a role is dropped or renamed by deleting or renaming
+  its declaration file, and a snapshot that still held the old file would
+  give the command nothing that disappeared to resolve.
+- **The command.** It runs the CLI's own intent command there — `pbps
+  rename <from> <to> --no-input --project <that directory>/<the project's
+  path>` and its siblings, with no `--format`, which the intent commands
+  do not take (**measured**: `rename --format json` exited 2 with
+  `unexpected argument '--format'`); decision 1's list of what speaks the
+  envelope is exact, and for these commands the page gets the exit status
+  and the blockers report of `stderr`.
+- **The paths.** What steps 1 to 6 commit are the listed files and every
+  regular file the command left different from the snapshot it was given,
+  the ids file among them, found by hashing the snapshot against `git
+  ls-tree` — the same set a CLI user commits after `pbps rename`. The
+  listed files already hold their bytes in the working tree, so step 2
+  places nothing for them and step 1's check that each still hashes to
+  the page's id is the whole of their handling; a deleted one must still
+  be absent (the no-follow lookup through its directory handle fails with
+  `ENOENT`) and is removed from the tree and the index rather than set,
+  `git update-index --force-remove -- <path>` in both of step 3's indexes,
+  the form that removes the entry whatever the working tree holds
+  (**measured**: after it the written tree lacked the path, and with the
+  commit on the branch and the prepared index installed, `git status` was
+  clean); what the command changed is placed as step 2 describes.
+
+The browser never composes a declaration or an ids-file line: the identity
+mapping a rename records comes from `pbps_diff::resolve`, which the intent
+command runs and the UI cannot, and a UI that chose the uid itself could
+write an ids file that is internally consistent and records a different
+identity transition than the one asked for — one `validate` accepts, since
+it checks the file's consistency and not what the user meant, and one a
+later `plan` reads as a drop and a create. SPEC §14.3's rule is kept as the
+CLI keeps it: the arguments are the user's decision, typed into the page
+instead of the shell, and `--no-input` declines any question the command
+would have asked, so a case it would ask about is refused and shown, never
+answered by the UI. Reasoned beyond the measurements above: what an intent
+command edits is the CLI's, unchanged here; step 4 of #64 measures the
+snapshot round trip.
 
 The first design was the porcelain `git commit --only -m <message> --
 <paths>`, with the commit read back afterwards and pushed only if it matched
