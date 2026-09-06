@@ -283,18 +283,24 @@ locked-copy `update-index` ran it), so every `git` also takes
    files' metadata with them and a `0644` temporary would leave a `100755`
    path reported modified under `core.fileMode` — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
-   `renamex_np(RENAME_SWAP)` — then hashes the file that came *out*: if
-   it is not the blob the page was shown, an editor saved between step 1's
-   check and the exchange, the two are exchanged back, and the compose is
-   refused with the newer content shown. If it is, the old version is
+   `renamex_np(RENAME_SWAP)` — then hashes the file that came *out* and
+   reads its mode: if the blob is not the one the page was shown, an editor
+   saved between step 1's check and the exchange; if the mode is not the
+   tip entry's, the user changed the executable bit in the working tree,
+   which the blob does not carry and the exchange would have silently
+   reset. In either case the two are exchanged back and the compose is
+   refused with what differs shown. If both match, the old version is
    still not deleted: an editor that opened the file before the exchange
    holds a descriptor to that inode and may write through it after the
    hash, and an unlinked inode would take that save with it. The
    swapped-out file is instead moved under `<git-dir>/pbps-ui/previous/`
-   with the path and the time in its name, kept there until the next
-   compose of the same path, and named on the page beside the commit; a
-   late write lands in a file the user can find, not in one that no
-   longer has a name. Where that directory is on another filesystem and
+   with the path and the time in its name, and named on the page beside
+   the commit; a late write lands in a file the user can find, not in one
+   that no longer has a name. The UI never deletes one of those files: a
+   descriptor can outlive any number of composes, so a file it might still
+   be written through is kept until the user removes it, and the page
+   lists what is there and how to clear it. Where that directory is on
+   another filesystem and
    the move fails, the file stays beside the path under its temporary
    name and the page says so. Step 1's comparison and this write cannot
    be made one operation, so the exchange makes the write reversible
