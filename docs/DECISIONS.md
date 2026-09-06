@@ -3786,3 +3786,46 @@ SPEC is in sync with all of these.
     all. Nothing was asked about it — there is no securable to ask about — and
     "unasked" is not "holds nothing"; `absent_schemas` reports it, and
     inventing a gap there would name a securable no `GRANT` can reach yet.
+236. **A unique index is gated and counted as the constraint it is, and a
+    filtered one only over the rows its predicate keeps — or not at all.**
+    SQL Server enforces a `UNIQUE` constraint *with* a unique index: the two
+    are one object, and which YAML key the uniqueness was written under
+    (`unique:` or `indexes: {…, unique: true}`) cannot decide whether the
+    change faces the gate or is counted. It did: `AddIndex` had no risk class
+    and no probe, so adding `unique: true` over a column holding duplicates
+    planned as a no-risk change and failed at the engine mid-apply — where,
+    under `--staged`, every earlier checkpoint has already committed.
+
+    The filter is the part that is not obvious. A filtered index constrains
+    only the rows its predicate keeps, so counting the others reports
+    collisions the engine exempts and refuses a plan it would have accepted —
+    the "invent a violation" direction, and the worse of the two. But the
+    predicate is arbitrary SQL over the whole row, while the relation
+    `rows_after` builds is a few projected columns unioned with rows that are
+    not in the table yet. It can only be asked of the stored branch, and only
+    where this plan leaves that branch alone: not where the plan writes a row
+    (an update that touches no key column still moves a row in or out of the
+    filtered set), not where it renames a column of the table (the text then
+    names nothing, or — when a second column is renamed into that spelling —
+    silently names the wrong one), not where it adds one (not there to be
+    read), and not where it retypes one. That last is 152's trap on the other
+    side of the query: there `UNION ALL` reconciled the branches by data-type
+    precedence, here it is comparison precedence, and no conversion can help,
+    because the predicate is the user's text over columns this projection
+    never selects. Measured: `flag int` holding `1` twice under
+    `WHERE [flag] = '01'` keeps both rows, so the probe counts a collision and
+    refuses the plan; retype `flag` to `varchar` and the stored values read
+    `'1'`, which the predicate excludes and the engine creates the index over
+    nothing.
+
+    Where any of those hold the probe disappears, which is the answer every
+    other unspellable value gets here (165, 171). It disappears *silently*: a
+    probe that is never built is not among the ones `apply` reports as
+    unchecked, since that count is of probes that ran and could not answer.
+    That is the standing behaviour of every `Ok(Vec::new())` in `preflight`
+    and not a property of this change, so it is not fixed here — see issue
+    #145. The gate is what carries the change either way: the risk class does
+    not depend on whether a count could be taken, so the approval still asks a
+    human. The alternative — counting unfiltered and
+    calling it conservative — is not conservative at all in this direction; it
+    refuses valid plans.

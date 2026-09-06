@@ -642,7 +642,7 @@ exists when prod deploys the rename five versions later.
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX | Data loss |
 | `narrowing` | Type narrowing or an incompatible conversion | Truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
-| `constraint` | Adding UNIQUE / FK / CHECK | Existing rows may not satisfy it |
+| `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
 | `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
@@ -739,7 +739,7 @@ pre-migration checks are hand-written SQL):
 | Risk class | Probe |
 |---|---|
 | `not-null` | Count existing NULLs when tightening a column; for a new required column with no DEFAULT/IDENTITY, count every existing row that lacks a value |
-| `constraint` | Count the rows that violate the new UNIQUE / FK / CHECK |
+| `constraint` | Count the rows that violate the new UNIQUE / FK / CHECK, or collide under the new unique index — over the rows a filtered index keeps, where its predicate can be asked |
 | `narrowing` | Count the values that fail or truncate under conversion |
 | `rename` | The impact queries of 7.4 |
 

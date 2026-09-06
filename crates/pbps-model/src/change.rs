@@ -1724,6 +1724,17 @@ impl Change {
             Change::AddUnique { .. } | Change::AddForeignKey { .. } | Change::AddCheck { .. } => {
                 r.insert(RiskClass::Constraint);
             }
+            // A unique index and a UNIQUE constraint ask the data the same
+            // question, and in SQL Server they *are* the same object: the
+            // engine enforces a UNIQUE constraint with a unique index. Which
+            // YAML key the uniqueness was written under cannot decide whether
+            // the change faces the gate, or adding `unique: true` to an index
+            // over a column that holds duplicates plans as a no-risk change
+            // and the engine refuses it mid-apply — where, under `--staged`,
+            // every earlier checkpoint has already committed.
+            Change::AddIndex { index, .. } if index.unique => {
+                r.insert(RiskClass::Constraint);
+            }
             Change::SetPrimaryKey { to: Some(_), .. } => {
                 r.insert(RiskClass::Constraint);
             }
@@ -1763,6 +1774,9 @@ impl Change {
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
+            // Only the non-unique ones: the arm above has already taken the
+            // unique index, which can fail on the data like any other
+            // uniqueness. A plain index constrains nothing.
             | Change::AddIndex { .. }
             // Neither creating nor re-stating a module risks anything: a failed
             // CREATE OR ALTER rolls back with the plan's transaction and the
@@ -2175,6 +2189,37 @@ mod tests {
             drop.intrinsic_risks(),
             BTreeSet::from([RiskClass::Destructive])
         );
+    }
+
+    /// In SQL Server a `UNIQUE` constraint *is* a unique index — the engine
+    /// creates one to enforce it — so the same object cannot land on opposite
+    /// sides of the gate according to which YAML key it was written under.
+    /// `AddIndex` was in the no-risk arm outright, so `unique: true` over a
+    /// column holding duplicates needed no `--allow constraint`, appeared in
+    /// no reviewer's gated-risk list, and failed at the engine mid-apply.
+    #[test]
+    fn only_a_unique_index_is_gated_like_the_constraint_it_is() {
+        let index = |unique: bool| Change::AddIndex {
+            table: "dbo.customer".parse().unwrap(),
+            name: "ix_customer_email".into(),
+            index: Box::new(crate::schema::Index {
+                columns: vec![crate::schema::IndexColumn {
+                    name: "email".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique,
+                filter: None,
+            }),
+        };
+        assert_eq!(
+            index(true).intrinsic_risks(),
+            BTreeSet::from([RiskClass::Constraint]),
+            "the same class the identical UNIQUE constraint gets"
+        );
+        // The negative case, without which the fix reads as "every index is
+        // risky": a plain index constrains nothing and stays ungated.
+        assert!(index(false).intrinsic_risks().is_empty());
     }
 
     /// A module change is not a table change, and says so: `table()` is for
