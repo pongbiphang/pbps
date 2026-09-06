@@ -11,7 +11,7 @@ use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::{CONNECT_TIMEOUT, DbError, Param};
+use crate::{DbError, Param};
 
 /// One row as this driver hands it back.
 pub struct Row(tiberius::Row);
@@ -48,11 +48,12 @@ impl Conn {
         // over two minutes. Waiting that long for a pipeline to say "I could
         // not reach prod" is a bad way to learn it, so the wait is bounded and
         // the message says which of the two happened.
-        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(source)) => return Err(DbError::Connect { addr, source }),
-            Err(_elapsed) => return Err(DbError::ConnectTimeout { addr }),
-        };
+        // Opened through [`crate::open_socket`], shared with the other driver:
+        // a timeout around `TcpStream::connect(host)` bounds the whole
+        // resolve-and-try-each-address loop, so one black-holed address of a
+        // dual-stack name spent the entire budget and the healthy one was never
+        // tried. The same shape was on both sides of the seam.
+        let tcp = crate::open_socket(&addr).await?;
         tcp.set_nodelay(true).map_err(|source| DbError::Connect {
             addr: config.get_addr().to_owned(),
             source,

@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio_postgres::Config;
 use tokio_postgres::tls::MakeTlsConnect;
 
-use crate::{CONNECT_TIMEOUT, DbError, Param};
+use crate::{DbError, Param};
 
 /// One row as this driver hands it back.
 pub struct Row(tokio_postgres::Row);
@@ -69,11 +69,10 @@ impl Conn {
         // keeps `Connect` and `ConnectTimeout` apart: the driver opens the
         // socket inside its own `connect` and wraps the `io::Error` in its
         // error type, and the seam wants that error by value (ADR-0014 §3).
-        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(source)) => return Err(DbError::Connect { addr, source }),
-            Err(_elapsed) => return Err(DbError::ConnectTimeout { addr }),
-        };
+        // How it is opened is [`crate::open_socket`]'s, shared with the other
+        // driver: every address the name resolves to gets a chance inside the
+        // one budget.
+        let tcp = crate::open_socket(&addr).await?;
         tcp.set_nodelay(true)
             .map_err(|source| DbError::Connect { addr, source })?;
 
@@ -290,7 +289,20 @@ fn endpoint(config: &Config) -> Result<(String, u16), DbError> {
             )));
         }
     };
-    let port = config.get_ports().first().copied().unwrap_or(5432);
+    // The driver's own path refuses a port list that does not line up with the
+    // host list, so taking the first of several would turn a string it calls
+    // malformed into a connection to whichever one came first.
+    let ports = config.get_ports();
+    if ports.len() > 1 {
+        return Err(DbError::BadConnectionString(format!(
+            "this connection string names one host and {} ports. The driver \
+             refuses that, because a port list has to line up with a host list, \
+             and taking the first would connect somewhere the string did not \
+             unambiguously name.",
+            ports.len()
+        )));
+    }
+    let port = ports.first().copied().unwrap_or(5432);
     Ok((name, port))
 }
 
@@ -456,6 +468,10 @@ mod tests {
             "host=/var/run/postgresql user=u",
             "hostaddr=10.0.0.5 host=db.example user=u",
             "host=first.example,second.example user=u",
+            // One host and two ports: the driver's own path calls this
+            // malformed, so taking the first would turn a string it refuses
+            // into a connection to whichever port came first.
+            "host=db.example port=5432,6432 user=u",
         ] {
             let error = endpoint_of(connection).expect_err(connection);
             assert!(

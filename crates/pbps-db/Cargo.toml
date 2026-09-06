@@ -27,5 +27,10 @@ tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 
+# The socket opener's tests need a runtime: they build a black hole out of a
+# listening socket and time the attempts against it.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true

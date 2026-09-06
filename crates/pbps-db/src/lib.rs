@@ -127,6 +127,111 @@ impl DbError {
 /// run.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Opens a TCP socket to `addr`, bounded by [`CONNECT_TIMEOUT`], giving every
+/// address the name resolves to a chance inside that budget.
+///
+/// One place, used by both drivers, because "there is a network" is this
+/// crate's and neither driver's — and because the bug this shape had was the
+/// same on both sides of the seam.
+///
+/// `tokio::net::TcpStream::connect(host)` resolves the name and tries the
+/// addresses **in turn**, returning the last error; a timeout wrapped around it
+/// bounds the *whole loop*. So one address that drops packets spends the entire
+/// budget and a healthy second address is never tried, and a dual-stack
+/// endpoint whose IPv6 address is black-holed is reported unreachable while it
+/// is reachable. Refusing work against a server that is up is the failure this
+/// project puts first.
+///
+/// The budget is divided as it is spent — each attempt gets what is left,
+/// divided by how many addresses are left — so the total is still
+/// [`CONNECT_TIMEOUT`] however many addresses there are, an address that
+/// refuses at once hands its share to the rest, and the last one gets whatever
+/// remains. Fixed shares would have made a slow-but-answering server fail
+/// behind a dead one.
+pub(crate) async fn open_socket(addr: &str) -> Result<tokio::net::TcpStream, DbError> {
+    let started = tokio::time::Instant::now();
+
+    // Resolution is inside the budget too: a DNS server that does not answer is
+    // one of the ways an endpoint fails to be reachable.
+    let addresses: Vec<std::net::SocketAddr> =
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(addr)).await {
+            Ok(Ok(found)) => found.collect(),
+            Ok(Err(source)) => {
+                return Err(DbError::Connect {
+                    addr: addr.to_owned(),
+                    source,
+                });
+            }
+            Err(_elapsed) => {
+                return Err(DbError::ConnectTimeout {
+                    addr: addr.to_owned(),
+                });
+            }
+        };
+    // A name that resolves to nothing is not a name that refused: it has to say
+    // which of the two happened, or the reader goes and looks at the firewall.
+    if addresses.is_empty() {
+        return Err(DbError::Connect {
+            addr: addr.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the name resolved to no address",
+            ),
+        });
+    }
+    let left = CONNECT_TIMEOUT
+        .checked_sub(started.elapsed())
+        .unwrap_or_default();
+    connect_any(addr, addresses, left).await
+}
+
+/// Tries each address in turn inside one budget, and says which way it failed.
+///
+/// The budget is divided as it is spent — each attempt gets what is left,
+/// divided by how many addresses are left — so the total is what the caller
+/// gave however many addresses there are, an address that refuses at once hands
+/// its share to the rest, and the last one gets whatever remains. Fixed shares
+/// would make a slow-but-answering server fail behind a dead one.
+///
+/// Split out from [`open_socket`] so that a test can choose the order and the
+/// budget: resolution order is the operating system's, and a test that depends
+/// on it passes or fails by luck.
+async fn connect_any(
+    addr: &str,
+    addresses: Vec<std::net::SocketAddr>,
+    budget: std::time::Duration,
+) -> Result<tokio::net::TcpStream, DbError> {
+    let started = tokio::time::Instant::now();
+    let mut remaining = addresses.len();
+    let mut last: Option<std::io::Error> = None;
+    for address in addresses {
+        let Some(left) = budget.checked_sub(started.elapsed()) else {
+            break;
+        };
+        let share = left / u32::try_from(remaining).unwrap_or(u32::MAX);
+        remaining -= 1;
+        match tokio::time::timeout(share, tokio::net::TcpStream::connect(address)).await {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(source)) => last = Some(source),
+            // Out of time for *this* address, not for the endpoint: the next
+            // one may answer at once.
+            Err(_elapsed) => {}
+        }
+    }
+    // A refusal from some address outranks the clock: it is the more specific
+    // answer, and the one whose fix the reader can act on. Only when no address
+    // ever answered at all is this the dropped-packets case.
+    match last {
+        Some(source) => Err(DbError::Connect {
+            addr: addr.to_owned(),
+            source,
+        }),
+        None => Err(DbError::ConnectTimeout {
+            addr: addr.to_owned(),
+        }),
+    }
+}
+
 /// One row of a result set, from whichever driver produced it.
 pub enum Row {
     Mssql(mssql::Row),
@@ -472,5 +577,120 @@ mod tests {
         let empty = Param::from("");
         assert!(matches!(absent, Param::OptStr(None)));
         assert!(matches!(empty, Param::Str("")));
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A socket that accepts nothing and whose accept queue is full, so the
+    /// kernel drops every further SYN — the same black hole the PostgreSQL live
+    /// suite builds, and for the same reason: a reserved address is not one, it
+    /// drops the first SYN of a run and answers `EHOSTUNREACH` for the rest.
+    ///
+    /// Linux-only, because this is Linux's overflow behaviour with
+    /// `tcp_abort_on_overflow` at its default of 0. Windows sends an RST, which
+    /// is the *refused* category, so these tests are absent there rather than
+    /// asserting something the platform does not do.
+    /// The listener is handed back with the queued connections: dropping it
+    /// closes the port, and a closed port **refuses** instead of dropping. An
+    /// earlier version of this helper let it fall out of scope, and the test
+    /// that should have proved the black hole passed because the address
+    /// refused quickly — a test passing for the wrong reason, caught by its
+    /// sibling asserting the other category.
+    #[cfg(target_os = "linux")]
+    async fn black_hole() -> (
+        SocketAddr,
+        tokio::net::TcpListener,
+        Vec<tokio::net::TcpStream>,
+    ) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("bind");
+        let listener = socket.listen(1).expect("listen");
+        let addr = listener.local_addr().expect("the bound address");
+        let mut queued = Vec::new();
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => queued.push(stream),
+                Ok(Err(e)) => panic!("the loopback refused a connection: {e}"),
+                Err(_) => break,
+            }
+        }
+        assert!(!queued.is_empty(), "the queue was never filled");
+        (addr, listener, queued)
+    }
+
+    /// An address that drops packets must not spend the whole budget: a name
+    /// that resolves to several addresses is dual-stack far more often than it
+    /// is broken, and reporting a reachable endpoint unreachable is refusing
+    /// work against a server that is up.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_later_address_is_tried_when_an_earlier_one_drops_packets() {
+        let (dead, _listener, _queued) = black_hole().await;
+        let alive = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let good = alive.local_addr().expect("the bound address");
+
+        let socket = connect_any("name:0", vec![dead, good], Duration::from_millis(600))
+            .await
+            .expect("the healthy address answers");
+        assert_eq!(socket.peer_addr().expect("a peer"), good);
+    }
+
+    /// And when nothing answers, the two ways of not answering stay two. A
+    /// refusal is the more specific report and outranks the clock; only when no
+    /// address ever answered is it the dropped-packets case.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_refusal_outranks_the_clock_and_only_silence_is_a_timeout() {
+        let (dead, _listener, _queued) = black_hole().await;
+        // Bound and dropped: nothing is listening, so the port refuses.
+        let refused: SocketAddr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a listener");
+            listener.local_addr().expect("the bound address")
+        };
+
+        let error = connect_any("name:0", vec![dead, refused], Duration::from_millis(600))
+            .await
+            .expect_err("neither address answers");
+        assert!(matches!(error, DbError::Connect { .. }), "{error:?}");
+
+        // Three of them, and the budget is the budget: it is divided as it is
+        // spent, so the whole attempt is bounded however many addresses there
+        // are. A full budget per address would take three times as long, and
+        // `CONNECT_TIMEOUT` would stop meaning what it says.
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let error = connect_any("name:0", vec![dead, dead, dead], budget)
+            .await
+            .expect_err("no address answers");
+        assert!(matches!(error, DbError::ConnectTimeout { .. }), "{error:?}");
+        let waited = started.elapsed();
+        assert!(waited < budget * 2, "the budget was not shared: {waited:?}");
+    }
+
+    /// A name that resolves to nothing is not a name that refused, and neither
+    /// is one that resolves to something unreachable.
+    #[tokio::test]
+    async fn a_name_that_resolves_to_no_address_says_so() {
+        let error = connect_any("name:0", Vec::new(), Duration::from_millis(50))
+            .await
+            .expect_err("there is nothing to connect to");
+        assert!(matches!(error, DbError::ConnectTimeout { .. }), "{error:?}");
     }
 }

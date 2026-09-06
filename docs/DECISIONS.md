@@ -3607,3 +3607,38 @@ SPEC is in sync with all of these.
     by nothing here. Left there rather than fixed with this one, because
     honouring them needs a new dependency and refusing them refuses strings that
     work — a choice, not a bug fix.
+    work — a choice, not a bug fix.
+
+232. **Opening the socket is one function, shared by both drivers, and it gives
+    every resolved address a chance inside one budget.** `TcpStream::connect(host)`
+    resolves the name and tries the addresses **in turn**, returning the last
+    error, so a timeout wrapped around it bounds the *whole loop*: one address
+    that drops packets spends the entire budget and a healthy second address is
+    never tried. A dual-stack endpoint whose IPv6 address is black-holed is the
+    ordinary case of that, and reporting a server that is up as unreachable
+    refuses work — the failure this project's review rules put first.
+
+    `open_socket` resolves first and tries each address itself. The budget is
+    divided as it is spent — each attempt gets what is left over how many
+    addresses are left — so the total is still `CONNECT_TIMEOUT` however many
+    there are, an address that refuses at once hands its share to the rest, and
+    the last one gets the remainder. Fixed shares would make a slow-but-
+    answering server fail behind a dead one, and a full budget each would make
+    `CONNECT_TIMEOUT` mean *N* times what it says.
+
+    A refusal from some address outranks the clock. `Connect` names something
+    with a fix the reader can act on, and only when no address answered at all
+    is this the dropped-packets case that `ConnectTimeout` describes.
+
+    In `pbps-db` itself rather than in either driver, because "there is a
+    network" is this crate's (ARCHITECTURE) — and because the defect was on both
+    sides of the seam. `pbps-db::mssql` had the same line, and fixing only the
+    engine under review is how a shape becomes a second finding.
+
+    The tests build the black hole out of a listening socket whose accept queue
+    is full, and take the address list and the budget as parameters: resolution
+    order is the operating system's, and a test that depends on it passes or
+    fails by luck. What is *not* pinned by a failing test is the resolution half
+    on its own — a hostname resolving to two addresses this test controls is not
+    portable (`localhost` is one address on some machines and two on others), so
+    the loop is pinned and the resolving is read.
