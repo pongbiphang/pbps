@@ -279,11 +279,25 @@ locked-copy `update-index` ran it), so every `git` also takes
    is overwritten, only swapped, and what was swapped out is inspected
    before it is let go (**measured**: the exchange put the UI's bytes at
    the path and the page's bytes in the swapped-out file, with the
-   page's bytes intact to be compared). A platform without an exchange
-   gets a plain rename, and the ADR says so here rather than pretend: the
-   window between the hash and the rename exists there, and step 3 of #64
-   names which platforms have the exchange. Each file is then stored as a
-   blob exactly as written: `git hash-object -w --no-filters -- <path>`.
+   page's bytes intact to be compared). A path that is absent — a new
+   declaration — has nothing to exchange with and is placed with `link()`,
+   which creates the name only if it does not exist and refuses with
+   `EEXIST` if something made it first (**measured**: the link landed the
+   complete file under the new name, and a second `link()` onto a name an
+   editor had meanwhile created was refused), so a file that appeared in
+   the window is never replaced. On Windows, which has no exchange, the
+   existing file is opened denying every other writer and deleter
+   (`FILE_SHARE_READ` alone), hashed through that handle, and — if it is
+   still the page's version — rewritten through the same handle, so that a
+   save cannot land between the check and the write because the editor
+   cannot open the file for writing until the handle closes; a new file is
+   created with `CREATE_NEW`, which fails if the name exists. That
+   in-place write is not crash-atomic, which is a different property from
+   the one at stake here, and step 3 of #64 measures it, since nothing on
+   Windows has been measured for this ADR. A platform with none of these
+   refuses to compose rather than overwrite a file it cannot prove is the
+   one the page saw. Each file is then stored as a blob exactly as written:
+   `git hash-object -w --no-filters -- <path>`.
    Without the flag
    `hash-object` runs the path's `clean` filter like `git add` does — a
    program from `.gitattributes` and the configuration that neither
