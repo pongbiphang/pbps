@@ -3807,12 +3807,25 @@ SPEC is in sync with all of these.
     (an update that touches no key column still moves a row in or out of the
     filtered set), not where it renames a column of the table (the text then
     names nothing, or — when a second column is renamed into that spelling —
-    silently names the wrong one), and not where it adds one (not there to be
-    read).
+    silently names the wrong one), not where it adds one (not there to be
+    read), and not where it retypes one. That last is 152's trap on the other
+    side of the query: there `UNION ALL` reconciled the branches by data-type
+    precedence, here it is comparison precedence, and no conversion can help,
+    because the predicate is the user's text over columns this projection
+    never selects. Measured: `flag int` holding `1` twice under
+    `WHERE [flag] = '01'` keeps both rows, so the probe counts a collision and
+    refuses the plan; retype `flag` to `varchar` and the stored values read
+    `'1'`, which the predicate excludes and the engine creates the index over
+    nothing.
 
-    Where any of those hold the probe disappears and the change is reported
-    unchecked, which is the answer every other unspellable value gets here
-    (165, 171). The gate still stands: the risk class does not depend on
-    whether a count could be taken, so a reviewer sees the change either way.
-    The alternative — counting unfiltered and calling it conservative — is not
-    conservative at all in this direction; it refuses valid plans.
+    Where any of those hold the probe disappears, which is the answer every
+    other unspellable value gets here (165, 171). It disappears *silently*: a
+    probe that is never built is not among the ones `apply` reports as
+    unchecked, since that count is of probes that ran and could not answer.
+    That is the standing behaviour of every `Ok(Vec::new())` in `preflight`
+    and not a property of this change, so it is not fixed here — see issue
+    #145. The gate is what carries the change either way: the risk class does
+    not depend on whether a count could be taken, so the approval still asks a
+    human. The alternative — counting unfiltered and
+    calling it conservative — is not conservative at all in this direction; it
+    refuses valid plans.

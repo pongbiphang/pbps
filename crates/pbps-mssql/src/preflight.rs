@@ -1379,7 +1379,8 @@ enum Applies<'a> {
 /// predicate is arbitrary SQL over the whole row, and this relation is a
 /// projection of a few columns unioned with rows that are not in the table
 /// yet, so it can only be asked of the stored branch and only where this plan
-/// leaves that branch's rows and column names alone. Where it cannot be asked,
+/// leaves that branch's rows, column names and column types alone. Where it
+/// cannot be asked,
 /// the answer is `None` — no probe — and never the unfiltered count, which
 /// counts duplicates among the very rows the index exempts and refuses a plan
 /// the engine would have accepted (DECISIONS 236).
@@ -1395,19 +1396,37 @@ fn rows_after(
         Applies::AllRows => None,
         Applies::Where(predicate) => {
             // The predicate reads columns this projection does not carry, so
-            // it can only run against the stored table. Three things put a row
-            // beyond it, and each is the "invent a violation" direction if
-            // guessed: a row the plan *writes*, whose membership of the
+            // it can only run against the stored table. Four things put a row
+            // beyond it: a row the plan *writes*, whose membership of the
             // filtered set is decided by values no `WHERE` here can see — an
             // update that touches no key column still moves a row in or out; a
             // column of this table the plan *renames*, after which the
             // predicate's text either names nothing (`Msg 207`, reported
             // unchecked) or, when the plan also renames a second column into
-            // that spelling, silently names the wrong one; and a column the
-            // plan *adds*, which is not there for the predicate to read.
+            // that spelling, silently names the wrong one; a column the plan
+            // *adds*, which is not there for the predicate to read; and a
+            // column of this table whose *type* this plan changes, because the
+            // predicate's own literals are coerced to the type the column has
+            // when the query runs, not the one it will have when the index is
+            // created.
+            //
+            // That last one is DECISIONS 152's trap on the other side of the
+            // query. `projected` converts the key columns because `UNION ALL`
+            // reconciles by data-type precedence; here it is comparison
+            // precedence, and no conversion can help — the predicate is the
+            // user's text over columns this projection never selects.
+            // Measured: `flag int` holding `1` twice under
+            // `WHERE [flag] = '01'` keeps both rows, so the probe counts a
+            // collision and refuses the plan; retype `flag` to `varchar` and
+            // the stored values read `'1'`, which the predicate excludes and
+            // the engine creates the index over nothing. Refusing a plan the
+            // engine accepts is the worse direction (PITFALLS #5), and it is
+            // symmetric — `<>` in place of `=` misses a collision instead — so
+            // the answer is the same as for the other three: no probe.
             if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
                 || names.columns.keys().any(|c| c.table == *table)
                 || names.added.keys().any(|c| c.table == *table)
+                || names.types.keys().any(|c| c.table == *table)
             {
                 return Ok(None);
             }
@@ -2546,8 +2565,51 @@ mod tests {
             0
         );
 
-        // An unfiltered index over the very same plan is still probed: what
-        // was refused is the predicate, not the counting.
+        // A column of this table retyped by the same plan. The predicate's
+        // own literals are coerced to the type the column has when the *probe*
+        // runs, and `AddIndex` runs after `AlterColumnType`: measured, two
+        // rows holding `flag` = `1` under `WHERE [flag] = '01'` are kept
+        // (`1 = 1`) and counted as a collision, while the engine, over the
+        // retyped `varchar` column, reads `'1' = '01'` and creates the index
+        // over nothing. Refusing a plan the engine accepts is the direction
+        // this whole probe exists to avoid.
+        let retype = Change::AlterColumnType {
+            uid: uid("c_bbbbbb"),
+            column: cref("dbo.customer.flag"),
+            from: ty("int"),
+            to: ty("varchar(2)"),
+            from_nullable: true,
+            to_nullable: true,
+        };
+        assert_eq!(
+            probed(vec![
+                retype.clone(),
+                index(&["email"], true, Some("[flag] = '01'")),
+            ]),
+            0
+        );
+
+        // The negative case that keeps the guard from generalising one step
+        // too far (PITFALLS #4): a retype elsewhere in the plan says nothing
+        // about *this* table's predicate, and must not cost the count.
+        assert_eq!(
+            probed(vec![
+                Change::AlterColumnType {
+                    uid: uid("c_cccccc"),
+                    column: cref("dbo.orders.flag"),
+                    from: ty("int"),
+                    to: ty("varchar(2)"),
+                    from_nullable: true,
+                    to_nullable: true,
+                },
+                index(&["email"], true, Some("[flag] = '01'")),
+            ]),
+            1
+        );
+
+        // An unfiltered index over the very same plans is still probed: what
+        // was refused is the predicate, not the counting. `projected` converts
+        // the key columns, so a retype is no obstacle there.
         assert_eq!(
             probed(vec![
                 Change::RenameColumn {
@@ -2560,6 +2622,7 @@ mod tests {
             ]),
             1
         );
+        assert_eq!(probed(vec![retype, index(&["email"], true, None)]), 1);
     }
 
     /// `order_key` runs every row change (9, 10) before every constraint
