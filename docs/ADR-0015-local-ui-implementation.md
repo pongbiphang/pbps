@@ -188,10 +188,17 @@ result; **measured**: against a declaration that still held the old name,
 `pbps rename` exited 2 with "this intent matches nothing"). So the working
 tree is where the intent is, and the compose is the CLI user's own last
 step made in the CLI user's own order: the page lists the project's
-modified declaration files (`git status --porcelain -z -- <project>`) with
+modified declaration files (`git status --porcelain -z
+--untracked-files=all -- <project>`, the flag because
+`status.showUntrackedFiles=no` in the user's configuration would otherwise
+hide the new side of a file-based rename — **measured**: under it the
+listing held the deleted old path alone, and with the flag both) with
 the blob id of each as read, the UI writes a snapshot of the recorded tip
-the way step 3 below writes one (`git ls-tree -r -z <tip>` and `git
-cat-file --batch`, regular-file entries only, under
+the way step 3 below writes one (`git ls-tree -r -z <tip> -- <project>`
+and `git cat-file --batch`, the project's subtree only — a monorepo's
+other gigabytes are not the project's inputs, and `ls-tree` scoped by
+path still names each entry from the worktree root (**measured**) —
+regular-file entries only, under
 `<git-dir>/pbps-ui/intent/<random>/`, under the path rules step 3 states),
 lays the working tree's version of each listed file over it from bytes
 read through the file's handle whose hash is the id the page carries —
@@ -199,7 +206,20 @@ and *removes* from it each listed file the working tree no longer has, a
 `D` in that listing, because a table or a role is dropped or renamed by
 deleting or renaming its declaration file, and a snapshot that still held
 the old file would give the command nothing that disappeared to resolve
-— and runs the CLI's own intent command there — `pbps rename <from> <to>
+— then asks the CLI where that snapshot's project keeps its inputs — `pbps
+doctor --format json --no-input --project <snapshot project>`, whose
+envelope carries `declarations` and `identity_file` as the CLI resolved
+them (**measured**: with an absolute `schema_dir` in `pbps.yml`, both came
+back absolute and outside the project) — and refuses the compose unless
+both lie under the snapshot's project directory, since
+`Project::schema_dir` and `Project::ids_file` join the configured path to
+the root and a configured absolute path discards the root: an intent
+command pointed at the snapshot would otherwise read the live declarations
+and write the live ids file before any of the protocol below had begun,
+and `validate` in step 3 would check live bytes instead of the tree; a
+project whose inputs lie outside its directory is one this UI does not
+compose for, and the Limits section says so. Then it runs the CLI's own
+intent command there — `pbps rename <from> <to>
 --no-input --project <that directory>/<the project's path>` and its
 siblings, with no `--format`, which the intent commands do not take
 (**measured**: `rename --format json` exited 2 with `unexpected argument
@@ -586,7 +606,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    read here. That tree is what the commit will hold, so it is what `pbps
    validate` is run on: the UI writes it out under
    `<git-dir>/pbps-ui/validate/<random>/` itself, from `git ls-tree -r -z
-   <tree>` and `git cat-file --batch`, regular-file entries only, and runs
+   <tree> -- <project>` and `git cat-file --batch`, the project's subtree
+   and regular-file entries only, and runs
    `pbps validate --format json --no-input --project <that
    directory>/<the project's path in the worktree>`, as decision 1 runs
    every command; a failing envelope rolls step 2 back and shows its
@@ -785,7 +806,24 @@ on refusal, the destination named after a push, the commands offered for
 the shell — is shown with its userinfo removed, everything between the
 scheme's `//` and an `@`, and every line of `git` output relayed to the
 page passes through the same removal, in case a helper is less careful
-than the transport. Before composing,
+than the transport. One more thing can move the destination after the
+URL is chosen: a `url.<base>.insteadOf` rule rewrites a URL for every
+command and a `url.<base>.pushInsteadOf` rule for pushes, `git remote
+get-url --push` has applied one round of them already, and the
+environment-only remote's URL is rewritten *again* on use by any rule
+whose value is a prefix of it (**measured**: with `pushInsteadOf` rules
+chaining `src` to `mid` and `mid` to `fin`, `get-url --push` answered
+`mid`, `ls-remote` of the environment-only remote spoke to `mid`, and its
+push published to `fin`; an `insteadOf` rule for `mid` then sent
+`ls-remote` to `fin` as well). So the UI lists every rule — `git config
+--get-regexp '^url\..*\.(push)?insteadof$'` — and refuses the compose,
+naming the rule, if any rule's value is a prefix of the chosen URL: the
+URL the checks spoke to and the URL the push goes to must be one string,
+and a rule that would rewrite it makes them two. The check reads the
+configuration rather than asking `git` about the environment-only
+remote, because `git remote get-url` does not see a remote that exists
+only in the environment (**measured**: `No such remote`) while
+`ls-remote` and `push` do. Before composing,
 the UI reads the remote's tip for the branch (`git ls-remote <name>
 refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
 showing the unpushed commits and the commands instead: a refspec bounds the
@@ -941,6 +979,13 @@ What this ADR reasons about and has not measured, in the order the steps of
 - **What the page needs from `apply`.** The Placement section names two
   answers; step 2 picks one after listing what the page actually renders after
   an apply.
+- **A project whose declarations or ids file lie outside its directory.**
+  Decision 5 snapshots the project's subtree and asks `doctor` where the
+  inputs are; a `schema_dir` or `ids_file` that resolves outside the
+  directory holding `pbps.yml` is refused with the paths shown, and the
+  shell's commands work as before. Composing for such a layout needs the
+  snapshot to follow the paths, which is a decision for when someone has
+  one.
 - **The `git` binary's presence on the machines the UI targets.** Decision 5
   assumes the DBA who will not run five commands still has `git` installed,
   because the checkout they are looking at came from somewhere. A machine
