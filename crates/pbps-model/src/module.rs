@@ -424,8 +424,8 @@ pub struct Hints {
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
     let haystack = scannable(definition);
-    let schema = name.schema.to_ascii_lowercase();
-    let object = name.name.to_ascii_lowercase();
+    let schema = folded(&name.schema);
+    let object = folded(&name.name);
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
@@ -596,10 +596,48 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     out
 }
 
+/// Case-folded for the dependency scan: simple lower-case, one character in
+/// and one character out.
+///
+/// # Why not `to_ascii_lowercase`
+///
+/// SQL Server folds the whole alphabet, not the ASCII part of it. Measured on
+/// SQL Server 2022 under `SQL_Latin1_General_CP1_CI_AS`, `Latin1_General_CI_AS`
+/// and `Latin1_General_100_CI_AS_SC` alike -- and by creating each object and
+/// selecting from the other spelling, which resolved exactly where the
+/// comparison said it would -- `CAFÉ` and `café` are one table, and so are `Σ`
+/// and `σ`. An ASCII fold left the accented halves untouched, so the scan found
+/// no edge and `creation_order` was free to put a view before the table it
+/// reads (DECISIONS 240).
+///
+/// # Why not `str::to_lowercase`
+///
+/// Full lower-casing is allowed to return more characters than it was given,
+/// and the two that matter here are the two that do. `İ` (U+0130) becomes `i`
+/// plus a combining dot, which the engine does *not* read as `i` -- measured
+/// `ne`, and the object did not resolve. Worse than the wrong answer is where
+/// it lands: the combining mark is not an identifier character, so
+/// `contains_word` sees a word boundary inside what was one letter and reports
+/// a match for the bare needle `i`. Folding character by character keeps `İ`
+/// whole and keeps the scan's boundaries where the text put them.
+fn folded(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(one), None) => one,
+                // Two or more: this is one of the expanding mappings, and the
+                // character stands as it is rather than become two.
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
 fn scannable(definition: &str) -> String {
-    let lowered = code_only(definition).to_ascii_lowercase();
+    let lowered = folded(&code_only(definition));
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
@@ -1296,6 +1334,94 @@ mod tests {
             "SELECT * FROM \"dbo\".\"active_customer\"",
             &target
         ));
+    }
+
+    /// Measured on SQL Server 2022: under the server's own
+    /// `SQL_Latin1_General_CP1_CI_AS`, and under `Latin1_General_CI_AS` and
+    /// `Latin1_General_100_CI_AS_SC`, each of these pairs compares equal — and
+    /// creating the object under one spelling and selecting it under the other
+    /// resolved. The scan folded ASCII only, so it saw two names where the
+    /// engine sees one, found no edge, and let `creation_order` put a view
+    /// before the table it reads.
+    #[test]
+    fn a_case_the_engine_folds_beyond_ascii_is_one_name_to_the_scan() {
+        for (what, declared, written) in [
+            ("E acute", "dbo.caf\u{e9}", "dbo.CAF\u{c9}"),
+            ("sigma", "dbo.\u{3c3}um", "dbo.\u{3a3}UM"),
+            ("Cyrillic de", "dbo.\u{434}om", "dbo.\u{414}OM"),
+            ("fullwidth a", "dbo.\u{ff41}b", "dbo.\u{ff21}B"),
+            ("angstrom", "dbo.\u{e5}r", "dbo.\u{212b}R"),
+        ] {
+            let target: ObjectName = declared.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {written}"), &target),
+                "{what}: the engine reads {written} and {declared} as one name"
+            );
+            // And the other way round, because either side may be the one
+            // written in upper case.
+            let target: ObjectName = written.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {declared}"), &target),
+                "{what}: the fold has to be symmetric"
+            );
+        }
+    }
+
+    /// The other direction of the same measurement, and the reason the fold is
+    /// character for character rather than `str::to_lowercase`.
+    ///
+    /// `İ` (U+0130) is not `i` to the engine — measured unequal under all three
+    /// collations, and the object did not resolve. Full lower-casing returns
+    /// `i` *plus a combining dot* for it, and the combining dot is not an
+    /// identifier character: `contains_word` would find its boundary in the
+    /// middle of what was one letter and report a reference to `dbo.i` that
+    /// the engine does not have. A fold that returns one character per
+    /// character cannot do that, whatever the character folds to.
+    #[test]
+    fn an_expanding_fold_does_not_invent_a_reference() {
+        assert_eq!(folded("\u{130}"), "\u{130}", "one character in, one out");
+        assert_eq!(folded("CAF\u{c9}"), "caf\u{e9}");
+        assert_eq!(folded("Ab_1"), "ab_1", "ASCII is unchanged");
+
+        let target: ObjectName = "dbo.i".parse().unwrap();
+        assert!(
+            !references("SELECT * FROM dbo.\u{130}", &target),
+            "U+0130 is not `i` on the engine"
+        );
+        assert!(references("SELECT * FROM dbo.I", &target), "but `I` is");
+
+        // The dotless `ı` is the same measurement mirrored: `I` folds to `i`,
+        // and U+0131 is a third letter that neither of them reaches.
+        let target: ObjectName = "dbo.\u{131}".parse().unwrap();
+        assert!(!references("SELECT * FROM dbo.I", &target));
+        assert!(references("SELECT * FROM dbo.\u{131}", &target));
+    }
+
+    /// Where the fold is knowingly wider than the engine's, pinned so the next
+    /// reader sees the price rather than rediscovers it.
+    ///
+    /// Measured unequal on the engine, and equal after a simple lower-case:
+    /// the Kelvin sign, the Ohm sign, and capital sharp s. Two modules whose
+    /// names differ only by one of these would get an edge the engine does not
+    /// justify — and a pair of them, an ordering cycle, which `creation_order`
+    /// then emits in name order. No fold short of the collation itself gets
+    /// this right: the engine folds U+212B to `å` and does *not* fold U+212A to
+    /// `k`, which is not a rule anything outside the collation can follow
+    /// (DECISIONS 240). `depends_on:` is the escape hatch, as it is for every
+    /// other case this scan reads wrong.
+    #[test]
+    fn the_fold_is_wider_than_the_engines_in_three_measured_places() {
+        for (what, declared, written) in [
+            ("Kelvin sign", "dbo.ktbl", "dbo.\u{212a}tbl"),
+            ("Ohm sign", "dbo.\u{3c9}tbl", "dbo.\u{2126}tbl"),
+            ("capital sharp s", "dbo.\u{df}tbl", "dbo.\u{1e9e}tbl"),
+        ] {
+            let target: ObjectName = declared.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {written}"), &target),
+                "{what}: the scan folds this and the engine does not"
+            );
+        }
     }
 
     /// The engine ends a `--` comment at a bare carriage return, so a scan

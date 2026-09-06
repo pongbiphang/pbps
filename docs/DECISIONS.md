@@ -4111,3 +4111,38 @@ SPEC is in sync with all of these.
     at the boundary — the largest value the source holds, and a value the target
     cannot represent — put through a real server, with `Safe` asserted as *the
     statement runs and the value does not change*.
+
+
+240. **The dependency scan folds case for the whole alphabet, character for
+    character, and is knowingly wider than the collation in three places.**
+    `references` lower-cased both sides with `to_ascii_lowercase`. The two
+    sides agreed with each other, so ASCII names were right; they did not
+    agree with SQL Server, whose collations fold the rest of the alphabet too.
+    Measured on SQL Server 2022 under `SQL_Latin1_General_CP1_CI_AS`,
+    `Latin1_General_CI_AS` and `Latin1_General_100_CI_AS_SC` alike, and
+    confirmed by creating each object under one spelling and selecting it
+    under the other: `CAFÉ` and `café` are one table, and so are `Σum` and
+    `σum`. The ASCII fold saw two names, found no edge, and let
+    `creation_order` place a view before the table it reads — the failure of
+    239 from another cause.
+
+    The fold is `char`-by-`char` simple lower-casing rather than
+    `str::to_lowercase` because full lower-casing may return more characters
+    than it was given. `İ` (U+0130) becomes `i` plus a combining dot, and the
+    engine does not read that as `i` — measured unequal, and the object did
+    not resolve. The combining dot is not an identifier character, so
+    `contains_word` finds a word boundary in the middle of what was one
+    letter: with `to_lowercase`, `SELECT * FROM dbo.İ` is a reference to
+    `dbo.i`, measured and pinned. One character in and one character out is
+    also what a collation does, which is the comparison being approximated.
+
+    Three measured cases go the other way, and are accepted rather than
+    special-cased: the engine folds neither the Kelvin sign to `k`, nor the
+    Ohm sign to `ω`, nor capital sharp s to `ß`, and a simple lower-case folds
+    all three. It does fold U+212B to `å`, which is the same class of
+    character and the opposite answer — there is no rule short of the
+    collation itself that gets all four right, and the model does not carry a
+    collation (§8.2). The price is an edge the engine does not justify between
+    two modules whose names differ only by one of those characters, and a
+    cycle if there are two such pairs; `depends_on:` is the escape hatch, as
+    it is everywhere else this scan reads wrong.
