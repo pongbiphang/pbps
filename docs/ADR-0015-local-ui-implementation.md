@@ -818,18 +818,32 @@ the path, and deleting the lock left it reporting the same). The gap
 cannot be closed — a ref and an index are two files — so it is made
 recoverable instead. Before step 5 the UI writes
 `<git-dir>/pbps-ui/composing/<random>.json` and flushes it and its
-directory: the branch, the tip it leased, the commit's id, the hash of
-the prepared `<index>.lock` as it stands, and, for every edited path,
+directory: its own id, the branch, the tip it leased, the commit's id,
+the hash of the prepared `<index>.lock` as it stands, and, for every
+edited path,
 the entry step 3 recorded and the temporary name beside it — the name a
 `link()` was made from, or the one the exchange put the old file under —
 so that the record names every file the compose still has to account for.
 Step 6 removes the record, last, after the rename and after the cleanup
 below.
 
+Every lock the UI creates carries the record's id as its content, written
+before the lock is relied on, which is what makes a lock reclaimable
+after a crash: `git` refuses a lock file whatever is inside it
+(**measured**: with `HEAD.lock` and a branch's lock holding a line of
+text, `symbolic-ref` and `update-ref` both failed with `File exists`,
+while reading the ref still worked), so the content is free for the UI to
+use and is the only way to tell its own leftover lock from a lock another
+`git` is holding right now.
+
 At launch, and before it offers to compose, the UI reads every record it
-finds and acts only where the evidence is unambiguous. It takes the same
-locks in the same order as a compose — `<index>.lock` is already the
-record's, so it takes `HEAD`'s and the branch's — and requires all of
+finds and acts only where the evidence is unambiguous. The locks a crash
+left behind are still on disk, so it does not create them again: it reads
+`HEAD.lock` and the branch's lock and continues only where each is either
+absent, and can be created, or already holds this record's id, in which
+case it is the record's own and is used as it stands and removed with the
+others at the end; a lock holding anything else belongs to a running
+`git`, and the UI reports and changes nothing. Then it requires all of
 what step 5 required after its own `update-ref`: that `HEAD` is still
 symbolic to the record's branch, that the branch is still a direct ref
 and not a symbolic one, and that it still names the record's commit.
@@ -837,16 +851,26 @@ and not a symbolic one, and that it still names the record's commit.
 process that died after `update-ref` released `HEAD.lock` leaves a window
 in which a `symbolic-ref` can move `HEAD` to another branch, and an index
 built for the record's branch installed onto that one would be a
-staged difference nobody made. Where all of that holds and
-`<index>.lock` is still there and still hashes to what the record says,
-the UI finishes what was interrupted: the same rename, then the cleanup
-step 2 owed — the `link()` source unlinked, each swapped-out file moved
+staged difference nobody made. Where all of that holds, the UI finishes what was interrupted, from
+whichever side of the rename the crash left it on: the prepared index is
+`<index>.lock` where that file is still there and still hashes to what
+the record says, and is `<index>` itself where the lock is gone and the
+installed index hashes to it, since the rename copies no bytes and the
+installed index is the prepared one (**measured**: the file's hash before
+and after the rename was the same). The lock's absence is
+therefore not a refusal but the evidence that the rename already
+happened, which is the one thing the record cannot say about itself,
+being written before the rename and removed after the cleanup. So the UI
+renames where there is something to rename, and in either case then does
+the cleanup step 2 owed — the `link()` source unlinked, each swapped-out file moved
 under `previous/` — done by name from the record and skipped where the
 name is already gone, so that running it twice is running it once, and
-only then the record removed. In every other case it changes nothing and
-shows the record, `HEAD`, the branch's actual tip, and the commands,
-because a lock that has changed is another `git`'s, and a `HEAD` or a
-branch that has moved is a state only the user can judge. A record is
+only then the record removed. Where neither file hashes to the record's
+index it changes nothing, and the same where `HEAD` or the branch has
+moved: an index that is neither the prepared one nor a lock the UI can
+account for is another `git`'s work, and a moved `HEAD` or branch is a
+state only the user can judge. In each of those it shows the record,
+`HEAD`, the branch's actual tip, and the commands. A record is
 never deleted except by the step that completes it or by the user.
 
 **Measured** on git 2.43, with staging, message-editing, pushing and pre-push
@@ -930,10 +954,18 @@ process's owner alone (**measured**: `/proc/<pid>/environ` is mode
 `0400`), which is who can already read the configuration file. So the
 URL stays in the UI process, and every URL the page is shown — the list
 on refusal, the destination named after a push, the commands offered for
-the shell — is shown with its userinfo removed, everything between the
-scheme's `//` and an `@`, and every line of `git` output relayed to the
-page passes through the same removal, in case a helper is less careful
-than the transport. One more thing can move the destination after the
+the shell — is not the URL with something taken out of it but a URL
+*rebuilt* from the three parts that name the destination: the scheme, the
+host with its port, and the path. Userinfo, query and fragment are not
+carried, because each of them can hold a credential and only the first
+announces itself with an `@`: `https://host/repo.git?access_token=…` has
+no userinfo at all, and `git`'s transport, which strips userinfo from its
+diagnostics, prints a query verbatim (**measured**: `unable to access
+'https://127.0.0.1:1/x.git?access_token=s3cret/'`). An `scp`-like address
+(`user@host:path`) is rebuilt as `host:path` the same way. Every line of
+`git` output relayed to the page has each URL-shaped run of characters in
+it replaced by that rebuilding, so the page never shows a string the UI
+did not construct. One more thing can move the destination after the
 URL is chosen: a `url.<base>.insteadOf` rule rewrites a URL for every
 command and a `url.<base>.pushInsteadOf` rule for pushes, `git remote
 get-url --push` has applied one round of them already, and the
