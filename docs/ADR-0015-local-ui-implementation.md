@@ -237,8 +237,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    refuses if the two differ — the locks stop `git`, not an editor saving
    the same file, and the browser's copy would otherwise overwrite newer
    work (**measured**: the page's id and the id after an editor's save
-   differed). It requires the path to carry no `filter` attribute (`git
-   check-attr filter -- <path>` must answer `unspecified`): a clean filter
+   differed). It requires the path to carry no `filter` attribute: `git
+   check-attr --all -z -- <path>` lists every attribute set on the path,
+   and no `filter` may be among them. The obvious query, `check-attr
+   filter`, answering `unspecified`, is not enough, because a driver may
+   be *named* `unspecified` (**measured**: under `*.json
+   filter=unspecified` with `filter.unspecified.clean` configured,
+   `check-attr filter` printed `filter: unspecified` exactly as it does
+   for no attribute, `hash-object --stdin --path` ran the clean program
+   all the same, and a pass-through program left the filtered and raw ids
+   equal; `--all` listed `filter: unspecified` for that path and nothing
+   for a path with no attribute). A clean filter
    is a program neither `core.hooksPath` nor `core.fsmonitor` reaches, and
    a blob stored around it leaves `git status` reporting the path modified
    the moment it is committed, since `git` compares through the filter. The
