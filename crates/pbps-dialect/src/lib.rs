@@ -630,6 +630,12 @@ pub trait Dialect {
     /// unrelated types and blocks a plan that changes nothing, and an omitted
     /// argument reads as the wrong type and can let a narrowing past the gate.
     /// Both dialects therefore normalize again here, which costs nothing.
+    ///
+    /// A type that does not normalize ends the question: the answer is
+    /// [`TypeChangeRisk::Incompatible`], not the classification of the declared
+    /// value. Carrying it on looks conservative and is not — a rejected
+    /// *modifier* keeps a base every family claims, so the family reads the
+    /// modifier as one the engine would accept and can call it `Safe`.
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
 
     /// The canonical form of an unquoted identifier in this dialect.

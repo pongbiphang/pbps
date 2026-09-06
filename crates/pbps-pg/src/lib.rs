@@ -197,12 +197,20 @@ impl Dialect for Postgres {
         // because an argument-free `character` looks unbounded — it is
         // `character(1)`, and that is a narrowing walking past the gate.
         //
-        // A type that cannot normalize keeps its declared form, which no
-        // family claims and every pair therefore calls `Incompatible`: the
-        // conservative answer, and the one `validate` has already refused the
-        // table for.
-        let normalized = |t: &ColumnType| types::normalize(t).unwrap_or_else(|_| t.clone());
-        types::change_risk(&normalized(from), &normalized(to))
+        // A type that does not normalize ends the question here rather than
+        // travelling on in its declared form. Falling back to the declared
+        // value is the answer that looks conservative and is not: an
+        // unknown *base* is claimed by no family and comes out `Incompatible`,
+        // but a rejected *modifier* on a known base keeps that base, and the
+        // family reads the modifier as if the engine would accept it —
+        // `numeric(1000) -> numeric(1001)` comes out `Safe` on a precision
+        // this engine does not have, and `interval(6) -> interval(7)` comes
+        // out `Safe` on the precision it silently stores as 6, which is the
+        // round trip the catalogue refuses the declaration for.
+        let (Ok(from), Ok(to)) = (types::normalize(from), types::normalize(to)) else {
+            return TypeChangeRisk::Incompatible;
+        };
+        types::change_risk(&from, &to)
     }
 
     /// Unquoted identifiers fold to **lower** case, where SQL Server folds to
@@ -715,10 +723,34 @@ mod tests {
             // And a real narrowing that the alias spelling used to hide.
             ("varchar(50)", "varchar(10)", TypeChangeRisk::Narrowing),
             ("int8", "int4", TypeChangeRisk::Narrowing),
-            // A type no catalogue claims stays refused rather than becoming
-            // safe by falling through to a family.
+            // A type the catalogue will not spell stays refused rather than
+            // falling through to a family. Both halves matter: an unknown base
+            // no family claims, and — the one that reads as safe if the
+            // declared value travels on — a rejected modifier on a base that
+            // every family does claim.
             ("serial", "integer", TypeChangeRisk::Incompatible),
             ("nonesuch", "integer", TypeChangeRisk::Incompatible),
+            // Past this engine's own precision, in the direction that looks
+            // like widening.
+            (
+                "numeric(1000)",
+                "numeric(1001)",
+                TypeChangeRisk::Incompatible,
+            ),
+            (
+                "numeric(1001)",
+                "numeric(1000)",
+                TypeChangeRisk::Incompatible,
+            ),
+            // The precision the engine takes and silently stores as 6, which
+            // is why the catalogue refuses to spell it at all.
+            ("interval(6)", "interval(7)", TypeChangeRisk::Incompatible),
+            // And a length past the engine's maximum for a string.
+            (
+                "varchar(10485760)",
+                "varchar(10485761)",
+                TypeChangeRisk::Incompatible,
+            ),
         ] {
             assert_eq!(
                 Postgres.type_change_risk(&ty(from), &ty(to)),

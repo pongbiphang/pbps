@@ -625,7 +625,8 @@ dependency tree ended up with.
 
 ## A comment that describes a check the code does not make
 
-Two in one review round, in code written the same week:
+Three now, and the third is the shape at its most flattering: a comment that
+*reasons* rather than states, and is right about half its subject.
 
 - `pbps-db::postgres::endpoint` fell back to `localhost` for a connection
   string it could not read, under a comment saying the connection would then
@@ -636,10 +637,28 @@ Two in one review round, in code written the same week:
   characters" and enforced no limit at all, while the SQL Server counterpart it
   was written from enforces one.
 
+- `pbps-pg`'s `type_change_risk` fell back to the declared type when
+  normalization failed, under a comment saying that value "no family claims and
+  every pair therefore calls `Incompatible` — the conservative answer". True of
+  an unknown *base*. Not true of a rejected *modifier* on a known base, which
+  keeps the base every family does claim: `numeric(1000) -> numeric(1001)` came
+  out `Safe` on a precision this engine does not have, and
+  `interval(6) -> interval(7)` came out `Safe` on the precision the engine
+  silently stores as 6 — which is the round trip the catalogue refuses the
+  declaration for. The unit test that was meant to pin the claim asked it only
+  of `serial` and `nonesuch`, both unknown bases, so it passed on the half that
+  was true. The same fallback is in the shipped SQL Server dialect, where
+  `decimal(38,0) -> decimal(39,0)` reads `Safe` past a maximum precision of 38.
+
 A comment stating a rule reads, to the next person and to the reviewer skimming
 for one, as a rule that is applied. **When a comment names a limit or a
 guarantee, the line that enforces it should be the next one** — and when it
 cannot be, the comment has to say that the check is somewhere else and where.
+A comment that argues *why* the code is safe needs the argument's cases
+enumerated and each one tested, or the test pins the case the author was
+already thinking of. **Prefer removing the fallback to reasoning about it**: the
+fixed version returns `Incompatible` when either side fails to normalize, and
+there is no longer a case to be half right about.
 
 ## A round trip tested only on the simple case
 
