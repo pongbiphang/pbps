@@ -851,11 +851,19 @@ locked-copy `update-index` ran it), so every `git` also takes
    branch, the placed files belong to *that* checkout now and the branch
    the UI advanced has nothing to say about them, so the tip `HEAD`
    resolves to decides instead — under that ref's own lock, taken here the
-   way the others are (`<git-common-dir>/<target>.lock`, created
+   way the others are (`<git rev-parse --git-path <target>>.lock`, created
    exclusively, which is the files backend's protocol whatever the ref is —
    **measured**: a lock at a tag's path made `update-ref` of that tag fail
-   with `cannot lock ref`) and discarded with them. The name it locks is
-   the one `git symbolic-ref --no-recurse HEAD` answers, the ref `HEAD`
+   with `cannot lock ref`), and discarded with them. Where that lock file
+   goes, `git` is asked, as step 0 asks it for the index and for `HEAD`,
+   because not every ref is shared: a per-worktree one — `refs/worktree/*`,
+   `refs/bisect/*`, `refs/rewritten/*` — lives under the worktree's own
+   directory, and `<git-common-dir>` would name a file nothing locks
+   (**measured** in a linked worktree on git 2.43: `--git-path
+   refs/worktree/foo` answered under `worktrees/<name>/` where `--git-path
+   refs/heads/<branch>` answered under the common directory, and
+   `symbolic-ref HEAD refs/worktree/foo` was accepted). The name it locks
+   is the one `git symbolic-ref --no-recurse HEAD` answers, the ref `HEAD`
    names *directly*, and not the branch at the end of a chain, which is
    what the bare command gives, dereferencing recursively by default
    (**measured** on git 2.43: with `HEAD` symbolic to `b` and `b` to `d`,
