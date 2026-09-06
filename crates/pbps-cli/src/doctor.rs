@@ -183,8 +183,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // about (the ledger lives there) and the declarations themselves are
     // already reported as findings above.
     let managed_schemas = managed_schemas(project);
-    let referenced = referenced_tables(project, &managed_schemas);
-    let granted = grant_targets(project);
+    let declared = Declared {
+        referenced: referenced_tables(project, &managed_schemas),
+        granted: grant_targets(project),
+        data: data_tables(project),
+        schemas: managed_schemas,
+    };
 
     if !project.ids_file().exists() {
         findings.push(
@@ -245,9 +249,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     name.as_deref(),
                     target.connection(),
                     target.driver(),
-                    &managed_schemas,
-                    &referenced,
-                    &granted,
+                    &declared,
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
@@ -288,9 +290,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     Some(&name),
                     &conn,
                     db::driver_for(project.config.dialect),
-                    &managed_schemas,
-                    &referenced,
-                    &granted,
+                    &declared,
                 )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
@@ -432,6 +432,44 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::O
     out.into_iter().collect()
 }
 
+/// The tables whose declarations carry rows, and what each would have written
+/// to it (ADR-0004).
+///
+/// `ALTER ON SCHEMA` confers no DML, so nothing else `doctor` asks for covers
+/// the `INSERT`, `UPDATE` and `DELETE` a `data:` block makes the emitter
+/// write. Read from the declarations, like the role targets, and for the same
+/// reason: a project that declares no rows must not be asked to hold DML on
+/// the tables it manages.
+///
+/// Declarations that do not load give an empty map, for the reason
+/// [`managed_schemas`] gives: the load failure is a finding of its own, and a
+/// project with nothing declared is a real state rather than an error.
+fn data_tables(project: &Project) -> pbps_mssql::doctor::DataTables {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return pbps_mssql::doctor::DataTables::new();
+    };
+    data_tables_of(&loaded.schema)
+}
+
+/// The declaration half of [`data_tables`], kept apart from the loading so
+/// what each declaration demands can be tested without a project on disk.
+///
+/// The reading itself is `DataDemand::of`'s, in one place: a table whose
+/// declaration could emit no statement answers `None` and is left out
+/// entirely, so this is the naming and nothing else.
+fn data_tables_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataTables {
+    let mut out = pbps_mssql::doctor::DataTables::new();
+    for (name, table) in &schema.tables {
+        if let Some(demand) = pbps_mssql::doctor::DataDemand::of(table) {
+            out.insert(
+                pbps_model::ObjectName::new(name.schema.clone(), name.name.clone()),
+                demand,
+            );
+        }
+    }
+    out
+}
+
 /// What the managed roles are granted on (ADR-0005), as far as the project
 /// files can say. Empty when the project declares no role and its ids file
 /// names none — which is not yet "no role": the environment's recorded state
@@ -496,15 +534,30 @@ fn append_cause(slot: &mut Option<String>, cause: String) {
     }
 }
 
+/// What the permission check needs from the declarations, read once for the
+/// whole estate.
+///
+/// One value rather than four parameters travelling together: they are derived
+/// from the same load, are handed on unchanged to every environment, and a
+/// fifth would otherwise be a fifth argument to thread through each call site.
+struct Declared {
+    /// The schemas this project manages.
+    schemas: Vec<String>,
+    /// Foreign-key targets outside them.
+    referenced: Vec<pbps_model::ObjectName>,
+    /// What the managed roles are granted on (ADR-0005).
+    granted: pbps_mssql::doctor::GrantTargets,
+    /// The tables that declare rows, and what each demands (ADR-0004).
+    data: pbps_mssql::doctor::DataTables,
+}
+
 /// Everything one environment can be asked without writing to it.
 async fn examine(
     name: &str,
     env_name: Option<&str>,
     connection: &str,
     driver: pbps_db::Driver,
-    schemas: &[String],
-    referenced: &[pbps_model::ObjectName],
-    granted: &pbps_mssql::doctor::GrantTargets,
+    declared: &Declared,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
@@ -553,7 +606,15 @@ async fn examine(
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted).await {
+    match pbps_mssql::doctor::permissions(
+        &mut conn,
+        &declared.schemas,
+        &declared.referenced,
+        &declared.granted,
+        &declared.data,
+    )
+    .await
+    {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()
@@ -895,6 +956,84 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "schema.absent")
             .and_then(|f| f.remedy)
+    }
+
+    fn with_rows(
+        mode: pbps_model::DataMode,
+        rows: &[&str],
+        columns: &[&str],
+    ) -> pbps_model::schema::Table {
+        let ty: pbps_model::ColumnType = "varchar(20)".parse().unwrap();
+        let mut t = pbps_model::schema::Table {
+            primary_key: Some(pbps_model::schema::PrimaryKey {
+                name: None,
+                columns: vec!["code".to_owned()],
+            }),
+            data: Some(pbps_model::TableData {
+                mode,
+                rows: rows
+                    .iter()
+                    .map(|k| {
+                        (
+                            pbps_model::RowKey((*k).to_owned()),
+                            pbps_model::Row(Default::default()),
+                        )
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        for name in std::iter::once(&"code").chain(columns) {
+            t.columns
+                .insert((*name).to_owned(), pbps_model::Column::new(ty.clone()));
+        }
+        t
+    }
+
+    /// Which tables `doctor` asks about, and under what name.
+    ///
+    /// What each one *demands* is `DataDemand::of`'s to decide and is pinned
+    /// where it lives; this is the half that is here — that a table whose
+    /// declaration could emit no statement is left out entirely rather than
+    /// carried as a demand of nothing, and that the key is the object the
+    /// engine authorizes on rather than the schema it sits in.
+    #[test]
+    fn only_tables_whose_declaration_can_emit_a_statement_are_asked_about() {
+        let mut schema = pbps_model::Schema::default();
+        schema.tables.insert(
+            "app.no_data".parse().unwrap(),
+            pbps_model::schema::Table::default(),
+        );
+        for (name, mode, rows) in [
+            ("app.seeded", pbps_model::DataMode::Exact, &["a"][..]),
+            ("app.must_be_empty", pbps_model::DataMode::Exact, &[][..]),
+            ("ref.lookup", pbps_model::DataMode::Ensure, &["a"][..]),
+            // Manages no row at all: nothing is ever inserted, corrected or
+            // removed, so nothing is asked for.
+            ("ref.inert", pbps_model::DataMode::Ensure, &[][..]),
+        ] {
+            schema
+                .tables
+                .insert(name.parse().unwrap(), with_rows(mode, rows, &["label"]));
+        }
+
+        let out = data_tables_of(&schema);
+        let mut named: Vec<String> = out.keys().map(ToString::to_string).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            ["app.must_be_empty", "app.seeded", "ref.lookup"],
+            "{out:?}"
+        );
+        // And each carries what its own declaration says, read in one place.
+        for (name, table) in &schema.tables {
+            let key = pbps_model::ObjectName::new(name.schema.clone(), name.name.clone());
+            assert_eq!(
+                out.get(&key).copied(),
+                pbps_mssql::doctor::DataDemand::of(table),
+                "{name}"
+            );
+        }
     }
 
     /// The permission read and the lock read fail independently, and each

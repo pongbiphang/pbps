@@ -234,6 +234,13 @@ fn try_on_server(connection: &str, sql: &str) -> Result<(), String> {
 
 const ONE_COLUMN: &str = "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n";
 
+/// A reference-data table with a correctable column, for the readiness tests:
+/// one `exact` row, and a `label` an `UPDATE` could differ in.
+const SEEDED: &str = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+                      label: {type: nvarchar(50), nullable: false}\n\
+                      primary_key: {name: pk_t, columns: [code]}\n\
+                      data:\n  mode: exact\n  rows:\n    new: {label: New}\n";
+
 #[test]
 fn first_run_creates_the_ids_file_and_warns_about_the_empty_baseline() {
     let d = Demo::new("first");
@@ -2561,6 +2568,188 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
     assert!(
         !stdout(&o).contains("Password"),
         "no part of a connection string may reach the report"
+    );
+}
+
+/// The wiring, end to end: `doctor` reads each table's `data:` block out of
+/// the declarations and asks for the DML that block can actually emit, at the
+/// securable the engine authorizes it on.
+///
+/// The dialect's unit tests pin what `missing` does once it is told which
+/// tables carry rows, and its live suite pins what a real server says about
+/// object and schema scope. Neither can tell whether the CLI ever *looks* at
+/// `data:` — an argument left at its default here would keep every one of them
+/// green while `doctor` went on printing "ready" for an account that cannot
+/// write a single declared row.
+///
+/// Five declarations against one login, because what is demanded is read off
+/// the declaration alone: a table absent from the database falls back to its
+/// schema, the same table present is asked on the object, a key-only table is
+/// never asked for `UPDATE`, an `ensure` block with no row is asked for
+/// nothing, and no block at all likewise.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let db = OwnDatabase::new(&server, "doctordml");
+    let login = format!("pbps_flow_dml_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    // Exactly the list `doctor` printed before reference data was on it: the
+    // managed permissions on `app`, the ledger's own on `dbo` (its tables do
+    // not exist yet, so those fall back to the schema), and the four database
+    // `CREATE`s. No DML anywhere near `app`. `CREATE SCHEMA` has to be first in
+    // its batch, so it travels inside an `EXEC`.
+    on_server(
+        db.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA app;'); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
+             GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+        ),
+    );
+
+    let base = server
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&base, "User Id", &login);
+    let as_login = with_key(&as_login, "Password", password);
+    let as_login = with_key(&as_login, "Database", db.name());
+
+    let d = Demo::new("doctordml");
+    d.table(SEEDED);
+    let var = format!("PBPS_DOCTOR_DML_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    d.commit();
+
+    // The declarations, and `doctor`'s answer for whatever they currently say.
+    let gaps = || {
+        let o = Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(["doctor", "--format", "json"])
+            .env(&var, &as_login)
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let mut named: Vec<String> = v["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {v}"))
+            .iter()
+            .map(|g| g.as_str().unwrap_or_default().to_owned())
+            .collect();
+        named.sort();
+        (named, code(&o), v)
+    };
+
+    // The table is not in the database yet — every first deployment of a
+    // project that seeds rows — so the question falls back to its schema, the
+    // only place a grant can sit that early. Exactly three, because the
+    // account holds everything else.
+    let (named, exit, v) = gaps();
+    assert_eq!(named.len(), 3, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT", "UPDATE"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on SCHEMA::[app] — ")),
+            "{v}"
+        );
+    }
+    // And it is a finding the pipeline can block on, not a note.
+    assert_eq!(exit, FINDING, "{v}");
+
+    // With the table there, the same three move to the object — where SQL
+    // Server authorizes the statement, and where a careful DBA's grant sits.
+    on_server(
+        db.connection(),
+        "CREATE TABLE app.t (code varchar(20) NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+         label nvarchar(50) NOT NULL);",
+    );
+    let (named, exit, v) = gaps();
+    assert_eq!(named.len(), 3, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT", "UPDATE"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on OBJECT::[app].[t] — ")),
+            "{v}"
+        );
+    }
+    assert_eq!(exit, FINDING, "{v}");
+
+    // An enumeration table whose only column is its code can insert and
+    // delete and can never update: the differ builds an `UPDATE` only from the
+    // columns a row can hold a value in, and there are none. Demanding it
+    // would report a gap against an account that can run every statement this
+    // declaration can produce — and this is the commonest reference-data shape
+    // there is.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
+    );
+    let (named, _, v) = gaps();
+    assert_eq!(named.len(), 2, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on OBJECT::[app].[t] — ")),
+            "{v}"
+        );
+    }
+
+    // `mode: ensure` with no declared row manages no row at all: nothing is
+    // ever inserted, corrected or removed, so nothing is asked for. The
+    // demand follows what the declaration can actually emit, not the mere
+    // presence of a `data:` block.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: ensure\n  rows: {}\n",
+    );
+    let (named, _, v) = gaps();
+    assert!(
+        named.is_empty(),
+        "an `ensure` block with no row must not be asked for DML: {v}"
+    );
+
+    // And no `data:` block at all, the overwhelmingly common case.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\n",
+    );
+    let (named, _, v) = gaps();
+    assert!(
+        named.is_empty(),
+        "a project declaring no row must not be asked for DML: {v}"
+    );
+
+    after_test_on_server(
+        &server,
+        &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
     );
 }
 

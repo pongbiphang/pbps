@@ -1188,9 +1188,7 @@ fn omitted_defaults(
     row: &pbps_model::Row,
 ) -> (BTreeMap<String, String>, BTreeMap<String, ColumnType>) {
     let types = table
-        .columns
-        .iter()
-        .filter(|(c, spec)| c.as_str() != key_column && spec.identity.is_none())
+        .row_columns(key_column)
         .map(|(c, spec)| (c.clone(), spec.ty.clone()))
         .collect();
     let defaults = omitted_columns(table, key_column, row)
@@ -1206,9 +1204,9 @@ fn omitted_columns<'a>(
     key_column: &'a str,
     row: &'a pbps_model::Row,
 ) -> impl Iterator<Item = (&'a String, &'a pbps_model::Column)> {
-    table.columns.iter().filter(move |(c, spec)| {
-        c.as_str() != key_column && !row.0.contains_key(*c) && spec.identity.is_none()
-    })
+    table
+        .row_columns(key_column)
+        .filter(move |(c, _)| !row.0.contains_key(*c))
 }
 
 #[cfg(test)]

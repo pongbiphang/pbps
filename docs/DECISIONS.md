@@ -3685,3 +3685,104 @@ SPEC is in sync with all of these.
     certificate this client trusts is its own piece of work; what is measured
     here was measured with `openssl s_client` against the same image and is
     written down above rather than asserted.
+235. **Reference data is asked for its own DML, on the table, and only for
+    what its declaration can emit.** `ALTER ON SCHEMA` confers no `INSERT`,
+    `UPDATE` or `DELETE`, and a `data:` block makes the emitter write all three
+    against the **managed** tables. Neither appeared in `doctor`'s list at any
+    scope that covered them: the `INSERT` and `DELETE` on it were
+    `Needed::Ledger`, on the two `dbo` tables, and `UPDATE` was absent
+    altogether. So an account granted exactly the list `doctor` printed passed
+    readiness with exit 0, `apply` took the lock and ran the DDL, and the first
+    row died on "INSERT permission was denied" — under `--staged`, after
+    earlier checkpoints had already committed, which is the failure this
+    command exists to prevent.
+
+    **Asked on the table, not on its schema.** The first version of this asked
+    at schema scope, because that is what the issue suggested and what the
+    `Managed` entries beside it do. Measured on the pinned image, it is wrong
+    in both directions:
+
+    | held | `OBJECT` | `SCHEMA` | statement runs |
+    | --- | --- | --- | --- |
+    | `GRANT INSERT ON app.t` alone | 1 | 0 | yes |
+    | `GRANT INSERT ON SCHEMA::app` + `DENY INSERT ON app.t` | 0 | 1 | no |
+
+    The first row is a careful DBA granting on exactly the table that carries
+    declared rows — reported as a gap they do not have, which is the
+    "make it db_owner" pressure this list exists to refuse, and the same
+    mistake `Needed::Ledger` was moved to object scope to fix. The second is
+    worse and is this entry's own bug one securable out: `doctor` says ready
+    and `apply` dies on the first row.
+
+    The `Managed` entries stay at schema scope and that is not the same shape:
+    `ALTER` and the probes' `SELECT` are needed on every table in the schema,
+    including the ones the plan is about to create, so there is no finite list
+    of objects to ask about. Reference data has one — the tables that declare
+    rows — which is what makes the narrower question askable at all.
+
+    Before the table exists there is no object to ask about (`HAS_PERMS_BY_NAME`
+    on a name the catalog does not hold answers 0, also measured), so the
+    question falls back to the table's schema — the only place a grant *can*
+    sit in advance of the deployment that creates the table. That is the
+    ledger's shape exactly, dedup included: five tables in one schema that all
+    fall back to it produce one gap per permission, not five.
+
+    **Demanded of a project that declares rows and of no other**, for the
+    reason `Needed::RoleAdmin` is: whether the project needs it is visible in
+    the declarations `doctor` already reads, and DML on a table someone else's
+    application also writes to is not a permission to ask for on spec.
+
+    **And only for what the declaration can emit.** What a table demands is
+    read off its `data:` block and its columns, which is all `doctor` can see —
+    it never looks at a plan. The three permissions are asked for
+    independently, because a declaration reaches one and not another:
+
+    | asked for | when |
+    | --- | --- |
+    | `INSERT` | the block declares a row |
+    | `UPDATE` | it declares a row **and** the table has a column a row can hold a value in |
+    | `DELETE` | `mode: exact`, declared rows or not |
+
+    `ensure` never emits a `DELETE` — that is the promise the mode makes to a
+    table the application also writes to (ADR-0004) — so asking for one would
+    demand row-removal rights on the very table that mode was chosen to keep
+    pbps out of. `exact` with no declared row is the mirror: "this table must
+    be empty" removes and never writes. An `ensure` block with no declared row
+    manages no row at all and is asked for nothing.
+
+    `UPDATE` is the one that is easiest to get wrong. The differ builds an
+    `UPDATE` only from the columns a row can hold a value in — every one but
+    the column the key lives in and the engine's own `IDENTITY`s — and emits it
+    only if that came out non-empty. So an enumeration table whose only column
+    is its code, which is the commonest reference-data shape there is, inserts
+    and deletes and can never update. Demanding `UPDATE` of it reports a gap
+    against an account that can run every statement the declaration can
+    produce. The rule has one spelling, `Table::row_columns`, which the differ
+    uses for the comparison and `doctor` asks from the other side; a second
+    copy in the readiness check would drift the first time the differ learned
+    to skip another kind of column, and drift in the direction that says
+    "ready".
+
+    `DataDemand` is built only through `DataDemand::of`, which reads the
+    declaration and answers `None` when it could emit nothing at all — so
+    "declares rows and demands nothing" is an absence from the map rather than
+    a value in it, and the reading happens in one place rather than at each
+    caller. `None` also covers a `data:` block on a table with no
+    single-column primary key, which the differ refuses outright: a broken
+    declaration, not an empty one, and `validate` reports it beside this.
+
+    **Not covered, and recorded rather than silently missed:** a table this
+    plan *renames*. `doctor` asks about declared names, and until `apply` runs
+    the object still carries its old one, so the object question finds nothing
+    and falls back to the schema. Grants and denies follow an object through
+    `sp_rename`, so an object-only grant on the old name is reported missing
+    and a `DENY` on it is not seen. It is a narrow conjunction — a rename of a
+    data table in the pending plan, plus a grant or deny placed on that one
+    object — and the same blind spot is older than this entry and wider than
+    it: every name `doctor` asks about comes from the declarations. Filed
+    rather than fixed here, so that one fix covers every site.
+
+    A data table whose *schema* the database does not have produces no gap at
+    all. Nothing was asked about it — there is no securable to ask about — and
+    "unasked" is not "holds nothing"; `absent_schemas` reports it, and
+    inventing a gap there would name a securable no `GRANT` can reach yet.
