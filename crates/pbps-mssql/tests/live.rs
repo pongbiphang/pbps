@@ -948,12 +948,19 @@ async fn rename_impact_finds_the_dependencies_that_block() {
 /// form being the broken one. A test of the quoted form alone would pass just
 /// as well if `OBJECT_ID` accepted both, and then the bug it is pinning would
 /// not exist and neither would the reason for the change.
+///
+/// The name carries an embedded **period**, not a space. `OBJECT_ID` splits its
+/// argument on periods and is otherwise tolerant, so `N'dbo.cust omer'` finds
+/// the table and a test built on a space would have passed with the fix
+/// reverted — the shape of test this project keeps catching. A period makes
+/// the bare form a three-part name, `dbo`.`cust`.`omer`, which names a
+/// different object entirely.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn object_id_resolves_a_quoted_name_and_not_the_bare_one() {
     let mut db = TestDb::create("object_id_form").await;
     db.conn
-        .execute("CREATE TABLE dbo.[cust omer] (id int NOT NULL);")
+        .execute("CREATE TABLE dbo.[cust.omer] (id int NOT NULL);")
         .await
         .expect("create table");
 
@@ -961,7 +968,7 @@ async fn object_id_resolves_a_quoted_name_and_not_the_bare_one() {
     // reads rather than a nullable one.
     let quoted: i32 = db
         .conn
-        .query("SELECT CASE WHEN OBJECT_ID(N'[dbo].[cust omer]') IS NULL THEN 0 ELSE 1 END;")
+        .query("SELECT CASE WHEN OBJECT_ID(N'[dbo].[cust.omer]') IS NULL THEN 0 ELSE 1 END;")
         .await
         .expect("quoted")[0]
         .try_get_at(0)
@@ -974,7 +981,7 @@ async fn object_id_resolves_a_quoted_name_and_not_the_bare_one() {
 
     let bare: i32 = db
         .conn
-        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.cust omer') IS NULL THEN 0 ELSE 1 END;")
+        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.cust.omer') IS NULL THEN 0 ELSE 1 END;")
         .await
         .expect("bare")[0]
         .try_get_at(0)
@@ -995,6 +1002,10 @@ async fn object_id_resolves_a_quoted_name_and_not_the_bare_one() {
 /// against NULL, and the report came back **empty** — which reads as "nothing
 /// depends on this". Empty is the dangerous answer, not a loud failure, which
 /// is why this needs a real server and its own test.
+///
+/// The period again, and for the same reason: with a space in the name the
+/// bare form still resolves, so this test would have passed against the code
+/// it is meant to catch.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_table_name_needing_quoting_still_reports_what_blocks_its_rename() {
@@ -1002,18 +1013,18 @@ async fn a_table_name_needing_quoting_still_reports_what_blocks_its_rename() {
 
     let mut db = TestDb::create("impact_quoted").await;
     db.conn
-        .execute("CREATE TABLE dbo.[cust omer] (id int NOT NULL, email nvarchar(255) NULL);")
+        .execute("CREATE TABLE dbo.[cust.omer] (id int NOT NULL, email nvarchar(255) NULL);")
         .await
         .expect("create table");
     db.conn
         .execute(
             "CREATE VIEW dbo.v_bound_odd WITH SCHEMABINDING \
-             AS SELECT id, email FROM dbo.[cust omer];",
+             AS SELECT id, email FROM dbo.[cust.omer];",
         )
         .await
         .expect("create view");
 
-    let target = RenameTarget::Table(pbps_model::TableName::new("dbo", "cust omer"));
+    let target = RenameTarget::Table(pbps_model::TableName::new("dbo", "cust.omer"));
     let report = rename_impact(&mut db.conn, &target).await.expect("impact");
 
     assert!(

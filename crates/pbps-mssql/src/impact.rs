@@ -256,12 +256,18 @@ pub async fn rename_impact(
     target: &RenameTarget,
 ) -> Result<ImpactReport, ImpactError> {
     // `OBJECT_ID` *parses* its argument as a name, so it is given the quoted
-    // form and not `TableName`'s `Display`. A name with a space, a period or a
-    // bracket in it makes the bare form return NULL, and every one of these
-    // queries then joins against NULL and matches nothing — so the report came
-    // back empty, which reads as "nothing depends on this". The `blocking`
-    // list goes with it, and a rename `sp_rename` will refuse because of a
-    // SCHEMABINDING view is waved through to fail at apply.
+    // form and not `TableName`'s `Display`. It splits on periods, so a name
+    // holding one makes the bare `schema.name` a three-part name — `dbo`.
+    // `cust`.`omer` — which names a different object and resolves to NULL.
+    // Every one of these queries then joins against NULL and matches nothing,
+    // so the report came back empty, which reads as "nothing depends on this".
+    // The `blocking` list goes with it, and a rename `sp_rename` will refuse
+    // because of a SCHEMABINDING view is waved through to fail at apply.
+    //
+    // A *space* is not one of these: `OBJECT_ID` is tolerant of it and finds
+    // the table from the bare form. That is worth writing down, because it is
+    // the character a test reaches for first, and a test built on it passes
+    // with this fix reverted.
     //
     // `preflight` and `doctor` already pass the quoted form (the latter builds
     // it server-side with `QUOTENAME`); this was the one place that did not.
@@ -418,9 +424,11 @@ mod tests {
         let plain = object_id_argument(&RenameTarget::Table(tname("dbo.customer"))).unwrap();
         assert_eq!(plain, "[dbo].[customer]");
 
-        // The three characters that make the bare form parse as something
-        // else: a space ends the name, a period splits it, a bracket is
-        // quoting syntax. Built with `TableName::new` rather than parsed,
+        // Quoted whatever the character is, rather than only for the ones
+        // that are known to break the bare form: `OBJECT_ID` resolves
+        // `dbo.a b` but not `dbo.a.b`, and which side of that line a
+        // character falls on is the server's business, not this function's.
+        // Built with `TableName::new` rather than parsed,
         // because that is how such a name actually arrives — `assemble` builds
         // them straight from the catalog, and `from_str` would refuse the one
         // with a period as three segments.
