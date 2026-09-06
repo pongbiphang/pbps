@@ -901,18 +901,19 @@ locked-copy `update-index` ran it), so every `git` also takes
    undone for all of them; and a target whose lock cannot be created has
    another `git` mid-transaction on it, where the UI decides nothing by a
    tip it cannot hold still and undoes step 2 for every path, which asks no
-   tip at all. Step 1's record stays the recursive answer: an intermediate
-   retargeted during the compose changes what `symbolic-ref HEAD` says, so
-   step 5's own check fails and lands here, which is the path that needs
-   the direct name. The page then names the commit, the tip the branch
-   actually holds, and every path with what became of it, since the user's
-   index is the one they had and only they can say which of the two states
-   they want. **Measured** both ways: undisturbed, the check passed and the
-   index was installed clean; with a `symbolic-ref` to a sibling in the
-   gap, the check failed, the branch held the commit, and the sibling's ref
-   and index were left alone by git. What the working tree keeps there is
-   the rule above and not that measurement: the sibling's tip does not hold
-   the placed bytes, so step 2 is undone for every such path.
+   tip at all. Step 1's record stays the recursive answer, which this rule
+   does not make safe: an intermediate retargeted before step 5's checks
+   changes what `symbolic-ref HEAD` answers, so the check fails and lands
+   here, while one retargeted after them is caught by nothing and is #140.
+   The page then names the commit, the tip the branch actually holds, and
+   every path with what became of it, since the user's index is the one
+   they had and only they can say which of the two states they want.
+   **Measured** both ways: undisturbed, the check passed and the index was
+   installed clean; with a `symbolic-ref` to a sibling in the gap, the
+   check failed, the branch held the commit, and the sibling's ref and
+   index were left alone by git. What the working tree keeps there is the
+   rule above and not that measurement: the sibling's tip does not hold the
+   placed bytes, so step 2 is undone for every such path.
 6. It installs the locked copy of the index that step 3 prepared by
    renaming `<index>.lock` to `<index>`, which is exactly the commit step
    of `git`'s own lock. Now
