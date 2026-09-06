@@ -180,6 +180,21 @@ struct Moved {
     /// so where the catalog says a foreign key to the deleted row spans the
     /// column, the write is refused instead (DECISIONS 124).
     unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
+    /// Per inserted row, the columns its change gives a type for.
+    ///
+    /// Read for what is *missing* from it. `InsertRow::types` names every
+    /// non-key column of the declared table **except** the `IDENTITY` ones,
+    /// which `pbps_diff`'s `omitted_defaults` leaves out because the engine
+    /// owns them (DECISIONS 94, 117). So for a column that is neither the key
+    /// nor spelled by the row, absent here means the engine assigns the value
+    /// — the one case where a column an insert omits does not arrive at NULL.
+    ///
+    /// Derived rather than carried as its own field because the plan already
+    /// says it, and a second field would be a second thing to keep true. The
+    /// invariant it rests on is pinned by a test in `pbps-diff`, so narrowing
+    /// `types` fails there rather than quietly turning identity columns back
+    /// into NULLs here.
+    typed: BTreeMap<RowKey, BTreeSet<String>>,
 }
 
 /// A foreign key this plan removes before its deletes run: the constraint,
@@ -316,11 +331,15 @@ impl AsStored {
                     key,
                     row,
                     defaults,
+                    types,
                     ..
                 } => {
                     let moved = this.moved.entry(table.clone()).or_default();
                     moved.key_column = key_column.clone();
                     let inserted = moved.inserted.entry(key.clone()).or_default();
+                    moved
+                        .typed
+                        .insert(key.clone(), types.keys().cloned().collect());
                     // The key is written like any other column, and may be
                     // one column of a composite foreign key.
                     inserted.insert(key_column.clone(), literal(key.as_str()));
@@ -1400,15 +1419,34 @@ fn rows_after(
                 .get(column)
                 .is_some_and(|rows| rows.contains(key))
         };
+        // A column the engine fills in: `IDENTITY`. See `Moved::typed` for why
+        // absence is the signal. The key column is excluded because an insert
+        // always spells it — including into an identity key, which ADR-0004
+        // writes under `SET IDENTITY_INSERT`, so its value *is* known.
+        let engine_assigned = |column: &String, key: &RowKey| {
+            column != &m.key_column
+                && m.typed
+                    .get(key)
+                    .is_some_and(|typed| !typed.contains(column))
+        };
         for (key, cells) in &m.inserted {
             // Every column of the key spelled outright: an insert names the
             // whole row, and a column it omits arrives at NULL — which is a
             // row the constraint exempts, not one it refuses.
+            //
+            // Unless the engine assigns it. An `IDENTITY` column reaches here
+            // like any other omitted column, and projecting NULL for it is the
+            // "invent a violation" direction: two inserted rows both became
+            // `TRY_CONVERT(int, NULL)`, so a unique constraint over an identity
+            // column reported a duplicate the engine would never produce, and
+            // the parent side of a foreign-key probe read all-NULL and made
+            // every real child row an orphan. The value is not knowable before
+            // the insert runs, which is what `unspellable` already means.
             let mut values = Vec::new();
             for (i, column) in columns.iter().enumerate() {
                 match cells.get(column) {
                     Some(sql) => values.push(projected(i, column, sql.clone())),
-                    None if unprobeable(column, key) => {
+                    None if unprobeable(column, key) || engine_assigned(column, key) => {
                         values.clear();
                         unspellable = true;
                         break;
@@ -2369,6 +2407,117 @@ mod tests {
             let s = sql(vec![writing, check.clone()]);
             assert!(s.is_empty(), "no answer is the honest one: {s:?}");
         }
+    }
+
+    /// An `IDENTITY` column is the engine's, and an insert that omits it does
+    /// not leave it NULL — the engine assigns a value, and a different one per
+    /// row. Projecting NULL made two inserted rows identical in that column,
+    /// so a unique constraint over it reported a duplicate the engine would
+    /// never produce: a valid plan refused, which is the direction that costs
+    /// a deploy.
+    #[test]
+    fn a_unique_over_an_identity_column_is_unchecked_rather_than_a_duplicate() {
+        // `types` names every non-key column except the identity ones, which
+        // is how this is known — see `Moved::typed`. `seq` is absent from it
+        // and unspelled by the row, so it is the engine's.
+        let insert = |key: &str| Change::InsertRow {
+            table: tname("dbo.setting"),
+            key_column: "code".into(),
+            identity_key: false,
+            key: RowKey::from(key),
+            row: pbps_model::Row::default(),
+            defaults: Default::default(),
+            types: [("label".to_owned(), ty("nvarchar(50)"))]
+                .into_iter()
+                .collect(),
+        };
+        let unique = Change::AddUnique {
+            table: tname("dbo.setting"),
+            name: "uq_setting_seq".into(),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec!["seq".into()],
+            },
+        };
+
+        let sql = probes(&plan(vec![insert("a"), insert("b"), unique.clone()]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect::<Vec<_>>();
+        assert!(
+            sql.is_empty(),
+            "the value is not knowable before the insert runs, so there is no \
+             probe to run: {sql:?}"
+        );
+
+        // The same plan over a column the insert genuinely leaves at NULL is
+        // still probed. Without this the fix would be "stop probing inserts",
+        // which trades an invented violation for a missed one.
+        let nullable = Change::AddUnique {
+            table: tname("dbo.setting"),
+            name: "uq_setting_label".into(),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec!["label".into()],
+            },
+        };
+        let sql = probes(&plan(vec![insert("a"), insert("b"), nullable]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect::<Vec<_>>();
+        let probe = sql.first().expect("a probe over an ordinary column");
+        assert!(
+            probe.matches("SELECT NULL AS k0").count() == 2,
+            "an omitted nullable column still arrives at NULL and is still \
+             counted: {probe}"
+        );
+        // And this is the shape the identity column produced: two branches
+        // both NULL, grouped, reported as a duplicate. Kept here so the two
+        // cases sit side by side.
+        assert!(probe.contains("HAVING COUNT(*) > 1"), "{probe}");
+    }
+
+    /// The other consequence of the same projection, and the more expensive
+    /// one. A foreign key whose parent column is `IDENTITY` read the parent
+    /// side as all-NULL, so no child could match and every real child row was
+    /// reported as an orphan — a valid plan refused, loudly and wrongly.
+    ///
+    /// Asserted separately from the unique case because the two probes fail
+    /// in opposite shapes from one cause, and a fix to `rows_after` that
+    /// covered only one of its four callers would pass the other test.
+    #[test]
+    fn an_identity_parent_column_leaves_the_foreign_key_unchecked_not_orphaned() {
+        let insert = |key: &str| Change::InsertRow {
+            table: tname("dbo.region"),
+            key_column: "code".into(),
+            identity_key: false,
+            key: RowKey::from(key),
+            row: pbps_model::Row::default(),
+            defaults: Default::default(),
+            types: [("label".to_owned(), ty("nvarchar(50)"))]
+                .into_iter()
+                .collect(),
+        };
+        let fk = Change::AddForeignKey {
+            table: tname("dbo.customer"),
+            name: "fk_customer_region".into(),
+            constraint: Box::new(ForeignKey {
+                // The parent side is the identity column.
+                columns: vec!["region_seq".into()],
+                references_table: tname("dbo.region"),
+                references_columns: vec!["seq".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        };
+
+        let sql = probes(&plan(vec![insert("eu"), fk]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect::<Vec<_>>();
+        assert!(
+            sql.is_empty(),
+            "the parent's key is not knowable before the insert runs, so no \
+             child can be judged against it: {sql:?}"
+        );
     }
 
     /// A probe runs before the first statement, so a column this plan is
