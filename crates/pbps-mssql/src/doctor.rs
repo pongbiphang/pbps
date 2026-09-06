@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param};
-use pbps_model::ObjectName;
+use pbps_model::{ObjectName, schema::Table};
 
 use crate::catalog::get;
 
@@ -113,8 +113,8 @@ pub enum Needed {
     /// grant option".
     Granted,
 
-    /// Needed on each **table** whose declaration would have a row written
-    /// to it (ADR-0004, DECISIONS 235).
+    /// Needed on each **table** whose declaration would have a row inserted
+    /// into it (ADR-0004, DECISIONS 235).
     ///
     /// `ALTER ON SCHEMA` confers no DML. A `data:` block makes the emitter
     /// write `INSERT INTO <managed table>` and `UPDATE <managed table> SET`,
@@ -143,7 +143,23 @@ pub enum Needed {
     /// reason `RoleAdmin` is: whether the project needs it is visible in the
     /// declarations `doctor` already reads, and DML on a table someone else's
     /// application also writes to is not a permission to ask for on spec.
-    Data,
+    DataInsert,
+
+    /// Needed on each table whose declaration would have a row **corrected**
+    /// in it (DECISIONS 225).
+    ///
+    /// Separate from [`Needed::DataInsert`] because a declaration can insert
+    /// without ever updating. An `UPDATE` is built only from the columns a row
+    /// can hold a value in — everything but the key and the engine's own
+    /// `IDENTITY`s ([`Table::row_columns`]) — and emitted only if that is not
+    /// empty. A table whose only column is its primary key is the commonest
+    /// reference-data shape there is, and it can never produce one; demanding
+    /// `UPDATE` of it reports a gap against an account that can run every
+    /// statement the declaration can produce.
+    ///
+    /// Asked at the same scope, and of the same tables, as
+    /// [`Needed::DataInsert`].
+    DataUpdate,
 
     /// Needed on each table whose declaration would have a row **removed**
     /// from it — `mode: exact`, and no other (DECISIONS 235).
@@ -158,7 +174,8 @@ pub enum Needed {
     /// chosen to keep pbps out of, which is the over-demand this enum exists
     /// to avoid.
     ///
-    /// Asked at the same scope, and of the same tables, as [`Needed::Data`].
+    /// Asked at the same scope, and of the same tables, as
+    /// [`Needed::DataInsert`].
     DataDelete,
 }
 
@@ -312,12 +329,12 @@ pub const REQUIRED: [Requirement; 20] = [
     req(
         "INSERT",
         "writing a declared row this table does not have",
-        Needed::Data,
+        Needed::DataInsert,
     ),
     req(
         "UPDATE",
         "correcting a declared row whose values have drifted",
-        Needed::Data,
+        Needed::DataUpdate,
     ),
     req(
         "DELETE",
@@ -459,35 +476,66 @@ pub struct GrantTargets {
     pub roles: Vec<String>,
 }
 
-/// What one table's declared rows would have written to it (ADR-0004).
+/// What one table's declaration could have done to its rows (ADR-0004).
 ///
-/// Three variants rather than two flags, so "declares rows and demands
-/// nothing" cannot be written down. The fourth combination is not a variant
-/// but an absence: `mode: ensure` with no declared row manages no row at all,
-/// so it asks for nothing and the table is left out of [`DataTables`]
-/// entirely.
+/// Read off the declaration, which is all `doctor` can see — it never looks at
+/// a plan. Each of the three is asked for on its own, because a declaration
+/// can reach one and not another: an enumeration table whose only column is
+/// its code inserts and deletes and can never update, and `mode: exact` with
+/// no declared row deletes and can never insert.
+///
+/// Built only through [`DataDemand::of`], which answers `None` for a
+/// declaration that could emit nothing at all — so "declares rows and demands
+/// nothing" is an absence from [`DataTables`] rather than a value in it, and
+/// the reading of the model happens in one place rather than at each caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataDemand {
-    /// Rows are declared and an undeclared one is left alone (`ensure`): a
-    /// row may have to be inserted or corrected, never removed.
-    Write,
-    /// `mode: exact` with no declared row — "this table must be empty". Every
-    /// surviving row is a `DELETE`, and there is nothing to write.
-    Remove,
-    /// `mode: exact` with rows: both.
-    WriteAndRemove,
+pub struct DataDemand {
+    inserts: bool,
+    corrects: bool,
+    removes: bool,
 }
 
 impl DataDemand {
-    /// Whether a row could be inserted or corrected, which is what `INSERT`
-    /// and `UPDATE` are asked for.
-    const fn writes(self) -> bool {
-        matches!(self, Self::Write | Self::WriteAndRemove)
+    /// What this table's `data:` block could do to it, or `None` if nothing.
+    ///
+    /// `None` covers three cases that are all "no statement": no block at all,
+    /// `mode: ensure` with no declared row — which manages no row, so it can
+    /// neither insert nor correct nor remove — and a block whose table has no
+    /// single-column primary key, which the differ refuses outright
+    /// (`DataWithoutKey`). The last is a broken declaration rather than an
+    /// empty one, and it is not read as good news anywhere: `validate` reports
+    /// it, and `doctor` runs `validate`'s own findings beside this.
+    pub fn of(table: &Table) -> Option<Self> {
+        let data = table.data.as_ref()?;
+        let key_column = table.data_key_column()?;
+        let declares_a_row = !data.rows.is_empty();
+        let demand = Self {
+            inserts: declares_a_row,
+            // Both halves are needed: a row to compare, and a cell to compare
+            // it in. The differ builds an `UPDATE` only from `row_columns` and
+            // emits it only if that came out non-empty.
+            corrects: declares_a_row && table.row_columns(key_column).next().is_some(),
+            // `exact` alone, whether or not a row is declared: with none, the
+            // declaration says the table must be empty, and every surviving
+            // row is a `DELETE`.
+            removes: data.mode == pbps_model::DataMode::Exact,
+        };
+        (demand.inserts || demand.corrects || demand.removes).then_some(demand)
+    }
+
+    /// Whether a row could be inserted, which is what `INSERT` is asked for.
+    const fn inserts(self) -> bool {
+        self.inserts
+    }
+
+    /// Whether a row could be corrected, which is what `UPDATE` is asked for.
+    const fn corrects(self) -> bool {
+        self.corrects
     }
 
     /// Whether a row could be removed, which is what `DELETE` is asked for.
     const fn removes(self) -> bool {
-        matches!(self, Self::Remove | Self::WriteAndRemove)
+        self.removes
     }
 }
 
@@ -732,7 +780,8 @@ pub async fn permissions(
                 Needed::Managed
                     | Needed::Ledger
                     | Needed::LedgerCreation
-                    | Needed::Data
+                    | Needed::DataInsert
+                    | Needed::DataUpdate
                     | Needed::DataDelete
             )
         })
@@ -809,7 +858,12 @@ pub async fn permissions(
     // to the schema, which is the only place a grant can sit that early.
     let data_perms: Vec<&str> = REQUIRED
         .iter()
-        .filter(|r| matches!(r.needed, Needed::Data | Needed::DataDelete))
+        .filter(|r| {
+            matches!(
+                r.needed,
+                Needed::DataInsert | Needed::DataUpdate | Needed::DataDelete
+            )
+        })
         .map(|r| r.name)
         .collect();
     let data_names: Vec<ObjectName> = data.keys().cloned().collect();
@@ -1007,9 +1061,9 @@ pub async fn permissions(
 /// The declared data tables that are missing `r`, at the securable each of
 /// them can be answered at.
 ///
-/// Spelled once for [`Needed::Data`] and [`Needed::DataDelete`]: they ask the
-/// same question of the same tables and differ only in which demand switches a
-/// table on, which is what `wanted` names.
+/// Spelled once for the three data requirements: they ask the same question of
+/// the same tables and differ only in which demand switches a table on, which
+/// is what `wanted` names.
 ///
 /// The scope is chosen per table, exactly as the ledger's is. A table the
 /// catalog shows can only be answered at object scope, because that is where a
@@ -1175,7 +1229,8 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     }
                 }
             }
-            Needed::Data => data_gaps(held, r, DataDemand::writes, &mut out),
+            Needed::DataInsert => data_gaps(held, r, DataDemand::inserts, &mut out),
+            Needed::DataUpdate => data_gaps(held, r, DataDemand::corrects, &mut out),
             // `exact` only, for the reason the variant gives: `ensure` never
             // emits a DELETE, and demanding one would be asking for the
             // permission that mode was chosen to withhold.
@@ -1400,6 +1455,58 @@ mod tests {
         assert!(missing(&held).is_empty());
     }
 
+    /// A declared table as `DataDemand::of` reads one: a single-column primary
+    /// key named `code`, one extra column per name in `extra`, and a `data:`
+    /// block in `mode` carrying one row per key in `rows`.
+    ///
+    /// Built rather than hand-written because `DataDemand` has one
+    /// constructor: what a declaration demands is derived in a single place,
+    /// so a test that asserted on a hand-made value would be asserting about a
+    /// value the tool never produces.
+    fn declared(mode: pbps_model::DataMode, rows: &[&str], extra: &[&str]) -> Table {
+        let mut t = Table {
+            primary_key: Some(pbps_model::schema::PrimaryKey {
+                name: None,
+                columns: vec!["code".to_owned()],
+            }),
+            data: Some(pbps_model::TableData {
+                mode,
+                rows: rows
+                    .iter()
+                    .map(|k| {
+                        (
+                            pbps_model::RowKey((*k).to_owned()),
+                            pbps_model::Row(BTreeMap::new()),
+                        )
+                    })
+                    .collect(),
+            }),
+            ..Table::default()
+        };
+        let ty: pbps_model::ColumnType = "varchar(20)".parse().expect("a type this crate spells");
+        t.columns
+            .insert("code".to_owned(), pbps_model::Column::new(ty.clone()));
+        for name in extra {
+            t.columns
+                .insert((*name).to_owned(), pbps_model::Column::new(ty.clone()));
+        }
+        t
+    }
+
+    /// What a table demands, or the panic that says it demands nothing.
+    fn demand(mode: pbps_model::DataMode, rows: &[&str], extra: &[&str]) -> DataDemand {
+        DataDemand::of(&declared(mode, rows, extra))
+            .unwrap_or_else(|| panic!("{mode} with {} row(s) demands nothing", rows.len()))
+    }
+
+    fn exact_table() -> DataDemand {
+        demand(pbps_model::DataMode::Exact, &["a"], &["label"])
+    }
+
+    fn ensure_table() -> DataDemand {
+        demand(pbps_model::DataMode::Ensure, &["a"], &["label"])
+    }
+
     /// The same holdings with the DML struck out of every schema, which is
     /// what an account granted exactly the list `doctor` used to print holds.
     fn everything_but_the_dml(schemas: &[&str]) -> Held {
@@ -1424,6 +1531,26 @@ mod tests {
             .collect()
     }
 
+    /// A declaration that could emit nothing is not a demand of nothing — it
+    /// is no entry at all, so `missing` is never asked about it and the three
+    /// axes can never all be false.
+    #[test]
+    fn a_declaration_that_can_emit_nothing_yields_no_demand() {
+        // No `data:` block: the overwhelmingly common table.
+        assert_eq!(DataDemand::of(&Table::default()), None);
+        // `ensure` with no declared row manages no row at all.
+        assert_eq!(
+            DataDemand::of(&declared(pbps_model::DataMode::Ensure, &[], &["label"])),
+            None
+        );
+        // A `data:` block the differ refuses outright: no single-column key,
+        // so no row statement can name one. Reported by `validate`, which
+        // `doctor` runs beside this — never silence.
+        let mut keyless = declared(pbps_model::DataMode::Exact, &["a"], &["label"]);
+        keyless.primary_key = None;
+        assert_eq!(DataDemand::of(&keyless), None);
+    }
+
     /// `ALTER ON SCHEMA` confers no DML, and a `data:` block makes the emitter
     /// write `INSERT`, `UPDATE` and `DELETE` against the **managed** tables. An
     /// account holding everything else passed readiness with exit 0, `apply`
@@ -1439,8 +1566,7 @@ mod tests {
             "a project declaring no row must not be asked for DML: {gaps:?}"
         );
 
-        held.data_tables
-            .insert(table("app.t"), DataDemand::WriteAndRemove);
+        held.data_tables.insert(table("app.t"), exact_table());
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let gaps = missing(&held);
         let mut named: Vec<String> = gaps
@@ -1478,8 +1604,7 @@ mod tests {
     #[test]
     fn a_grant_on_the_table_alone_satisfies_the_check() {
         let mut held = everything_but_the_dml(&["app"]);
-        held.data_tables
-            .insert(table("app.t"), DataDemand::WriteAndRemove);
+        held.data_tables.insert(table("app.t"), exact_table());
         held.data_objects.insert(table("app.t"), dml());
         assert!(
             held.schemas["app"].is_disjoint(&dml()),
@@ -1500,7 +1625,7 @@ mod tests {
             dml().is_subset(&held.schemas["app"]),
             "the premise: the whole schema is granted"
         );
-        held.data_tables.insert(table("app.t"), DataDemand::Write);
+        held.data_tables.insert(table("app.t"), ensure_table());
         held.data_objects
             .insert(table("app.t"), ["UPDATE".to_owned()].into_iter().collect());
         let gaps = missing(&held);
@@ -1517,8 +1642,7 @@ mod tests {
     #[test]
     fn a_data_table_that_does_not_exist_yet_is_asked_of_its_schema() {
         let mut held = everything_but_the_dml(&["app"]);
-        held.data_tables
-            .insert(table("app.t"), DataDemand::WriteAndRemove);
+        held.data_tables.insert(table("app.t"), exact_table());
         let mut named: Vec<String> = missing(&held)
             .iter()
             .map(|g| format!("{} on {}", g.permission, g.securable()))
@@ -1539,7 +1663,7 @@ mod tests {
         // permission: the operator runs one `GRANT`, not five identical ones.
         for n in ["u", "v", "w", "x"] {
             held.data_tables
-                .insert(table(&format!("app.{n}")), DataDemand::WriteAndRemove);
+                .insert(table(&format!("app.{n}")), exact_table());
         }
         assert_eq!(missing(&held).len(), 3, "{:?}", missing(&held));
 
@@ -1557,7 +1681,7 @@ mod tests {
     #[test]
     fn an_ensure_table_is_not_asked_for_delete() {
         let mut held = everything_but_the_dml(&["app"]);
-        held.data_tables.insert(table("app.t"), DataDemand::Write);
+        held.data_tables.insert(table("app.t"), ensure_table());
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
         named.sort_unstable();
@@ -1571,12 +1695,56 @@ mod tests {
     #[test]
     fn an_empty_exact_table_is_asked_for_delete_and_nothing_else() {
         let mut held = everything_but_the_dml(&["app"]);
-        held.data_tables.insert(table("app.t"), DataDemand::Remove);
+        held.data_tables.insert(
+            table("app.t"),
+            demand(pbps_model::DataMode::Exact, &[], &["label"]),
+        );
         held.data_objects.insert(table("app.t"), BTreeSet::new());
         let gaps = missing(&held);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "DELETE");
         assert_eq!(gaps[0].securable(), "OBJECT::[app].[t]");
+    }
+
+    /// An enumeration table whose only column is its code — the commonest
+    /// reference-data shape there is — inserts and deletes and can never
+    /// update: the differ builds an `UPDATE` only from the columns a row can
+    /// hold a value in, and emits it only if that is not empty. Demanding
+    /// `UPDATE` of it reports a gap against an account that can run every
+    /// statement the declaration can produce.
+    #[test]
+    fn a_key_only_table_is_not_asked_for_update() {
+        let mut held = everything_but_the_dml(&["app"]);
+        held.data_tables.insert(
+            table("app.t"),
+            demand(pbps_model::DataMode::Exact, &["a"], &[]),
+        );
+        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
+        named.sort_unstable();
+        assert_eq!(named, ["DELETE", "INSERT"], "{:?}", missing(&held));
+    }
+
+    /// A non-key `IDENTITY` is the engine's: never written by a row and never
+    /// read back, so it is not a cell that can differ. A table whose only
+    /// non-key column is one can no more update than a key-only table can.
+    #[test]
+    fn a_table_whose_only_other_column_is_an_identity_is_not_asked_for_update() {
+        let mut t = declared(pbps_model::DataMode::Exact, &["a"], &["seq"]);
+        t.columns.get_mut("seq").expect("the extra column").identity =
+            Some(pbps_model::schema::Identity {
+                seed: 1,
+                increment: 1,
+            });
+        let mut held = everything_but_the_dml(&["app"]);
+        held.data_tables.insert(
+            table("app.t"),
+            DataDemand::of(&t).expect("it still inserts"),
+        );
+        held.data_objects.insert(table("app.t"), BTreeSet::new());
+        let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
+        named.sort_unstable();
+        assert_eq!(named, ["DELETE", "INSERT"], "{:?}", missing(&held));
     }
 
     /// The demand is per table, not per estate: a table declaring nothing is
@@ -1586,14 +1754,12 @@ mod tests {
     #[test]
     fn the_dml_demanded_is_per_table_and_not_estate_wide() {
         let mut held = everything_but_the_dml(&["app", "ref"]);
-        held.data_tables
-            .insert(table("app.seeded"), DataDemand::WriteAndRemove);
+        held.data_tables.insert(table("app.seeded"), exact_table());
         held.data_objects
             .insert(table("app.seeded"), BTreeSet::new());
         held.data_objects
             .insert(table("app.plain"), BTreeSet::new());
-        held.data_tables
-            .insert(table("ref.lookup"), DataDemand::Write);
+        held.data_tables.insert(table("ref.lookup"), ensure_table());
         held.data_objects
             .insert(table("ref.lookup"), BTreeSet::new());
         let mut named: Vec<String> = missing(&held)
@@ -1624,8 +1790,7 @@ mod tests {
         let mut held = everything_but_the_dml(&["app"]);
         held.schemas.remove("app");
         held.absent_schemas.insert("app".to_owned());
-        held.data_tables
-            .insert(table("app.t"), DataDemand::WriteAndRemove);
+        held.data_tables.insert(table("app.t"), exact_table());
         assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
@@ -1790,7 +1955,7 @@ mod tests {
     /// stays credible if every entry on it is really needed.
     ///
     /// A `data:` block does make the deployment write rows in an application
-    /// schema, and that is asked for separately (`Needed::Data`) and only of a
+    /// schema, and that is asked for separately (`Needed::DataInsert`) and only of a
     /// project that declares one; this holds nothing back from that. The
     /// project here declares no row, which is what keeps the demand at nil.
     #[test]
@@ -2123,7 +2288,8 @@ mod tests {
                     Needed::Referenced
                         | Needed::RoleAdmin
                         | Needed::Granted
-                        | Needed::Data
+                        | Needed::DataInsert
+                        | Needed::DataUpdate
                         | Needed::DataDelete
                 )
             })

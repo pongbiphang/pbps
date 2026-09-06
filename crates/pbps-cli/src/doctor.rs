@@ -454,32 +454,21 @@ fn data_tables(project: &Project) -> pbps_mssql::doctor::DataTables {
     data_tables_of(&loaded.schema)
 }
 
-/// The declaration half of [`data_tables`], kept apart from the loading so the
-/// reading of each mode can be tested without a project on disk.
+/// The declaration half of [`data_tables`], kept apart from the loading so
+/// what each declaration demands can be tested without a project on disk.
 ///
-/// What a table demands is read off the declaration alone, which is all
-/// `doctor` can see — it never looks at a plan. The mode says whether an
-/// undeclared row is removed, and whether any row is *declared* says whether
-/// one can be written: `ensure` with no rows manages no row at all, so it is
-/// asked for nothing, while `exact` with no rows means "this table must be
-/// empty" and every surviving row is a `DELETE`.
+/// The reading itself is `DataDemand::of`'s, in one place: a table whose
+/// declaration could emit no statement answers `None` and is left out
+/// entirely, so this is the naming and nothing else.
 fn data_tables_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataTables {
-    use pbps_mssql::doctor::DataDemand;
     let mut out = pbps_mssql::doctor::DataTables::new();
     for (name, table) in &schema.tables {
-        let Some(data) = &table.data else {
-            continue;
-        };
-        let demand = match (data.mode, data.rows.is_empty()) {
-            (pbps_model::DataMode::Exact, false) => DataDemand::WriteAndRemove,
-            (pbps_model::DataMode::Exact, true) => DataDemand::Remove,
-            (pbps_model::DataMode::Ensure, false) => DataDemand::Write,
-            (pbps_model::DataMode::Ensure, true) => continue,
-        };
-        out.insert(
-            pbps_model::ObjectName::new(name.schema.clone(), name.name.clone()),
-            demand,
-        );
+        if let Some(demand) = pbps_mssql::doctor::DataDemand::of(table) {
+            out.insert(
+                pbps_model::ObjectName::new(name.schema.clone(), name.name.clone()),
+                demand,
+            );
+        }
     }
     out
 }
@@ -950,8 +939,17 @@ mod tests {
             .and_then(|f| f.remedy)
     }
 
-    fn with_rows(mode: pbps_model::DataMode, rows: &[&str]) -> pbps_model::schema::Table {
-        pbps_model::schema::Table {
+    fn with_rows(
+        mode: pbps_model::DataMode,
+        rows: &[&str],
+        columns: &[&str],
+    ) -> pbps_model::schema::Table {
+        let ty: pbps_model::ColumnType = "varchar(20)".parse().unwrap();
+        let mut t = pbps_model::schema::Table {
+            primary_key: Some(pbps_model::schema::PrimaryKey {
+                name: None,
+                columns: vec!["code".to_owned()],
+            }),
             data: Some(pbps_model::TableData {
                 mode,
                 rows: rows
@@ -965,61 +963,58 @@ mod tests {
                     .collect(),
             }),
             ..Default::default()
+        };
+        for name in std::iter::once(&"code").chain(columns) {
+            t.columns
+                .insert((*name).to_owned(), pbps_model::Column::new(ty.clone()));
         }
+        t
     }
 
-    /// A table that declares no rows demands nothing: the DML is asked for
-    /// only where a `data:` block is, which is what keeps `doctor` from asking
-    /// every estate for write access to its own tables.
+    /// Which tables `doctor` asks about, and under what name.
+    ///
+    /// What each one *demands* is `DataDemand::of`'s to decide and is pinned
+    /// where it lives; this is the half that is here — that a table whose
+    /// declaration could emit no statement is left out entirely rather than
+    /// carried as a demand of nothing, and that the key is the object the
+    /// engine authorizes on rather than the schema it sits in.
     #[test]
-    fn a_table_that_declares_no_rows_demands_no_dml() {
+    fn only_tables_whose_declaration_can_emit_a_statement_are_asked_about() {
         let mut schema = pbps_model::Schema::default();
         schema.tables.insert(
-            "app.customer".parse().unwrap(),
+            "app.no_data".parse().unwrap(),
             pbps_model::schema::Table::default(),
         );
-        assert!(data_tables_of(&schema).is_empty());
-    }
-
-    /// Each mode is read for what it can actually emit, per table, and an
-    /// `ensure` block with no declared row manages no row at all — so it asks
-    /// for nothing rather than for the writes it can never make. `exact` with
-    /// no rows is the opposite case: "this table must be empty", which is a
-    /// `DELETE` per surviving row and nothing to write.
-    #[test]
-    fn what_a_table_demands_is_its_mode_and_whether_it_declares_a_row() {
-        use pbps_mssql::doctor::DataDemand;
-        let mut schema = pbps_model::Schema::default();
-        for (name, table) in [
-            (
-                "app.exact_rows",
-                with_rows(pbps_model::DataMode::Exact, &["a"]),
-            ),
-            (
-                "app.exact_empty",
-                with_rows(pbps_model::DataMode::Exact, &[]),
-            ),
-            (
-                "app.ensure_rows",
-                with_rows(pbps_model::DataMode::Ensure, &["a"]),
-            ),
-            (
-                "app.ensure_empty",
-                with_rows(pbps_model::DataMode::Ensure, &[]),
-            ),
+        for (name, mode, rows) in [
+            ("app.seeded", pbps_model::DataMode::Exact, &["a"][..]),
+            ("app.must_be_empty", pbps_model::DataMode::Exact, &[][..]),
+            ("ref.lookup", pbps_model::DataMode::Ensure, &["a"][..]),
+            // Manages no row at all: nothing is ever inserted, corrected or
+            // removed, so nothing is asked for.
+            ("ref.inert", pbps_model::DataMode::Ensure, &[][..]),
         ] {
-            schema.tables.insert(name.parse().unwrap(), table);
+            schema
+                .tables
+                .insert(name.parse().unwrap(), with_rows(mode, rows, &["label"]));
         }
+
         let out = data_tables_of(&schema);
-        let by = |n: &str| {
-            out.get(&n.parse::<pbps_model::ObjectName>().unwrap())
-                .copied()
-        };
-        assert_eq!(by("app.exact_rows"), Some(DataDemand::WriteAndRemove));
-        assert_eq!(by("app.exact_empty"), Some(DataDemand::Remove));
-        assert_eq!(by("app.ensure_rows"), Some(DataDemand::Write));
-        assert_eq!(by("app.ensure_empty"), None, "{out:?}");
-        assert_eq!(out.len(), 3, "{out:?}");
+        let mut named: Vec<String> = out.keys().map(ToString::to_string).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            ["app.must_be_empty", "app.seeded", "ref.lookup"],
+            "{out:?}"
+        );
+        // And each carries what its own declaration says, read in one place.
+        for (name, table) in &schema.tables {
+            let key = pbps_model::ObjectName::new(name.schema.clone(), name.name.clone());
+            assert_eq!(
+                out.get(&key).copied(),
+                pbps_mssql::doctor::DataDemand::of(table),
+                "{name}"
+            );
+        }
     }
 
     /// The permission read and the lock read fail independently, and each

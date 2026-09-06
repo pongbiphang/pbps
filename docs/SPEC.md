@@ -1132,10 +1132,12 @@ authorizes the statement: a grant on the one table that carries declared rows
 answers 0 at schema scope, and a `DENY` on that table answers 1 there while the
 statement fails. Falling back to the schema only while the table does not exist
 yet, like the ledger's writes. What each table asks for is what its declaration
-can emit: `DELETE` only under `mode: exact` — `ensure` never emits one
-(ADR-0004), and demanding it would ask for row-removal rights on the table that
-mode was chosen to keep pbps out of — and `INSERT`/`UPDATE` only where a row is
-declared, since an `ensure` block with none manages no row at all.
+can emit, the three asked independently: `DELETE` only under `mode: exact` —
+`ensure` never emits one (ADR-0004), and demanding it would ask for row-removal
+rights on the table that mode was chosen to keep pbps out of — `INSERT` only
+where a row is declared, since an `ensure` block with none manages no row at
+all, and `UPDATE` only where a declared row could differ in some cell, since a
+table whose only column is its key can never produce one.
 The ledger's schema is not treated as a managed one
 — a project that declares nothing in `dbo` never touches a `dbo` table and must
 not be asked for `ALTER` there. Asking for all of

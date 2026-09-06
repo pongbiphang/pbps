@@ -1664,6 +1664,34 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     let _ = name;
 }
 
+/// A declared `exact` table with one row and one correctable column, which is
+/// what `app.t` below is: the demand travels through `DataDemand::of`, the one
+/// place a declaration is read, rather than being hand-made here.
+fn seeded_table() -> pbps_mssql::doctor::DataDemand {
+    let ty: pbps_model::ColumnType = "varchar(20)".parse().unwrap();
+    let mut t = pbps_model::schema::Table {
+        primary_key: Some(pbps_model::schema::PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        }),
+        data: Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [(
+                pbps_model::RowKey("a".to_owned()),
+                pbps_model::Row(Default::default()),
+            )]
+            .into_iter()
+            .collect(),
+        }),
+        ..Default::default()
+    };
+    t.columns
+        .insert("code".to_owned(), pbps_model::Column::new(ty.clone()));
+    t.columns
+        .insert("label".to_owned(), pbps_model::Column::new(ty));
+    pbps_mssql::doctor::DataDemand::of(&t).expect("an `exact` table with a row demands all three")
+}
+
 /// The readiness question for one project's declared data tables, asked the
 /// way `doctor` asks it.
 async fn data_permissions(
@@ -1808,12 +1836,9 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
     // Declaring rows in `app.t`, the three refusals above become three gaps,
     // on the table — the report the operator needed before `apply` took the
     // lock.
-    let exact: pbps_mssql::doctor::DataTables = [(
-        "app.t".parse().unwrap(),
-        pbps_mssql::doctor::DataDemand::WriteAndRemove,
-    )]
-    .into_iter()
-    .collect();
+    let exact: pbps_mssql::doctor::DataTables = [("app.t".parse().unwrap(), seeded_table())]
+        .into_iter()
+        .collect();
     let held = data_permissions(&mut lp, &exact).await;
     assert_eq!(
         named_gaps(&held),
@@ -1887,12 +1912,10 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
     // A table this deployment has still to create: no object to ask about, so
     // the question falls back to its schema — every first deployment of a
     // project that seeds rows. `app` carries the DML here, so it is ready.
-    let unbuilt: pbps_mssql::doctor::DataTables = [(
-        "app.unbuilt".parse().unwrap(),
-        pbps_mssql::doctor::DataDemand::WriteAndRemove,
-    )]
-    .into_iter()
-    .collect();
+    let unbuilt: pbps_mssql::doctor::DataTables =
+        [("app.unbuilt".parse().unwrap(), seeded_table())]
+            .into_iter()
+            .collect();
     let held = data_permissions(&mut lp, &unbuilt).await;
     assert!(
         held.data_objects.is_empty(),

@@ -63,6 +63,44 @@ impl Schema {
     }
 }
 
+impl Table {
+    /// The single column a declared row is keyed by, where this table has one.
+    ///
+    /// `None` is not "no key": it is a primary key that is absent or composite,
+    /// which a `data:` block cannot be written against at all — the differ
+    /// refuses it (`DataWithoutKey`) rather than emitting anything.
+    pub fn data_key_column(&self) -> Option<&str> {
+        match &self.primary_key {
+            Some(pk) if pk.columns.len() == 1 => Some(pk.columns[0].as_str()),
+            _ => None,
+        }
+    }
+
+    /// The columns a declared row can hold a value in: every one but the
+    /// column its key lives in and the engine's own `IDENTITY`s.
+    ///
+    /// The key is the map key of the row, not a cell in it, and a non-key
+    /// `IDENTITY` is the engine's — never written by a row and never read back
+    /// (DECISIONS 94). So neither is a cell that can differ, and a table with
+    /// none of these can never produce an `UPDATE`: the differ builds one only
+    /// from columns that pass this filter and emits it only if the result is
+    /// non-empty.
+    ///
+    /// One spelling, because it is asked from two sides. The differ asks which
+    /// cells to compare; `doctor` asks whether an `UPDATE` is possible at all,
+    /// and demanding the permission for a table that can never emit one would
+    /// report a gap against an account that can run every statement this
+    /// declaration can produce.
+    pub fn row_columns<'a>(
+        &'a self,
+        key_column: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a Column)> {
+        self.columns
+            .iter()
+            .filter(move |(c, spec)| c.as_str() != key_column && spec.identity.is_none())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {

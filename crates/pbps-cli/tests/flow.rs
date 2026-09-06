@@ -234,6 +234,13 @@ fn try_on_server(connection: &str, sql: &str) -> Result<(), String> {
 
 const ONE_COLUMN: &str = "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n";
 
+/// A reference-data table with a correctable column, for the readiness tests:
+/// one `exact` row, and a `label` an `UPDATE` could differ in.
+const SEEDED: &str = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+                      label: {type: nvarchar(50), nullable: false}\n\
+                      primary_key: {name: pk_t, columns: [code]}\n\
+                      data:\n  mode: exact\n  rows:\n    new: {label: New}\n";
+
 #[test]
 fn first_run_creates_the_ids_file_and_warns_about_the_empty_baseline() {
     let d = Demo::new("first");
@@ -2575,10 +2582,11 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
 /// green while `doctor` went on printing "ready" for an account that cannot
 /// write a single declared row.
 ///
-/// Four declarations against one login, because what is demanded is read off
+/// Five declarations against one login, because what is demanded is read off
 /// the declaration alone: a table absent from the database falls back to its
-/// schema, the same table present is asked on the object, an `ensure` block
-/// with no row is asked for nothing, and no block at all likewise.
+/// schema, the same table present is asked on the object, a key-only table is
+/// never asked for `UPDATE`, an `ensure` block with no row is asked for
+/// nothing, and no block at all likewise.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
@@ -2634,10 +2642,7 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     let as_login = with_key(&as_login, "Database", db.name());
 
     let d = Demo::new("doctordml");
-    d.table(
-        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
-         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
-    );
+    d.table(SEEDED);
     let var = format!("PBPS_DOCTOR_DML_{}", std::process::id());
     std::fs::write(
         d.dir.join("pbps.yml"),
@@ -2685,7 +2690,8 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     // Server authorizes the statement, and where a careful DBA's grant sits.
     on_server(
         db.connection(),
-        "CREATE TABLE app.t (code varchar(20) NOT NULL CONSTRAINT pk_t PRIMARY KEY);",
+        "CREATE TABLE app.t (code varchar(20) NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+         label nvarchar(50) NOT NULL);",
     );
     let (named, exit, v) = gaps();
     assert_eq!(named.len(), 3, "{v}");
@@ -2696,6 +2702,25 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
         );
     }
     assert_eq!(exit, FINDING, "{v}");
+
+    // An enumeration table whose only column is its code can insert and
+    // delete and can never update: the differ builds an `UPDATE` only from the
+    // columns a row can hold a value in, and there are none. Demanding it
+    // would report a gap against an account that can run every statement this
+    // declaration can produce — and this is the commonest reference-data shape
+    // there is.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
+    );
+    let (named, _, v) = gaps();
+    assert_eq!(named.len(), 2, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on OBJECT::[app].[t] — ")),
+            "{v}"
+        );
+    }
 
     // `mode: ensure` with no declared row manages no row at all: nothing is
     // ever inserted, corrected or removed, so nothing is asked for. The
