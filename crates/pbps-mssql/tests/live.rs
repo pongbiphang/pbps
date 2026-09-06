@@ -1151,6 +1151,102 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
     assert_eq!(by("collide"), 2, "{counts:?}");
 }
 
+/// A unique index is a constraint, and a *filtered* one constrains only the
+/// rows its predicate keeps. Both halves are claims about this engine, and
+/// both decide whether a valid plan is refused, so the engine answers them:
+/// the index that must fail is created and fails, and the one that must
+/// succeed is created and succeeds.
+///
+/// Ignoring the filter would have reported the two duplicates below and
+/// refused a plan SQL Server accepts without complaint.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let mut db = TestDb::create("uniqidx").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.customer (
+                 id int NOT NULL,
+                 email nvarchar(255) NULL,
+                 deleted_at datetime2 NULL
+             );
+             INSERT INTO dbo.customer VALUES
+                 (1, N'a@example.com', NULL),
+                 (2, N'b@example.com', NULL),
+                 (3, N'c@example.com', '2020-01-01'),
+                 (4, N'c@example.com', '2020-01-01');",
+        )
+        .await
+        .expect("create");
+
+    let index = |unique: bool, filter: Option<&str>| Change::AddIndex {
+        table: TableName::new("dbo", "customer"),
+        name: "ix_customer_email".into(),
+        index: Box::new(Index {
+            columns: vec![IndexColumn {
+                name: "email".into(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique,
+            filter: filter.map(str::to_owned),
+        }),
+    };
+    let one = |change: Change| ChangeSet {
+        changes: vec![PlannedChange::new(change)],
+    };
+
+    // A plain index constrains nothing, so there is nothing to count.
+    assert!(
+        Mssql.preflight(&one(index(false, None))).is_empty(),
+        "a plain index is not probed"
+    );
+
+    let probes = Mssql.preflight(&one(index(true, None)));
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    let rows = db
+        .conn
+        .query(&probes[0].sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probes[0].sql));
+    let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    // Rows, not groups: the two rows sharing c@example.com.
+    assert_eq!(n, 2, "{}", probes[0].sql);
+
+    let filtered = Mssql.preflight(&one(index(true, Some("[deleted_at] IS NULL"))));
+    assert_eq!(filtered.len(), 1, "{filtered:?}");
+    let rows = db
+        .conn
+        .query(&filtered[0].sql)
+        .await
+        .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", filtered[0].sql));
+    let n: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(
+        n, 0,
+        "the duplicates are both deleted, so the filter exempts them: {}",
+        filtered[0].sql
+    );
+
+    // What the engine does with the same two statements, which is the whole
+    // reason either count is worth reporting.
+    let refused = db
+        .conn
+        .execute("CREATE UNIQUE INDEX ix_a ON dbo.customer (email);")
+        .await;
+    assert!(
+        refused.is_err(),
+        "the unfiltered index must fail on the duplicates the probe counted"
+    );
+    db.conn
+        .execute("CREATE UNIQUE INDEX ix_b ON dbo.customer (email) WHERE deleted_at IS NULL;")
+        .await
+        .expect("the filtered index exempts the deleted duplicates and is created");
+
+    db.drop().await;
+}
+
 /// `order_key` runs every row change before every constraint a plan adds, so
 /// the rows a `UNIQUE` or a `PRIMARY KEY` will meet are the ones the plan
 /// leaves. Counting the rows standing now refused a plan that deletes its own

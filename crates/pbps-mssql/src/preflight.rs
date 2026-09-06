@@ -575,6 +575,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &constraint.columns,
                 names.moved.get(table),
                 "c",
+                &Applies::AllRows,
             )?
             else {
                 return Ok(Vec::new());
@@ -597,8 +598,15 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
             // It subsumes 171's substitution of a column this plan adds —
             // `rows_after` spells one, and a derived table's column can be
             // grouped by where a bare constant cannot.
-            let Some(rows) = rows_after(names, table, &pk.columns, names.moved.get(table), "c")?
-            else {
+            let rows = rows_after(
+                names,
+                table,
+                &pk.columns,
+                names.moved.get(table),
+                "c",
+                &Applies::AllRows,
+            )?;
+            let Some(rows) = rows else {
                 return Ok(Vec::new());
             };
             let from = format!("(\n{rows}\n) AS r");
@@ -612,6 +620,38 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 "rows that would collide under the new primary key",
             )?);
             Ok(out)
+        }
+
+        // The same question `AddUnique` asks, because in SQL Server it is the
+        // same object: a UNIQUE constraint is enforced by a unique index, and
+        // which YAML key the uniqueness was written under cannot decide
+        // whether the data is counted. A plain index constrains nothing and
+        // falls to the arm below.
+        Change::AddIndex { table, name, index } if index.unique => {
+            // The key columns only. `INCLUDE` is payload the engine carries in
+            // the leaf and never compares, so counting it would group rows the
+            // index will still collide.
+            let columns: Vec<String> = index.columns.iter().map(|c| c.name.clone()).collect();
+            let applies = match &index.filter {
+                Some(predicate) => Applies::Where(predicate),
+                None => Applies::AllRows,
+            };
+            let rows = rows_after(
+                names,
+                table,
+                &columns,
+                names.moved.get(table),
+                "c",
+                &applies,
+            )?;
+            let Some(rows) = rows else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![duplicate_probe(
+                &format!("(\n{rows}\n) AS r"),
+                &keys(columns.len()),
+                &format!("rows that would collide under the new unique index {name}"),
+            )?])
         }
 
         Change::AddForeignKey {
@@ -629,6 +669,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &constraint.columns,
                 names.moved.get(table),
                 "c",
+                &Applies::AllRows,
             )?
             else {
                 return Ok(Vec::new());
@@ -639,6 +680,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                 &constraint.references_columns,
                 names.moved.get(&constraint.references_table),
                 "p",
+                &Applies::AllRows,
             )?
             else {
                 return Ok(Vec::new());
@@ -686,6 +728,7 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
+        // The unique ones are counted above; a plain index refuses nothing.
         | Change::AddIndex { .. }
         | Change::DropIndex { .. }
         // Inserting and updating a declared row need no probe: the row's whole
@@ -1283,6 +1326,17 @@ fn unprobeable_probe(
     )))
 }
 
+/// Which rows a constraint judges: every row of the relation, or only the
+/// ones a filtered index's predicate keeps.
+///
+/// Named rather than an `Option<&str>` so that the callers that judge every
+/// row say so, and the one that does not carries the predicate it means.
+enum Applies<'a> {
+    AllRows,
+    /// The `WHERE` of a filtered index, verbatim as declared.
+    Where(&'a str),
+}
+
 /// One table's rows in `columns`, as the plan will have left them by the time
 /// the change that asks runs — a derived table whose columns are `k0`..`kn`.
 ///
@@ -1320,13 +1374,46 @@ fn unprobeable_probe(
 /// has no value before it runs (117). That is the same direction every other
 /// probe leans: the engine refuses such a row loudly inside the transaction,
 /// where a guess here could refuse a plan that is perfectly good.
+///
+/// `applies` narrows the relation to a filtered index's predicate. That
+/// predicate is arbitrary SQL over the whole row, and this relation is a
+/// projection of a few columns unioned with rows that are not in the table
+/// yet, so it can only be asked of the stored branch and only where this plan
+/// leaves that branch's rows and column names alone. Where it cannot be asked,
+/// the answer is `None` — no probe — and never the unfiltered count, which
+/// counts duplicates among the very rows the index exempts and refuses a plan
+/// the engine would have accepted (DECISIONS 236).
 fn rows_after(
     names: &AsStored,
     table: &TableName,
     columns: &[String],
     moved: Option<&Moved>,
     alias: &str,
+    applies: &Applies<'_>,
 ) -> Result<Option<String>, DialectError> {
+    let filter = match applies {
+        Applies::AllRows => None,
+        Applies::Where(predicate) => {
+            // The predicate reads columns this projection does not carry, so
+            // it can only run against the stored table. Three things put a row
+            // beyond it, and each is the "invent a violation" direction if
+            // guessed: a row the plan *writes*, whose membership of the
+            // filtered set is decided by values no `WHERE` here can see — an
+            // update that touches no key column still moves a row in or out; a
+            // column of this table the plan *renames*, after which the
+            // predicate's text either names nothing (`Msg 207`, reported
+            // unchecked) or, when the plan also renames a second column into
+            // that spelling, silently names the wrong one; and a column the
+            // plan *adds*, which is not there for the predicate to read.
+            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+                || names.columns.keys().any(|c| c.table == *table)
+                || names.added.keys().any(|c| c.table == *table)
+            {
+                return Ok(None);
+            }
+            Some(*predicate)
+        }
+    };
     let mut branches = Vec::new();
     // Whether a row the plan writes was dropped because one of the key's cells
     // is a value no probe can evaluate — a default that is not a literal
@@ -1380,6 +1467,12 @@ fn rows_after(
                 selected.join(", "),
                 qualified(&stored)?
             );
+            let mut where_clauses: Vec<String> = Vec::new();
+            // Parenthesised, because the predicate is the user's text and an
+            // `OR` in it would otherwise bind looser than the exclusion below.
+            if let Some(predicate) = filter {
+                where_clauses.push(format!("({predicate})"));
+            }
             // Minus the rows this plan takes away or moves within these columns:
             // both run first, so counting them is counting a state that will not
             // be there. A row the plan rewrites comes back below, as it will be.
@@ -1401,12 +1494,15 @@ fn rows_after(
                     let Some(key_column) = names.column(&table.column(&m.key_column)) else {
                         return Ok(None);
                     };
-                    sql.push_str(&format!(
-                        " WHERE {alias}.{} NOT IN ({})",
+                    where_clauses.push(format!(
+                        "{alias}.{} NOT IN ({})",
                         quote(&key_column.name)?,
                         gone.into_iter().collect::<Vec<_>>().join(", ")
                     ));
                 }
+            }
+            if !where_clauses.is_empty() {
+                sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
             }
             branches.push(sql);
         }
@@ -2323,6 +2419,147 @@ mod tests {
         ]);
         assert_eq!(s.len(), 1, "{s:?}");
         assert!(s[0].contains("N'new'"), "the planned row is in it: {s:?}");
+    }
+
+    fn index(columns: &[&str], unique: bool, filter: Option<&str>) -> Change {
+        Change::AddIndex {
+            table: tname("dbo.customer"),
+            name: "ix_customer_email".into(),
+            index: Box::new(pbps_model::Index {
+                columns: columns
+                    .iter()
+                    .map(|c| pbps_model::IndexColumn {
+                        name: (*c).to_owned(),
+                        descending: false,
+                    })
+                    .collect(),
+                include: vec!["note".into()],
+                unique,
+                filter: filter.map(str::to_owned),
+            }),
+        }
+    }
+
+    /// The engine enforces a `UNIQUE` constraint with a unique index, so the
+    /// two spellings of one object have to be counted alike. Written under
+    /// `indexes:` the change was probed by nobody, and the duplicates arrived
+    /// as an engine error mid-apply — after every earlier `--staged`
+    /// checkpoint had committed.
+    #[test]
+    fn a_unique_index_counts_the_colliding_rows_and_a_plain_one_is_not_probed() {
+        let sql = sql_of(&index(&["email", "tenant"], true, None));
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        // The key columns, and only those: `INCLUDE` is payload the index
+        // never compares, so grouping by it would miss the collision.
+        assert!(
+            sql[0].contains("SELECT c.[email] AS k0, c.[tenant] AS k1 FROM [dbo].[customer] AS c"),
+            "{sql:?}"
+        );
+        assert!(!sql[0].contains("[note]"), "{sql:?}");
+        assert!(sql[0].contains("GROUP BY r.k0, r.k1"), "{sql:?}");
+        assert!(sql[0].contains("HAVING COUNT(*) > 1"), "{sql:?}");
+
+        // The negative half, and the point of the fix: a plain index
+        // constrains nothing, so it stays unprobed. Without this the fix
+        // reads as "probe every index".
+        assert!(sql_of(&index(&["email"], false, None)).is_empty());
+    }
+
+    /// A filtered unique index constrains only the rows its predicate keeps.
+    /// Counting the others is the "invent a violation" direction: duplicates
+    /// among exempt rows would refuse a plan the engine accepts.
+    #[test]
+    fn a_filtered_unique_index_counts_only_the_rows_its_predicate_keeps() {
+        let sql = sql_of(&index(&["email"], true, Some("[deleted_at] IS NULL")));
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].contains("WHERE ([deleted_at] IS NULL)"), "{sql:?}");
+
+        // Beside a delete, both survive: the predicate decides membership and
+        // the exclusion drops a row that will not be there to collide.
+        let sql = probes(&plan(vec![
+            Change::DeleteRow {
+                table: tname("dbo.customer"),
+                key_column: "code".into(),
+                key: RowKey::from("dup"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                row: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+            },
+            index(&["email"], true, Some("[deleted_at] IS NULL")),
+        ]))
+        .into_iter()
+        .filter(|p| p.description.contains("collide"))
+        .map(|p| p.sql)
+        .collect::<Vec<_>>();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains("WHERE ([deleted_at] IS NULL) AND c.[code] NOT IN (N'dup')"),
+            "{sql:?}"
+        );
+    }
+
+    /// Where the predicate cannot be evaluated, the honest answer is no probe.
+    /// The unfiltered count is not a safe fallback: it counts collisions among
+    /// the rows the index exempts and refuses a valid plan.
+    #[test]
+    fn a_filtered_unique_index_is_unprobed_where_its_predicate_cannot_be_asked() {
+        let filtered = index(&["email"], true, Some("[deleted_at] IS NULL"));
+        let probed = |changes: Vec<Change>| {
+            probes(&plan(changes))
+                .into_iter()
+                .filter(|p| p.description.contains("collide"))
+                .count()
+        };
+
+        // A row the plan writes: its membership of the filtered set depends on
+        // `deleted_at`, which this relation does not carry — and an update
+        // that touches no key column can still move a row in or out of it.
+        assert_eq!(
+            probed(vec![
+                Change::InsertRow {
+                    table: tname("dbo.customer"),
+                    key_column: "code".into(),
+                    identity_key: false,
+                    key: RowKey::from("new"),
+                    row: Default::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+                filtered.clone(),
+            ]),
+            0
+        );
+
+        // A column of this table renamed by the same plan: the predicate's
+        // text names the table as it will be, not as the probe finds it.
+        assert_eq!(
+            probed(vec![
+                Change::RenameColumn {
+                    uid: uid("c_aaaaaa"),
+                    table: tname("dbo.customer"),
+                    from: "removed_at".into(),
+                    to: "deleted_at".into(),
+                },
+                filtered.clone(),
+            ]),
+            0
+        );
+
+        // An unfiltered index over the very same plan is still probed: what
+        // was refused is the predicate, not the counting.
+        assert_eq!(
+            probed(vec![
+                Change::RenameColumn {
+                    uid: uid("c_aaaaaa"),
+                    table: tname("dbo.customer"),
+                    from: "removed_at".into(),
+                    to: "deleted_at".into(),
+                },
+                index(&["email"], true, None),
+            ]),
+            1
+        );
     }
 
     /// `order_key` runs every row change (9, 10) before every constraint
