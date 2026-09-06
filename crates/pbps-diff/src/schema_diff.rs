@@ -276,6 +276,14 @@ pub fn diff_partial(
     // change's rendering. Debug output alone would sort by uid, which is random
     // at mint time — the plan would be correct but differently ordered per
     // project, and a reviewer diffing two plan.sql files would see noise.
+    //
+    // `subject()` does not speak for one side consistently: `RenameTable` and
+    // `RenameRole` answer with the name the object is losing, everything else
+    // with the name it will have. Two changes to one object are therefore
+    // sorted against two different spellings of it, and the alphabet — not the
+    // dependency — decides which wins. Anything with a real order between them
+    // belongs in separate `order_key` classes; this tiebreaker cannot express
+    // it.
     // Rows follow the foreign keys among the tables that declare them. The
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
@@ -1127,6 +1135,11 @@ fn diff_modules(
 /// Renames come first, so every later step can use current names. Dropping
 /// constraints and indexes must precede dropping columns, since they may
 /// reference those columns; adding them must follow adding columns.
+/// Inserting a class shifts every class below it, and these ordinals are
+/// quoted in prose that uses them to justify behaviour: DECISIONS 140, 146,
+/// 151 and 174, `docs/PITFALLS.md`, and `preflight.rs`. A new class means
+/// renumbering those in the same commit — a stale ordinal there reads as a
+/// statement about the code and is not checked against it.
 fn order_key(c: &Change) -> u8 {
     match c {
         // Modules go first and last, and both ends are load-bearing. A
@@ -1137,27 +1150,40 @@ fn order_key(c: &Change) -> u8 {
         // A role drop needs nothing else gone first, and a plan that also
         // recreates the name wants the old one out of the way early.
         Change::DropRole { .. } => 0,
-        Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => 1,
+        // A table rename, and a role rename that depends on nothing here.
+        Change::RenameTable { .. } | Change::RenameRole { .. } => 1,
+        // A class of its own, after the table renames: `sp_rename` on a column
+        // names the table, and `resolve_columns` iterates the *declared*
+        // schema, so a `RenameColumn` always carries the post-rename table.
+        //
+        // Not sharing class 1 with `RenameTable`, which is where it was. The
+        // two are not peers — one depends on the other — and sharing a class
+        // left `subject()` to separate them. `RenameTable` answers with its
+        // `from`, the old name, while the column rename carries the new one,
+        // so the two were sorted against two different names for one table and
+        // the alphabet decided: `dbo.customers` -> `dbo.clients` put the
+        // column rename first, against a table that did not exist yet.
+        Change::RenameColumn { .. } => 2,
         // After the renames, so a revoke names the role and the object as
         // they now are; before the drops, though a revoke on an object this
         // plan drops is never emitted (see `diff_roles`).
-        Change::Revoke { .. } => 2,
+        Change::Revoke { .. } => 3,
         Change::DropIndex { .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. } => 2,
-        Change::DropColumn { .. } => 3,
-        Change::DropTable { .. } => 4,
-        Change::CreateTable { .. } => 5,
-        Change::AddColumn { .. } => 6,
+        | Change::DropCheck { .. } => 3,
+        Change::DropColumn { .. } => 4,
+        Change::DropTable { .. } => 5,
+        Change::CreateTable { .. } => 6,
+        Change::AddColumn { .. } => 7,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 7,
-        Change::SetColumnDeprecated { .. } => 8,
+        | Change::AlterColumnDefault { .. } => 8,
+        Change::SetColumnDeprecated { .. } => 9,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
-        Change::InsertRow { .. } | Change::UpdateRow { .. } => 9,
+        Change::InsertRow { .. } | Change::UpdateRow { .. } => 10,
         // Rows leave after every insert and update, and after the foreign keys
         // that could block them are gone. No single order satisfies every
         // shape — a delete-then-insert on a table with a UNIQUE elsewhere
@@ -1168,20 +1194,20 @@ fn order_key(c: &Change) -> u8 {
         // at the old one when the old one goes, and `ON DELETE CASCADE` takes
         // the child with it, after which the update touches zero rows and
         // nothing says so.
-        Change::DeleteRow { .. } => 10,
+        Change::DeleteRow { .. } => 11,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
-        | Change::AddIndex { .. } => 11,
-        Change::CreateModule { .. } | Change::AlterModule { .. } => 12,
+        | Change::AddIndex { .. } => 12,
+        Change::CreateModule { .. } | Change::AlterModule { .. } => 13,
         // A grant names an object, so it comes after every object exists —
         // and after the role does.
-        Change::CreateRole { .. } => 13,
-        Change::Grant { .. } => 14,
+        Change::CreateRole { .. } => 14,
+        Change::Grant { .. } => 15,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
-        Change::SetDataMode { .. } => 15,
+        Change::SetDataMode { .. } => 16,
     }
 }
 /// The defaults an inserted row is left to: every column the row omits, the
@@ -2571,7 +2597,7 @@ mod tests {
     /// column's table as the declaration does, because by the time the drop
     /// runs the rename has already happened.
     ///
-    /// `order_key` puts `RenameTable` at 1 and `DropColumn` at 3, so the
+    /// `order_key` puts `RenameTable` at 1 and `DropColumn` at 4, so the
     /// statements are emitted in that order. Built from the base side's
     /// `ColumnRef` — which every sibling change in that loop is not — the plan
     /// read `sp_rename 'dbo.customers', 'clients'` and then
@@ -2649,6 +2675,79 @@ mod tests {
             panic!("no DropColumn in {kinds:?}");
         };
         assert!(rename < drop, "{kinds:?}");
+    }
+
+    /// A table renamed beside a column of its own: the plan's kinds, in order.
+    ///
+    /// The column rename is spelled with the table's **declared** name because
+    /// `resolve_columns` iterates the declared schema, which is the whole
+    /// reason the two changes are sorted against two different names for one
+    /// table.
+    fn rename_pair(from: &str, to: &str) -> Vec<String> {
+        let base = schema_of(
+            from,
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("old", Column::new(ty("int"))),
+            ]),
+        );
+        let declared = schema_of(
+            to,
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("new", Column::new(ty("int"))),
+            ]),
+        );
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: from.parse().unwrap(),
+                    to: to.parse().unwrap(),
+                },
+                Intent::RenameColumn {
+                    table: to.parse().unwrap(),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+            ],
+        );
+        kinds(&cs)
+    }
+
+    /// A column rename runs after the rename of the table it names, even when
+    /// the table's new name sorts before its old one.
+    ///
+    /// `RenameTable` answers `subject()` with its **`from`** — the old name —
+    /// while `RenameColumn` carries the declared, post-rename table. Sharing
+    /// one ordering class, the two were separated by that tiebreaker, so the
+    /// alphabet decided: `"dbo.clients" < "dbo.customers"` put the column
+    /// rename first and the plan emitted
+    /// `sp_rename 'dbo.clients.old', 'new', 'COLUMN'` against a table that did
+    /// not exist yet. A valid, reviewed plan the engine refuses.
+    #[test]
+    fn a_column_rename_follows_its_table_rename_though_the_new_name_sorts_first() {
+        assert_eq!(
+            rename_pair("dbo.customers", "dbo.clients"),
+            ["RenameTable", "RenameColumn"],
+            "the column rename must name a table that already exists"
+        );
+    }
+
+    /// The same pair with the names the other way round, where the tiebreaker
+    /// happened to give the right answer already.
+    ///
+    /// This is the case that passed before the fix, and it is here so the fix
+    /// is not read as a coincidence of names: the order must come from the
+    /// dependency, not from which spelling sorts lower.
+    #[test]
+    fn a_column_rename_follows_its_table_rename_though_the_old_name_sorts_first() {
+        assert_eq!(
+            rename_pair("dbo.clients", "dbo.customers"),
+            ["RenameTable", "RenameColumn"],
+            "the order must not depend on the alphabet"
+        );
     }
 
     #[test]

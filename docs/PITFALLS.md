@@ -224,11 +224,11 @@ one group.
 
 **The other form: the rows.** A probe attached to a change that sorts *after*
 the row changes is not asking about the table the statement will meet. Row
-changes are ranks 9 and 10; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
-`AddForeignKey` and `AddIndex` are all 11. So a plan that deletes its own
+changes are ranks 10 and 11; `AddCheck`, `AddUnique`, `SetPrimaryKey`,
+`AddForeignKey` and `AddIndex` are all 12. So a plan that deletes its own
 violations and then tightens was refused for violations that will be gone, and
 one that writes violating rows was told there were none. `AlterColumnType`,
-`AlterColumnNullability` and `AddColumn` sort at 6-8, before the rows, so
+`AlterColumnNullability` and `AddColumn` sort at 7-9, before the rows, so
 reading the current table is exactly right for those — **the rank is the
 test**, not the intuition that "a probe should see the future".
 
