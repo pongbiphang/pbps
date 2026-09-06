@@ -172,8 +172,16 @@ fn one_blocker(b: &Blocker) -> String {
             for i in intents {
                 s.push_str(&format!("    {}\n", intent(i)));
             }
+            // Where it was written, not where it was read. An intent reaches
+            // `resolve` from a `renamed_from:` line, from the `pbps rename`
+            // being run right now (`cmd_intent` appends it to the loaded ones)
+            // or from an answer at the prompt, and a remedy naming only the
+            // declarations sends the user to delete the annotation that is
+            // right — after which the column it explained is an unexplained
+            // addition and the old one an unexplained drop.
             s.push_str(
-                "\n    edit the declarations so that only one of them names it, then plan again\n",
+                "\n    keep one and drop the other where it was written: a `renamed_from:` \
+                 line in the declarations, or the `pbps rename` you have just run\n",
             );
             s
         }
@@ -981,8 +989,36 @@ mod tests {
         });
         assert_eq!(f.id, "identity.conflicting-rename-intents");
         assert!(
-            f.remedy.as_deref().is_some_and(|r| r.contains("edit the")),
+            f.remedy.as_deref().is_some_and(|r| r.contains("keep one")),
             "{f:?}"
         );
+    }
+
+    /// The remedy does not say where the contradiction lives, because it does
+    /// not know.
+    ///
+    /// One claimant can be a `renamed_from:` line and the other the
+    /// `pbps rename` being run right now — `cmd_intent` appends the
+    /// command-line intent to the loaded ones and resolves them together — so
+    /// a remedy that says "edit the declarations" is advice to delete the
+    /// annotation that is right, which turns the next plan into an ambiguity.
+    #[test]
+    fn a_rename_conflict_does_not_claim_both_claimants_are_in_the_files() {
+        let claim = |to: &str| Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: to.into(),
+        };
+        let text = one_blocker(&Blocker::ConflictingRenameIntents {
+            side: RenameSide::Source,
+            name: "dbo.t.old".into(),
+            intents: vec![claim("aaa"), claim("zzz")],
+        });
+        assert!(
+            !text.contains("edit the declarations"),
+            "the remedy must not assume both claimants are annotations: {text}"
+        );
+        assert!(text.contains("pbps rename"), "{text}");
+        assert!(text.contains("renamed_from"), "{text}");
     }
 }
