@@ -294,19 +294,28 @@ locked-copy `update-index` ran it), so every `git` also takes
    temporary made from the tree mode alone would turn a `0600` file into a
    `0644` one and drop its ACLs and extended attributes — copying the
    permission bits (`fstat`, `fchmod`), the owner and group where the
-   process may set them (`fchown`), and every extended attribute and ACL
-   (`flistxattr`, `fgetxattr`, `fsetxattr`), all through the handles and
-   never by name, and refusing the compose where any of them cannot be
-   copied rather than exchanging a file that has lost something; a new
+   process may set them (`fchown`), every extended attribute
+   (`flistxattr`, `fgetxattr`, `fsetxattr`), and the ACL through the
+   platform's ACL interface — on Linux the `system.posix_acl_*` attributes
+   the calls above already carry, on macOS `acl_get_fd_np` and
+   `acl_set_fd_np`, since Darwin keeps an ACL outside the attribute list —
+   all through the handles and never by name, and refusing the compose
+   where any of them cannot be copied rather than exchanging a file that
+   has lost something; a new
    file gets the mode `0666` less the umask, which is what an editor would
    give it — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
    `renamex_np(RENAME_SWAP)` — then hashes the file that came *out* and
-   reads its mode: if the blob is not the one the page was shown, an editor
-   saved between step 1's check and the exchange; if the mode is not the
-   tip entry's, the user changed the executable bit in the working tree,
-   which the blob does not carry and the exchange would have silently
-   reset. In either case the two are exchanged back and the compose is
+   reads back the whole of its metadata: if the blob is not the one the
+   page was shown, an editor saved between step 1's check and the
+   exchange; if the mode is not the tip entry's, the user changed the
+   executable bit in the working tree, which the blob does not carry and
+   the exchange would have silently reset; and if the permission bits,
+   owner, group, attributes or ACL are not what the temporary copied a
+   moment earlier, something changed them in that gap and the copy is
+   already stale — the same comparison the copy was made from, taken
+   again on the other side of the exchange. In any of these cases the
+   two are exchanged back and the compose is
    refused with what differs shown — and so is every path placed before
    it, in reverse order: an exchanged path is exchanged back, a path
    `link()` created is unlinked, since an intent may edit more than one
