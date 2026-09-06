@@ -288,10 +288,18 @@ locked-copy `update-index` ran it), so every `git` also takes
    carrying both showed as `s`), and a path the user has told `git` to
    leave alone is not one the UI should quietly bring back. Under the
    lock, what step 1 saw is what step 6 finds.
-2. It writes each edited file beside its path, gives it the mode the tip's
-   entry has — executable for `100755`, since the exchange swaps the
-   files' metadata with them and a `0644` temporary would leave a `100755`
-   path reported modified under `core.fileMode` — and puts it in place
+2. It writes each edited file beside its path, gives it the metadata of
+   the file it replaces — the exchange swaps the files' metadata with them,
+   and `git`'s `100644`/`100755` carries only the executable bit, so a
+   temporary made from the tree mode alone would turn a `0600` file into a
+   `0644` one and drop its ACLs and extended attributes — copying the
+   permission bits (`fstat`, `fchmod`), the owner and group where the
+   process may set them (`fchown`), and every extended attribute and ACL
+   (`flistxattr`, `fgetxattr`, `fsetxattr`), all through the handles and
+   never by name, and refusing the compose where any of them cannot be
+   copied rather than exchanging a file that has lost something; a new
+   file gets the mode `0666` less the umask, which is what an editor would
+   give it — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
    `renamex_np(RENAME_SWAP)` — then hashes the file that came *out* and
    reads its mode: if the blob is not the one the page was shown, an editor
