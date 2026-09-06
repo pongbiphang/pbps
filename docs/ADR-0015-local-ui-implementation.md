@@ -233,8 +233,22 @@ step made in the CLI user's own order, in this order:
   snapshot; the UI takes each relative to the snapshot's project directory
   and joins it to the checkout's, and those two checkout paths are what
   the rest of this list means by *the declarations* and *the ids file*.
-- **The listing.** `git status --porcelain -z --untracked-files=all
-  --ignored -- <the declarations> <the ids file>`: the pathspec
+- **The listing.** `git status` finds what is new; the tracked files are
+  found by hashing, because the flags that hid `pbps.yml` hide a
+  declaration just as well (**measured**: an edited tracked `.yml` marked
+  `--assume-unchanged` produced no porcelain record while `ls-files -v`
+  said `h`). So every path the tip holds under the declarations directory
+  or at the ids file is checked directly: `git ls-files -v` must say `H`
+  for it, and its bytes, read through its handle, are hashed against the
+  tip's entry — equal means unedited, different means an edit the listing
+  would have named, and any other tag refuses the compose with the path
+  shown, since a path the user has told `git` to leave alone is not one
+  the UI should quietly commit. That is the same check step 1 makes of
+  the paths it is about to edit, made here of every input instead, and it
+  is what discovery rests on; `git status --porcelain -z
+  --untracked-files=all --ignored -- <the declarations> <the ids file>`
+  then adds what the tip does not hold — the new file, the deleted one,
+  the ignored one. Its pathspec
   is those two and never the project directory, and of what it returns
   the UI keeps only the files the CLI itself reads — a path under the
   declarations directory whose extension is `.yml` or `.yaml`, which is
@@ -876,13 +890,27 @@ and files may be placed. The rename is what publishes it — never after, so tha
 worst one step ahead of the disk and never behind it:
 
 - `locking`, before step 0 creates a single file, holding the record's
-  own id alone, so that the locks it is about to make are already
-  attributable; the hash of `<index>.lock` is written to the record as
+  own id, the UI's process id and that process's start time — the pair
+  that says whether the compose is still running, since a process id
+  alone is reused (Linux's `/proc/<pid>/stat` field 22, macOS's
+  `kinfo_proc`, Windows' process creation time) — so that the locks it is
+  about to make are already attributable; the hash of `<index>.lock` is written to the record as
   soon as the copy exists, and again whenever the UI rewrites that file.
 - `placing`, before step 2 touches the first path, adding the branch and
-  the tip step 1 recorded, and, for each path as it is placed, the
-  temporary name beside it — the name a `link()` was made from, or the
-  one the exchange put the old file under.
+  the tip step 1 recorded, and, for each path *before* it is placed, the
+  temporary name beside it — the name a `link()` will be made from, or
+  the one the exchange will put the old file under — together with what
+  identifies each of the two files: the hash and the inode of what the
+  path holds now, and the hash and the inode of the replacement waiting
+  under that temporary name. Both, because the record must be written
+  before the exchange and cannot say afterwards whether the exchange
+  happened: with only the name, a recovery would find a file at the path
+  and a file beside it and no way to tell which is which, and undoing a
+  swap that never happened would put the replacement *into* the working
+  tree while the branch stayed at the old tip. With both, a recovery
+  reads what is at each of the two names and knows which side of the
+  exchange it is on — and where neither pair matches, a third party has
+  touched them and it changes nothing and reports.
 - `composed`, before step 5, adding the commit's id and the entry step 3
   recorded for each path. Every file step 2 wrote is flushed before this
   phase is written — the replacement's contents through its handle, and
@@ -922,7 +950,16 @@ record before each is relied on — so a lock whose hash is the record's is
 the UI's own and any other is a running `git`'s.
 
 At launch, and before it offers to compose, the UI reads every record it
-finds and acts only where the evidence is unambiguous. The locks a crash
+finds and acts only where the evidence is unambiguous. A record whose
+process is still alive — the id and the start time both matching — is a
+compose someone is running right now, in this UI or another launched
+beside it: nothing of it is reclaimed, nothing is rolled back, and this
+UI refuses to compose while it stands, because every lock and every
+leftover it would otherwise recognise as its own kind may be that
+compose's, in use this instant. That includes the branch lock holding the
+record's commit, which a live `update-ref` writes and an interrupted one
+leaves behind identically; only a record whose process is gone gets the
+treatment below. The locks a crash
 left behind are still on disk, so it does not create them again: it reads
 `HEAD.lock` and the branch's lock and continues only where each is either
 absent, and can be created, or already holds this record's id, in which
