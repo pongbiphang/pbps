@@ -293,8 +293,9 @@ locked-copy `update-index` ran it), so every `git` also takes
    tip entry's, the user changed the executable bit in the working tree,
    which the blob does not carry and the exchange would have silently
    reset. In either case the two are exchanged back and the compose is
-   refused with what differs shown — and so is every path exchanged
-   before it, in reverse order, since an intent may edit more than one
+   refused with what differs shown — and so is every path placed before
+   it, in reverse order: an exchanged path is exchanged back, a path
+   `link()` created is unlinked, since an intent may edit more than one
    file and a refusal that left some of them replaced would be a partial
    edit nobody asked for; the retained copies below are made only after
    every path has passed, so at that point nothing has been let go and the
@@ -370,7 +371,10 @@ locked-copy `update-index` ran it), so every `git` also takes
    configuration, not a guarantee this UI adds — a forced signature fails on
    a machine without a key, and so does the shell's.
 5. It moves the branch to the commit only if the branch is still where it
-   was: `git update-ref refs/heads/<branch> <oid> <tip>`, a compare-and-swap
+   was: `git update-ref --no-deref refs/heads/<branch> <oid> <tip>`, a
+   compare-and-swap on the named ref itself — `--no-deref` so that a branch
+   turned into a symbolic ref since step 1 is not followed to a target the
+   UI never locked — 
    that refuses if anything moved the branch in between (ref locks are not
    the index lock; **measured**, the update went through with the index lock
    held), and the one step that changes the checkout. `update-ref` takes
@@ -383,8 +387,12 @@ locked-copy `update-index` ran it), so every `git` also takes
    protocol, so the UI refuses a repository whose `extensions.refStorage`
    names another backend (`reftable` keeps branches in tables no such file
    guards) rather than hold a lock that locks nothing — and
-   only then checks that `HEAD` is still symbolic to the recorded branch and
-   that the branch still names `<oid>` (`git rev-parse refs/heads/<branch>`).
+   only then checks that `HEAD` is still symbolic to the recorded branch,
+   that the branch is still a direct ref and not a symbolic one (`git
+   symbolic-ref refs/heads/<branch>` must fail, as in step 1 — a sibling
+   worktree can make it one under the locks of step 0, which do not cover
+   the branch), and that the branch still names `<oid>` (`git rev-parse
+   refs/heads/<branch>`).
    The gap admits a `symbolic-ref` and it admits a `reset --soft`, which
    moves the branch under a held index lock, and either leaves an index
    built for `<oid>` wrong for the checkout; and a branch is shared by every
