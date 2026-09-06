@@ -2564,6 +2564,142 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
     );
 }
 
+/// The wiring, end to end: `doctor` reads the `data:` block out of the
+/// declarations and asks for the DML that block needs, on the schema that
+/// declares it.
+///
+/// The dialect's unit tests pin what `missing` does once it is told a schema
+/// carries rows, and its live suite pins that `ALTER ON SCHEMA` really confers
+/// no DML on a real server. Neither can tell whether the CLI ever *looks* at
+/// `data:` — an argument left at its default here would keep every one of them
+/// green while `doctor` went on printing "ready" for an account that cannot
+/// write a single declared row.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let db = OwnDatabase::new(&server, "doctordml");
+    let login = format!("pbps_flow_dml_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    // Exactly the list `doctor` printed before reference data was on it: the
+    // managed permissions on `app`, the ledger's own on `dbo` (its tables do
+    // not exist yet, so those fall back to the schema), and the four database
+    // `CREATE`s. No DML anywhere near `app`. `CREATE SCHEMA` has to be first in
+    // its batch, so it travels inside an `EXEC`.
+    on_server(
+        db.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA app;'); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
+             GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+        ),
+    );
+
+    let base = server
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&base, "User Id", &login);
+    let as_login = with_key(&as_login, "Password", password);
+    let as_login = with_key(&as_login, "Database", db.name());
+
+    let d = Demo::new("doctordml");
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\ndata:\n  mode: exact\n  rows:\n    new: {}\n",
+    );
+    let var = format!("PBPS_DOCTOR_DML_{}", std::process::id());
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    d.commit();
+
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env(&var, &as_login)
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let env = &v["data"]["environments"][0];
+    let mut named: Vec<String> = env["missing_permissions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no permission list: {v}"))
+        .iter()
+        .map(|g| g.as_str().unwrap_or_default().to_owned())
+        .collect();
+    named.sort();
+    // Exactly three, and each on the schema that declares the rows: the account
+    // holds everything else, so anything more would be a demand this list has
+    // not earned and anything less is the gap that reaches `apply`.
+    assert_eq!(named.len(), 3, "{v}");
+    for (gap, permission) in named.iter().zip(["DELETE", "INSERT", "UPDATE"]) {
+        assert!(
+            gap.starts_with(&format!("{permission} on SCHEMA::[app] — ")),
+            "{v}"
+        );
+    }
+    // And it is a finding the pipeline can block on, not a note.
+    assert_eq!(code(&o), FINDING, "{}", stderr(&o));
+
+    // The same declarations without the `data:` block ask for none of it: the
+    // demand follows what the project declares, which is the whole reason it
+    // can be made at all.
+    d.table(
+        "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n\
+         primary_key: {name: pk_t, columns: [code]}\n",
+    );
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["doctor", "--format", "json"])
+        .env(&var, &as_login)
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        v["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a project declaring no row must not be asked for DML: {v}"
+    );
+
+    after_test_on_server(
+        &server,
+        &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
+    );
+}
+
 // ---- Phase 3.1: the interactive prompt (SPEC 6.3) ----
 
 /// The conversation itself is unit-tested in `prompt`; what only the real binary

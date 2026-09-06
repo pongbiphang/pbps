@@ -3685,3 +3685,41 @@ SPEC is in sync with all of these.
     certificate this client trusts is its own piece of work; what is measured
     here was measured with `openssl s_client` against the same image and is
     written down above rather than asserted.
+235. **Reference data is asked for its own DML, and `exact` alone is asked for
+    `DELETE`.** `ALTER ON SCHEMA` confers no `INSERT`, `UPDATE` or `DELETE`,
+    and a `data:` block makes the emitter write all three against the
+    **managed** tables. Neither appeared in `doctor`'s list at that scope: the
+    `INSERT` and `DELETE` on it were `Needed::Ledger`, on the two `dbo` tables,
+    and `UPDATE` was absent altogether. So an account granted exactly the list
+    `doctor` printed passed readiness with exit 0, `apply` took the lock and
+    ran the DDL, and the first row died on "INSERT permission was denied" —
+    under `--staged`, after earlier checkpoints had already committed, which is
+    the failure this command exists to prevent.
+
+    Demanded of a project that declares rows and of no other, for the reason
+    `Needed::RoleAdmin` is: whether the project needs it is visible in the
+    declarations `doctor` already reads, and DML on a schema someone else's
+    application owns is not a permission to ask for on spec. This is the second
+    entry on the list to depend on what the project declares, and the same rule
+    holds it — a schema that declares no row is asked for none of the three.
+
+    `DELETE` is split from the other two because the two modes differ in
+    exactly it. `exact` says the declared rows are the whole table, so an
+    undeclared row is a `DELETE`; `ensure` never emits one — that is the
+    promise the mode makes to a table the application also writes to
+    (ADR-0004). An `ensure`-only schema asked for `DELETE` would be asked for
+    row-removal rights on the very table the mode was chosen to keep pbps out
+    of, which is the "make it db_owner" pressure this list refuses everywhere
+    else. Within a schema the demand is the union of what its tables need, so
+    one `exact` table among `ensure` ones still asks.
+
+    The claim underneath it was measured rather than reasoned about, as the
+    three earlier permission mistakes here had to be: a login holding exactly
+    the pre-change list can `ALTER TABLE app.t` and is refused all three row
+    statements on it (`declared_rows_need_dml_that_alter_on_the_schema_does_not_confer`).
+
+    A data schema the database does not have stays a `schema.absent` finding
+    and produces no permission gap. Nothing was asked about it — there is no
+    securable to ask about — and "unasked" is not "holds nothing"; reporting a
+    gap there would fire on every first deployment of a project that seeds
+    rows, naming a securable no `GRANT` can reach yet.

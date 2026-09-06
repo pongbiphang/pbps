@@ -1122,7 +1122,15 @@ because `CREATE TABLE` at the database does not by itself authorize creating a
 table in a given schema. `SELECT` appears twice because it is needed in two
 places for two reasons:
 the probes count rows in managed tables, and reading the recorded state is a
-read of two tables in `dbo`. The ledger's schema is not treated as a managed one
+read of two tables in `dbo`. `INSERT`, `UPDATE` and `DELETE` are asked for on
+each managed schema whose tables declare rows, and on no other: `ALTER ON
+SCHEMA` confers no DML, and a `data:` block makes the emitter write all three
+against the managed tables — so an account granted the rest of this list passed
+readiness and then died on the first row, under `--staged` after earlier
+checkpoints had committed. `DELETE` is asked for only where a table declares
+`mode: exact`; `ensure` never emits one (ADR-0004), and demanding it would ask
+for row-removal rights on the table that mode was chosen to keep pbps out of.
+The ledger's schema is not treated as a managed one
 — a project that declares nothing in `dbo` never touches a `dbo` table and must
 not be asked for `ALTER` there. Asking for all of
 them at database scope — which is what `sys.fn_my_permissions(NULL, 'DATABASE')`

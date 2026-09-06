@@ -185,6 +185,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     let managed_schemas = managed_schemas(project);
     let referenced = referenced_tables(project, &managed_schemas);
     let granted = grant_targets(project);
+    let data = data_schemas(project);
 
     if !project.ids_file().exists() {
         findings.push(
@@ -248,6 +249,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &managed_schemas,
                     &referenced,
                     &granted,
+                    &data,
                 ))
             }
             Err(e) => EnvDiagnosis::unconfigured(
@@ -291,6 +293,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     &managed_schemas,
                     &referenced,
                     &granted,
+                    &data,
                 )),
                 // Each environment is examined independently. One misconfigured
                 // variable must not cost the operator the other five answers —
@@ -432,6 +435,48 @@ fn referenced_tables(project: &Project, managed: &[String]) -> Vec<pbps_model::O
     out.into_iter().collect()
 }
 
+/// The managed schemas holding a table that declares rows, and the strongest
+/// mode among those tables (ADR-0004).
+///
+/// `ALTER ON SCHEMA` confers no DML, so nothing else `doctor` asks for covers
+/// the `INSERT`, `UPDATE` and `DELETE` a `data:` block makes the emitter
+/// write. Read from the declarations, like the role targets, and for the same
+/// reason: a project that declares no rows must not be asked to hold DML on
+/// the schemas it manages.
+///
+/// The mode decides `DELETE` alone. A schema with one `exact` table and five
+/// `ensure` ones needs it; a schema of `ensure` tables does not, because
+/// `ensure` never emits a `DELETE`.
+///
+/// Declarations that do not load give an empty map, for the reason
+/// [`managed_schemas`] gives: the load failure is a finding of its own, and a
+/// project with nothing declared is a real state rather than an error.
+fn data_schemas(project: &Project) -> pbps_mssql::doctor::DataSchemas {
+    let Ok(loaded) = crate::load_quiet(project) else {
+        return pbps_mssql::doctor::DataSchemas::new();
+    };
+    data_schemas_of(&loaded.schema)
+}
+
+/// The declaration half of [`data_schemas`], kept apart from the loading so
+/// the fold over the modes can be tested without a project on disk.
+fn data_schemas_of(schema: &pbps_model::Schema) -> pbps_mssql::doctor::DataSchemas {
+    let mut out = pbps_mssql::doctor::DataSchemas::new();
+    for (name, table) in &schema.tables {
+        let Some(data) = &table.data else {
+            continue;
+        };
+        let entry = out.entry(name.schema.clone()).or_insert(data.mode);
+        // `Exact` wins over `Ensure` whichever order the tables come in: the
+        // demand is the union of what the schema's tables need, not the last
+        // one's.
+        if data.mode == pbps_model::DataMode::Exact {
+            *entry = pbps_model::DataMode::Exact;
+        }
+    }
+    out
+}
+
 /// What the managed roles are granted on (ADR-0005), as far as the project
 /// files can say. Empty when the project declares no role and its ids file
 /// names none — which is not yet "no role": the environment's recorded state
@@ -505,6 +550,7 @@ async fn examine(
     schemas: &[String],
     referenced: &[pbps_model::ObjectName],
     granted: &pbps_mssql::doctor::GrantTargets,
+    data: &pbps_mssql::doctor::DataSchemas,
 ) -> EnvDiagnosis {
     // `unreachable` until a connection says otherwise: every early return below
     // is a database that could not be read, and the state each of them leaves
@@ -553,7 +599,7 @@ async fn examine(
             });
         }
     }
-    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted).await {
+    match pbps_mssql::doctor::permissions(&mut conn, schemas, referenced, granted, data).await {
         Ok(held) => {
             d.missing_permissions = pbps_mssql::doctor::missing(&held)
                 .into_iter()
@@ -895,6 +941,57 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "schema.absent")
             .and_then(|f| f.remedy)
+    }
+
+    /// A table that declares no rows puts its schema nowhere: the DML is asked
+    /// for only of a project that declares a `data:` block, which is what keeps
+    /// `doctor` from asking every estate for write access to its own tables.
+    #[test]
+    fn a_schema_whose_tables_declare_no_rows_is_not_a_data_schema() {
+        let mut schema = pbps_model::Schema::default();
+        schema.tables.insert(
+            "app.customer".parse().unwrap(),
+            pbps_model::schema::Table::default(),
+        );
+        assert!(data_schemas_of(&schema).is_empty());
+    }
+
+    /// `exact` wins over `ensure` within a schema, whichever order the tables
+    /// come in: the demand is the union of what the schema's tables need. A
+    /// schema of `ensure` tables alone stays `ensure`, and gets no `DELETE`.
+    #[test]
+    fn one_exact_table_makes_its_whole_schema_exact() {
+        let mut schema = pbps_model::Schema::default();
+        // `zzz` sorts after `aaa`, so the `ensure` table is the one the fold
+        // sees last: an assignment rather than a max would lose the `exact`.
+        for (name, mode) in [
+            ("app.aaa", pbps_model::DataMode::Exact),
+            ("app.zzz", pbps_model::DataMode::Ensure),
+            ("ref.only", pbps_model::DataMode::Ensure),
+        ] {
+            schema.tables.insert(
+                name.parse().unwrap(),
+                pbps_model::schema::Table {
+                    data: Some(pbps_model::TableData {
+                        mode,
+                        rows: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let out = data_schemas_of(&schema);
+        assert_eq!(
+            out.get("app"),
+            Some(&pbps_model::DataMode::Exact),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.get("ref"),
+            Some(&pbps_model::DataMode::Ensure),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
     }
 
     /// The permission read and the lock read fail independently, and each

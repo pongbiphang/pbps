@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param};
-use pbps_model::ObjectName;
+use pbps_model::{DataMode, ObjectName};
 
 use crate::catalog::get;
 
@@ -112,6 +112,38 @@ pub enum Needed {
     /// what is asked for, because `HAS_PERMS_BY_NAME` cannot ask "held with
     /// grant option".
     Granted,
+
+    /// Needed on every managed schema holding a table that declares rows
+    /// (ADR-0004), and only there (DECISIONS 235).
+    ///
+    /// `ALTER ON SCHEMA` confers no DML. A `data:` block makes the emitter
+    /// write `INSERT INTO <managed table>` and `UPDATE <managed table> SET`,
+    /// and nothing else in this list is asked at a scope that covers them —
+    /// the `INSERT` above is `Needed::Ledger`, on the two `dbo` tables. So an
+    /// account granted exactly what `doctor` printed passed readiness, `apply`
+    /// took the lock and ran the DDL, and the first row died on "INSERT
+    /// permission was denied". Under `--staged` the earlier checkpoints have
+    /// already committed, which is the failure this command exists to prevent.
+    ///
+    /// Demanded of a project that declares rows and of no other, for the
+    /// reason `RoleAdmin` is: whether the project needs it is visible in the
+    /// declarations `doctor` already reads, and DML on a schema someone else's
+    /// application owns is not a permission to ask for on spec.
+    Data,
+
+    /// Needed on a managed schema holding a table that declares rows in
+    /// `mode: exact` — and on no other (DECISIONS 235).
+    ///
+    /// `DELETE` is split from the other two because the modes differ in
+    /// exactly this. `exact` says the declared rows are the whole table, so an
+    /// undeclared row is a `DELETE`; `ensure` "never emits a DELETE — that is
+    /// the promise the mode makes to a table the application also writes to",
+    /// which is `DeleteCause::Undeclared`'s own wording in `pbps-model` and
+    /// the condition the differ really tests. Asking for `DELETE` on an
+    /// `ensure`-only schema would demand row-removal rights on the very table
+    /// the mode was chosen to keep pbps out of, which is the over-demand this
+    /// enum exists to avoid.
+    DataDelete,
 }
 
 /// A permission pbps needs, what needs it, and where it has to be held.
@@ -137,7 +169,7 @@ pub const LEDGER_SCHEMA: &str = "dbo";
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 17] = [
+pub const REQUIRED: [Requirement; 20] = [
     req(
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
@@ -259,6 +291,23 @@ pub const REQUIRED: [Requirement; 17] = [
          securable itself",
         Needed::Granted,
     ),
+    // Reference data (ADR-0004), demanded only of a schema whose tables
+    // declare rows. `ALTER ON SCHEMA` confers none of these.
+    req(
+        "INSERT",
+        "writing a declared row that the table does not have",
+        Needed::Data,
+    ),
+    req(
+        "UPDATE",
+        "correcting a declared row whose values have drifted",
+        Needed::Data,
+    ),
+    req(
+        "DELETE",
+        "removing an undeclared row from a table declared `mode: exact`",
+        Needed::DataDelete,
+    ),
 ];
 
 // # A permission deliberately absent: `CONTROL` on the managed schemas
@@ -352,6 +401,19 @@ pub struct Held {
     /// schema-scoped permissions effective on it. A schema the database does
     /// not have is absent, like a managed schema that does not exist yet.
     pub granted_schemas: BTreeMap<String, BTreeSet<String>>,
+
+    /// Which managed schemas hold a table that declares rows, and whether any
+    /// of those tables is `mode: exact` (ADR-0004).
+    ///
+    /// A *predicate*, not a second set of holdings: the permissions come from
+    /// [`Held::schemas`], which this is a subset of the keys of. Kept as the
+    /// mode rather than as two sets so "exact but not a data schema" cannot be
+    /// written down — `DELETE` is demanded of the `Exact` entries and the
+    /// other two of every entry.
+    ///
+    /// A schema that produced no row from `sys.schemas` does not exist yet and
+    /// is not here, for the reason [`Held::schemas`] gives.
+    pub data_schemas: BTreeMap<String, DataMode>,
 }
 
 /// What the managed roles are granted on, as `doctor` has to ask about it
@@ -375,6 +437,16 @@ pub struct GrantTargets {
     /// be held; the declarations alone cannot see it.
     pub roles: Vec<String>,
 }
+
+/// The managed schemas whose declared tables carry rows, and the strongest
+/// mode among those tables (ADR-0004) — `Exact` if any one of them is exact.
+///
+/// A schema is in here because the project declares a `data:` block on a table
+/// in it, not because that block currently lists rows: `mode: exact` with no
+/// rows means "this table must be empty", which is a `DELETE` per surviving
+/// row. Emptiness of the block is a question for the plan, which sees the
+/// database; `doctor` sees only the declarations.
+pub type DataSchemas = BTreeMap<String, DataMode>;
 
 /// A permission that is needed and not held, and the securable it is missing on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,6 +653,7 @@ pub async fn permissions(
     schemas: &[String],
     referenced: &[ObjectName],
     granted: &GrantTargets,
+    data: &DataSchemas,
 ) -> Result<Held, DbError> {
     let rows = conn
         .query("SELECT permission_name AS name FROM sys.fn_my_permissions(NULL, 'DATABASE');")
@@ -606,7 +679,11 @@ pub async fn permissions(
         .filter(|r| {
             matches!(
                 r.needed,
-                Needed::Managed | Needed::Ledger | Needed::LedgerCreation
+                Needed::Managed
+                    | Needed::Ledger
+                    | Needed::LedgerCreation
+                    | Needed::Data
+                    | Needed::DataDelete
             )
         })
         .map(|r| r.name)
@@ -848,6 +925,16 @@ pub async fn permissions(
     let managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
     per_schema.retain(|name, _| managed.contains(name.as_str()));
 
+    // Narrowed to the schemas that were actually asked about. A data schema
+    // the database does not have is already reported by `absent_schemas`, and
+    // leaving it here would have `missing` look for holdings that were never
+    // read — the same "unasked is not empty" trap `Held::schemas` documents.
+    let data_schemas: DataSchemas = data
+        .iter()
+        .filter(|(name, _)| per_schema.contains_key(*name))
+        .map(|(name, mode)| (name.clone(), *mode))
+        .collect();
+
     Ok(Held {
         database,
         schemas: per_schema,
@@ -858,6 +945,7 @@ pub async fn permissions(
         roles_declared,
         granted_objects,
         granted_schemas,
+        data_schemas,
     })
 }
 
@@ -978,6 +1066,42 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                     }
                 }
                 for (schema, granted) in &held.granted_schemas {
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Schema(schema.clone()),
+                        });
+                    }
+                }
+            }
+            // Iterated over `held.schemas`, the map of what was asked and
+            // answered, with `data_schemas` used only as a predicate. A data
+            // schema the database does not have is therefore skipped here and
+            // reported as absent instead — the same rule `Needed::Managed`
+            // follows, and the reason it is not a lookup that could miss.
+            Needed::Data => {
+                for (schema, granted) in &held.schemas {
+                    if !held.data_schemas.contains_key(schema) {
+                        continue;
+                    }
+                    if !granted.contains(r.name) {
+                        out.push(Gap {
+                            permission: r.name,
+                            why: r.why,
+                            securable: Securable::Schema(schema.clone()),
+                        });
+                    }
+                }
+            }
+            // `exact` only, for the reason the variant gives: `ensure` never
+            // emits a DELETE, and demanding one would be asking for the
+            // permission that mode was chosen to withhold.
+            Needed::DataDelete => {
+                for (schema, granted) in &held.schemas {
+                    if held.data_schemas.get(schema) != Some(&DataMode::Exact) {
+                        continue;
+                    }
                     if !granted.contains(r.name) {
                         out.push(Gap {
                             permission: r.name,
@@ -1119,6 +1243,9 @@ mod tests {
             roles_declared: false,
             granted_objects: BTreeMap::new(),
             granted_schemas: BTreeMap::new(),
+            // No `data:` block is the overwhelmingly common case, so this
+            // helper declares none; the tests that need one add it.
+            data_schemas: BTreeMap::new(),
         }
     }
 
@@ -1201,6 +1328,121 @@ mod tests {
         held.database.insert("CREATE ROLE".into());
         held.database.insert("ALTER ANY ROLE".into());
         assert!(missing(&held).is_empty());
+    }
+
+    /// The same holdings with the DML struck out, which is what an account
+    /// granted exactly the list `doctor` used to print holds.
+    fn everything_but_the_dml(schemas: &[&str]) -> Held {
+        let mut held = everything(schemas);
+        for granted in held.schemas.values_mut() {
+            for p in ["INSERT", "UPDATE", "DELETE"] {
+                granted.remove(p);
+            }
+        }
+        held
+    }
+
+    /// `ALTER ON SCHEMA` confers no DML, and a `data:` block makes the emitter
+    /// write `INSERT`, `UPDATE` and `DELETE` against the **managed** tables. An
+    /// account holding everything else passed readiness with exit 0, `apply`
+    /// took the lock and ran the DDL, and the first row died on "INSERT
+    /// permission was denied" — under `--staged`, after earlier checkpoints
+    /// had committed.
+    #[test]
+    fn a_schema_declaring_rows_is_asked_for_the_dml_alter_does_not_confer() {
+        let mut held = everything_but_the_dml(&["app"]);
+        let gaps = missing(&held);
+        assert!(
+            gaps.is_empty(),
+            "a project declaring no row must not be asked for DML: {gaps:?}"
+        );
+
+        held.data_schemas.insert("app".to_owned(), DataMode::Exact);
+        let gaps = missing(&held);
+        let mut named: Vec<String> = gaps
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                "DELETE on SCHEMA::[app]",
+                "INSERT on SCHEMA::[app]",
+                "UPDATE on SCHEMA::[app]",
+            ],
+            "{gaps:?}"
+        );
+        // Each says what it is for: the report is "you lack this, for that",
+        // and a DML gap indistinguishable from the ledger's would send the
+        // operator to grant it on the ledger's schema instead.
+        assert!(
+            gaps.iter().all(|g| !g.why.contains("lock")),
+            "the ledger's reasons must not be reused for reference data: {gaps:?}"
+        );
+
+        for p in ["INSERT", "UPDATE", "DELETE"] {
+            held.schemas
+                .get_mut("app")
+                .expect("the managed schema is in the map")
+                .insert(p.to_owned());
+        }
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
+    }
+
+    /// `ensure` never emits a `DELETE` — that is the promise the mode makes to
+    /// a table the application also writes to. Demanding it anyway would ask a
+    /// DBA for row-removal rights on the very table the mode was chosen to
+    /// keep pbps out of, which is the over-demand this list refuses.
+    #[test]
+    fn an_ensure_only_schema_is_not_asked_for_delete() {
+        let mut held = everything_but_the_dml(&["app"]);
+        held.data_schemas.insert("app".to_owned(), DataMode::Ensure);
+        let mut named: Vec<&str> = missing(&held).iter().map(|g| g.permission).collect();
+        named.sort_unstable();
+        assert_eq!(named, ["INSERT", "UPDATE"], "{:?}", missing(&held));
+    }
+
+    /// The demand is the union of what a schema's tables need, so one `exact`
+    /// table among `ensure` ones still asks for `DELETE` — and a managed
+    /// schema that declares no row at all is asked for none of the three,
+    /// which is the whole point of making this depend on the declarations.
+    #[test]
+    fn the_dml_demanded_is_per_schema_and_not_estate_wide() {
+        let mut held = everything_but_the_dml(&["app", "ref", "plain"]);
+        held.data_schemas.insert("app".to_owned(), DataMode::Exact);
+        held.data_schemas.insert("ref".to_owned(), DataMode::Ensure);
+        let mut named: Vec<String> = missing(&held)
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.securable()))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                "DELETE on SCHEMA::[app]",
+                "INSERT on SCHEMA::[app]",
+                "INSERT on SCHEMA::[ref]",
+                "UPDATE on SCHEMA::[app]",
+                "UPDATE on SCHEMA::[ref]",
+            ],
+            "{:?}",
+            missing(&held)
+        );
+    }
+
+    /// A declared schema the database does not have produced no row from
+    /// `sys.schemas`, so nothing was asked about it and nothing can be said —
+    /// it is reported by `absent_schemas` instead. Reporting a DML gap there
+    /// too would fire on every first deployment of a project that seeds rows,
+    /// and would name a securable no grant can reach yet.
+    #[test]
+    fn a_data_schema_the_database_lacks_is_reported_absent_and_not_as_a_dml_gap() {
+        let mut held = everything_but_the_dml(&["app"]);
+        held.schemas.remove("app");
+        held.absent_schemas.insert("app".to_owned());
+        held.data_schemas.insert("app".to_owned(), DataMode::Exact);
+        assert!(missing(&held).is_empty(), "{:?}", missing(&held));
     }
 
     /// A `GRANT` is authorized on the securable itself, which `ALTER` on the
@@ -1359,12 +1601,18 @@ mod tests {
     }
 
     /// The ledger and the lock live in `dbo`. Demanding INSERT and DELETE on an
-    /// application schema would send an organization to grant a write
-    /// permission the deployment never uses there — and this list only stays
-    /// credible if every entry on it is really needed.
+    /// application schema *for their sake* would send an organization to grant
+    /// a write permission the deployment never uses there — and this list only
+    /// stays credible if every entry on it is really needed.
+    ///
+    /// A `data:` block does make the deployment write rows in an application
+    /// schema, and that is asked for separately (`Needed::Data`) and only of a
+    /// project that declares one; this holds nothing back from that. The
+    /// project here declares no row, which is what keeps the demand at nil.
     #[test]
     fn the_ledger_writes_are_not_demanded_on_an_application_schema() {
         let mut held = everything(&["dbo", "app"]);
+        assert!(held.data_schemas.is_empty(), "no row is declared here");
         let app = held.schemas.get_mut("app").unwrap();
         app.remove("INSERT");
         app.remove("DELETE");
@@ -1677,16 +1925,21 @@ mod tests {
             roles_declared: false,
             granted_objects: BTreeMap::new(),
             granted_schemas: BTreeMap::new(),
+            data_schemas: BTreeMap::new(),
         };
         // Not the ones that depend on what the project declares: no foreign
-        // key out of the managed schemas, and no role, means none of those
-        // are asked about at all.
+        // key out of the managed schemas, no role, and no declared row means
+        // none of those are asked about at all.
         let applicable = REQUIRED
             .iter()
             .filter(|r| {
                 !matches!(
                     r.needed,
-                    Needed::Referenced | Needed::RoleAdmin | Needed::Granted
+                    Needed::Referenced
+                        | Needed::RoleAdmin
+                        | Needed::Granted
+                        | Needed::Data
+                        | Needed::DataDelete
                 )
             })
             .count();
