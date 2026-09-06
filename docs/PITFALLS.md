@@ -772,6 +772,14 @@ and whose target is appearing. A leftover annotation — the thing
 soon as the vacated name is reused, and the wider guard refused that valid plan.
 **A guard that admits more than the code it guards is a new way to say no.**
 
+**And a guard that stops the work is a new way to say the wrong no.** The first
+form raised its blocker and skipped the rest of the resolver, which reads as
+caution and is not: the skipped decision was discarded anyway, and skipping it
+stranded every unrelated intent of that kind, so the sweep at the end called a
+correct annotation a likely typo. **A check that has found something should add
+to the report, not subtract from the work** — unless the work would write
+something, and here it never does.
+
 ## Tests that pass for the wrong reason
 
 Eleven so far, every one invisible in a green run. **Assert the specific failure,

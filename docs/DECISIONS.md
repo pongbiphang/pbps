@@ -4230,12 +4230,16 @@ SPEC is in sync with all of these.
     valid plan for an annotation nobody had got around to deleting, which is
     the failure this repo weighs heaviest.
 
-    It runs before its scope's matching loop and that scope then returns, the
-    same shape `AmbiguousColumns` uses: the loop would decide the contest by
-    declaration order, and every judgement after it is downstream of that.
-    The contending intents are marked used, or the sweep at the end of
-    `resolve` would report each of them a second time as "matches nothing …
-    likely a typo" — the opposite of what is wrong with them.
+    It runs before its scope's matching loop, raises what it finds, and the
+    loop then runs anyway. Skipping it — the shape `AmbiguousColumns` uses —
+    was the obvious move and the wrong one twice over: the loop's
+    order-dependent decision goes nowhere in any case, because `resolve`
+    discards the whole `Resolution` when it returns `Err`, while skipping it
+    leaves every *other* intent of that kind unmatched, so an unrelated and
+    perfectly matchable rename or drop beside the contest was reported as
+    "matches nothing … likely a typo". The contending intents themselves are
+    marked used for the same reason: the sweep must not be told twice, and the
+    second telling is the misleading one.
 
     **Identical intents are not a conflict.** The same rename reaches `resolve`
     twice whenever a `renamed_from` annotation is also answered at the

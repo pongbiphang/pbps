@@ -871,6 +871,126 @@ mod tests {
         );
     }
 
+    /// A conflict does not make a typo of the intents beside it.
+    ///
+    /// The guard raises the contest and the resolver carries on. Skipping the
+    /// rest of the kind was the obvious move and the wrong one: `resolve`
+    /// discards the whole `Resolution` when it returns `Err`, so the loop's
+    /// order-dependent decision goes nowhere — but every unrelated intent it
+    /// skipped reaches the sweep unmatched and is reported as "matches nothing
+    /// … likely a typo". Two blockers, and the second one sends the user to
+    /// look for a misspelling in an annotation that is exactly right.
+    #[test]
+    fn a_conflict_does_not_make_a_typo_of_the_renames_beside_it() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.x", &["id"])]);
+        let s = schema(&[("dbo.a", &["id"]), ("dbo.b", &["id"]), ("dbo.y", &["id"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.a"),
+                },
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.b"),
+                },
+                // Untouched by the contest, and perfectly matchable.
+                Intent::RenameTable {
+                    from: t("dbo.x"),
+                    to: t("dbo.y"),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// The same for a drop, which the skipped loop would also have matched. Its
+    /// reason is recorded and its object really is disappearing; nothing about
+    /// it is a typo.
+    #[test]
+    fn a_conflict_does_not_make_a_typo_of_the_drops_beside_it() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.gone", &["id"])]);
+        let s = schema(&[("dbo.a", &["id"]), ("dbo.b", &["id"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.a"),
+                },
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.b"),
+                },
+                Intent::DropTable {
+                    table: t("dbo.gone"),
+                    reason: "superseded".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// And in the other direction: a conflict in one table says nothing about
+    /// another table's rename.
+    ///
+    /// This one passed with the early exit too — `resolve_columns` walks the
+    /// declared tables, so its `continue` only ever skipped the contested one.
+    /// Kept anyway, and said so here: the two above show the defect, this one
+    /// holds the boundary the fix must not move, and a reader who finds it
+    /// green under a revert should not conclude the revert was harmless.
+    #[test]
+    fn a_conflict_in_one_table_leaves_another_tables_rename_alone() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old"]), ("dbo.u", &["id", "x"])]);
+        let s = schema(&[("dbo.t", &["id", "a", "b"]), ("dbo.u", &["id", "y"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "a".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "b".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.u"),
+                    from: "x".into(),
+                    to: "y".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+    }
+
     // ---- roles (ADR-0005) ----
 
     fn with_roles(spec: &[(&str, &[&str])], roles: &[&str]) -> Schema {

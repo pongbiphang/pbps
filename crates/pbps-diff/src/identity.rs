@@ -182,6 +182,13 @@ struct Claim<'a, T> {
 /// left unused it would reach the sweep at the end of [`resolve`] and be
 /// reported a second time as "matches nothing … likely a typo", which is the
 /// opposite of what is wrong with it.
+///
+/// The caller raises what this returns and then carries on. It must not skip
+/// its matching loop over a conflict, though the loop can no longer produce a
+/// correct answer: `resolve` discards its whole `Resolution` when it returns
+/// `Err`, so the order-dependent decision goes nowhere — while skipping the
+/// loop leaves every *other* intent of that kind unmatched, and the sweep then
+/// reports each of those as a likely typo too.
 fn contested_rename_claims<T: Ord + std::fmt::Display>(
     claims: &[Claim<'_, T>],
     used: &mut BTreeSet<usize>,
@@ -292,14 +299,14 @@ fn resolve_roles(
             })
         })
         .collect();
-    let contested = contested_rename_claims(&claims, used);
-    if !contested.is_empty() {
-        // Nothing below this line, for the same reason `AmbiguousRoles` returns:
-        // the loop that follows would decide the contest by declaration order,
-        // and every judgement after it is downstream of that.
-        blockers.extend(contested);
-        return;
-    }
+    // Raised, and then everything below runs as it always did. Returning here
+    // was the obvious move and the wrong one: the loop's decision is discarded
+    // anyway — `resolve` throws `r` away when it returns `Err` — while
+    // returning early strands every *other* intent of this kind unmatched, and
+    // the sweep at the end then calls a perfectly good annotation a likely
+    // typo. The contenders are already marked used, which is what the sweep
+    // has to be told; the bystanders match their way to the same place.
+    blockers.extend(contested_rename_claims(&claims, used));
 
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameRole { from, to } = intent
@@ -395,11 +402,7 @@ fn resolve_tables(
             })
         })
         .collect();
-    let contested = contested_rename_claims(&claims, used);
-    if !contested.is_empty() {
-        blockers.extend(contested);
-        return;
-    }
+    blockers.extend(contested_rename_claims(&claims, used));
 
     // Rename wins over drop: if both intents are given for one table, rename is
     // the more specific statement.
@@ -496,11 +499,7 @@ fn resolve_columns(
                 )
             })
             .collect();
-        let contested = contested_rename_claims(&claims, used);
-        if !contested.is_empty() {
-            blockers.extend(contested);
-            continue;
-        }
+        blockers.extend(contested_rename_claims(&claims, used));
 
         for (i, intent) in intents.iter().enumerate() {
             if let Intent::RenameColumn { table, from, to } = intent
