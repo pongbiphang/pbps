@@ -604,7 +604,14 @@ fn scannable(definition: &str) -> String {
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
         if ch.is_whitespace() {
-            let before = unquoted[..i].chars().next_back();
+            // From `out`, not from `unquoted`: what precedes this character in
+            // the *result* is the dot itself when the whitespace between them
+            // has already been dropped. Read from the input it was the first
+            // character of the run, so only that one went — a formatter's
+            // `dbo.\n    customer` kept its indentation and the qualified
+            // needle then matched nothing (DECISIONS 239). The trailing side
+            // never had the bug: `after` skips the whole run to find the dot.
+            let before = out.chars().next_back();
             let after = unquoted[i + ch.len_utf8()..]
                 .chars()
                 .find(|c| !c.is_whitespace());
@@ -849,6 +856,57 @@ mod tests {
             assert!(
                 references(definition, &n("dbo.active_customer")),
                 "{definition}"
+            );
+        }
+    }
+
+    /// The gap around a dot is closed however long it is, and on both sides.
+    /// A formatter that breaks a qualified name across lines leaves a run of
+    /// whitespace after the dot; reading the character before it from the
+    /// input dropped only the first of that run, so `dbo.active_customer`
+    /// matched nothing, no edge was recorded, and `creation_order` was free to
+    /// put the view before what it selects from — a valid plan whose
+    /// `CREATE VIEW` fails inside its own transaction (DECISIONS 239).
+    #[test]
+    fn a_run_of_whitespace_around_a_dot_is_closed_on_both_sides() {
+        // Asked of the scan itself: `references` also tries the bare name,
+        // which matches a half-closed gap and would hide the difference.
+        for definition in [
+            "SELECT * FROM dbo.\n    active_customer",
+            "SELECT * FROM dbo.\r\n\tactive_customer",
+            "SELECT * FROM dbo  . active_customer",
+            "SELECT * FROM [dbo] . [active_customer]",
+            "SELECT * FROM dbo\n  .\n  active_customer",
+        ] {
+            assert_eq!(
+                scannable(definition),
+                "select * from dbo.active_customer",
+                "{definition:?}"
+            );
+            assert!(
+                references(definition, &n("dbo.active_customer")),
+                "{definition:?}"
+            );
+        }
+        // Whitespace that is not beside a dot is a boundary and stays.
+        assert_eq!(
+            scannable("select a\n  from dbo.t"),
+            "select a\n  from dbo.t"
+        );
+    }
+
+    /// Closing the gap must not fuse what the dot does not join. The three-part
+    /// name is another object, and the longer identifier is still a longer
+    /// identifier once the whitespace is gone — both would be invented edges.
+    #[test]
+    fn closing_the_gap_does_not_invent_a_reference() {
+        for definition in [
+            "SELECT * FROM sales.dbo.\n    active_customer",
+            "SELECT * FROM dbo.\n    active_customer_archive",
+        ] {
+            assert!(
+                !references(definition, &n("dbo.active_customer")),
+                "{definition:?}"
             );
         }
     }

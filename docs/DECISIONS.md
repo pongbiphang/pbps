@@ -3917,3 +3917,28 @@ SPEC is in sync with all of these.
     recomputes both sides with the same binary — so the plan file is the whole
     of the compatibility question. A test pins the fingerprint of a fixture
     beside the version number, so changing one without the other fails there.
+
+239. **The gap around a dot is closed from the text already emitted, not from
+    the text still to come.** `scannable` folds `[Dbo] . [V]` and `dbo.v` into
+    one string so the dependency scan can look for a qualified name. It read
+    the character *before* a whitespace out of the input, where that is the
+    first character of a run, and the character *after* it by skipping the
+    whole run — so a leading gap closed and a trailing one did not. A
+    formatter that breaks `dbo.` from its object across a line left
+    `dbo.<indent>customer`, and the qualified needle found nothing.
+
+    What decides then is the bare name, which is the weaker question the scan
+    falls back on for a definition written inside its own schema. It answers
+    `sales.dbo.customer` yes for `dbo.customer` — the qualified needle exists
+    precisely to say no there — so the half-closed gap does not merely lose an
+    edge, it invents one, and an invented edge can close a cycle. Members of a
+    cycle are emitted in name order, and then a `CREATE VIEW` fails inside the
+    plan's transaction: everything rolls back, so nothing is damaged, but a
+    valid plan was refused and the only way past it is a hand-written
+    `depends_on:`.
+
+    Reading `before` from `out` is the whole fix: what precedes this character
+    in the result is the dot itself once the whitespace between them has been
+    dropped, however long the run. The tests ask `scannable` directly rather
+    than going through `references`, because the bare-name fallback matches a
+    half-closed gap too and would hide the difference.
