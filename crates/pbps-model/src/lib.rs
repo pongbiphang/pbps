@@ -20,7 +20,8 @@
 //! stable: the identity file is committed to git, and shifting order would
 //! manufacture phantom diffs. The one exception is `Table::columns`, which uses
 //! `IndexMap` to preserve declaration order because that affects the column
-//! layout of `CREATE TABLE`.
+//! layout of `CREATE TABLE` — an order equality ignores, and which
+//! [`state_checksum`] therefore sorts away before hashing (DECISIONS 238).
 
 pub mod change;
 pub mod data;

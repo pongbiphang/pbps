@@ -3868,3 +3868,52 @@ SPEC is in sync with all of these.
 
     The re-add stays in the constraint class far below, after the renames,
     which is where the new spelling can be written. Only the drop moves.
+
+238. **The state fingerprint sorts a table's columns; the plan's does not.**
+    Two rules answered "has this environment moved" and gave different
+    answers. `Schema`'s `==` ignores column order — `Table::columns` is an
+    `IndexMap`, compared as a map — while `state_checksum` serialized that map
+    in declaration order, so the order was in the hash. A DBA who drops a
+    column and adds it back identically (fixing a collation, say) moves it to
+    the end of `sys.columns`, and the two rules then disagreed about the same
+    database: the differ reported no changes and put nothing in
+    `unexpressible`, and the checksum said the state had moved. `verify`
+    announced drift and listed nothing that drifted, `plan --db` refused, and
+    the only way forward was a re-baseline — the escape the drift gate exists
+    to make unnecessary.
+
+    The fingerprint is the side that gives way, because it is the side whose
+    sensitivity buys nothing. Live column order decides no statement pbps
+    emits: `CREATE TABLE` lays out the columns of the *declarations*, and no
+    change this tool plans reorders an existing table. So the order is
+    recorded — it stays in `state_json`, which is a snapshot and a backup, and
+    `state export` still hands back the layout the database had — and it is
+    sorted away in the one place that asks whether anything changed. Making
+    the differ agree with the checksum instead (an `unexpressible` entry
+    naming the table) was the other shape on offer. It reports the same thing
+    more honestly and still leaves the operator with no forward path: the
+    checksum mismatch, not the change list, is what `plan --db` refuses on.
+
+    The sort is in `state_checksum` alone. `plan_checksum` hashes the plan
+    file whole, and a `CreateTable` carries the table it will emit, column
+    order included: two plans that would run two different `CREATE TABLE`
+    statements must remain two different artifacts, and that is pinned by a
+    test of its own. Determinism is unaffected — the sorted order is a
+    function of the key set, and two schemas that compare equal have the same
+    key set, so equal schemas now hash equally by construction rather than by
+    coincidence of insertion order.
+
+    The saved plan's format version moves with the algorithm, to 6. A plan is
+    the one artifact carrying a fingerprint written by one build and
+    recomputed by another — `apply` compares `baseline.checksum` against what
+    it computes from the live database — so without the bump a plan from the
+    previous build would be refused as *drift*, against a database nobody had
+    touched, and a plan from this one refused the same way by an older build.
+    Both refusals name the wrong problem and send an operator to reconcile
+    nothing. Refused as a format instead, before anything is connected to,
+    with the remedy a stale artifact always had: run `plan --db` again and
+    take the new plan through the gate. Nothing else stores a state
+    fingerprint — the ledger keeps whole snapshots, and every comparison
+    recomputes both sides with the same binary — so the plan file is the whole
+    of the compatibility question. A test pins the fingerprint of a fixture
+    beside the version number, so changing one without the other fails there.

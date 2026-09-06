@@ -109,7 +109,9 @@ pub struct Table {
 
     /// An `IndexMap` preserves declaration order, which decides the column
     /// layout of `CREATE TABLE`. Equality ignores order, so reordering is never
-    /// mistaken for a schema change.
+    /// mistaken for a schema change — and neither is it by
+    /// [`state_checksum`](crate::state_checksum), which sorts these keys before
+    /// hashing them for that reason (DECISIONS 238).
     pub columns: IndexMap<String, Column>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
