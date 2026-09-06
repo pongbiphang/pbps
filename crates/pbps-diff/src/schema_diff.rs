@@ -1135,6 +1135,11 @@ fn diff_modules(
 /// Renames come first, so every later step can use current names. Dropping
 /// constraints and indexes must precede dropping columns, since they may
 /// reference those columns; adding them must follow adding columns.
+/// Inserting a class shifts every class below it, and these ordinals are
+/// quoted in prose that uses them to justify behaviour: DECISIONS 140, 146,
+/// 151 and 174, `docs/PITFALLS.md`, and `preflight.rs`. A new class means
+/// renumbering those in the same commit — a stale ordinal there reads as a
+/// statement about the code and is not checked against it.
 fn order_key(c: &Change) -> u8 {
     match c {
         // Modules go first and last, and both ends are load-bearing. A

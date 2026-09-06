@@ -1326,7 +1326,7 @@ SPEC is in sync with all of these.
     side's, whose absence for a column doubled as "the base has no recorded
     cell here, so hold the row to nothing". That reading is right *before* the
     write and wrong after it. When one revision adds a column and populates it
-    in the same declared row, `AddColumn` sorts at 6 and the row changes at 9,
+    in the same declared row, `AddColumn` sorts at 7 and the row changes at 10,
     so by the time the `UPDATE` runs the column exists and holds the declared
     type — but the postcondition looked the column up in the base's map, found
     nothing, and held the new cell to nothing at all. An `AFTER UPDATE`
@@ -1334,7 +1334,7 @@ SPEC is in sync with all of these.
     back and record it, and the next connected plan would propose the same
     update forever: the silence 132 exists to close, reopened for the one
     column the revision was about. The same shape hid a second case, since
-    `AlterColumnType` sorts at 7: a column retyped in the same plan had its
+    `AlterColumnType` sorts at 8: a column retyped in the same plan had its
     result compared by the rendering of the type it no longer had.
     `after_types` now carries the post-plan type wherever it differs from the
     base's — the added column and the retyped one — and the emitter resolves
@@ -1440,7 +1440,7 @@ SPEC is in sync with all of these.
     on months later is worthless anywhere a reader does not look.
 
 146. **A cell whose column this plan retypes is carried, and held by
-    nothing.** `AlterColumnType` sorts at 7 and the row changes at 9 and 10,
+    nothing.** `AlterColumnType` sorts at 8 and the row changes at 10 and 11,
     so by the time an `UPDATE` or a `DELETE` runs the engine has already
     converted the column — and the recorded text is the spelling the *old*
     type gave it. Measured on SQL Server 2025: a `decimal(5,2)` holding `1.50`
@@ -1616,8 +1616,8 @@ SPEC is in sync with all of these.
     reverted, `apply` reports success and records it.
 
 151. **The new foreign key is probed against the rows the plan will leave,
-    not the ones it finds.** `AddForeignKey` sorts at 11 and the row changes
-    at 9 and 10, so the probe — which runs before statement one — was
+    not the ones it finds.** `AddForeignKey` sorts at 12 and the row changes
+    at 10 and 11, so the probe — which runs before statement one — was
     answering about a table that will not exist in that shape by the time the
     constraint is created. Two faults, and the first is the one that matters:
     a plan that inserts the parent rows its children need, or repairs the
