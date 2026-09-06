@@ -275,9 +275,10 @@ locked-copy `update-index` ran it), so every `git` also takes
    root is checked with `lstat` and none may be a link, and every file
    operation the UI makes is done through directory handles opened from
    the root so that no component is followed as a link — on Linux one
-   `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, elsewhere one
+   `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, on macOS one
    `openat` per component from the previous component's handle, each with
-   `O_DIRECTORY | O_NOFOLLOW`. `O_NOFOLLOW` guards the last component only,
+   `O_DIRECTORY | O_NOFOLLOW`, and on Windows the per-component handles
+   step 2 describes. `O_NOFOLLOW` guards the last component only,
    and `RESOLVE_BENEATH` guards the worktree's boundary, not the path: a
    link *inside* the worktree is followed under it (**measured** on Linux
    6.6: with `dir/link` a link to a sibling directory, `openat2` of
@@ -351,10 +352,22 @@ locked-copy `update-index` ran it), so every `git` also takes
    again on the other side of the exchange. In any of these cases the
    two are exchanged back and the compose is
    refused with what differs shown — and so is every path placed before
-   it, in reverse order: an exchanged path is exchanged back, a path
-   `link()` created is unlinked, since an intent may edit more than one
-   file and a refusal that left some of them replaced would be a partial
-   edit nobody asked for. The swapped-out files stay beside their paths
+   it, in reverse order: an exchanged path is exchanged back, which puts
+   the replacement under its temporary name, and a path `link()` created
+   has that name unlinked, which leaves its inode under the temporary
+   name it was linked from; since an intent may edit more than one file,
+   a refusal that left some of them replaced would be a partial edit
+   nobody asked for. The replacements are then retained under
+   `<git-dir>/pbps-ui/previous/` exactly as a swapped-out original is
+   below, named on the page as what a refused compose had placed, and
+   never deleted: an editor that opened the replacement in the window it
+   was at the path holds its inode and may save through it, and a rollback
+   that unlinked the last name would take that save with it, which is the
+   loss the retention exists to prevent. The UI unlinks a name only while
+   the inode has another — the path's, once step 5 has moved the branch,
+   for the temporary a `link()` was made from, so that the new file has
+   one name and `git status` shows nothing untracked; the temporary's,
+   for a linked name undone. The swapped-out files stay beside their paths
    under their temporary names until step 5 has moved the branch, and the
    retained copies below are made only then: until that point nothing has
    been let go, and every refusal before it — a path failing a check here,
@@ -394,7 +407,8 @@ locked-copy `update-index` ran it), so every `git` also takes
    they no longer name one directory — the ancestor
    was renamed away and another put in its place — the exchange is undone
    through the same handle, a linked name is unlinked through it
-   (`unlinkat`), and the compose refused, since the UI's bytes would
+   (`unlinkat`, its inode staying under the temporary name), and the
+   compose refused, since the UI's bytes would
    otherwise sit in a directory the worktree no longer contains while the
    commit named the path. `link()` needs this check as much as the
    exchange does: `EEXIST` guards only the leaf name, not where the
@@ -417,7 +431,20 @@ locked-copy `update-index` ran it), so every `git` also takes
    `EEXIST` if something made it first (**measured**: the link landed the
    complete file under the new name, and a second `link()` onto a name an
    editor had meanwhile created was refused), so a file that appeared in
-   the window is never replaced. On Windows, which has no exchange, the
+   the window is never replaced. On Windows, which has no exchange and
+   no `openat`, the same shape needs its own calls: each component from
+   the worktree root is opened with `CreateFileW` under
+   `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, so that a
+   junction, a symbolic link or any other reparse point is opened *as
+   itself* and refused when `GetFileInformationByHandle` reports
+   `FILE_ATTRIBUTE_REPARSE_POINT`, and every component after the first is
+   opened relative to the previous handle — `NtCreateFile` with the
+   handle as `RootDirectory`, since `CreateFileW` takes only a whole path
+   and would walk it again from the root, through whatever a component
+   has become since. The identity comparison after each placement is the
+   same as on Linux, taken over the volume serial number and file index
+   of the two handles, and a mismatch is undone through the handle that
+   made the placement. Within that directory handle the
    existing file is opened denying every other writer and deleter
    (`FILE_SHARE_READ` alone), hashed through that handle, refused if the
    handle reports more than one link (`GetFileInformationByHandle`'s link
@@ -428,8 +455,11 @@ locked-copy `update-index` ran it), so every `git` also takes
    cannot open the file for writing until the handle closes; a new file is
    created with `CREATE_NEW`, which fails if the name exists. That
    in-place write is not crash-atomic, which is a different property from
-   the one at stake here, and step 3 of #64 measures it, since nothing on
-   Windows has been measured for this ADR. A platform with none of these
+   the one at stake here. Nothing on Windows has been measured for this
+   ADR: step 3 of #64 measures every claim in this paragraph on a Windows
+   machine, and until it has, the UI on Windows refuses to compose and
+   gives the commands to run by hand, as the Limits section says a machine
+   without `git` gets. A platform with none of these
    refuses to compose rather than overwrite a file it cannot prove is the
    one the page saw. Each file is then stored as a blob exactly as written,
    from the bytes the UI holds: `git hash-object -w --no-filters --stdin`.
@@ -441,7 +471,17 @@ locked-copy `update-index` ran it), so every `git` also takes
    with an upper-casing `clean`, `hash-object -w` stored the upper-cased
    text and `--no-filters` stored the file). The declarations are this
    tool's own format, LF and UTF-8 by rule, so what the UI wrote is what
-   the commit should hold.
+   the commit should hold. Whether it *is* a declaration is the CLI's
+   question, not the UI's: before any blob is stored, the UI runs `pbps
+   validate --format json --no-input` in the checkout, as decision 1 runs
+   every command, and a failing envelope rolls step 2 back and shows its
+   findings. The bytes came from the browser, and ADR-0006 keeps the one
+   validation path in the CLI, so the CLI is asked, after placement,
+   about the files as they will be committed. It validates the checkout
+   as it stands, so an uncommitted edit of the user's own that fails
+   refuses the compose too, with the findings the shell would print;
+   reasoned, not measured, since which rules `validate` enforces is
+   SPEC's and unchanged here.
 3. In an index of its own (`GIT_INDEX_FILE`), it reads the recorded tip's
    tree, sets the entry for each edited path to that blob at the mode the
    path had at the tip — for a path the tip does not hold, the mode `git
