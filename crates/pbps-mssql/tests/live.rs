@@ -6296,3 +6296,65 @@ async fn a_query_may_bind_two_fewer_parameters_than_the_server_names() {
     assert!(format!("{err}").contains("2100"), "{err}");
     db.drop().await;
 }
+
+/// sysname's length belongs to the alias. Safe changes must preserve a value
+/// at the source boundary, and shortening past it must still require approval.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn sysname_risk_matches_the_engines_length_boundary() {
+    use pbps_dialect::TypeChangeRisk;
+
+    let mut db = TestDb::create("sysname_capacity").await;
+    for (from, length, to, expected) in [
+        ("sysname", 128, "nvarchar(10)", TypeChangeRisk::Narrowing),
+        ("sysname", 128, "nvarchar(128)", TypeChangeRisk::Safe),
+        ("nvarchar(50)", 50, "sysname", TypeChangeRisk::Safe),
+        ("nvarchar(128)", 128, "sysname", TypeChangeRisk::Safe),
+        ("nvarchar(129)", 129, "sysname", TypeChangeRisk::Narrowing),
+    ] {
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.alias_capacity (v {from} NULL); \
+             INSERT dbo.alias_capacity VALUES (REPLICATE(N'界', {length}));"
+            ))
+            .await
+            .expect("create and fill source");
+        let result = db
+            .conn
+            .execute(&format!(
+                "ALTER TABLE dbo.alias_capacity ALTER COLUMN v {to} NULL;"
+            ))
+            .await;
+        match expected {
+            TypeChangeRisk::Safe => {
+                result.unwrap_or_else(|e| panic!("{from} -> {to}: {e}"));
+                let rows = db
+                    .conn
+                    .query("SELECT v FROM dbo.alias_capacity;")
+                    .await
+                    .unwrap();
+                let value: &str = rows[0].try_get_at(0).unwrap().unwrap();
+                assert_eq!(value, "界".repeat(length), "{from} -> {to}");
+            }
+            TypeChangeRisk::Narrowing => {
+                let error = result.expect_err("the boundary value must not fit");
+                assert_eq!(
+                    error.server_error_code().as_deref(),
+                    Some("2628"),
+                    "{error}"
+                );
+            }
+            TypeChangeRisk::Incompatible => unreachable!("these pairs are length changes"),
+        }
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            expected,
+            "{from} -> {to}"
+        );
+        db.conn
+            .execute("DROP TABLE dbo.alias_capacity;")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}

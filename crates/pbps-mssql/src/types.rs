@@ -413,7 +413,14 @@ fn family(t: &ColumnType) -> Family {
         "char" => text(false, true),
         "varchar" => text(false, false),
         "nchar" => text(true, true),
-        "nvarchar" | "sysname" => text(true, false),
+        "nvarchar" => text(true, false),
+        // sysname takes no arguments, but its capacity is nvarchar(128), not
+        // the default length of an unparameterized string declaration.
+        "sysname" => Family::Text {
+            len: Len::Bounded(128),
+            unicode: true,
+            fixed: false,
+        },
         "text" => Family::Text {
             len: Len::Max,
             unicode: false,
@@ -772,6 +779,26 @@ mod tests {
             risk("nvarchar(max)", "nvarchar(4000)"),
             TypeChangeRisk::Narrowing
         );
+    }
+
+    #[test]
+    fn sysname_has_the_capacity_of_nvarchar_128_without_length_arguments() {
+        assert_eq!(norm("sysname"), "sysname");
+        assert!(normalize(&ty("sysname(128)")).is_err());
+        for (from, to, expected) in [
+            ("sysname", "nvarchar(10)", TypeChangeRisk::Narrowing),
+            ("sysname", "nvarchar(127)", TypeChangeRisk::Narrowing),
+            ("sysname", "nvarchar(128)", TypeChangeRisk::Safe),
+            ("sysname", "nvarchar(max)", TypeChangeRisk::Safe),
+            ("nvarchar(50)", "sysname", TypeChangeRisk::Safe),
+            ("nvarchar(128)", "sysname", TypeChangeRisk::Safe),
+            ("nvarchar(129)", "sysname", TypeChangeRisk::Narrowing),
+            ("nvarchar(max)", "sysname", TypeChangeRisk::Narrowing),
+            ("sysname", "varchar(128)", TypeChangeRisk::Narrowing),
+            ("sysname", "nchar(128)", TypeChangeRisk::Narrowing),
+        ] {
+            assert_eq!(risk(from, to), expected, "{from} -> {to}");
+        }
     }
 
     /// Going from unicode to non-unicode loses whatever the target collation
