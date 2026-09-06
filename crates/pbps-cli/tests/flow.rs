@@ -9722,3 +9722,431 @@ fn a_panicking_test_leaves_no_database_behind() {
     assert!(taken.is_err(), "the panic must not be swallowed");
     assert!(!exists(&name), "`{name}` outlived the test that owned it");
 }
+
+/// The published envelope schema, as this binary produces it.
+///
+/// Read from the checked-in copy rather than regenerated: a unit test already
+/// pins the copy to the binary, so reading the file here checks the thing a
+/// consumer actually fetches — and if the two ever part, the failure names the
+/// stale file rather than appearing as a mysterious validation error.
+fn envelope_schema() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("schemas")
+        .join("envelope.schema.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+}
+
+/// Asserts that one command's JSON output is an envelope the published schema
+/// accepts.
+///
+/// The whole document, not a sample of its fields: the point of publishing a
+/// schema is that a consumer can trust every key in it, and a test that checked
+/// three of them would let the fourth drift the moment somebody adds a field
+/// without describing it.
+#[track_caller]
+fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: &Output) {
+    let text = stdout(out);
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{label}: stdout is not JSON ({e}): {text}"));
+    if let Err(e) = validator.validate(&value) {
+        panic!("{label}: the envelope does not match the published schema: {e}\n{text}");
+    }
+    // `oneOf` is satisfied by exactly one branch, and the branch is chosen by
+    // `command`. Checking the field as well is what says the *right* branch
+    // matched: a payload that happened to fit another command's shape would
+    // otherwise validate and be read as that command's.
+    assert_eq!(
+        value["command"],
+        serde_json::json!(label),
+        "{label}: the envelope names another command"
+    );
+}
+
+/// Every offline command that speaks the envelope emits one the published
+/// schema accepts.
+///
+/// This is the contract ADR-0015 decision 1 rests on: the UI parses envelopes
+/// and nothing else, so a payload that grows a field the schema does not
+/// describe is a UI that cannot read its own tool. The connected commands are
+/// covered by the live test below, and `explain` by the one after it, so that
+/// every branch of the schema is exercised by output some command actually
+/// produced.
+#[test]
+fn every_offline_envelope_matches_the_published_schema() {
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+
+    let d = Demo::new("envelope-offline");
+    d.table("table: dbo.t\ncolumns:\n  id: { type: int, nullable: false }\nprimary_key: [id]\n");
+    d.commit();
+
+    let plan = d.dir.join("p.json");
+    for (label, args) in [
+        ("validate", vec!["validate", "--format", "json"]),
+        ("fmt", vec!["fmt", "--check", "--format", "json"]),
+        ("plan", vec!["plan", "--format", "json"]),
+        ("doctor", vec!["doctor", "--format", "json"]),
+        (
+            "plan",
+            vec!["plan", "--out", plan.to_str().unwrap(), "--format", "json"],
+        ),
+        (
+            "explain",
+            vec![
+                "explain",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        ),
+    ] {
+        envelope_matches_schema(&validator, label, &d.run(&args));
+    }
+
+    // The unhappy shapes too. An envelope a command emits only when something
+    // is wrong is the one a consumer meets on its worst day, and it is exactly
+    // the shape nobody looks at while adding a field.
+    let broken = Demo::new("envelope-offline-broken");
+    broken.table("table: dbo.t\ncolumns:\n  id: { type: nonsense }\n");
+    broken.commit();
+    envelope_matches_schema(
+        &validator,
+        "validate",
+        &broken.run(&["validate", "--format", "json"]),
+    );
+    envelope_matches_schema(
+        &validator,
+        "status",
+        // No environments configured: `status`'s one-finding envelope, with no
+        // `data` at all.
+        &broken.run(&["status", "--format", "json"]),
+    );
+}
+
+/// Every command name in the schema is one this binary can produce, and every
+/// command that emits an envelope is in the schema.
+///
+/// The list in `envelope_branches!` is written by hand, and a hand-written list
+/// beside a `--format json` flag is exactly the pair that drifts: a new command
+/// ships with the flag, nothing describes its payload, and the UI meets it as a
+/// parse error. `--help` is the other side of the pair, and it is generated.
+#[test]
+fn the_schema_describes_every_command_that_emits_an_envelope() {
+    let schema = envelope_schema();
+    let described: std::collections::BTreeSet<String> = schema["oneOf"]
+        .as_array()
+        .expect("oneOf is a list")
+        .iter()
+        .map(|b| {
+            let r = b["$ref"].as_str().expect("a branch is a $ref");
+            schema["$defs"][r.trim_start_matches("#/$defs/")]["properties"]["command"]["const"]
+                .as_str()
+                .expect("each branch pins its command")
+                .to_owned()
+        })
+        .collect();
+
+    // Discovered from `--help`, not from a second list here: a command with a
+    // `--format` option that takes `json` is a command that emits an envelope,
+    // and `docs`, whose `--format` names a document format, is the one
+    // deliberate exception.
+    //
+    // Read section by section rather than by scanning the whole page: the
+    // first attempt matched any help text containing the two words, and
+    // `pbps schema` — whose `--kind` lists a value documented as "the
+    // `--format json` envelope" — came back as a command that emits one.
+    fn help(args: &[&str]) -> String {
+        String::from_utf8_lossy(
+            &Command::new(BIN)
+                .args(args)
+                .arg("--help")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned()
+    }
+
+    /// The names listed under `Commands:`, which is where clap puts
+    /// subcommands and nothing else.
+    fn subcommands(help: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in help.lines() {
+            if line.starts_with("Commands:") {
+                inside = true;
+                continue;
+            }
+            if inside && !line.starts_with("  ") {
+                break;
+            }
+            if let Some(name) = inside
+                .then(|| line.split_whitespace().next())
+                .flatten()
+                .filter(|n| *n != "help")
+            {
+                out.push(name.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Whether this command takes `--format json` — an option line, not a
+    /// mention of the words somewhere in a description.
+    fn takes_format_json(help: &str) -> bool {
+        help.lines().any(|l| l.trim_start().starts_with("--format")) && help.contains("json")
+    }
+
+    let mut emitting = std::collections::BTreeSet::new();
+    let top = help(&[]);
+    for name in subcommands(&top) {
+        if name == "docs" {
+            continue;
+        }
+        let page = help(&[&name]);
+        if takes_format_json(&page) {
+            emitting.insert(name.clone());
+        }
+        for sub in subcommands(&page) {
+            if takes_format_json(&help(&[&name, &sub])) {
+                emitting.insert(format!("{name} {sub}"));
+            }
+        }
+    }
+
+    assert_eq!(
+        described, emitting,
+        "the envelope schema and the commands with `--format json` have parted"
+    );
+}
+
+/// `state list` tells a database with no ledger apart from one with an empty
+/// ledger, and both apart from one it could not reach.
+///
+/// The three read alike in the one rendering that matters — an empty list of
+/// entries — and each is a different thing for an operator to do next: adopt
+/// the database, wait for the first apply to finish, or fix the connection.
+/// Only the findings and `initialized` keep them apart, so all three are
+/// asserted here rather than the happy path alone.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_server() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statelist");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statelist");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    let json = |args: &[&str]| -> (i32, serde_json::Value) {
+        let o = d.run(args);
+        let text = stdout(&o);
+        let v = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {text}\n{}", stderr(&o)));
+        (code(&o), v)
+    };
+
+    // 1. No ledger at all: this database has never been written to.
+    let (c, v) = json(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(
+        c, 0,
+        "a database without a ledger is an answer, not a failure"
+    );
+    assert_eq!(v["result"], "ok", "{v}");
+    assert_eq!(v["data"]["initialized"], false, "{v}");
+    assert_eq!(v["data"]["entries"].as_array().unwrap().len(), 0, "{v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"state.uninitialized"), "{v}");
+
+    // 2. The ledger exists and is empty — what a first bootstrap looks like
+    // while it runs. `lock` calls `ensure_tables`, so this is the tool's own
+    // path to that state, not a hand-written table.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            pbps_mssql::state::lock(&mut conn, "state-list-test")
+                .await
+                .expect("lock");
+            pbps_mssql::state::unlock(&mut conn).await.expect("unlock");
+        });
+    }
+    let (c, v) = json(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(c, 0, "{v}");
+    assert_eq!(v["data"]["initialized"], true, "the tables exist now: {v}");
+    assert_eq!(v["data"]["entries"].as_array().unwrap().len(), 0, "{v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"state.no-entries") && !ids.contains(&"state.uninitialized"),
+        "an empty ledger is not an absent one: {v}"
+    );
+
+    // 3. Unreachable: no `data` at all, and `unanswerable` rather than a
+    // history that happens to be empty.
+    let unreachable = with_key(
+        "Server=127.0.0.1,1;TrustServerCertificate=true",
+        "User Id",
+        "sa",
+    );
+    let (c, v) = json(&[
+        "state",
+        "list",
+        "--db",
+        &with_key(&unreachable, "Password", "nope"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(c, 1, "an unreachable server is a tool failure: {v}");
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert!(v.get("data").is_none(), "no history was read: {v}");
+}
+
+/// A real ledger comes back newest first, with the fields a timeline is drawn
+/// from, and the envelope matches the published schema.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_returns_the_history_newest_first_in_the_published_shape() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statehist");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statehist");
+    d.table(ONE_COLUMN);
+    // Identities first: `bootstrap` builds what the ids file knows, and a
+    // project that has never planned has nothing for it to build.
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // Two entries of different kinds, recording different schemas, so the
+    // order, the `kind` and the per-entry counts are each asserted against
+    // something that could be wrong: the baseline adopts an empty database,
+    // and the bootstrap that follows builds the declared table into it.
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "adopting"])),
+        0
+    );
+    let built = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&built), 0, "{}", stderr(&built));
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(&validator, "state list", &o);
+
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{v}");
+    assert!(
+        entries[0]["id"].as_i64().unwrap() > entries[1]["id"].as_i64().unwrap(),
+        "newest first: {v}"
+    );
+    assert_eq!(entries[1]["kind"], "baseline", "{v}");
+    assert_eq!(entries[1]["reason"], "adopting", "{v}");
+    assert!(entries[0]["applied_at"].is_string(), "{v}");
+    assert!(entries[0]["operator"].is_string(), "{v}");
+    assert!(entries[0]["state_version"].is_number(), "{v}");
+    // Each entry counts the schema *it* recorded: the database was empty when
+    // it was adopted and holds the declared table after the bootstrap. A count
+    // taken from the declarations rather than from the entry would read `1`
+    // for both.
+    assert_eq!(entries[0]["tables"], 1, "{v}");
+    assert_eq!(entries[1]["tables"], 0, "{v}");
+    // The recorded schema itself is not in a timeline: it is the whole
+    // database, and `state show` is what will hand it over.
+    assert!(entries[0].get("schema").is_none(), "{v}");
+
+    // `--limit` is the head of the history, not a different history.
+    let o = d.run(&[
+        "state",
+        "list",
+        "--db",
+        &connection,
+        "--limit",
+        "1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let one: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(one["data"]["entries"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["data"]["limit"], 1, "{one}");
+    assert_eq!(one["data"]["entries"][0]["id"], entries[0]["id"], "{one}");
+
+    // The human rendering names the same entries, so a reader of either sees
+    // the same history.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 0, "{}", stderr(&human));
+    let text = stdout(&human);
+    assert!(
+        text.contains("baseline") && text.contains("bootstrap"),
+        "{text}"
+    );
+    assert!(text.starts_with("ID"), "a header line: {text}");
+}
+
+/// `verify` and `status`, the two connected envelopes, match the published
+/// schema against a real database.
+///
+/// Offline they only ever produce their unreachable shapes, and the payload a
+/// consumer actually renders — the drift report, the environment rows — is the
+/// one no offline test can reach.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_connected_envelopes_match_the_published_schema() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "envelopelive");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("envelopelive");
+    d.table(ONE_COLUMN);
+    d.commit();
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    envelope_matches_schema(
+        &validator,
+        "verify",
+        &d.run(&["verify", "--db", &connection, "--format", "json"]),
+    );
+
+    // `status` reads the configured environments rather than `--db`, so the
+    // project has to name this database to produce a row at all.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: mssql\nenvironments:\n  live:\n    url_env: PBPS_STATUS_TEST_URL\n",
+    )
+    .unwrap();
+    let o = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(["status", "--format", "json"])
+        .env("PBPS_STATUS_TEST_URL", &connection)
+        .output()
+        .unwrap();
+    envelope_matches_schema(&validator, "status", &o);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["data"][0]["environment"], "live", "{v}");
+}

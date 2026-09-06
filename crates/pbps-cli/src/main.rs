@@ -13,6 +13,7 @@ mod integration;
 mod output;
 mod prompt;
 mod report;
+mod state_list;
 mod status;
 
 /// The command ran correctly and found something the user must act on.
@@ -402,8 +403,15 @@ impl Command {
             | Command::Snapshot { .. }
             | Command::Baseline { .. }
             | Command::Bootstrap { .. }
-            | Command::State { .. }
             | Command::Unlock { .. } => return None,
+            // The one subcommand that speaks an envelope. Matched on its own
+            // rather than folded into the arm above, because a project that
+            // cannot be discovered has to reach a `state list --format json`
+            // consumer as a finding and not as prose on stderr.
+            Command::State {
+                command: StateCommand::List { format, .. },
+            } => ("state list", *format),
+            Command::State { .. } => return None,
         };
         (format == OutputFormat::Json).then_some(name)
     }
@@ -411,6 +419,20 @@ impl Command {
 
 #[derive(Subcommand)]
 enum StateCommand {
+    /// Show this environment's history, newest first
+    List {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// How many entries to show
+        #[arg(long, default_value_t = pbps_db::ledger::DEFAULT_KEEP)]
+        limit: u32,
+
+        /// text (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+
     /// Delete all but the newest snapshots
     Prune {
         #[command(flatten)]
@@ -853,6 +875,24 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
+            StateCommand::List {
+                target,
+                limit,
+                format,
+            } => {
+                let json = format == OutputFormat::Json;
+                // Through the envelope, like every other step that can fail
+                // before the command has anything to report: an unset
+                // `url_env` variable must not leave a JSON consumer with an
+                // empty stdout (SPEC §9.8).
+                let target = output::or_unanswerable(
+                    "state list",
+                    json,
+                    "environment.unresolved",
+                    target.resolve(&project),
+                )?;
+                state_list::cmd_state_list(&project, &target, limit, json)
+            }
             StateCommand::Prune { target, keep } => {
                 let target = target.resolve(&project)?;
                 deploy::cmd_prune(&project, &target, keep)
@@ -1799,7 +1839,7 @@ fn cmd_validate(
 /// Present even when the run failed: a consumer showing "3 of 40 tables are
 /// broken" needs the 40, and a payload that vanished on failure would make the
 /// only interesting case the one with no context.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct ValidateData {
     pub dialect: &'static str,
     pub tables: usize,
@@ -1809,7 +1849,7 @@ pub struct ValidateData {
     pub identity: Option<IdentityCounts>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct IdentityCounts {
     pub tables: usize,
     pub columns: usize,
@@ -1994,8 +2034,8 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
 }
 
 /// What `fmt` looked at, for `--format json`.
-#[derive(serde::Serialize)]
-struct FmtData {
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct FmtData {
     checked: usize,
     changed: usize,
     /// `check` or `write`. The findings mean different things in each, and a
@@ -2131,8 +2171,8 @@ fn resolve_with_intent(
 /// The changes are counted rather than listed: the typed change set is what
 /// `--out` writes, and `explain` is what renders it. Two spellings of the same
 /// list, one of them abbreviated, is how a consumer comes to read the wrong one.
-#[derive(serde::Serialize)]
-struct PlanData {
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct PlanData {
     baseline: String,
     changes: usize,
     tables: usize,

@@ -25,14 +25,19 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`,
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
-(`--env`), `schema` (`--kind`), `completions`, `man`. Every read-only command
-takes `--format human|json`; `--no-input` is global.
+(`--env`), `schema` (`--kind declaration|config|envelope`), `completions`,
+`man`. Every read-only command
+takes `--format human|json`; `--no-input` is global. The envelope those
+commands emit has a published schema of its own (`schema --kind envelope`,
+`schemas/envelope.schema.json`), and a test validates each command's real
+output against it.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
 (`--force` / `--data`), `plan --db` (`--staged`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
-(`--reason`), `bootstrap` (`--sql`), `state prune` (`--keep`), `unlock`,
+(`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),
+`state prune` (`--keep`), `unlock`,
 `status` (`--format json`).
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
@@ -204,5 +209,7 @@ in [ADR-0015](ADR-0015-local-ui-implementation.md): the UI runs the `pbps`
 binary as a subprocess and links none of the crates, serves a page embedded in
 the binary with no build step, refuses any request without its per-launch
 token, reads no credential itself, and commits through the user's own `git`.
-The steps are in issue #64; the code waits for the last Phase 5 model change,
-because a page over a moving payload is a second implementation of it.
+The steps are in issue #64. Step 1 is that ADR. Step 2 froze what the page
+reads: the envelope's schema is published and checked against real output, and
+`state list` gives the ledger timeline `status`'s newest-entry row cannot
+(DECISIONS 213-215).

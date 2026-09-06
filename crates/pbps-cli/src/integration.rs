@@ -31,6 +31,8 @@ pub enum SchemaKind {
     Config,
     /// One declaration file: a table, or a view, procedure, function or trigger.
     Declaration,
+    /// The `--format json` envelope of SPEC §9.8, one branch per command.
+    Envelope,
 }
 
 /// The version of the *published schemas*, independent of the tool's.
@@ -38,7 +40,7 @@ pub enum SchemaKind {
 /// It moves when a schema changes in a way an editor would notice, which the
 /// tool version does — for reasons no editor cares about (SPEC §14.2,
 /// acceptance criterion 6).
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block
 //    that did not exist — which is exactly the criterion above.
 // 3: the `hooks.on_apply_attempt` event hook.
@@ -62,6 +64,101 @@ pub const SCHEMA_VERSION: u32 = 8;
 //    notices in the way that matters: it stops flagging a valid file
 //    (DECISIONS 213). A consumer keying on this number could not otherwise
 //    tell the widened grammar from the version-7 enum.
+// 9: the `envelope` kind exists. Nothing an editor completes changed, and no
+//    published schema's contents moved; the number moves because a consumer
+//    keying on it can now ask this binary for a schema a version-8 one would
+//    have refused, and "which kinds does this binary publish" is exactly what
+//    the stamp is for.
+
+/// Every command that emits an envelope, with the payload its `data` carries.
+///
+/// The list is the contract ADR-0015 decision 1 rests on. Nothing else names
+/// it: the published schema is built from it, and the flow test reads the
+/// command names back out of that schema and compares them with the commands
+/// `--help` says take `--format json`, so a command added here without the
+/// flag, or given the flag without a line here, is a failing test rather than
+/// an envelope nothing describes.
+macro_rules! envelope_branches {
+    ($mac:ident) => {
+        $mac! {
+            "plan" => crate::PlanData,
+            "validate" => crate::ValidateData,
+            "fmt" => crate::FmtData,
+            "explain" => crate::explain::Explanation,
+            "doctor" => crate::doctor::Diagnosis,
+            "verify" => pbps_model::DriftReport,
+            "status" => Vec<crate::status::EnvStatus>,
+            "state list" => crate::state_list::StateListData,
+        }
+    };
+}
+
+/// The published schema of the envelope: one branch per command, selected by
+/// the `command` field.
+///
+/// One document with a `oneOf` rather than one document per command, because
+/// what a consumer holds is *an envelope*: it reads `command` and only then
+/// knows what `data` is. Publishing them separately would make it choose the
+/// schema before reading the field that decides which one applies.
+///
+/// Every branch is generated from the type the command serializes, the way the
+/// other two kinds are generated from the loader's and the config's types, so
+/// the published shape cannot drift from the emitted one.
+fn envelope_schema() -> serde_json::Value {
+    let mut defs = serde_json::Map::new();
+    let mut branches = Vec::new();
+
+    macro_rules! build {
+        ($($name:literal => $ty:ty),* $(,)?) => {$({
+            let mut doc =
+                serde_json::to_value(schemars::schema_for!(crate::output::Report<$ty>))
+                    .expect("a generated schema always serializes");
+            let obj = doc.as_object_mut().expect("a generated schema is an object");
+
+            // Each `schema_for!` brings its own `$defs`, and the shared types —
+            // `Finding`, `Severity`, `Outcome` — appear in all of them under
+            // the same name with the same body, so merging is safe. The assert
+            // is what says so if it ever stops being true, rather than one
+            // branch silently winning.
+            if let Some(serde_json::Value::Object(d)) = obj.remove("$defs") {
+                for (k, v) in d {
+                    match defs.get(&k) {
+                        Some(existing) => assert_eq!(
+                            existing, &v,
+                            "two envelope branches define `{k}` differently"
+                        ),
+                        None => {
+                            defs.insert(k, v);
+                        }
+                    }
+                }
+            }
+            obj.remove("$schema");
+            obj.remove("title");
+            // Pinned to the one value that selects this branch. Without the
+            // constant every branch would match every envelope and `oneOf`
+            // would reject all of them for matching more than one.
+            if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
+                props.insert("command".to_owned(), serde_json::json!({ "const": $name }));
+            }
+
+            let def = format!("envelope.{}", $name.replace(' ', "-"));
+            defs.insert(def.clone(), doc);
+            branches.push(serde_json::json!({ "$ref": format!("#/$defs/{def}") }));
+        })*};
+    }
+    envelope_branches!(build);
+
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "pbps --format json envelope",
+        "description":
+            "One envelope per read-only command (SPEC 9.8). `command` selects which \
+             branch applies, and `data` is that command's own payload.",
+        "oneOf": branches,
+        "$defs": defs,
+    })
+}
 
 pub fn schema(kind: SchemaKind) -> serde_json::Value {
     let mut v = match kind {
@@ -69,6 +166,7 @@ pub fn schema(kind: SchemaKind) -> serde_json::Value {
         SchemaKind::Declaration => {
             serde_json::to_value(schemars::schema_for!(pbps_load::dto::DeclarationFile))
         }
+        SchemaKind::Envelope => Ok(envelope_schema()),
     }
     // These are generated from types that derive the trait; a failure would mean
     // the derive itself produced something unserializable, which the build would
@@ -175,6 +273,7 @@ mod tests {
         for (kind, file) in [
             (SchemaKind::Declaration, "declaration.schema.json"),
             (SchemaKind::Config, "pbps.yml.schema.json"),
+            (SchemaKind::Envelope, "envelope.schema.json"),
         ] {
             let path = root.join(file);
             let on_disk = std::fs::read_to_string(&path)

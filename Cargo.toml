@@ -87,6 +87,14 @@ serde-saphyr = "1.2"
 # because column order is meaningful and `TableDto::columns` is an IndexMap.
 schemars = { version = "1", features = ["indexmap2"] }
 
+# Tests only, and only for the envelope schema of SPEC 9.8: the published
+# schema is checked by validating real command output against it, and the
+# alternative — a validator written inside the test — would be a second
+# implementation of the very thing under test. `default-features = false`
+# keeps the network resolver and its TLS stack out; nothing here fetches a
+# remote `$ref`. It never reaches the shipped binary (SPEC 11.4).
+jsonschema = { version = "0.54", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

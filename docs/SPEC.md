@@ -967,6 +967,7 @@ full state.
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason --operator` | Reset the state baseline |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
+| `pbps state list` | This environment's history, newest first |
 | `pbps state prune --keep N` | Clean up historical snapshots |
 | `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
 
@@ -1220,10 +1221,17 @@ copy blesses files the loader refuses, and does it quietly.
 ### 9.8 Machine-readable output and exit codes
 
 Every read-only command — `plan` (offline, including `--check`), `validate`,
-`fmt`, `explain`, `doctor`, `verify`, `status` — takes `--format human|json`
+`fmt`, `explain`, `doctor`, `verify`, `status`, `state list` — takes
+`--format human|json`
 and, in JSON, emits one envelope. `plan --db` is deliberately outside that set:
 it connects, reads the ledger and writes the deployment artifact, and what a
-reviewer reads *from* that artifact is `explain`.
+reviewer reads *from* that artifact is `explain` (DECISIONS 214).
+
+The envelope's own schema is published, generated from the types the commands
+serialize: `pbps schema --kind envelope`, and `schemas/envelope.schema.json` in
+the repository. One document, with a branch per command selected by the
+`command` field, so a consumer reads that field and then knows what `data` is
+(DECISIONS 213).
 
 ```json
 {
@@ -1762,7 +1770,7 @@ around the typed plan and its checksum.
 | Discover the declaration format while typing | Users move between YAML and this document, and a misspelled key is found only by running `validate` | Ship versioned JSON Schemas for `pbps.yml` and the declarations, **generated from the loader's own types** so the two cannot drift, plus a `pbps schema` exporter for air-gapped editors, shell completions and generated man pages | **P0** |
 | Apply organization-specific safety rules | Built-in validation cannot express local naming, size or change-window rules | A declarative `policies:` block selects built-in rules and severities. Suppression requires a rule id, a reason and an optional expiry; no embedded code in v1 (14.3). `validate --since` evaluates only changed objects, so a large estate can adopt it gradually. The block is a new format surface and gets an ADR before it is built, as reference data and roles did | **P1** |
 | Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
-| Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
+| Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state list` (built) shows the timeline; `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
 | Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed — delivered in [CI.md](CI.md). A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet, keeping the existing split: `Change::intrinsic_risks()` for what needs no dialect, dialect-computed findings attached to `PlannedChange::risks`. Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
@@ -1801,7 +1809,8 @@ and `status`; and the interactive prompt of 6.3, which was the last part of
 Phase 4 delivered the `policies:` block and the first analyzer catalogue
 ([ADR-0008](ADR-0008-policies.md)), and the documented pipelines are in
 [CI.md](CI.md). What remains in 14.1 is P1 and P2: operational estimates,
-`state show / diff / export`, the optional UI (Phase 6) and a versioned CI
+`state show / diff / export` — of which `state list`, the timeline, is built —
+the optional UI (Phase 6) and a versioned CI
 component, and the wider analyzer catalogue. The catalogue is not a phase of
 its own: it is depth over the typed `ChangeSet`, added rule by rule, and the
 rules that need the target's row counts belong beside the operational estimate

@@ -33,7 +33,7 @@ use crate::{db, output, report};
 /// Serialized rather than re-derived by a consumer: the optional UI of ADR-0006
 /// renders exactly this, and a UI that recomputed "which risks apply" from the
 /// change list would be a second implementation of the gate's own arithmetic.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Explanation {
     pub applyable: bool,
     pub dialect: String,
@@ -74,14 +74,14 @@ pub struct Explanation {
     pub target: Option<TargetState>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct RiskDetail {
     pub class: &'static str,
     pub why: &'static str,
     pub changes: Vec<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct TargetState {
     pub environment: String,
     /// `ready`, `locked`, `mid-deployment`, `uninitialized`, `unreachable` or

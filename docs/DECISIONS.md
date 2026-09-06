@@ -3229,3 +3229,58 @@ SPEC is in sync with all of these.
     closed list that refused `SELECT`, and this one accepts it. A consumer
     keying on that number to cache or select an artifact could not otherwise
     tell the two apart, which is the drift detection the field is for.
+
+## Phase 6 — the envelope contract (ADR-0015, #64 step 2)
+
+213. **The envelope's schema is published as one document with a branch per
+    command, selected by `command`.** SPEC §9.8's shape has been a Rust type
+    and an example since Phase 3.1; ADR-0015 decision 1 makes it the whole
+    contract between the UI and the tool, and a contract nothing publishes is
+    one nobody can check against.
+
+    One document rather than one per command, because what a consumer holds is
+    *an envelope*: it reads `command` and only then knows what `data` is.
+    Publishing them separately would make it choose a schema before reading
+    the field that decides which one applies. Each branch pins `command` to a
+    constant, so `oneOf` picks exactly one and a payload that happens to fit
+    another command's shape is rejected rather than silently read as that
+    command's.
+
+    Every branch is generated from the type the command serializes, the way
+    the declaration and config schemas are generated from the loader's and the
+    config's types (SPEC §14.1). The list of command-to-payload pairs is
+    written once, in `envelope_branches!`, and a flow test reads the command
+    names back out of the published schema and compares them with the
+    commands `--help` says take `--format json` — so a command given the flag
+    without a line in that list, or a line without the flag, is a failing test
+    rather than an envelope nothing describes.
+
+214. **`plan --db` stays outside the envelope set.** #64 asked whether the
+    connected plan should join it now that a UI will trigger one (step 5).
+
+    It does not, and the reason is the one SPEC §9.8 already gives: `plan --db`
+    is not a read-only command. It connects, reads the ledger, and *writes the
+    deployment artifact* — the file the checksum gate pins. What a reviewer
+    reads from that artifact is `explain`, which does speak the envelope, and
+    which reads the file rather than the run that produced it. A UI that
+    rendered the producing run's own JSON would be showing a description of the
+    artifact that was not computed from the artifact, which is precisely the
+    gap the checksum exists to close.
+
+    So the UI's trigger path stays: run `plan --db`, then read the plan back
+    with `explain --plan --format json`. ADR-0015 decision 1's list of what
+    speaks the envelope is exact and unchanged.
+
+215. **`state list` carries the ledger's columns, never the recorded schema.**
+    The timeline the UI draws needs an id, a time, a kind, an operator and the
+    provenance fields; the snapshot's `schema` and `ids` are the whole database
+    twice over. A payload that carried them would send megabytes to a page
+    drawing a list of dates, and they are what `state show` and `state export`
+    are for — the second half of SPEC §14.1's row, deliberately not built here.
+
+    `initialized` sits beside `entries` because an empty list is the one
+    rendering that must never stand for "this database has no ledger" or "the
+    server could not be reached". The three are a note plus `initialized:
+    false`, a note plus `initialized: true`, and `unanswerable` with no `data`
+    at all — three answers, as the repository's rule for absent, empty and
+    unreadable requires.

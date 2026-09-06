@@ -27,7 +27,7 @@ use pbps_mssql::edition::Edition;
 use crate::{db, output};
 
 /// Everything `doctor` learned, for `--format json`.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Diagnosis {
     pub project_file: String,
     pub declarations: String,
@@ -41,7 +41,7 @@ pub struct Diagnosis {
     pub environments: Vec<EnvDiagnosis>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct EnvDiagnosis {
     pub environment: String,
     /// `ready`, `mid-deployment`, `uninitialized`, `locked`, `lock-unknown`,

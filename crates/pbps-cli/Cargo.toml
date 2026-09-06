@@ -51,3 +51,4 @@ pbps-model.workspace = true
 pbps-db.workspace = true
 pbps-mssql.workspace = true
 tokio.workspace = true
+jsonschema.workspace = true

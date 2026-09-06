@@ -27,7 +27,9 @@ use crate::name::TableName;
 pub const CURRENT_VERSION: u32 = 1;
 
 /// The recorded state the live database was compared against.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct DriftBaseline {
     /// The ledger row, so an operator can find it: `SELECT * FROM
     /// dbo.__pbps_state WHERE id = ...`.
@@ -39,7 +41,9 @@ pub struct DriftBaseline {
     pub checksum: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct DriftReport {
     pub version: u32,
 
@@ -58,11 +62,24 @@ pub struct DriftReport {
     pub live_checksum: String,
 
     /// What the live database has that the recorded state does not.
+    ///
+    /// Opaque to the published envelope schema (SPEC §9.8): the change model is
+    /// the tool's own vocabulary, not a format anyone writes, and deriving
+    /// `JsonSchema` across it would publish — and freeze — every variant of
+    /// `Change` as a contract. The report carries its own `version` for a
+    /// consumer that reads inside it.
+    #[schemars(with = "serde_json::Value")]
     pub changes: ChangeSet,
 
     /// Tables in the database that pbps does not manage. Informational: their
     /// presence is not drift.
+    ///
+    /// Described as strings in the published schema because that is what they
+    /// are on the wire: `TableName` serializes through `into = "String"`, so a
+    /// derived description of its two fields would document a shape this JSON
+    /// never has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<String>")]
     pub unmanaged: Vec<TableName>,
 
     /// Differences the differ found but has no [`Change`](crate::Change) for —
