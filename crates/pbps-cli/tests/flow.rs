@@ -3546,6 +3546,50 @@ fn explain_refuses_a_plan_version_it_does_not_understand() {
     );
 }
 
+/// The other direction, and the one that has a wrong answer waiting for it: a
+/// plan written *before* this build. Its `baseline.checksum` came from the
+/// fingerprint as it was, and `apply` recomputes that string from the live
+/// database — so an artifact one version old would be reported as drift
+/// against a database nobody had touched (DECISIONS 238), sending an operator
+/// to reconcile a difference that does not exist. It is refused as a format
+/// instead, before anything is connected to.
+#[test]
+fn apply_refuses_a_plan_written_before_this_format() {
+    let d = Demo::new("planversionold");
+    d.table(ONE_COLUMN);
+    let plan = write_plan(&d, "stale.json", "transactional");
+
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    let current = pbps_model::plan::CURRENT_VERSION;
+    let older = raw.replace(
+        &format!("\"version\": {current}"),
+        &format!("\"version\": {}", current - 1),
+    );
+    assert_ne!(raw, older, "the fixture must carry a version to lower");
+    std::fs::write(&plan, older).unwrap();
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        "Server=127.0.0.1,1;Database=nowhere;User Id=u;Password=p",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(&format!("version {}", current - 1)),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        !stderr(&o).to_lowercase().contains("drift"),
+        "a stale artifact must not be reported as a changed database: {}",
+        stderr(&o)
+    );
+}
+
 /// The one-envelope contract holds for the failures too. A missing or malformed
 /// plan left stdout empty, so the converter reported its own generic "produced
 /// no output" instead of a report naming the bad file.

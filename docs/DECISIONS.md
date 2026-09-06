@@ -3902,3 +3902,18 @@ SPEC is in sync with all of these.
     function of the key set, and two schemas that compare equal have the same
     key set, so equal schemas now hash equally by construction rather than by
     coincidence of insertion order.
+
+    The saved plan's format version moves with the algorithm, to 6. A plan is
+    the one artifact carrying a fingerprint written by one build and
+    recomputed by another — `apply` compares `baseline.checksum` against what
+    it computes from the live database — so without the bump a plan from the
+    previous build would be refused as *drift*, against a database nobody had
+    touched, and a plan from this one refused the same way by an older build.
+    Both refusals name the wrong problem and send an operator to reconcile
+    nothing. Refused as a format instead, before anything is connected to,
+    with the remedy a stale artifact always had: run `plan --db` again and
+    take the new plan through the gate. Nothing else stores a state
+    fingerprint — the ledger keeps whole snapshots, and every comparison
+    recomputes both sides with the same binary — so the plan file is the whole
+    of the compatibility question. A test pins the fingerprint of a fixture
+    beside the version number, so changing one without the other fails there.

@@ -69,7 +69,20 @@ use crate::schema::Schema;
 /// a trigger's three-part key for a name it cannot parse; a newer one reading
 /// an older file would take `app.audit` for a view. Neither is a partial reading, so
 /// the number moves.
-pub const CURRENT_VERSION: u32 = 5;
+///
+/// Bumped to 6 when [`state_checksum`] began sorting a table's columns
+/// (DECISIONS 238). This is the one artifact carrying a fingerprint *written*
+/// by one build and *recomputed* by another: `apply` compares
+/// `baseline.checksum` against what it computes from the live database, so a
+/// version 5 plan — whose string came from the order-sensitive algorithm —
+/// read by this build would be refused as drift against a database nobody had
+/// touched, and a version 6 plan read by an older build would be refused the
+/// same way in the other direction. Neither refusal names the real reason,
+/// which is what this number is for: the plan is turned away as a format this
+/// build does not understand, and the remedy is the one that was always
+/// right for a stale artifact — run `plan --db` again and take the new plan
+/// through the gate.
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -419,6 +432,23 @@ mod tests {
         let other = schema_of(&["id", "email", "note"]);
         assert_eq!(one, other, "equality already ignores column order");
         assert_eq!(state_checksum(&one, &ids), state_checksum(&other, &ids));
+    }
+
+    /// A saved plan is the one artifact carrying a fingerprint *written* by one
+    /// build and *recomputed* by another: `apply` compares `baseline.checksum`
+    /// against what it computes from the live database. So the value below is
+    /// pinned. If it changes, the algorithm changed, and
+    /// [`CURRENT_VERSION`] has to change with it (DECISIONS 238) — otherwise
+    /// a plan from the previous build is refused as drift against a database
+    /// nobody touched, which names the wrong problem and sends the operator
+    /// to reconcile nothing.
+    #[test]
+    fn the_fingerprint_is_pinned_to_the_plan_format_version() {
+        assert_eq!(
+            state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
+            "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
+        );
+        assert_eq!(CURRENT_VERSION, 6);
     }
 
     /// Sorting the keys must not sort away a difference. The same three
