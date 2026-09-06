@@ -1327,9 +1327,16 @@ fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, Dia
     let q = qualified(table)?;
     Ok(match &pk.name {
         Some(n) => Statement::new(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n)?)),
+        // The statement being built is a *string*, so the table name inside it
+        // is in literal position and not in code position. `quote` is the
+        // wrong tool there: it doubles `]`, and an apostrophe passes through
+        // it untouched and closes the literal early. So the whole prefix is
+        // handed to `literal`, the way `rows.rs` builds its dynamic statement
+        // — which also means the name can never be interpolated raw again.
         None => Statement::new(format!(
-            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@pk);\n    EXEC(@sql);\nEND",
-            literal(&q)
+            "DECLARE @pk sysname = (\n    SELECT name FROM sys.key_constraints\n     WHERE parent_object_id = OBJECT_ID({}) AND type = 'PK');\nIF @pk IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = {} + QUOTENAME(@pk);\n    EXEC(@sql);\nEND",
+            literal(&q),
+            literal(&format!("ALTER TABLE {q} DROP CONSTRAINT "))
         ))
         .own_batch(),
     })
@@ -1344,9 +1351,11 @@ fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, Dia
 fn drop_default_block(table: &TableName, column: &str) -> Result<String, DialectError> {
     let q = qualified(table)?;
     Ok(format!(
-        "DECLARE @df sysname = (\n    SELECT dc.name FROM sys.default_constraints dc\n      JOIN sys.columns c ON c.object_id = dc.parent_object_id\n                        AND c.column_id = dc.parent_column_id\n     WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {});\nIF @df IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = N'ALTER TABLE {q} DROP CONSTRAINT ' + QUOTENAME(@df);\n    EXEC(@sql);\nEND",
+        "DECLARE @df sysname = (\n    SELECT dc.name FROM sys.default_constraints dc\n      JOIN sys.columns c ON c.object_id = dc.parent_object_id\n                        AND c.column_id = dc.parent_column_id\n     WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {});\nIF @df IS NOT NULL\nBEGIN\n    DECLARE @sql nvarchar(max) = {} + QUOTENAME(@df);\n    EXEC(@sql);\nEND",
         literal(&q),
-        literal(column)
+        literal(column),
+        // Literal position, not code position — see `drop_primary_key`.
+        literal(&format!("ALTER TABLE {q} DROP CONSTRAINT "))
     ))
 }
 
@@ -1717,6 +1726,55 @@ mod tests {
             name: TableName::new("dbo", "x]; DROP TABLE users; --"),
         });
         assert_eq!(sql, ["DROP TABLE [dbo].[x]]; DROP TABLE users; --];"]);
+    }
+
+    /// The other half of the same property, for the statements that are built
+    /// as a *string* and run through `EXEC`. Brackets stop a name from ending
+    /// an identifier; they do nothing to stop it ending the literal the
+    /// identifier is sitting inside, and an apostrophe is a legal character in
+    /// a SQL Server name, so `pull` can adopt one. Both looked-up drops are
+    /// checked, because the shape is written out twice.
+    #[test]
+    fn a_name_with_an_apostrophe_cannot_break_out_of_a_dynamic_statement() {
+        let looked_up_pk = sql_of(&Change::SetPrimaryKey {
+            table: tname("dbo.o'brien"),
+            from: Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+            }),
+            to: None,
+        });
+        let looked_up_default = sql_of(&Change::DropColumn {
+            uid: uid("c_k7x2mq"),
+            column: cref("dbo.o'brien.legacy"),
+        });
+
+        for sql in [&looked_up_pk[0], &looked_up_default[0]] {
+            // Every line that is building a string — the `OBJECT_ID` argument
+            // and the dynamic statement — carries the doubled spelling, and
+            // none of them carries the raw one. Asserting only that the
+            // escaped form is present would still pass with a raw copy left
+            // beside it, which is the bug that was here.
+            let building = sql.lines().filter(|l| l.contains("N'")).collect::<Vec<_>>();
+            assert!(!building.is_empty(), "{sql}");
+            for line in building {
+                assert!(!line.contains("[o'brien]"), "{sql}");
+            }
+            assert!(
+                sql.contains("N'ALTER TABLE [dbo].[o''brien] DROP CONSTRAINT '"),
+                "{sql}"
+            );
+        }
+
+        // The undoubled spelling is not wrong everywhere: the plain
+        // `ALTER TABLE` that follows the lookup is code, not a string, and
+        // there the name must *not* be doubled. One name, two positions, two
+        // spellings — which is why `quote` in literal position was the bug.
+        assert!(
+            looked_up_default[0].ends_with("ALTER TABLE [dbo].[o'brien] DROP COLUMN [legacy];"),
+            "{}",
+            looked_up_default[0]
+        );
     }
 
     #[test]
