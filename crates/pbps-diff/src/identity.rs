@@ -57,6 +57,33 @@ pub enum Blocker {
     /// Ignoring it silently would leave the user facing an ambiguity error they
     /// cannot explain.
     UnusedIntent { intent: Intent },
+    /// Two or more rename intents claim one name: one source renamed to two
+    /// targets, or two sources renamed onto one name.
+    ///
+    /// Not an ambiguity to be resolved by choosing, which is why this carries
+    /// no candidates. The matching loops consume from `disappeared` and
+    /// `appeared`, so the first intent to reach a contested name takes it and
+    /// the rest fall through — the winner is declaration order, which is not a
+    /// decision anyone made.
+    ConflictingRenameIntents {
+        side: RenameSide,
+        /// The contested name, spelled as the user wrote it: `dbo.t.old` for a
+        /// column, `dbo.t` for a table, the bare name for a role.
+        name: String,
+        /// Every intent claiming it, in declaration order. Always more than
+        /// one, and always of one kind.
+        intents: Vec<Intent>,
+    },
+}
+
+/// The half of a rename that two intents fought over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameSide {
+    /// They all rename *from* the contested name. The object it names can only
+    /// become one of the targets.
+    Source,
+    /// They all rename *to* it. Only one object can end up with the name.
+    Target,
 }
 
 /// Information a tombstone needs that cannot be derived from the files.
@@ -97,8 +124,17 @@ pub fn resolve(
         ids: ids.clone(),
         ..Default::default()
     };
-    let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
+
+    // First, and alone: once two intents claim one name, every judgement below
+    // is decided by declaration order, so anything else the resolvers reported
+    // would be downstream of a question the user has not answered. The target
+    // case already reached `Err`, but as an `UnusedIntent` — "matches nothing,
+    // likely a typo" about an intent that matches too much.
+    let mut blockers = conflicting_rename_intents(intents);
+    if !blockers.is_empty() {
+        return Err(blockers);
+    }
 
     resolve_tables(declared, intents, ctx, &mut r, &mut blockers, &mut used);
     resolve_columns(declared, intents, ctx, &mut r, &mut blockers, &mut used);
@@ -118,6 +154,78 @@ pub fn resolve(
     } else {
         Err(blockers)
     }
+}
+
+/// The `(source, target)` a rename intent claims, each keyed by the kind of
+/// object it names and spelled as the user wrote it. `None` for a drop, which
+/// claims nothing.
+///
+/// The kind is part of the key because a table and a role may share a name and
+/// two intents renaming them are not in conflict. A column's key carries its
+/// table for the same reason.
+fn rename_claims(intent: &Intent) -> Option<((UidKind, String), (UidKind, String))> {
+    let pair = |kind, from: String, to: String| Some(((kind, from), (kind, to)));
+    match intent {
+        Intent::RenameTable { from, to } => pair(UidKind::Table, from.to_string(), to.to_string()),
+        Intent::RenameColumn { table, from, to } => pair(
+            UidKind::Column,
+            table.column(from).to_string(),
+            table.column(to).to_string(),
+        ),
+        Intent::RenameRole { from, to } => pair(UidKind::Role, from.clone(), to.clone()),
+        Intent::DropTable { .. } | Intent::DropColumn { .. } | Intent::DropRole { .. } => None,
+    }
+}
+
+/// Rename intents that claim one name, on either side.
+///
+/// One guard for tables, columns and roles rather than one per resolver. The
+/// three matching loops are the same code over three types, and a rule with
+/// three homes is three chances to be fixed once (`docs/PITFALLS.md`, "One
+/// rule, spelled in three places"). DECISIONS 246.
+///
+/// **Identical intents are not a conflict.** The same rename can reach
+/// `resolve` twice — a `renamed_from` annotation the user also answered at the
+/// interactive prompt produces two equal intents — and refusing that would
+/// refuse a valid plan for saying one true thing twice. Only *distinct*
+/// intents contending for a name are ambiguous.
+///
+/// A chain (`a -> b` beside `b -> c`) is not caught here and does not need to
+/// be: no name is claimed twice on one side, and the loops refuse it already
+/// because `b` is on both sides of the declarations and so is in neither
+/// `appeared` nor `disappeared`.
+fn conflicting_rename_intents(intents: &[Intent]) -> Vec<Blocker> {
+    let mut seen: BTreeSet<&Intent> = BTreeSet::new();
+    let mut by_source: BTreeMap<(UidKind, String), Vec<Intent>> = BTreeMap::new();
+    let mut by_target: BTreeMap<(UidKind, String), Vec<Intent>> = BTreeMap::new();
+    for intent in intents {
+        if !seen.insert(intent) {
+            continue;
+        }
+        let Some((source, target)) = rename_claims(intent) else {
+            continue;
+        };
+        by_source.entry(source).or_default().push(intent.clone());
+        by_target.entry(target).or_default().push(intent.clone());
+    }
+
+    let contested = |side: RenameSide, grouped: BTreeMap<(UidKind, String), Vec<Intent>>| {
+        grouped
+            .into_iter()
+            .filter(|(_, claimants)| claimants.len() > 1)
+            .map(
+                move |((_, name), intents)| Blocker::ConflictingRenameIntents {
+                    side,
+                    name,
+                    intents,
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+
+    let mut blockers = contested(RenameSide::Source, by_source);
+    blockers.extend(contested(RenameSide::Target, by_target));
+    blockers
 }
 
 /// Whether this intent has already taken effect — its fact is in the ids file.

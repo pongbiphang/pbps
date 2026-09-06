@@ -4190,3 +4190,52 @@ SPEC is in sync with all of these.
     tool cannot order correctly in any case, and the narrowing picks the
     spelling rather than the meaning. Declaring the dependency says what the
     scan cannot read.
+246. **Two rename intents claiming one name are refused, before anything else
+    is judged.** The three matching loops in `identity.rs` consume from
+    `disappeared` and `appeared`, and nothing checked that two intents named
+    one column, table or role. The first to be reached took it; the rest fell
+    through.
+
+    The source case was **silent**. Measured: with `renamed_from: old` on both
+    `aaa` and `zzz`, `resolve` returned `Ok`, the column holding the data was
+    renamed to `aaa`, and `zzz` was created as a new empty column beside it —
+    so the data answered to a name the author did not choose and the name they
+    expected held nothing. The second intent went unreported because its target
+    had by then been minted into the ids file, which is what the absorbed check
+    reads. Which of the two won was declaration order.
+
+    The target case did reach `Err`, but as `UnusedIntent` — "matches nothing
+    in either the declarations or the identity file, likely a typo" — about an
+    intent whose every name exists. A message that sends the reader looking for
+    a misspelling there is none of is worse than the count of blockers
+    suggests.
+
+    **One guard for all three kinds, not one per resolver.** The loops are the
+    same code over three types, and a rule with three homes is three chances to
+    be fixed once (`docs/PITFALLS.md`, "One rule, spelled in three places").
+    The key carries the kind, and a column's carries its table, so a table and
+    a role that share a name — or one column name in two tables — stay two
+    claims rather than becoming one.
+
+    **It runs first and returns alone.** Once two intents claim one name, every
+    judgement below is decided by declaration order, so anything else the
+    resolvers reported would be downstream of a question the user has not
+    answered.
+
+    **Identical intents are not a conflict.** The same rename reaches `resolve`
+    twice whenever a `renamed_from` annotation is also answered at the
+    interactive prompt, and refusing that would refuse a valid plan for saying
+    one true thing twice. Only distinct intents contending for a name are
+    ambiguous.
+
+    **And it offers no choice.** The prompt's candidates would be exactly the
+    intents the user has already written down, so it would ask them to pick one
+    of their own contradictory statements and then record it — turning a caught
+    mistake into a committed one. The file is where the contradiction lives and
+    where it has to be resolved.
+
+    A chain (`a -> b` beside `b -> c`) claims no name twice on either side and
+    is not this guard's business; it is already refused, because `b` is in both
+    the declarations and the ids file and so is in neither `appeared` nor
+    `disappeared`. A test pins that, so nobody widens the guard onto a case
+    that is covered.

@@ -6,7 +6,7 @@
 //! instructions — otherwise a user reading a CI log sees "this is ambiguous" with
 //! no idea what to type.
 
-use pbps_diff::Blocker;
+use pbps_diff::{Blocker, RenameSide};
 use pbps_model::change::DeleteCause;
 use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 
@@ -54,6 +54,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
         Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
         Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
         Blocker::UnusedIntent { .. } => "identity.unused-intent",
+        Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
     };
     let text = one_blocker(b);
     // The first line says what happened; the rest are the commands.
@@ -151,6 +152,30 @@ fn one_blocker(b: &Blocker) -> String {
                 "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n",
                 intent(i)
             )
+        }
+        // The opposite complaint to the one above: these match too much. Every
+        // one of them is well formed, and the file does not say which the
+        // author meant — so they are listed and none is performed.
+        Blocker::ConflictingRenameIntents {
+            side,
+            name,
+            intents,
+        } => {
+            let claim = match side {
+                RenameSide::Source => format!("all rename {name}"),
+                RenameSide::Target => format!("all rename something to {name}"),
+            };
+            let mut s = format!(
+                "  {} intents {claim}, and nothing says which one you meant:\n",
+                intents.len()
+            );
+            for i in intents {
+                s.push_str(&format!("    {}\n", intent(i)));
+            }
+            s.push_str(
+                "\n    edit the declarations so that only one of them names it, then plan again\n",
+            );
+            s
         }
     }
 }
@@ -924,5 +949,40 @@ mod tests {
         });
         assert!(text.contains("--reason \"<why>\""), "{text}");
         assert!(!has_bare_placeholder(&text), "{text}");
+    }
+
+    /// A conflict names every intent that caused it, not just the count.
+    ///
+    /// The user's next act is to delete one of them from a file, and they can
+    /// only do that if they are told which ones are contending. A message that
+    /// said "two intents conflict" would send them to read the whole tree.
+    #[test]
+    fn a_rename_conflict_lists_the_intents_that_caused_it() {
+        let claim = |to: &str| Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: to.into(),
+        };
+        let text = one_blocker(&Blocker::ConflictingRenameIntents {
+            side: RenameSide::Source,
+            name: "dbo.t.old".into(),
+            intents: vec![claim("aaa"), claim("zzz")],
+        });
+        assert!(text.contains("dbo.t.aaa renamed_from old"), "{text}");
+        assert!(text.contains("dbo.t.zzz renamed_from old"), "{text}");
+
+        // And the finding splits into a message and a remedy, like every other
+        // blocker: a caller reading JSON gets the same two halves the human
+        // view prints.
+        let f = blocker_finding(&Blocker::ConflictingRenameIntents {
+            side: RenameSide::Target,
+            name: "dbo.t.new".into(),
+            intents: vec![claim("new"), claim("new")],
+        });
+        assert_eq!(f.id, "identity.conflicting-rename-intents");
+        assert!(
+            f.remedy.as_deref().is_some_and(|r| r.contains("edit the")),
+            "{f:?}"
+        );
     }
 }

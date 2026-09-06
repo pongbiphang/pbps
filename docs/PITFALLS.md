@@ -737,6 +737,33 @@ this repo (a column list, a type's own modifier args) are safe only because
 their elements cannot nest, and that is a property worth confirming rather
 than assuming.
 
+## A matching loop where the loser leaves no trace
+
+A loop that pairs supplied intent against `disappeared` and `appeared` decides
+by consumption: `disappeared.remove(from) && appeared.remove(to)`. Nothing in
+that expression asks whether a second intent wanted the same name, so the first
+to be reached wins and the rest fall through — and the winner is declaration
+order, which is not a decision anyone made.
+
+The reason it was *silent* rather than merely wrong is the second half.
+`resolve` sweeps unmatched intents at the end and reports each as an
+`UnusedIntent`, but the sweep asks `intent_is_absorbed`, which reads the ids
+file — into which the winning rename has by then written the loser's target as
+a fresh column. The loser therefore reads as **already done**. A guard placed
+after a mutation is asking about a world the mutation has already changed
+(DECISIONS 246).
+
+The tell is that the two arms of the failure look different from each other:
+contending for a source returned `Ok` and renamed the wrong column, contending
+for a target returned `Err` with "matches nothing … likely a typo" about an
+intent whose every name exists. **When one shape produces a wrong success and a
+misleading failure depending on which half collides, the check is missing
+upstream of both** — not in either arm.
+
+**Ask "can two of these claim one thing?" of every loop that consumes from a
+set.** The answer decides whether the loop is a matching or a race, and the
+question is not visible in the loop's own text.
+
 ## Tests that pass for the wrong reason
 
 Eleven so far, every one invisible in a green run. **Assert the specific failure,

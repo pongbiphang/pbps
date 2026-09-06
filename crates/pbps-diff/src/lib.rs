@@ -11,7 +11,7 @@ pub mod identity;
 pub mod managed;
 pub mod schema_diff;
 
-pub use identity::{Blocker, Context, Resolution, intent_is_absorbed, resolve};
+pub use identity::{Blocker, Context, RenameSide, Resolution, intent_is_absorbed, resolve};
 pub use managed::{Scoped, observed_ids, scope};
 pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
 
@@ -446,6 +446,299 @@ mod tests {
             2,
             "the missing drop reason and the column ambiguity should both be reported: {errs:?}"
         );
+    }
+
+    // ---- rename intents that claim one name ----
+
+    /// The one that was silent. Two intents naming one source: the first to be
+    /// reached consumed it, the second fell through, and because its target had
+    /// meanwhile been minted into the ids file the absorbed check read it as
+    /// already done. `resolve` returned `Ok`.
+    ///
+    /// Measured before the fix: the column that held the data was renamed to
+    /// `aaa` — a name the author did not choose for it — and `zzz` was created
+    /// as a brand-new empty column beside it. Which of the two won was
+    /// declaration order.
+    #[test]
+    fn two_rename_intents_naming_one_source_column_are_refused() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old"])]);
+        let s = schema(&[("dbo.t", &["id", "aaa", "zzz"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "aaa".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "zzz".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            matches!(&errs[0], Blocker::ConflictingRenameIntents { side, name, intents }
+                if *side == RenameSide::Source && name == "dbo.t.old" && intents.len() == 2),
+            "{errs:?}"
+        );
+    }
+
+    /// The mirror: two sources renamed onto one name. Only one object can end
+    /// up with it.
+    ///
+    /// This one already reached `Err` — but as an `UnusedIntent`, "matches
+    /// nothing in either the declarations or the identity file, likely a typo",
+    /// about an intent whose every name exists. The blocker has to say what is
+    /// actually wrong or the user goes looking for a misspelling there is none
+    /// of.
+    #[test]
+    fn two_rename_intents_naming_one_target_column_are_refused() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old1", "old2"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old1".into(),
+                    to: "new".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old2".into(),
+                    to: "new".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            matches!(&errs[0], Blocker::ConflictingRenameIntents { side, name, intents }
+                if *side == RenameSide::Target && name == "dbo.t.new" && intents.len() == 2),
+            "{errs:?}"
+        );
+    }
+
+    /// The same shape one level up. `resolve_tables` is the same loop over a
+    /// different type, so fixing the columns alone would be fixing none
+    /// (`docs/PITFALLS.md`, "One rule, spelled in three places").
+    #[test]
+    fn two_rename_intents_naming_one_source_table_are_refused() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"])]);
+        let s = schema(&[("dbo.aaa", &["id"]), ("dbo.zzz", &["id"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.aaa"),
+                },
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.zzz"),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            matches!(&errs[0], Blocker::ConflictingRenameIntents { side, name, .. }
+                if *side == RenameSide::Source && name == "dbo.old"),
+            "{errs:?}"
+        );
+    }
+
+    /// And roles, where the consequence is the worst of the three: a role's
+    /// membership follows it through a rename and is destroyed by a drop and
+    /// add, so a role renamed to a name nobody chose takes its members with it.
+    #[test]
+    fn two_rename_intents_naming_one_source_role_are_refused() {
+        let s = with_roles(&[("dbo.t", &["id"])], &["old"]);
+        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["aaa", "zzz"]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameRole {
+                    from: "old".into(),
+                    to: "aaa".into(),
+                },
+                Intent::RenameRole {
+                    from: "old".into(),
+                    to: "zzz".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            matches!(&errs[0], Blocker::ConflictingRenameIntents { side, name, .. }
+                if *side == RenameSide::Source && name == "old"),
+            "{errs:?}"
+        );
+    }
+
+    /// A table and a role may share a name, and two intents renaming them are
+    /// not in conflict. The key carries the kind so that they are not read as
+    /// one claim — the negative case for the grouping, and the one a key of
+    /// bare strings would get wrong.
+    #[test]
+    fn a_table_and_a_role_of_one_name_are_two_claims_not_one() {
+        let s = with_roles(&[("dbo.thing", &["id"])], &["thing"]);
+        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let s = with_roles(&[("dbo.renamed", &["id"])], &["renamed"]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.thing"),
+                    to: t("dbo.renamed"),
+                },
+                Intent::RenameRole {
+                    from: "thing".into(),
+                    to: "renamed".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_tables.len(), 1);
+        assert_eq!(r.renamed_roles.len(), 1);
+    }
+
+    /// One rename stated twice is redundant, not ambiguous. The same intent
+    /// reaches `resolve` twice whenever a `renamed_from` annotation is also
+    /// answered at the interactive prompt, and refusing that would refuse a
+    /// valid plan for saying one true thing twice.
+    #[test]
+    fn one_rename_stated_twice_is_not_a_conflict() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old"])]);
+        let s = schema(&[("dbo.t", &["id", "new"])]);
+        let intent = Intent::RenameColumn {
+            table: t("dbo.t"),
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let r = resolve(&s, &ids, &[intent.clone(), intent], &ctx()).unwrap();
+
+        assert_eq!(r.renamed_columns.len(), 1);
+        assert_eq!(r.renamed_columns[0].2.name, "new");
+    }
+
+    /// Two renames in one table that contend for nothing are still two
+    /// renames. The guard must not fire on a plan whose only crime is being
+    /// more than one rename long.
+    #[test]
+    fn two_unrelated_renames_in_one_table_are_not_a_conflict() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "a", "b"])]);
+        let s = schema(&[("dbo.t", &["id", "x", "y"])]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "a".into(),
+                    to: "x".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "b".into(),
+                    to: "y".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_columns.len(), 2);
+    }
+
+    /// A chain — `a -> b` beside `b -> c` — claims no name twice on either
+    /// side, so this guard is silent about it. It is refused anyway, because
+    /// `b` is in the declarations and in the ids file and so is in neither
+    /// `appeared` nor `disappeared`; both intents go unmatched. Pinned so that
+    /// nobody widens the guard to cover a case that is already covered.
+    #[test]
+    fn a_rename_chain_is_refused_by_the_existing_rule_not_by_this_guard() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "a", "b"])]);
+        let s = schema(&[("dbo.t", &["id", "b", "c"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "a".into(),
+                    to: "b".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "b".into(),
+                    to: "c".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| !matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|b| matches!(b, Blocker::UnusedIntent { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// Two intents claiming one column name in *different* tables are two
+    /// claims. The column's key carries its table, and a key of bare column
+    /// names would refuse this valid plan.
+    #[test]
+    fn one_column_name_in_two_tables_is_two_claims() {
+        let (_, ids) = baseline(&[("dbo.a", &["old"]), ("dbo.b", &["old"])]);
+        let s = schema(&[("dbo.a", &["new"]), ("dbo.b", &["new"])]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.a"),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.b"),
+                    from: "old".into(),
+                    to: "new".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_columns.len(), 2);
     }
 
     // ---- roles (ADR-0005) ----
