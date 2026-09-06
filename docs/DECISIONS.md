@@ -3642,3 +3642,46 @@ SPEC is in sync with all of these.
     on its own — a hostname resolving to two addresses this test controls is not
     portable (`localhost` is one address on some machines and two on others), so
     the loop is pinned and the resolving is read.
+
+233. **A dollar-quote tag follows the engine's grammar, which is over bytes.**
+    PostgreSQL's lexer spells it `dolq_start [A-Za-z\200-\377_]` and
+    `dolq_cont` the same plus the digits: **any** byte with the high bit set is
+    a tag character. `char::is_alphanumeric` is a different and smaller set —
+    measured on 18.6, `$á$` written as `a` and a combining acute is a tag the
+    engine accepts, and Rust classifies U+0301 as neither letter nor number.
+    Refusing it there scanned the literal's body as code and folded its spacing
+    away: the silent failure of 226 again, one level down, arriving through the
+    rule written to prevent it.
+
+    "Not ASCII" is the whole of the high-bit half, so the test is
+    `is_ascii_alphabetic() || '_' || !is_ascii()`, plus the digits after the
+    first character. A Unicode class is the wrong tool for a grammar written in
+    bytes, however much it looks like the right one.
+
+234. **A TLS stack is built only when the connection may use one, and ALPN is
+    offered only for direct SSL.** Two halves of the same mistake: doing TLS
+    work that the connection string has already ruled out, and not doing the
+    TLS work it asks for.
+
+    Building the stack reads the host's certificate store, and `tls()` refuses
+    when that cannot be read — deliberately, because a trust store that failed
+    to load is not an empty one. Under `sslmode=disable` that refused a
+    connection over certificates it was never going to look at, on exactly the
+    minimal image SPEC §11.3's single static binary is for. `connect` now
+    branches, and the disabled path hands the driver `NoTls`.
+
+    The other half is ALPN. **Measured on PostgreSQL 18.6**: a direct SSL
+    connection that offers no ALPN is refused — `received direct SSL connection
+    request without ALPN protocol negotiation extension` in the server log —
+    while the TLS handshake itself *completes*, so the failure lands after it
+    and reads as the connection dropping rather than as a protocol requirement.
+    Neither `tokio-postgres` nor `tokio-postgres-rustls` sets it, so
+    `sslnegotiation=direct` could not connect at all. Offered only for `Direct`,
+    because the `SSLRequest` negotiation the default uses asks for none and
+    libpq offers none there either.
+
+    Both are pinned by unit tests over the parsed config rather than by the live
+    suite. The suite's server has TLS off, as CI's does, and giving it a
+    certificate this client trusts is its own piece of work; what is measured
+    here was measured with `openssl s_client` against the same image and is
+    written down above rather than asserted.

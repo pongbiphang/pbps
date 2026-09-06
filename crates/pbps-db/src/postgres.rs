@@ -81,19 +81,24 @@ impl Conn {
         // type. The price is making the TLS connector by hand, which is also
         // where the host name for SNI is supplied — the socket is already
         // open, so nothing else would tell it which certificate to expect.
-        let mut maker = tls()?;
-        let connector =
-            MakeTlsConnect::<TcpStream>::make_tls_connect(&mut maker, &host).map_err(|e| {
-                DbError::BadConnectionString(format!("`{host}` is not a TLS host: {e}"))
-            })?;
-        let (client, connection) = config.connect_raw(tcp, connector).await?;
-        let driver = tokio::spawn(async move {
-            // The connection future resolves when the socket closes. Its error
-            // is the socket's, and the next statement reports it with the
-            // context of what was being run; logging it here would print a
-            // second failure beside the real one.
-            let _ = connection.await;
-        });
+        //
+        // Two branches, because a connection that has turned TLS off must not
+        // depend on a TLS stack: building one reads the host's trust store, and
+        // a host with none — a minimal image, which is what SPEC §11.3's single
+        // binary is for — would have had `sslmode=disable` refused over
+        // certificates it was never going to look at.
+        let (client, driver) = if wants_tls(&config) {
+            let mut maker = tls(&config)?;
+            let connector = MakeTlsConnect::<TcpStream>::make_tls_connect(&mut maker, &host)
+                .map_err(|e| {
+                    DbError::BadConnectionString(format!("`{host}` is not a TLS host: {e}"))
+                })?;
+            let (client, connection) = config.connect_raw(tcp, connector).await?;
+            (client, hold(connection))
+        } else {
+            let (client, connection) = config.connect_raw(tcp, tokio_postgres::NoTls).await?;
+            (client, hold(connection))
+        };
         let mut conn = Self {
             client,
             _driver: driver,
@@ -306,13 +311,60 @@ fn endpoint(config: &Config) -> Result<(String, u16), DbError> {
     Ok((name, port))
 }
 
+/// Whether this connection needs a TLS stack at all.
+///
+/// `sslmode=disable` is the one answer that needs none — and needing none is
+/// not the same as having one that goes unused, because building one reads the
+/// host's certificate store and fails where there is not one to read.
+fn wants_tls(config: &Config) -> bool {
+    config.get_ssl_mode() != tokio_postgres::config::SslMode::Disable
+}
+
+/// The protocols to advertise over ALPN, which is empty except for one case.
+///
+/// **Measured on PostgreSQL 18.6.** A direct SSL connection that offers no ALPN
+/// is refused — `received direct SSL connection request without ALPN protocol
+/// negotiation extension` in the server log — even though the TLS handshake
+/// itself completes, so the failure arrives after it and reads as the
+/// connection dropping. Neither `tokio-postgres` nor `tokio-postgres-rustls`
+/// sets this, so without it `sslnegotiation=direct` could never connect at all.
+///
+/// Only for `Direct`: the `SSLRequest` negotiation the default uses asks for no
+/// ALPN, and libpq offers none there either.
+fn alpn(config: &Config) -> Vec<Vec<u8>> {
+    if config.get_ssl_negotiation() == tokio_postgres::config::SslNegotiation::Direct {
+        vec![b"postgresql".to_vec()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Polls the connection future for as long as the client lives.
+///
+/// Held, not detached — see the module header. Generic because the future's
+/// type carries the transport, and the transport is the one thing the two
+/// branches of [`Conn::connect`] do not share.
+fn hold<S, T>(connection: tokio_postgres::Connection<S, T>) -> tokio::task::JoinHandle<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        // The connection future resolves when the socket closes. Its error is
+        // the socket's, and the next statement reports it with the context of
+        // what was being run; logging it here would print a second failure
+        // beside the real one.
+        let _ = connection.await;
+    })
+}
+
 /// The TLS stack, chosen here rather than pinned by the driver.
 ///
 /// ADR-0014's Limits name this: the spike used `NoTls`, and a real dialect
 /// needs a stack — which is where open question 10's supply-chain story
 /// rejoins. `rustls` with the platform's own trust store, and the same `rustls`
 /// the other driver already resolves, so the tree carries one.
-fn tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbError> {
+fn tls(config: &Config) -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbError> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     // A trust store that failed to load is not an empty one. Connecting with no
@@ -339,14 +391,15 @@ fn tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbError> {
     // dependency's default features rather than by anything here. `tiberius`
     // names its own for the same reason, and this is the same answer on the
     // other side of the seam (DECISIONS 228).
-    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    let mut client = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|e| DbError::BadConnectionString(format!("this build has no usable TLS: {e}")))?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+    client.alpn_protocols = alpn(config);
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(client))
 }
 
 /// Owns each bound value for as long as the statement runs.
@@ -439,7 +492,44 @@ mod tests {
     use super::*;
 
     fn endpoint_of(connection: &str) -> Result<(String, u16), DbError> {
-        endpoint(&connection.parse::<Config>().expect("a config parses"))
+        endpoint(&config_of(connection))
+    }
+
+    fn config_of(connection: &str) -> Config {
+        connection.parse::<Config>().expect("a config parses")
+    }
+
+    /// A connection that has turned TLS off must not depend on a TLS stack.
+    /// Building one reads the host's certificate store, so on a minimal image
+    /// with none this was `sslmode=disable` refused over certificates it was
+    /// never going to look at.
+    #[test]
+    fn only_a_connection_that_may_use_tls_asks_for_a_tls_stack() {
+        assert!(!wants_tls(&config_of("host=db.example sslmode=disable")));
+        assert!(wants_tls(&config_of("host=db.example sslmode=prefer")));
+        assert!(wants_tls(&config_of("host=db.example sslmode=require")));
+        // The default is `prefer`, so saying nothing still wants one.
+        assert!(wants_tls(&config_of("host=db.example")));
+    }
+
+    /// ALPN is offered for direct SSL and for nothing else. Measured on
+    /// PostgreSQL 18.6: a direct SSL connection offering none is refused —
+    /// `received direct SSL connection request without ALPN protocol
+    /// negotiation extension` — although the TLS handshake itself completes,
+    /// so the failure arrives after it and reads as the connection dropping.
+    #[test]
+    fn alpn_is_offered_for_a_direct_ssl_connection_and_for_no_other() {
+        assert_eq!(
+            alpn(&config_of(
+                "host=db.example sslmode=require sslnegotiation=direct"
+            )),
+            vec![b"postgresql".to_vec()]
+        );
+        assert!(
+            alpn(&config_of("host=db.example sslmode=require")).is_empty(),
+            "the SSLRequest negotiation asks for no ALPN, and libpq offers none"
+        );
+        assert!(alpn(&config_of("host=db.example sslmode=disable")).is_empty());
     }
 
     /// The ordinary case, and the two things the seam takes from the config

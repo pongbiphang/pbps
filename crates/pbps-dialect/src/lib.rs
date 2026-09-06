@@ -541,11 +541,16 @@ fn dollar_tag(s: &str) -> Option<usize> {
         if c == '$' {
             return Some(j + 2);
         }
-        let ok = if j == 0 {
-            c.is_alphabetic() || c == '_'
-        } else {
-            c.is_alphanumeric() || c == '_'
-        };
+        // PostgreSQL's grammar for a tag is over **bytes**, not Unicode
+        // classes (DECISIONS 233): `dolq_start [A-Za-z\200-\377_]` and
+        // `dolq_cont` the same
+        // plus the digits. Every byte of a non-ASCII character is ≥ 0x80, so
+        // "not ASCII" is the whole of that half. `char::is_alphanumeric` is a
+        // different set and a smaller one — measured on 18.6, `$á$` with a
+        // combining acute is a tag the engine accepts, and refusing it here
+        // scanned the literal body as code and folded its spacing away.
+        let ok =
+            c.is_ascii_alphabetic() || c == '_' || !c.is_ascii() || (j > 0 && c.is_ascii_digit());
         if !ok {
             return None;
         }
@@ -1096,6 +1101,15 @@ mod tests {
             PG.normalize_definition("SELECT $a$x  $b$  y$a$"),
             "SELECT $a$x  $b$  y$a$"
         );
+        // The tag grammar is the engine's, which is over bytes: any character
+        // outside ASCII is a tag character, including one `char::is_alphanumeric`
+        // refuses. Measured on 18.6, `$á$` with a combining acute — `a` then
+        // U+0301 — is a literal, and reading it as code folded the spacing
+        // inside it away, which is the silent failure again.
+        assert_ne!(
+            PG.normalize_definition("SELECT $a\u{301}$x  y$a\u{301}$"),
+            PG.normalize_definition("SELECT $a\u{301}$x y$a\u{301}$")
+        );
         // Layout *around* one is still layout.
         assert_eq!(
             PG.normalize_definition("SELECT   $tag$a  b$tag$\n  FROM t"),
@@ -1134,6 +1148,11 @@ mod tests {
             assert_eq!(
                 l.normalize_definition("SELECT a$b$c  ,  d  FROM t"),
                 "SELECT a$b$c , d FROM t"
+            );
+            // A tag may not start with a digit, on either engine.
+            assert_eq!(
+                l.normalize_definition("SELECT $1x$a  b$1x$"),
+                "SELECT $1x$a b$1x$"
             );
         }
     }
