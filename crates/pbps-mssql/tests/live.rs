@@ -503,6 +503,64 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
     }
 }
 
+/// A permission row whose joined securable name is NULL is reported, not
+/// dropped (issue #93) — but a grant on a *system* object must not become one
+/// of those: its `major_id` is absent from `sys.objects` and present in
+/// `sys.all_objects`, so the narrower join called an ordinary
+/// `GRANT SELECT ON sys.objects` unnameable, and a reported grant with no
+/// target refuses every connected command. The engine is asked because which
+/// catalog view holds the row is the whole question.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_grant_on_a_system_object_is_reported_with_its_name_not_as_unnameable() {
+    let mut db = TestDb::create("nameless").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.customer (id int NOT NULL);
+             CREATE ROLE app_reader;
+             GRANT SELECT ON dbo.customer TO app_reader;
+             GRANT SELECT ON OBJECT::sys.objects TO app_reader;",
+        )
+        .await
+        .expect("create the role and its grants");
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let said = format!("{:?}", pulled.unexpressible);
+    // The negative case: the ordinary table is adopted either way.
+    let targets: Vec<String> = pulled.schema.roles["app_reader"]
+        .grants
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(targets, ["dbo.customer"], "{said}");
+    // The system object is not a table pbps models, so the grant on it is
+    // reported rather than adopted — but *with* its target, which is what the
+    // managed-set filter needs to discard it as somebody else's object. Named
+    // nowhere, it was a targetless report, and those refuse every command.
+    let system_grant: Vec<&pbps_mssql::introspect::Unexpressible> = pulled
+        .unexpressible
+        .iter()
+        .filter(|u| {
+            u.target
+                == Some(pbps_model::GrantTarget::Object(
+                    pbps_model::ObjectName::new("sys", "objects"),
+                ))
+        })
+        .collect();
+    assert_eq!(system_grant.len(), 1, "{said}");
+    assert!(
+        !pulled
+            .unexpressible
+            .iter()
+            .any(|u| u.what.contains("cannot name")),
+        "a grant the catalog can name was reported as unnameable: {said}"
+    );
+}
+
 /// ADR-0002: modules are not managed, but a pull that does not even see them
 /// tells the user the database is covered when half of it is not.
 #[tokio::test]
