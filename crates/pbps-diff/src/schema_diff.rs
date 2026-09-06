@@ -28,7 +28,7 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ModuleId, Permission, PlannedChange, Schema, Table, TableName, Uid, Value,
+    ModuleId, Permission, PlannedChange, Renames, Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -191,6 +191,7 @@ pub fn diff_partial(
 
     // Table present on both sides: possibly renamed, and its contents must be
     // compared.
+    let renames = renames_of(base, declared);
     for (uid, declared_name) in declared_tables {
         let Some(base_name) = base_tables.get(uid) else {
             continue;
@@ -220,7 +221,12 @@ pub fn diff_partial(
             &mut changes,
             &mut errs,
         );
-        diff_constraints(declared_name, base_table, declared_table, &mut changes);
+        diff_constraints(
+            declared_name,
+            &renames.apply(base_table, base_name),
+            declared_table,
+            &mut changes,
+        );
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
@@ -435,6 +441,32 @@ fn columns_of(ids: &IdsFile, table: &TableName) -> BTreeMap<Uid, ColumnRef> {
         .filter(|(_, c)| &c.table == table)
         .map(|(u, c)| (u.clone(), c.clone()))
         .collect()
+}
+
+/// The renames this plan performs, as a map the model can bring a base-side
+/// table's constraints forward through.
+///
+/// The uid is what says two differently-spelled names are one object, exactly
+/// as it does for rows (see `base_name_of` at the call site). What the map is
+/// then allowed to rewrite — and what it must not — is [`Renames::apply`]'s
+/// business, and the measurement that decides it lives there.
+fn renames_of(base: Side, declared: Side) -> Renames {
+    let mut renames = Renames::default();
+    for (uid, declared_name) in &declared.ids.tables {
+        if let Some(base_name) = base.ids.tables.get(uid)
+            && base_name != declared_name
+        {
+            renames.rename_table(base_name.clone(), declared_name.clone());
+        }
+    }
+    for (uid, declared_ref) in &declared.ids.columns {
+        if let Some(base_ref) = base.ids.columns.get(uid)
+            && base_ref.name != declared_ref.name
+        {
+            renames.rename_column(base_ref.clone(), declared_ref.name.clone());
+        }
+    }
+    renames
 }
 
 /// Constraints and indexes are always matched by name and never modified in
@@ -1375,7 +1407,7 @@ mod tests {
     use pbps_dialect::MinimalDialect;
     use pbps_model::{
         CheckConstraint, Column, ColumnType, ForeignKey, IdsFile, Index, IndexColumn, Intent,
-        ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
+        PrimaryKey, ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
     };
 
     fn ctx() -> Context {
@@ -3079,6 +3111,206 @@ mod tests {
             tables,
             ["dbo.aaa", "dbo.zzz"],
             "two unrelated checks keep the table-name tiebreaker"
+        );
+    }
+
+    /// A column rename does not restate the primary key that names it.
+    ///
+    /// `diff_constraints` compares column *lists*, and the base side's are the
+    /// pre-rename names, so renaming a key column made `pk_differs` true and
+    /// the plan carried a `SetPrimaryKey` beside the rename. The emitter
+    /// renders that as `DROP CONSTRAINT` + `ADD PRIMARY KEY`, which the engine
+    /// refuses outright when a foreign key references the key (3727,
+    /// measured), adds `Constraint` risk to a plan approved as a rename, and
+    /// re-mints the name the engine invented for an unnamed key — the very
+    /// churn the unnamed-match rule above `pk_differs` exists to prevent.
+    ///
+    /// Measured: `sp_rename` on a key column is accepted and the primary key
+    /// follows it, keeping its invented name.
+    #[test]
+    fn renaming_a_key_column_does_not_restate_the_primary_key() {
+        let mut base_t = sku_table();
+        base_t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let mut want_t = table(&[
+            ("cust_id", Column::new(ty("int"))),
+            ("sku", Column::new(ty("int"))),
+        ]);
+        want_t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["cust_id".into()],
+        });
+
+        let cs = run(
+            &schema_of("dbo.t", base_t),
+            &schema_of("dbo.t", want_t),
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "id".into(),
+                to: "cust_id".into(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["RenameColumn"], "{cs:?}");
+    }
+
+    /// The same for an index and a unique constraint, and the risk the plan
+    /// carries is the point: `DropIndex` is `Destructive`, so a rename-only
+    /// revision demanded `--allow destructive` at the gate for a change the
+    /// user never asked for.
+    ///
+    /// Measured: a column rename is accepted and the index — key and
+    /// `INCLUDE` alike — and the unique constraint follow it.
+    #[test]
+    fn renaming_an_indexed_column_does_not_restate_the_index() {
+        let mut base_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+            ("note", Column::new(ty("int"))),
+        ]);
+        base_t.indexes.insert(
+            "ix_t_old".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "old".into(),
+                    descending: false,
+                }],
+                include: vec!["note".into()],
+                unique: false,
+                filter: None,
+            },
+        );
+        base_t.unique.insert("uq_t_old".into(), unique(&["old"]));
+
+        let mut want_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+            ("note", Column::new(ty("int"))),
+        ]);
+        want_t.indexes.insert(
+            "ix_t_old".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "new".into(),
+                    descending: false,
+                }],
+                include: vec!["note".into()],
+                unique: false,
+                filter: None,
+            },
+        );
+        want_t.unique.insert("uq_t_old".into(), unique(&["new"]));
+
+        let cs = run(
+            &schema_of("dbo.t", base_t),
+            &schema_of("dbo.t", want_t),
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["RenameColumn"], "{cs:?}");
+        let risks: Vec<RiskClass> = cs.changes.iter().flat_map(|p| p.risks.clone()).collect();
+        assert_eq!(
+            risks,
+            [RiskClass::Rename],
+            "a rename-only revision must not ask for --allow destructive"
+        );
+    }
+
+    /// A **table** rename does it one level out: `references_table` changes on
+    /// every child, so tables the revision never mentions got a foreign key
+    /// dropped and re-added.
+    ///
+    /// Measured: `sp_rename` of a table carries the child foreign keys — the
+    /// child reports the new name immediately after.
+    #[test]
+    fn renaming_a_table_does_not_restate_the_foreign_keys_that_reference_it() {
+        let mut child = sku_table();
+        child
+            .foreign_keys
+            .insert("fk_c".into(), fk(&["sku"], "dbo.parent", &["sku"]));
+        let mut parent = sku_table();
+        parent.unique.insert("uq_p".into(), unique(&["sku"]));
+        let base = two_tables(("dbo.parent", parent.clone()), ("dbo.child", child));
+
+        let mut child2 = sku_table();
+        child2
+            .foreign_keys
+            .insert("fk_c".into(), fk(&["sku"], "dbo.ancestor", &["sku"]));
+        let declared = two_tables(("dbo.ancestor", parent), ("dbo.child", child2));
+
+        let cs = run(
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "dbo.parent".parse().unwrap(),
+                to: "dbo.ancestor".parse().unwrap(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["RenameTable"], "{cs:?}");
+    }
+
+    /// The negative case: a genuine change of membership still produces the
+    /// restatement, and a check constraint whose expression names the renamed
+    /// column still produces one too.
+    ///
+    /// The rebased comparison must suppress only the spelling. A check's
+    /// expression is opaque text this tool never rewrites, and measured, the
+    /// engine refuses `sp_rename` on a column a check names at all (15336), so
+    /// its drop and re-add is the only way the rename can happen — not churn.
+    #[test]
+    fn a_real_membership_change_and_a_check_still_restate_themselves() {
+        let mut base_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+            ("other", Column::new(ty("int"))),
+        ]);
+        base_t.unique.insert("uq_t".into(), unique(&["old"]));
+        base_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "old > 0".into(),
+            },
+        );
+
+        let mut want_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+            ("other", Column::new(ty("int"))),
+        ]);
+        // The unique now covers a second column: a real change, not a spelling.
+        want_t
+            .unique
+            .insert("uq_t".into(), unique(&["new", "other"]));
+        want_t.checks.insert(
+            "ck_t".into(),
+            CheckConstraint {
+                expression: "new > 0".into(),
+            },
+        );
+
+        let cs = run(
+            &schema_of("dbo.t", base_t),
+            &schema_of("dbo.t", want_t),
+            &[Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            }],
+        );
+        assert_eq!(
+            kinds(&cs),
+            [
+                "RenameColumn",
+                "DropCheck",
+                "DropUnique",
+                "AddCheck",
+                "AddUnique"
+            ],
+            "{cs:?}"
         );
     }
 

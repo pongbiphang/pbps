@@ -1457,9 +1457,45 @@ fn refuse_unplanned_movement(
         }
     }
 
+    // The renames this plan performs, keyed by the names the *before* side
+    // spells everything with, so a base-side table can be brought forward to
+    // the shape the rename leaves.
+    let mut renames = pbps_model::Renames::default();
+    for (from, to) in &renamed {
+        renames.rename_table((*from).clone(), (*to).clone());
+    }
+    // A `RenameColumn` carries its table's *declared* name — the one the
+    // rename leaves it under — so it is taken back to the before-side spelling
+    // first. A plan that renames a table and a column of it in one revision is
+    // the case that needs it.
+    let was_called: BTreeMap<&TableName, &TableName> =
+        renamed.iter().map(|(from, to)| (*to, *from)).collect();
+    for ((table, to), from) in &renamed_columns {
+        let base_table = was_called.get(table).copied().unwrap_or(table);
+        renames.rename_column(
+            pbps_model::ColumnRef::new((*base_table).clone(), *from),
+            *to,
+        );
+    }
+
     let mut moved = Vec::new();
     let named = |n: &TableName| objects.contains(n);
-    compare("", &before.tables, &after.tables, named, &mut moved);
+    // The baseline brought forward, for the tables this plan never mentions.
+    // A child's foreign key follows the parent it references through
+    // `sp_rename` — the referenced table and its columns are both rewritten by
+    // the engine — so the child's shape moves with no change of this plan on
+    // it and nothing to excuse it with. Built only when there is a rename to
+    // apply; the map is otherwise the baseline's own.
+    let carried_forward: Option<BTreeMap<TableName, pbps_model::Table>> = (!renames.is_empty())
+        .then(|| {
+            before
+                .tables
+                .iter()
+                .map(|(n, t)| (n.clone(), renames.apply(t, n).into_owned()))
+                .collect()
+        });
+    let before_tables = carried_forward.as_ref().unwrap_or(&before.tables);
+    compare("", before_tables, &after.tables, named, &mut moved);
     // Every touched table, under the name it ends with — including the ones
     // this plan creates, which have no `before` entry to be found under. A
     // loop over the baseline alone never visited a new table, so an
@@ -1661,6 +1697,15 @@ fn refuse_unplanned_movement(
             }
         }
         if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
+            // A rename carries the constraints that name the column or the
+            // table with it — a primary key, a unique, an index's key and
+            // `INCLUDE` columns, a child's `references_table` — so no change
+            // of this plan restates them and there is nothing here to excuse
+            // them with. The before side is brought forward to the spelling
+            // the rename leaves, exactly as the differ does when it decides
+            // not to emit the restatement in the first place. What may be
+            // rewritten and what may not is `Renames::apply`'s business.
+            let was = &renames.apply(was, name);
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
             let no_names = BTreeSet::new();
