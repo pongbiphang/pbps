@@ -254,7 +254,13 @@ locked-copy `update-index` ran it), so every `git` also takes
    --path <path>` against `--stdin --no-filters`), because an attribute
    that leaves the old content alone can still act on the new: a file
    without a marker passed, and the same file with `$Id: forged $` written
-   into it did not (**measured**). It
+   into it did not (**measured**). Both of these attribute checks answer
+   by path name — `--path` and `check-attr` read the `.gitattributes`
+   files along the name as it is at that moment — so they are taken
+   *after* step 2 has placed the file and confirmed the directory's
+   identity, in the same instant as that confirmation, and a failure then
+   rolls step 2 back like any other; the answer holds exactly as long as
+   the identity check does, which is the limit already named for it. It
    requires the path to be a regular file or absent — never a symlink,
    and never *under* one: every component of the path from the worktree
    root is checked with `lstat` and none may be a link, and every file
@@ -293,15 +299,20 @@ locked-copy `update-index` ran it), so every `git` also takes
    and `git`'s `100644`/`100755` carries only the executable bit, so a
    temporary made from the tree mode alone would turn a `0600` file into a
    `0644` one and drop its ACLs and extended attributes — copying the
-   permission bits (`fstat`, `fchmod`), the owner and group where the
-   process may set them (`fchown`), every extended attribute
+   owner and group first, where the process may set them (`fchown`), then
+   the permission bits (`fstat`, `fchmod`) — in that order, because
+   `fchown` clears a setuid or setgid bit even when it sets the owner the
+   file already has, so bits copied first would be gone — every extended
+   attribute
    (`flistxattr`, `fgetxattr`, `fsetxattr`), and the ACL through the
    platform's ACL interface — on Linux the `system.posix_acl_*` attributes
    the calls above already carry, on macOS `acl_get_fd_np` and
    `acl_set_fd_np`, since Darwin keeps an ACL outside the attribute list —
-   all through the handles and never by name, and refusing the compose
-   where any of them cannot be copied rather than exchanging a file that
-   has lost something; a new
+   all through the handles and never by name, then reading the temporary
+   back (`fstat`, the attribute and ACL calls again) and refusing the
+   compose if what it holds is not what was copied, or where any item
+   cannot be copied at all, rather than exchanging a file that has lost
+   something; a new
    file gets the mode `0666` less the umask, which is what an editor would
    give it — and puts it in place
    with an atomic exchange — Linux `renameat2(RENAME_EXCHANGE)`, macOS
