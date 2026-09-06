@@ -3316,3 +3316,36 @@ SPEC is in sync with all of these.
 
     This is the repository's absent/empty/unreadable rule applied one level
     down: it holds for a row as much as for a ledger.
+
+218. **Presence is asked by attempting the statement, never by `OBJECT_ID`.**
+    `is_initialized` asked the catalog whether `dbo.__pbps_state` exists. The
+    lock reader had asked the same way and was fixed one shape earlier; the
+    ledger reader was not swept with it.
+
+    Measured against the pinned server, with a contained user holding no
+    permission on an existing `__pbps_state`: `OBJECT_ID` answers NULL and
+    `HAS_PERMS_BY_NAME` answers 0 — the same answers an absent table gives.
+    Attempting `SELECT TOP (0) 1 AS present FROM dbo.__pbps_state` separates
+    them: **208** when the table is absent, **229** when it exists and is
+    hidden, **207** when it is there with a shape this build does not know, and
+    every other failure stays a failure. `TOP (0)` still resolves the object and
+    still checks the permission, so the probe costs no rows.
+
+    Fixed in `is_initialized` itself rather than at the new call site: `latest`,
+    `history`, `timeline`, `prune`, `doctor` and `explain` all asked through it,
+    and each turned "not authorized to look" into "this database has no pbps
+    ledger" — `doctor` reporting `uninitialized`, `explain` offering
+    `bootstrap`, `state list` printing an empty history for an environment with
+    years of it. All six inherit the fix with no signature change, and both
+    outside callers already routed an error correctly.
+
+219. **An `unanswerable` envelope exits 1, and never 2.** `state list`'s
+    ledger-read failure built its own findings and returned `Found::reported()`,
+    which `main` maps to `EXIT_FINDING`. The JSON said the question could not be
+    answered while the exit code said there was something to act on — decision
+    34's two audiences, given contradictory instructions by the same run.
+
+    The branch goes through `output::or_unanswerable` like every other step in
+    the command, so the envelope and the exit code are produced by one thing.
+    That is the general rule: a command that reaches for `Found` on a path where
+    it also emits `unanswerable` has routed a tool failure to the wrong person.

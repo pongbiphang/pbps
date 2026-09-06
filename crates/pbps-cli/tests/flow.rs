@@ -10018,6 +10018,81 @@ fn state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_serv
     assert!(v.get("data").is_none(), "no history was read: {v}");
 }
 
+/// A ledger that is there and cannot be read exits 1, not 2.
+///
+/// The envelope already said `unanswerable`, and the process said 2 — the code
+/// this tool reserves for a difference it established and wants acted on. An
+/// operator whose account cannot read `__pbps_state`, or whose ledger a hand
+/// edit has damaged, would have had that routed to whoever reads findings
+/// rather than to whoever fixes the environment (decision 34). The two have to
+/// agree, so both are asserted.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statebroken");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statebroken");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    // The tool's own path to a real ledger, then one column renamed out from
+    // under the reader: the table resolves and the principal may read it, so
+    // this is "present and unreadable" rather than absent or denied — the case
+    // a test can build without a second login.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = pbps_db::Conn::connect(&connection).await.expect("connect");
+            pbps_mssql::state::lock(&mut conn, "state-list-broken")
+                .await
+                .expect("lock");
+            pbps_mssql::state::unlock(&mut conn).await.expect("unlock");
+            conn.execute(
+                "EXEC sp_rename 'dbo.__pbps_state.state_json', 'was_state_json', 'COLUMN';",
+            )
+            .await
+            .expect("rename the column out from under the reader");
+        });
+    }
+
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    let text = stdout(&o);
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {text}\n{}", stderr(&o)));
+    assert_eq!(
+        code(&o),
+        1,
+        "a ledger that cannot be read is a tool failure: {v}"
+    );
+    assert_eq!(v["result"], "unanswerable", "{v}");
+    assert!(v.get("data").is_none(), "no history was read: {v}");
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"state.unreadable") && !ids.contains(&"state.uninitialized"),
+        "a damaged ledger is not an absent one: {v}"
+    );
+
+    // Human mode agrees, and says so on stderr rather than printing a table.
+    let human = d.run(&["state", "list", "--db", &connection]);
+    assert_eq!(code(&human), 1, "{}", stderr(&human));
+    assert!(
+        stdout(&human).is_empty(),
+        "no table was drawn: {}",
+        stdout(&human)
+    );
+}
+
 /// A real ledger comes back newest first, with the fields a timeline is drawn
 /// from, and the envelope matches the published schema.
 #[test]

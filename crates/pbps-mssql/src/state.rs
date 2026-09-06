@@ -121,21 +121,36 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     conn.execute(CREATE_LOCK).await
 }
 
+/// The cheapest statement that resolves the ledger and checks the permission to
+/// read it without returning a row. See [`is_initialized`] for why it is a
+/// statement at all.
+const PROBE_STATE: &str = "SELECT TOP (0) 1 AS present FROM dbo.__pbps_state;";
+
 /// Whether this database has a ledger at all.
 ///
 /// Every read has to ask first: querying a table that does not exist fails with
 /// "invalid object name", which tells the user nothing about what to do. The
 /// answer they need is "run baseline or bootstrap", and only this distinction
 /// can produce it.
+///
+/// # Why the statement is attempted rather than the catalog asked
+///
+/// This asked `OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL`, and it was wrong
+/// for exactly the reason [`is_missing_table`] gives about the lock table:
+/// measured against the pinned server, a principal with no permission on an
+/// existing `__pbps_state` gets NULL from `OBJECT_ID` and 0 from
+/// `HAS_PERMS_BY_NAME`, the same answers an absent table gives. So "not
+/// authorized to look" arrived at every caller as "there is no ledger" — a
+/// `doctor` that says `uninitialized`, an `explain` that offers `bootstrap`,
+/// and a `state list` that reports an empty history. The statement separates
+/// them: 208 when the table is absent, 229 when it is there and hidden, and
+/// every other failure stays a failure (DECISIONS 218).
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
-    let rows = conn
-        .query("SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL THEN 0 ELSE 1 END AS present;")
-        .await?;
-    let present: i32 = match rows.first() {
-        Some(row) => get(row, "present")?,
-        None => return Err(DbError::BadRow("`present` returned no row".into())),
-    };
-    Ok(present == 1)
+    match conn.query(PROBE_STATE).await {
+        Ok(_) => Ok(true),
+        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// The newest state, which is the environment's current baseline.
@@ -277,7 +292,9 @@ const INVALID_OBJECT_NAME: &str = "208";
 /// is wrong: SQL Server's metadata-visibility rules hide an object from a
 /// principal with no permission on it, so `OBJECT_ID` answers NULL for a table
 /// that exists and holds a live lock. That turned "not authorized to look" into
-/// "no lock", which is the one direction this tool must never round in.
+/// "no lock", which is the one direction this tool must never round in. The
+/// ledger table had the same guard and the same fault; [`is_initialized`] now
+/// attempts a statement for this reason too.
 ///
 /// `HAS_PERMS_BY_NAME` does not separate them either — measured against a real
 /// server, it answers **0** both for an absent table and for one hidden this

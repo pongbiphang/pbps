@@ -158,25 +158,32 @@ pub fn cmd_state_list(
             db::connect(target).await,
         )?;
 
-        let (initialized, entries) = match pbps_mssql::state::timeline(&mut conn, limit).await {
-            Ok(entries) => (true, entries),
+        let found = match pbps_mssql::state::timeline(&mut conn, limit).await {
+            Ok(entries) => Some(entries),
             // Not an error: a database this tool has never written to has no
             // history, and saying so is the answer. It is *not* an empty
-            // history — the finding below is what keeps the two apart.
-            Err(pbps_db::LedgerError::NotInitialized) => (false, Vec::new()),
-            Err(e) => {
-                let findings = vec![output::Finding::error(
-                    "state.unreadable",
-                    format!("{}: the ledger could not be read: {e}", target.label),
-                )];
-                if json {
-                    output::unanswerable("state list", findings);
-                } else {
-                    eprint!("{}", output::human(&findings));
-                }
-                return Err(crate::Found::reported().into());
-            }
+            // history — the finding below is what keeps the two apart, and a
+            // ledger that exists but cannot be read is neither (DECISIONS 218).
+            Err(pbps_db::LedgerError::NotInitialized) => None,
+            // Reached the server and could not read the ledger: a tool
+            // failure, which exits 1. Never `Found` — that is exit 2, the code
+            // reserved for a difference this command established, and an
+            // envelope whose result is `unanswerable` beside an exit code
+            // meaning "there are findings" routes the failure to the wrong
+            // person (DECISIONS 219). `or_unanswerable` is what every
+            // other step here uses, for the same reason.
+            Err(e) => Some(output::or_unanswerable(
+                "state list",
+                json,
+                "state.unreadable",
+                Err(anyhow::anyhow!(
+                    "{}: the ledger could not be read: {e}",
+                    target.label
+                )),
+            )?),
         };
+        let initialized = found.is_some();
+        let entries = found.unwrap_or_default();
 
         let mut findings = Vec::new();
         // Named one by one, and as a warning rather than a note: a row this

@@ -12,7 +12,7 @@ Treat a new instance as likely rather than surprising.
 
 ### 1. An error, an absence and an emptiness read as good news
 
-Twenty instances so far. **Absent, empty and unreadable are three different
+Twenty-one instances so far. **Absent, empty and unreadable are three different
 things, and only one of them is good news.**
 
 - A failed permission query reported as "no permissions missing".
@@ -28,7 +28,12 @@ things, and only one of them is good news.**
 - A lock that outlived its state table, invisible to `status`, then to `doctor`
   and `explain`.
 - A lock table the caller has **no permission to read**: metadata visibility
-  makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock".
+  makes `OBJECT_ID` answer NULL, so "cannot look" became "no lock". The *ledger*
+  table was asked the same way and was not swept with it, so a principal with no
+  permission on `__pbps_state` was told the database had never been touched —
+  `doctor` saying `uninitialized`, `explain` offering `bootstrap`, `state list`
+  drawing an empty history. Presence is attempted now, not asked: 208 absent,
+  229 hidden (DECISIONS 218).
 - `validate --since` reading a failed `ls-tree` as "no declarations at that
   revision", which calls every table new. From a project in a subdirectory it
   was empty every time: the pathspec lacked the `--full-tree` its sibling
@@ -78,6 +83,13 @@ broken: the annotation converter mapped `doctor`'s exit 1 to 2, and `verify`
 folded an unexpressible live difference into the connection catch-all as
 `environment.unreachable` at exit 1 — when the database had been reached and
 the difference established, which is drift and exit 2.
+
+`state list` broke it a third way, and this one is visible without a database:
+the branch emitted an `unanswerable` envelope and then returned `Found`, so the
+JSON said "no answer" while the exit code said "act on this". A command that
+reaches for `Found` on a path that also emits `unanswerable` has contradicted
+itself; going through `or_unanswerable` leaves one thing producing both
+(DECISIONS 219).
 
 ### 4. A fix that generalises one step too far
 
