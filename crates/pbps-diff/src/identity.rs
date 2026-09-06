@@ -124,17 +124,8 @@ pub fn resolve(
         ids: ids.clone(),
         ..Default::default()
     };
+    let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
-
-    // First, and alone: once two intents claim one name, every judgement below
-    // is decided by declaration order, so anything else the resolvers reported
-    // would be downstream of a question the user has not answered. The target
-    // case already reached `Err`, but as an `UnusedIntent` — "matches nothing,
-    // likely a typo" about an intent that matches too much.
-    let mut blockers = conflicting_rename_intents(intents);
-    if !blockers.is_empty() {
-        return Err(blockers);
-    }
 
     resolve_tables(declared, intents, ctx, &mut r, &mut blockers, &mut used);
     resolve_columns(declared, intents, ctx, &mut r, &mut blockers, &mut used);
@@ -156,76 +147,72 @@ pub fn resolve(
     }
 }
 
-/// The `(source, target)` a rename intent claims, each keyed by the kind of
-/// object it names and spelled as the user wrote it. `None` for a drop, which
-/// claims nothing.
-///
-/// The kind is part of the key because a table and a role may share a name and
-/// two intents renaming them are not in conflict. A column's key carries its
-/// table for the same reason.
-fn rename_claims(intent: &Intent) -> Option<((UidKind, String), (UidKind, String))> {
-    let pair = |kind, from: String, to: String| Some(((kind, from), (kind, to)));
-    match intent {
-        Intent::RenameTable { from, to } => pair(UidKind::Table, from.to_string(), to.to_string()),
-        Intent::RenameColumn { table, from, to } => pair(
-            UidKind::Column,
-            table.column(from).to_string(),
-            table.column(to).to_string(),
-        ),
-        Intent::RenameRole { from, to } => pair(UidKind::Role, from.clone(), to.clone()),
-        Intent::DropTable { .. } | Intent::DropColumn { .. } | Intent::DropRole { .. } => None,
-    }
+/// One rename intent that could match in the scope being resolved: where it is
+/// in the list, what it says, and the two names it claims.
+struct Claim<'a, T> {
+    index: usize,
+    intent: &'a Intent,
+    source: T,
+    target: T,
 }
 
-/// Rename intents that claim one name, on either side.
+/// The rename claims that contend for one name, on either side.
 ///
-/// One guard for tables, columns and roles rather than one per resolver. The
-/// three matching loops are the same code over three types, and a rule with
-/// three homes is three chances to be fixed once (`docs/PITFALLS.md`, "One
-/// rule, spelled in three places"). DECISIONS 246.
+/// One implementation for tables, columns and roles. The three matching loops
+/// are the same code over three types, and a rule with three homes is three
+/// chances to be fixed once (`docs/PITFALLS.md`, "One rule, spelled in three
+/// places"). DECISIONS 246.
 ///
-/// **Identical intents are not a conflict.** The same rename can reach
-/// `resolve` twice — a `renamed_from` annotation the user also answered at the
-/// interactive prompt produces two equal intents — and refusing that would
-/// refuse a valid plan for saying one true thing twice. Only *distinct*
-/// intents contending for a name are ambiguous.
+/// **Only claims that could match here.** The caller passes intents whose
+/// source is in `disappeared` and whose target is in `appeared`, and that
+/// filter is the whole difference between a conflict and a leftover. A
+/// `renamed_from` annotation lives on until `pbps fmt` strips it, so an
+/// annotation recording a rename that already happened is *expected* to be
+/// sitting in the file — and if its vacated source name has since been reused
+/// by a new object that this revision renames, grouping the two by their
+/// shared source would refuse a plan that is not ambiguous at all. The stale
+/// one cannot match: its target is on both sides of the declarations, so it is
+/// not in `appeared`.
 ///
-/// A chain (`a -> b` beside `b -> c`) is not caught here and does not need to
-/// be: no name is claimed twice on one side, and the loops refuse it already
-/// because `b` is on both sides of the declarations and so is in neither
-/// `appeared` nor `disappeared`.
-fn conflicting_rename_intents(intents: &[Intent]) -> Vec<Blocker> {
-    let mut seen: BTreeSet<&Intent> = BTreeSet::new();
-    let mut by_source: BTreeMap<(UidKind, String), Vec<Intent>> = BTreeMap::new();
-    let mut by_target: BTreeMap<(UidKind, String), Vec<Intent>> = BTreeMap::new();
-    for intent in intents {
-        if !seen.insert(intent) {
-            continue;
-        }
-        let Some((source, target)) = rename_claims(intent) else {
-            continue;
-        };
-        by_source.entry(source).or_default().push(intent.clone());
-        by_target.entry(target).or_default().push(intent.clone());
-    }
-
-    let contested = |side: RenameSide, grouped: BTreeMap<(UidKind, String), Vec<Intent>>| {
-        grouped
-            .into_iter()
-            .filter(|(_, claimants)| claimants.len() > 1)
-            .map(
-                move |((_, name), intents)| Blocker::ConflictingRenameIntents {
+/// **Identical claims are one claim.** The same rename reaches `resolve` twice
+/// whenever an annotation is also answered at the interactive prompt, and
+/// refusing that would refuse a valid plan for saying one true thing twice.
+///
+/// Every contending intent is marked used, because the guard has consumed it:
+/// left unused it would reach the sweep at the end of [`resolve`] and be
+/// reported a second time as "matches nothing … likely a typo", which is the
+/// opposite of what is wrong with it.
+fn contested_rename_claims<T: Ord + std::fmt::Display>(
+    claims: &[Claim<'_, T>],
+    used: &mut BTreeSet<usize>,
+) -> Vec<Blocker> {
+    let mut out = Vec::new();
+    let mut pass =
+        |side: RenameSide, pick: for<'a> fn(&'a Claim<'_, T>) -> &'a T, out: &mut Vec<Blocker>| {
+            let mut grouped: BTreeMap<&T, Vec<&Claim<'_, T>>> = BTreeMap::new();
+            let mut seen: BTreeSet<&Intent> = BTreeSet::new();
+            for c in claims {
+                if seen.insert(c.intent) {
+                    grouped.entry(pick(c)).or_default().push(c);
+                }
+            }
+            for (name, group) in grouped {
+                if group.len() < 2 {
+                    continue;
+                }
+                for c in &group {
+                    used.insert(c.index);
+                }
+                out.push(Blocker::ConflictingRenameIntents {
                     side,
-                    name,
-                    intents,
-                },
-            )
-            .collect::<Vec<_>>()
-    };
-
-    let mut blockers = contested(RenameSide::Source, by_source);
-    blockers.extend(contested(RenameSide::Target, by_target));
-    blockers
+                    name: name.to_string(),
+                    intents: group.iter().map(|c| c.intent.clone()).collect(),
+                });
+            }
+        };
+    pass(RenameSide::Source, |c| &c.source, &mut out);
+    pass(RenameSide::Target, |c| &c.target, &mut out);
+    out
 }
 
 /// Whether this intent has already taken effect — its fact is in the ids file.
@@ -289,6 +276,30 @@ fn resolve_roles(
         .filter(|n| !declared_names.contains(n))
         .cloned()
         .collect();
+
+    let claims: Vec<Claim<'_, &String>> = intents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, intent)| {
+            let Intent::RenameRole { from, to } = intent else {
+                return None;
+            };
+            (disappeared.contains(from) && appeared.contains(to)).then_some(Claim {
+                index,
+                intent,
+                source: from,
+                target: to,
+            })
+        })
+        .collect();
+    let contested = contested_rename_claims(&claims, used);
+    if !contested.is_empty() {
+        // Nothing below this line, for the same reason `AmbiguousRoles` returns:
+        // the loop that follows would decide the contest by declaration order,
+        // and every judgement after it is downstream of that.
+        blockers.extend(contested);
+        return;
+    }
 
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameRole { from, to } = intent
@@ -369,6 +380,27 @@ fn resolve_tables(
         .cloned()
         .collect();
 
+    let claims: Vec<Claim<'_, &TableName>> = intents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, intent)| {
+            let Intent::RenameTable { from, to } = intent else {
+                return None;
+            };
+            (disappeared.contains(from) && appeared.contains(to)).then_some(Claim {
+                index,
+                intent,
+                source: from,
+                target: to,
+            })
+        })
+        .collect();
+    let contested = contested_rename_claims(&claims, used);
+    if !contested.is_empty() {
+        blockers.extend(contested);
+        return;
+    }
+
     // Rename wins over drop: if both intents are given for one table, rename is
     // the more specific statement.
     for (i, intent) in intents.iter().enumerate() {
@@ -444,6 +476,31 @@ fn resolve_columns(
             .filter(|n| !declared_cols.contains(n))
             .cloned()
             .collect();
+
+        let claims: Vec<Claim<'_, ColumnRef>> = intents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, intent)| {
+                let Intent::RenameColumn { table, from, to } = intent else {
+                    return None;
+                };
+                (table == table_name && disappeared.contains(from) && appeared.contains(to)).then(
+                    || Claim {
+                        index,
+                        intent,
+                        // Qualified, so the blocker names the column the way the
+                        // user would go looking for it.
+                        source: table_name.column(from),
+                        target: table_name.column(to),
+                    },
+                )
+            })
+            .collect();
+        let contested = contested_rename_claims(&claims, used);
+        if !contested.is_empty() {
+            blockers.extend(contested);
+            continue;
+        }
 
         for (i, intent) in intents.iter().enumerate() {
             if let Intent::RenameColumn { table, from, to } = intent

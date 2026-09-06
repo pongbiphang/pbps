@@ -741,6 +741,136 @@ mod tests {
         assert_eq!(r.renamed_columns.len(), 2);
     }
 
+    /// A stale annotation whose vacated source name has since been reused is
+    /// not contending with the live rename of the object now holding it.
+    ///
+    /// A `renamed_from` lives on until `pbps fmt` strips it, which is what
+    /// `intent_is_absorbed` exists for — so an annotation recording a rename
+    /// that already happened is *expected* to be sitting in the file. Here
+    /// `dbo.zzz` still says `renamed_from: dbo.old`, a new `dbo.old` has since
+    /// been created, and this revision renames it to `dbo.aaa`. Grouped by
+    /// their shared source the two look like a contest; they are not, because
+    /// the stale one cannot match — `dbo.zzz` is on both sides of the
+    /// declarations and so is not in `appeared`.
+    ///
+    /// Measured: the first form of the guard refused this, which is a valid
+    /// plan refused for an annotation `fmt` has not got to yet.
+    #[test]
+    fn a_stale_annotation_does_not_contend_with_a_live_rename() {
+        let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.zzz", &["id"])]);
+        let s = schema(&[("dbo.aaa", &["id"]), ("dbo.zzz", &["id"])]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.aaa"),
+                },
+                Intent::RenameTable {
+                    from: t("dbo.old"),
+                    to: t("dbo.zzz"),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_tables.len(), 1);
+        assert_eq!(r.renamed_tables[0].2, t("dbo.aaa"));
+    }
+
+    /// The same for a column, where the reused name is far likelier: a column
+    /// name vacated by a rename is exactly the name a later revision reaches
+    /// for.
+    #[test]
+    fn a_stale_column_annotation_does_not_contend_with_a_live_rename() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old", "zzz"])]);
+        let s = schema(&[("dbo.t", &["id", "aaa", "zzz"])]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "aaa".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "zzz".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_columns.len(), 1);
+        assert_eq!(r.renamed_columns[0].2.name, "aaa");
+    }
+
+    /// And for a role.
+    #[test]
+    fn a_stale_role_annotation_does_not_contend_with_a_live_rename() {
+        let s = with_roles(&[("dbo.t", &["id"])], &["old", "zzz"]);
+        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let s = with_roles(&[("dbo.t", &["id"])], &["aaa", "zzz"]);
+        let r = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameRole {
+                    from: "old".into(),
+                    to: "aaa".into(),
+                },
+                Intent::RenameRole {
+                    from: "old".into(),
+                    to: "zzz".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(r.renamed_roles.len(), 1);
+        assert_eq!(r.renamed_roles[0].2, "aaa");
+    }
+
+    /// A contested rename reports the contest and nothing else. The
+    /// contending intents are marked used by the guard, or the sweep at the end
+    /// of `resolve` would report each of them a second time as "matches
+    /// nothing … likely a typo" — the opposite of what is wrong with them.
+    #[test]
+    fn a_contested_rename_is_not_also_reported_as_an_unused_intent() {
+        let (_, ids) = baseline(&[("dbo.t", &["id", "old"])]);
+        let s = schema(&[("dbo.t", &["id", "aaa", "zzz"])]);
+        let errs = resolve(
+            &s,
+            &ids,
+            &[
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "aaa".into(),
+                },
+                Intent::RenameColumn {
+                    table: t("dbo.t"),
+                    from: "old".into(),
+                    to: "zzz".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+
+        assert!(
+            errs.iter()
+                .all(|b| matches!(b, Blocker::ConflictingRenameIntents { .. })),
+            "{errs:?}"
+        );
+    }
+
     // ---- roles (ADR-0005) ----
 
     fn with_roles(spec: &[(&str, &[&str])], roles: &[&str]) -> Schema {

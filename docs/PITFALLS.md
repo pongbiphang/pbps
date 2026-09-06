@@ -764,6 +764,14 @@ upstream of both** — not in either arm.
 set.** The answer decides whether the loop is a matching or a race, and the
 question is not visible in the loop's own text.
 
+**And the guard for it inherits the loop's filter.** The first form of this one
+grouped every rename intent it was given, which is wider than the loop it
+protects: the loop only ever considers an intent whose source is disappearing
+and whose target is appearing. A leftover annotation — the thing
+`intent_is_absorbed` exists to tolerate — shares a source with a live rename as
+soon as the vacated name is reused, and the wider guard refused that valid plan.
+**A guard that admits more than the code it guards is a new way to say no.**
+
 ## Tests that pass for the wrong reason
 
 Eleven so far, every one invisible in a green run. **Assert the specific failure,

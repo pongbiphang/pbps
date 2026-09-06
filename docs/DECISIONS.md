@@ -4217,10 +4217,25 @@ SPEC is in sync with all of these.
     a role that share a name — or one column name in two tables — stay two
     claims rather than becoming one.
 
-    **It runs first and returns alone.** Once two intents claim one name, every
-    judgement below is decided by declaration order, so anything else the
-    resolvers reported would be downstream of a question the user has not
-    answered.
+    **Only claims that could match here.** The guard sees the rename intents
+    whose source is in `disappeared` and whose target is in `appeared`, and
+    that filter is the whole difference between a conflict and a leftover. Its
+    first form grouped every raw intent and was measured wrong on this: a
+    `renamed_from` lives on until `pbps fmt` strips it — which is what
+    `intent_is_absorbed` exists for — so an annotation recording a rename that
+    already happened is *expected* to be in the file, and once its vacated
+    source name has been reused by a new object that this revision renames, the
+    two share a source and nothing else. The stale one cannot match, because
+    its target is on both sides of the declarations. Grouping them refused a
+    valid plan for an annotation nobody had got around to deleting, which is
+    the failure this repo weighs heaviest.
+
+    It runs before its scope's matching loop and that scope then returns, the
+    same shape `AmbiguousColumns` uses: the loop would decide the contest by
+    declaration order, and every judgement after it is downstream of that.
+    The contending intents are marked used, or the sweep at the end of
+    `resolve` would report each of them a second time as "matches nothing …
+    likely a typo" — the opposite of what is wrong with them.
 
     **Identical intents are not a conflict.** The same rename reaches `resolve`
     twice whenever a `renamed_from` annotation is also answered at the
