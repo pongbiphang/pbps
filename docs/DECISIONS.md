@@ -55,7 +55,8 @@ SPEC is in sync with all of these.
     (`numeric`→`decimal`, `float(24)`→`real`, `varchar`→`varchar(1)`);
     introspection reads the stored form back, and any gap is a phantom diff.
 14. **`pull` never drops what it cannot express** (computed columns, UDTs,
-    clustered indexes, unmanageable modules): each becomes a warning or an
+    indexes whose physical kind the model has no place for — clustered,
+    columnstore, XML, spatial, hash — unmanageable modules): each becomes a warning or an
     inventory entry, and a table with no expressible columns is left out whole.
     The round-trip `load(render(pulled)) == pulled` is pinned by
     `pbps-cli/tests/pull_roundtrip.rs`, for modules as well as tables.

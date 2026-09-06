@@ -87,13 +87,59 @@ pub struct RawCheck {
     pub definition: String,
 }
 
+/// The physical kind of an index, as `sys.indexes.type` reports it.
+///
+/// The declarations hold one kind of index: a nonclustered rowstore one. Every
+/// other kind is a different physical object with the same catalog shape, so
+/// the code travels rather than a `is_clustered` yes/no. Read as "clustered or
+/// not", a columnstore, XML, spatial or hash index answered "not clustered"
+/// and was adopted as a plain index it is not — bootstrapping a B-tree where
+/// the database had a columnstore, or emitting a `CREATE INDEX` the engine
+/// rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// `type = 2`: nonclustered rowstore, the only kind [`pbps_model::Index`]
+    /// expresses.
+    Nonclustered,
+    /// Any other type, carried whole so the limitation can name what it was.
+    /// A type this build does not know about lands here too: an unknown
+    /// physical kind is not evidence of an ordinary one.
+    Unmodelled(u8),
+}
+
+impl IndexKind {
+    pub fn from_type_code(code: u8) -> Self {
+        match code {
+            2 => Self::Nonclustered,
+            other => Self::Unmodelled(other),
+        }
+    }
+}
+
+/// How an unmodelled index type is named to the operator.
+///
+/// The codes are `sys.indexes.type`. An unrecognised one is reported by number
+/// rather than guessed at: the operator can look it up, and a wrong name would
+/// send them after the wrong object.
+fn index_type_name(code: u8) -> String {
+    match code {
+        1 => "clustered".to_owned(),
+        3 => "an XML index".to_owned(),
+        4 => "a spatial index".to_owned(),
+        5 => "a clustered columnstore index".to_owned(),
+        6 => "a nonclustered columnstore index".to_owned(),
+        7 => "a hash index".to_owned(),
+        other => format!("of `sys.indexes.type` {other}"),
+    }
+}
+
 /// One column of an index that is not backing a PK or UNIQUE constraint.
 #[derive(Debug, Clone)]
 pub struct RawIndexColumn {
     pub object_id: i32,
     pub index_name: String,
     pub is_unique: bool,
-    pub is_clustered: bool,
+    pub kind: IndexKind,
     pub filter: Option<String>,
     pub column: String,
     pub is_included: bool,
@@ -673,26 +719,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         );
     }
 
-    let mut clustered_indexes = BTreeSet::new();
+    let mut unmodelled_indexes = BTreeSet::new();
     for i in &raw.index_columns {
         let Some(table) = tables.get_mut(&i.object_id) else {
             continue;
         };
-        if i.is_clustered {
-            // The model has no clustered-ness; recording the index without it
-            // would make bootstrap create a different physical layout.
+        if let IndexKind::Unmodelled(code) = i.kind {
+            // The model holds a nonclustered rowstore index and nothing else;
+            // recording any other kind without what makes it that kind would
+            // make bootstrap create a different physical object — or, for the
+            // kinds `CREATE INDEX` cannot spell at all, a statement the engine
+            // rejects.
             let table_name = name_of(i.object_id, &names);
             // One catalog row is returned per index column. Deduplicate those
             // rows by the owning object as well as the index name: SQL Server
             // permits two tables to use the same index name.
-            if clustered_indexes.insert((i.object_id, i.index_name.clone())) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
                 push_limitation(
                     &mut warnings,
                     &mut limitations,
                     names.get(&i.object_id),
                     format!(
-                        "{table_name}: index `{}` is clustered, which is not modelled yet; it was left out of the declarations",
-                        i.index_name
+                        "{table_name}: index `{}` is {}, which is not modelled yet; it was left out of the declarations",
+                        i.index_name,
+                        index_type_name(code)
                     ),
                 );
             }
@@ -1464,7 +1514,7 @@ mod tests {
             object_id: 10,
             index_name: "ix_email".into(),
             is_unique: false,
-            is_clustered: false,
+            kind: IndexKind::Nonclustered,
             filter: Some("([email] IS NOT NULL)".into()),
             column: "email".into(),
             is_included: false,
@@ -1493,7 +1543,7 @@ mod tests {
             object_id: 10,
             index_name: "cx_shared".into(),
             is_unique: false,
-            is_clustered: true,
+            kind: IndexKind::Unmodelled(1),
             filter: None,
             column: "id".into(),
             is_included: false,
@@ -1510,7 +1560,7 @@ mod tests {
             object_id: 20,
             index_name: "cx_shared".into(),
             is_unique: false,
-            is_clustered: true,
+            kind: IndexKind::Unmodelled(1),
             filter: None,
             column: "id".into(),
             is_included: false,
@@ -1534,6 +1584,63 @@ mod tests {
                 TableName::new("dbo", "archive")
             ]
         );
+    }
+
+    /// A clustered columnstore is the case that used to pass silently: it is
+    /// not `type = 1`, so the old clustered flag called it "not clustered" and
+    /// the index was written into the declarations as an ordinary rowstore one.
+    #[test]
+    fn a_physical_index_kind_the_model_cannot_express_is_named_and_left_out() {
+        // Through `from_type_code`, so the test pins the catalog's reading of
+        // `sys.indexes.type` and not only the assembler's use of it.
+        let column = |name: &str, type_code: u8| RawIndexColumn {
+            object_id: 10,
+            index_name: name.to_owned(),
+            is_unique: false,
+            kind: IndexKind::from_type_code(type_code),
+            filter: None,
+            column: "email".into(),
+            is_included: false,
+            is_descending: false,
+        };
+        let mut raw = one_table_catalog();
+        raw.index_columns.push(column("cci", 5));
+        raw.index_columns.push(column("xi", 3));
+        // A type this build has never heard of is still not an ordinary index.
+        raw.index_columns.push(column("zi", 9));
+        // Negative case: the one kind the model does express is kept, and
+        // costs no limitation.
+        raw.index_columns.push(column("ix_email", 2));
+
+        let p = assemble(&raw);
+        let indexes = &p.schema.tables[&TableName::new("dbo", "customer")].indexes;
+        assert_eq!(indexes.keys().collect::<Vec<_>>(), ["ix_email"]);
+        assert_eq!(p.limitations.len(), 3, "{:?}", p.limitations);
+        let said = p
+            .limitations
+            .iter()
+            .map(|l| l.detail.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("`cci` is a clustered columnstore index"),
+            "{said}"
+        );
+        assert!(said.contains("`xi` is an XML index"), "{said}");
+        assert!(said.contains("`zi` is of `sys.indexes.type` 9"), "{said}");
+        assert!(!said.contains("ix_email"), "{said}");
+    }
+
+    #[test]
+    fn only_the_nonclustered_rowstore_type_reads_as_an_expressible_index() {
+        assert_eq!(IndexKind::from_type_code(2), IndexKind::Nonclustered);
+        for code in [1, 3, 4, 5, 6, 7, 9] {
+            assert_eq!(
+                IndexKind::from_type_code(code),
+                IndexKind::Unmodelled(code),
+                "type {code}"
+            );
+        }
     }
 
     /// Rows for tables outside the managed set (dropped between queries, or

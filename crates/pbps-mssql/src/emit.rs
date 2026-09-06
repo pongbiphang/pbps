@@ -535,9 +535,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // No ONLINE clause, deliberately. SQL Server accepts `WITH (ONLINE =
         // ON)` on a drop only for a **clustered** index, where the drop rebuilds
         // the table as a heap and there is something to do online; every index
-        // this emitter creates is nonclustered (introspection excludes clustered
-        // ones), so the clause would be rejected even on Enterprise. Dropping a
-        // nonclustered index is metadata anyway, which is why nothing is lost.
+        // this emitter creates is nonclustered (introspection adopts no other
+        // physical kind), so the clause would be rejected even on Enterprise.
+        // Dropping a nonclustered index is metadata anyway, which is why
+        // nothing is lost.
         Change::DropIndex { table, name } => one(format!(
             "DROP INDEX {} ON {};",
             quote(name)?,

@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use pbps_mssql::introspect::{
-    ModuleKind, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn,
-    RawModule, RawTable, assemble,
+    IndexKind, ModuleKind, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
+    RawKeyColumn, RawModule, RawTable, assemble,
 };
 
 /// A catalog exercising every construct the model can express.
@@ -89,7 +89,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 index_name: "ix_customer_email".into(),
                 is_unique: false,
-                is_clustered: false,
+                kind: IndexKind::Nonclustered,
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "email".into(),
                 is_included: false,
@@ -99,7 +99,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 index_name: "ix_customer_email".into(),
                 is_unique: false,
-                is_clustered: false,
+                kind: IndexKind::Nonclustered,
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "status".into(),
                 is_included: true,
