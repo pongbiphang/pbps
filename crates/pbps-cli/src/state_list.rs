@@ -166,6 +166,10 @@ pub fn cmd_state_list(
                 .remedy("pbps bootstrap, or pbps baseline to adopt the database as it stands"),
             );
         } else if entries.is_empty() {
+            // Sound because `--limit` refuses zero: with at least one row
+            // asked for, nothing coming back means there is nothing to come
+            // back. `TOP (0)` would make this sentence a lie about an
+            // environment with a full history.
             findings.push(output::Finding::note(
                 "state.no-entries",
                 format!(

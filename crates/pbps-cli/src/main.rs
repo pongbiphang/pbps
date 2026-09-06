@@ -424,8 +424,20 @@ enum StateCommand {
         #[command(flatten)]
         target: TargetArgs,
 
-        /// How many entries to show
-        #[arg(long, default_value_t = pbps_db::ledger::DEFAULT_KEEP)]
+        /// How many entries to show; at least 1
+        ///
+        /// Zero is refused rather than accepted as "none": `TOP (0)` returns
+        /// no rows against a full ledger, and the command reads an empty
+        /// result as an empty ledger — which would report "a first apply has
+        /// not finished" about an environment with years of history. The
+        /// reading is sound exactly while at least one row was asked for, so
+        /// the flag is what guarantees it (SPEC §9.8; absent, empty and
+        /// unreadable are three answers).
+        #[arg(
+            long,
+            default_value_t = pbps_db::ledger::DEFAULT_KEEP,
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
         limit: u32,
 
         /// text (default) or json

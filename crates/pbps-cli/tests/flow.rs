@@ -10103,6 +10103,49 @@ fn state_list_returns_the_history_newest_first_in_the_published_shape() {
     assert!(text.starts_with("ID"), "a header line: {text}");
 }
 
+/// `state list --limit 0` is refused, because an empty answer would be a lie.
+///
+/// `TOP (0)` returns no rows against a full ledger, and the command reads an
+/// empty result as an empty ledger — so a zero limit would have it report "a
+/// first apply has not finished" about an environment with years of history.
+/// Offline: the refusal is `clap`'s, before anything connects, which is the
+/// point — no database is needed to know that nobody means it.
+#[test]
+fn state_list_refuses_a_limit_of_zero() {
+    let d = Demo::new("statelimit");
+    d.table(ONE_COLUMN);
+
+    let o = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "0",
+    ]);
+    assert_eq!(code(&o), 2, "clap refuses the value: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("--limit") && stderr(&o).contains('0'),
+        "the message names the flag and the value: {}",
+        stderr(&o)
+    );
+    // And one is accepted, so the refusal is the boundary and not the flag.
+    let one = d.run(&[
+        "state",
+        "list",
+        "--db",
+        "Server=127.0.0.1,1",
+        "--limit",
+        "1",
+    ]);
+    assert_ne!(
+        code(&one),
+        2,
+        "a limit of one is a question, not a usage error: {}",
+        stderr(&one)
+    );
+}
+
 /// `verify` and `status`, the two connected envelopes, match the published
 /// schema against a real database.
 ///
