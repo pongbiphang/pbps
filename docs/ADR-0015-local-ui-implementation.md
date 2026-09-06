@@ -711,14 +711,21 @@ for the first and to the push URL for the second, and a
 server and the push go to another. The URL is handed to `git` as a remote
 that exists only in the environment of the two processes that use it —
 `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=remote.pbps-ui.url`,
-`GIT_CONFIG_VALUE_0=<push-url>` — and named `pbps-ui` on their command
-lines, never written on a command line or into the configuration file
-(**measured**: `ls-remote pbps-ui` and `push pbps-ui` under that
+`GIT_CONFIG_VALUE_0=<push-url>` — and named on their command lines,
+never written on a command line or into the configuration file
+(**measured**: `ls-remote` and `push` of that name under that
 environment reached the URL, the configuration file did not mention the
-name, and without the environment the name resolved to nothing;
-overriding the *existing* remote's `url` the same way did not work, since
-the key is multi-valued and the override was appended after the fetch
-URL). A URL may carry a credential, and `git remote get-url` prints one
+name, and without the environment the name resolved to nothing). The
+name is `pbps-ui-<random>`, drawn per launch, and the UI first requires
+`git config --get-regexp '^remote\.<name>\.'` to find nothing, because a
+remote's `url` is multi-valued and an environment entry *adds* to a name
+the configuration already has rather than shadowing it (**measured**:
+with a remote of that name already configured, `get-url --all` listed
+both URLs and one push published to both repositories; overriding the
+*existing* remote's `url` the same way appended the override after the
+fetch URL; the regexp found nothing for a fresh random name and exit 0
+for the configured one), and a `pushurl` under the name would win over
+the `url` the same way. A URL may carry a credential, and `git remote get-url` prints one
 verbatim (**measured**: `https://tok3n@…` came back as typed) where `git`'s
 transport strips it from its own diagnostics (**measured**: `ls-remote`
 and `push` against that URL reported `unable to access
@@ -732,7 +739,7 @@ the shell — is shown with its userinfo removed, everything between the
 scheme's `//` and an `@`, and every line of `git` output relayed to the
 page passes through the same removal, in case a helper is less careful
 than the transport. Before composing,
-the UI reads the remote's tip for the branch (`git ls-remote pbps-ui
+the UI reads the remote's tip for the branch (`git ls-remote <name>
 refs/heads/<branch>`) and refuses to compose unless the local tip equals it,
 showing the unpushed commits and the commands instead: a refspec bounds the
 destination ref, not the range, and **measured**, a branch one unrelated
@@ -740,7 +747,7 @@ commit ahead had that commit published under the intent commit by
 `HEAD:refs/heads/<branch>`. A branch the remote does not have yet — the first
 push of a feature branch, the common case — is published *before* composing,
 as its own step the page names as such: `git push --no-verify
---no-follow-tags --recurse-submodules=no pbps-ui
+--no-follow-tags --recurse-submodules=no <name>
 <tip>:refs/heads/<branch>` with an empty lease (`--force-with-lease=
 refs/heads/<branch>:`) — the same flags as the final push, since
 `push.followTags=true` would otherwise send every annotated tag reachable
@@ -768,7 +775,7 @@ with it), and `--no-follow-tags`; never a bare `git push`, which under
 ```
 git push --no-verify --no-follow-tags --recurse-submodules=no \
     --force-with-lease=refs/heads/<branch>:<tip> \
-    pbps-ui <oid>:refs/heads/<branch>
+    <name> <oid>:refs/heads/<branch>
 ```
 
 Both pushes — this one and the one that publishes a new branch — take
