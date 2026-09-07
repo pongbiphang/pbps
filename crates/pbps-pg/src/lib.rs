@@ -262,8 +262,16 @@ impl Dialect for Postgres {
     /// ```
     ///
     /// So the pin has to be established on an *earlier* batch, and `begin` is
-    /// the earlier batch every connection runs — the same place SQL Server's
-    /// `SET XACT_ABORT ON` lives, for the same structural reason.
+    /// the earlier batch a transactional apply runs — the same place SQL
+    /// Server's `SET XACT_ABORT ON` lives, for the same structural reason.
+    ///
+    /// **A staged apply opens no transaction and is therefore not covered
+    /// here.** The pin belongs on the connection in that mode, and it cannot be
+    /// moved into the emitter's statements: a staged run checkpoints after each
+    /// one, and a `--resume` on a fresh connection starts at the next
+    /// unexecuted statement — which is the one whose pin was two statements
+    /// back. Nothing can reach that path on this dialect yet, and it lands with
+    /// the ledger and the staged path in Phase 5 step 8.
     ///
     /// - **`standard_conforming_strings = on`** is what makes ADR-0011's
     ///   scanner rule — a plain literal escapes by doubling — true.

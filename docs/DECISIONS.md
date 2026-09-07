@@ -4476,8 +4476,19 @@ SPEC is in sync with all of these.
 
     so a `SET` in front of the statement it is meant to protect protects
     nothing. The pin has to be established on an earlier batch, and `begin` is
-    the earlier batch every connection runs — the same place SQL Server's `SET
-    XACT_ABORT ON` lives (DECISIONS 194), for the same structural reason.
+    the earlier batch a transactional apply runs — the same place SQL Server's
+    `SET XACT_ABORT ON` lives (DECISIONS 194), for the same structural reason.
+
+    **A staged apply opens no transaction, so `begin` does not cover it**, and
+    an earlier version of this entry said "every connection" and was wrong. The
+    pin belongs on the connection there, and it cannot be moved into the
+    emitter's own statements: a staged run checkpoints after each one, and a
+    `--resume` on a fresh connection starts at the next unexecuted statement,
+    which is exactly the one whose pin was two statements back. No staged apply
+    can reach this dialect yet — `main.rs`'s `dialect()` refuses it and
+    `apply_staged_under_lock` calls `pbps_mssql::state` by name — so the
+    connection-level pin lands with the PostgreSQL ledger and staged path
+    (issue #83), which is the step that builds the connection it belongs on.
 
     Both are the ones ADR-0013 §3 names. `standard_conforming_strings = on` is
     what makes ADR-0011's scanner rule true: measured under `off`, `CHECK (label
@@ -4509,10 +4520,26 @@ SPEC is in sync with all of these.
 
     The test is *whole expression is one string literal*, and nothing more: an
     expression carrying a cast, a call or an operator is emitted as written.
-    That is not a shortcut, it is the boundary — a default that already carries
-    a cast is the form `pg_get_expr` reads back (ADR-0013 §4), so a declaration
-    pulled from a live database is never refused, and the refusal falls only on
-    the one shape whose meaning the applying session decides.
+
+    **A cast resolves nothing, and a first version of this entry said it did.**
+    Measured, `'01/02/2026'::date`, `DATE '01/02/2026'` and `CAST('01/02/2026'
+    AS date)` all store 2026-01-02 under MDY and 2026-02-01 under DMY, exactly
+    as the uncast spelling does. What decides the value is whether the
+    *spelling* is ambiguous, which is a question about a value and therefore the
+    engine's to answer.
+
+    So the boundary this draws is a different one, and it is worth stating
+    exactly: a **bare** literal is the one shape that can never round-trip,
+    because `pg_get_expr` always reads a default back with a cast welded on
+    (ADR-0013 §4) — the declaration and the database would disagree on every
+    plan after the bootstrap, for ever, which is the shipped SQL Server loop
+    DECISIONS 208 closed. A **typed** literal that is not the engine's own
+    rendering keeps the session dependence and is not refused, and that gap is
+    deliberate: the only offline rule that closes it also refuses
+    `'2026-01-02'::date`, which is a correct declaration and the one `pull`
+    itself writes, with no remedy a message could name. ADR-0013 §3 closes it at
+    plan time, connected, and that resolver arrives with the step that has a
+    caller for it.
 
     **One literal has four spellings here, and a first version knew one.**
     Measured, `'01/02/2026'`, `E'01/02/2026'`, `$$01/02/2026$$` and

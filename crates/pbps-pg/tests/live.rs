@@ -2705,6 +2705,14 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
     ))
     .await
     .expect("the resolved spelling, still under DMY");
+    // And the cast does **not** resolve anything, which is the reason the gap
+    // below is recorded rather than closed: an ambiguous literal moves with the
+    // session whether it is cast or not.
+    let cast = "d date DEFAULT '01/02/2026'::date, e date DEFAULT DATE '01/02/2026', \
+                f date DEFAULT CAST('01/02/2026' AS date)";
+    conn.execute(&format!("CREATE TABLE {s}.cast_dmy ({cast})"))
+        .await
+        .expect("cast, under DMY");
     conn.execute("SET DateStyle = 'ISO, MDY'")
         .await
         .expect("back");
@@ -2721,6 +2729,13 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         stored(&mut conn, &format!("{s}.resolved")).await,
         "'2026-01-02'::date",
         "the resolved spelling does not move"
+    );
+    assert_eq!(
+        stored(&mut conn, &format!("{s}.cast_dmy")).await,
+        "'2026-02-01'::date",
+        "all three cast spellings moved with the session, so a cast is not a \
+         resolution — which is why only the bare literal is refused here and \
+         the rest waits for ADR-0013 §3's canonicalization at plan time"
     );
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

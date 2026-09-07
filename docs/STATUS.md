@@ -262,8 +262,10 @@ all three are *refused* under a path that is only the object's own schema
 (ADR-0013 §3, DECISIONS 259). The two settings that decide how a definition
 parses cannot ride there at all: a simple query is lexed as a whole before any
 of it runs, so `standard_conforming_strings = on` and `check_function_bodies =
-on` are pinned by the transaction framing, the earlier batch every connection
-runs (DECISIONS 260).
+on` are pinned by the transaction framing, the earlier batch a transactional
+apply runs (DECISIONS 260). A staged apply opens no transaction and needs the
+same pin on its connection; it lands with the ledger in step 8, which is the
+step that builds that connection.
 
 Three refusals are the step's substance rather than its edges. A bare-literal
 default on a setting-sensitive column is refused offline with the resolved

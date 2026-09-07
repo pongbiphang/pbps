@@ -202,11 +202,13 @@ pub(crate) fn refuse_an_unresolved_default(
         return None;
     }
     Some(invalid(format!(
-        "column `{column}` is `{ty}` and its default is the bare literal {default}. What that \
-         text means is decided by the session that runs the `CREATE`: measured, `'01/02/2026'` on \
-         a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
-         either way. Write the default in the resolved typed spelling the engine reads back — \
-         `'2026-01-02'::date` — so that the declaration says which value it means (ADR-0013 §3)."
+        "column `{column}` is `{ty}` and its default is the bare literal {default}. Two things \
+         are wrong with that. What the text means is decided by the session that runs the \
+         `CREATE` — measured, `'01/02/2026'` on a `date` stores 2026-01-02 under `DateStyle` MDY \
+         and 2026-02-01 under DMY, with no error either way — and a bare literal is not the \
+         spelling this engine reads a default back in, so the declaration and the database would \
+         disagree on every plan after the first. Write it as the engine renders it, with the cast \
+         it welds on: `'2026-01-02'::date` (ADR-0013 §3, §4)."
     )))
 }
 
