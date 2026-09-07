@@ -1211,8 +1211,8 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     );
     assert_eq!(child.columns["amount"].default.as_deref(), Some("0"));
     assert_eq!(
-        child.checks["child_amount_ck"].expression,
-        "CHECK ((amount >= (0)::numeric))"
+        child.checks["child_amount_ck"].expression, "(amount >= (0)::numeric)",
+        "the expression, not the `CHECK (…)` clause `pg_get_constraintdef` wraps it in"
     );
     let ix = &child.indexes["child_note_ix"];
     assert_eq!(ix.filter.as_deref(), Some("(note IS NOT NULL)"));
@@ -1339,6 +1339,24 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.unchecked (id integer, oid_ integer);
              ALTER TABLE {s}.unchecked ADD CONSTRAINT unchecked_fk
                  FOREIGN KEY (oid_) REFERENCES {s}.odd (id) NOT VALID;
+             CREATE TABLE {s}.serialised (id serial PRIMARY KEY, note text);
+             CREATE TABLE {s}.full_match (a integer, b integer, UNIQUE (a, b));
+             CREATE TABLE {s}.partly (a integer, b integer,
+                 CONSTRAINT partly_fk FOREIGN KEY (a, b)
+                     REFERENCES {s}.full_match (a, b) MATCH FULL);
+             CREATE TABLE {s}.nulls (a integer);
+             CREATE UNIQUE INDEX nulls_nnd ON {s}.nulls (a) NULLS NOT DISTINCT;
+             CREATE TABLE {s}.half_built (a integer);
+             CREATE INDEX half_built_ix ON {s}.half_built (a);
+             -- The state a `CREATE INDEX CONCURRENTLY` that failed leaves
+             -- behind. Reached here by writing the catalog directly, because
+             -- the honest route is to interrupt a build at the right instant.
+             UPDATE pg_catalog.pg_index SET indisvalid = false
+                 WHERE indexrelid = '{s}.half_built_ix'::regclass;
+             CREATE TABLE {s}.quoted (x integer, \"a)b\" integer, UNIQUE (x, \"a)b\"));
+             CREATE TABLE {s}.pointing (x integer, y integer,
+                 CONSTRAINT pointing_fk FOREIGN KEY (x, y)
+                     REFERENCES {s}.quoted (x, \"a)b\"));
              CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
@@ -1375,6 +1393,15 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "inherits from another",
         // A key whose check can be put off to the end of the transaction.
         "DEFERRABLE INITIALLY DEFERRED",
+        // A composite key that refuses a partly-null row where the default
+        // accepts it.
+        "MATCH FULL",
+        // A unique index that admits at most one null key.
+        "NULLS NOT DISTINCT",
+        // An index the planner will not use.
+        "indisvalid = false",
+        // The sequence a `serial` owns and this model cannot hold.
+        "serialised`.`id` defaults from the sequence",
         // A check the rows already there were never checked against, and a
         // foreign key likewise — the constraint's own name, because `NOT
         // VALID` on its own is satisfied by either of them.
@@ -1416,6 +1443,43 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     // there, not about the key, so the key is carried and the fact is named.
     let unchecked = &pulled.schema.tables[&pbps_model::TableName::new(&s, "unchecked")];
     assert!(unchecked.foreign_keys.contains_key("unchecked_fk"));
+    // A `MATCH FULL` key and a `NULLS NOT DISTINCT` index are properties of
+    // the object, so the objects are left out.
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "partly")]
+            .foreign_keys
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "nulls")]
+            .indexes
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "half_built")]
+            .indexes
+            .is_empty(),
+        "an index the planner will not use is not an index"
+    );
+    // A `serial`'s column is carried — an `integer` with a `nextval` default,
+    // which is exactly what the model says — and the sequence beside it named.
+    let serialised = &pulled.schema.tables[&pbps_model::TableName::new(&s, "serialised")];
+    assert_eq!(serialised.columns["id"].ty.to_string(), "integer");
+    assert!(
+        serialised.columns["id"]
+            .default
+            .as_deref()
+            .is_some_and(|d| d.starts_with("nextval(")),
+        "{:?}",
+        serialised.columns["id"].default
+    );
+    // And a referenced column whose name contains the `)` that a parse of
+    // `pg_get_constraintdef` would have stopped inside of.
+    let pointing = &pulled.schema.tables[&pbps_model::TableName::new(&s, "pointing")];
+    assert_eq!(
+        pointing.foreign_keys["pointing_fk"].references_columns,
+        ["x", "a)b"]
+    );
     // A generated column's expression shares `pg_attrdef` with the defaults,
     // and reading it back as one would make a plan that computes it once.
     assert_eq!(
@@ -1431,8 +1495,15 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         [
             // The inheritance parent is an ordinary table and stays.
             pbps_model::TableName::new(&s, "ancestor"),
+            pbps_model::TableName::new(&s, "full_match"),
+            pbps_model::TableName::new(&s, "half_built"),
+            pbps_model::TableName::new(&s, "nulls"),
             pbps_model::TableName::new(&s, "odd"),
+            pbps_model::TableName::new(&s, "partly"),
+            pbps_model::TableName::new(&s, "pointing"),
+            pbps_model::TableName::new(&s, "quoted"),
             pbps_model::TableName::new(&s, "restricted"),
+            pbps_model::TableName::new(&s, "serialised"),
             pbps_model::TableName::new(&s, "unchecked"),
         ],
         "the partitioned table, the inheritance child and this tool's own \

@@ -627,6 +627,29 @@ of that trade only because it is labelled — an `XX000` rendered by the seam as
 `db error` (issue #167) would have been the third of absent, empty and
 unreadable, wearing the clothes of the first.
 
+## A join widened by one letter, matching a third thing
+
+The columns query found an identity's sequence through `pg_depend` with
+`deptype = 'i'`. Review pointed out that a `serial`'s sequence is `deptype =
+'a'`, so the join was widened to `IN ('i', 'a')` — correct as far as it went,
+and wrong, because `'a'` is *also* how an **index** depends on the columns it
+indexes. Every indexed column acquired a sequence it does not have, and every
+column with two indexes on it appeared in the pull twice.
+
+The fix is one more condition — the dependent object has to be `relkind = 'S'`
+— and the point is that the widening read as a two-value set when it is a
+predicate over a relationship whose *other end* was never constrained.
+
+**The shape:** a filter that names one kind of relationship is widened to a
+second, and the widened form admits a third that was never in view. Nothing in
+the diff shows the third one; it lives in the catalog's documentation.
+
+**How to avoid it:** when a filter selects rows by a *kind*, say what the row
+points at as well. Here the query asked "which dependency" and never "of what".
+It was caught by the live test asserting that an ordinary table earns **no
+warning at all** — the negative case, which is the one that noticed a warning
+appearing where nothing had changed.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

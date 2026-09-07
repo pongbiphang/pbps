@@ -4324,3 +4324,16 @@ SPEC is in sync with all of these.
     other kind: the constraint itself is exactly what the model says, and what
     recreating it changes is which rows get checked. Carried and named, that is
     a plan that may fail on apply rather than one that lies.
+
+250. **A foreign key's referenced columns are resolved against the referenced
+    table's own columns, which the pull already has. Supersedes 247.** That
+    entry chose to parse them out of `pg_get_constraintdef`, on the grounds that
+    `confkey` names attnums on the *other* table and a second catalog join would
+    put the answer where no test can reach it. The parse is wrong on a legal
+    name: `FOREIGN KEY (x, y) REFERENCES q(x, "a)b")` stops at the `)` inside
+    the quoted identifier, produces two items, passes its own count check
+    against `confkey`, and records the column `"a`. The count check was the
+    guard, and it agreed with the wrong answer. What 247 missed is that the
+    columns of every table in the pull are already in the assembler: no parse,
+    no second query, and an attnum with nothing behind it is the same named
+    limitation as everywhere else.

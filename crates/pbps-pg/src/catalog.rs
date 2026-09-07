@@ -92,6 +92,13 @@ fn partitioned_query() -> String {
 /// found through `pg_depend` rather than `pg_get_serial_sequence` — that
 /// function takes a *text* table name and would have to be handed one built by
 /// interpolation.
+///
+/// **Both dependency types**, because they are two different things wearing one
+/// shape. An identity's sequence is `deptype = 'i'`, internal: it is part of the
+/// column. A `serial`'s is `deptype = 'a'`, auto: a separate object the column
+/// merely defaults from, and one this model has nowhere to put. Reading only
+/// `'i'` returned a `serial` column as an ordinary integer whose default happens
+/// to say `nextval(...)`, with no word about the sequence that default needs.
 fn columns_query() -> String {
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
@@ -101,14 +108,18 @@ fn columns_query() -> String {
             a.attidentity::text AS identity_kind,
             a.attgenerated::text AS generated,
             s.seqstart::int8 AS seq_start,
-            s.seqincrement::int8 AS seq_increment
+            s.seqincrement::int8 AS seq_increment,
+            dep.deptype::text AS sequence_dependency,
+            seq.relname AS sequence_name
        FROM pg_catalog.pg_attribute a
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-       LEFT JOIN pg_catalog.pg_depend dep
+       LEFT JOIN (pg_catalog.pg_depend dep
+                  JOIN pg_catalog.pg_class seq
+                    ON seq.oid = dep.objid AND seq.relkind = 'S')
               ON dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum
-             AND dep.classid = 'pg_class'::regclass AND dep.deptype = 'i'
+             AND dep.classid = 'pg_class'::regclass AND dep.deptype IN ('i', 'a')
        LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid = dep.objid
       WHERE c.relkind = 'r'
         AND {NOT_A_PROJECTS_SCHEMA}
@@ -131,6 +142,8 @@ fn constraints_query() -> String {
             con.convalidated AS validated,
             con.condeferrable AS deferrable, con.condeferred AS deferred,
             pg_catalog.pg_get_constraintdef(con.oid) AS definition,
+            pg_catalog.pg_get_expr(con.conbin, con.conrelid) AS expression,
+            con.confmatchtype::text AS match_type,
             con.conindid::int8 AS index_oid
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
@@ -150,7 +163,9 @@ fn indexes_query() -> String {
     format!(
         "SELECT i.indexrelid::int8 AS oid, i.indrelid::int8 AS table_oid, ic.relname AS name,
             i.indisunique AS is_unique, i.indisprimary AS is_primary,
-            i.indisexclusion AS is_exclusion, i.indnkeyatts::int4 AS key_count,
+            i.indisexclusion AS is_exclusion, i.indisvalid AS is_valid,
+            i.indnullsnotdistinct AS nulls_not_distinct,
+            i.indnkeyatts::int4 AS key_count,
             replace(i.indkey::text, ' ', ',') AS keys,
             replace(i.indoption::text, ' ', ',') AS options,
             pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS filter,
@@ -261,6 +276,13 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             }),
             _ => None,
         };
+        // `a` is the `serial` case: a sequence the column defaults from and
+        // does not contain. `i` is the identity's, which the column does.
+        let owned_sequence =
+            match first_char(&optional_text(&row, "sequence_dependency")?.unwrap_or_default()) {
+                Some('a') => optional_text(&row, "sequence_name")?,
+                _ => None,
+            };
         raw.columns.push(RawColumn {
             table_oid: number(&row, "table_oid")?,
             attnum: small(&row, "attnum")?,
@@ -270,6 +292,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             default: optional_text(&row, "default_expr")?,
             identity,
             generated: first_char(&text(&row, "generated")?).is_some(),
+            owned_sequence,
         });
     }
     for row in conn.query(&constraints_query()).await? {
@@ -288,6 +311,8 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             deferrable: flag(&row, "deferrable")?,
             deferred: flag(&row, "deferred")?,
             definition: text(&row, "definition")?,
+            expression: optional_text(&row, "expression")?,
+            match_type: first_char(&text(&row, "match_type")?).unwrap_or(' '),
             index_oid: {
                 let oid = number(&row, "index_oid")?;
                 (oid != 0).then_some(oid)
@@ -302,6 +327,8 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             unique: flag(&row, "is_unique")?,
             primary: flag(&row, "is_primary")?,
             exclusion: flag(&row, "is_exclusion")?,
+            valid: flag(&row, "is_valid")?,
+            nulls_not_distinct: flag(&row, "nulls_not_distinct")?,
             key_count: small(&row, "key_count")?.max(0) as usize,
             columns: numbers(&text(&row, "keys")?),
             options: numbers(&text(&row, "options")?),

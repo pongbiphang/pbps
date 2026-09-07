@@ -80,6 +80,10 @@ pub struct RawColumn {
     pub identity: Option<RawIdentity>,
     /// `attgenerated`: `s` for a stored generated column, empty for neither.
     pub generated: bool,
+    /// The sequence this column merely *defaults from* — a `serial`'s, whose
+    /// `pg_depend` entry is `deptype = 'a'`. An identity's sequence is not
+    /// here: that one is part of the column, and arrives as [`RawIdentity`].
+    pub owned_sequence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,8 +126,14 @@ pub struct RawConstraint {
     /// legally exist in the middle of one.
     pub deferrable: bool,
     pub deferred: bool,
-    /// `pg_get_constraintdef`, verbatim.
+    /// `pg_get_constraintdef`, verbatim: the whole clause, `CHECK (…)` and all.
     pub definition: String,
+    /// `pg_get_expr(conbin, conrelid)`: the check's expression **without** the
+    /// `CHECK (…)` around it, which is what the model holds.
+    pub expression: Option<String>,
+    /// `confmatchtype`: `s` MATCH SIMPLE (the default), `f` MATCH FULL,
+    /// `p` MATCH PARTIAL (which this engine does not implement).
+    pub match_type: char,
     /// `conindid`: the index this constraint is enforced by, if any. It is how
     /// a unique index that *is* a constraint is told from one that is not.
     pub index_oid: Option<i64>,
@@ -138,6 +148,12 @@ pub struct RawIndex {
     pub unique: bool,
     pub primary: bool,
     pub exclusion: bool,
+    /// `indisvalid`. A failed `CREATE INDEX CONCURRENTLY` leaves a row behind
+    /// that the planner will not use.
+    pub valid: bool,
+    /// `indnullsnotdistinct`, which decides whether a unique index admits more
+    /// than one null key.
+    pub nulls_not_distinct: bool,
     /// `indnkeyatts`: how many of `columns` are key columns. The rest are the
     /// `INCLUDE` payload.
     pub key_count: usize,
@@ -238,6 +254,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut pulled = Pulled::default();
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
+    // Every table's columns, by (table, attnum). A foreign key's `confkey`
+    // names attnums on the **referenced** table, which the constrained table's
+    // own map cannot answer for — and the definition text cannot either, as a
+    // quoted identifier may contain the `)` a parse would stop at.
+    let by_table_and_attnum: HashMap<(i64, i32), &str> = raw
+        .columns
+        .iter()
+        .map(|c| ((c.table_oid, c.attnum), c.name.as_str()))
+        .collect();
     let constraints_by_table = group(&raw.constraints, |c| c.table_oid);
     let indexes_by_table = group(&raw.indexes, |i| i.table_oid);
     let table_names: HashMap<i64, TableName> = raw
@@ -252,6 +277,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // remove, by dropping an index the engine will not let go of.
     let constraint_indexes: BTreeSet<i64> =
         raw.constraints.iter().filter_map(|c| c.index_oid).collect();
+    // A unique constraint is enforced by an index, so `NULLS NOT DISTINCT` on
+    // that index is a property of the constraint. The constraint arm cannot see
+    // the index, so the set is built here.
+    let nulls_not_distinct: BTreeSet<i64> = raw
+        .indexes
+        .iter()
+        .filter(|i| i.nulls_not_distinct)
+        .map(|i| i.oid)
+        .collect();
 
     for raw_table in &raw.tables {
         let name = TableName::new(&raw_table.schema, &raw_table.name);
@@ -278,7 +312,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .get(&raw_table.oid)
             .map_or(&[][..], Vec::as_slice)
         {
-            add_constraint(constraint, &parts, &table_names, &mut table, &mut pulled);
+            add_constraint(
+                constraint,
+                &parts,
+                &table_names,
+                &by_table_and_attnum,
+                &nulls_not_distinct,
+                &mut table,
+                &mut pulled,
+            );
         }
         for index in indexes_by_table
             .get(&raw_table.oid)
@@ -364,6 +406,26 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         );
     }
 
+    // A `serial` is not a type (DECISIONS 227): the column is an `integer`
+    // whose default is `nextval(...)`, and the sequence that default needs is a
+    // separate object with nowhere to live in this model. The column is carried
+    // — it is exactly what the model says — and the sequence is named, because
+    // a declaration pulled from here cannot recreate this table in an empty
+    // database.
+    if let Some(sequence) = &raw.owned_sequence {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "column `{}`.`{}` defaults from the sequence `{sequence}`, which it owns — the \
+                 shape `serial` creates. This model holds the default and has nowhere to put the \
+                 sequence, so a declaration pulled from here does not create it, and a rebuild \
+                 of this table can drop it before the default is applied again.",
+                parts.name, raw.name
+            ),
+        );
+    }
+
     let identity = raw.identity.map(|id| {
         if !id.always {
             note(
@@ -400,6 +462,8 @@ fn add_constraint(
     raw: &RawConstraint,
     parts: &Parts,
     table_names: &HashMap<i64, TableName>,
+    by_table_and_attnum: &HashMap<(i64, i32), &str>,
+    nulls_not_distinct: &BTreeSet<i64>,
     table: &mut Table,
     pulled: &mut Pulled,
 ) {
@@ -412,6 +476,26 @@ fn add_constraint(
         // A key whose check can be put off is a different key, and the model
         // holds neither word. Named on every kind that can carry it, before
         // the kind's own arm decides what to do with the rest of it.
+        // A unique key whose index admits more than one null key is a
+        // different key, and the model holds only "unique".
+        'p' | 'u'
+            if raw
+                .index_oid
+                .is_some_and(|oid| nulls_not_distinct.contains(&oid)) =>
+        {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is enforced by a `NULLS NOT DISTINCT` index, so it \
+                     admits at most one null key where an ordinary unique constraint admits any \
+                     number. This model holds only `unique`, so the constraint is left out \
+                     rather than read back as the weaker one it is not.",
+                    raw.name, parts.name
+                ),
+            );
+        }
+
         'p' | 'u' | 'f' if raw.deferrable => {
             note(
                 pulled,
@@ -466,17 +550,32 @@ fn add_constraint(
                     ),
                 );
             }
+            // `pg_get_constraintdef` returns the whole clause — measured,
+            // `CHECK ((id > 0))` — and `CheckConstraint::expression` is the
+            // inside of it, which every emitter wraps. Stored whole it would
+            // emit `CHECK (CHECK ((id > 0)))`, and no declaration a person
+            // would write could ever converge with it.
+            let Some(expression) = raw.expression.clone() else {
+                note(
+                    pulled,
+                    &parts.name,
+                    format!(
+                        "check constraint `{}` on `{}` has no readable expression, so it is left \
+                         out. Its definition is `{}`.",
+                        raw.name, parts.name, raw.definition
+                    ),
+                );
+                return;
+            };
             table.checks.insert(
                 raw.name.clone(),
-                CheckConstraint {
-                    // Verbatim, including the parentheses and casts the engine
-                    // welded on.
-                    expression: raw.definition.clone(),
-                },
+                // Verbatim, including the parentheses and casts the engine
+                // welded on.
+                CheckConstraint { expression },
             );
         }
 
-        'f' => add_foreign_key(raw, parts, table_names, table, pulled),
+        'f' => add_foreign_key(raw, parts, table_names, by_table_and_attnum, table, pulled),
 
         'x' => note(
             pulled,
@@ -505,6 +604,7 @@ fn add_foreign_key(
     raw: &RawConstraint,
     parts: &Parts,
     table_names: &HashMap<i64, TableName>,
+    by_table_and_attnum: &HashMap<(i64, i32), &str>,
     table: &mut Table,
     pulled: &mut Pulled,
 ) {
@@ -540,6 +640,31 @@ fn add_foreign_key(
         return;
     };
 
+    // MATCH SIMPLE is the default and the only one this model can mean.
+    // MATCH FULL refuses a row whose referencing columns are partly null,
+    // which MATCH SIMPLE accepts — so a composite key read back as an ordinary
+    // one is a constraint that has quietly stopped rejecting those rows.
+    if raw.match_type != 's' {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "foreign key `{}` on `{}` is `MATCH {}`, and this model holds only the default \
+                 `MATCH SIMPLE`. The difference decides what happens to a row whose referencing \
+                 columns are partly null — accepted by SIMPLE, refused by FULL — so the key is \
+                 left out rather than read back as the one it is not.",
+                raw.name,
+                parts.name,
+                match raw.match_type {
+                    'f' => "FULL",
+                    'p' => "PARTIAL",
+                    other => return unknown_match(pulled, parts, &raw.name, other),
+                }
+            ),
+        );
+        return;
+    }
+
     let Ok(columns) = parts.names(&raw.columns) else {
         unresolved(
             pulled,
@@ -551,10 +676,9 @@ fn add_foreign_key(
         return;
     };
 
-    // The referenced columns are attnums **on the other table**, so this map
-    // cannot answer for them. The definition carries them and is reported when
-    // the pair cannot be built.
-    let references_columns = match reference_columns(raw) {
+    // The referenced columns are attnums **on the other table**, resolved
+    // against that table's own columns.
+    let references_columns = match reference_columns(raw, by_table_and_attnum) {
         Some(names) => names,
         None => {
             note(
@@ -603,34 +727,43 @@ fn add_foreign_key(
     );
 }
 
-/// The referenced columns of a foreign key, read out of its own definition.
+/// The referenced columns of a foreign key.
 ///
-/// `confkey` holds attnums on the *referenced* table, which the constrained
-/// table's map cannot answer for; joining the catalog a second time to resolve
-/// them would put the answer in the query file, where no test can reach it.
-/// `pg_get_constraintdef` already spells them, and its shape is fixed:
-/// `FOREIGN KEY (a, b) REFERENCES s.t(c, d) …`.
-fn reference_columns(raw: &RawConstraint) -> Option<Vec<String>> {
-    let after = raw.definition.split_once(") REFERENCES ")?.1;
-    let inside = after.split_once('(')?.1.split_once(')')?.0;
-    let names: Vec<String> = inside
-        .split(',')
-        .map(|s| unquote_ident(s.trim()))
-        .filter(|s| !s.is_empty())
-        .collect();
-    // The two sides of a foreign key line up or it is not one, and a count
-    // that disagrees means this parse read something other than what it
-    // thinks. Refusing it is what keeps a misparse from becoming a plan.
-    (names.len() == raw.ref_columns.len()).then_some(names)
+/// `confkey` holds attnums on the **referenced** table, which the constrained
+/// table's map cannot answer for. A first version read them out of
+/// `pg_get_constraintdef` instead, on the grounds that a second catalog join
+/// would put the answer where no test can reach it. Measured, that parse is
+/// wrong on a legal name: `FOREIGN KEY (x, y) REFERENCES q(x, "a)b")` stops
+/// inside the quoted identifier, yields two items, passes a count check against
+/// `confkey`, and records the column `"a`. The columns of every table in the
+/// pull are already here, so they answer it instead — no parse, and no second
+/// query either (DECISIONS 250, superseding 247).
+fn reference_columns(
+    raw: &RawConstraint,
+    by_table_and_attnum: &HashMap<(i64, i32), &str>,
+) -> Option<Vec<String>> {
+    let table = raw.ref_table?;
+    raw.ref_columns
+        .iter()
+        .map(|attnum| {
+            by_table_and_attnum
+                .get(&(table, *attnum))
+                .map(|name| (*name).to_owned())
+        })
+        .collect()
 }
 
-/// One identifier as `pg_get_constraintdef` renders it: quoted only when it has
-/// to be, and a quoted one doubles its own quotes.
-fn unquote_ident(s: &str) -> String {
-    match s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        Some(inner) => inner.replace("\"\"", "\""),
-        None => s.to_owned(),
-    }
+/// A match type this engine has and this code has never seen.
+fn unknown_match(pulled: &mut Pulled, parts: &Parts, name: &str, kind: char) {
+    note(
+        pulled,
+        &parts.name,
+        format!(
+            "foreign key `{name}` on `{}` has the match type `{kind}`, which this dialect does \
+             not know. It is left out rather than read back as the default one.",
+            parts.name
+        ),
+    );
 }
 
 fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) {
@@ -653,6 +786,38 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             format!(
                 "index `{}` on `{}` is over an expression, which this model does not hold. It is \
                  left out of the pull, so a plan cannot see it.",
+                raw.name, parts.name
+            ),
+        );
+        return;
+    }
+    // A failed `CREATE INDEX CONCURRENTLY` leaves a row behind that the
+    // planner will not use. Read back as an index, a declaration of the same
+    // shape compares clean — and the index the operator believes they have
+    // does not exist.
+    if !raw.valid {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` is `indisvalid = false`: the engine keeps the row and the \
+                 planner does not use it, which is what a `CREATE INDEX CONCURRENTLY` that \
+                 failed leaves behind. It is left out of the pull, so a declaration of the same \
+                 shape reads as an index that is missing rather than one that is present.",
+                raw.name, parts.name
+            ),
+        );
+        return;
+    }
+    if raw.nulls_not_distinct {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` is `NULLS NOT DISTINCT`, so it admits at most one null key \
+                 where an ordinary unique index admits any number. This model holds only \
+                 `unique:`, so the index is left out rather than read back as the weaker one it \
+                 is not.",
                 raw.name, parts.name
             ),
         );
@@ -764,6 +929,7 @@ mod tests {
             default: None,
             identity: None,
             generated: false,
+            owned_sequence: None,
         }
     }
 
@@ -781,6 +947,8 @@ mod tests {
             deferrable: false,
             deferred: false,
             definition: String::new(),
+            expression: None,
+            match_type: 's',
             index_oid: None,
         }
     }
@@ -793,6 +961,8 @@ mod tests {
             unique: false,
             primary: false,
             exclusion: false,
+            valid: true,
+            nulls_not_distinct: false,
             key_count: 1,
             columns: vec![1],
             options: vec![0],
@@ -938,24 +1108,26 @@ mod tests {
         assert!(pulled.warnings[0].contains("RESTRICT"));
     }
 
-    /// The referenced columns are read out of the definition, because the
-    /// attnums in `confkey` belong to the other table. A parse that disagrees
-    /// with the count refuses rather than guesses.
+    /// `confkey` names attnums on the **referenced** table, so they are
+    /// resolved against that table's own columns. The name here contains the
+    /// `)` that the first version of this — a parse of
+    /// `pg_get_constraintdef` — stopped inside of, recording `\"a` and passing
+    /// its own count check.
     #[test]
-    fn a_foreign_keys_referenced_columns_come_from_the_definition() {
+    fn a_foreign_keys_referenced_columns_come_from_the_referenced_table() {
         let mut fk = constraint(1, "t_fk", 'f');
         fk.columns = vec![1, 2];
         fk.ref_columns = vec![1, 2];
         fk.ref_table = Some(2);
         fk.definition =
-            "FOREIGN KEY (a, b) REFERENCES app.other(\"x y\", z) ON UPDATE CASCADE".to_owned();
+            "FOREIGN KEY (a, b) REFERENCES app.other(\"a)b\", z) ON UPDATE CASCADE".to_owned();
         fk.on_update = 'c';
         let raw = RawCatalog {
             tables: vec![table(1, "t"), table(2, "other")],
             columns: vec![
                 col(1, 1, "a", "integer"),
                 col(1, 2, "b", "integer"),
-                col(2, 1, "x y", "integer"),
+                col(2, 1, "a)b", "integer"),
                 col(2, 2, "z", "integer"),
             ],
             constraints: vec![fk],
@@ -963,15 +1135,15 @@ mod tests {
         };
         let pulled = assemble(&raw);
         let key = &pulled.schema.tables[&TableName::new("app", "t")].foreign_keys["t_fk"];
-        assert_eq!(key.references_columns, ["x y", "z"]);
+        assert_eq!(key.references_columns, ["a)b", "z"]);
         assert_eq!(key.on_update, ReferentialAction::Cascade);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
 
-    /// A definition whose column count does not match `confkey` means the parse
-    /// read something other than what it thinks it read.
+    /// An attnum on the referenced table that this pull did not read is the
+    /// third thing again: the key is left out and named, never shortened.
     #[test]
-    fn a_referenced_column_list_that_does_not_match_the_catalog_is_refused() {
+    fn a_referenced_column_the_pull_did_not_read_leaves_the_key_out() {
         let mut fk = constraint(1, "t_fk", 'f');
         fk.columns = vec![1];
         fk.ref_columns = vec![1, 2];
@@ -1086,6 +1258,7 @@ mod tests {
         column.default = Some("(0)::numeric".to_owned());
         let mut check = constraint(1, "t_ck", 'c');
         check.definition = "CHECK ((amount >= (0)::numeric))".to_owned();
+        check.expression = Some("(amount >= (0)::numeric)".to_owned());
         let mut ix = index(50, 1, "t_ix");
         ix.filter = Some("(amount IS NOT NULL)".to_owned());
         let raw = RawCatalog {
@@ -1101,8 +1274,8 @@ mod tests {
             Some("(0)::numeric")
         );
         assert_eq!(
-            read.checks["t_ck"].expression,
-            "CHECK ((amount >= (0)::numeric))"
+            read.checks["t_ck"].expression, "(amount >= (0)::numeric)",
+            "the expression, not the `CHECK (…)` clause an emitter wraps it in"
         );
         assert_eq!(
             read.indexes["t_ix"].filter.as_deref(),
@@ -1279,6 +1452,146 @@ mod tests {
         );
         assert_eq!(pulled.limitations.len(), 1);
         assert!(pulled.warnings[0].contains("NOT VALID"));
+    }
+
+    /// `pg_get_constraintdef` returns the whole clause and the model holds its
+    /// inside. Stored whole, an emitter that wraps it produces
+    /// `CHECK (CHECK (…))`, and `amount >= 0` — what a person writes — could
+    /// never converge with the live schema.
+    #[test]
+    fn a_check_is_stored_as_its_expression_and_not_as_the_whole_clause() {
+        let mut check = constraint(1, "t_ck", 'c');
+        check.definition = "CHECK ((id > 0))".to_owned();
+        check.expression = Some("(id > 0)".to_owned());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "id", "integer")],
+            constraints: vec![check],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(only(&pulled).checks["t_ck"].expression, "(id > 0)");
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// And a check with no readable expression is the third thing again.
+    #[test]
+    fn a_check_with_no_readable_expression_is_left_out_and_named() {
+        let mut check = constraint(1, "t_ck", 'c');
+        check.definition = "CHECK ((id > 0))".to_owned();
+        check.expression = None;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "id", "integer")],
+            constraints: vec![check],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).checks.is_empty());
+        assert!(pulled.warnings[0].contains("no readable expression"));
+    }
+
+    /// `MATCH FULL` refuses a row whose referencing columns are partly null,
+    /// which the default accepts. Read back as the default it is a constraint
+    /// that has quietly stopped refusing them.
+    #[test]
+    fn a_foreign_key_whose_match_type_is_not_the_default_is_left_out_and_named() {
+        for (match_type, expected) in [('s', true), ('f', false), ('p', false), ('z', false)] {
+            let mut fk = constraint(1, "t_fk", 'f');
+            fk.columns = vec![1];
+            fk.ref_columns = vec![1];
+            fk.ref_table = Some(2);
+            fk.match_type = match_type;
+            let raw = RawCatalog {
+                tables: vec![table(1, "t"), table(2, "other")],
+                columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
+                constraints: vec![fk],
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            assert_eq!(
+                pulled.schema.tables[&TableName::new("app", "t")]
+                    .foreign_keys
+                    .contains_key("t_fk"),
+                expected,
+                "match type `{match_type}`"
+            );
+        }
+    }
+
+    /// A failed `CREATE INDEX CONCURRENTLY` leaves a row the planner will not
+    /// use. Read back as an index, a declaration of the same shape compares
+    /// clean and the operator has no index at all.
+    #[test]
+    fn an_index_the_planner_will_not_use_is_left_out_and_named() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.valid = false;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: Vec::new(),
+            indexes: vec![ix],
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(pulled.warnings[0].contains("indisvalid = false"));
+    }
+
+    /// `NULLS NOT DISTINCT` decides whether a unique key admits more than one
+    /// null, and the model holds only `unique`. Both the bare index and the
+    /// constraint its index enforces are left out.
+    #[test]
+    fn a_unique_key_that_admits_one_null_is_left_out_whichever_shape_it_has() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.unique = true;
+        ix.nulls_not_distinct = true;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: Vec::new(),
+            indexes: vec![ix.clone()],
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(pulled.warnings[0].contains("NULLS NOT DISTINCT"));
+
+        // And the same index standing behind a unique constraint.
+        let mut uq = constraint(1, "t_uq", 'u');
+        uq.columns = vec![1];
+        uq.index_oid = Some(50);
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: vec![uq],
+            indexes: vec![ix],
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).unique.is_empty());
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(pulled.warnings.iter().any(|w| w.contains("`t_uq`")));
+    }
+
+    /// A `serial` column is an `integer` with a `nextval(...)` default and a
+    /// sequence beside it that this model has nowhere to put. The column is
+    /// carried; the sequence is named.
+    #[test]
+    fn a_column_that_defaults_from_a_sequence_it_owns_is_carried_and_named() {
+        let mut column = col(1, 1, "id", "integer");
+        column.default = Some("nextval('app.t_id_seq'::regclass)".to_owned());
+        column.owned_sequence = Some("t_id_seq".to_owned());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![column],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(
+            only(&pulled).columns["id"].default.as_deref(),
+            Some("nextval('app.t_id_seq'::regclass)")
+        );
+        assert_eq!(pulled.limitations.len(), 1);
+        assert!(pulled.warnings[0].contains("t_id_seq"));
     }
 
     /// Every limitation carries its table, so a caller can tell drift inside
