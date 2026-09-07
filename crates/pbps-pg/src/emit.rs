@@ -90,29 +90,88 @@ const SETTING_SENSITIVE: &[&str] = &[
     "double precision",
 ];
 
-/// Whether `expression` is a bare quoted literal and nothing else.
+/// Whether `expression` is one string literal and nothing else.
 ///
 /// Not a parser, and it does not have to be one: the question is only whether
-/// the whole expression is one `'…'` with nothing before or after it, and the
-/// closing rule for a plain literal is doubling (`standard_conforming_strings`
-/// is pinned `on` by the transaction framing, which is what makes that true).
-/// Anything with a cast, a call or an operator in it answers `false` and is
-/// emitted as written.
+/// the whole expression is a single literal, in any of the spellings this
+/// engine has for one. Anything with a cast, a call or an operator in it
+/// answers `false` and is emitted as written.
+///
+/// **All four openers, and a first version had only the first.** A rule about
+/// `'…'` alone would have let `E'01/02/2026'` and `$$01/02/2026$$` through on a
+/// `date` column — the same text, the same session-decided value, and a
+/// spelling a person copying from somewhere else would write. `U&'…' UESCAPE
+/// '!'` is the one form left over: it is two literals with a keyword between
+/// them, it answers `false`, and it is named here so that the gap is a recorded
+/// one rather than a spelling nobody thought of.
 fn is_a_bare_literal(expression: &str) -> bool {
     let e = expression.trim();
-    let Some(inner) = e.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) else {
+    if e.starts_with('$') {
+        return is_one_dollar_quoted_literal(e);
+    }
+    // `E'…'` is the only one of these in which a backslash escapes; `U&'…'`
+    // gives the backslash a meaning of its own (a Unicode escape) that does not
+    // change where the literal *ends*, which is the only thing asked here.
+    let (escapes, rest) = if let Some(r) = e.strip_prefix("E'").or_else(|| e.strip_prefix("e'")) {
+        (true, r)
+    } else if let Some(r) = e.strip_prefix("U&'").or_else(|| e.strip_prefix("u&'")) {
+        (false, r)
+    } else if let Some(r) = e.strip_prefix('\'') {
+        (false, r)
+    } else {
         return false;
     };
-    // A doubled quote is inside the literal; a single one would have closed it
-    // before the end, which means the expression is not just this literal.
-    let mut rest = inner;
-    while let Some(at) = rest.find('\'') {
-        match rest[at..].strip_prefix("''") {
-            Some(after) => rest = after,
-            None => return false,
+    let Some(inner) = rest.strip_suffix('\'') else {
+        return false;
+    };
+    closes_only_at_the_end(inner, escapes)
+}
+
+/// Whether the quote that ends `inner` is the first one that could have.
+///
+/// A doubled quote is inside the literal; a single one would have closed it
+/// early, which means the expression is more than this literal.
+fn closes_only_at_the_end(inner: &str, escapes: bool) -> bool {
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if escapes => i += 2,
+            b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+            b'\'' => return false,
+            // Every other byte, which includes the continuation bytes of a
+            // multi-byte character: none of them can be one of the two above.
+            _ => i += 1,
         }
     }
-    true
+    // A step that ran past the end consumed the closing quote as an escaped
+    // one, so the literal did not end there — `E'a\'` is not a closed literal.
+    i == bytes.len()
+}
+
+/// Whether `e` is one `$tag$…$tag$` literal and nothing else.
+fn is_one_dollar_quoted_literal(e: &str) -> bool {
+    let Some(rest) = e.strip_prefix('$') else {
+        return false;
+    };
+    let Some(at) = rest.find('$') else {
+        return false;
+    };
+    let tag = &rest[..at];
+    // The tag's own rule: empty, or a name that does not start with a digit.
+    if !tag.is_empty()
+        && !(tag.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && tag.chars().all(|c| c.is_alphanumeric() || c == '_'))
+    {
+        return false;
+    }
+    let delim = format!("${tag}$");
+    let Some(body) = e[delim.len()..].strip_suffix(&delim) else {
+        return false;
+    };
+    // Nothing inside can close it, which is the whole point of the form — but
+    // a *second* pair of the same tag would mean two literals side by side.
+    !body.contains(&delim)
 }
 
 /// Refuses a default whose value would be decided by whoever applies it.
@@ -891,7 +950,19 @@ mod tests {
     /// expression the engine resolves rather than a text a setting reads.
     #[test]
     fn only_a_whole_bare_literal_is_one() {
-        for yes in ["'2026-01-02'", "  '2026-01-02'  ", "''", "'it''s'"] {
+        for yes in [
+            "'2026-01-02'",
+            "  '2026-01-02'  ",
+            "''",
+            "'it''s'",
+            // The three other spellings of one literal, each of which a rule
+            // about `'…'` alone would have let through on a `date`.
+            r"E'2026-01-02'",
+            r"e'it\'s'",
+            "$$2026-01-02$$",
+            "$d$2026-01-02$d$",
+            "U&'2026-01-02'",
+        ] {
             assert!(is_a_bare_literal(yes), "{yes}");
         }
         for no in [
@@ -903,6 +974,16 @@ mod tests {
             "",
             "'",
             "current_date",
+            // Two literals, not one, in each spelling.
+            r"E'a' || E'b'",
+            "$$a$$ || $$b$$",
+            // The closing quote is escaped, so nothing closed the literal.
+            r"E'a\'",
+            // A tag that is not a tag, and a body that is not closed.
+            "$1$a$1$",
+            "$d$a$e$",
+            // The recorded gap: two literals with a keyword between them.
+            "U&'a' UESCAPE '!'",
         ] {
             assert!(!is_a_bare_literal(no), "{no}");
         }

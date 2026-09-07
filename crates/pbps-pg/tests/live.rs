@@ -2679,19 +2679,24 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         text(
             conn,
             &format!(
-                "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) FROM pg_catalog.pg_attrdef d \
+                "SELECT string_agg(DISTINCT pg_catalog.pg_get_expr(d.adbin, d.adrelid), ' ') \
+                 FROM pg_catalog.pg_attrdef d \
                  WHERE d.adrelid = '{table}'::pg_catalog.regclass"
             ),
         )
         .await
     }
+    // Every spelling of one literal, because a rule about `'…'` alone would
+    // have let the other three through with exactly this behaviour.
+    let columns = "d date DEFAULT '01/02/2026', e date DEFAULT E'01/02/2026', \
+                   f date DEFAULT $$01/02/2026$$, g date DEFAULT U&'01/02/2026'";
     conn.execute(&format!(
-        "SET DateStyle = 'ISO, MDY'; CREATE TABLE {s}.mdy (d date DEFAULT '01/02/2026')"
+        "SET DateStyle = 'ISO, MDY'; CREATE TABLE {s}.mdy ({columns})"
     ))
     .await
     .expect("under MDY");
     conn.execute(&format!(
-        "SET DateStyle = 'ISO, DMY'; CREATE TABLE {s}.dmy (d date DEFAULT '01/02/2026')"
+        "SET DateStyle = 'ISO, DMY'; CREATE TABLE {s}.dmy ({columns})"
     ))
     .await
     .expect("under DMY");
@@ -2733,12 +2738,22 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
             table: Box::new(t),
         }
     };
-    let refusal = Postgres::new()
-        .emit(&table("'01/02/2026'"), Strategy::default())
-        .expect_err("a bare literal on a date");
-    let message = refusal.to_string();
-    assert!(message.contains("DateStyle"), "{message}");
-    assert!(message.contains("'2026-01-02'::date"), "{message}");
+    for spelling in [
+        "'01/02/2026'",
+        r"E'01/02/2026'",
+        "$$01/02/2026$$",
+        "U&'01/02/2026'",
+    ] {
+        let refusal = Postgres::new()
+            .emit(&table(spelling), Strategy::default())
+            .unwrap_err();
+        let message = refusal.to_string();
+        assert!(message.contains("DateStyle"), "{spelling}: {message}");
+        assert!(
+            message.contains("'2026-01-02'::date"),
+            "{spelling}: {message}"
+        );
+    }
     Postgres::new()
         .emit(&table("'2026-01-02'::date"), Strategy::default())
         .expect("the resolved typed spelling is emitted as written");

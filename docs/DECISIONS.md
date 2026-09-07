@@ -4507,12 +4507,21 @@ SPEC is in sync with all of these.
     DEFAULT '2026-01-02'::date under either:            '2026-01-02'::date
     ```
 
-    The test is *whole expression is one quoted literal*, and nothing more: an
+    The test is *whole expression is one string literal*, and nothing more: an
     expression carrying a cast, a call or an operator is emitted as written.
     That is not a shortcut, it is the boundary — a default that already carries
     a cast is the form `pg_get_expr` reads back (ADR-0013 §4), so a declaration
     pulled from a live database is never refused, and the refusal falls only on
     the one shape whose meaning the applying session decides.
+
+    **One literal has four spellings here, and a first version knew one.**
+    Measured, `'01/02/2026'`, `E'01/02/2026'`, `$$01/02/2026$$` and
+    `U&'01/02/2026'` on a `date` all store 2026-01-02 under MDY and 2026-02-01
+    under DMY — identical behaviour, and three of them would have walked past a
+    check written around the quote character. The one form left over is
+    `U&'…' UESCAPE '…'`, which is two literals with a keyword between them; it
+    answers "not a bare literal" and is named in the code so the gap is
+    recorded rather than unnoticed.
 
     Which types are on the list is ADR-0013's derivation and not this file's
     judgement: `date`, `time`, `timetz`, `timestamp`, `timestamptz`,
