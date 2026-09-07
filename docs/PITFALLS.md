@@ -701,6 +701,15 @@ one caller.** The decision now runs before anything that names a table is built,
 and the maps describe the tables in the pull rather than the tables the catalog
 returned.
 
+**And a third time, from the other end.** A foreign key was recorded against a
+uniqueness the pull had just refused — the referenced primary key had an
+`INCLUDE` payload, so it was left out, and its backing index with it, and the
+key still went in because the arm checked only that the target table and columns
+existed. **A decision reachable through a map built before the decision was
+made is a decision that has not happened yet.** The foreign keys now run in a
+second pass, against what the constraint and index arms actually recorded
+(DECISIONS 254).
+
 **The shape both share:** the catalog answers "what kind of thing is this?" in
 one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the

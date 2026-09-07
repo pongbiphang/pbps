@@ -315,9 +315,16 @@ struct Lookups<'a> {
     /// constraint's payload lives on its backing index and nowhere in
     /// `pg_constraint`.
     covering: BTreeSet<i64>,
+    /// The indexes that reached the pull — as an index, or as the key
+    /// constraint they enforce. Empty until the first pass has run, which is
+    /// why the foreign keys are the second one: a foreign key is legal only
+    /// against a uniqueness that is there, and whether it is there is not known
+    /// until the constraint and index arms have had their say.
+    surviving_indexes: BTreeSet<i64>,
 }
 
 /// Everything a table's own assembly needs, gathered once.
+#[derive(Clone)]
 struct Parts<'a> {
     name: TableName,
     /// attnum to column name. Built from the live columns, so a dropped slot
@@ -372,7 +379,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .map(|t| t.oid)
         .collect();
 
-    let lookups = Lookups {
+    let mut lookups = Lookups {
         tables: raw
             .tables
             .iter()
@@ -397,6 +404,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .filter(|i| i.columns.len() > i.key_count)
             .map(|i| i.oid)
             .collect(),
+        surviving_indexes: BTreeSet::new(),
     };
     let constraints_by_table = group(&raw.constraints, |c| c.table_oid);
     let indexes_by_table = group(&raw.indexes, |i| i.table_oid);
@@ -419,6 +427,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .filter_map(|c| c.index_oid)
         .collect();
 
+    let mut surviving: BTreeSet<i64> = BTreeSet::new();
+    let mut deferred: Vec<(Parts, &RawConstraint)> = Vec::new();
     for raw_table in &raw.tables {
         let name = TableName::new(&raw_table.schema, &raw_table.name);
         let raw_columns = columns_by_table
@@ -447,7 +457,16 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .get(&raw_table.oid)
             .map_or(&[][..], Vec::as_slice)
         {
-            add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
+            // Foreign keys wait for the second pass. See `surviving_indexes`.
+            if constraint.kind == 'f' {
+                deferred.push((parts.clone(), *constraint));
+                continue;
+            }
+            if add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled)
+                && let Some(oid) = constraint.index_oid
+            {
+                surviving.insert(oid);
+            }
         }
         for index in indexes_by_table
             .get(&raw_table.oid)
@@ -456,10 +475,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             if constraint_indexes.contains(&index.oid) {
                 continue;
             }
-            add_index(index, &parts, &mut table, &mut pulled);
+            if add_index(index, &parts, &mut table, &mut pulled) {
+                surviving.insert(index.oid);
+            }
         }
 
         pulled.schema.tables.insert(name, table);
+    }
+
+    // The second pass. A foreign key is enforced against a uniqueness on the
+    // referenced table, and the engine records which one in `conindid`. If that
+    // index did not reach the pull — because the key constraint enforcing it
+    // has an `INCLUDE` payload, or is `NULLS NOT DISTINCT`, or any of the other
+    // reasons this file leaves one out — then the schema described here cannot
+    // be built: adding the foreign key back would fail for want of the
+    // uniqueness nothing mentions.
+    lookups.surviving_indexes = surviving;
+    for (parts, constraint) in deferred {
+        // Taken out and put back rather than borrowed in place: `note` writes
+        // to the same `Pulled` the table lives in.
+        let Some(mut table) = pulled.schema.tables.remove(&parts.name) else {
+            continue;
+        };
+        add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
+        pulled.schema.tables.insert(parts.name.clone(), table);
     }
 
     pulled
@@ -489,6 +528,35 @@ fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Ve
 /// and an ids file address, and a table whose column cannot be written is no
 /// more usable than one whose own name cannot.
 fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn]) -> Option<String> {
+    // The same question of a column's *type*. A spelling the catalogue cannot
+    // read is kept as the engine wrote it (issue #130) — and `app.money_amount`
+    // and `timestamp(3) with time zone` are both written out as themselves and
+    // both refused on the way back, one for the dot and one for the words after
+    // the parenthesis. Carrying them produces exactly the failure the name
+    // check exists to prevent, one field over.
+    // Every one of them, not the first: the table is out either way, and an
+    // operator reading this is deciding what to do about the columns, not about
+    // the guard.
+    let unwritable: Vec<String> = columns
+        .iter()
+        .filter(|c| ColumnType::from_str(&raw_type_as_written(&c.ty)).is_err())
+        .map(|c| format!("`{}` (`{}`)", c.name, c.ty))
+        .collect();
+    if !unwritable.is_empty() {
+        return Some(format!(
+            "`{name}` has {} whose type this dialect's catalogue cannot spell and the \
+             declaration format cannot write back either — a type is stored as its own spelling \
+             and read by parsing it, and these do not survive that: {}. The whole table is left \
+             out of the pull, because a schema that can be written and not loaded is worse than \
+             one that says a table is missing (issue #130).",
+            if unwritable.len() == 1 {
+                "a column"
+            } else {
+                "columns"
+            },
+            unwritable.join(", ")
+        ));
+    }
     if TableName::from_str(&name.to_string()).as_ref() != Ok(name) {
         return Some(format!(
             "`{name}` is a table whose name the declaration format cannot write back: it is \
@@ -511,9 +579,23 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
     })
 }
 
+/// What [`column`] would store as an opaque type's `base`: the engine's own
+/// spelling, unchanged. Named so that the round-trip check and the construction
+/// cannot drift apart.
+fn raw_type_as_written(ty: &str) -> String {
+    String::from(ColumnType::new(ty.to_owned(), Vec::new()))
+}
+
 /// The `CACHE` a sequence has when nothing asks for one — **measured**, and the
 /// one a plan that recreates an identity would get.
 const DEFAULT_SEQUENCE_CACHE: i64 = 1;
+
+/// [`note`], for the arms that are expressions rather than blocks. Always
+/// `false`: a constraint that earns a warning here is one that was left out.
+fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
+    note(pulled, table, detail);
+    false
+}
 
 fn note(pulled: &mut Pulled, table: &TableName, detail: String) {
     pulled.warnings.push(detail.clone());
@@ -708,18 +790,21 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     }
 }
 
+/// Returns whether the constraint reached the pull. For a key constraint that
+/// is what says its backing index is there; for the rest the answer is unused
+/// and honest anyway.
 fn add_constraint(
     raw: &RawConstraint,
     parts: &Parts,
     lookups: &Lookups,
     table: &mut Table,
     pulled: &mut Pulled,
-) {
+) -> bool {
     match raw.kind {
         // PostgreSQL 18 gives every NOT NULL a `pg_constraint` row. The column
         // already carries it, and a reader that let this fall through to the
         // check arm would report one phantom check per NOT NULL column.
-        'n' => {}
+        'n' => false,
 
         // `NOT ENFORCED` is not `NOT VALID`, and the difference is the whole
         // constraint: a `NOT VALID` one still checks every new row, while this
@@ -738,6 +823,7 @@ fn add_constraint(
                     raw.name, parts.name, raw.definition
                 ),
             );
+            false
         }
 
         // `NO INHERIT` is a check that stops at this table. Read back as an
@@ -756,6 +842,7 @@ fn add_constraint(
                     raw.name, parts.name, raw.definition
                 ),
             );
+            false
         }
 
         // A foreign key is not a fact in `pg_constraint`, it is triggers. A
@@ -776,6 +863,7 @@ fn add_constraint(
                     raw.name, parts.name, raw.definition
                 ),
             );
+            false
         }
 
         // A temporal key keeps the `contype` of an ordinary one, so nothing but
@@ -795,6 +883,7 @@ fn add_constraint(
                     raw.name, parts.name, raw.definition
                 ),
             );
+            false
         }
 
         // A key whose check can be put off is a different key, and the model
@@ -820,6 +909,7 @@ fn add_constraint(
                     raw.name, parts.name
                 ),
             );
+            false
         }
 
         // A unique key whose index admits more than one null key is a
@@ -840,6 +930,7 @@ fn add_constraint(
                     raw.name, parts.name
                 ),
             );
+            false
         }
 
         'p' | 'u' | 'f' if raw.deferrable => {
@@ -862,6 +953,7 @@ fn add_constraint(
                     raw.definition
                 ),
             );
+            false
         }
 
         'p' => match parts.names(&raw.columns) {
@@ -870,8 +962,12 @@ fn add_constraint(
                     name: Some(raw.name.clone()),
                     columns,
                 });
+                true
             }
-            Err(attnum) => unresolved(pulled, parts, "primary key", &raw.name, attnum),
+            Err(attnum) => {
+                unresolved(pulled, parts, "primary key", &raw.name, attnum);
+                false
+            }
         },
 
         'u' => match parts.names(&raw.columns) {
@@ -879,8 +975,12 @@ fn add_constraint(
                 table
                     .unique
                     .insert(raw.name.clone(), UniqueConstraint { columns });
+                true
             }
-            Err(attnum) => unresolved(pulled, parts, "unique constraint", &raw.name, attnum),
+            Err(attnum) => {
+                unresolved(pulled, parts, "unique constraint", &raw.name, attnum);
+                false
+            }
         },
 
         'c' => {
@@ -911,7 +1011,7 @@ fn add_constraint(
                         raw.name, parts.name, raw.definition
                     ),
                 );
-                return;
+                return false;
             };
             table.checks.insert(
                 raw.name.clone(),
@@ -919,11 +1019,12 @@ fn add_constraint(
                 // welded on.
                 CheckConstraint { expression },
             );
+            false
         }
 
         'f' => add_foreign_key(raw, parts, lookups, table, pulled),
 
-        'x' => note(
+        'x' => note_false(
             pulled,
             &parts.name,
             format!(
@@ -934,7 +1035,7 @@ fn add_constraint(
             ),
         ),
 
-        other => note(
+        other => note_false(
             pulled,
             &parts.name,
             format!(
@@ -952,7 +1053,30 @@ fn add_foreign_key(
     lookups: &Lookups,
     table: &mut Table,
     pulled: &mut Pulled,
-) {
+) -> bool {
+    // A foreign key is enforced against a uniqueness on the referenced table,
+    // and `conindid` says which index that is. If it did not reach the pull —
+    // the key constraint enforcing it has an `INCLUDE` payload, or is `NULLS
+    // NOT DISTINCT`, or any of the other reasons this file leaves one out —
+    // then the schema described here cannot be built: adding this key back
+    // would fail for want of a uniqueness nothing mentions.
+    if raw
+        .index_oid
+        .is_some_and(|oid| !lookups.surviving_indexes.contains(&oid))
+    {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "foreign key `{}` on `{}` is enforced against a uniqueness on the referenced \
+                 table that this pull left out, so it is left out too — read back it would be a \
+                 key with nothing to point at, and recreating this schema would fail on it. Its \
+                 definition is `{}`.",
+                raw.name, parts.name, raw.definition
+            ),
+        );
+        return false;
+    }
     // The same rule the check arm applies, and for the same reason: a key
     // added `NOT VALID` holds for new rows and has never been checked against
     // the rows already there. Read back as an ordinary key it compares equal to
@@ -985,7 +1109,7 @@ fn add_foreign_key(
                 raw.name, parts.name, raw.definition
             ),
         );
-        return;
+        return false;
     };
 
     // `ON DELETE SET NULL (a)` nulls one column; the model's `SetNull` nulls
@@ -1003,7 +1127,7 @@ fn add_foreign_key(
                 raw.name, parts.name, raw.definition
             ),
         );
-        return;
+        return false;
     }
 
     // MATCH SIMPLE is the default and the only one this model can mean.
@@ -1024,11 +1148,14 @@ fn add_foreign_key(
                 match raw.match_type {
                     'f' => "FULL",
                     'p' => "PARTIAL",
-                    other => return unknown_match(pulled, parts, &raw.name, other),
+                    other => {
+                        unknown_match(pulled, parts, &raw.name, other);
+                        return false;
+                    }
                 }
             ),
         );
-        return;
+        return false;
     }
 
     let Ok(columns) = parts.names(&raw.columns) else {
@@ -1039,7 +1166,7 @@ fn add_foreign_key(
             &raw.name,
             *raw.columns.last().unwrap_or(&0),
         );
-        return;
+        return false;
     };
 
     // The referenced columns are attnums **on the other table**, resolved
@@ -1056,7 +1183,7 @@ fn add_foreign_key(
                     raw.name, parts.name, raw.definition
                 ),
             );
-            return;
+            return false;
         }
     };
 
@@ -1078,7 +1205,7 @@ fn add_foreign_key(
                 action_name(raw.on_update)
             ),
         );
-        return;
+        return false;
     };
 
     table.foreign_keys.insert(
@@ -1091,6 +1218,7 @@ fn add_foreign_key(
             on_update,
         },
     );
+    true
 }
 
 /// The referenced columns of a foreign key.
@@ -1132,7 +1260,9 @@ fn unknown_match(pulled: &mut Pulled, parts: &Parts, name: &str, kind: char) {
     );
 }
 
-fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) {
+/// Returns whether the index reached the pull, which is what tells a foreign
+/// key whether the uniqueness it is enforced against is there.
+fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) -> bool {
     if raw.method != "btree" {
         note(
             pulled,
@@ -1143,7 +1273,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name, raw.method
             ),
         );
-        return;
+        return false;
     }
     if raw.has_expressions || raw.columns.contains(&0) {
         note(
@@ -1155,7 +1285,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name
             ),
         );
-        return;
+        return false;
     }
     // A failed `CREATE INDEX CONCURRENTLY` leaves a row behind that the
     // planner will not use. Read back as an index, a declaration of the same
@@ -1173,7 +1303,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name
             ),
         );
-        return;
+        return false;
     }
     if raw.nondefault_column_options {
         note(
@@ -1188,7 +1318,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name
             ),
         );
-        return;
+        return false;
     }
     if raw.nulls_not_distinct {
         note(
@@ -1202,7 +1332,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name
             ),
         );
-        return;
+        return false;
     }
     if raw.exclusion {
         note(
@@ -1214,7 +1344,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.name, parts.name
             ),
         );
-        return;
+        return false;
     }
 
     let key_count = raw.key_count.min(raw.columns.len());
@@ -1227,7 +1357,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             &raw.name,
             *raw.columns.last().unwrap_or(&0),
         );
-        return;
+        return false;
     };
 
     // Bit 0 is DESC and bit 1 is NULLS FIRST, and the model holds only the
@@ -1267,6 +1397,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             filter: raw.filter.clone(),
         },
     );
+    true
 }
 
 /// An attnum with no live column behind it.
@@ -1672,26 +1803,42 @@ mod tests {
         );
     }
 
-    /// A type the catalogue cannot spell is the one #130 is about, and it is
-    /// read back as itself with a word said. Silence here would be a column
-    /// pbps believes it understands.
+    /// A type the catalogue cannot spell is the one #130 is about, and #130
+    /// says what the pull owes it: "`pull` will have to report it as unmanaged
+    /// rather than adopt it". Kept as the engine spelled it, the column made a
+    /// schema that can be written and not loaded — `app.money_amount` is
+    /// refused for the dot and `timestamp(3) with time zone` for the words
+    /// after the parenthesis. Silence would be worse than either.
     #[test]
-    fn a_type_the_catalogue_cannot_spell_is_kept_and_named() {
+    fn a_type_the_catalogue_cannot_spell_takes_its_table_out_and_is_named() {
+        for spelling in ["timestamp(3) with time zone", "app.money_amount"] {
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "when", spelling)],
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            assert!(pulled.schema.tables.is_empty(), "{spelling}");
+            assert_eq!(pulled.limitations.len(), 1, "{spelling}");
+            assert!(pulled.warnings[0].contains("issue #130"), "{spelling}");
+            assert!(pulled.warnings[0].contains(spelling), "{spelling}");
+        }
+
+        // The negative case: a spelling the catalogue reads is carried and
+        // earns nothing.
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
-            columns: vec![col(1, 1, "when", "timestamp(3) with time zone")],
+            columns: vec![col(1, 1, "when", "timestamp with time zone")],
             constraints: Vec::new(),
             indexes: Vec::new(),
         };
         let pulled = assemble(&raw);
-        assert_eq!(pulled.limitations.len(), 1);
-        assert!(pulled.warnings[0].contains("issue #130"));
         assert_eq!(
             only(&pulled).columns["when"].ty.to_string(),
-            "timestamp(3) with time zone",
-            "kept as the engine spelled it, so the differ reports a change it \
-             will refuse to emit rather than reporting nothing"
+            "timestamp with time zone"
         );
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
 
     /// `GENERATED BY DEFAULT` and `GENERATED ALWAYS` read back the same, and a
@@ -2377,6 +2524,92 @@ mod tests {
         // The negative case: the same key at a table whose name round-trips.
         let raw = RawCatalog {
             tables: vec![table(1, "c"), table(2, "t")],
+            ..raw
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .len(),
+            1
+        );
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// A foreign key is legal only against a uniqueness that is there. When the
+    /// key constraint enforcing it is left out — here for an `INCLUDE` payload
+    /// — the key has nothing to point at, and the schema described cannot be
+    /// built.
+    #[test]
+    fn a_foreign_key_whose_referenced_uniqueness_was_left_out_goes_with_it() {
+        // The referencing table is first, so its turn comes before the
+        // referenced table's constraint has been decided.
+        let mut fk = constraint(1, "c_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(2);
+        fk.index_oid = Some(50);
+        let mut pk = constraint(2, "p_pk", 'p');
+        pk.columns = vec![1];
+        pk.index_oid = Some(50);
+        let mut backing = index(50, 2, "p_pk");
+        backing.unique = true;
+        backing.primary = true;
+        backing.key_count = 1;
+        backing.columns = vec![1, 2];
+        let raw = RawCatalog {
+            tables: vec![table(1, "c"), table(2, "p")],
+            columns: vec![
+                col(1, 1, "a", "integer"),
+                col(2, 1, "a", "integer"),
+                col(2, 2, "b", "integer"),
+            ],
+            constraints: vec![fk, pk],
+            indexes: vec![backing],
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "p")]
+                .primary_key
+                .is_none()
+        );
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .is_empty(),
+            "a key against a uniqueness that is not in the pull is not a key"
+        );
+        assert!(
+            pulled.warnings.iter().any(|w| w.contains("INCLUDE")),
+            "{:?}",
+            pulled.warnings
+        );
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("uniqueness on the referenced table")),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // The negative case: the same key against a primary key that survives.
+        let mut pk = constraint(2, "p_pk", 'p');
+        pk.columns = vec![1];
+        pk.index_oid = Some(50);
+        let mut backing = index(50, 2, "p_pk");
+        backing.unique = true;
+        backing.primary = true;
+        backing.key_count = 1;
+        backing.columns = vec![1];
+        let mut fk = constraint(1, "c_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(2);
+        fk.index_oid = Some(50);
+        let raw = RawCatalog {
+            constraints: vec![fk, pk],
+            indexes: vec![backing],
             ..raw
         };
         let pulled = assemble(&raw);

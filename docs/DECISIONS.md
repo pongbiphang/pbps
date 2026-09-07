@@ -4389,3 +4389,23 @@ SPEC is in sync with all of these.
     would be a second opinion that can fall out of step with it. The whole table
     goes, not the offending column, because a table missing one column is a
     table a plan would add it to.
+
+254. **The foreign keys are assembled in a second pass, after everything that
+    could take their uniqueness away.** A foreign key is legal only against a
+    unique index on the referenced table, and `conindid` says which one. That
+    index may not reach the pull — its key constraint carries an `INCLUDE`
+    payload, or is `NULLS NOT DISTINCT`, or is deferrable, or any of the other
+    reasons 249 leaves an object out — and a key recorded against it describes a
+    schema that cannot be built: adding the key back fails for want of a
+    uniqueness nothing mentions.
+
+    Whether it survived is not knowable from the constraint's own row, only from
+    what the constraint and index arms did, so the arms report it: they return
+    whether they recorded the object, and the foreign keys run afterwards
+    against the set that did. Asking the arms rather than re-deriving the
+    predicates, because a second copy of "which indexes this file refuses" is a
+    second opinion that can fall out of step with the first.
+
+    This is the third time in this file that a decision was reachable through a
+    map built before the decision was made — 250's `confkey`, round 8's refused
+    table, and this. The shape is in PITFALLS.
