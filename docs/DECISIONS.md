@@ -4298,3 +4298,29 @@ SPEC is in sync with all of these.
     the parse when the column count disagrees with `confkey`. A misparse
     becomes a named limitation rather than a foreign key over the wrong
     columns.
+
+248. **The whole catalog read is one `REPEATABLE READ READ ONLY` transaction,
+    and the canonical search path is set inside it.** Five autocommit
+    statements are five snapshots. A table dropped between the tables query and
+    the columns query comes back as a live table with no columns — which
+    assembles cleanly, compares as a table whose every column was deleted, and
+    plans accordingly; nothing about it looks like a failure. One snapshot
+    makes the five reads unable to disagree about what exists. `READ ONLY` is
+    the engine enforcing what a comment would otherwise only promise (measured:
+    `cannot execute CREATE TABLE in a read-only transaction`). And the path is
+    set with `is_local`, so **ending** the transaction restores it — measured on
+    `COMMIT` and on `ROLLBACK` alike. That is the difference between handling
+    "a read failed halfway and left the session changed" and making it
+    unrepresentable.
+
+249. **A property of an object the model cannot hold means the object is left
+    out; a fact about the rows already there means it is carried.** Both are
+    named either way, and the line decides which way the resulting plan is
+    wrong. `RESTRICT`, `DEFERRABLE`, a `gin` index: carried, each compares
+    equal to an object that behaves differently, so a plan reports no change
+    while the behaviour stays wrong — the failure this tool exists to prevent.
+    Left out, the plan tries to create something that is already there and
+    fails on apply, loudly, with the warning saying why. `NOT VALID` is the
+    other kind: the constraint itself is exactly what the model says, and what
+    recreating it changes is which rows get checked. Carried and named, that is
+    a plan that may fail on apply rather than one that lies.

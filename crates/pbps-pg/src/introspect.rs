@@ -16,6 +16,23 @@
 //! show it. Drift that pbps cannot see is worse than drift it reports and
 //! cannot fix, because only the second kind is visible to the operator.
 //!
+//! # Two ways of not being able to hold something
+//!
+//! A fact this model cannot carry is always named. What differs is whether the
+//! object it belongs to is carried anyway, and the line is what the difference
+//! is *about*:
+//!
+//! - **A property of the object itself** — `RESTRICT`, `DEFERRABLE`, a `gin`
+//!   index, an expression index — means the object is **left out**. Carried, it
+//!   would compare equal to one that behaves differently, and a plan would
+//!   report no change while the behaviour stayed wrong. Left out, the plan is
+//!   wrong in the direction that fails loudly on apply, and the warning says
+//!   why.
+//! - **A fact about the rows already there** — `NOT VALID` — means the object
+//!   is **carried**, because the object itself is exactly what the model says.
+//!   What recreating it would change is which rows get checked, and that is a
+//!   plan that fails on apply rather than one that lies.
+//!
 //! **It must not un-respell anything** (ADR-0009 §2). PostgreSQL rewrites what
 //! it was given — `'x'` becomes `'x'::character varying`, `CHECK (amount >= 0)`
 //! becomes `CHECK ((amount >= (0)::numeric))` — and the state's `declared`
@@ -100,6 +117,11 @@ pub struct RawConstraint {
     /// `convalidated`. A constraint declared `NOT VALID` has never been checked
     /// against the rows already there.
     pub validated: bool,
+    /// `condeferrable` and `condeferred`. A key whose check can be put off to
+    /// the end of the transaction is a different key: rows that violate it may
+    /// legally exist in the middle of one.
+    pub deferrable: bool,
+    pub deferred: bool,
     /// `pg_get_constraintdef`, verbatim.
     pub definition: String,
     /// `conindid`: the index this constraint is enforced by, if any. It is how
@@ -321,14 +343,23 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         }
     };
 
+    // **Measured**: a generated column's expression is stored in `pg_attrdef`,
+    // the same place an ordinary default lives, so the columns query hands it
+    // back through `default_expr`. Kept, it would read back as
+    // `DEFAULT (id * 2)` — a value computed once at insert where the live
+    // column is recomputed on every write, and a declaration that recreates
+    // the table would silently produce the first.
     if raw.generated {
         note(
             pulled,
             &parts.name,
             format!(
                 "column `{}`.`{}` is a generated column, which this model does not hold. Its \
-                 expression is not read back, so a plan cannot see a change to it.",
-                parts.name, raw.name
+                 expression is `{}`, and it is **not** read back as a `default:` — a default is \
+                 computed once when a row is inserted, and this is recomputed on every write.",
+                parts.name,
+                raw.name,
+                raw.default.as_deref().unwrap_or("not readable")
             ),
         );
     }
@@ -355,8 +386,10 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     Column {
         ty,
         nullable: raw.nullable,
-        // Verbatim, cast and all: see this module's own documentation.
-        default: raw.default.clone(),
+        // Verbatim, cast and all: see this module's own documentation — except
+        // for a generated column, whose expression shares `pg_attrdef` with
+        // the defaults and is not one.
+        default: (!raw.generated).then(|| raw.default.clone()).flatten(),
         identity,
         description: None,
         deprecated: None,
@@ -375,6 +408,31 @@ fn add_constraint(
         // already carries it, and a reader that let this fall through to the
         // check arm would report one phantom check per NOT NULL column.
         'n' => {}
+
+        // A key whose check can be put off is a different key, and the model
+        // holds neither word. Named on every kind that can carry it, before
+        // the kind's own arm decides what to do with the rest of it.
+        'p' | 'u' | 'f' if raw.deferrable => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is `DEFERRABLE{}`, and this model holds neither \
+                     word. Read back as an ordinary constraint it compares equal to one that is \
+                     checked immediately — so a transaction that relies on `SET CONSTRAINTS`, or \
+                     on rows that violate it in the middle of one, would break with no plan \
+                     saying anything had changed. Its definition is `{}`.",
+                    raw.name,
+                    parts.name,
+                    if raw.deferred {
+                        " INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    },
+                    raw.definition
+                ),
+            );
+        }
 
         'p' => match parts.names(&raw.columns) {
             Ok(columns) => {
@@ -450,6 +508,24 @@ fn add_foreign_key(
     table: &mut Table,
     pulled: &mut Pulled,
 ) {
+    // The same rule the check arm applies, and for the same reason: a key
+    // added `NOT VALID` holds for new rows and has never been checked against
+    // the rows already there. Read back as an ordinary key it compares equal to
+    // one that has, and recreating it validates every existing row — which can
+    // fail on data the live key legally tolerates.
+    if !raw.validated {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "foreign key `{}` on `{}` is `NOT VALID`: rows already there have never been \
+                 checked against it, and this model holds only the key. Read back it is an \
+                 ordinary foreign key, which is one that would be validated on being recreated.",
+                raw.name, parts.name
+            ),
+        );
+    }
+
     let Some(references_table) = raw.ref_table.and_then(|oid| table_names.get(&oid)).cloned()
     else {
         note(
@@ -702,6 +778,8 @@ mod tests {
             on_delete: 'a',
             on_update: 'a',
             validated: true,
+            deferrable: false,
+            deferred: false,
             definition: String::new(),
             index_oid: None,
         }
@@ -1099,6 +1177,108 @@ mod tests {
         let pulled = assemble(&raw);
         assert_eq!(pulled.limitations.len(), 1);
         assert!(pulled.warnings[0].contains("generated column"));
+    }
+
+    /// **Measured**: a generated column's expression lives in `pg_attrdef`,
+    /// where an ordinary default lives, so the query hands it back as one.
+    /// Kept, it reads back as `DEFAULT (id * 2)` — computed once on insert,
+    /// where the live column is recomputed on every write.
+    #[test]
+    fn a_generated_columns_expression_is_never_read_back_as_a_default() {
+        let mut column = col(1, 1, "total", "integer");
+        column.generated = true;
+        column.default = Some("(id * 2)".to_owned());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![column],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(only(&pulled).columns["total"].default, None);
+        assert!(pulled.warnings[0].contains("(id * 2)"));
+        assert!(pulled.warnings[0].contains("every write"));
+    }
+
+    /// A key whose check can be deferred is a different key, and the model has
+    /// neither word. It is left out, like every other property of an object
+    /// this model cannot hold.
+    #[test]
+    fn a_deferrable_key_is_left_out_and_named_whatever_kind_it_is() {
+        for kind in ['p', 'u', 'f'] {
+            let mut c = constraint(1, "t_key", kind);
+            c.columns = vec![1];
+            c.ref_columns = vec![1];
+            c.ref_table = Some(1);
+            c.definition = "UNIQUE (a) DEFERRABLE INITIALLY DEFERRED".to_owned();
+            c.deferrable = true;
+            c.deferred = true;
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "integer")],
+                constraints: vec![c],
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            let read = only(&pulled);
+            assert!(read.primary_key.is_none(), "{kind}");
+            assert!(read.unique.is_empty(), "{kind}");
+            assert!(read.foreign_keys.is_empty(), "{kind}");
+            assert_eq!(pulled.limitations.len(), 1, "{kind}");
+            assert!(pulled.warnings[0].contains("DEFERRABLE INITIALLY DEFERRED"));
+        }
+    }
+
+    /// `DEFERRABLE` without `INITIALLY DEFERRED` is still a key `SET
+    /// CONSTRAINTS` can move, so it is named too — and the message says which
+    /// of the two it is.
+    #[test]
+    fn a_deferrable_key_that_is_initially_immediate_is_named_as_that() {
+        let mut c = constraint(1, "t_key", 'u');
+        c.columns = vec![1];
+        c.deferrable = true;
+        c.deferred = false;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: vec![c],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).unique.is_empty());
+        assert!(
+            pulled.warnings[0].contains("`DEFERRABLE`"),
+            "{:?}",
+            pulled.warnings
+        );
+        assert!(!pulled.warnings[0].contains("INITIALLY DEFERRED"));
+    }
+
+    /// A foreign key added `NOT VALID` is carried — the key is exactly what the
+    /// model says — and named, because recreating it validates rows the live
+    /// key legally tolerates. The same rule the check arm follows.
+    #[test]
+    fn a_not_valid_foreign_key_is_carried_and_named() {
+        let mut fk = constraint(1, "t_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(2);
+        fk.validated = false;
+        fk.definition = "FOREIGN KEY (a) REFERENCES app.other(x) NOT VALID".to_owned();
+        let raw = RawCatalog {
+            tables: vec![table(1, "t"), table(2, "other")],
+            columns: vec![col(1, 1, "a", "integer"), col(2, 1, "x", "integer")],
+            constraints: vec![fk],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "t")]
+                .foreign_keys
+                .contains_key("t_fk")
+        );
+        assert_eq!(pulled.limitations.len(), 1);
+        assert!(pulled.warnings[0].contains("NOT VALID"));
     }
 
     /// Every limitation carries its table, so a caller can tell drift inside

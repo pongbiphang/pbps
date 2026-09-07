@@ -1060,6 +1060,30 @@ async fn build(conn: &mut Conn, schema: &str, body: &str) {
     }
 }
 
+/// A pull, retried while another test in this same run is applying DDL.
+///
+/// The suite is its own concurrent writer: these tests run in parallel and each
+/// builds and drops a schema. A pull taken across another's `DROP` fails by
+/// design — `pg_get_constraintdef` reads through the syscache rather than the
+/// transaction's snapshot, so the object it is rendering can be gone. That is
+/// the guard firing, not a defect, and the assertion here is that it fires with
+/// the message that says so rather than as a bare driver error.
+async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
+    for _ in 0..4 {
+        match pbps_pg::catalog::introspect(conn).await {
+            Ok(pulled) => return pulled,
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("the catalog changed while it was being read"),
+                    "the pull failed for a reason this suite does not cause: {e}"
+                );
+            }
+        }
+    }
+    panic!("four pulls in a row were taken across another test's DDL");
+}
+
 /// The limitations this suite's own schema earned.
 ///
 /// Scoped for the same reason as [`ours`]: the container is shared, and a bare
@@ -1128,9 +1152,7 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     )
     .await;
 
-    let pulled = pbps_pg::catalog::introspect(&mut conn)
-        .await
-        .expect("the pull succeeds");
+    let pulled = pull(&mut conn).await;
     assert!(
         ours_limitations(&pulled, &s).is_empty(),
         "nothing here is beyond the model: {:?}",
@@ -1253,17 +1275,26 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
     assert_eq!(under_a_path, "FOREIGN KEY (pid) REFERENCES p(id)");
 
     // And the pull, taken from that same session, is the qualified one.
-    let pulled = pbps_pg::catalog::introspect(&mut conn)
-        .await
-        .expect("the pull succeeds");
+    let pulled = pull(&mut conn).await;
     let fk = &pulled.schema.tables[&pbps_model::TableName::new(&s, "c")].foreign_keys;
     let key = fk.values().next().expect("one foreign key");
     assert_eq!(key.references_table, pbps_model::TableName::new(&s, "p"));
     assert_eq!(key.references_columns, ["id"]);
 
-    // And the session is handed back exactly as it was found.
+    // And the session is handed back exactly as it was found — which is not a
+    // restore this code performs but a consequence of the setting being local
+    // to the transaction the pull runs in.
     let after = text(&mut conn, "SELECT current_setting('search_path')").await;
     assert_eq!(after, format!("{s}, public"));
+    // No transaction is left open either: a pull that returned inside one
+    // would hold every lock it took until the caller happened to commit.
+    let in_transaction = truth(
+        &mut conn,
+        "SELECT pg_catalog.txid_current_if_assigned() IS NOT NULL
+             OR current_setting('transaction_read_only') = 'on'",
+    )
+    .await;
+    assert!(!in_transaction);
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
@@ -1303,15 +1334,20 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  id integer PRIMARY KEY,
                  oid_ integer REFERENCES {s}.odd (id) ON DELETE RESTRICT
              );
+             ALTER TABLE {s}.restricted
+                 ADD CONSTRAINT restricted_uq UNIQUE (id) DEFERRABLE INITIALLY DEFERRED;
+             CREATE TABLE {s}.unchecked (id integer, oid_ integer);
+             ALTER TABLE {s}.unchecked ADD CONSTRAINT unchecked_fk
+                 FOREIGN KEY (oid_) REFERENCES {s}.odd (id) NOT VALID;
              CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
+             CREATE TABLE {s}.ancestor (a integer, b integer);
+             CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
              CREATE TABLE {s}.__pbps_state (id integer)"
         ),
     )
     .await;
 
-    let pulled = pbps_pg::catalog::introspect(&mut conn)
-        .await
-        .expect("the pull succeeds");
+    let pulled = pull(&mut conn).await;
     let all = pulled.warnings.join("\n");
 
     // Each of these is a fact about the database that the pull cannot carry,
@@ -1333,8 +1369,20 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "NOT VALID",
         // An action the model has no word for.
         "RESTRICT",
-        // A table of a kind the model does not hold at all.
+        // A table of a kind the model does not hold at all — one whose
+        // `relkind` says so, and one whose does not.
         "partitioned table",
+        "inherits from another",
+        // A key whose check can be put off to the end of the transaction.
+        "DEFERRABLE INITIALLY DEFERRED",
+        // A check the rows already there were never checked against, and a
+        // foreign key likewise — the constraint's own name, because `NOT
+        // VALID` on its own is satisfied by either of them.
+        "check constraint `odd_ck`",
+        "foreign key `unchecked_fk` on",
+        // Measured: a generated column's expression is in `pg_attrdef`, where
+        // an ordinary default lives, so the warning has to name it.
+        "(id * 2)",
     ] {
         assert!(
             all.contains(expected),
@@ -1359,6 +1407,21 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "{:?}",
         restricted.foreign_keys
     );
+    assert!(
+        restricted.unique.is_empty(),
+        "a deferrable key is a property of the object, so the object is left out: {:?}",
+        restricted.unique
+    );
+    // And the other side of that line: `NOT VALID` is about the rows already
+    // there, not about the key, so the key is carried and the fact is named.
+    let unchecked = &pulled.schema.tables[&pbps_model::TableName::new(&s, "unchecked")];
+    assert!(unchecked.foreign_keys.contains_key("unchecked_fk"));
+    // A generated column's expression shares `pg_attrdef` with the defaults,
+    // and reading it back as one would make a plan that computes it once.
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "odd")].columns["total"].default,
+        None
+    );
 
     // The partitioned table is not in the pull at all — and this is why the
     // warning above matters, because otherwise it reads as a table to create.
@@ -1366,9 +1429,14 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     assert_eq!(
         ours(&pulled, &s),
         [
+            // The inheritance parent is an ordinary table and stays.
+            pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "odd"),
             pbps_model::TableName::new(&s, "restricted"),
-        ]
+            pbps_model::TableName::new(&s, "unchecked"),
+        ],
+        "the partitioned table, the inheritance child and this tool's own \
+         tables are not in the pull"
     );
 
     // Every limitation names its table, so a caller can tell drift inside the

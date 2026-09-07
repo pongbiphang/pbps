@@ -601,6 +601,32 @@ avoid it:** an arm that matches both orderings of a pair needs its comment to
 say something about each, or it needs to be two arms. Splitting it is what
 forced the measurement that found the precision.
 
+## The snapshot the rendering functions do not read from
+
+`REPEATABLE READ` was added to the PostgreSQL pull so that five catalog queries
+could not disagree about what exists. It does that. What it does **not** do is
+make the pull immune to concurrent DDL, because `pg_get_constraintdef`,
+`pg_get_expr` and `format_type` do not read the catalog tables — they go through
+the syscache, which follows the latest committed state. **Measured**: with a
+transaction open on a fixed snapshot, another session's `DROP TABLE` makes the
+next rendering call fail with
+
+```text
+ERROR:  cache lookup failed for attribute 1 of relation 115849   (XX000)
+```
+
+**The shape:** a mechanism that fixes one layer, applied to a problem that
+spans two. The isolation level governs what the *rows* say; the rendering
+functions are a second source of truth reached by a different path, and no
+isolation level covers them.
+
+**How to avoid it:** name what the guard actually guarantees, in the place the
+guard is set. Here the snapshot buys "the reads cannot disagree about what
+exists" and not "the read cannot fail", and the loud failure is the better half
+of that trade only because it is labelled — an `XX000` rendered by the seam as
+`db error` (issue #167) would have been the third of absent, empty and
+unreadable, wearing the clothes of the first.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

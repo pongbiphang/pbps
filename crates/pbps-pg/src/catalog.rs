@@ -56,20 +56,29 @@ fn tables_query() -> String {
       WHERE c.relkind = 'r'
         AND {NOT_A_PROJECTS_SCHEMA}
         AND c.relname NOT LIKE '\\_\\_pbps\\_%'
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
       ORDER BY n.nspname, c.relname"
     )
 }
 
 /// The tables of a kind the model does not hold, so that they are named rather
-/// than missing. A partitioned table read as absent is a plan that creates it.
+/// than missing. A table read as absent is a plan that creates it.
+///
+/// A partitioned table's `relkind` says so; an inheritance child's does not —
+/// **measured**, a child of `INHERITS` is an ordinary `r` and only `pg_inherits`
+/// tells it apart. Its inherited columns are `attislocal = false`, so a pull
+/// that took it for an ordinary table would declare somebody else's columns as
+/// its own and plan a table that has them locally instead of by inheritance.
 fn partitioned_query() -> String {
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind IN ('p', 'f')
-        AND {NOT_A_PROJECTS_SCHEMA}
+      WHERE {NOT_A_PROJECTS_SCHEMA}
         AND c.relname NOT LIKE '\\_\\_pbps\\_%'
+        AND (c.relkind IN ('p', 'f')
+             OR (c.relkind = 'r'
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)))
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -120,6 +129,7 @@ fn constraints_query() -> String {
             con.confrelid::int8 AS ref_table,
             con.confdeltype::text AS on_delete, con.confupdtype::text AS on_update,
             con.convalidated AS validated,
+            con.condeferrable AS deferrable, con.condeferred AS deferred,
             pg_catalog.pg_get_constraintdef(con.oid) AS definition,
             con.conindid::int8 AS index_oid
        FROM pg_catalog.pg_constraint con
@@ -157,19 +167,48 @@ fn indexes_query() -> String {
     )
 }
 
-/// Reads the whole managed set back, under the canonical search path.
+const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+
+/// `true` is `is_local`: the setting belongs to this transaction and goes back
+/// when it ends, whichever way it ends.
+const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true)";
+
+/// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
-/// The path is put back whatever happens: a caller's connection is not this
-/// function's to leave changed, and a read that failed halfway is exactly when
-/// a stale setting would be hardest to notice.
+/// **All of it inside one transaction**, and each word of `BEGIN ISOLATION
+/// LEVEL REPEATABLE READ READ ONLY` is load-bearing.
+///
+/// *Repeatable read*, because five autocommit statements are five snapshots. A
+/// table dropped after the tables query and before the columns query comes back
+/// as a live table with no columns at all — which assembles cleanly, compares
+/// as a table whose every column was deleted, and plans accordingly. Under one
+/// snapshot the five reads cannot disagree about what exists.
+///
+/// *Read only*, because introspection has no business writing and the engine
+/// can say so rather than this code promising it. Measured, `CREATE TABLE` in
+/// such a transaction is `cannot execute CREATE TABLE in a read-only
+/// transaction`.
+///
+/// And the canonical search path is set **`is_local`**, so the transaction
+/// carries it and ending the transaction puts back whatever the session had.
+/// Measured, that holds on `COMMIT` and on `ROLLBACK` alike — which is what
+/// makes "a read that failed halfway leaves the session changed" not a case to
+/// handle but a case that cannot arise.
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
-    let before = current_search_path(conn).await?;
-    let read = read_all(conn).await;
-    // The restore runs before the `?`, so a failed read still hands the
-    // connection back as it was found.
-    let restored = set_search_path(conn, &before).await;
-    let raw = read?;
-    restored?;
+    conn.execute(BEGIN).await?;
+    let raw = match read_all(conn).await {
+        Ok(raw) => {
+            conn.execute("COMMIT").await?;
+            raw
+        }
+        // `ROLLBACK` rather than `COMMIT`, and its own error is dropped: a
+        // transaction the server has already killed must not replace the
+        // failure that killed it.
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK").await;
+            return Err(schema_changed_underneath(e));
+        }
+    };
 
     let mut pulled = assemble(&raw.0);
     // Prepended: a table the model cannot hold at all is the thing a reader
@@ -181,7 +220,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 }
 
 async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError> {
-    set_search_path(conn, "").await?;
+    conn.query(CANONICAL_PATH).await?;
 
     let mut warnings = Vec::new();
     for row in conn.query(&partitioned_query()).await? {
@@ -190,6 +229,8 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
         let kind = match text(&row, "kind")?.as_str() {
             "p" => "a partitioned table",
             "f" => "a foreign table",
+            // The only `r` this query returns is an inheritance child.
+            "r" => "a table that inherits from another",
             other => &format!("a relation of kind `{other}`"),
         };
         warnings.push(format!(
@@ -244,6 +285,8 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             on_delete: first_char(&text(&row, "on_delete")?).unwrap_or(' '),
             on_update: first_char(&text(&row, "on_update")?).unwrap_or(' '),
             validated: flag(&row, "validated")?,
+            deferrable: flag(&row, "deferrable")?,
+            deferred: flag(&row, "deferred")?,
             definition: text(&row, "definition")?,
             index_oid: {
                 let oid = number(&row, "index_oid")?;
@@ -270,38 +313,43 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
     Ok((raw, warnings))
 }
 
-async fn current_search_path(conn: &mut Conn) -> Result<String, DbError> {
-    let rows = conn
-        .query("SELECT pg_catalog.current_setting('search_path') AS path")
-        .await?;
-    match rows.first() {
-        Some(row) => text(row, "path"),
-        None => Err(missing("search_path")),
-    }
-}
-
-/// The path is set through `set_config` rather than `SET`, because `SET` takes
-/// a bare identifier list and putting the old value back would mean building a
-/// statement out of it.
-async fn set_search_path(conn: &mut Conn, path: &str) -> Result<(), DbError> {
-    let rows = conn
-        .query(&format!(
-            "SELECT pg_catalog.set_config('search_path', {}, false) AS path",
-            quote_literal(path)
-        ))
-        .await?;
-    rows.first()
-        .map(|_| ())
-        .ok_or_else(|| missing("search_path"))
-}
-
-/// A string literal for this engine, doubling the quotes inside it.
+/// The one failure the snapshot cannot prevent, named so that it does not
+/// arrive as a mystery.
 ///
-/// The only value that reaches it is a `search_path` this same function read
-/// back a moment ago, but "the caller only ever passes something safe" is not a
-/// property a reader can check, and it is one refactoring removes.
-fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+/// `REPEATABLE READ` fixes the snapshot of the catalog *tables*, and
+/// `pg_get_constraintdef`, `pg_get_expr` and `format_type` do not read them:
+/// they go through the syscache, which follows the latest committed catalog
+/// state. **Measured** — a `DROP TABLE` committed in another session while this
+/// transaction is open, and the next rendering call fails:
+///
+/// ```text
+/// ERROR:  cache lookup failed for attribute 1 of relation 115849
+/// SQLSTATE: XX000
+/// ```
+///
+/// That is the snapshot doing its job in the only direction it can. Without the
+/// transaction the pull would have returned a table with no columns and called
+/// it a schema; with it, the read fails. What is left is to say so, because the
+/// driver renders `XX000` as `db error` and an unreadable failure is the third
+/// thing CLAUDE.md's rule names (issue #167).
+fn schema_changed_underneath(e: DbError) -> DbError {
+    match &e {
+        DbError::Driver { code, .. } if code.as_deref() == Some("XX000") => DbError::Driver {
+            code: code.clone(),
+            message: format!(
+                "the catalog changed while it was being read: {e}.\n\
+                 Something applied DDL to this database during the pull. The read is taken in \
+                 one snapshot so that it cannot report half of a change as a whole schema, and \
+                 this is that guard firing. Run it again when the other change has finished."
+            ),
+        },
+        DbError::Driver { .. }
+        | DbError::BadConnectionString(_)
+        | DbError::Connect { .. }
+        | DbError::ConnectTimeout { .. }
+        | DbError::WrongSession { .. }
+        | DbError::BadRow(_) => e,
+    }
 }
 
 fn missing(column: &str) -> DbError {
@@ -381,14 +429,6 @@ mod tests {
         );
     }
 
-    /// The path put back is the one that was found, whatever is in it.
-    #[test]
-    fn a_search_path_goes_back_as_the_literal_it_was() {
-        assert_eq!(quote_literal(""), "''");
-        assert_eq!(quote_literal("\"$user\", public"), "'\"$user\", public'");
-        assert_eq!(quote_literal("it's"), "'it''s'");
-    }
-
     /// Every query names its schema filter from one place, so a schema that is
     /// the engine's cannot be included by one read and excluded by another.
     #[test]
@@ -402,6 +442,18 @@ mod tests {
         ] {
             assert!(sql.contains(NOT_A_PROJECTS_SCHEMA), "{name}");
         }
+    }
+
+    /// Each word of the framing is load-bearing and none of them is visible in
+    /// a passing test, so they are asserted here: without `REPEATABLE READ` the
+    /// five reads are five snapshots, without `READ ONLY` nothing but this
+    /// comment stops a future query from writing, and with `false` for
+    /// `is_local` the search path outlives the transaction that set it.
+    #[test]
+    fn the_read_is_framed_as_one_snapshot_that_cannot_write_or_outlive_itself() {
+        assert!(BEGIN.contains("REPEATABLE READ"));
+        assert!(BEGIN.contains("READ ONLY"));
+        assert!(CANONICAL_PATH.contains("'search_path', '', true"));
     }
 
     /// The filters ADR-0012 §6 and this file's own documentation turn on. A
