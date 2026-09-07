@@ -1029,7 +1029,7 @@ mod tests {
         for (name, table) in &schema.tables {
             let key = pbps_model::ObjectName::new(name.schema.clone(), name.name.clone());
             assert_eq!(
-                out.get(&key).copied(),
+                out.get(&key).cloned(),
                 pbps_mssql::doctor::DataDemand::of(table),
                 "{name}"
             );

@@ -158,7 +158,11 @@ pub enum Needed {
     /// statement the declaration can produce.
     ///
     /// Asked at the same scope, and of the same tables, as
-    /// [`Needed::DataInsert`].
+    /// [`Needed::DataInsert`] — and, when the object answer is 0, on each of
+    /// those columns in turn: SQL Server takes `GRANT UPDATE` on a column, and
+    /// an account granted exactly the columns it writes holds nothing at
+    /// object scope. See [`Columns`] for the measurement and for why the
+    /// declared list is asked rather than the catalog's.
     DataUpdate,
 
     /// Needed on each table whose declaration would have a row **removed**
@@ -488,11 +492,19 @@ pub struct GrantTargets {
 /// declaration that could emit nothing at all — so "declares rows and demands
 /// nothing" is an absence from [`DataTables`] rather than a value in it, and
 /// the reading of the model happens in one place rather than at each caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataDemand {
     inserts: bool,
     corrects: bool,
     removes: bool,
+    /// The columns an emitted `UPDATE` could name, in declaration order.
+    ///
+    /// Carried rather than recomputed because it is two answers, not one:
+    /// whether the declaration can correct a row at all (`corrects` is this
+    /// list being non-empty), and *which* columns the permission has to cover
+    /// — the question a column-level grant makes different from the
+    /// object-level one (see [`Columns::Declared`]).
+    row_columns: Vec<String>,
 }
 
 impl DataDemand {
@@ -509,33 +521,45 @@ impl DataDemand {
         let data = table.data.as_ref()?;
         let key_column = table.data_key_column()?;
         let declares_a_row = !data.rows.is_empty();
+        let row_columns: Vec<String> = table
+            .row_columns(key_column)
+            .map(|(name, _)| name.clone())
+            .collect();
         let demand = Self {
             inserts: declares_a_row,
             // Both halves are needed: a row to compare, and a cell to compare
             // it in. The differ builds an `UPDATE` only from `row_columns` and
             // emits it only if that came out non-empty.
-            corrects: declares_a_row && table.row_columns(key_column).next().is_some(),
+            corrects: declares_a_row && !row_columns.is_empty(),
             // `exact` alone, whether or not a row is declared: with none, the
             // declaration says the table must be empty, and every surviving
             // row is a `DELETE`.
             removes: data.mode == pbps_model::DataMode::Exact,
+            row_columns,
         };
         (demand.inserts || demand.corrects || demand.removes).then_some(demand)
     }
 
     /// Whether a row could be inserted, which is what `INSERT` is asked for.
-    const fn inserts(self) -> bool {
+    const fn inserts(&self) -> bool {
         self.inserts
     }
 
     /// Whether a row could be corrected, which is what `UPDATE` is asked for.
-    const fn corrects(self) -> bool {
+    const fn corrects(&self) -> bool {
         self.corrects
     }
 
     /// Whether a row could be removed, which is what `DELETE` is asked for.
-    const fn removes(self) -> bool {
+    const fn removes(&self) -> bool {
         self.removes
+    }
+
+    /// The columns an emitted `UPDATE` could name — the set `UPDATE` has to
+    /// be held on, column by column, when it is not held on the table.
+    #[must_use]
+    pub fn row_columns(&self) -> &[String] {
+        &self.row_columns
     }
 }
 
@@ -629,6 +653,92 @@ enum Existing {
     OrNot,
 }
 
+/// The permissions SQL Server authorizes column by column, and therefore the
+/// only ones whose object-scope answer has a column-scope fallback.
+///
+/// Measured on the pinned image, not read off the enum: `GRANT INSERT ON
+/// app.t(label)` is a *syntax* error ("Sub-entity lists … cannot be specified
+/// for entity-level permissions"), and `HAS_PERMS_BY_NAME(…, 'INSERT', 'label',
+/// 'COLUMN')` answers NULL — as does `DELETE`. A NULL read as "not held" would
+/// turn the fallback into a gap on every table, so the list is a fact about the
+/// engine and is spelled here rather than being tried and recovered from.
+const COLUMN_SCOPED: [&str; 3] = ["SELECT", "UPDATE", "REFERENCES"];
+
+/// Whether the column-scope question may be put for this permission at all.
+fn column_scoped(permission: &str) -> bool {
+    COLUMN_SCOPED
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(permission.trim()))
+}
+
+/// Which columns a permission that is not held on the object is looked for on.
+///
+/// SQL Server takes `GRANT SELECT | UPDATE | REFERENCES` on a *column*, and an
+/// account granted exactly the columns it writes holds nothing at object scope:
+/// `GRANT UPDATE ON app.t(label)` answers 0 for `HAS_PERMS_BY_NAME(app.t,
+/// 'OBJECT', 'UPDATE')` and 1 for the same question naming `label`, and the
+/// `UPDATE` really runs (measured on the pinned image). So the object answer
+/// alone reports a gap the account does not have, and the remedy it prints
+/// widens a deliberately narrow grant.
+///
+/// The right question is not "on some column" but **on every column the
+/// statement could name** — `doctor` never sees a plan, so it cannot know
+/// which one an `UPDATE` will set. Held on the object still answers first:
+/// an object-level grant answers 1 at column scope too, including for a column
+/// added after the grant, so `object OR every-column` is never narrower than
+/// what the account has.
+///
+/// That last sentence is the safety of the whole thing: the column question
+/// can only turn a 0 into a 1, never a 1 into a 0. Whatever the column list
+/// gets wrong, no gap this check used to report is lost — the worst a wrong
+/// list can do is leave the over-demand that was there before.
+#[derive(Debug, Clone, Copy)]
+enum Columns<'a> {
+    /// The columns the catalog shows, asked in the server — no parameters, and
+    /// right for the objects pbps does not declare: the ledger tables, the
+    /// foreign-key targets, the securables a role is granted on. Nothing this
+    /// tool does adds a column to one of them, so what the catalog holds is
+    /// the whole set a statement could name.
+    ///
+    /// An object with no visible column keeps the object answer: metadata
+    /// visibility hides every column from a principal with no permission on
+    /// the object, and "no column is ungranted" over an empty list would
+    /// read that silence as ready.
+    Catalog,
+    /// The **declared** columns, per object, for the tables whose rows this
+    /// tool writes (ADR-0004).
+    ///
+    /// Not the catalog's, and that difference is the point twice over. The
+    /// declared list is the columns an `UPDATE` could **set** — it leaves out
+    /// the key column and the engine's own `IDENTITY`s
+    /// ([`Table::row_columns`]), which no emitted `UPDATE` ever names; the
+    /// catalog's list holds them, and demanding `UPDATE` on a primary key
+    /// would refuse every column-level grant a careful DBA would actually
+    /// write. And a column the next
+    /// plan adds is not in the catalog yet, so a catalog-sourced list would
+    /// answer "every existing column is granted" and call the account ready
+    /// for an `UPDATE` that will name a column it holds nothing on. Asked as
+    /// declared, that column answers 0 — and only an object-level grant
+    /// rescues it, which is exactly the grant that does cover a column added
+    /// later. Both halves measured on the pinned image: after `ALTER TABLE app.t
+    /// ADD extra`, a column-only grantee answers 0 on `extra` and its `UPDATE`
+    /// is denied; an object-level grantee answers 1 and its `UPDATE` runs.
+    Declared(&'a BTreeMap<ObjectName, Vec<String>>),
+}
+
+impl Columns<'_> {
+    /// How many parameters one object costs beyond its own two slots.
+    fn parameters_for(self, object: &ObjectName) -> usize {
+        match self {
+            // The column list is `sys.columns`, joined in the server.
+            Self::Catalog => 0,
+            // Three per column: the object's two parts again, so the list can
+            // be matched back to the object it belongs to, and the name.
+            Self::Declared(declared) => 3 * declared.get(object).map_or(0, |columns| columns.len()),
+        }
+    }
+}
+
 /// The object-scope question, spelled once for the three lists that ask it.
 ///
 /// Each object is bound as its two parts and the securable is assembled by
@@ -639,16 +749,29 @@ enum Existing {
 /// NULL — both read as a gap on a permission the account held (measured on
 /// the pinned image, as `sa`). The **requested** parts come back as the key,
 /// not the catalog's spelling, for the reason the schema query gives.
+///
+/// The answer is the object-level one **or** the column-level one over every
+/// column [`Columns`] names, and the ordering of the `CASE` is what makes the
+/// cost bearable: the column subqueries are reached only for a permission the
+/// engine takes at column scope and only when the object answer was not 1.
 fn object_permissions_sql<'a>(
     objects: &'a [ObjectName],
     perms: &[&'a str],
     existing: Existing,
+    columns: Columns<'a>,
 ) -> (String, Vec<Param<'a>>) {
     let mut params: Vec<Param<'a>> = Vec::new();
     let mut perm_slots = Vec::new();
     for p in perms {
         params.push(Param::from(*p));
-        perm_slots.push(format!("(@P{})", params.len()));
+        // The flag is a literal, not a parameter: it is this crate's reading
+        // of `COLUMN_SCOPED`, not a value from the caller, and it costs a
+        // parameter slot the wide lists cannot spare.
+        perm_slots.push(format!(
+            "(@P{}, {})",
+            params.len(),
+            i32::from(column_scoped(p))
+        ));
     }
     let mut object_slots = Vec::new();
     for o in objects {
@@ -656,16 +779,63 @@ fn object_permissions_sql<'a>(
         params.push(Param::from(o.name.as_str()));
         object_slots.push(format!("(@P{}, @P{})", params.len() - 1, params.len()));
     }
-    let filter = match existing {
-        Existing::Only => {
-            " WHERE OBJECT_ID(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), N'U') IS NOT NULL"
+    let (any_column, ungranted_column) = match columns {
+        Columns::Catalog => (
+            "EXISTS (SELECT 1 FROM sys.columns AS c WHERE c.object_id = OBJECT_ID(x.q))".to_owned(),
+            "EXISTS (SELECT 1 FROM sys.columns AS c WHERE c.object_id = OBJECT_ID(x.q) \
+             AND HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.name, 'COLUMN') = 0)"
+                .to_owned(),
+        ),
+        Columns::Declared(declared) => {
+            let mut column_slots = Vec::new();
+            for o in objects {
+                for column in declared.get(o).map_or(&[][..], Vec::as_slice) {
+                    params.push(Param::from(o.schema.as_str()));
+                    params.push(Param::from(o.name.as_str()));
+                    params.push(Param::from(column.as_str()));
+                    column_slots.push(format!(
+                        "(@P{}, @P{}, @P{})",
+                        params.len() - 2,
+                        params.len() - 1,
+                        params.len()
+                    ));
+                }
+            }
+            // `VALUES ()` is not T-SQL, and a chunk whose objects declare no
+            // row column has nothing to fall back to: the object answer
+            // stands, which is what an always-false predicate leaves.
+            if column_slots.is_empty() {
+                ("1 = 0".to_owned(), "1 = 0".to_owned())
+            } else {
+                // The same `@P` names in both predicates. A parameter may be
+                // read as often as the statement likes, so spelling the list
+                // twice costs no second binding — which is what keeps a wide
+                // table at three slots per column rather than six.
+                let list = format!("(VALUES {}) AS c(s, n, col)", column_slots.join(", "));
+                (
+                    format!("EXISTS (SELECT 1 FROM {list} WHERE c.s = o.s AND c.n = o.n)"),
+                    format!(
+                        "EXISTS (SELECT 1 FROM {list} WHERE c.s = o.s AND c.n = o.n \
+                         AND HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0)"
+                    ),
+                )
+            }
         }
+    };
+    let filter = match existing {
+        Existing::Only => " WHERE OBJECT_ID(x.q, N'U') IS NOT NULL",
         Existing::OrNot => "",
     };
     let sql = format!(
         "SELECT o.s AS [schema], o.n AS [object], p.n AS permission, \
-         HAS_PERMS_BY_NAME(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), 'OBJECT', p.n) AS held \
-         FROM (VALUES {}) AS o(s, n) CROSS JOIN (VALUES {}) AS p(n){filter};",
+         CASE WHEN HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n) = 1 THEN 1 \
+              WHEN p.col = 0 THEN 0 \
+              WHEN {ungranted_column} THEN 0 \
+              WHEN {any_column} THEN 1 \
+              ELSE 0 END AS held \
+         FROM (VALUES {}) AS o(s, n) \
+         CROSS APPLY (VALUES (QUOTENAME(o.s) + N'.' + QUOTENAME(o.n))) AS x(q) \
+         CROSS JOIN (VALUES {}) AS p(n, col){filter};",
         object_slots.join(", "),
         perm_slots.join(", ")
     );
@@ -684,16 +854,41 @@ fn object_permissions_sql<'a>(
 /// crate's to name (constraint 9).
 const MAX_PARAMETERS: usize = 2098;
 
-/// How many objects fit in one statement beside `perms` permission slots,
-/// at two slots per object. Every object list is asked in pieces of this
-/// size: a foreign-key list or a role's grants past about a thousand objects
-/// made one statement that the server refused, and `doctor` reported an
-/// estate it could have checked as unreadable.
-fn objects_per_statement(perms: usize) -> usize {
-    // Bounded below at one so a permission list that alone filled the
-    // statement would still fail loudly on the server instead of looping
-    // forever here; this crate's own lists are a handful of names.
-    ((MAX_PARAMETERS.saturating_sub(perms)) / 2).max(1)
+/// The object list cut into pieces each of which fits one statement.
+///
+/// Every object list is asked in pieces: a foreign-key list or a role's grants
+/// past about a thousand objects made one statement that the server refused,
+/// and `doctor` reported an estate it could have checked as unreadable.
+///
+/// Packed rather than divided, because an object no longer costs a fixed two
+/// slots — under [`Columns::Declared`] it costs three more per declared row
+/// column, so one wide table can be worth a hundred narrow ones and a fixed
+/// chunk size would be sized for either the widest table or none of them.
+fn object_statements<'a>(
+    objects: &'a [ObjectName],
+    perms: usize,
+    columns: Columns<'_>,
+) -> Vec<&'a [ObjectName]> {
+    let budget = MAX_PARAMETERS.saturating_sub(perms);
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut spent = 0;
+    for (i, object) in objects.iter().enumerate() {
+        let cost = 2 + columns.parameters_for(object);
+        // Never an empty piece: an object whose own cost exceeds the budget
+        // is asked alone and fails loudly on the server, rather than looping
+        // forever here or being dropped — a dropped object reads as ready.
+        if spent + cost > budget && i > start {
+            out.push(&objects[start..i]);
+            start = i;
+            spent = 0;
+        }
+        spent += cost;
+    }
+    if start < objects.len() {
+        out.push(&objects[start..]);
+    }
+    out
 }
 
 async fn object_permissions(
@@ -701,12 +896,13 @@ async fn object_permissions(
     objects: &[ObjectName],
     perms: &[&str],
     existing: Existing,
+    columns: Columns<'_>,
 ) -> Result<BTreeMap<ObjectName, BTreeSet<String>>, DbError> {
     let mut out: BTreeMap<ObjectName, BTreeSet<String>> = BTreeMap::new();
     // `VALUES ()` is not T-SQL: nothing to ask when nothing is named — and
-    // `chunks(n)` over an empty list yields nothing, so the loop agrees.
-    for chunk in objects.chunks(objects_per_statement(perms.len())) {
-        let (sql, params) = object_permissions_sql(chunk, perms, existing);
+    // an empty list is cut into no pieces at all, so the loop agrees.
+    for chunk in object_statements(objects, perms.len(), columns) {
+        let (sql, params) = object_permissions_sql(chunk, perms, existing, columns);
         for row in &conn.query_with(&sql, &params).await? {
             let schema: &str = get(row, "schema")?;
             let object: &str = get(row, "object")?;
@@ -847,8 +1043,17 @@ pub async fn permissions(
     // question can see that grant. Only where they exist: before the first
     // deployment there is nothing to ask about, and `missing` then falls back
     // to the schema answer above.
-    let ledger_objects =
-        object_permissions(conn, &ledger_tables(), &ledger_perms, Existing::Only).await?;
+    // `Columns::Catalog`: the ledger's shape is this tool's own, and a
+    // `SELECT` it cannot run on one of those columns is a gap however narrowly
+    // the grant was written.
+    let ledger_objects = object_permissions(
+        conn,
+        &ledger_tables(),
+        &ledger_perms,
+        Existing::Only,
+        Columns::Catalog,
+    )
+    .await?;
 
     // The declared data tables at object scope, `Existing::Only` like the
     // ledger and for the ledger's reason: a table this deployment has still to
@@ -867,7 +1072,21 @@ pub async fn permissions(
         .map(|r| r.name)
         .collect();
     let data_names: Vec<ObjectName> = data.keys().cloned().collect();
-    let data_objects = object_permissions(conn, &data_names, &data_perms, Existing::Only).await?;
+    // The declared row columns, not the catalog's: see `Columns::Declared`.
+    // `UPDATE` is the only one of the three the engine takes at column scope,
+    // so it is the only one this list can change the answer for.
+    let data_columns: BTreeMap<ObjectName, Vec<String>> = data
+        .iter()
+        .map(|(table, demand)| (table.clone(), demand.row_columns().to_vec()))
+        .collect();
+    let data_objects = object_permissions(
+        conn,
+        &data_names,
+        &data_perms,
+        Existing::Only,
+        Columns::Declared(&data_columns),
+    )
+    .await?;
 
     // Foreign-key targets outside the managed schemas, also at object scope —
     // but every named one, present or not, and that difference from the
@@ -881,8 +1100,14 @@ pub async fn permissions(
         .filter(|r| matches!(r.needed, Needed::Referenced))
         .map(|r| r.name)
         .collect();
-    let referenced_objects =
-        object_permissions(conn, referenced, &referenced_perms, Existing::OrNot).await?;
+    let referenced_objects = object_permissions(
+        conn,
+        referenced,
+        &referenced_perms,
+        Existing::OrNot,
+        Columns::Catalog,
+    )
+    .await?;
 
     // What the declared roles are granted on (ADR-0005). Objects the way the
     // foreign-key targets are asked — every named one, so absent and
@@ -987,8 +1212,14 @@ pub async fn permissions(
         }
         let objects: Vec<ObjectName> = objects.into_iter().collect();
         let schemas_wanted: Vec<String> = schemas_wanted.into_iter().collect();
-        granted_objects =
-            object_permissions(conn, &objects, &granted_perms, Existing::OrNot).await?;
+        granted_objects = object_permissions(
+            conn,
+            &objects,
+            &granted_perms,
+            Existing::OrNot,
+            Columns::Catalog,
+        )
+        .await?;
         if !schemas_wanted.is_empty() {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut perm_slots = Vec::new();
@@ -1074,10 +1305,10 @@ pub async fn permissions(
 /// Deduplicated against this requirement's own gaps, like the ledger's: five
 /// tables in one schema that all fall back to it need one `GRANT`, not five
 /// identical lines telling the operator to run it five times.
-fn data_gaps(held: &Held, r: &Requirement, wanted: fn(DataDemand) -> bool, out: &mut Vec<Gap>) {
+fn data_gaps(held: &Held, r: &Requirement, wanted: fn(&DataDemand) -> bool, out: &mut Vec<Gap>) {
     let mut reported: Vec<Securable> = Vec::new();
     for (table, demand) in &held.data_tables {
-        if !wanted(*demand) {
+        if !wanted(demand) {
             continue;
         }
         let (granted, securable) = match held.data_objects.get(table) {
@@ -1383,11 +1614,18 @@ mod tests {
     fn the_object_securable_is_quoted_by_the_server_from_two_bound_parts() {
         let objects = [ObjectName::new("dbo", "a.b"), ObjectName::new("app", "x]y")];
         for existing in [Existing::Only, Existing::OrNot] {
-            let (sql, params) = object_permissions_sql(&objects, &["SELECT"], existing);
+            let (sql, params) =
+                object_permissions_sql(&objects, &["SELECT"], existing, Columns::Catalog);
+            // Assembled once, in the server, and every question asks the same
+            // assembled name.
             assert!(
                 sql.contains(
-                    "HAS_PERMS_BY_NAME(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), 'OBJECT', p.n)"
+                    "CROSS APPLY (VALUES (QUOTENAME(o.s) + N'.' + QUOTENAME(o.n))) AS x(q)"
                 ),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n)"),
                 "{sql}"
             );
             assert!(!sql.contains("HAS_PERMS_BY_NAME(o.n"), "{sql}");
@@ -1397,13 +1635,92 @@ mod tests {
             assert_eq!(params.len(), 1 + 2 * objects.len(), "{sql}");
             assert!(sql.contains("(@P2, @P3), (@P4, @P5)"), "{sql}");
             assert_eq!(
-                sql.contains(
-                    "WHERE OBJECT_ID(QUOTENAME(o.s) + N'.' + QUOTENAME(o.n), N'U') IS NOT NULL"
-                ),
+                sql.contains("WHERE OBJECT_ID(x.q, N'U') IS NOT NULL"),
                 existing == Existing::Only,
                 "{sql}"
             );
         }
+    }
+
+    /// The column-scope fallback is put only for the permissions SQL Server
+    /// takes at column scope. `INSERT` and `DELETE` answer NULL there, and a
+    /// NULL read as "not held" would turn the fallback into a gap on every
+    /// table that has one — the under-reported over-demand this whole enum
+    /// exists to remove, one securable further down.
+    #[test]
+    fn only_the_permissions_the_engine_takes_at_column_scope_carry_the_fallback() {
+        let objects = [ObjectName::new("app", "t")];
+        let perms = ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"];
+        let (sql, params) =
+            object_permissions_sql(&objects, &perms, Existing::OrNot, Columns::Catalog);
+        // The flag is a literal beside each bound name, in the order asked.
+        assert!(
+            sql.contains("(@P1, 1), (@P2, 0), (@P3, 1), (@P4, 0), (@P5, 1)"),
+            "{sql}"
+        );
+        assert!(sql.contains("WHEN p.col = 0 THEN 0"), "{sql}");
+        // And the flag costs no parameter of its own: the wide lists cannot
+        // spare one per permission.
+        assert_eq!(params.len(), perms.len() + 2 * objects.len(), "{sql}");
+        for p in perms {
+            assert_eq!(
+                column_scoped(p),
+                COLUMN_SCOPED.contains(&p),
+                "the engine's list, not this test's: {p}"
+            );
+        }
+        // Lower case and a stray space are the same permission to the engine.
+        assert!(column_scoped(" update "), "trimmed and case-folded");
+        assert!(!column_scoped("CONTROL"), "not a column-scope permission");
+    }
+
+    /// The declared column list is bound three slots to a column — the
+    /// object's two parts and the name — and read twice from the same
+    /// parameters, so a wide table does not cost six.
+    #[test]
+    fn the_declared_columns_are_bound_once_and_read_twice() {
+        let objects = [ObjectName::new("app", "t"), ObjectName::new("app", "u")];
+        let declared: BTreeMap<ObjectName, Vec<String>> = [
+            (
+                objects[0].clone(),
+                vec!["label".to_owned(), "note".to_owned()],
+            ),
+            // A table whose only column is its key declares none, and asking
+            // about no column must not make the object's own answer vanish.
+            (objects[1].clone(), Vec::new()),
+        ]
+        .into_iter()
+        .collect();
+        let (sql, params) = object_permissions_sql(
+            &objects,
+            &["UPDATE"],
+            Existing::Only,
+            Columns::Declared(&declared),
+        );
+        assert_eq!(params.len(), 1 + 2 * 2 + 3 * 2, "{sql}");
+        assert!(sql.contains("AS c(s, n, col)"), "{sql}");
+        assert!(
+            sql.contains("HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0"),
+            "{sql}"
+        );
+        // Twice in the statement, and the same slots both times.
+        assert_eq!(
+            sql.matches("(@P6, @P7, @P8), (@P9, @P10, @P11)").count(),
+            2,
+            "{sql}"
+        );
+        // Nothing declared at all leaves the object answer standing rather
+        // than an empty `VALUES`, which is not T-SQL.
+        let empty: BTreeMap<ObjectName, Vec<String>> = BTreeMap::new();
+        let (sql, params) = object_permissions_sql(
+            &objects,
+            &["UPDATE"],
+            Existing::Only,
+            Columns::Declared(&empty),
+        );
+        assert!(!sql.contains("AS c(s, n, col)"), "{sql}");
+        assert!(sql.contains("WHEN 1 = 0 THEN"), "{sql}");
+        assert_eq!(params.len(), 1 + 2 * 2, "{sql}");
     }
 
     /// One statement per chunk, each within the server's parameter limit,
@@ -1416,12 +1733,12 @@ mod tests {
         let objects: Vec<ObjectName> = (0..1_100)
             .map(|i| ObjectName::new("app", format!("t{i}")))
             .collect();
-        let per = objects_per_statement(perms.len());
-        let chunks: Vec<&[ObjectName]> = objects.chunks(per).collect();
+        let chunks = object_statements(&objects, perms.len(), Columns::Catalog);
         assert!(chunks.len() > 1, "1,100 objects must not fit one statement");
         let mut seen = 0;
         for chunk in &chunks {
-            let (sql, params) = object_permissions_sql(chunk, &perms, Existing::OrNot);
+            let (sql, params) =
+                object_permissions_sql(chunk, &perms, Existing::OrNot, Columns::Catalog);
             assert!(
                 params.len() <= MAX_PARAMETERS,
                 "{} params: {sql}",
@@ -1431,11 +1748,60 @@ mod tests {
             seen += chunk.len();
         }
         assert_eq!(seen, objects.len(), "every object is in exactly one chunk");
-        // And the largest chunk is as large as the limit allows: one slot
-        // more per object would cross it.
+        // And the largest chunk is as large as the limit allows: one object
+        // more would cross it.
+        let per = chunks[0].len();
         assert!(perms.len() + 2 * (per + 1) > MAX_PARAMETERS, "per={per}");
         // A list that fits is one statement, as before.
-        assert_eq!(objects[..10].chunks(per).count(), 1);
+        assert_eq!(
+            object_statements(&objects[..10], perms.len(), Columns::Catalog).len(),
+            1
+        );
+    }
+
+    /// The declared columns are what a chunk is packed against, not the
+    /// object count: at three slots a column, one wide table is worth
+    /// hundreds of narrow ones, and a fixed chunk size would be sized either
+    /// for the widest table in the estate or for none of them.
+    #[test]
+    fn declared_columns_are_counted_into_the_parameter_limit() {
+        let perms = ["INSERT", "UPDATE", "DELETE"];
+        let wide: Vec<String> = (0..100).map(|i| format!("c{i}")).collect();
+        let objects: Vec<ObjectName> = (0..20)
+            .map(|i| ObjectName::new("app", format!("t{i}")))
+            .collect();
+        let declared: BTreeMap<ObjectName, Vec<String>> =
+            objects.iter().map(|o| (o.clone(), wide.clone())).collect();
+        let columns = Columns::Declared(&declared);
+        let chunks = object_statements(&objects, perms.len(), columns);
+        // Twenty tables, well under the count that fills a statement on the
+        // object slots alone, and still more than one statement.
+        assert!(chunks.len() > 1, "{} chunks", chunks.len());
+        assert_eq!(
+            object_statements(&objects, perms.len(), Columns::Catalog).len(),
+            1,
+            "the same twenty objects fit one statement when the columns come \
+             from the catalog"
+        );
+        let mut seen = 0;
+        for chunk in &chunks {
+            let (_, params) = object_permissions_sql(chunk, &perms, Existing::Only, columns);
+            assert!(params.len() <= MAX_PARAMETERS, "{} params", params.len());
+            seen += chunk.len();
+        }
+        assert_eq!(seen, objects.len(), "every table is in exactly one chunk");
+        // A table wider than one statement can hold is asked alone and fails
+        // on the server, rather than being dropped — a dropped table reads
+        // as ready.
+        let huge: BTreeMap<ObjectName, Vec<String>> = [(
+            objects[0].clone(),
+            (0..2_000).map(|i| format!("c{i}")).collect(),
+        )]
+        .into_iter()
+        .collect();
+        let chunks = object_statements(&objects[..1], perms.len(), Columns::Declared(&huge));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
     }
 
     /// The role permissions are asked for only of a project that declares a

@@ -1990,6 +1990,12 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
 /// what `app.t` below is: the demand travels through `DataDemand::of`, the one
 /// place a declaration is read, rather than being hand-made here.
 fn seeded_table() -> pbps_mssql::doctor::DataDemand {
+    seeded_table_with(&["label"])
+}
+
+/// The same, with the correctable columns named — the set an emitted `UPDATE`
+/// could reach, and therefore the set the permission has to cover.
+fn seeded_table_with(columns: &[&str]) -> pbps_mssql::doctor::DataDemand {
     let ty: pbps_model::ColumnType = "varchar(20)".parse().unwrap();
     let mut t = pbps_model::schema::Table {
         primary_key: Some(pbps_model::schema::PrimaryKey {
@@ -2009,8 +2015,10 @@ fn seeded_table() -> pbps_mssql::doctor::DataDemand {
     };
     t.columns
         .insert("code".to_owned(), pbps_model::Column::new(ty.clone()));
-    t.columns
-        .insert("label".to_owned(), pbps_model::Column::new(ty));
+    for column in columns {
+        t.columns
+            .insert((*column).to_owned(), pbps_model::Column::new(ty.clone()));
+    }
     pbps_mssql::doctor::DataDemand::of(&t).expect("an `exact` table with a row demands all three")
 }
 
@@ -2026,6 +2034,23 @@ async fn data_permissions(
         &[],
         &pbps_mssql::doctor::GrantTargets::default(),
         data,
+    )
+    .await
+    .expect("read permissions")
+}
+
+/// The readiness question for one project's foreign-key targets outside the
+/// managed schemas, asked the way `doctor` asks it.
+async fn referenced_permissions(
+    conn: &mut Conn,
+    referenced: &[pbps_model::ObjectName],
+) -> pbps_mssql::doctor::Held {
+    pbps_mssql::doctor::permissions(
+        conn,
+        &["app".to_owned()],
+        referenced,
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &pbps_mssql::doctor::DataTables::new(),
     )
     .await
     .expect("read permissions")
@@ -2270,6 +2295,315 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
     // Best-effort, like the other login tests here: the server may still count
     // a just-closed session as logged in, and a tidy-up that failed must not
     // be reported as this test failing. The container is throwaway.
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
+/// The base a least-privilege login needs before any of the questions this
+/// file asks about reference data: the managed permissions on `app`, the
+/// ledger's own on `dbo`, and the four database `CREATE`s. Everything the
+/// tests below then add or take away is DML, so a gap they report is about
+/// the grant under test and not about a permission the setup forgot.
+///
+/// `CREATE SCHEMA` has to be first in its batch, so it travels inside an
+/// `EXEC`, which gives it one of its own.
+async fn least_privilege_login(db: &mut TestDb, login: &str, password: &str) -> String {
+    db.conn
+        .execute(&format!(
+            "USE master; \
+             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ))
+        .await
+        .expect("create login");
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             EXEC(N'CREATE SCHEMA app;'); \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
+             GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the base");
+    let base_no_credentials = conn_str()
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "{base_no_credentials};User Id={login};Password={password};Database={}",
+        db.name
+    )
+}
+
+/// Whether this connection's account holds a permission on an object at
+/// **object** scope, asked the plain way — the premise every assertion below
+/// rests on, read from the engine rather than assumed.
+async fn holds_at_object_scope(conn: &mut Conn, object: &str, permission: &str) -> bool {
+    let rows = conn
+        .query(&format!(
+            "SELECT HAS_PERMS_BY_NAME('{object}', 'OBJECT', '{permission}') AS held;"
+        ))
+        .await
+        .expect("ask the object question");
+    let row = rows.first().expect("one row");
+    let held: i32 = row.try_get("held").expect("held").unwrap_or(-1);
+    held == 1
+}
+
+/// A column-level `GRANT` is a grant, and the readiness check has to see it.
+///
+/// SQL Server authorizes `UPDATE` column by column. An account granted exactly
+/// the columns a declaration writes holds nothing at object scope — the object
+/// question answers 0 — and its `UPDATE` runs. `doctor` used to report that as
+/// a gap it did not have, and the remedy it printed (`GRANT UPDATE ON app.t`)
+/// widened a deliberately narrow grant.
+///
+/// Nothing here can be settled without the engine. That the object question
+/// answers 0 under a column grant, that the column question answers 1, that
+/// the statement really runs, and — the case that decides which column list to
+/// ask about — that a column added *after* a column-level grant is not covered
+/// by it while one added after an object-level grant is.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
+    let mut db = TestDb::create("doctorcol").await;
+    let login = format!("pbps_col_{}", std::process::id());
+    // Not a secret: this login exists for the length of one test inside a
+    // throwaway container, and it is dropped below.
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+
+    // Created by the owner, so that the login's refusals below are about DML
+    // and not about the DDL.
+    db.conn
+        .execute(
+            "CREATE TABLE app.t (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NULL, note nvarchar(50) NULL); \
+             INSERT INTO app.t VALUES ('a', N'A', N'N');",
+        )
+        .await
+        .expect("create the data table");
+    // `INSERT` and `DELETE` on the object, so `UPDATE` is the only permission
+    // in question — those two SQL Server does not take at column scope at all.
+    // Then `UPDATE` on exactly the two columns the declaration can correct.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             GRANT INSERT, DELETE ON app.t TO [{login}]; \
+             GRANT UPDATE ON app.t(label) TO [{login}]; \
+             GRANT UPDATE ON app.t(note) TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant the column-level UPDATE");
+
+    let declared: pbps_mssql::doctor::DataTables = [(
+        "app.t".parse().unwrap(),
+        seeded_table_with(&["label", "note"]),
+    )]
+    .into_iter()
+    .collect();
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    // The premise: nothing at object scope, and the statement runs anyway.
+    assert!(
+        !holds_at_object_scope(&mut lp, "app.t", "UPDATE").await,
+        "the premise: a column-level grant answers 0 at object scope"
+    );
+    lp.execute("UPDATE app.t SET label = N'B', note = N'M' WHERE code = 'a';")
+        .await
+        .expect("the premise: the column grant really authorizes the UPDATE");
+    let held = data_permissions(&mut lp, &declared).await;
+    assert!(
+        held.data_objects[&"app.t".parse::<pbps_model::ObjectName>().unwrap()].contains("UPDATE"),
+        "the column-level grant is what the object question answers with: {held:?}"
+    );
+    let gaps = pbps_mssql::doctor::missing(&held);
+    assert!(gaps.is_empty(), "{gaps:?}");
+
+    // One writable column short of the declaration, and it is a gap again —
+    // reported on the object, which is where the operator's `GRANT` goes.
+    // `doctor` never sees a plan, so "held on some column" is not a question
+    // it could act on: the `UPDATE` may name any of them.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; REVOKE UPDATE ON app.t(note) FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke one column");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    assert!(
+        lp.execute("UPDATE app.t SET note = N'X' WHERE code = 'a';")
+            .await
+            .is_err(),
+        "the premise: the revoked column really refuses the statement"
+    );
+    let held = data_permissions(&mut lp, &declared).await;
+    assert_eq!(
+        named_gaps(&held),
+        ["UPDATE on OBJECT::[app].[t]"],
+        "{held:?}"
+    );
+
+    // The column a plan is about to add. It is not in the catalog, so a
+    // column list taken from there would say "every column is granted" and
+    // call this ready for an `UPDATE` that will name a column the account
+    // holds nothing on. Asked as *declared*, it answers 0.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT UPDATE ON app.t(note) TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("restore the second column");
+    let adds_a_column: pbps_mssql::doctor::DataTables = [(
+        "app.t".parse().unwrap(),
+        seeded_table_with(&["label", "note", "extra"]),
+    )]
+    .into_iter()
+    .collect();
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    assert!(
+        pbps_mssql::doctor::missing(&data_permissions(&mut lp, &declared).await).is_empty(),
+        "the premise: the two existing columns are granted again"
+    );
+    assert_eq!(
+        named_gaps(&data_permissions(&mut lp, &adds_a_column).await),
+        ["UPDATE on OBJECT::[app].[t]"],
+        "a declared column that is not there yet is not granted either"
+    );
+
+    // And that gap is the truth, not caution: the column-level grants do not
+    // reach a column added after them, and the object-level grant does.
+    db.conn
+        .execute("ALTER TABLE app.t ADD extra nvarchar(50) NULL;")
+        .await
+        .expect("add the column the declaration names");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    assert!(
+        lp.execute("UPDATE app.t SET extra = N'X' WHERE code = 'a';")
+            .await
+            .is_err(),
+        "a column-level grantee is refused the column added after its grants"
+    );
+    assert_eq!(
+        named_gaps(&data_permissions(&mut lp, &adds_a_column).await),
+        ["UPDATE on OBJECT::[app].[t]"],
+        "the same gap, now that the column exists and is ungranted"
+    );
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; GRANT UPDATE ON app.t TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant UPDATE on the object");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    lp.execute("UPDATE app.t SET extra = N'X' WHERE code = 'a';")
+        .await
+        .expect("an object-level grantee reaches a column added after the grant");
+    let gaps = pbps_mssql::doctor::missing(&data_permissions(&mut lp, &adds_a_column).await);
+    assert!(gaps.is_empty(), "{gaps:?}");
+
+    drop(lp);
+    // Best-effort, like the other login tests here: the server may still count
+    // the session, and a login this container will drop with it must not be
+    // reported as this test failing.
+    let _ = db
+        .conn
+        .execute(&format!(
+            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+        ))
+        .await;
+    db.drop().await;
+}
+
+/// The same grant, on a securable whose columns pbps does not declare: a
+/// foreign-key target outside the managed schemas.
+///
+/// There the column list is the catalog's own, which is the whole set a
+/// statement could name — nothing this tool does adds a column to someone
+/// else's table. `SELECT` and `REFERENCES` are both taken at column scope, so
+/// an account granted them column by column on the parent is ready, and one
+/// column short of it is not.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_column_level_grant_on_a_referenced_table_is_read_from_the_catalog() {
+    let mut db = TestDb::create("doctorrefcol").await;
+    let login = format!("pbps_refcol_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    let as_login = least_privilege_login(&mut db, &login, password).await;
+    db.conn
+        .execute(
+            "EXEC(N'CREATE SCHEMA shared;'); \
+             CREATE TABLE shared.parent (code varchar(20) NOT NULL PRIMARY KEY, \
+             label nvarchar(50) NULL);",
+        )
+        .await
+        .expect("create the referenced table");
+
+    let referenced: Vec<pbps_model::ObjectName> = vec!["shared.parent".parse().unwrap()];
+
+    // Every column of the parent, and nothing at object scope.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; \
+             GRANT SELECT, REFERENCES ON shared.parent(code) TO [{login}]; \
+             GRANT SELECT, REFERENCES ON shared.parent(label) TO [{login}];",
+            db.name
+        ))
+        .await
+        .expect("grant column by column");
+    let mut lp = connect_live(&as_login).await.expect("connect as the login");
+    assert!(
+        !holds_at_object_scope(&mut lp, "shared.parent", "SELECT").await,
+        "the premise: a column-level grant answers 0 at object scope"
+    );
+    lp.execute("SELECT 1 FROM shared.parent;")
+        .await
+        .expect("the premise: the probe this permission is for really runs");
+    let gaps = pbps_mssql::doctor::missing(&referenced_permissions(&mut lp, &referenced).await);
+    assert!(gaps.is_empty(), "{gaps:?}");
+
+    // One column short: the probe reads the whole row, so a column it cannot
+    // read is a gap — and it is reported on the object, where the `GRANT`
+    // goes.
+    db.conn
+        .execute(&format!(
+            "USE [{0}]; REVOKE SELECT ON shared.parent(label) FROM [{login}];",
+            db.name
+        ))
+        .await
+        .expect("revoke one column");
+    let mut lp = connect_live(&as_login).await.expect("reconnect");
+    let held = referenced_permissions(&mut lp, &referenced).await;
+    assert_eq!(
+        named_gaps(&held),
+        ["SELECT on OBJECT::[shared].[parent]"],
+        "{held:?}"
+    );
+
+    drop(lp);
     let _ = db
         .conn
         .execute(&format!(
