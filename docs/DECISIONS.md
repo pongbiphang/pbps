@@ -4147,14 +4147,25 @@ SPEC is in sync with all of these.
     asks of *every* letter: `dbo.CAFÉ` and `dbo.café` are two objects under a
     `CS_AS` collation, and any fold reads them as one. `creation_order`
     answers it without a connection, because it does not need one: two
-    declarations that fold onto a single name are both in front of it. Where
-    there are two, the fold cannot say which of them a definition names — it
-    would answer both — so those are compared exactly and every other name
-    keeps the fold. Two such over-answers make an ordering cycle out of
-    modules that have none, and a cycle is emitted in name order, so this is
-    the difference between a `CREATE VIEW` that works and one that fails
-    inside the plan's transaction. The collision is counted over *distinct*
-    names, so two overloads of one routine — the same name twice — are not
+    declarations that a fold reads as one name are both in front of it. Each
+    name therefore gets the *widest* fold that still tells it from every other
+    declaration — the whole alphabet where nothing collides, ASCII where
+    something does, and exact where even ASCII collides. Two over-answers make
+    an ordering cycle out of modules that have none, and a cycle is emitted in
+    name order, so this is the difference between a `CREATE VIEW` that works
+    and one that fails inside the plan's transaction.
+
+    Widest and not narrowest, because a collision is not evidence of a
+    case-sensitive database: the three characters above are ones *this scan*
+    folds and the engine does not, so `dbo.ktbl` and `dbo.Ktbl` — with the
+    Kelvin sign — can both be declared against a case-insensitive server, and
+    there `SELECT * FROM DBO.KTBL` still means `dbo.ktbl`. Comparing that pair
+    exactly would drop a real edge over an ASCII case difference no
+    case-insensitive collation keeps. The ASCII fold separates them and keeps
+    the case-insensitivity the engine does have; only a pair that collides
+    under it as well — `dbo.Z` beside `dbo.z` — is compared exactly, and
+    only a case-sensitive database can be holding that pair. The collision is
+    counted over *distinct* names, so two overloads of one routine are not
     mistaken for one.
 
     What is left of the price is a definition that names a spelling nothing
