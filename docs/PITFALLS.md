@@ -399,6 +399,15 @@ replaced** before pushing: a character class that lives in a named constant is
 what makes the next omission visible, and two spellings of the same rule in one
 file is the state that produced this.
 
+**And a third time, in the SQL Server pull.** `skip_ws` — the whitespace and
+comment skipper the module header parse runs on — searched for `\n` alone, so
+`CREATE VIEW v -- note<CR> AS SELECT …` had the rest of its definition read as
+comment, the `AS` was never found, and a module that runs perfectly well was
+inventoried as one this tool cannot read. The failure direction was the mild one
+— unreadable, not silently wrong — but "unreadable" was false, and the operator
+was sent to look at a definition with nothing wrong with it. Found by grepping
+for the shape, not by a bug report.
+
 ## `shell_arg` has been wrong about shells five times
 
 **The test written to pin the second fix asserted the bug.**
