@@ -769,6 +769,18 @@ pub fn depends_on_the_session_time_zone(from: &ColumnType, to: &ColumnType) -> b
             // A zone has to be involved at all — with no offset on either side
             // there is nothing for `TimeZone` to be read into, and `date` into
             // `timestamp` is midnight either way.
+            //
+            // And one pair with a zone is still not the session's: `timetz`
+            // physically stores a local time *and* its offset, so dropping the
+            // offset keeps the time that is already there. Measured,
+            // `12:00:00+03` into `time` is `12:00:00` from a `UTC` session and
+            // from an `America/New_York` one alike. `timestamptz` is the
+            // opposite, and that is why the exception is this narrow: it holds
+            // an *instant*, so writing it without a zone means choosing one —
+            // measured, the same value into `timestamp` is `12:00:00` under
+            // UTC and `07:00:00` under New York. What decides it is what the
+            // type holds, not which way the offset went.
+            let a_projection = ao && !bo && !ad && !bd;
             (ao || bo)
                 // Then either end of the zone moves: the offset is gained or
                 // lost, or the value is rebased because the *date* is. The
@@ -784,6 +796,7 @@ pub fn depends_on_the_session_time_zone(from: &ColumnType, to: &ColumnType) -> b
                 // being placed in a day, and one disappearing is a value being
                 // read out of one, and a zone decides both.
                 && (ao != bo || ad != bd)
+                && !a_projection
         }
         _ => false,
     }
@@ -1582,7 +1595,6 @@ mod tests {
             ("timestamp", "timestamptz"),
             ("timestamptz", "timestamp"),
             ("time", "timetz"),
-            ("timetz", "time"),
             // No time part on one end and a zone gained on the other is the
             // same hazard: midnight, in whichever zone the session holds.
             ("date", "timestamptz"),
@@ -1609,6 +1621,11 @@ mod tests {
             ("timestamp", "date"),
             ("date", "timestamp"),
             ("timestamptz", "timestamptz"),
+            // The one pair with a zone that is still not the session's:
+            // `timetz` stores the offset beside the local time, so dropping it
+            // keeps what is already there. Refusing it would refuse a valid
+            // plan, and the loss it does carry is what `Narrowing` is for.
+            ("timetz", "time"),
             // Both ends carry an offset *and* a date part, so nothing is
             // rebased — the pin against the widened rule becoming "any two
             // types that can hold a zone".

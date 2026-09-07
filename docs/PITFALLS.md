@@ -651,6 +651,27 @@ from a measurement, enumerate the family the measurement belongs to — here, th
 six date-and-time types and the conversions between them — and check each
 member against the *rule*, not against the example.
 
+## The scanner's rule, respelled from memory in the crate that needed it
+
+`pbps-dialect` records PostgreSQL's identifier grammar as a **byte** rule
+(DECISIONS 233): `[A-Za-z\200-\377_0-9$]`, so every byte of a non-ASCII
+character continues an identifier, and its comment carries the measurement —
+`á` spelled `a` then U+0301 continues a name for the engine and ends one for
+`char::is_alphanumeric`.
+
+`pbps-pg`'s emitter then needed to know where a dollar-quoted literal ends, and
+wrote the tag rule again: `c.is_alphabetic()`, `c.is_alphanumeric()`. The same
+`á` measured the same way — `$á$…$á$` is one literal on 18.6 — read as *not* a
+literal, so the guard that refuses an ambiguous date default never looked at
+it. The rule had been decided, measured and written down, in a crate this one
+already depends on, and the second spelling still went in.
+
+The fix is not a better predicate, it is one predicate: `continues_ident` is
+public now and the emitter calls it. When you find yourself writing a
+character-class test for another system's grammar, search for it first — a rule
+subtle enough to need a DECISIONS entry is subtle enough that your second
+attempt will differ from your first.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

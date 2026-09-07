@@ -292,8 +292,10 @@ carrying one is refused at plan time rather than halfway through an apply
 (DECISIONS 262).
 
 Two rules came out of the emitter's own fixpoint rather than from the issue.
-A table declared in `pg_catalog`, `information_schema` or any schema whose name
-begins with `pg_` is refused offline, because the pull never reads one — and
+A table the pull would never read is refused offline — a schema of
+`pg_catalog`, `information_schema` or any name beginning with `pg_`, or a table
+called `__pbps_state` or `__pbps_lock`, which the reader hides in every schema
+(DECISIONS 274). The pull never reads one — and
 `pg_temp` is worse than invisible: measured, it is the parser's alias for the
 session's temporary schema, so the declaration yields a `pg_temp_58.t` that
 disappears with the connection (DECISIONS 273). And a nullable primary key

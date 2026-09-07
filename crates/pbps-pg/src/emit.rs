@@ -159,9 +159,18 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
     };
     let tag = &rest[..at];
     // The tag's own rule: empty, or a name that does not start with a digit.
+    //
+    // Asked with the scanner's predicate, not with `char::is_alphanumeric`.
+    // The engine's grammar is over **bytes** — `dolq_start [A-Za-z\200-\377_]`,
+    // `dolq_cont` the same plus digits (DECISIONS 233) — so every byte of a
+    // non-ASCII character is a tag character, including ones Unicode calls
+    // marks rather than letters. Measured, `$á$…$á$` with `á` spelled `a` then
+    // U+0301 is one dollar-quoted literal to the engine; `is_alphanumeric`
+    // says the mark is neither letter nor digit, so this read the expression
+    // as *not* a bare literal and the default guard never looked at it.
     if !tag.is_empty()
-        && !(tag.starts_with(|c: char| c.is_alphabetic() || c == '_')
-            && tag.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        && !(tag.starts_with(|c: char| !c.is_ascii_digit() && pbps_dialect::continues_ident(c))
+            && tag.chars().all(pbps_dialect::continues_ident))
     {
         return false;
     }
@@ -1119,6 +1128,11 @@ mod tests {
             r"e'it\'s'",
             "$$2026-01-02$$",
             "$d$2026-01-02$d$",
+            // A tag the engine's byte grammar accepts and Unicode's letter
+            // classes do not: `a` followed by U+0301, whose second character is
+            // a mark. Measured, this is one dollar-quoted literal on 18.6, so
+            // reading it as anything else leaves an ambiguous date unguarded.
+            "$a\u{301}$01/02/2026$a\u{301}$",
             "U&'2026-01-02'",
         ] {
             assert!(is_a_bare_literal(yes), "{yes}");
@@ -1140,6 +1154,9 @@ mod tests {
             // A tag that is not a tag, and a body that is not closed.
             "$1$a$1$",
             "$d$a$e$",
+            // A tag may not *start* with a digit even when every later
+            // character is fine, and the byte rule does not change that.
+            "$1a$b$1a$",
             // The recorded gap: two literals with a keyword between them.
             "U&'a' UESCAPE '!'",
         ] {

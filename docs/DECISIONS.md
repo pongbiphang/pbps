@@ -4767,6 +4767,19 @@ SPEC is in sync with all of these.
     ad != bd)` — a zone has to be involved at all, and then either end of it
     moves.
 
+    **With one exception, and finding it took a third round.** `timetz` → `time`
+    involves a zone and moves it and is still *not* the session's: `timetz`
+    stores a local time and its offset side by side, so dropping the offset
+    keeps the time that is already there. Measured, `12:00:00+03` becomes
+    `12:00:00` from a `UTC` session and from an `America/New_York` one alike.
+    `timestamptz` is the opposite, and that is why the exception is exactly
+    this narrow: it holds an *instant*, so writing it without a zone means
+    choosing one — measured, the same value into `timestamp` is `12:00:00`
+    under UTC and `07:00:00` under New York. What decides it is what the type
+    holds, not which way the offset went. Refusing the projection would have
+    refused a valid plan, and the loss it does carry is what `Narrowing` is
+    for.
+
     `types::change_risk` already knows the shape and answers `Narrowing`, with a
     comment naming exactly this. That is not enough: `Narrowing` is a risk class
     a human clears at the gate, and what the human cleared was the *loss*. The
@@ -4964,3 +4977,24 @@ SPEC is in sync with all of these.
     validation that refused it would refuse a declaration the pull reads
     perfectly well (the same trap `catalog.rs` avoids by not writing the filter
     as a `LIKE` pattern, DECISIONS 254).
+
+
+274. **The two table names this tool owns are refused in every schema.** The
+    reader hides `__pbps_state` and `__pbps_lock` wherever they appear
+    (`catalog.rs`), so a declaration using one is created and then invisible:
+    the pull reports it absent, the next plan creates it again, and the engine
+    refuses that for already existing. The apply reported success and the
+    recording says the table is as declared — the shape DECISIONS 273 refused a
+    schema for, now for a name.
+
+    **By name and never by prefix**, which is the reader's own hard-won
+    narrowing; its comment records the bug, that `NOT LIKE '\_\_pbps\_%'` also hid
+    a project's `app.__pbps_customers` and nothing refused *that* declaration
+    either. So the validation is derived from the same list, `catalog::OURS`,
+    and `the_filter_hides_exactly_the_names_the_validation_refuses` ties them
+    together in both directions: a name the validation refuses that the filter
+    does not hide is a false refusal, and a name the filter hides that the
+    validation does not refuse is this bug again.
+
+    SPEC §8.1 defines the two, and a step that adds a third adds it to `OURS`,
+    where the filter and the validation both read it.

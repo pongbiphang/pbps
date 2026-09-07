@@ -3394,6 +3394,55 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     assert!(message.contains("time zone"), "{message}");
     assert!(message.contains("AT TIME ZONE"), "{message}");
 
+    // The pair with a zone that is *not* the session's, measured beside them
+    // because a guard that cannot say yes is a guard nobody can use: `timetz`
+    // stores the offset next to the local time, so dropping it keeps what is
+    // already there.
+    let s3 = emit_schema("zone3");
+    fresh(&mut conn, &s3).await;
+    let mut projected = Vec::new();
+    for zone in ["UTC", "America/New_York"] {
+        conn.execute(&format!(
+            "SET TimeZone = '{zone}'; \
+             CREATE TABLE {s3}.z (at timetz); \
+             INSERT INTO {s3}.z VALUES ('12:00:00+03'); \
+             ALTER TABLE {s3}.z ALTER COLUMN at TYPE time"
+        ))
+        .await
+        .expect("the projection this dialect must not refuse");
+        projected.push(text(&mut conn, &format!("SELECT at::text FROM {s3}.z")).await);
+        conn.execute(&format!("DROP TABLE {s3}.z"))
+            .await
+            .expect("drop");
+    }
+    conn.execute(&format!("DROP SCHEMA {s3} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        projected,
+        vec!["12:00:00".to_owned(), "12:00:00".to_owned()],
+        "the stored local time is kept and no session was consulted"
+    );
+    assert!(
+        Postgres::new()
+            .emit(
+                &pbps_model::Change::AlterColumnType {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                    column: pbps_model::ColumnRef {
+                        table: TableName::new(&s, "z"),
+                        name: "at".into(),
+                    },
+                    from: ty("timetz"),
+                    to: ty("time"),
+                    from_nullable: true,
+                    to_nullable: true,
+                },
+                Strategy::default(),
+            )
+            .is_ok(),
+        "and the emitter has to let it through"
+    );
+
     let kept_refusal = Postgres::new()
         .emit(
             &pbps_model::Change::AlterColumnType {

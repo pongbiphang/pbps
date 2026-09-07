@@ -484,6 +484,29 @@ impl Dialect for Postgres {
                 ),
             });
         }
+        // The two tables this tool owns, refused for the same reason and from
+        // the same list the reader hides them by (`catalog::OURS`). A
+        // declaration naming one is created and then invisible: the pull
+        // reports it absent and the next plan creates it again, which the
+        // engine refuses for already existing.
+        //
+        // By name and in every schema, because that is how the filter reads —
+        // `catalog.rs` narrowed it from a prefix on purpose, so that a
+        // project's own `app.__pbps_customers` stays a project's table
+        // (DECISIONS 274).
+        if catalog::OURS.contains(&name.name.as_str()) {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` uses the name `{}`, which is one of the two this tool owns \
+                     (SPEC §8.1) and which this dialect's pull hides in every schema. The engine \
+                     would create the table and no plan could ever see it again. Only these two \
+                     names are taken: a table of your own called `{}_customers`, or anything \
+                     else beginning with the same letters, is read back normally.",
+                    name.name, name.name
+                ),
+            });
+        }
         // Every other name the table owns, which the engine truncates at the
         // same limit and which the emitter has to spell just as often: the
         // primary key's, and the keys of the four maps.
@@ -706,6 +729,42 @@ mod tests {
         // three characters against `pg_`, so `pga` is a project's schema and
         // has to stay one.
         for name in ["pga.t", "app.t", "public.t", "pg.t"] {
+            assert!(one(name).is_empty(), "`{name}` is a project's own");
+        }
+    }
+
+    /// A table named as one of the two this tool owns is refused, in any
+    /// schema, because the reader hides it in any schema.
+    ///
+    /// The negative case is the whole reason the reader's filter names the two
+    /// rather than matching a prefix: a project's own `__pbps_customers` is a
+    /// project's table, and refusing it would refuse a declaration the pull
+    /// reads perfectly well.
+    #[test]
+    fn validating_a_table_refuses_the_two_names_this_tool_owns() {
+        let one = |name: &str| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().expect("a type")),
+            );
+            Postgres::new().validate_table(&name.parse().expect("a table name parses"), &table)
+        };
+        for name in ["app.__pbps_state", "app.__pbps_lock", "public.__pbps_state"] {
+            let problems = one(name);
+            assert_eq!(problems.len(), 1, "`{name}`: {problems:?}");
+            assert!(
+                problems[0].to_string().contains("this tool owns"),
+                "`{name}`: {}",
+                problems[0]
+            );
+        }
+        for name in [
+            "app.__pbps_customers",
+            "app.__pbps_statement",
+            "app.pbps_state",
+            "app.customers",
+        ] {
             assert!(one(name).is_empty(), "`{name}` is a project's own");
         }
     }

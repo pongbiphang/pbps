@@ -62,6 +62,15 @@ const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'informatio
 /// own ledger lives, so `app.__pbps_state` is still hidden here (#185).
 const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
 
+/// The same two names, for the one other place that has to know them:
+/// `validate_table` refuses a declaration that uses one, because a table the
+/// reader always hides is one the pull reports absent and the next plan tries
+/// to create again (DECISIONS 274). Kept beside the filter, and tied to it by
+/// `the_filter_hides_exactly_the_names_the_validation_refuses`, so the two
+/// cannot drift apart — this rule has already been spelled in two places once
+/// (PITFALLS, "one rule, spelled in three places").
+pub(crate) const OURS: [&str; 2] = ["__pbps_state", "__pbps_lock"];
+
 /// `relkind = 'r'`, and the filter is the whole point: `pg_attribute` holds a
 /// row for every index and sequence column too, so a reader without it reports
 /// `child_id_seq` and `child_pk` as tables with columns.
@@ -861,5 +870,26 @@ mod tests {
         }
         assert!(!NOT_A_PROJECTS_SCHEMA.contains('\\'));
         assert!(CANONICAL_PATH.contains("standard_conforming_strings"));
+    }
+
+    /// The filter and the validation are the same rule, and this is the thread
+    /// between them: `validate_table` refuses a declaration naming one of these
+    /// tables because the reader hides it, so a name added to one and not the
+    /// other is a table that is created and then never seen again.
+    #[test]
+    fn the_filter_hides_exactly_the_names_the_validation_refuses() {
+        for name in OURS {
+            assert!(
+                NOT_ONE_OF_OURS.contains(&format!("'{name}'")),
+                "`{name}` is refused by the validation and not hidden by the filter"
+            );
+        }
+        // And nothing else: a third name in the filter that the validation does
+        // not know is the same drift from the other side.
+        assert_eq!(
+            NOT_ONE_OF_OURS.matches('\'').count(),
+            OURS.len() * 2,
+            "the filter names something `OURS` does not: {NOT_ONE_OF_OURS}"
+        );
     }
 }
