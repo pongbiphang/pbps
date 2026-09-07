@@ -280,6 +280,14 @@ statement says `non_transactional` and `own_batch` about itself, so a plan
 carrying one is refused at plan time rather than halfway through an apply
 (DECISIONS 262).
 
+One rule came out of the emitter's own fixpoint rather than from the issue: a
+nullable primary key column. SQL Server refuses the table; measured, this engine
+accepts it and sets `NOT NULL` itself, so the declaration and the database
+disagree from the moment the table exists and the `DROP NOT NULL` that would put
+it back is refused for ever (DECISIONS 266). The rest of the other dialect's
+key-column checks are absent here and are issue #175 — they fail at the server,
+which is late but not silent.
+
 The live suite runs the three shapes issue #79 named — a created table with a
 foreign key, a table already there gaining a column, a key, a unique, an index
 and a foreign key, and a bootstrap whose next plan must be empty — each as

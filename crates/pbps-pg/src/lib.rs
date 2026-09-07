@@ -402,6 +402,31 @@ impl Dialect for Postgres {
             }
         }
 
+        // A primary key column that the declaration calls nullable. SQL Server
+        // refuses this at `CREATE`; **measured, this engine does not** — it
+        // accepts the table and sets `NOT NULL` itself, so the declaration and
+        // the database disagree from the moment the table exists. The pull then
+        // reads `nullable: false`, every plan proposes `DROP NOT NULL`, and the
+        // engine refuses that with `column "id" is in a primary key`: a plan
+        // that can never converge and can never succeed. Refused here, where a
+        // user is looking at the declaration, and worded as the other dialect
+        // words it because it is the same mistake.
+        if let Some(pk) = &table.primary_key {
+            for column in &pk.columns {
+                if table.columns.get(column).is_some_and(|c| c.nullable) {
+                    found.push(DialectError::Invalid {
+                        dialect: types::DIALECT,
+                        message: format!(
+                            "primary key column `{column}` is nullable; a primary key column must \
+                             be NOT NULL. This engine does not refuse the table — it sets \
+                             `NOT NULL` for you — and then no plan can ever make the column match \
+                             the declaration again."
+                        ),
+                    });
+                }
+            }
+        }
+
         for (column_name, column) in &table.columns {
             if let Err(e) = self.quote_ident(column_name) {
                 found.push(e);
@@ -755,9 +780,12 @@ mod tests {
     fn validating_a_table_refuses_every_owned_name_the_emitter_could_not_spell() {
         let long = "a".repeat(MAX_IDENT_BYTES + 1);
         let mut table = Table::default();
-        table
-            .columns
-            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        table.columns.insert(
+            "id".to_owned(),
+            // `not_null` because a nullable key column is its own finding, and
+            // this test is about names.
+            pbps_model::Column::new(ty("integer")).not_null(),
+        );
         table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some(long.clone()),
             columns: vec!["id".to_owned()],

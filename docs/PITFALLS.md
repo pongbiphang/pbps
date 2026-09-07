@@ -655,6 +655,22 @@ the implementation must not depend on the caller having normalized, and names
 the caller that cannot. Reading the sibling implementation beside the trait is
 the other half, and it is what a call-site sweep is for.
 
+**And a scar can be the wrong shape on the second engine, not just missing.**
+`pbps-mssql` refuses a nullable primary key column because SQL Server refuses
+the table; the rule buys an earlier, clearer failure and nothing else.
+`pbps-pg` had no such rule, and measured, PostgreSQL does not refuse the table
+— it sets `NOT NULL` itself and says nothing. The same missing rule is
+therefore a *different and worse* defect on the second engine: not a late
+failure but no failure, a declaration silently rewritten, and every plan
+afterwards proposing a `DROP NOT NULL` the engine refuses with `column "id" is
+in a primary key`.
+
+Copying the rule across would have got the right behaviour for the wrong
+reason, and the comment would have said "the engine refuses this" about an
+engine that does not. Port the *question* the rule asks, then measure the
+second engine's answer — it can be worse than the first one's, which is not
+what "inherit the scar" leads you to expect.
+
 ## One match arm, two directions, one direction's reason
 
 `change_risk` classified `time -> interval` and `interval -> time` in a single

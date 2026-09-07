@@ -4625,3 +4625,31 @@ SPEC is in sync with all of these.
     `pbps.yml` would be one nothing reads — which is worse than none, because a
     user who sets it would have every reason to believe it took effect. The key
     lands with the step that can read it.
+
+266. **A nullable primary key column is refused on PostgreSQL too, and for the
+    opposite reason.** SQL Server refuses the table at `CREATE`, so its rule
+    (`validate.rs`) only moves the failure earlier. **Measured, this engine
+    accepts it** and sets `NOT NULL` itself:
+
+    ```text
+    CREATE TABLE t (id integer, CONSTRAINT pk PRIMARY KEY (id));  accepted
+    the column afterwards:                                        attnotnull = t
+    ALTER TABLE t ALTER COLUMN id DROP NOT NULL;
+        -> ERROR 42P16: column "id" is in a primary key
+    ```
+
+    So the declaration and the database disagree from the moment the table
+    exists, the pull reads `nullable: false`, every plan proposes the
+    `DROP NOT NULL` that would put the declaration back, and the engine refuses
+    that one for ever. A declaration an engine silently rewrites is worse than
+    one it rejects, and the rule is more necessary here than on the engine it
+    came from.
+
+    Written from the measurement rather than inherited: `pbps-pg` had no
+    key-column checks at all, which is PITFALLS' "the second implementation did
+    not inherit the first one's scar" with the scar in the wrong shape as well
+    as missing. The rest of `pbps-mssql`'s `key_columns` — a key naming a column
+    the table does not have, naming one twice, naming none, or naming one whose
+    type cannot be part of a key — is missing here too and is issue #175: those
+    four fail loudly at the server, which is late but not silent, and this one
+    does not fail at all.

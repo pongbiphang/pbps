@@ -2857,6 +2857,66 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
     );
 }
 
+/// A nullable primary key column is refused, and the engine is why.
+///
+/// SQL Server refuses this at `CREATE`, loudly. Measured here, PostgreSQL
+/// **accepts** the table and sets `NOT NULL` itself — so the declaration and
+/// the database disagree from the moment the table exists, the pull reads
+/// `nullable: false`, and the plan that would put it back is refused for ever.
+/// A declaration this engine silently rewrites is worse than one it rejects,
+/// which is why the rule is not inherited from the other dialect but measured
+/// on this one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not() {
+    let s = emit_schema("nullablepk");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer, CONSTRAINT pk PRIMARY KEY (id))"
+    ))
+    .await
+    .expect("this engine accepts the table a nullable declaration describes");
+    assert!(
+        truth(
+            &mut conn,
+            &format!(
+                "SELECT attnotnull FROM pg_catalog.pg_attribute \
+                 WHERE attrelid = '{s}.t'::pg_catalog.regclass AND attname = 'id'"
+            ),
+        )
+        .await,
+        "the engine set NOT NULL itself, which the declaration never said"
+    );
+    // And the plan that would put the declaration back is refused, so the
+    // disagreement is permanent.
+    let refusal = conn
+        .execute(&format!("ALTER TABLE {s}.t ALTER COLUMN id DROP NOT NULL"))
+        .await
+        .expect_err("a primary key column cannot be made nullable");
+    // `42P16` is `invalid_table_definition`: `column "id" is in a primary key`.
+    assert_eq!(sqlstate(&refusal), "42P16");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new(ty("integer")));
+    table.primary_key = Some(PrimaryKey {
+        name: Some("pk".into()),
+        columns: vec!["id".into()],
+    });
+    let problems = Postgres::new().validate_table(&TableName::new(&s, "t"), &table);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].to_string().contains("must be NOT NULL"),
+        "{}",
+        problems[0]
+    );
+}
+
 /// A rename that crosses a schema takes two statements, and each says what it
 /// does to the name so that a staged checkpoint can find the table in between.
 #[tokio::test]
