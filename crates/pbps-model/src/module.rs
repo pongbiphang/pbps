@@ -423,9 +423,27 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    let haystack = scannable(definition);
-    let schema = folded(&name.schema);
-    let object = folded(&name.name);
+    references_as(definition, name, Case::Folded)
+}
+
+/// How the scan compares letters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Case {
+    /// The usual answer: a database collation is case-insensitive far more
+    /// often than not, and a definition that writes `DBO.CUSTOMER` means the
+    /// declared `dbo.customer`.
+    Folded,
+    /// Where two declarations fold to one name, the fold cannot tell them
+    /// apart, and only a case-sensitive database can be holding both.
+    Exact,
+}
+
+fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
+    let haystack = scannable(definition, case);
+    let (schema, object) = match case {
+        Case::Folded => (folded(&name.schema), folded(&name.name)),
+        Case::Exact => (name.schema.clone(), name.name.clone()),
+    };
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
@@ -636,8 +654,12 @@ fn folded(s: &str) -> String {
 
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
-fn scannable(definition: &str) -> String {
-    let lowered = folded(&code_only(definition));
+fn scannable(definition: &str, case: Case) -> String {
+    let code = code_only(definition);
+    let lowered = match case {
+        Case::Folded => folded(&code),
+        Case::Exact => code,
+    };
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
@@ -711,6 +733,35 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
 
+    // The declarations that fold onto one name, keyed by that name. Only a
+    // case-sensitive database can be holding two of them — the model keeps
+    // names exactly as written, and `fold_ident` folds nothing for the same
+    // reason (DECISIONS 240). Where there are two, the fold is the wrong
+    // question to ask of a definition: it cannot say which of them the text
+    // names, so it would answer *both*, and two such pairs make an ordering
+    // cycle out of modules that have none.
+    let mut folds: BTreeMap<String, BTreeSet<ObjectName>> = BTreeMap::new();
+    for name in &names {
+        if let Some(referenced) = name.referenced_name() {
+            // Keyed by the folded name and counted by the distinct ones, so
+            // that two overloads of one routine — the same name twice — are
+            // not mistaken for a case collision.
+            folds
+                .entry(format!(
+                    "{}.{}",
+                    folded(&referenced.schema),
+                    folded(&referenced.name)
+                ))
+                .or_default()
+                .insert(referenced);
+        }
+    }
+    let ambiguous = |name: &ObjectName| {
+        folds
+            .get(&format!("{}.{}", folded(&name.schema), folded(&name.name)))
+            .is_some_and(|declared| declared.len() > 1)
+    };
+
     // needs[a] = the modules `a` must follow.
     let mut needs: BTreeMap<&ModuleId, BTreeSet<&ModuleId>> = BTreeMap::new();
     for name in &names {
@@ -742,9 +793,14 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
             let sibling = matches!(name, ModuleId::Routine(_))
                 && other.referenced_name() == name.referenced_name();
             let referenced = !sibling
-                && other
-                    .referenced_name()
-                    .is_some_and(|n| references(&module.definition, &n));
+                && other.referenced_name().is_some_and(|n| {
+                    let case = if ambiguous(&n) {
+                        Case::Exact
+                    } else {
+                        Case::Folded
+                    };
+                    references_as(&module.definition, &n, case)
+                });
             if declared || attached || referenced {
                 set.insert(other);
             }
@@ -917,7 +973,7 @@ mod tests {
             "SELECT * FROM dbo\n  .\n  active_customer",
         ] {
             assert_eq!(
-                scannable(definition),
+                scannable(definition, Case::Folded),
                 "select * from dbo.active_customer",
                 "{definition:?}"
             );
@@ -928,7 +984,7 @@ mod tests {
         }
         // Whitespace that is not beside a dot is a boundary and stays.
         assert_eq!(
-            scannable("select a\n  from dbo.t"),
+            scannable("select a\n  from dbo.t", Case::Folded),
             "select a\n  from dbo.t"
         );
     }
@@ -1015,6 +1071,47 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(creation_order(&m, &ModuleDeps::default()), first);
         }
+    }
+
+    /// A case-sensitive database holds `dbo.CAF\u{c9}` beside `dbo.caf\u{e9}`, and
+    /// the fold that reads `DBO.CUSTOMER` as `dbo.customer` cannot tell those
+    /// two apart. Asked with the fold, the scan answers *both* — so a
+    /// definition naming one of them gets an edge to the other as well, and a
+    /// second such definition closes a cycle between modules that have none.
+    /// `creation_order` breaks a cycle by emitting its members in name order,
+    /// which is how a valid plan ends up with a `CREATE VIEW` that fails.
+    ///
+    /// Two declarations that fold onto one name are visible without a
+    /// connection, so the scan compares those exactly and keeps the fold for
+    /// every other name (DECISIONS 240).
+    #[test]
+    fn two_declarations_that_fold_to_one_name_are_compared_exactly() {
+        let upper = "dbo.CAF\u{c9}";
+        let lower = "dbo.caf\u{e9}";
+        // A chain, not a cycle: `lower` names nothing, `dbo.z` names `lower`,
+        // and `upper` names `dbo.z`. Folded, `dbo.z` reads as naming `upper`
+        // too, which closes a loop with it.
+        let m = modules(&[
+            (upper, "SELECT * FROM dbo.z"),
+            (lower, "SELECT 1"),
+            ("dbo.z", format!("SELECT * FROM {lower}").as_str()),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id(lower), id("dbo.z"), id(upper)],
+            "each module comes after the one it names, and there is no cycle"
+        );
+
+        // And the fold is still the answer for a name nothing collides with:
+        // the same three definitions with the accented pair spelled apart.
+        let m = modules(&[
+            ("dbo.caf\u{e9}", "SELECT 1"),
+            ("dbo.tea", "SELECT * FROM DBO.CAF\u{c9}"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.caf\u{e9}"), id("dbo.tea")]
+        );
     }
 
     /// The scan matches a name, and a name is not an identity where routines
@@ -1401,14 +1498,15 @@ mod tests {
     /// reader sees the price rather than rediscovers it.
     ///
     /// Measured unequal on the engine, and equal after a simple lower-case:
-    /// the Kelvin sign, the Ohm sign, and capital sharp s. Two modules whose
-    /// names differ only by one of these would get an edge the engine does not
-    /// justify — and a pair of them, an ordering cycle, which `creation_order`
-    /// then emits in name order. No fold short of the collation itself gets
-    /// this right: the engine folds U+212B to `å` and does *not* fold U+212A to
-    /// `k`, which is not a rule anything outside the collation can follow
-    /// (DECISIONS 240). `depends_on:` is the escape hatch, as it is for every
-    /// other case this scan reads wrong.
+    /// the Kelvin sign, the Ohm sign, and capital sharp s. No fold short of the
+    /// collation itself gets this right — the engine folds U+212B to `å` and
+    /// does *not* fold U+212A to `k`, which is not a rule anything outside the
+    /// collation can follow (DECISIONS 240).
+    ///
+    /// `creation_order` narrows what this costs: where both spellings are
+    /// *declared*, it sees the collision and compares those two exactly. What
+    /// is left is a definition naming a spelling nothing declares, which is the
+    /// scan's ordinary over-reach and has `depends_on:` for an escape hatch.
     #[test]
     fn the_fold_is_wider_than_the_engines_in_three_measured_places() {
         for (what, declared, written) in [

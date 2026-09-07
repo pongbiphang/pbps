@@ -4136,13 +4136,29 @@ SPEC is in sync with all of these.
     `dbo.i`, measured and pinned. One character in and one character out is
     also what a collation does, which is the comparison being approximated.
 
-    Three measured cases go the other way, and are accepted rather than
-    special-cased: the engine folds neither the Kelvin sign to `k`, nor the
-    Ohm sign to `ω`, nor capital sharp s to `ß`, and a simple lower-case folds
-    all three. It does fold U+212B to `å`, which is the same class of
-    character and the opposite answer — there is no rule short of the
+    Three measured cases go the other way: the engine folds neither the Kelvin
+    sign to `k`, nor the Ohm sign to `ω`, nor capital sharp s to `ß`, and a
+    simple lower-case folds all three. It does fold U+212B to `å`, the same
+    class of character and the opposite answer — there is no rule short of the
     collation itself that gets all four right, and the model does not carry a
-    collation (§8.2). The price is an edge the engine does not justify between
-    two modules whose names differ only by one of those characters, and a
-    cycle if there are two such pairs; `depends_on:` is the escape hatch, as
-    it is everywhere else this scan reads wrong.
+    collation (§8.2).
+
+    The wider question those three raise is the one a case-sensitive database
+    asks of *every* letter: `dbo.CAFÉ` and `dbo.café` are two objects under a
+    `CS_AS` collation, and any fold reads them as one. `creation_order`
+    answers it without a connection, because it does not need one: two
+    declarations that fold onto a single name are both in front of it. Where
+    there are two, the fold cannot say which of them a definition names — it
+    would answer both — so those are compared exactly and every other name
+    keeps the fold. Two such over-answers make an ordering cycle out of
+    modules that have none, and a cycle is emitted in name order, so this is
+    the difference between a `CREATE VIEW` that works and one that fails
+    inside the plan's transaction. The collision is counted over *distinct*
+    names, so two overloads of one routine — the same name twice — are not
+    mistaken for one.
+
+    What is left of the price is a definition that names a spelling nothing
+    declares: the fold may then attach it to a declaration it does not belong
+    to. That is the scan's ordinary over-reach, the same one that matches a
+    bare name inside a longer qualified one, and `depends_on:` is the escape
+    hatch for it as it is everywhere else.
