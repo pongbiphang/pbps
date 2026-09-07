@@ -189,32 +189,62 @@ fn is_a_bare_literal(expression: &str) -> bool {
     } else {
         return false;
     };
-    let Some(inner) = rest.strip_suffix('\'') else {
+    // Where this piece ends, rather than whether the whole tail is one piece:
+    // a string constant may be *continued*, and then the expression is still
+    // one literal.
+    let Some(end) = end_of_literal(rest, escapes) else {
         return false;
     };
-    closes_only_at_the_end(inner, escapes)
+    let mut tail = &rest[end..];
+    // **Measured**, the continuation rule is narrower than "another literal":
+    //
+    // ```text
+    // 'a' ⏎ 'b'      -> ab          E'a' ⏎ 'b'   -> ab      U&'a' ⏎ 'b' -> ab
+    // 'a' ⏎ E'b'     -> syntax error
+    // $$a$$ ⏎ $$b$$  -> syntax error
+    // 'a' ⏎ 'b\'c'   -> unterminated: the backslash does not escape here,
+    //                   even when the first piece was an `E'…'`
+    // ```
+    //
+    // So a continuation is a plain `'…'`, scanned without escapes whatever the
+    // first piece was, and it must be preceded by whitespace containing a
+    // newline — on one line the same text is a syntax error, which is why the
+    // newline is checked rather than assumed.
+    while !tail.is_empty() {
+        let after_gap = tail.trim_start();
+        if !tail[..tail.len() - after_gap.len()].contains('\n') {
+            return false;
+        }
+        let Some(next) = after_gap.strip_prefix('\'') else {
+            return false;
+        };
+        let Some(end) = end_of_literal(next, false) else {
+            return false;
+        };
+        tail = &next[end..];
+    }
+    true
 }
 
-/// Whether the quote that ends `inner` is the first one that could have.
-///
-/// A doubled quote is inside the literal; a single one would have closed it
-/// early, which means the expression is more than this literal.
-fn closes_only_at_the_end(inner: &str, escapes: bool) -> bool {
-    let bytes = inner.as_bytes();
+/// The byte index just past the closing quote of the literal that starts at
+/// the beginning of `rest`, which is the text *after* its opening quote.
+fn end_of_literal(rest: &str, escapes: bool) -> Option<usize> {
+    let bytes = rest.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'\\' if escapes => i += 2,
             b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
-            b'\'' => return false,
+            // The closing quote, and the first byte after it is the answer.
+            b'\'' => return Some(i + 1),
             // Every other byte, which includes the continuation bytes of a
             // multi-byte character: none of them can be one of the two above.
             _ => i += 1,
         }
     }
-    // A step that ran past the end consumed the closing quote as an escaped
-    // one, so the literal did not end there — `E'a\'` is not a closed literal.
-    i == bytes.len()
+    // Ran off the end: either nothing closed it, or a step consumed the
+    // closing quote as an escaped one — `E'a\'` is not a closed literal.
+    None
 }
 
 /// Whether `e` is one `$tag$…$tag$` literal and nothing else.
@@ -1277,6 +1307,14 @@ mod tests {
             // Grouping is not resolution: the engine drops the parentheses and
             // reads the same text through the same setting.
             "('01/02/2026')",
+            // Continued across a newline, which this engine reads as one
+            // string constant — measured, and measured again for the forms
+            // that do *not* continue, below.
+            "'01/02/'\n'2026'",
+            "E'01/02/'\n'2026'",
+            "U&'01/02/'\n'2026'",
+            "'01/02/'\n  \n  '2026'",
+            "'01/'\n'02/'\n'2026'",
             "  ( ( '01/02/2026' ) )  ",
             "($$01/02/2026$$)",
             "U&'2026-01-02'",
@@ -1306,6 +1344,16 @@ mod tests {
             // Parenthesised, but not one literal: the first group closes
             // before the end, so nothing is unwrapped and nothing is refused.
             "('a') || ('b')",
+            // Two literals on one line are a syntax error to the engine, not
+            // one constant, so this is not a declaration to refuse.
+            "'01/02/' '2026'",
+            // A continuation may not be an escape string, and dollar quoting
+            // does not continue at all: both are syntax errors, measured.
+            "'01/02/'\nE'2026'",
+            "$$01/02/$$\n$$2026$$",
+            // Still two literals with an operator between them, newline or
+            // not.
+            "'a'\n|| 'b'",
             "('a')::date",
             "('a'",
             // A literal's own parentheses cannot make a pair out of two

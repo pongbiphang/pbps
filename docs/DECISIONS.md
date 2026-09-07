@@ -4576,6 +4576,25 @@ SPEC is in sync with all of these.
     declaration with its types, and every command that hands statements to a
     database runs it (DECISIONS 141), so the change is never planned at all.
 
+    **A string constant continued across a newline is one literal**, and the
+    continuation rule is narrower than "another literal beside it". Measured:
+
+    ```text
+    'a' ⏎ 'b'       -> ab        E'a' ⏎ 'b'  -> ab       U&'a' ⏎ 'b' -> ab
+    'a'   'b'       -> syntax error: on one line they are two constants
+    'a' ⏎ E'b'      -> syntax error: a continuation is a plain literal
+    $$a$$ ⏎ $$b$$   -> syntax error: dollar quoting does not continue
+    'a' ⏎ 'b\'c'    -> unterminated: the backslash does not escape in a
+                       continuation, even after an `E'…'` first piece
+    ```
+
+    So `DEFAULT '01/02/'` ⏎ `'2026'` on a `date` is the same declaration as the
+    one-piece spelling and stores the same session-decided value — measured,
+    `'2026-01-02'::date` under MDY — and a guard that stopped at the first
+    closing quote let it past. The scanner now reads pieces: the first in
+    whichever of the three forms opened it, each later one plain and preceded
+    by whitespace that contains a newline.
+
     **Grouping parentheses are taken off first, and that is the boundary of
     what this guard reads.** Measured, `DEFAULT ('01/02/2026')` on a `date`
     stores `'2026-01-02'` under MDY and `'2026-02-01'` under DMY exactly as the
