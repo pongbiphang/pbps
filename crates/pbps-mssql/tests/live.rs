@@ -7296,3 +7296,111 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
         "the index filter arrived"
     );
 }
+
+/// `timestamp` is eight bytes and is not a binary column: the engine refuses
+/// `ALTER COLUMN` on either end of it, by number.
+///
+/// Both errors are here because they are two different refusals — 4928 names
+/// the column's *current* type and 4927 names the one asked for — and a fix
+/// that caught only one direction would pass a test that asked only about the
+/// other.
+///
+/// The last assertion is the reason `preflight` builds no probe for these:
+/// the conversion a probe would ask about *succeeds*. `TRY_CONVERT` finds
+/// nothing wrong with the values, so a probe over them counts zero rows and
+/// prints as a pass under a statement that will not compile. The prohibition
+/// is on the column, not on the data, and only the classification can carry
+/// it.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_timestamp_column_cannot_be_altered_into_or_out_of() {
+    use pbps_dialect::TypeChangeRisk;
+
+    let mut db = TestDb::create("timestamp_alter").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.rv (id int NOT NULL, v rowversion, b varbinary(8) NULL); \
+             INSERT dbo.rv (id, b) VALUES (1, 0xAB);",
+        )
+        .await
+        .expect("create the probe table");
+
+    // Out of the type. `varbinary(8)` is the exact capacity `sys.types`
+    // reports for `timestamp`, which is the pair a capacity-based classifier
+    // calls Safe.
+    let error = db
+        .conn
+        .execute("ALTER TABLE dbo.rv ALTER COLUMN v varbinary(8) NULL;")
+        .await
+        .expect_err("SQL Server does not alter a timestamp column");
+    assert_eq!(
+        error.server_error_code().as_deref(),
+        Some("4928"),
+        "{error}"
+    );
+
+    // Into it.
+    let error = db
+        .conn
+        .execute("ALTER TABLE dbo.rv ALTER COLUMN b timestamp;")
+        .await
+        .expect_err("SQL Server does not alter a column into timestamp");
+    assert_eq!(
+        error.server_error_code().as_deref(),
+        Some("4927"),
+        "{error}"
+    );
+
+    // Nothing moved: a refusal that left the column half-changed would make
+    // the risk classification the least of the problems.
+    let rows = db
+        .conn
+        .query(
+            "SELECT t.name FROM sys.columns c JOIN sys.types t \
+             ON t.user_type_id = c.user_type_id \
+             WHERE c.object_id = OBJECT_ID('dbo.rv') AND c.name = 'v';",
+        )
+        .await
+        .unwrap();
+    let name: &str = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(name, "timestamp");
+
+    // What the dialect says about the same two changes, and about the identity
+    // — which is not a change and must stay Safe however it is spelled, or
+    // every plan against a table with a `rowversion` grows a change nobody
+    // asked for.
+    for (from, to, expected) in [
+        ("timestamp", "varbinary(8)", TypeChangeRisk::Incompatible),
+        ("varbinary(8)", "timestamp", TypeChangeRisk::Incompatible),
+        ("rowversion", "varbinary(8)", TypeChangeRisk::Incompatible),
+        ("timestamp", "timestamp", TypeChangeRisk::Safe),
+        ("rowversion", "timestamp", TypeChangeRisk::Safe),
+    ] {
+        assert_eq!(
+            Mssql.type_change_risk(&ty(from), &ty(to)),
+            expected,
+            "{from} -> {to}"
+        );
+    }
+
+    // The conversion is legal; the alteration is not. This is why no probe can
+    // stand in for the classification — the query below is exactly the one
+    // `conversion_probe` used to build for this change, and it answers zero.
+    let rows = db
+        .conn
+        .query(
+            "SELECT COUNT(*) AS n FROM dbo.rv \
+             WHERE b IS NOT NULL AND TRY_CONVERT(timestamp, b) IS NULL;",
+        )
+        .await
+        .unwrap();
+    let unconvertible: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    assert_eq!(
+        unconvertible, 0,
+        "the probe was supposed to be useless here; if it can see the \
+         prohibition, the classification is not the only thing carrying it"
+    );
+
+    db.conn.execute("DROP TABLE dbo.rv;").await.unwrap();
+    db.drop().await;
+}

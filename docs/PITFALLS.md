@@ -842,11 +842,11 @@ three chances to be measured once and fixed once.
 
 ## One property of a type standing in for what it holds
 
-Five instances over four review rounds, four of them in the classification that
-decides whether a change needs a human's approval, all in the direction that
-skips one. Each rule named a real property of the type — its digit count, its
-significant digits, its components, its range — and each time the property was
-true and not the whole answer.
+Six instances, five of them in the classification that decides whether a change
+needs a human's approval, all in the direction that skips one. Each rule named a
+real property of the type — its digit count, its significant digits, its
+components, its range, its width in bytes — and each time the property was true
+and not the whole answer.
 
 - **`numeric(10,0)` and `integer` are both "ten digits".** Measured,
   `9999999999` into an `integer` is `integer out of range`; on SQL Server,
@@ -872,12 +872,30 @@ true and not the whole answer.
   down is refused for being too *large*. The column's range is the wrong range
   at both ends, and it is the one a reader reaches for.
 
+- **"eight bytes, variable length" is not "a binary column".** SQL Server's
+  `timestamp` (`rowversion`) was grouped with `varbinary`, so a capacity
+  comparison answered every pair it took part in. Measured, the engine refuses
+  `ALTER COLUMN` on *either* end of it — 4928 leaving the type, 4927 arriving
+  at it — so `timestamp -> varbinary(8)`, the pair whose capacities match
+  exactly, came out `Safe` for a statement that will not compile. The obvious
+  repair is the wrong one twice over: the width the classifier read was 1, and
+  correcting it to the 8 `sys.types` reports makes the same pair `Safe` for the
+  same reason. The property that governs is not a width (#141).
+
 Every one reads as obviously correct, and a test written by the same hand asks
 the same question the rule does. **What catches them is a row at the boundary,
 on a real server**: the largest value the source holds, and a value the target
 cannot represent, with the promise asserted as *the statement runs and the value
 does not change*. A classification cannot be checked against itself, and the
 second one cannot be checked against the engine's own printing either.
+
+The sixth is the exception that says what the others have in common. No row
+catches it, because no row is wrong: `CONVERT(timestamp, 0xAB)` succeeds and
+returns `0xAB00000000000000`, so the pre-flight probe over the column counts
+zero and prints as a pass. **Where the boundary row cannot answer, the thing to
+run is the statement itself** — and a prohibition no probe can see is one only
+the classification can carry, which is why the fix had to remove the probe as
+well as change the answer.
 
 ## The engine accepted the declaration and stored a different one
 

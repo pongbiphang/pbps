@@ -435,10 +435,31 @@ fn family(t: &ColumnType) -> Family {
             len: len(),
             fixed: true,
         },
-        "varbinary" | "timestamp" => Family::Binary {
+        "varbinary" => Family::Binary {
             len: len(),
             fixed: false,
         },
+        // `timestamp` (`rowversion`) is bytes, and it is not a binary column.
+        // It is `Opaque` so that every pair it takes part in falls to the
+        // `Incompatible` arm below, because SQL Server refuses `ALTER COLUMN`
+        // on *either* end of it — measured on the pinned image:
+        //
+        //     ALTER TABLE t ALTER COLUMN v varbinary(8)  -- v is timestamp
+        //       -> Msg 4928: Cannot alter column 'v' because it is 'timestamp'.
+        //     ALTER TABLE t ALTER COLUMN v timestamp     -- v is varbinary(8)
+        //       -> Msg 4927: Cannot alter column 'v' to be data type timestamp.
+        //
+        // Giving it the capacity `sys.types` reports (`max_length` 8) would be
+        // the obvious repair and the wrong one: `timestamp -> varbinary(8)`
+        // would then be a widening, which is to say `Safe`, for a statement
+        // that cannot run at all. The capacity is right and the question is
+        // not about capacity (DECISIONS 283).
+        //
+        // The identity is unaffected: `timestamp -> timestamp` — and
+        // `rowversion -> timestamp`, which is the same value after
+        // normalization — returns above, before any family is asked for, so a
+        // column that keeps its type still produces no change.
+        "timestamp" => Family::Opaque,
         "image" => Family::Binary {
             len: Len::Max,
             fixed: false,
@@ -566,6 +587,26 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             _,
         ) => TypeChangeRisk::Incompatible,
     }
+}
+
+/// Whether SQL Server refuses an `ALTER COLUMN` that names this type, on
+/// either end of the change.
+///
+/// Only `timestamp` (`rowversion`) answers yes. It is not a question about the
+/// rows, and that is the whole point: no probe can see it. Measured on the
+/// pinned image, `CONVERT(timestamp, 0xAB)` *succeeds* as an expression and
+/// returns `0xAB00000000000000`, so a `TRY_CONVERT` probe over the column
+/// counts zero rows and reports a clean pass for a statement the engine will
+/// not compile.
+///
+/// Takes the type as declared and normalizes it, so the `rowversion` spelling
+/// answers the same as `timestamp`. A spelling this dialect does not know is
+/// not `timestamp`, and it is refused a step earlier by
+/// [`Dialect::type_change_risk`](pbps_dialect::Dialect::type_change_risk),
+/// which ends the question at `Incompatible` when either side fails to
+/// normalize.
+pub fn alter_column_is_refused(ty: &ColumnType) -> bool {
+    normalize(ty).is_ok_and(|t| t.base == "timestamp")
 }
 
 fn safe_if(cond: bool) -> TypeChangeRisk {
@@ -888,6 +929,82 @@ mod tests {
         assert_eq!(risk("xml", "nvarchar(max)"), TypeChangeRisk::Incompatible);
         // Numbers always render as text, so that direction only truncates.
         assert_eq!(risk("int", "nvarchar(5)"), TypeChangeRisk::Narrowing);
+    }
+
+    /// `timestamp` is eight bytes and is not a binary column: SQL Server will
+    /// not `ALTER COLUMN` either into it or out of it, whatever the capacities
+    /// line up to. Measured on the pinned image — 4928 leaving the type, 4927
+    /// arriving at it — and pinned live in `tests/live.rs`.
+    ///
+    /// Both directions, because a classifier that reads capacity gets one of
+    /// them right by accident: eight bytes into `varbinary(8)` looks like an
+    /// exact fit and eight bytes into `varbinary(1)` looks like a narrowing,
+    /// and neither is the answer. The identity is here as the negative case —
+    /// a column that keeps its type must still be no change at all, or every
+    /// plan against a table with a `rowversion` grows a change nobody asked
+    /// for.
+    #[test]
+    fn a_type_change_touching_timestamp_is_impossible_in_either_direction() {
+        let mut wrong = Vec::new();
+        for (from, to, expected) in [
+            // Out of it. `varbinary(8)` is the exact capacity `sys.types`
+            // reports for `timestamp`, which is what makes it the tempting one.
+            ("timestamp", "varbinary(8)", TypeChangeRisk::Incompatible),
+            ("timestamp", "varbinary(1)", TypeChangeRisk::Incompatible),
+            ("timestamp", "varbinary(max)", TypeChangeRisk::Incompatible),
+            ("timestamp", "binary(8)", TypeChangeRisk::Incompatible),
+            ("timestamp", "bigint", TypeChangeRisk::Incompatible),
+            // Into it.
+            ("varbinary(8)", "timestamp", TypeChangeRisk::Incompatible),
+            ("varbinary(1)", "timestamp", TypeChangeRisk::Incompatible),
+            ("binary(8)", "timestamp", TypeChangeRisk::Incompatible),
+            ("bigint", "timestamp", TypeChangeRisk::Incompatible),
+            // The alias, on both ends, which normalization makes the same type.
+            ("rowversion", "varbinary(8)", TypeChangeRisk::Incompatible),
+            ("varbinary(8)", "rowversion", TypeChangeRisk::Incompatible),
+            // And the identity, which is not a change and must stay Safe —
+            // however it is spelled.
+            ("timestamp", "timestamp", TypeChangeRisk::Safe),
+            ("rowversion", "rowversion", TypeChangeRisk::Safe),
+            ("rowversion", "timestamp", TypeChangeRisk::Safe),
+            ("timestamp", "rowversion", TypeChangeRisk::Safe),
+            // The neighbours it was grouped with keep answering as before, so
+            // the fix is about `timestamp` and not about binary capacity.
+            ("varbinary(1)", "varbinary(8)", TypeChangeRisk::Safe),
+            ("varbinary(8)", "varbinary(1)", TypeChangeRisk::Narrowing),
+        ] {
+            let got = risk(from, to);
+            if got != expected {
+                wrong.push(format!("`{from}` -> `{to}`: {got:?}, want {expected:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The engine's refusal is not a question about the rows, and the point of
+    /// saying so is that no probe can see it: `CONVERT(timestamp, 0xAB)`
+    /// succeeds as an expression. `preflight` asks this before it builds one.
+    #[test]
+    fn alter_column_is_refused_only_for_timestamp_however_it_is_spelled() {
+        for s in ["timestamp", "rowversion", "TIMESTAMP", "RowVersion"] {
+            assert!(alter_column_is_refused(&ty(s)), "{s}");
+        }
+        for s in [
+            "varbinary(8)",
+            "binary(8)",
+            "varbinary(max)",
+            "image",
+            "bigint",
+            "sysname",
+        ] {
+            assert!(!alter_column_is_refused(&ty(s)), "{s}");
+        }
+        // A spelling this dialect does not know is not `timestamp`. It is
+        // refused a step earlier, where either side failing to normalize ends
+        // the question at `Incompatible`.
+        for s in ["jsonb", "serial", "nonesuch", "int(10)"] {
+            assert!(!alter_column_is_refused(&ty(s)), "{s}");
+        }
     }
 
     /// Spelling a type differently is not a change, and this is the single most
