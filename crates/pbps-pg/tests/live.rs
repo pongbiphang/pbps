@@ -5507,6 +5507,86 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         .expect("drop");
 }
 
+/// The account this tool is actually built for cannot take a routine's lock,
+/// and the attempt must not destroy the transaction it was protecting.
+///
+/// **Measured**, as a non-superuser owning its own function:
+///
+/// ```text
+/// BEGIN; SELECT … FROM pg_proc … FOR UPDATE;
+///     ERROR:  permission denied for table pg_proc
+/// SELECT 1;
+///     ERROR:  current transaction is aborted, commands ignored …
+/// ```
+///
+/// Without a savepoint around the attempt, a rebuild that could perfectly well
+/// have gone ahead unserialized fails instead — and it fails at the *first*
+/// read after the lock, which is a message about `pg_proc` for an operator who
+/// asked about a view's ACL. What this asserts is both halves: the answer says
+/// the rebuild is not serialized, **and** the reads that follow it still work.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_still_run() {
+    let s = emit_schema("unprivileged");
+    let deployer = format!("{s}_deploy");
+    let mut admin = connect().await;
+    fresh(&mut admin, &s).await;
+    for sql in [
+        format!("DROP ROLE IF EXISTS {deployer}"),
+        format!("CREATE ROLE {deployer} LOGIN PASSWORD 'Pbps!Test12345'"),
+        format!("GRANT CREATE, USAGE ON SCHEMA {s} TO {deployer}"),
+    ] {
+        admin
+            .execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    // As the deploying account, which owns what it creates and nothing else.
+    let as_deployer = conn_str().replace("user=postgres", &format!("user={deployer}"));
+    let mut conn = Conn::connect(Driver::Postgres, &as_deployer)
+        .await
+        .expect("connect as the deploying account");
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.f(a int) RETURNS int LANGUAGE sql AS $$ SELECT a $$"
+    ))
+    .await
+    .expect("the deploying account owns its own function");
+
+    let id: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let rebuild =
+        pbps_pg::modules::before_a_rebuild(&mut conn, &id, pbps_model::ModuleKind::Function)
+            .await
+            .expect("the read must survive an attempt that could not take the lock");
+    rollback(&mut conn).await;
+
+    match &rebuild.serialized {
+        pbps_pg::modules::Serialized::Not(why) => {
+            assert!(why.contains("pg_proc"), "{why}");
+            assert!(why.contains("not serialized"), "{why}");
+        }
+        pbps_pg::modules::Serialized::By(what) => {
+            panic!("this account should not be able to lock `pg_proc`: {what}")
+        }
+    }
+    // And the reads after the failed attempt ran: this function is owned by
+    // the account that would rebuild it and carries no ACL, so there is
+    // nothing to refuse — which is only distinguishable from "the reads never
+    // ran" because the reads did run.
+    assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
+
+    drop(conn);
+    admin
+        .execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    admin
+        .execute(&format!("DROP ROLE {deployer}"))
+        .await
+        .expect("drop the role");
+}
+
 /// ADR-0009 §4: on this engine the dependency refusal is the ordinary case, and
 /// the enumeration is over **every** reverse `pg_depend` edge and not only
 /// modules.
@@ -5548,9 +5628,11 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
     }
 
     let g: pbps_model::ModuleId = format!("{s}.g(integer)").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
     let found = pbps_pg::modules::dependents(&mut conn, &g, pbps_model::ModuleKind::Function)
         .await
         .expect("read the dependents");
+    rollback(&mut conn).await;
     let described: Vec<&str> = found.iter().map(|d| d.described.as_str()).collect();
     assert_eq!(
         described,
@@ -5626,6 +5708,18 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         "these are what a plan has to drop before the rebuild and create after it"
     );
 
+    // Outside a transaction the answer would be true when it was given and
+    // stale by the `DROP`, and the canonical `search_path` it pins is set
+    // `is_local` — which outside one does nothing at all, so the descriptions
+    // would be worded by whatever path the operator's session held.
+    let unheld = pbps_pg::modules::dependents(&mut conn, &g, pbps_model::ModuleKind::Function)
+        .await
+        .expect_err("a dependency read with no transaction to hold it");
+    assert!(
+        format!("{unheld}").contains("inside the transaction"),
+        "{unheld}"
+    );
+
     // And the engine names the same objects, which is the failure a plan
     // without this reader would be applyable straight into.
     let engine = conn
@@ -5646,9 +5740,11 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         conn.execute(&sql).await.expect("the views");
     }
     let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
     let on_the_view = pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
         .await
         .expect("read the dependents");
+    rollback(&mut conn).await;
     assert_eq!(
         on_the_view
             .iter()
@@ -5700,9 +5796,11 @@ async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_
     }
 
     let dep_f: pbps_model::ModuleId = format!("{s}.dep_f(integer)").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
     let edges = pbps_pg::modules::dependents(&mut conn, &dep_f, pbps_model::ModuleKind::Function)
         .await
         .expect("read the dependents");
+    rollback(&mut conn).await;
     assert!(
         edges.is_empty(),
         "the catalog records nothing for a plpgsql caller: {edges:?}"

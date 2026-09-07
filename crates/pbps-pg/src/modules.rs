@@ -209,27 +209,52 @@ async fn serialize(
             let Some(oid) = module_oid(conn, id, kind).await? else {
                 return Ok(Serialized::Not(format!("`{id}` is not in the catalog")));
             };
-            match conn
+            // Inside a savepoint, because a failed statement dooms a
+            // PostgreSQL transaction and this one is *expected* to fail for
+            // the accounts this tool is built for. **Measured**, as the
+            // non-superuser owner of the function:
+            //
+            // ```text
+            // BEGIN; SELECT … FROM pg_proc … FOR UPDATE;
+            //     ERROR:  permission denied for table pg_proc
+            // SELECT 1;
+            //     ERROR:  current transaction is aborted, commands ignored …
+            // ```
+            //
+            // Without it the attempt to serialize destroys the transaction it
+            // was protecting, and every read after it fails — so a rebuild
+            // that could perfectly well have gone ahead unserialized is
+            // refused instead. `ROLLBACK TO SAVEPOINT` un-dooms it, which is
+            // the same device ADR-0009 §3 measured for a different question.
+            conn.execute("SAVEPOINT pbps_routine_lock").await?;
+            let taken = conn
                 .query_with(
-                    "SELECT p.oid::int8 AS oid FROM pg_catalog.pg_proc p WHERE p.oid = ($1::int8)::oid \
-                     FOR UPDATE",
+                    "SELECT p.oid::int8 AS oid FROM pg_catalog.pg_proc p \
+                     WHERE p.oid = ($1::int8)::oid FOR UPDATE",
                     &[Param::I64(oid)],
                 )
-                .await
-            {
-                Ok(_) => Ok(Serialized::By(
-                    "a row lock on the routine's `pg_proc` entry",
-                )),
+                .await;
+            match taken {
+                Ok(_) => {
+                    conn.execute("RELEASE SAVEPOINT pbps_routine_lock").await?;
+                    Ok(Serialized::By(
+                        "a row lock on the routine's `pg_proc` entry",
+                    ))
+                }
                 // Not an error to the caller: refusing here would refuse every
                 // routine edit, since §3 makes them all rebuilds. The residual
                 // is named where the reviewer sees it instead.
-                Err(e) => Ok(Serialized::Not(format!(
-                    "this rebuild is not serialized: a routine is not a relation, so the only \
-                     lock that would serialize it is a row lock on its `pg_proc` entry, and this \
-                     account cannot take one ({e}). A concurrent `ALTER FUNCTION` between this \
-                     read and the `DROP` is reverted by the rebuild, and pbps cannot stop it \
-                     without privileges it should not need (ADR-0009 §3)"
-                ))),
+                Err(e) => {
+                    conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock")
+                        .await?;
+                    Ok(Serialized::Not(format!(
+                        "this rebuild is not serialized: a routine is not a relation, so the \
+                         only lock that would serialize it is a row lock on its `pg_proc` entry, \
+                         and this account cannot take one ({e}). A concurrent `ALTER FUNCTION` \
+                         between this read and the `DROP` is reverted by the rebuild, and pbps \
+                         cannot stop it without privileges it should not need (ADR-0009 §3)"
+                    )))
+                }
             }
         }
     }
@@ -509,8 +534,10 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
                   connection has none open.\nWhat it reads is what a `DROP` is about to destroy, \
                   and it takes the object's lock so that nothing changes between the read and the \
                   `DROP`. Outside a transaction the lock is released at the end of the statement \
-                  that took it, so the answer would be true when it was given and unenforced \
-                  afterwards (ADR-0009 §3)."
+                  that took it, and the canonical `search_path` these reads pin is set \
+                  `is_local` and does nothing at all — so the answer would be true when it was \
+                  given, unenforced afterwards, and worded by whatever path the session happened \
+                  to hold (ADR-0009 §3)."
             .to_owned(),
     })
 }
@@ -684,11 +711,22 @@ impl Dependent {
 ///
 /// `deptype <> 'i'` because an object's own internal edges are not dependents:
 /// a view's `_RETURN` rule and its row type both point at the view itself.
+///
+/// **Inside the caller's transaction, like [`before_a_rebuild`], and for two
+/// reasons that both matter.** The answer has to hold until the `DROP` — a
+/// dependent created between this read and the rebuild is one the plan does not
+/// account for, which is the applyable-and-predictably-fails outcome SPEC §7.5
+/// exists to prevent. And the canonical `search_path` these reads pin is set
+/// `is_local`, which outside a transaction is a statement that quietly does
+/// nothing: `pg_describe_object` and `format_type` qualify a name only when it
+/// is not visible on the path, so the descriptions would silently become
+/// whatever the operator's session made them.
 pub async fn dependents(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,
 ) -> Result<Vec<Dependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
     conn.query(CANONICAL_PATH).await?;
     let Some(oid) = module_oid(conn, id, kind).await? else {
         return Ok(Vec::new());
