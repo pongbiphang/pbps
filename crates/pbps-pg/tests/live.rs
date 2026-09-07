@@ -1357,6 +1357,18 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.pointing (x integer, y integer,
                  CONSTRAINT pointing_fk FOREIGN KEY (x, y)
                      REFERENCES {s}.quoted (x, \"a)b\"));
+             CREATE TABLE {s}.guarded (id integer PRIMARY KEY);
+             ALTER TABLE {s}.guarded ENABLE ROW LEVEL SECURITY;
+             CREATE UNLOGGED TABLE {s}.volatile_ (id integer);
+             CREATE TABLE {s}.collated (a text, b text COLLATE \"C\");
+             CREATE INDEX collated_pat ON {s}.collated (a text_pattern_ops);
+             CREATE TABLE {s}.bounded (
+                 id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
+             CREATE TABLE {s}.setnull (a integer, b integer,
+                 CONSTRAINT setnull_fk FOREIGN KEY (a) REFERENCES {s}.odd (id)
+                     ON DELETE SET NULL (a));
+             CREATE TABLE {s}.covering (a integer, b integer,
+                 CONSTRAINT covering_pk PRIMARY KEY (a) INCLUDE (b));
              CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
@@ -1366,7 +1378,15 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     .await;
 
     let pulled = pull(&mut conn).await;
-    let all = pulled.warnings.join("\n");
+    // This suite's own schema only. `warnings` covers the whole database, so
+    // joining all of them lets another session's table — or this suite's own
+    // leftovers from a run that crashed before its `DROP SCHEMA` — satisfy an
+    // expectation that the fixture below no longer produces.
+    let all = ours_limitations(&pulled, &s)
+        .iter()
+        .map(|l| l.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Each of these is a fact about the database that the pull cannot carry,
     // and each has to reach the operator.
@@ -1400,6 +1420,23 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "NULLS NOT DISTINCT",
         // An index the planner will not use.
         "indisvalid = false",
+        // A table whose rows are not all a reader's to see.
+        "row-level security",
+        // A table that does not survive a crash.
+        "UNLOGGED",
+        // A collation that decides which values compare equal. Named down to
+        // the column and out to the collation itself: the operator-class
+        // message says `COLLATE` too, and the table is named schema-qualified,
+        // so a bare "`collated`" matches nothing.
+        ".collated`.`b` is `COLLATE \"C\"`",
+        // An identity that runs out, or wraps, somewhere else.
+        "and cycles",
+        // A `SET NULL` that names its columns.
+        "ON DELETE SET",
+        // An operator class that is not the column's own.
+        "operator class",
+        // A key constraint whose index covers more than its key.
+        "INCLUDE",
         // The sequence a `serial` owns and this model cannot hold.
         "serialised`.`id` defaults from the sequence",
         // A check the rows already there were never checked against, and a
@@ -1461,6 +1498,31 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .is_empty(),
         "an index the planner will not use is not an index"
     );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")]
+            .indexes
+            .is_empty(),
+        "an index ordered by an operator class the model cannot hold is left out"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "setnull")]
+            .foreign_keys
+            .is_empty()
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "covering")]
+            .primary_key
+            .is_none(),
+        "a key constraint whose index covers more than its key is left out"
+    );
+    // A collated column is carried — the type is what the model says — and the
+    // collation beside it is named.
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")].columns["b"]
+            .ty
+            .to_string(),
+        "text"
+    );
     // A `serial`'s column is carried — an `integer` with a `nextval` default,
     // which is exactly what the model says — and the sequence beside it named.
     let serialised = &pulled.schema.tables[&pbps_model::TableName::new(&s, "serialised")];
@@ -1495,6 +1557,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         [
             // The inheritance parent is an ordinary table and stays.
             pbps_model::TableName::new(&s, "ancestor"),
+            pbps_model::TableName::new(&s, "bounded"),
+            pbps_model::TableName::new(&s, "collated"),
+            pbps_model::TableName::new(&s, "covering"),
             pbps_model::TableName::new(&s, "full_match"),
             pbps_model::TableName::new(&s, "half_built"),
             pbps_model::TableName::new(&s, "nulls"),
@@ -1504,20 +1569,37 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "quoted"),
             pbps_model::TableName::new(&s, "restricted"),
             pbps_model::TableName::new(&s, "serialised"),
+            pbps_model::TableName::new(&s, "setnull"),
             pbps_model::TableName::new(&s, "unchecked"),
         ],
-        "the partitioned table, the inheritance child and this tool's own \
-         tables are not in the pull"
+        "the partitioned table, the inheritance child, the row-level-secured \
+         table, the UNLOGGED table and this tool's own tables are not in the \
+         pull"
     );
 
     // Every limitation names its table, so a caller can tell drift inside the
-    // managed set from a fact about somebody else's.
-    for limitation in ours_limitations(&pulled, &s) {
-        assert!(
-            pulled.schema.tables.contains_key(&limitation.table),
-            "{limitation:?} names a table that is not in the pull"
-        );
-    }
+    // managed set from a fact about somebody else's — and the only tables a
+    // limitation names that are *not* in the pull are the ones the pull refused
+    // whole. "Absent" and "named but left out" are the two answers that must
+    // not be confused; a table missing from both lists would be silence.
+    let mut refused: Vec<_> = ours_limitations(&pulled, &s)
+        .iter()
+        .map(|l| l.table.clone())
+        .filter(|t| !pulled.schema.tables.contains_key(t))
+        .collect();
+    refused.sort();
+    refused.dedup();
+    assert_eq!(
+        refused,
+        vec![
+            pbps_model::TableName::new(&s, "descendant"),
+            pbps_model::TableName::new(&s, "guarded"),
+            pbps_model::TableName::new(&s, "parted"),
+            pbps_model::TableName::new(&s, "volatile_"),
+        ],
+        "a limitation about a table that is in the pull must name it, and the \
+         tables left out whole must each earn one"
+    );
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

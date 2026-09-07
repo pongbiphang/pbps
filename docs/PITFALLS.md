@@ -882,6 +882,19 @@ three ways a state can be unreadable rather than one row asserted about twice.
   findings" from the truncated page. Not code, but the same shape as every
   entry in section 1, and the reason this bullet is here: **a paginated read
   that does not check `hasNextPage` is an absence, not an emptiness.**
+- A live introspection test that asserted over `pulled.warnings` — every
+  warning in the **whole database**. The shared test server carries the probe
+  schemas of every run that crashed before its `DROP SCHEMA`, so an expectation
+  the current fixture no longer produced was still satisfied, by a schema
+  written by an older build of the same test. Two of its expectations had also
+  drifted out of matching the message they named (`` `collated` `` where the
+  message says `` `schema.collated` ``, and a trailing backtick where the
+  message says `COLLATE "C"`), and neither showed. **A live assertion scoped to
+  the server rather than to the fixture is answered by whatever else is on the
+  server.** Scoped to this suite's own schema, both drifts failed at once — and
+  a third thing fell out: a table the pull refuses whole earned a warning but no
+  `Limitation`, so the list that names a table said nothing about the tables
+  nothing could be said about.
 - A format-version test asserting `json.contains(r#""version":1"#)` on a
   serialized state snapshot — which embeds an ids file whose own version is 1.
   It matched the *nested* field and went on passing through the bumps to 2, 3

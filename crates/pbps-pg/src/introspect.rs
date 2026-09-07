@@ -33,6 +33,21 @@
 //!   What recreating it would change is which rows get checked, and that is a
 //!   plan that fails on apply rather than one that lies.
 //!
+//! # This list is sampled, not derived
+//!
+//! Everything below is a feature this model cannot hold, found one at a time —
+//! several of them by review rather than by this code. That is the wrong shape
+//! and it is knowingly the wrong shape: **enumerating what a model cannot hold
+//! is an open set, and proving what it did hold is a closed one.** The next
+//! engine release adds to the first list without touching the second;
+//! `pg_constraint.contype = 'n'` is exactly that, having arrived in PostgreSQL
+//! 18.
+//!
+//! The closed form needs an emitter to render an object back and compare it
+//! against the engine's own text, so it belongs with Phase 5 step 4 and is
+//! issue #168. Until then, every rule here is one a reader can check, and each
+//! message names the fact rather than the flag.
+//!
 //! **It must not un-respell anything** (ADR-0009 §2). PostgreSQL rewrites what
 //! it was given — `'x'` becomes `'x'::character varying`, `CHECK (amount >= 0)`
 //! becomes `CHECK ((amount >= (0)::numeric))` — and the state's `declared`
@@ -84,6 +99,8 @@ pub struct RawColumn {
     /// `pg_depend` entry is `deptype = 'a'`. An identity's sequence is not
     /// here: that one is part of the column, and arrives as [`RawIdentity`].
     pub owned_sequence: Option<String>,
+    /// The column's collation, when it is not the one its type carries.
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +109,10 @@ pub struct RawIdentity {
     pub always: bool,
     pub seed: i64,
     pub increment: i64,
+    /// The rest of the sequence, which [`Identity`] has nowhere to put.
+    pub min: i64,
+    pub max: i64,
+    pub cycles: bool,
 }
 
 /// One row of `pg_constraint`, whatever its kind.
@@ -134,6 +155,9 @@ pub struct RawConstraint {
     /// `confmatchtype`: `s` MATCH SIMPLE (the default), `f` MATCH FULL,
     /// `p` MATCH PARTIAL (which this engine does not implement).
     pub match_type: char,
+    /// `confdelsetcols`: the columns an `ON DELETE SET NULL (a, b)` touches.
+    /// Empty for the ordinary form, which touches all of them.
+    pub delete_set_columns: Vec<i32>,
     /// `conindid`: the index this constraint is enforced by, if any. It is how
     /// a unique index that *is* a constraint is told from one that is not.
     pub index_oid: Option<i64>,
@@ -167,6 +191,11 @@ pub struct RawIndex {
     pub has_expressions: bool,
     /// `amname`: `btree`, `hash`, `gin`, …
     pub method: String,
+    /// Whether any key column uses an operator class that is not its type's
+    /// default, or a collation that is not the column's own — `text_pattern_ops`
+    /// and `COLLATE "C"`. Computed in the query, because what "default" means
+    /// is a catalog lookup rather than a fact about the row.
+    pub nondefault_column_options: bool,
 }
 
 /// Everything one pull read, before any of it is interpreted.
@@ -226,6 +255,29 @@ fn action_name(c: char) -> &'static str {
     }
 }
 
+/// The answers the whole pull shares, built once before any table is
+/// assembled.
+///
+/// A struct rather than four parameters: each is a question one arm asks, and
+/// the alternative was a signature long enough that adding the next one would
+/// mean reading every call site to see what moved.
+struct Lookups<'a> {
+    /// Every table in the pull, by oid — a foreign key's target.
+    tables: HashMap<i64, TableName>,
+    /// Every column in the pull, by table and attnum. A foreign key's
+    /// `confkey` names attnums on the **referenced** table, which the
+    /// constrained table's own map cannot answer for (DECISIONS 250).
+    columns: HashMap<(i64, i32), &'a str>,
+    /// The indexes that admit at most one null key. A unique constraint is
+    /// enforced by an index, so this is a property of the constraint too, and
+    /// the constraint arm cannot see the index.
+    nulls_not_distinct: BTreeSet<i64>,
+    /// The indexes that carry an `INCLUDE` payload, for the same reason: a key
+    /// constraint's payload lives on its backing index and nowhere in
+    /// `pg_constraint`.
+    covering: BTreeSet<i64>,
+}
+
 /// Everything a table's own assembly needs, gathered once.
 struct Parts<'a> {
     name: TableName,
@@ -254,22 +306,32 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut pulled = Pulled::default();
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
-    // Every table's columns, by (table, attnum). A foreign key's `confkey`
-    // names attnums on the **referenced** table, which the constrained table's
-    // own map cannot answer for — and the definition text cannot either, as a
-    // quoted identifier may contain the `)` a parse would stop at.
-    let by_table_and_attnum: HashMap<(i64, i32), &str> = raw
-        .columns
-        .iter()
-        .map(|c| ((c.table_oid, c.attnum), c.name.as_str()))
-        .collect();
+    let lookups = Lookups {
+        tables: raw
+            .tables
+            .iter()
+            .map(|t| (t.oid, TableName::new(&t.schema, &t.name)))
+            .collect(),
+        columns: raw
+            .columns
+            .iter()
+            .map(|c| ((c.table_oid, c.attnum), c.name.as_str()))
+            .collect(),
+        nulls_not_distinct: raw
+            .indexes
+            .iter()
+            .filter(|i| i.nulls_not_distinct)
+            .map(|i| i.oid)
+            .collect(),
+        covering: raw
+            .indexes
+            .iter()
+            .filter(|i| i.columns.len() > i.key_count)
+            .map(|i| i.oid)
+            .collect(),
+    };
     let constraints_by_table = group(&raw.constraints, |c| c.table_oid);
     let indexes_by_table = group(&raw.indexes, |i| i.table_oid);
-    let table_names: HashMap<i64, TableName> = raw
-        .tables
-        .iter()
-        .map(|t| (t.oid, TableName::new(&t.schema, &t.name)))
-        .collect();
 
     // An index that enforces a constraint is that constraint, and reporting it
     // again under `indexes:` would make every primary key look like a primary
@@ -277,15 +339,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // remove, by dropping an index the engine will not let go of.
     let constraint_indexes: BTreeSet<i64> =
         raw.constraints.iter().filter_map(|c| c.index_oid).collect();
-    // A unique constraint is enforced by an index, so `NULLS NOT DISTINCT` on
-    // that index is a property of the constraint. The constraint arm cannot see
-    // the index, so the set is built here.
-    let nulls_not_distinct: BTreeSet<i64> = raw
-        .indexes
-        .iter()
-        .filter(|i| i.nulls_not_distinct)
-        .map(|i| i.oid)
-        .collect();
 
     for raw_table in &raw.tables {
         let name = TableName::new(&raw_table.schema, &raw_table.name);
@@ -312,15 +365,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .get(&raw_table.oid)
             .map_or(&[][..], Vec::as_slice)
         {
-            add_constraint(
-                constraint,
-                &parts,
-                &table_names,
-                &by_table_and_attnum,
-                &nulls_not_distinct,
-                &mut table,
-                &mut pulled,
-            );
+            add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
         }
         for index in indexes_by_table
             .get(&raw_table.oid)
@@ -426,6 +471,24 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         );
     }
 
+    // A collation decides comparison, ordering and therefore which values a
+    // unique key calls equal. Read back as an ordinary column, one collated
+    // `"C"` compares equal to one that is not, and a recreated table accepts a
+    // different set of values.
+    if let Some(collation) = &raw.collation {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "column `{}`.`{}` is `COLLATE \"{collation}\"`, and this model holds only the \
+                 type. Read back it is a column with the type's own collation, which orders and \
+                 compares differently — so a unique key over it accepts a different set of \
+                 values.",
+                parts.name, raw.name
+            ),
+        );
+    }
+
     let identity = raw.identity.map(|id| {
         if !id.always {
             note(
@@ -436,6 +499,30 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                      only the seed and the increment. Read back it is indistinguishable from \
                      `GENERATED ALWAYS`, which is the one a plan would emit.",
                     parts.name, raw.name
+                ),
+            );
+        }
+        // The bounds this engine gives a sequence the model does not spell
+        // (`types::identity_seed_range`) are the ones a plan would recreate.
+        // Anything else — a `MINVALUE`, a `MAXVALUE`, a `CYCLE` — reads back as
+        // an identity that runs out, or wraps, somewhere else.
+        let expected = types::identity_seed_range(&ty, id.increment);
+        let bounds_are_the_default =
+            expected.is_some_and(|range| id.min == *range.start() && id.max == *range.end());
+        if !bounds_are_the_default || id.cycles {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "column `{}`.`{}` has an `identity:` whose sequence runs {}..={}{}, and this \
+                     model holds only the seed and the increment. Read back it is an identity \
+                     with this engine's default bounds, which runs out — or wraps — somewhere \
+                     else.",
+                    parts.name,
+                    raw.name,
+                    id.min,
+                    id.max,
+                    if id.cycles { " and cycles" } else { "" }
                 ),
             );
         }
@@ -461,9 +548,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
 fn add_constraint(
     raw: &RawConstraint,
     parts: &Parts,
-    table_names: &HashMap<i64, TableName>,
-    by_table_and_attnum: &HashMap<(i64, i32), &str>,
-    nulls_not_distinct: &BTreeSet<i64>,
+    lookups: &Lookups,
     table: &mut Table,
     pulled: &mut Pulled,
 ) {
@@ -476,12 +561,34 @@ fn add_constraint(
         // A key whose check can be put off is a different key, and the model
         // holds neither word. Named on every kind that can carry it, before
         // the kind's own arm decides what to do with the rest of it.
+        // A key constraint whose backing index carries an `INCLUDE` payload.
+        // `PrimaryKey` and `UniqueConstraint` hold their key columns and
+        // nothing else, so the payload cannot be read back — and it is the
+        // reason the index exists in the shape it does.
+        'p' | 'u'
+            if raw
+                .index_oid
+                .is_some_and(|oid| lookups.covering.contains(&oid)) =>
+        {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is enforced by an index with an `INCLUDE` payload, \
+                     and this model holds a key constraint's key columns and nothing else. Read \
+                     back it is the same constraint over a narrower index, so it is left out \
+                     rather than read back as one that covers less than it does.",
+                    raw.name, parts.name
+                ),
+            );
+        }
+
         // A unique key whose index admits more than one null key is a
         // different key, and the model holds only "unique".
         'p' | 'u'
             if raw
                 .index_oid
-                .is_some_and(|oid| nulls_not_distinct.contains(&oid)) =>
+                .is_some_and(|oid| lookups.nulls_not_distinct.contains(&oid)) =>
         {
             note(
                 pulled,
@@ -575,7 +682,7 @@ fn add_constraint(
             );
         }
 
-        'f' => add_foreign_key(raw, parts, table_names, by_table_and_attnum, table, pulled),
+        'f' => add_foreign_key(raw, parts, lookups, table, pulled),
 
         'x' => note(
             pulled,
@@ -603,8 +710,7 @@ fn add_constraint(
 fn add_foreign_key(
     raw: &RawConstraint,
     parts: &Parts,
-    table_names: &HashMap<i64, TableName>,
-    by_table_and_attnum: &HashMap<(i64, i32), &str>,
+    lookups: &Lookups,
     table: &mut Table,
     pulled: &mut Pulled,
 ) {
@@ -626,7 +732,10 @@ fn add_foreign_key(
         );
     }
 
-    let Some(references_table) = raw.ref_table.and_then(|oid| table_names.get(&oid)).cloned()
+    let Some(references_table) = raw
+        .ref_table
+        .and_then(|oid| lookups.tables.get(&oid))
+        .cloned()
     else {
         note(
             pulled,
@@ -639,6 +748,24 @@ fn add_foreign_key(
         );
         return;
     };
+
+    // `ON DELETE SET NULL (a)` nulls one column; the model's `SetNull` nulls
+    // every referencing column. Read back as the ordinary form, recreating the
+    // key turns a targeted write into a wholesale one.
+    if !raw.delete_set_columns.is_empty() {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "foreign key `{}` on `{}` names the columns its `ON DELETE SET` action touches, \
+                 and this model holds only the action. Read back it would null or default every \
+                 referencing column instead of the named ones, so it is left out. Its definition \
+                 is `{}`.",
+                raw.name, parts.name, raw.definition
+            ),
+        );
+        return;
+    }
 
     // MATCH SIMPLE is the default and the only one this model can mean.
     // MATCH FULL refuses a row whose referencing columns are partly null,
@@ -678,7 +805,7 @@ fn add_foreign_key(
 
     // The referenced columns are attnums **on the other table**, resolved
     // against that table's own columns.
-    let references_columns = match reference_columns(raw, by_table_and_attnum) {
+    let references_columns = match reference_columns(raw, &lookups.columns) {
         Some(names) => names,
         None => {
             note(
@@ -809,6 +936,21 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         );
         return;
     }
+    if raw.nondefault_column_options {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` orders a column by an operator class or a collation that is \
+                 not its type's own — `text_pattern_ops` and `COLLATE \"C\"` are the two that \
+                 come up — and `IndexColumn` holds only the name and the direction. Read back it \
+                 is an ordinary index, which answers different queries and compares different \
+                 values equal, so it is left out.",
+                raw.name, parts.name
+            ),
+        );
+        return;
+    }
     if raw.nulls_not_distinct {
         note(
             pulled,
@@ -930,6 +1072,7 @@ mod tests {
             identity: None,
             generated: false,
             owned_sequence: None,
+            collation: None,
         }
     }
 
@@ -949,6 +1092,7 @@ mod tests {
             definition: String::new(),
             expression: None,
             match_type: 's',
+            delete_set_columns: Vec::new(),
             index_oid: None,
         }
     }
@@ -969,6 +1113,7 @@ mod tests {
             filter: None,
             has_expressions: false,
             method: "btree".to_owned(),
+            nondefault_column_options: false,
         }
     }
 
@@ -1315,6 +1460,9 @@ mod tests {
                 always,
                 seed: 5,
                 increment: 2,
+                min: 1,
+                max: i64::from(i32::MAX),
+                cycles: false,
             });
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
@@ -1592,6 +1740,138 @@ mod tests {
         );
         assert_eq!(pulled.limitations.len(), 1);
         assert!(pulled.warnings[0].contains("t_id_seq"));
+    }
+
+    /// A collation decides which values compare equal, so a unique key over a
+    /// collated column accepts a different set of them. The column is carried
+    /// — it is the type the model says — and the collation is named.
+    #[test]
+    fn a_column_collated_other_than_its_type_is_named() {
+        let mut column = col(1, 1, "name", "text");
+        column.collation = Some("C".to_owned());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![column],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(only(&pulled).columns["name"].ty.to_string(), "text");
+        assert_eq!(pulled.limitations.len(), 1);
+        assert!(pulled.warnings[0].contains("COLLATE"));
+    }
+
+    /// `Identity` holds a seed and an increment. The rest of the sequence —
+    /// where it stops, whether it wraps — reads back as this engine's defaults,
+    /// which run out somewhere else.
+    #[test]
+    fn an_identity_whose_sequence_is_not_the_default_one_is_named() {
+        let default_max = i64::from(i32::MAX);
+        for (min, max, cycles, reported) in [
+            (1, default_max, false, false),
+            (5, 99, false, true),
+            (1, default_max, true, true),
+            (1, 99, false, true),
+        ] {
+            let mut column = col(1, 1, "id", "integer");
+            column.nullable = false;
+            column.identity = Some(RawIdentity {
+                always: true,
+                seed: 1,
+                increment: 1,
+                min,
+                max,
+                cycles,
+            });
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![column],
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            assert_eq!(
+                !pulled.warnings.is_empty(),
+                reported,
+                "{min}..={max} cycles={cycles}: {:?}",
+                pulled.warnings
+            );
+            assert!(only(&pulled).columns["id"].identity.is_some());
+        }
+    }
+
+    /// `ON DELETE SET NULL (a)` nulls one column; `SetNull` nulls all of them.
+    #[test]
+    fn a_foreign_key_whose_set_action_names_columns_is_left_out_and_named() {
+        let mut fk = constraint(1, "t_fk", 'f');
+        fk.columns = vec![1, 2];
+        fk.ref_columns = vec![1, 2];
+        fk.ref_table = Some(2);
+        fk.on_delete = 'n';
+        fk.delete_set_columns = vec![1];
+        fk.definition =
+            "FOREIGN KEY (a, b) REFERENCES app.other(x, y) ON DELETE SET NULL (a)".to_owned();
+        let raw = RawCatalog {
+            tables: vec![table(1, "t"), table(2, "other")],
+            columns: vec![
+                col(1, 1, "a", "integer"),
+                col(1, 2, "b", "integer"),
+                col(2, 1, "x", "integer"),
+                col(2, 2, "y", "integer"),
+            ],
+            constraints: vec![fk],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "t")]
+                .foreign_keys
+                .is_empty()
+        );
+        assert!(pulled.warnings[0].contains("ON DELETE SET"));
+    }
+
+    /// `text_pattern_ops` and `COLLATE "C"` answer different queries and
+    /// compare different values equal, and `IndexColumn` holds a name and a
+    /// direction.
+    #[test]
+    fn an_index_ordered_by_something_other_than_its_columns_own_is_left_out() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.nondefault_column_options = true;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "text")],
+            constraints: Vec::new(),
+            indexes: vec![ix],
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(pulled.warnings[0].contains("operator class"));
+    }
+
+    /// A key constraint's `INCLUDE` payload lives on its backing index and
+    /// nowhere in `pg_constraint`. The index is skipped because it *is* the
+    /// constraint, so without this the payload goes with it.
+    #[test]
+    fn a_key_constraint_whose_index_covers_more_than_its_key_is_left_out() {
+        let mut pk = constraint(1, "t_pk", 'p');
+        pk.columns = vec![1];
+        pk.index_oid = Some(50);
+        let mut backing = index(50, 1, "t_pk");
+        backing.unique = true;
+        backing.primary = true;
+        backing.key_count = 1;
+        backing.columns = vec![1, 2];
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer"), col(1, 2, "b", "integer")],
+            constraints: vec![pk],
+            indexes: vec![backing],
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).primary_key.is_none());
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(pulled.warnings[0].contains("INCLUDE"));
     }
 
     /// Every limitation carries its table, so a caller can tell drift inside

@@ -26,8 +26,11 @@
 
 use pbps_db::{Conn, DbError, Row};
 
+use pbps_model::TableName;
+
 use crate::introspect::{
-    Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawTable, assemble,
+    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawTable,
+    assemble,
 };
 
 /// The schemas that are never a project's.
@@ -57,6 +60,8 @@ fn tables_query() -> String {
         AND {NOT_A_PROJECTS_SCHEMA}
         AND c.relname NOT LIKE '\\_\\_pbps\\_%'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
+        AND NOT c.relrowsecurity
+        AND c.relpersistence = 'p'
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -71,14 +76,17 @@ fn tables_query() -> String {
 /// its own and plan a table that has them locally instead of by inheritance.
 fn partitioned_query() -> String {
     format!(
-        "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind
+        "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
+            c.relrowsecurity AS row_security, c.relpersistence::text AS persistence
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE {NOT_A_PROJECTS_SCHEMA}
         AND c.relname NOT LIKE '\\_\\_pbps\\_%'
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
-                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)))
+                 AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
+                      OR c.relrowsecurity
+                      OR c.relpersistence <> 'p')))
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -110,10 +118,16 @@ fn columns_query() -> String {
             s.seqstart::int8 AS seq_start,
             s.seqincrement::int8 AS seq_increment,
             dep.deptype::text AS sequence_dependency,
-            seq.relname AS sequence_name
+            seq.relname AS sequence_name,
+            s.seqmin::int8 AS seq_min, s.seqmax::int8 AS seq_max, s.seqcycle AS seq_cycle,
+            CASE WHEN a.attcollation <> ty.typcollation
+                 THEN (SELECT co.collname FROM pg_catalog.pg_collation co
+                        WHERE co.oid = a.attcollation)
+            END AS collation
        FROM pg_catalog.pg_attribute a
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN (pg_catalog.pg_depend dep
                   JOIN pg_catalog.pg_class seq
@@ -144,6 +158,7 @@ fn constraints_query() -> String {
             pg_catalog.pg_get_constraintdef(con.oid) AS definition,
             pg_catalog.pg_get_expr(con.conbin, con.conrelid) AS expression,
             con.confmatchtype::text AS match_type,
+            pg_catalog.array_to_string(con.confdelsetcols, ',') AS delete_set_columns,
             con.conindid::int8 AS index_oid
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
@@ -170,7 +185,21 @@ fn indexes_query() -> String {
             replace(i.indoption::text, ' ', ',') AS options,
             pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS filter,
             i.indexprs IS NOT NULL AS has_expressions,
-            am.amname AS method
+            am.amname AS method,
+            EXISTS (
+              SELECT 1 FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+               WHERE i.indclass[k.n - 1] <> (
+                       SELECT oc.oid FROM pg_catalog.pg_opclass oc
+                        WHERE oc.opcmethod = ic.relam
+                          AND oc.opcintype = (SELECT a.atttypid FROM pg_catalog.pg_attribute a
+                                               WHERE a.attrelid = i.indrelid
+                                                 AND a.attnum = i.indkey[k.n - 1])
+                          AND oc.opcdefault)
+                  OR (i.indcollation[k.n - 1] <> 0
+                      AND i.indcollation[k.n - 1] <> (
+                            SELECT a.attcollation FROM pg_catalog.pg_attribute a
+                             WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]))
+            ) AS nondefault_column_options
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -228,31 +257,48 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     let mut pulled = assemble(&raw.0);
     // Prepended: a table the model cannot hold at all is the thing a reader
     // most needs to see, and it is not about any table in the schema.
-    let mut warnings = raw.1;
+    //
+    // Recorded as a `Limitation` as well as a warning, for the same reason
+    // every other one is: a caller that asks "what could this pull not say
+    // about this table?" must not be told "nothing" about the tables it could
+    // not say anything about at all. The two lists stay one-to-one.
+    let mut warnings: Vec<String> = raw.1.iter().map(|l| l.detail.clone()).collect();
     warnings.append(&mut pulled.warnings);
     pulled.warnings = warnings;
+    let mut limitations = raw.1;
+    limitations.append(&mut pulled.limitations);
+    pulled.limitations = limitations;
     Ok(pulled)
 }
 
-async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError> {
+async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbError> {
     conn.query(CANONICAL_PATH).await?;
 
     let mut warnings = Vec::new();
     for row in conn.query(&partitioned_query()).await? {
         let schema = text(&row, "schema_name")?;
         let name = text(&row, "table_name")?;
+        // An `r` reaches here for one of three reasons, and the message has to
+        // say which: none of them is visible in `relkind`.
         let kind = match text(&row, "kind")?.as_str() {
             "p" => "a partitioned table",
             "f" => "a foreign table",
-            // The only `r` this query returns is an inheritance child.
+            "r" if flag(&row, "row_security")? => {
+                "a table with row-level security enabled, whose policies this model does not hold"
+            }
+            "r" if text(&row, "persistence")? == "u" => "an UNLOGGED table",
+            "r" if text(&row, "persistence")? == "t" => "a temporary table",
             "r" => "a table that inherits from another",
             other => &format!("a relation of kind `{other}`"),
         };
-        warnings.push(format!(
-            "`{schema}.{name}` is {kind}, which this model does not hold. It is left out of the \
-             pull entirely — not read back as an ordinary table, which would make a plan that \
-             recreates it without what makes it one."
-        ));
+        warnings.push(Limitation {
+            table: TableName::new(&schema, &name),
+            detail: format!(
+                "`{schema}.{name}` is {kind}, which this model does not hold. It is left out of \
+                 the pull entirely — not read back as an ordinary table, which would make a plan \
+                 that recreates it without what makes it one."
+            ),
+        });
     }
 
     let mut raw = RawCatalog::default();
@@ -273,6 +319,9 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
                 // engine will accept back (see `types::identity_seed_range`).
                 seed: number(&row, "seq_start")?,
                 increment: number(&row, "seq_increment")?,
+                min: number(&row, "seq_min")?,
+                max: number(&row, "seq_max")?,
+                cycles: flag(&row, "seq_cycle")?,
             }),
             _ => None,
         };
@@ -293,6 +342,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             identity,
             generated: first_char(&text(&row, "generated")?).is_some(),
             owned_sequence,
+            collation: optional_text(&row, "collation")?,
         });
     }
     for row in conn.query(&constraints_query()).await? {
@@ -313,6 +363,9 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             definition: text(&row, "definition")?,
             expression: optional_text(&row, "expression")?,
             match_type: first_char(&text(&row, "match_type")?).unwrap_or(' '),
+            delete_set_columns: numbers(
+                &optional_text(&row, "delete_set_columns")?.unwrap_or_default(),
+            ),
             index_oid: {
                 let oid = number(&row, "index_oid")?;
                 (oid != 0).then_some(oid)
@@ -335,6 +388,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<String>), DbError>
             filter: optional_text(&row, "filter")?,
             has_expressions: flag(&row, "has_expressions")?,
             method: text(&row, "method")?,
+            nondefault_column_options: flag(&row, "nondefault_column_options")?,
         });
     }
     Ok((raw, warnings))
