@@ -3160,12 +3160,17 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
     t.columns
         .insert("at".into(), Column::new(ty("timestamptz")));
     t.columns.insert("i".into(), Column::new(ty("interval")));
-    // Three literals, each unambiguous to the person who wrote it and each read
-    // through a different one of the three settings.
+    t.columns.insert("x".into(), Column::new(ty("integer")));
+    // One expression per setting, each unambiguous to the person who wrote it.
+    // The last two are not temporal input at all: an abbreviation is read from
+    // a dictionary `TimeZone` does not cover, and `x = NULL` is rewritten by
+    // the *parser* into a different predicate.
     for (name, expression) in [
         ("ck_d", "d >= '01/02/2026'"),
         ("ck_at", "at >= '2026-01-02 00:00'"),
         ("ck_i", "i >= '-1 2:00:00'"),
+        ("ck_abbrev", "at >= '2026-01-15 12:00:00 CST'"),
+        ("ck_null", "x = NULL"),
     ] {
         t.checks.insert(
             name.into(),
@@ -3203,12 +3208,10 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
     }
 
     // The operator's environment, as an `ALTER ROLE … SET` would leave it.
-    conn.execute(
-        "SET DateStyle = 'ISO, DMY'; SET TimeZone = 'America/New_York'; \
-         SET IntervalStyle = 'sql_standard'",
-    )
-    .await
-    .expect("the operator's settings");
+    const THEIRS: &str = "SET DateStyle = 'ISO, DMY'; SET TimeZone = 'America/New_York'; \
+         SET IntervalStyle = 'sql_standard'; SET timezone_abbreviations = 'Australia'; \
+         SET transform_null_equals = on";
+    conn.execute(THEIRS).await.expect("the operator's settings");
     run(&mut conn, &statements).await;
     // Read from a canonical session, and that is not a detail: two of these
     // three settings render on the way *out* as well as reading on the way in,
@@ -3222,7 +3225,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
     conn.execute(&format!("DROP TABLE {s}.temporal"))
         .await
         .expect("drop what the unpinned session decided");
-    conn.execute("SET TimeZone = 'America/New_York'; SET IntervalStyle = 'sql_standard'")
+    conn.execute(THEIRS)
         .await
         .expect("the operator's settings again");
 
@@ -3239,14 +3242,27 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
         .await
         .expect("drop");
 
-    // A day, an instant and a sign, all three decided by the session.
-    assert!(theirs.contains("'2026-02-01'"), "{theirs}");
-    assert!(theirs.contains("05:00:00+00"), "{theirs}");
-    assert!(theirs.contains("-1 days -02:00:00"), "{theirs}");
-    // Under the pin, one meaning, and it is the one the framing names.
-    assert!(ours.contains("'2026-01-02'"), "{ours}");
-    assert!(ours.contains("00:00:00+00"), "{ours}");
-    assert!(ours.contains("-1 days +02:00:00"), "{ours}");
+    // A day, an instant, a sign, an abbreviation fifteen and a half hours out,
+    // and a predicate that stopped being the one that was written.
+    for decided in [
+        "'2026-02-01'",
+        "2026-01-02 05:00:00+00",
+        "-1 days -02:00:00",
+        "2026-01-15 02:30:00+00",
+        "x IS NULL",
+    ] {
+        assert!(theirs.contains(decided), "{decided} not in {theirs}");
+    }
+    // Under the pin, one meaning each, and it is the one the framing names.
+    for pinned in [
+        "'2026-01-02'",
+        "2026-01-02 00:00:00+00",
+        "-1 days +02:00:00",
+        "2026-01-15 18:00:00+00",
+        "x = NULL::integer",
+    ] {
+        assert!(ours.contains(pinned), "{pinned} not in {ours}");
+    }
 }
 
 /// A type change that gains or loses the time zone is refused by name, and the

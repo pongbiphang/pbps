@@ -535,6 +535,23 @@ model can carry that text before writing the check, and ask whether the fix
 belongs on the text or on the thing reading it. A guard per carrier is a sweep
 you have to repeat every time the model grows a fourth.
 
+**And then the same shape moved to the list.** The pin went in with three
+settings — the three that decide what a *temporal* literal is — and the next
+review found a fourth, `timezone_abbreviations`, which `TimeZone = 'UTC'` does
+not cover and which puts the same declared instant fifteen and a half hours
+away. Sweeping for that one found a fifth, `transform_null_equals`, which is
+not an input function at all: it is a parser rewrite that turns
+`CHECK (x = NULL)` into `CHECK (x IS NULL)`, a different predicate from the one
+in the approved plan. Three of the five were already named by ADR-0013 §3 and
+the implementation carried the ones the case at hand had shown.
+
+The list was closed against the wrong rule. "The settings temporal input reads"
+is a category the first three fit and the next two do not; the rule the entries
+were derived from is "a setting that changes what the declared text means",
+which reaches all five and says how to test a sixth. When a list is derived,
+write the derivation next to it — a list whose rule is left implicit gets
+extended by resemblance to its existing members.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

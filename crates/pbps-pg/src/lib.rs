@@ -285,27 +285,44 @@ impl Dialect for Postgres {
     ///   that does not exist is created *silently* under `off` and fails the
     ///   first time it is called; under `on` the `CREATE` is refused.
     ///
-    /// **Three more are here for a different reason: they are constants.**
-    /// `DateStyle`, `TimeZone` and `IntervalStyle` decide what a literal
-    /// *inside* a declared expression means, and every one of the three
-    /// verbatim expressions this model holds can carry one. Measured, the same
-    /// declaration creates a different object under two settings, silently:
+    /// **The rest are here for a different reason: they are constants, and each
+    /// one decides what a declared expression *means*.** All three verbatim
+    /// expressions this model holds — a default, a check, an index filter
+    /// (ADR-0013 §3) — are text the engine reads through an input function or
+    /// a parser rule, and the same declaration then creates a different object
+    /// under two settings, silently. Measured, one row per setting:
     ///
     /// ```text
     /// CHECK (d >= '01/02/2026')       MDY -> '2026-01-02'   DMY -> '2026-02-01'
     /// CHECK (t >= '2026-01-02 00:00') UTC -> 00:00:00+00    America/New_York -> 05:00:00+00
     /// CHECK (i >= '-1 2:00:00')       postgres -> -1 days +02:00:00
     ///                                 sql_standard -> -1 days -02:00:00
+    /// CHECK (t >= '2026-01-15 12:00:00 CST')
+    ///                                 Default -> 18:00:00+00   Australia -> 02:30:00+00
+    /// CHECK (x = NULL)                off -> (x = NULL::integer)   on -> (x IS NULL)
     /// ```
     ///
-    /// The last one is the sign, which is the kind of difference nobody reads
-    /// twice. They could ride in the statement's own scope — unlike the two
-    /// above, these are read at parse *analysis*, and measured, a `SET LOCAL
+    /// One is the sign and one is the whole predicate, which are the kinds of
+    /// difference nobody reads twice. `timezone_abbreviations` is a dictionary
+    /// `TimeZone` does not cover — fifteen and a half hours apart above — and
+    /// `transform_null_equals` is not an input function at all but a *parser*
+    /// rewrite, which is why the list cannot be "the settings temporal input
+    /// reads": it is **every setting that changes what the declared text
+    /// means**, and that is the rule to extend it by.
+    ///
+    /// They could ride in the statement's own scope — unlike the two above,
+    /// these are read at parse *analysis*, and measured, a `SET LOCAL
     /// DateStyle` does reach the rest of its own batch — but they do not vary
-    /// per statement the way `search_path` does, and putting five settings and
-    /// five `RESET`s around every line of a plan would bury the SQL a reviewer
+    /// per statement the way `search_path` does, and putting seven settings and
+    /// seven `RESET`s around every line of a plan would bury the SQL a reviewer
     /// is there to read (SPEC §14.1). A constant belongs where the constants
     /// are.
+    ///
+    /// `lc_monetary` belongs to this class and is deliberately absent, for the
+    /// reason `catalog.rs` gives on the read side: `SET` fails outright on a
+    /// locale the server does not have, so pinning it would turn a database
+    /// that deploys into one that cannot. Its reach is a `money` literal, and
+    /// this dialect's type catalogue refuses `money` outright.
     ///
     /// **Two settings the canonical *read* scope pins are deliberately not
     /// here**, and that is derived rather than trimmed: `bytea_output` and
@@ -323,7 +340,9 @@ impl Dialect for Postgres {
         TransactionFraming {
             begin: "SET standard_conforming_strings = on; SET check_function_bodies = on; \
                     SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
-                    SET IntervalStyle = 'postgres'; BEGIN;",
+                    SET IntervalStyle = 'postgres'; \
+                    SET timezone_abbreviations = 'Default'; \
+                    SET transform_null_equals = off; BEGIN;",
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.

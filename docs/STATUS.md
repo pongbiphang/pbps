@@ -263,11 +263,13 @@ all three are *refused* under a path that is only the object's own schema
 parses cannot ride there at all: a simple query is lexed as a whole before any
 of it runs, so `standard_conforming_strings = on` and `check_function_bodies =
 on` are pinned by the transaction framing, the earlier batch a transactional
-apply runs (DECISIONS 260), and so are `DateStyle`, `TimeZone` and
-`IntervalStyle`: those three decide what a declared date, instant or interval
-*means*, they are constants rather than per-object, and measured, the same check
-constraint stores a different day, a different instant and an interval with the
-opposite sign without a word (DECISIONS 267). A staged apply opens no
+apply runs (DECISIONS 260), and so are the five that decide what a declared
+expression *means* — `DateStyle`, `TimeZone`, `IntervalStyle`,
+`timezone_abbreviations` and `transform_null_equals`. They are constants rather
+than per-object, and measured, the same check constraint stores a different day,
+a different instant, an interval with the opposite sign, a time fifteen and a
+half hours out, and a predicate that is no longer the one that was written —
+without a word (DECISIONS 267). A staged apply opens no
 transaction and needs the same pin on its connection; it lands with the ledger
 in step 8, which is the step that builds that connection.
 

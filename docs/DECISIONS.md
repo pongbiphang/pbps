@@ -4663,12 +4663,12 @@ SPEC is in sync with all of these.
     four fail loudly at the server, which is late but not silent, and this one
     does not fail at all.
 
-267. **`DateStyle`, `TimeZone` and `IntervalStyle` are pinned in the transaction
-    framing, not around each statement.** The three verbatim expressions the
-    model carries — a column default, a check expression and an index filter
-    (ADR-0013 §3) — are text the engine reads through an input function, and
-    three settings decide what that text means. Measured on 18.6, the identical
-    declaration created by two sessions:
+267. **Every setting that changes what a declared expression means is pinned in
+    the transaction framing, not around each statement.** The three verbatim
+    expressions the model carries — a column default, a check expression and an
+    index filter (ADR-0013 §3) — are text the engine reads through an input
+    function or a parser rule, and five settings decide what that text means.
+    Measured on 18.6, the identical declaration created by two sessions:
 
     ```text
     CHECK (d >= '01/02/2026')       MDY -> '2026-01-02'   DMY -> '2026-02-01'
@@ -4676,16 +4676,35 @@ SPEC is in sync with all of these.
       on a timestamptz              UTC -> 00:00:00+00    New_York -> 05:00:00+00
     CHECK (i >= '-1 2:00:00')       postgres -> -1 days +02:00:00
                                     sql_standard -> -1 days -02:00:00
+    CHECK (at >= '2026-01-15 12:00:00 CST')
+                                    Default -> 18:00:00+00   Australia -> 02:30:00+00
+    CHECK (x = NULL)                off -> (x = NULL::integer)   on -> (x IS NULL)
     ```
 
-    A different day, a different instant, and an interval with the opposite
-    sign. No error, no warning, and nothing afterwards can say which session
-    decided it.
+    A different day, a different instant, an interval with the opposite sign, a
+    time fifteen and a half hours out, and a predicate that stopped being the
+    one that was written. No error, no warning, and nothing afterwards can say
+    which session decided it.
+
+    **The list is a rule, not a set of temporal traps**, and the last two are
+    what say so. `timezone_abbreviations` is a dictionary `TimeZone` does not
+    cover, so pinning the zone does not pin the abbreviation; and
+    `transform_null_equals` is not an input function at all but a *parser*
+    rewrite, which changes the predicate rather than a value inside it. The
+    rule is: **a setting that changes what the declared text means is pinned**.
+    Both were found by review after the first three shipped, and a list closed
+    against its rule would have taken a third round to find the fourth.
+
+    `lc_monetary` is in the class and is deliberately out, for the reason
+    `catalog.rs` gives on the read side: `SET` fails outright on a locale the
+    server does not have, so pinning it would turn a database that deploys into
+    one that cannot. Its reach is a `money` literal, and this dialect's type
+    catalogue refuses `money`.
 
     They go in `begin` and not in the per-statement scope because they are
     *constants*: unlike `search_path`, which is the object's own schema and
     therefore varies per statement (DECISIONS 259), one value serves the whole
-    plan. Five `SET`s and five `RESET`s around every line of `plan.sql` would
+    plan. Seven `SET`s and seven `RESET`s around every line of `plan.sql` would
     bury the SQL a reviewer has to read (SPEC §14.1) to say the same thing
     once.
 
