@@ -453,6 +453,37 @@ impl Dialect for Postgres {
                 found.push(e);
             }
         }
+        // A schema the *reader* excludes, refused here rather than left to an
+        // engine that will not object. The pull skips `pg_catalog`,
+        // `information_schema` and every name beginning with `pg_`
+        // (`catalog.rs`), so a table declared in one is created and then
+        // invisible: absent from the pulled schema, planned again as a
+        // `CREATE` the engine refuses for already existing.
+        //
+        // `pg_temp` is the one that is not merely invisible. **Measured**, it
+        // is the parser's alias for the session's temporary schema, so
+        // `CREATE TABLE "pg_temp"."t"` succeeds and leaves `pg_temp_58.t` with
+        // `relpersistence = 't'` — a session-local table under a name the
+        // declaration never wrote, gone when the connection closes. That is
+        // the silent rewrite DECISIONS 266 wrote this class of rule for: an
+        // engine that refuses by name can be left to refuse, and one that
+        // hands back something else cannot.
+        let schema = name.schema.as_str();
+        if schema == "information_schema" || schema.starts_with("pg_") {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` is declared in `{schema}`, which this dialect's pull \
+                     never reads: `pg_catalog`, `information_schema` and every schema whose \
+                     name begins with `pg_` are excluded from the managed set. The engine \
+                     would create the table and no plan could ever see it again — and \
+                     `pg_temp` is worse than invisible, because it is this engine's alias for \
+                     the session's temporary schema: measured, `CREATE TABLE \"pg_temp\".\"t\"` \
+                     leaves a `pg_temp_58.t` that disappears with the connection. Declare the \
+                     table in a schema of the project's own."
+                ),
+            });
+        }
         // Every other name the table owns, which the engine truncates at the
         // same limit and which the emitter has to spell just as often: the
         // primary key's, and the keys of the four maps.
@@ -636,6 +667,47 @@ mod tests {
         let message = problems[0].to_string();
         assert!(message.contains("column `d`"), "{message}");
         assert!(message.contains("DateStyle"), "{message}");
+    }
+
+    /// A table declared where the pull will not look is refused before
+    /// anything connects, and `pg_temp` is why the rule is not only about
+    /// visibility.
+    ///
+    /// Measured, `pg_temp` is this engine's alias for the session's temporary
+    /// schema: `CREATE TABLE "pg_temp"."t"` succeeds and leaves `pg_temp_58.t`
+    /// with `relpersistence = 't'`, under a name the declaration never wrote
+    /// and gone when the connection closes. An engine that refuses by name can
+    /// be left to refuse; one that hands back something else cannot
+    /// (DECISIONS 266).
+    #[test]
+    fn validating_a_table_refuses_a_schema_the_pull_would_never_read() {
+        let one = |name: &str| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().expect("a type")),
+            );
+            Postgres::new().validate_table(&name.parse().expect("a table name parses"), &table)
+        };
+        for name in [
+            "pg_temp.t",
+            "pg_catalog.t",
+            "information_schema.t",
+            "pg_toast.t",
+        ] {
+            let problems = one(name);
+            assert_eq!(problems.len(), 1, "`{name}`: {problems:?}");
+            let message = problems[0].to_string();
+            assert!(message.contains("never reads"), "`{name}`: {message}");
+        }
+        // The negative case, and it is the one that matters: a project schema
+        // whose name merely begins with the same letters as the reader's
+        // exclusion is not excluded by it — the reader compares the first
+        // three characters against `pg_`, so `pga` is a project's schema and
+        // has to stay one.
+        for name in ["pga.t", "app.t", "public.t", "pg.t"] {
+            assert!(one(name).is_empty(), "`{name}` is a project's own");
+        }
     }
 
     /// Unquoted identifiers fold down, not away: this is the difference from

@@ -291,8 +291,13 @@ statement says `non_transactional` and `own_batch` about itself, so a plan
 carrying one is refused at plan time rather than halfway through an apply
 (DECISIONS 262).
 
-One rule came out of the emitter's own fixpoint rather than from the issue: a
-nullable primary key column. SQL Server refuses the table; measured, this engine
+Two rules came out of the emitter's own fixpoint rather than from the issue.
+A table declared in `pg_catalog`, `information_schema` or any schema whose name
+begins with `pg_` is refused offline, because the pull never reads one — and
+`pg_temp` is worse than invisible: measured, it is the parser's alias for the
+session's temporary schema, so the declaration yields a `pg_temp_58.t` that
+disappears with the connection (DECISIONS 273). And a nullable primary key
+column. SQL Server refuses the table; measured, this engine
 accepts it and sets `NOT NULL` itself, so the declaration and the database
 disagree from the moment the table exists and the `DROP NOT NULL` that would put
 it back is refused for ever (DECISIONS 266). The rest of the other dialect's

@@ -4933,3 +4933,34 @@ SPEC is in sync with all of these.
     is no second one to create a divergent table with. Both halves are
     measured — the setting exists and is validated against the installed
     methods, and `USING heap` fixes `relam` — and the reader's rule is code.
+
+273. **A table declared in a schema the pull never reads is refused offline.**
+    The reader skips `pg_catalog`, `information_schema` and every schema whose
+    name begins with `pg_` (`catalog.rs`), so a table declared in one is
+    created and then invisible: absent from the pulled schema, planned again as
+    a `CREATE` the engine refuses for already existing. The rule is derived
+    from the reader's own list rather than written beside it, which is why it
+    lives in this dialect and not in the loader — the excluded set is this
+    engine's.
+
+    **`pg_temp` is why the rule is not only about visibility**, and it is what
+    makes this the class DECISIONS 266 wrote an offline rule for rather than
+    one to leave to the engine. Measured, `pg_temp` is the parser's alias for
+    the session's temporary schema:
+
+    ```text
+    CREATE TABLE "pg_temp"."t" (id integer);       accepted
+    the relation afterwards:  pg_temp_58.t, relpersistence = 't'
+    ```
+
+    A session-local table, under a name the declaration never wrote, gone when
+    the connection closes. An engine that refuses by name can be left to refuse
+    — that is the line #175 and #179 are answered on — and one that hands back
+    something else cannot.
+
+    The negative half is in the test and is the reason the check is `starts_with
+    ("pg_")` and not a looser match: the reader compares the first three
+    characters, so a project's schema called `pga` is a project's schema, and a
+    validation that refused it would refuse a declaration the pull reads
+    perfectly well (the same trap `catalog.rs` avoids by not writing the filter
+    as a `LIKE` pattern, DECISIONS 254).
