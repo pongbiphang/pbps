@@ -819,6 +819,29 @@ It survived because **every `--dev` test passed a connection string**: the
 docker path had no automated coverage at all. Reading found it; running could
 not have.
 
+## A guard written as a `for` over a `Result`
+
+A read that must return exactly one row grew a guard for the case where it
+returns none:
+
+```rust
+for row in rows.first().ok_or_else(|| vanished(oid)) { ... }
+```
+
+It compiles, and it does nothing. `Result` is an `IntoIterator` over its `Ok`,
+so the `Err` is discarded and the loop runs zero times — the guard is in plain
+sight, in a diff, in review, and the failing case takes the silent path it was
+written to close. The same shape swallows an `Option`'s `None`.
+
+It arrived by editing a loop over many rows into a read of one, keeping the
+`for` and adding the check inside its head. Nothing about the change looks like
+removing a check.
+
+**A guard that must stop the function is `let … ?` or an early return, never a
+loop header.** And a guard whose failing case has no test is a guard whose
+failing case has never run: this one was found by reading, and the read only
+happened because the two fixes before it were about the same silence.
+
 ## One rule, spelled in three places
 
 The definition scanner asks "does the identifier before this character end
