@@ -989,7 +989,12 @@ fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statem
         ),
         ModuleKind::Trigger => format!("CREATE TRIGGER {}\n{body}", quote(id.name())?),
     };
-    scoped(pg, id.schema(), &sql)
+    // The terminator on a line of its own, because the line before it is the
+    // user's: a definition ending in `-- note` would otherwise swallow it, and
+    // the statement would run on into the `RESET search_path` the scope adds.
+    // The same rule as every other verbatim expression here (DECISIONS 281),
+    // and the whole body is verbatim.
+    scoped(pg, id.schema(), &format!("{sql}\n;"))
 }
 
 /// The `DROP` for a module, under its schema's write path.
@@ -1666,7 +1671,7 @@ mod tests {
             assert_eq!(
                 sql,
                 vec![format!(
-                    "SET search_path = \"app\";\n{expected}\nRESET search_path;"
+                    "SET search_path = \"app\";\n{expected}\n;\nRESET search_path;"
                 )],
                 "{id}"
             );

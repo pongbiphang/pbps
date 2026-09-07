@@ -29,8 +29,8 @@ use pbps_db::{Conn, DbError, Row};
 use pbps_model::TableName;
 
 use crate::introspect::{
-    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawTable,
-    assemble,
+    Limitation, Pulled, RawCatalog, RawColumn, RawConstraint, RawIdentity, RawIndex, RawModule,
+    RawModuleArg, RawTable, assemble,
 };
 
 /// The schemas that are never a project's.
@@ -98,6 +98,121 @@ fn tables_query() -> String {
         AND c.reloftype = 0
         AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')
       ORDER BY n.nspname, c.relname"
+    )
+}
+
+/// Objects owned by an extension, which are nobody's declarations.
+///
+/// `CREATE EXTENSION` installs functions, views and types that belong to the
+/// extension and are dropped with it. `CREATE EXTENSION … SCHEMA app` puts them
+/// in a project's schema, where a reader without this filter reports every one
+/// as an undeclared module and the next plan offers to drop them — objects
+/// whose declaration lives in a `.sql` file the extension owns and this project
+/// does not have.
+///
+/// Left out rather than reported: they are not a limitation of the model, they
+/// are somebody else's objects. `DROP EXTENSION` is how one goes away.
+const NOT_AN_EXTENSIONS: &str = "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                    WHERE d.objid = %OID% AND d.classid = %CLASS%::regclass
+                      AND d.deptype = 'e')";
+
+fn not_an_extensions(oid: &str, class: &str) -> String {
+    NOT_AN_EXTENSIONS
+        .replace("%OID%", oid)
+        .replace("%CLASS%", &format!("'pg_catalog.{class}'"))
+}
+
+/// Views, functions, procedures and triggers, each with the text this engine
+/// deparses for it (ADR-0009 §2).
+///
+/// One query and not four, because the assembler wants one list and the four
+/// catalogs answer the same four questions — the kind, where it lives, what it
+/// is called, and what it says. `pg_get_functiondef` is asked only of `f` and
+/// `p`: **measured**, it refuses an aggregate by name (`"agg" is an aggregate
+/// function`), so a `prokind` filter is not tidiness but the difference between
+/// a pull and an error.
+///
+/// The identity's argument types are a second query — one row each — rather
+/// than a joined string, because a type name may contain the character that
+/// would separate them: `format_type` quotes one that needs it, and a reader
+/// splitting on commas would cut `"a,b"` in half.
+fn modules_query() -> String {
+    let view_not_extension = not_an_extensions("c.oid", "pg_class");
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    let trigger_not_extension = not_an_extensions("tg.oid", "pg_trigger");
+    format!(
+        "SELECT c.oid::int8 AS oid, 'v' AS kind, n.nspname AS schema_name,
+                c.relname AS name, '' AS on_table,
+                pg_catalog.pg_get_viewdef(c.oid, true) AS definition
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'v'
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {view_not_extension}
+          UNION ALL
+         SELECT p.oid::int8, p.prokind::text, n.nspname, p.proname, '',
+                pg_catalog.pg_get_functiondef(p.oid)
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.prokind IN ('f', 'p')
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
+          UNION ALL
+         SELECT tg.oid::int8, 't', n.nspname, tg.tgname, c.relname,
+                pg_catalog.pg_get_triggerdef(tg.oid)
+           FROM pg_catalog.pg_trigger tg
+           JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT tg.tgisinternal
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {trigger_not_extension}
+          ORDER BY 3, 4, 1"
+    )
+}
+
+/// One row per routine argument, in position order.
+///
+/// `format_type` under the canonical empty `search_path`, which is what makes
+/// this the identity the engine keys on: a built-in bare, a user type
+/// schema-qualified, every modifier already discarded (ADR-0009 §1).
+fn module_args_query() -> String {
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
+    format!(
+        "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
+                pg_catalog.format_type(u.ty, NULL) AS ty
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes)
+                    WITH ORDINALITY AS u(ty, pos)
+          WHERE p.prokind IN ('f', 'p')
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
+          ORDER BY 1, 2"
+    )
+}
+
+/// The module-shaped objects the model does not hold, so that they are named
+/// rather than missing — the same rule as [`unheld_query`] for tables.
+///
+/// A materialized view is a view with rows; an aggregate and a window function
+/// are `pg_proc` entries `pg_get_functiondef` refuses outright. Reading any of
+/// them back as the ordinary kind would make a plan that recreates it as
+/// something else.
+fn unheld_modules_query() -> String {
+    format!(
+        "SELECT n.nspname AS schema_name, c.relname AS name,
+                'a materialized view, which holds rows a plan would have to refresh' AS detail
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'm' AND {NOT_A_PROJECTS_SCHEMA}
+          UNION ALL
+         SELECT n.nspname, p.proname,
+                CASE p.prokind WHEN 'a' THEN 'an aggregate function'
+                               ELSE 'a window function' END
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.prokind IN ('a', 'w') AND {NOT_A_PROJECTS_SCHEMA}
+          ORDER BY 1, 2"
     )
 }
 
@@ -615,6 +730,36 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             has_expressions: flag(&row, "has_expressions")?,
             method: text(&row, "method")?,
             nondefault_column_options: flag(&row, "nondefault_column_options")?,
+        });
+    }
+    for row in conn.query(&modules_query()).await? {
+        raw.modules.push(RawModule {
+            oid: number(&row, "oid")?,
+            kind: first_char(&text(&row, "kind")?).unwrap_or('?'),
+            schema: text(&row, "schema_name")?,
+            name: text(&row, "name")?,
+            on_table: text(&row, "on_table")?,
+            definition: text(&row, "definition")?,
+        });
+    }
+    for row in conn.query(&module_args_query()).await? {
+        raw.module_args.push(RawModuleArg {
+            routine_oid: number(&row, "oid")?,
+            position: number(&row, "pos")?,
+            ty: text(&row, "ty")?,
+        });
+    }
+    for row in conn.query(&unheld_modules_query()).await? {
+        let schema = text(&row, "schema_name")?;
+        let name = text(&row, "name")?;
+        warnings.push(Limitation {
+            table: TableName::new(&schema, &name),
+            detail: format!(
+                "`{schema}.{name}` is {}, which this model does not hold. It is left out of the \
+                 pull entirely — not read back as an ordinary module, which would make a plan \
+                 that recreates it as something else.",
+                text(&row, "detail")?
+            ),
         });
     }
     Ok((raw, warnings))

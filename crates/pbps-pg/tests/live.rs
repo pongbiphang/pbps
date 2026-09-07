@@ -5056,3 +5056,250 @@ async fn the_settings_a_staged_run_depends_on_reach_a_connection_that_opens_no_t
          that way"
     );
 }
+
+// ---- modules (issue #80, ADR-0009) ----
+
+/// Only this test's own modules, so that a comparison says something about
+/// what this test created and nothing about the shared container.
+fn our_modules(
+    pulled: &pbps_pg::introspect::Pulled,
+    schema: &str,
+) -> std::collections::BTreeMap<pbps_model::ModuleId, pbps_model::Module> {
+    pulled
+        .schema
+        .modules
+        .iter()
+        .filter(|(id, _)| id.schema() == schema)
+        .map(|(id, m)| (id.clone(), m.clone()))
+        .collect()
+}
+
+fn module(kind: pbps_model::ModuleKind, definition: &str) -> pbps_model::Module {
+    pbps_model::Module {
+        kind,
+        description: None,
+        definition: definition.to_owned(),
+    }
+}
+
+/// A table and one module of every kind this model holds, in one schema.
+fn schema_with_modules(s: &str) -> Schema {
+    let mut schema = Schema::default();
+    let mut t = Table::default();
+    t.columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    t.columns.insert("a".into(), Column::new(ty("text")));
+    t.primary_key = Some(PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+    });
+    schema.tables.insert(TableName::new(s, "t"), t);
+
+    schema.modules.insert(
+        format!("{s}.v").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::View,
+            &format!("SELECT id, a FROM {s}.t"),
+        ),
+    );
+    schema.modules.insert(
+        format!("{s}.f(integer)").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n + 1 $$",
+        ),
+    );
+    schema.modules.insert(
+        format!("{s}.p(integer)").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Procedure,
+            &format!("(n integer) LANGUAGE sql AS $$ INSERT INTO {s}.t (id) VALUES (n) $$"),
+        ),
+    );
+    schema.modules.insert(
+        format!("{s}.trf()").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+        ),
+    );
+    schema.modules.insert(
+        format!("{s}.t.audit").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Trigger,
+            &format!("AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+        ),
+    );
+    schema
+}
+
+/// The round trip issue #80 asks for first: a module of every kind planned,
+/// applied, and read back **as the same object**.
+///
+/// The identity is what is asserted, not the text — ADR-0009 §2 measured that
+/// this engine does not store what it was given, so a declaration and its
+/// read-back are two spellings of one module and §2.2 keeps them in separate
+/// comparisons. What must survive exactly is the key: a routine read back under
+/// a signature the declaration did not write is a routine whose next `DROP`
+/// names another object.
+///
+/// The second half is what `bootstrap` needs and nothing else proves: the text
+/// the engine gave back is applied again, and the engine gives back the same
+/// text. A deparsed definition that cannot be re-emitted is a state this tool
+/// can record and never restore.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
+    let s = emit_schema("modules");
+    let declared = schema_with_modules(&s);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let first = our_modules(&pull(&mut conn).await, &s);
+    assert_eq!(
+        first.keys().cloned().collect::<Vec<_>>(),
+        declared.modules.keys().cloned().collect::<Vec<_>>(),
+        "the pull did not read back the objects the plan created"
+    );
+    for (id, m) in &first {
+        assert_eq!(
+            m.kind, declared.modules[id].kind,
+            "`{id}` came back as another kind"
+        );
+        assert!(!m.definition.trim().is_empty(), "`{id}` came back empty");
+    }
+
+    // Re-applied from the read-back, which is what `bootstrap` does with a
+    // recorded state. Every module is dropped and created again — this engine
+    // has no other shape (ADR-0009 §3) — so the order matters and the trigger
+    // has to go before the function it calls.
+    let rebuild = Schema {
+        modules: first.clone(),
+        ..Schema::default()
+    };
+    let statements: Vec<_> = plan(&Schema::default(), &IdsFile::default(), &rebuild, &ids)
+        .changes
+        .iter()
+        .map(|p| p.change.clone())
+        .collect();
+    assert!(!statements.is_empty(), "nothing to rebuild");
+    for id in first.keys().rev() {
+        let kind = first[id].kind;
+        for stmt in pg
+            .emit(
+                &pbps_model::Change::DropModule {
+                    id: id.clone(),
+                    kind,
+                },
+                pbps_model::Strategy::default(),
+            )
+            .expect("emit a drop")
+        {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("dropping `{id}`:\n{}\n{e}", stmt.sql));
+        }
+    }
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &rebuild, &ids),
+    )
+    .await;
+
+    let second = our_modules(&pull(&mut conn).await, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        second, first,
+        "the text this engine deparsed did not rebuild into the same object"
+    );
+}
+
+/// ADR-0009 §1's whole reason for a typed `ModuleId`: on this engine a name is
+/// not an identity. Two overloads are declared, applied and read back as **two**
+/// objects, and each `DROP` names exactly one of them.
+///
+/// The negative half is the one that matters: `DROP FUNCTION` without a
+/// signature is refused by the engine where more than one overload exists, so a
+/// dialect that answered `overloads → false` would emit a statement that cannot
+/// run.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
+    let s = emit_schema("overload");
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        format!("{s}.f(integer)").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(n integer) RETURNS text LANGUAGE sql AS $$ SELECT 'integer overload' $$",
+        ),
+    );
+    declared.modules.insert(
+        format!("{s}.f(text)").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(n text) RETURNS text LANGUAGE sql AS $$ SELECT 'text overload' $$",
+        ),
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let pulled = our_modules(&pull(&mut conn).await, &s);
+    assert_eq!(
+        pulled.keys().cloned().collect::<Vec<_>>(),
+        declared.modules.keys().cloned().collect::<Vec<_>>(),
+        "two overloads did not read back as two objects"
+    );
+
+    // The engine's own answer to the name-only question, which is why the
+    // signature is in the key.
+    let refused = conn
+        .execute(&format!("DROP FUNCTION {s}.f"))
+        .await
+        .expect_err("a bare name names two functions");
+    assert_eq!(sqlstate(&refused), "42725", "{refused:?}");
+
+    // And with the signature, exactly one goes.
+    for stmt in pg
+        .emit(
+            &pbps_model::Change::DropModule {
+                id: format!("{s}.f(integer)").parse().expect("a module id"),
+                kind: pbps_model::ModuleKind::Function,
+            },
+            pbps_model::Strategy::default(),
+        )
+        .expect("emit")
+    {
+        conn.execute(&stmt.sql).await.expect("drop one overload");
+    }
+    let left = our_modules(&pull(&mut conn).await, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        left.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        vec![format!("{s}.f(text)")],
+        "the drop with a signature took the wrong object, or both"
+    );
+}
