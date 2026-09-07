@@ -1316,6 +1316,82 @@ one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the
 catalog, it is reading half of it.
 
+## A fallback arm, and a filter inside a known arm
+
+A union with one arm per catalog and a last arm for everything else looks like
+it enumerates from the catalog rather than from memory. It does not, if an arm
+can throw a row away:
+
+```sql
+JOIN pg_catalog.pg_class c2 ON c2.oid = con.conrelid     -- 0 for a domain
+WHERE ... AND NOT tg.tgisinternal                        -- and this one too
+```
+
+Both rows matched a class the list already knew, so the fallback — which
+selects the classes *not* on the list — could not see them. The dependent
+vanished, the rebuild reported itself unblocked, and the `DROP` failed at
+apply.
+
+**The rule.** A fallback covers a class with no arm. Nothing covers an arm that
+is not total over its own class. Every filter inside an arm has to be a
+*column*, not a `WHERE`: the row comes back saying what it is and why this
+project cannot hold it, so "there is something here I cannot put back" never
+becomes "there is nothing there".
+
+## The identity is in the key and in the body, and the engine trusts the body
+
+Where the emitter composes a prefix and the declaration holds the rest, any
+part of the identity that the grammar puts *after* the split is written twice —
+once in the key the tool plans against, once in the text the engine reads. The
+engine reads only its copy, and accepts a disagreement without a word.
+
+PostgreSQL has two, both measured:
+
+```text
+key app.t.audit    body AFTER INSERT ON app.other   -> the trigger lands on app.other
+key app.f(integer) body (x text) RETURNS int …      -> the function is app.f(text)
+```
+
+In each case the object is created, the apply reports success, and the key
+names nothing. The next plan creates it again and drops nothing, for ever.
+
+**The rule.** Every part of an identity that appears in the body gets a check
+in `validate_module`, and the check refuses only what it is *certain* about —
+a gate that guesses refuses valid plans, which is the one direction it may not
+be wrong in. What it cannot decide is left to the catalog assertion after the
+`CREATE`, which is keyed by the identity and fails inside the transaction.
+
+## A helper whose message names the wrong cause
+
+`missing(column)` said "the query and this code have gone out of step", which
+is true of every `NULL` a column reader meets — except the ones where it is
+not. A deparser answering `NULL` for an object that has just been dropped is
+not a renamed column; it is the catalog moving under a read. The message sent
+every future reader to the one place there was nothing to find.
+
+**The rule.** A generic error helper is a claim about the cause, not just the
+shape. Before reusing one, ask whether the cause it names is the only cause
+that reaches it — and where it is not, the caller says which case it is in.
+`Option` at the call site is what makes that possible: `text` collapses
+"absent" into "wrong", `optional_text` lets the caller keep them apart.
+
+## A fixture that reaches outside its own schema
+
+Every test here builds a schema and drops it with `CASCADE`, which is what
+makes them safe to run beside each other. Two fixtures broke that:
+
+- `CREATE EXTENSION` beside another test's `CREATE EXTENSION` deadlocked the
+  suite — four unrelated tests came back `40P01`. There is one extension in
+  this suite, and a test that needs an extension-owned object joins it.
+- attaching an object to an extension the *database* owns rather than the
+  schema. Measured, `DROP SCHEMA … CASCADE` over a schema holding a member
+  drops the extension itself: attaching a materialized view to `plpgsql` took
+  plpgsql, and every plpgsql function in the database, out with the schema.
+
+**The rule.** A fixture may create and drop only things its own schema owns.
+Anything database-wide — an extension, a role, a cast — is shared with every
+other test in the run and with every other run on the container.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

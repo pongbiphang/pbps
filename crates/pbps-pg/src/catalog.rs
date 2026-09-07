@@ -207,20 +207,35 @@ fn module_args_query() -> String {
 /// are `pg_proc` entries `pg_get_functiondef` refuses outright. Reading any of
 /// them back as the ordinary kind would make a plan that recreates it as
 /// something else.
+///
+/// [`NOT_AN_EXTENSIONS`] here too, and for the same reason it is on the module
+/// queries: an extension installed into a project's schema owns aggregates and
+/// materialized views of its own, and DECISIONS 287 says those are left out
+/// **silently** rather than reported. Reported, they are worse than noise —
+/// `managed_limitations` refuses every command for a limitation whose name is
+/// in the managed set, so an extension object colliding with a declared name
+/// would refuse a plan that is correct. A filter the ordinary reader applies
+/// and the limitation reader does not is a rule with a hole in it.
 fn unheld_modules_query() -> String {
+    let matview_not_extension = not_an_extensions("c.oid", "pg_class");
+    let proc_not_extension = not_an_extensions("p.oid", "pg_proc");
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS name,
                 'a materialized view, which holds rows a plan would have to refresh' AS detail
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relkind = 'm' AND {NOT_A_PROJECTS_SCHEMA}
+          WHERE c.relkind = 'm'
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {matview_not_extension}
           UNION ALL
          SELECT n.nspname, p.proname,
                 CASE p.prokind WHEN 'a' THEN 'an aggregate function'
                                ELSE 'a window function' END
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-          WHERE p.prokind IN ('a', 'w') AND {NOT_A_PROJECTS_SCHEMA}
+          WHERE p.prokind IN ('a', 'w')
+            AND {NOT_A_PROJECTS_SCHEMA}
+            AND {proc_not_extension}
           ORDER BY 1, 2"
     )
 }
@@ -742,13 +757,21 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
         });
     }
     for row in conn.query(&modules_query()).await? {
+        let kind = first_char(&text(&row, "kind")?).unwrap_or('?');
+        let schema = text(&row, "schema_name")?;
+        let name = text(&row, "name")?;
+        // Not `text`: a `NULL` here is not a column this reader has lost track
+        // of, and saying so sends the reader to the one place that is right.
+        let Some(definition) = optional_text(&row, "definition")? else {
+            return Err(deparsed_away(kind, &schema, &name));
+        };
         raw.modules.push(RawModule {
             oid: number(&row, "oid")?,
-            kind: first_char(&text(&row, "kind")?).unwrap_or('?'),
-            schema: text(&row, "schema_name")?,
-            name: text(&row, "name")?,
+            kind,
+            schema,
+            name,
             on_table: text(&row, "on_table")?,
-            definition: text(&row, "definition")?,
+            definition,
         });
     }
     for row in conn.query(&module_args_query()).await? {
@@ -841,12 +864,75 @@ fn schema_changed_underneath(e: DbError) -> DbError {
                  this is that guard firing. Run it again when the other change has finished."
             ),
         },
+        // A deadlock, which reaches an operator as `db error` and nothing
+        // else. It is the third way the catalog moves under this read, and
+        // the only one where the engine has already decided the outcome.
+        //
+        // The pull deparses every view in the database, and
+        // `pg_get_viewdef` opens each one — so the read holds `ACCESS SHARE`
+        // on relations a rebuild wants exclusively (ADR-0009 §3), and the two
+        // orders can cross. Measured from the server log:
+        //
+        // ```text
+        // deadlock detected
+        // Process A: LOCK TABLE "app"."granted" IN ACCESS EXCLUSIVE MODE
+        // Process B: SELECT … pg_get_viewdef(c.oid, true) …
+        // ```
+        //
+        // Nothing is half-read and nothing is half-written: the engine chose a
+        // victim and rolled it back whole. What the message has to say is that
+        // it was a tie, not a fault, and that running again is the answer.
+        DbError::Driver { code, .. } if code.as_deref() == Some("40P01") => DbError::Driver {
+            code: code.clone(),
+            message: format!(
+                "the catalog changed while it was being read: {e} (deadlock).\n\
+                 Another session was changing this database while the pull was reading it, and \
+                 the two needed the same objects in opposite orders. The engine broke the tie \
+                 and rolled this read back whole. Run it again when the other change has \
+                 finished."
+            ),
+        },
         DbError::Driver { .. }
         | DbError::BadConnectionString(_)
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
         | DbError::WrongSession { .. }
         | DbError::BadRow(_) => e,
+    }
+}
+
+/// A deparse that came back `NULL`, which is the object having gone.
+///
+/// **Measured**, the deparsers answer `NULL` for an oid that is not there
+/// rather than raising:
+///
+/// ```text
+/// pg_get_viewdef(999999, true)  ->  NULL
+/// pg_get_functiondef(999999)    ->  NULL
+/// ```
+///
+/// The pull reads the catalog in one `REPEATABLE READ` snapshot so that it
+/// cannot report half of a change as a whole schema — but a deparser resolves
+/// its oid through the syscache against a *fresh* snapshot, so an object
+/// dropped between the scan and the deparse comes back as a row with a name
+/// and no definition. That is the catalog moving under the read, which is the
+/// case [`schema_changed_underneath`] already exists for; it arrives here as a
+/// `NULL` instead of as `XX000` because these two functions do not raise.
+///
+/// Reported as [`missing`] it read as "the query and this code have gone out
+/// of step", which sends a reader to look for a renamed column — the one thing
+/// that is not wrong here. **Absent, empty and unreadable are three different
+/// things**, and a vanished object is the third.
+fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
+    DbError::Driver {
+        code: None,
+        message: format!(
+            "the catalog changed while it was being read: `{schema}.{name}` (kind `{kind}`) was \
+             there when the catalog was scanned and gone when its definition was deparsed.\n\
+             Something applied DDL to this database during the pull. The read is taken in one \
+             snapshot so that it cannot report half of a change as a whole schema, and this is \
+             that guard firing. Run it again when the other change has finished."
+        ),
     }
 }
 

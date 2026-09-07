@@ -179,7 +179,9 @@ pub async fn before_a_rebuild(
     let Some(oid) = module_oid(conn, id, kind).await? else {
         return Err(not_in_the_catalog(id));
     };
-    let serialized = serialize(conn, id, kind, oid).await?;
+    let serialized = serialize(conn, id, kind, oid)
+        .await
+        .map_err(|e| the_engine_broke_a_tie(id, e))?;
     let mut carries = Vec::new();
     match kind {
         ModuleKind::View => {
@@ -999,6 +1001,24 @@ fn dependent_routine_args_query(refclass: &str) -> String {
 /// the same wording the engine puts in the `DETAIL` of the refusal a plan
 /// without this would hit, so a reviewer reading the plan and an operator
 /// reading the failure see one description.
+///
+/// **Every arm is total over its class.** The fallback below catches a class
+/// with no arm; nothing catches a row an arm's own `JOIN` or `WHERE` throws
+/// away, because that row already matched a class the list knows. Two did:
+///
+/// - a domain's check constraint has `conrelid = 0` and names its domain
+///   through `contypid`, so the inner join to `pg_class` dropped it —
+///   **measured**, `CREATE DOMAIN md.label AS text CHECK (md.ok(VALUE))` puts
+///   a `pg_constraint` row with `conrelid = 0` on the reverse edge of
+///   `md.ok(text)`, and `DROP FUNCTION md.ok(text)` is refused with
+///   `constraint label_check depends on function md.ok(text)`;
+/// - `NOT tg.tgisinternal` did the same to a trigger the engine owns.
+///
+/// Both now come back with a sentence in `unrepresentable` instead, which is
+/// the difference between "there is nothing there" and "there is something
+/// here this project cannot put back". A filter inside an arm turns the second
+/// into the first, and the first is what makes a plan applyable and
+/// predictably failing (SPEC §7.5).
 fn dependents_query(refclass: &str) -> String {
     let edge = format!(
         "d.refclassid = '{refclass}'::regclass AND d.refobjid = ($1::int8)::oid AND d.deptype <> 'i'"
@@ -1030,22 +1050,26 @@ fn dependents_query(refclass: &str) -> String {
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = p2.pronamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_proc'::regclass
           UNION ALL
-         SELECT 'trigger', {described}, n2.nspname, c2.relname, tg.tgname, 0::int8, ''
+         SELECT 'trigger', {described}, n2.nspname, c2.relname, tg.tgname, 0::int8,
+                CASE WHEN tg.tgisinternal
+                     THEN 'a trigger the engine owns, which no declaration holds'
+                     ELSE '' END
            FROM pg_catalog.pg_depend d
            JOIN pg_catalog.pg_trigger tg ON tg.oid = d.objid
            JOIN pg_catalog.pg_class c2 ON c2.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_trigger'::regclass
-            AND NOT tg.tgisinternal
           UNION ALL
          SELECT 'check', {described}, n2.nspname, c2.relname, con.conname, 0::int8,
-                CASE WHEN con.contype <> 'c'
+                CASE WHEN con.conrelid = 0
+                     THEN 'a constraint on a domain rather than on a table, which this model does not hold'
+                     WHEN con.contype <> 'c'
                      THEN 'a constraint of a kind that is not a check'
                      ELSE '' END
            FROM pg_catalog.pg_depend d
            JOIN pg_catalog.pg_constraint con ON con.oid = d.objid
-           JOIN pg_catalog.pg_class c2 ON c2.oid = con.conrelid
-           JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
+           LEFT JOIN pg_catalog.pg_class c2 ON c2.oid = con.conrelid
+           LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_constraint'::regclass
           UNION ALL
          SELECT 'default', {described}, n2.nspname, c2.relname, a.attname, 0::int8,
@@ -1113,6 +1137,45 @@ const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
     "pg_catalog.pg_attrdef",
     "pg_catalog.pg_class",
 ];
+
+/// A deadlock taking the rebuild's lock, said in words.
+///
+/// The lock this takes is `ACCESS EXCLUSIVE` on the object about to be
+/// replaced (ADR-0009 §3); a `pull` running at the same time deparses every
+/// view in the database and `pg_get_viewdef` opens each one, so it holds
+/// `ACCESS SHARE` on relations this wants exclusively. The two orders can
+/// cross, and measured from the server log the engine says so and kills one
+/// side:
+///
+/// ```text
+/// deadlock detected
+/// Process A: LOCK TABLE "app"."granted" IN ACCESS EXCLUSIVE MODE
+/// Process B: SELECT … pg_get_viewdef(c.oid, true) …
+/// ```
+///
+/// Reaching a caller as `db error`, that is unactionable — and the action is
+/// exactly one thing: run it again. Nothing was half-done; the engine rolled
+/// the victim back whole before either side wrote.
+fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
+    match &e {
+        DbError::Driver { code, .. } if code.as_deref() == Some("40P01") => DbError::Driver {
+            code: code.clone(),
+            message: format!(
+                "another session held what this rebuild of `{id}` needed, and needed what this \
+                 held: the engine broke the tie and rolled this side back whole ({e}).\n\
+                 Nothing was changed. Run the deploy again once the other session has \
+                 finished — most often it is a `pull` or a `status`, which opens every view in \
+                 the database to read its definition back."
+            ),
+        },
+        DbError::Driver { .. }
+        | DbError::BadConnectionString(_)
+        | DbError::Connect { .. }
+        | DbError::ConnectTimeout { .. }
+        | DbError::WrongSession { .. }
+        | DbError::BadRow(_) => e,
+    }
+}
 
 /// The refusal for dependents this project could not put back, or `None`.
 ///

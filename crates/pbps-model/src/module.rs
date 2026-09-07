@@ -172,9 +172,16 @@ impl FromStr for RoutineArg {
             }
             // A space between two words is part of the name — `timestamp with
             // time zone` — and a space beside punctuation is layout.
+            //
+            // `.` is in that punctuation, because the engine accepts a space
+            // around a qualified type's dot and never writes one back:
+            // **measured**, `CREATE FUNCTION md.spaced(a md . my_type)` is
+            // accepted and its identity reads `md.spaced(md.my_type)`. Left
+            // unfolded, the declared key and the catalog key differ, and every
+            // plan drops and recreates a routine that never changed.
             if pending_space
-                && !matches!(c, '(' | ')' | '[' | ']' | ',')
-                && !out.ends_with(['(', '[', ','])
+                && !matches!(c, '(' | ')' | '[' | ']' | ',' | '.')
+                && !out.ends_with(['(', '[', ',', '.'])
             {
                 out.push(' ');
             }
@@ -1845,6 +1852,12 @@ mod tests {
             ("TIMESTAMP  WITH   TIME ZONE", "timestamp with time zone"),
             ("Character Varying ( 10 )", "character varying(10)"),
             ("ID.Pos", "id.pos"),
+            // The engine accepts a space around a qualified type's dot and
+            // never writes one back, so the two spellings have to be one key.
+            ("md . my_type", "md.my_type"),
+            ("md .my_type", "md.my_type"),
+            ("md. my_type", "md.my_type"),
+            ("s . \"Odd Name\" []", "s.\"Odd Name\"[]"),
             ("\"char\"", "\"char\""),
             ("\"CHAR\"", "\"CHAR\""),
             ("s.\"Odd Name\"", "s.\"Odd Name\""),

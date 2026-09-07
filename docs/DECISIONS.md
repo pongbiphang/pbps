@@ -5751,6 +5751,15 @@ SPEC is in sync with all of these.
 
     Closes the question 59 left open.
 
+    **Amended: the dot is punctuation too.** Measured, the engine accepts a
+    space around a qualified type's dot and never writes one back —
+    `CREATE FUNCTION md.spaced(a md . my_type)` reads back as
+    `md.spaced(md.my_type)`. Left unfolded, the declared key and the catalog
+    key are two keys for one routine, and every plan drops it and creates it
+    again: the cry-wolf loop ADR-0002 names as the failure to avoid. The fold
+    now drops the whitespace beside `.` as well, outside quotes only, so a
+    quoted name keeps whatever it holds.
+
 284. **A PostgreSQL trigger's table is in its identity *and* in its
     definition, and a declaration where the two disagree is refused.**
     ADR-0002 fixed where a module's `definition:` begins by what the emitter
@@ -5906,6 +5915,14 @@ SPEC is in sync with all of these.
     extension object in front of every reader, which is how a report stops
     being read.
 
+    **Amended: the limitation reader is a reader.** The filter was on the
+    module queries and not on the unheld-module query, so an extension's
+    materialized view or aggregate in a project schema came back as a
+    limitation — which is worse than noise, because `managed_limitations`
+    refuses every command for a limitation whose name is in the managed set. A
+    rule the ordinary reader applies and the reader beside it does not is a
+    rule with a hole in it, and the hole is on the path that refuses.
+
 288. **On this dialect every carried attribute refuses the rebuild today,
     because there is no declared grant for one to come back from.**
     ADR-0009 §3 decides that a grant to a **declared** role survives a module
@@ -5954,6 +5971,18 @@ SPEC is in sync with all of these.
     as the cases somebody thought of, and each was corrected by finding the next
     one. What ends that sequence is not a longer list.
 
+    **Amended: a fallback covers a missing arm, not a leaky one.** The next
+    case arrived inside a class the list already knew. A domain's check
+    constraint is a `pg_constraint` row with `conrelid = 0` — measured, it
+    names its domain through `contypid` — so the arm's own inner join to
+    `pg_class` threw it away, and the fallback could not see it because
+    `pg_constraint` is on the known list. `NOT tg.tgisinternal` did the same to
+    a trigger the engine owns. **Every arm is now total over its class**: a row
+    an arm cannot represent comes back with a sentence saying so, never as no
+    row at all. A filter inside an arm turns "there is something here this
+    project cannot put back" into "there is nothing there", and the second is
+    what makes a plan applyable and predictably failing.
+
 289. **The rebind test is a name and a path, not a position on it.**
     ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
     the modules it could capture, in that same plan. The obvious
@@ -5980,3 +6009,110 @@ SPEC is in sync with all of these.
     The middle line is a whole plan cycle in which the environment means one
     thing and the declarations mean another, with nothing in the plan that
     created the shadow having said so.
+
+290. **A routine's parameter list is checked against its identity, and only
+    where the disagreement is certain.** The emitter writes
+    `CREATE FUNCTION <name>` and the declaration writes everything after the
+    name (283, ADR-0009 §1), so the identity's argument types live in the key
+    *and* in the body — the same split the trigger's `ON` clause has, and the
+    same silent failure. Measured: `CREATE FUNCTION app.f\n(x text) …` under
+    the key `app.f(integer)` is accepted without a word and creates
+    `app.f(text)`. The key names an object that does not exist, and every later
+    plan creates it again and drops nothing.
+
+    So `validate_module` reads the list. Three facts from the engine make that
+    a scan and not a parse:
+
+    ```text
+    CREATE FUNCTION me.noparens RETURNS int …   syntax error at or near "RETURNS"
+    CREATE FUNCTION me.o(out int) …             identity  me.o()
+    CREATE FUNCTION mf.a(a out int) …           identity  mf.a()
+    ```
+
+    The list is mandatory, `OUT` is the one mode that keeps a parameter out of
+    `proargtypes`, and a mode may be written on either side of the name. With
+    the mode off, a parameter is `type` or `name type` and the grammar offers
+    nothing else, so exactly two readings are tried.
+
+    **Only a certain disagreement refuses.** A count is always certain. A type
+    is not: `format_type` under the empty read path always qualifies a user
+    type (ADR-0013 §3), so a key reading `app.f(md.my_type)` over a body
+    reading `(a my_type)` is one object whenever the write path reaches `md` —
+    and this dialect cannot know whether it does. Refusing that would refuse a
+    valid plan, which is the one direction this gate may not be wrong in. A
+    spelling the dialect cannot parse counts as agreement for the same reason:
+    a scan that cannot read a spelling has not learned that it is wrong.
+
+    What stands behind the cases it cannot decide is the catalog assertion
+    after the `CREATE` (ADR-0009 §3), which is keyed by the identity and fails
+    inside the transaction. An offline gate that decides what it can and a
+    connected assertion that decides the rest is the split; a gate that guessed
+    would be neither.
+
+291. **A module the deparse could not find is the catalog moving, not a reader
+    out of step with its query.** The pull reads the catalog in one
+    `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a
+    change as a whole schema, and 267's guard turns the `XX000` a moved catalog
+    raises into a retryable message. The module queries opened a second way for
+    the catalog to move, and it does not raise. Measured:
+
+    ```text
+    pg_get_viewdef(999999, true)  ->  NULL
+    pg_get_functiondef(999999)    ->  NULL
+    ```
+
+    A deparser resolves its oid through the syscache against a *fresh*
+    snapshot, so an object dropped between the scan and the deparse comes back
+    as a row with a name and no definition. Read through the ordinary
+    `missing` helper that said "the query and this code have gone out of step",
+    which is the one diagnosis that is certainly wrong — nothing is out of
+    step, and a reader sent to look for a renamed column will not find one.
+    **Absent, empty and unreadable are three different things**, and a vanished
+    object is the third.
+
+    So the modules read takes the definition as optional and turns `NULL` into
+    the same "the catalog changed while it was being read" the `XX000` path
+    gives. Not into a limitation and not into a skipped module (286): 286 is
+    for a statement this reader cannot *cut*, which is a fact about the object
+    and stays true on the next pull. This is a fact about the moment, and the
+    answer to it is to read again.
+
+    It was found by the live suite going red under its own parallelism, which
+    is what that suite is for: every test builds a schema and drops it, so a
+    pull is nearly always running across somebody's `DROP`. A defect that only
+    appears when two things happen at once has no other way to be found.
+
+292. **A pull and a rebuild can deadlock, and the answer is a sentence rather
+    than a lock order.** Reading a module's definition means deparsing it, and
+    `pg_get_viewdef` opens the view — so a pull holds `ACCESS SHARE` on every
+    view in the database for as long as that query runs. A rebuild takes
+    `ACCESS EXCLUSIVE` on the object it is about to replace (ADR-0009 §3).
+    Neither can be reordered: the pull's order is the catalog's, and the
+    rebuild's is one object. Measured, from the server log:
+
+    ```text
+    deadlock detected
+    Process A: LOCK TABLE "app"."granted" IN ACCESS EXCLUSIVE MODE
+    Process B: SELECT … pg_get_viewdef(c.oid, true) …
+    ```
+
+    The engine detects the cycle, picks a victim and rolls it back **whole** —
+    there is no half-read schema and no half-applied plan, which is the only
+    property that matters here. What was missing was the words: `40P01` reached
+    an operator as `db error` and nothing else, on both paths.
+
+    So both say it: the pull's guard (267) gains a `40P01` arm beside its
+    `XX000` one, and `before_a_rebuild` wraps the lock it takes. Each says the
+    same three things — it was a tie, nothing changed, run it again — and the
+    rebuild's names the likely other side, because "a `pull` or a `status`
+    opens every view in the database" is not something an operator can be
+    expected to know.
+
+    Not solved by taking a weaker lock: the lock is what makes the catalog
+    enumeration before the `DROP` mean anything. Not solved by holding the
+    deployment lock either — that serializes deployers, and a `pull` is not
+    one.
+
+    Found by the live suite, where fifty tests read the catalog while a handful
+    lock objects. The suite retries, and says in the helper that the retry is
+    its own concurrency rather than the product's.

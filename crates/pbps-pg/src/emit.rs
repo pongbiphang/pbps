@@ -1196,6 +1196,289 @@ fn unquoted(ident: &str) -> String {
         )
 }
 
+/// The parameter list at the front of a routine's definition, without its
+/// parentheses, or `None` where the text does not begin with one.
+///
+/// **Measured**, the list is not optional: `CREATE FUNCTION me.noparens
+/// RETURNS int …` is `syntax error at or near "RETURNS"`. So a definition that
+/// does not start with `(` is one the engine would refuse anyway, and this
+/// answers `None` rather than reading the whole body as a parameter.
+fn parameter_list(definition: &str) -> Option<&str> {
+    // Through the gap, not merely the whitespace: a comment is whitespace to
+    // this engine, so a definition opening with one still begins with its
+    // parameter list.
+    let body = after_the_gap(definition).0;
+    if !body.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < body.len() {
+        if let Some(skip) = skip_datum(&body[at..]) {
+            at += skip;
+            continue;
+        }
+        let c = body[at..].chars().next()?;
+        match c {
+            '"' => {
+                at += one_ident_len(&body[at..])?;
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&body[1..at]);
+                }
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    None
+}
+
+/// One slice per parameter, split at the commas the list's own depth zero
+/// puts between them — not at every comma, because `numeric(10, 2)` has one
+/// inside it and `DEFAULT '=,)'` has one inside a literal.
+fn parameters(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    while at < list.len() {
+        if let Some(skip) = skip_datum(&list[at..]) {
+            at += skip;
+            continue;
+        }
+        let Some(c) = list[at..].chars().next() else {
+            break;
+        };
+        match c {
+            '"' => {
+                if let Some(len) = one_ident_len(&list[at..]) {
+                    at += len;
+                    continue;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(list[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    parts.push(list[start..].trim());
+    if parts.len() == 1 && parts[0].is_empty() {
+        return Vec::new();
+    }
+    parts
+}
+
+/// A parameter mode this engine writes, folded.
+fn is_a_mode(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "in" | "out" | "inout" | "variadic"
+    )
+}
+
+/// Whether the identity carries this parameter, and the text after its mode.
+///
+/// The mode may come **before or after the name**, and both are the engine's,
+/// not a guess — measured:
+///
+/// ```text
+/// CREATE FUNCTION mf.a(a out int) …   identity  mf.a()
+/// CREATE FUNCTION me.o(out int) …     identity  me.o()
+/// CREATE FUNCTION mf.c(c inout int) … identity  mf.c(integer)
+/// ```
+///
+/// so `OUT` is the one mode a parameter can carry and stay out of
+/// `proargtypes`, and `VARIADIC text[]` is carried as `text[]` (ADR-0009 §1).
+fn after_the_mode(parameter: &str) -> (bool, &str) {
+    let Some(first) = one_ident_len(parameter) else {
+        return (true, parameter);
+    };
+    if is_a_mode(&parameter[..first]) {
+        return (
+            !parameter[..first].eq_ignore_ascii_case("out"),
+            parameter[first..].trim_start(),
+        );
+    }
+    // `name mode type`: the name is read and thrown away, because what is left
+    // is the type either way.
+    let after_name = parameter[first..].trim_start();
+    if let Some(second) = one_ident_len(after_name)
+        && is_a_mode(&after_name[..second])
+    {
+        return (
+            !after_name[..second].eq_ignore_ascii_case("out"),
+            after_name[second..].trim_start(),
+        );
+    }
+    (true, parameter)
+}
+
+/// The text before a parameter's default, which is the type and maybe a name.
+///
+/// `DEFAULT` and `=` are the two spellings, and the scan is the lexical one
+/// again: a `=` inside `DEFAULT '=,)'` is a byte of a literal, not the start
+/// of one.
+fn before_the_default(text: &str) -> &str {
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < text.len() {
+        if let Some(skip) = skip_datum(&text[at..]) {
+            at += skip;
+            continue;
+        }
+        let Some(c) = text[at..].chars().next() else {
+            break;
+        };
+        match c {
+            '"' => {
+                if let Some(len) = one_ident_len(&text[at..]) {
+                    at += len;
+                    continue;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => return text[..at].trim_end(),
+            _ if depth == 0 && pbps_dialect::continues_ident(c) && c != '"' => {
+                let end = at
+                    + text[at..]
+                        .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+                        .unwrap_or(text.len() - at);
+                if text[at..end].eq_ignore_ascii_case("default") {
+                    return text[..at].trim_end();
+                }
+                at = end;
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    text.trim_end()
+}
+
+/// Whether a type the body declares is **certainly not** the one the identity
+/// carries.
+///
+/// Certainly, and not merely apparently, because this decides a refusal. Two
+/// readings are tried, since a parameter with its mode off is `type` or
+/// `name type` and the engine's own grammar offers nothing else; a reading
+/// this dialect cannot parse as a type counts as agreement, because a scan
+/// that cannot read a spelling has not learned it is wrong.
+fn certainly_not(parameter: &str, identity: &RoutineArg) -> bool {
+    let rest = before_the_default(after_the_mode(parameter).1);
+    let readings = [
+        Some(rest),
+        one_ident_len(rest).map(|n| rest[n..].trim_start()),
+    ];
+    !readings.into_iter().flatten().any(|reading| {
+        reading
+            .parse::<RoutineArg>()
+            .ok()
+            .is_none_or(|declared| agrees(&declared, identity))
+    })
+}
+
+/// Whether two spellings are the same type, **or could be**.
+fn agrees(declared: &RoutineArg, identity: &RoutineArg) -> bool {
+    let declared = types::routine_arg(declared);
+    let identity = types::routine_arg(identity);
+    if declared == identity {
+        return true;
+    }
+    // A bare spelling in the body and a qualified one in the identity are one
+    // type whenever the write path puts that schema in front of the name, and
+    // this dialect cannot know whether it does: `format_type` under the empty
+    // read path always qualifies a user type (ADR-0013 §3), so the identity is
+    // written `md.my_type` while a hand-written body may say `my_type` and the
+    // engine resolve it to the same thing. Refusing that would refuse a valid
+    // plan, which is the one direction this gate may not be wrong in — and the
+    // catalog assertion after the `CREATE` (ADR-0009 §3) is what covers the
+    // case this cannot decide.
+    let (declared, declared_array) = types::peel_array(declared.as_str());
+    let (identity, identity_array) = types::peel_array(identity.as_str());
+    declared_array == identity_array
+        && !declared.is_empty()
+        && !identity.is_empty()
+        && (identity
+            .strip_suffix(declared)
+            .is_some_and(|schema| schema.ends_with('.'))
+            || declared
+                .strip_suffix(identity)
+                .is_some_and(|schema| schema.ends_with('.')))
+}
+
+/// What the body's parameter list disagrees with the identity about.
+///
+/// The same shape as the trigger's `ON` check above and for the same reason:
+/// the identity holds the argument types **and** the body holds the parameter
+/// list, so the two can disagree and the engine accepts the disagreement
+/// without a word. `CREATE FUNCTION app.f\n(x text) …` under the key
+/// `app.f(integer)` creates `app.f(text)`; the key names an object that does
+/// not exist, and every later plan creates it again and drops nothing.
+///
+/// Only a **certain** disagreement is refused. A count is always certain: an
+/// `OUT` parameter is not in `proargtypes` and every other mode is, so the
+/// number the body carries into the identity is a count this scan can take.
+/// A type is certain only where both spellings are read; where one is a bare
+/// name the write path may qualify, [`agrees`] says so and this says nothing,
+/// and the catalog assertion after the `CREATE` (ADR-0009 §3) is what stands
+/// behind it.
+fn the_body_declares_the_identity(
+    id: &ModuleId,
+    definition: &str,
+    args: &[RoutineArg],
+) -> Vec<DialectError> {
+    let Some(list) = parameter_list(definition) else {
+        return vec![invalid(format!(
+            "routine `{id}` has a definition that does not begin with a parameter list. On this \
+             engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
+             after the name, so the list is the body's — and **measured**, the engine requires \
+             one: `CREATE FUNCTION f RETURNS int …` is a syntax error",
+            id.object_name()
+        ))];
+    };
+    let carried: Vec<&str> = parameters(list)
+        .into_iter()
+        .filter(|p| after_the_mode(p).0)
+        .collect();
+    if carried.len() != args.len() {
+        return vec![invalid(format!(
+            "routine `{id}` is declared with {} argument type(s), and its definition's parameter \
+             list carries {} into the identity. On this engine a routine is its name and its \
+             argument types (ADR-0009 §1), so the engine would create an object this key does not \
+             name — and accept it without a word",
+            args.len(),
+            carried.len()
+        ))];
+    }
+    carried
+        .iter()
+        .zip(args)
+        .enumerate()
+        .filter(|(_, (parameter, arg))| certainly_not(parameter, arg))
+        .map(|(at, (parameter, arg))| {
+            invalid(format!(
+                "routine `{id}` names `{arg}` as argument {}, and its definition declares that \
+                 parameter as `{parameter}`. The identity comes from the parameter list the \
+                 definition holds, so the engine would create a different routine under this key \
+                 and the next plan would not find the one named here",
+                at + 1
+            ))
+        })
+        .collect()
+}
+
 fn empty_definition(id: &ModuleId) -> DialectError {
     invalid(format!("module `{id}` has an empty definition"))
 }
@@ -1216,11 +1499,18 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
         found.push(e);
     }
     match module.kind {
-        ModuleKind::Function | ModuleKind::Procedure => {
-            if let Err(e) = signature(id) {
-                found.push(e);
+        ModuleKind::Function | ModuleKind::Procedure => match id.args() {
+            // `signature` is the one that says what a routine without an
+            // argument list costs, and it errs exactly here.
+            None => found.extend(signature(id).err()),
+            // An empty definition is already refused above; running the
+            // parameter scan on it would say the same thing twice, in worse
+            // words.
+            Some(args) if !module.definition.trim().is_empty() => {
+                found.extend(the_body_declares_the_identity(id, &module.definition, args));
             }
-        }
+            Some(_) => {}
+        },
         ModuleKind::Trigger => match attached_to(id) {
             Err(e) => found.push(e),
             Ok(on) => {
@@ -1762,6 +2052,188 @@ mod tests {
 
     fn id(s: &str) -> ModuleId {
         s.parse().expect("a module id parses")
+    }
+
+    /// The routine half of the same rule the trigger's `ON` check enforces:
+    /// the identity and the body both carry the argument types, and the engine
+    /// creates whatever the body says under whatever key the declarations use.
+    #[test]
+    fn a_parameter_list_that_creates_another_identity_is_refused_offline() {
+        for (key, definition) in [
+            // The shape the review found: same count, different type.
+            (
+                "app.f(integer)",
+                "(x text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A second parameter the identity does not carry.
+            (
+                "app.f(integer)",
+                "(a integer, b text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // None at all where the identity carries one.
+            (
+                "app.f(integer)",
+                "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // `OUT` is the one mode that keeps a parameter out of the
+            // identity, so this list carries nothing into it.
+            (
+                "app.f(integer)",
+                "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The modifier goes, and `numeric(10,2)` is still not `integer`.
+            (
+                "app.f(integer)",
+                "(a numeric(10, 2)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Two qualified spellings that are both certain and differ.
+            (
+                "app.f(md.my_type)",
+                "(a other.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The default is cut at the `=` outside the literal, and what is
+            // left is still the wrong type.
+            (
+                "app.f(integer)",
+                "(a text = ')') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Measured: the engine requires the list, so a body without one is
+            // not a routine this dialect can create under any key.
+            (
+                "app.f(integer)",
+                "RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                !found.is_empty(),
+                "`{key}` with `{definition}` was accepted, and the engine would create another \
+                 object under this key"
+            );
+        }
+    }
+
+    /// The other half, which is the one that decides whether the gate is
+    /// usable: every spelling the engine accepts for the declared identity
+    /// passes, including the ones a scan could mistake for a disagreement.
+    #[test]
+    fn a_parameter_list_that_creates_the_declared_identity_is_accepted() {
+        for (key, definition) in [
+            (
+                "app.f(integer)",
+                "(x integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // No name at all, which is a parameter list of one type.
+            (
+                "app.f(integer)",
+                "(integer) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+            ),
+            // A spelling the engine folds to the identity's.
+            (
+                "app.f(integer)",
+                "(a int DEFAULT 3) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The modifier is discarded from every routine argument.
+            (
+                "app.f(numeric)",
+                "(a numeric(10, 2)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(character varying)",
+                "(a character varying(5)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A two-word type with a name in front of it, which the two
+            // readings are there for.
+            (
+                "app.f(double precision)",
+                "(a double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // And without one.
+            (
+                "app.f(double precision)",
+                "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+            ),
+            // `OUT` is not in the identity; every other mode is.
+            ("app.f()", "(out x text) LANGUAGE sql AS $$ SELECT 'q' $$"),
+            (
+                "app.f(integer)",
+                "(a integer, out b text) LANGUAGE sql AS $$ SELECT 'q' $$",
+            ),
+            (
+                "app.f(integer)",
+                "(a inout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(text[])",
+                "(variadic a text[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Measured: the mode may follow the name as well as precede it.
+            ("app.f()", "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$"),
+            // A bare name the write path may qualify to the identity's — this
+            // dialect cannot know whether it does, so it does not refuse.
+            (
+                "app.f(md.my_type)",
+                "(a my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(md.my_type[])",
+                "(a my_type[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A quoted name with a comma in it is one parameter, not two.
+            (
+                "app.f(integer)",
+                "(\"a,b\" integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // The comma inside a literal default is not a separator either.
+            (
+                "app.f(integer,text)",
+                "(a integer, b text DEFAULT ',)') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // Nothing on either side.
+            ("app.f()", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            // A leading comment is not a missing parameter list.
+            (
+                "app.f(integer)",
+                "/* the id */ (a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                found.is_empty(),
+                "`{key}` with `{definition}` was refused: {:?}",
+                found.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A scan that cannot read a spelling has not learned that it is wrong,
+    /// and a refusal it makes anyway refuses a plan the engine would accept.
+    #[test]
+    fn a_parameter_this_scan_cannot_read_is_not_read_as_a_disagreement() {
+        for (key, definition) in [
+            // A type spelling `RoutineArg` does not admit, in a body the
+            // engine is perfectly happy with.
+            (
+                "app.f(integer)",
+                "(a t%rowtype) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A quoted type name the catalogue has never heard of.
+            (
+                "app.f(\"odd type\")",
+                "(a \"odd type\") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id(key), &module(ModuleKind::Function, definition));
+            assert!(
+                found.is_empty(),
+                "`{key}` with `{definition}` was refused on a spelling this dialect cannot read: \
+                 {:?}",
+                found.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Each prefix ends where this engine's grammar puts the declaration's

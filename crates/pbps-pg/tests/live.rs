@@ -1046,9 +1046,7 @@ fn probe_schema(test: &str) -> String {
 }
 
 async fn build(conn: &mut Conn, schema: &str, body: &str) {
-    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .await
-        .expect("drop the probe schema");
+    drop_schema(conn, schema).await;
     conn.execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .expect("create the probe schema");
@@ -1084,7 +1082,7 @@ async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
                 assert!(
                     e.to_string()
                         .contains("the catalog changed while it was being read"),
-                    "the pull failed for a reason this suite does not cause: {e}"
+                    "the pull failed for a reason this suite does not cause: {e:?}"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -1242,9 +1240,7 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
     assert_eq!(fk.on_update, pbps_model::ReferentialAction::NoAction);
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// The reason ADR-0013 §3 pins the search path, measured rather than asserted.
@@ -1350,9 +1346,7 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
     .await;
     assert!(!in_transaction);
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// PostgreSQL does not nest transactions, so a pull that ran inside the
@@ -1404,9 +1398,7 @@ async fn a_pull_inside_the_callers_own_transaction_is_refused() {
     let pulled = pull(&mut conn).await;
     assert!(ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "kept")));
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// Two settings that decide how the pull's *own SQL* is read, rather than how
@@ -1444,9 +1436,7 @@ async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
         ours(&pulled, &s)
     );
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// Every kind of object the model cannot hold, in one database, each measured
@@ -1555,6 +1545,22 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.leaning (a integer,
                  CONSTRAINT leaning_fk FOREIGN KEY (a) REFERENCES {s}.covering (a));
              CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA {s};
+             -- Two module-shaped objects the model does not hold, owned by an
+             -- extension. `ALTER EXTENSION … ADD` is how the fixture is built
+             -- rather than an extension that ships them: what the reader keys
+             -- on is the `pg_depend deptype = 'e'` edge, and this makes one.
+             -- Here rather than in a test of its own because `CREATE
+             -- EXTENSION` is expensive and a second one running beside this
+             -- one deadlocked the suite: four other tests came back `40P01`.
+             --
+             -- The extension has to be one this schema owns. Measured, a
+             -- `DROP SCHEMA … CASCADE` over a schema holding a member drops
+             -- the *extension* — attaching these to `plpgsql` took plpgsql and
+             -- every plpgsql function in the database with the schema.
+             CREATE MATERIALIZED VIEW {s}.theirs_mv AS SELECT id FROM {s}.odd;
+             CREATE AGGREGATE {s}.theirs_agg(integer) (sfunc = int4pl, stype = integer);
+             ALTER EXTENSION btree_gist ADD MATERIALIZED VIEW {s}.theirs_mv;
+             ALTER EXTENSION btree_gist ADD AGGREGATE {s}.theirs_agg(integer);
              CREATE TABLE {s}.temporal (
                  id integer, valid daterange,
                  CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
@@ -1718,6 +1724,31 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             "no warning mentions `{expected}`:\n{all}"
         );
     }
+
+    // An extension's own objects are left out **silently** (DECISIONS 287),
+    // and that holds for the limitation reader as much as for the ordinary
+    // one. Reported, they would be worse than noise: `managed_limitations`
+    // refuses every command for a limitation whose name is in the managed set,
+    // so an extension object colliding with a declared name would refuse a
+    // plan that is correct. A materialized view and an aggregate are the two
+    // kinds the unheld reader reports, so they are the two this checks.
+    for theirs in ["theirs_mv", "theirs_agg"] {
+        assert!(
+            !all.contains(theirs),
+            "`{s}.{theirs}` belongs to an extension and is nobody's declaration:\n{all}"
+        );
+    }
+    // And the extension's objects are not read back as this project's either,
+    // which is the same rule on the other reader.
+    assert!(
+        !pulled
+            .schema
+            .modules
+            .keys()
+            .any(|id| id.schema() == s && id.name().starts_with("theirs")),
+        "{:?}",
+        pulled.schema.modules.keys().collect::<Vec<_>>()
+    );
 
     // The two that must be left out rather than read back wrong.
     let odd = &pulled.schema.tables[&pbps_model::TableName::new(&s, "odd")];
@@ -1961,9 +1992,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
          tables left out whole must each earn one"
     );
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,9 +2010,7 @@ fn emit_schema(test: &str) -> String {
 }
 
 async fn fresh(conn: &mut Conn, schema: &str) {
-    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .await
-        .expect("drop the emit schema");
+    drop_schema(conn, schema).await;
     conn.execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .expect("create the emit schema");
@@ -2232,9 +2259,7 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
         ),
     )
     .await;
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     assert!(
         limitations.is_empty(),
@@ -2270,9 +2295,7 @@ async fn the_plan_straight_after_a_bootstrap_is_empty() {
 
     let pulled = pull(&mut conn).await;
     let ours = ours_only(&pulled, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     let again = plan(&ours, &ids, &declared, &ids);
     assert!(
@@ -2375,9 +2398,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
     let pulled = pull(&mut conn).await;
     let state_b = ours_only(&pulled, &s);
     let limitations = ours_limitations(&pulled, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     assert!(limitations.is_empty(), "{limitations:?}");
     assert_eq!(state_b, normalized(&b));
@@ -2474,12 +2495,8 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
         table.checks["ck_floor"].expression,
         table.indexes["ix_floor"].filter
     );
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
-    conn.execute(&format!("DROP SCHEMA {ext} CASCADE"))
-        .await
-        .expect("drop the extra");
+    drop_schema(&mut conn, &s).await;
+    drop_schema(&mut conn, &ext).await;
     assert_eq!(
         bindings.matches(&format!("{ext}.floorish")).count(),
         3,
@@ -2504,9 +2521,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
         .expect("the path that would name it");
     let explicit = text(&mut conn, "SELECT lower('X')").await;
     conn.execute("RESET search_path").await.expect("reset");
-    conn.execute(&format!("DROP SCHEMA {shadow} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &shadow).await;
     assert_eq!(
         implicit, "x",
         "the built-in wins wherever the path omits it"
@@ -2597,9 +2612,7 @@ async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
         "{:?} {:?} {:?}",
         table.columns["n"].default, table.checks["ck_n"].expression, table.indexes["ix_n"].filter
     );
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     // The engine keeps none of the comments — `pg_get_constraintdef` renders
     // the parsed expression — so what this asserts is that all three arrived
     // and none of them took the syntax behind it away.
@@ -2705,9 +2718,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
     );
     let refusals = run(&mut conn, &statements).await;
     conn.rollback(framing).await.expect("rollback");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     assert_eq!(
         refusals,
         vec!["42601"],
@@ -2804,9 +2815,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
         .await
         .expect_err("a concurrent build inside a transaction");
     conn.rollback(framing).await.expect("rollback");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     // `25001` is `active_sql_transaction`: `CREATE INDEX CONCURRENTLY cannot
     // run inside a transaction block`, which is the engine's own words for
     // what `Statement::non_transactional` reports at plan time.
@@ -2904,9 +2913,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
          resolution — which is why only the bare literal is refused here and \
          the rest waits for ADR-0013 §3's canonicalization at plan time"
     );
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     // So the emitter refuses the first spelling and emits the second.
     let table = |default: &str| {
@@ -2983,9 +2990,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
         .await
         .expect_err("this engine will not choose the conversion either");
     assert_eq!(sqlstate(&engine), "42804");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     let column = TableName::new(&s, "t").column("c");
     let refusal = Postgres::new()
@@ -3068,9 +3073,7 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
         .expect_err("a primary key column cannot be made nullable");
     // `42P16` is `invalid_table_definition`: `column "id" is in a primary key`.
     assert_eq!(sqlstate(&refusal), "42P16");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     let mut table = Table::default();
     table
@@ -3129,12 +3132,8 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
     }
     let pulled = pull(&mut conn).await;
     let landed = ours_only(&pulled, &to_schema);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
-    conn.execute(&format!("DROP SCHEMA {to_schema} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
+    drop_schema(&mut conn, &to_schema).await;
     assert_eq!(landed.tables.keys().collect::<Vec<_>>(), vec![&to]);
 }
 
@@ -3183,9 +3182,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
 
     let pulled = pull(&mut conn).await;
     let ours = ours_only(&pulled, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     assert_eq!(ours.tables[&table].primary_key, None);
 }
 
@@ -3287,9 +3284,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     let pulled = pull(&mut conn).await;
     let state_b = ours_only(&pulled, &s);
     let limitations = ours_limitations(&pulled, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     assert!(limitations.is_empty(), "{limitations:?}");
     assert_eq!(state_b, normalized(&b));
@@ -3405,9 +3400,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
     // this transaction's own DDL.
     let ours = stored(&mut conn, &s).await;
     conn.rollback(framing).await.expect("rollback");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     // A day, an instant, a sign, an abbreviation fifteen and a half hours out,
     // and a predicate that stopped being the one that was written.
@@ -3480,9 +3473,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
             .await
             .expect("drop");
     }
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     assert_eq!(
         instants,
         vec![
@@ -3514,9 +3505,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
             .await
             .expect("drop");
     }
-    conn.execute(&format!("DROP SCHEMA {s2} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s2).await;
     assert_eq!(
         kept,
         vec!["12:00:00+00".to_owned(), "07:00:00-05".to_owned()],
@@ -3566,9 +3555,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
             .await
             .expect("drop");
     }
-    conn.execute(&format!("DROP SCHEMA {s3} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s3).await;
     assert_eq!(
         projected,
         vec!["12:00:00".to_owned(), "12:00:00".to_owned()],
@@ -3669,9 +3656,7 @@ async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
     apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
 
     let pulled = pull(&mut conn).await;
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     let state = ours_only(&pulled, &s);
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
@@ -3733,9 +3718,7 @@ async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
 
     let pulled = pull(&mut conn).await;
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     let state = ours_only(&pulled, &s);
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
@@ -3795,9 +3778,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
     }
     let rendered = text(&mut conn, &format!("SELECT b || ' ' || f FROM {s}.t")).await;
     conn.rollback(framing).await.expect("rollback");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     // What the pin decided, not what the session held: `escape` would have
     // stored `\001\002` and `-3` would have stopped at twelve digits.
@@ -3853,9 +3834,7 @@ async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
     apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
 
     let pulled = pull(&mut conn).await;
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     let state = ours_only(&pulled, &s);
     assert_eq!(state, normalized(&b));
     let again = plan(&state, &ids_b, &b, &ids_b);
@@ -5217,9 +5196,7 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
     .await;
 
     let second = our_modules(&pull(&mut conn).await, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     assert_eq!(
         second, first,
         "the text this engine deparsed did not rebuild into the same object"
@@ -5294,9 +5271,7 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
         conn.execute(&stmt.sql).await.expect("drop one overload");
     }
     let left = our_modules(&pull(&mut conn).await, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     assert_eq!(
         left.keys().map(ToString::to_string).collect::<Vec<_>>(),
         vec![format!("{s}.f(text)")],
@@ -5307,6 +5282,75 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
 /// Opens a transaction, because [`pbps_pg::modules::before_a_rebuild`] takes
 /// the object's lock and holds it through the rebuild — outside a transaction
 /// the lock would be released at the end of the statement that took it.
+/// A rebuild's carried state, read in its own transaction, retried when the
+/// engine breaks a lock cycle.
+///
+/// `before_a_rebuild` takes `ACCESS EXCLUSIVE` on the object it is about to
+/// replace (ADR-0009 §3). Every other test in this file pulls, and a pull
+/// deparses every view in the database — `pg_get_viewdef` opens each one, so
+/// the read holds `ACCESS SHARE` on relations this test wants exclusively.
+/// Measured from the server log, the two orders cross and the engine kills a
+/// side:
+///
+/// ```text
+/// deadlock detected
+/// Process A: LOCK TABLE "…_carried"."granted" IN ACCESS EXCLUSIVE MODE
+/// Process B: SELECT … pg_get_viewdef(c.oid, true) …
+/// ```
+///
+/// Which side it kills is its choice, so both have to be able to lose. Outside
+/// this suite a deployer holds the deployment lock and a pull is a moment;
+/// here fifty tests read the catalog while a handful lock objects, and that is
+/// the suite's own doing rather than anything the product has to answer for.
+/// What the product owes is the message, and [`deadlocked`] is what checks it.
+async fn read_a_rebuild(
+    conn: &mut Conn,
+    id: &pbps_model::ModuleId,
+    kind: pbps_model::ModuleKind,
+) -> pbps_pg::modules::Rebuild {
+    for _ in 0..20 {
+        in_a_transaction(conn).await;
+        match pbps_pg::modules::before_a_rebuild(conn, id, kind).await {
+            Ok(rebuild) => {
+                rollback(conn).await;
+                return rebuild;
+            }
+            Err(e) => {
+                rollback(conn).await;
+                assert!(deadlocked(&e), "{id}: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("twenty rebuild reads in a row lost a lock cycle to another test");
+}
+
+/// Whether the engine broke a lock cycle and this side lost.
+fn deadlocked(e: &DbError) -> bool {
+    matches!(e, DbError::Driver { code, .. } if code.as_deref() == Some("40P01"))
+}
+
+/// `DROP SCHEMA … CASCADE`, retried for the same reason.
+///
+/// The teardown takes `ACCESS EXCLUSIVE` on everything in the schema, which
+/// includes its views — so a pull in another test is exactly the other half of
+/// the cycle above.
+async fn drop_schema(conn: &mut Conn, schema: &str) {
+    for _ in 0..20 {
+        match conn
+            .execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+        {
+            Ok(()) => return,
+            Err(e) => {
+                assert!(deadlocked(&e), "drop {schema}: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("twenty drops in a row lost a lock cycle to another test");
+}
+
 async fn in_a_transaction(conn: &mut Conn) {
     conn.execute("BEGIN").await.expect("begin");
 }
@@ -5397,11 +5441,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     ];
     for (id, kind, expected) in &cases {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
-        in_a_transaction(&mut conn).await;
-        let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &id, *kind)
-            .await
-            .unwrap_or_else(|e| panic!("{id}: {e}"));
-        rollback(&mut conn).await;
+        let rebuild = read_a_rebuild(&mut conn, &id, *kind).await;
         match expected {
             None => assert_eq!(
                 rebuild.refusal(),
@@ -5445,11 +5485,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     .await
     .expect("default privileges");
     let plain: pbps_model::ModuleId = format!("{s}.plain").parse().expect("a module id");
-    in_a_transaction(&mut conn).await;
-    let arriving = pbps_pg::modules::before_a_rebuild(&mut conn, &plain, View)
-        .await
-        .expect("read");
-    rollback(&mut conn).await;
+    let arriving = read_a_rebuild(&mut conn, &plain, View).await;
     let refusal = arriving
         .refusal()
         .expect("a view that would arrive granted must refuse");
@@ -5467,11 +5503,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         .await
         .expect("a view created while the default privilege is in force");
     let arrived: pbps_model::ModuleId = format!("{s}.arrived").parse().expect("a module id");
-    in_a_transaction(&mut conn).await;
-    let after = pbps_pg::modules::before_a_rebuild(&mut conn, &arrived, View)
-        .await
-        .expect("read");
-    rollback(&mut conn).await;
+    let after = read_a_rebuild(&mut conn, &arrived, View).await;
     let landed = after
         .refusal()
         .expect("the object the CREATE made carries a grant nothing declared");
@@ -5486,9 +5518,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     ))
     .await
     .expect("undo the default privileges");
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
     conn.execute(&format!("DROP ROLE {reader}"))
         .await
         .expect("drop the role");
@@ -5530,11 +5560,7 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         (format!("{s}.f(integer)"), Function, "pg_proc"),
     ] {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
-        in_a_transaction(&mut conn).await;
-        let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &id, kind)
-            .await
-            .unwrap_or_else(|e| panic!("{id}: {e}"));
-        rollback(&mut conn).await;
+        let rebuild = read_a_rebuild(&mut conn, &id, kind).await;
         match &rebuild.serialized {
             pbps_pg::modules::Serialized::By(what) => {
                 assert!(what.contains(expected), "{id}: {what}");
@@ -5579,9 +5605,7 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         format!("{refused}").contains("inside the transaction"),
         "{refused}"
     );
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// The account this tool is actually built for cannot take a routine's lock,
@@ -5631,12 +5655,8 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
     .expect("the deploying account owns its own function");
 
     let id: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
-    in_a_transaction(&mut conn).await;
-    let rebuild =
-        pbps_pg::modules::before_a_rebuild(&mut conn, &id, pbps_model::ModuleKind::Function)
-            .await
-            .expect("the read must survive an attempt that could not take the lock");
-    rollback(&mut conn).await;
+    // The read must survive an attempt that could not take the lock.
+    let rebuild = read_a_rebuild(&mut conn, &id, pbps_model::ModuleKind::Function).await;
 
     match &rebuild.serialized {
         pbps_pg::modules::Serialized::Not(why) => {
@@ -5853,6 +5873,57 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         .await
         .expect("drop the cast");
 
+    // A domain's check constraint is a `pg_constraint` row like a table's,
+    // and it is not on a table: measured, `conrelid` is 0 and `contypid`
+    // names the domain. The inner join to `pg_class` therefore threw the row
+    // away, and a reader that reported no blocker emitted a `DROP FUNCTION`
+    // the engine refuses — the case the fallback arm exists for, arriving
+    // inside a class the list already knew.
+    for sql in [
+        format!(
+            "CREATE FUNCTION {s}.ok(t text) RETURNS boolean IMMUTABLE LANGUAGE sql \
+             AS $$ SELECT length(t) > 2 $$"
+        ),
+        format!("CREATE DOMAIN {s}.checked AS text CHECK ({s}.ok(VALUE))"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let ok: pbps_model::ModuleId = format!("{s}.ok(text)").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let behind_a_domain =
+        pbps_pg::modules::dependents(&mut conn, &ok, pbps_model::ModuleKind::Function)
+            .await
+            .expect("read the dependents");
+    rollback(&mut conn).await;
+    assert_eq!(
+        behind_a_domain
+            .iter()
+            .map(|d| d.described.as_str())
+            .collect::<Vec<_>>(),
+        vec!["constraint checked_check"],
+        "a constraint an arm's own join drops is as absent as one with no arm"
+    );
+    assert!(
+        matches!(&behind_a_domain[0].holds, pbps_pg::modules::Holds::Unrepresentable(why)
+                 if why.contains("domain")),
+        "a domain constraint is something this project cannot put back, not nothing: {:?}",
+        behind_a_domain[0].holds
+    );
+    let domain_refusal = pbps_pg::modules::unmanaged_refusal(&ok, &behind_a_domain, &nothing)
+        .expect("a dependent this project cannot recreate refuses");
+    assert!(domain_refusal.contains("checked_check"), "{domain_refusal}");
+    let engine_agrees_again = conn
+        .execute(&format!("DROP FUNCTION {s}.ok(text)"))
+        .await
+        .expect_err("and the engine refuses the drop this reader would have allowed");
+    assert_eq!(
+        sqlstate(&engine_agrees_again),
+        "2BP01",
+        "{engine_agrees_again:?}"
+    );
+
     // A view's own edges are not its dependents, and this is the case that
     // shows it: `pg_depend` holds an *internal* edge from a view's `_RETURN`
     // rule and its row type to the view itself, so a reader that took every
@@ -5897,9 +5968,7 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         .expect_err("the level below has to go first");
     assert_eq!(sqlstate(&out_of_order), "2BP01", "{out_of_order:?}");
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// The limit of "enumerate from the catalog", measured: `pg_depend` records an
@@ -5985,9 +6054,7 @@ async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_
     };
     assert_eq!(sqlstate(&broken), "42883", "{broken:?}");
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }
 
 /// ADR-0013 §3, and the issue's last named check: **a same-named object
@@ -6135,9 +6202,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
     );
 
     for schema in [&s, &shared] {
-        conn.execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await
-            .expect("drop");
+        drop_schema(&mut conn, schema).await;
     }
 }
 
@@ -6188,9 +6253,7 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
         .iter()
         .filter(|w| w.contains(&format!("{s}.")))
         .collect();
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     assert_eq!(
         ours.keys().map(ToString::to_string).collect::<Vec<_>>(),
@@ -6205,6 +6268,291 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
             "`{s}.{object}` was not named: {named:#?}"
         );
     }
+}
+
+/// A module the catalog scan saw and the deparse could not: the third of
+/// "absent, empty and unreadable", and the one the pull used to report as its
+/// own bug.
+///
+/// The pull takes one `REPEATABLE READ` snapshot so that it cannot report half
+/// of a change as a whole schema. A deparser does not read from it — it
+/// resolves its oid through the syscache against a fresh snapshot — so an
+/// object dropped between the scan and the deparse comes back as a row with a
+/// name and no definition. Reported as an unexpected row shape it read as "the
+/// query and this code have gone out of step", which is the one diagnosis that
+/// is certainly wrong: nothing is out of step, the catalog moved.
+///
+/// Two halves. The engine's, which is what the rule rests on and is exact; and
+/// the reader's, driven by dropping views out from under a pull until it
+/// happens.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_module_dropped_between_the_scan_and_the_deparse_says_the_catalog_moved() {
+    let mut conn = connect().await;
+    // The deparsers answer `NULL` for an oid that is not there rather than
+    // raising, which is why this arrives as a row and not as `XX000`. If a
+    // later engine raises instead, this fails and the reader's rule is the
+    // thing to revisit.
+    for probe in [
+        "pg_catalog.pg_get_viewdef(999999::oid, true)",
+        "pg_catalog.pg_get_functiondef(999999::oid)",
+    ] {
+        assert!(
+            truth(&mut conn, &format!("SELECT {probe} IS NULL")).await,
+            "{probe} must answer NULL for an oid that is gone"
+        );
+    }
+
+    // One schema of routines, dropped one at a time. Not whole schemas: a
+    // `DROP SCHEMA … CASCADE` storm deadlocks against the rest of this suite
+    // doing the same thing, and a test that destabilises its neighbours is not
+    // paying for itself. Routines rather than views because
+    // `pg_get_functiondef` is the deparser that answers `NULL` for an oid that
+    // is gone — `pg_get_viewdef` more often catches the drop mid-flight and
+    // raises `XX000`, which is the path that was already right.
+    const ROUTINES: usize = 40;
+    let s = emit_schema("vanishing");
+    fresh(&mut conn, &s).await;
+    // Long bodies rather than many routines: what has to be long is the
+    // *deparse*, so that a drop has somewhere to land inside it, and forty
+    // statements do not slow the rest of the suite down the way four hundred
+    // do.
+    let padding = "-- ".to_owned() + &"pad ".repeat(500);
+    for n in 0..ROUTINES {
+        conn.execute(&format!(
+            "CREATE FUNCTION {s}.f{n}(a int) RETURNS int LANGUAGE sql AS $$\n{padding}\n\
+             SELECT a $$"
+        ))
+        .await
+        .expect("a routine");
+    }
+
+    let churn_schema = s.clone();
+    let churn = tokio::spawn(async move {
+        let mut churner = connect().await;
+        for n in 0..ROUTINES {
+            churner
+                .execute(&format!("DROP FUNCTION {churn_schema}.f{n}(int)"))
+                .await
+                .expect("drop one routine");
+        }
+    });
+
+    let mut caught = 0usize;
+    let mut pulls = 0usize;
+    while !churn.is_finished() {
+        pulls += 1;
+        if let Err(e) = pbps_pg::catalog::introspect(&mut conn).await {
+            let message = e.to_string();
+            assert!(
+                !message.contains("gone out of step"),
+                "a vanished module is not a reader out of step with its query: {message}"
+            );
+            assert!(
+                message.contains("the catalog changed while it was being read"),
+                "the pull failed for a reason this test does not cause: {message}"
+            );
+            caught += 1;
+        }
+    }
+    churn.await.expect("the churner finished");
+    drop_schema(&mut conn, &s).await;
+
+    // Asserted to have fired, because a test that can pass without reaching
+    // the case is one that will go on passing when the case breaks. The
+    // fixture is sized for it: every pull scans all of these schemas, and the
+    // churn drops them one at a time, so a pull that overlaps none of the
+    // drops means the churn outran the reader and the counts say so.
+    assert!(
+        caught > 0,
+        "{pulls} pulls ran and none of them overlapped a drop; the fixture has stopped \
+         reaching the case it exists for"
+    );
+}
+
+/// The routine half of "the identity and the body both carry it, and the
+/// engine accepts the disagreement without a word".
+///
+/// The trigger's `ON` clause has had this test since the kind was added; the
+/// parameter list had none, and it is the same fact: the emitter writes
+/// `CREATE FUNCTION <name>` and the declaration writes the list, so a key
+/// saying `f(integer)` over a body saying `(x text)` creates `f(text)` — an
+/// object the key does not name, that every later plan creates again and never
+/// finds.
+///
+/// Measured both ways round: every spelling the gate accepts creates exactly
+/// the identity its key names, and the shape the gate refuses is one the
+/// engine really does accept under the wrong name.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_under() {
+    let s = emit_schema("routine_identity");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TYPE {s}.my_type AS ENUM ('a', 'b')"))
+        .await
+        .expect("a user type to qualify");
+    let pg = Postgres::new();
+
+    // Every one of these is a spelling a declaration may reasonably carry, and
+    // the assertion is not that the gate likes it: it is that the object the
+    // engine creates is the one the key names.
+    for (at, (args, definition)) in [
+        (
+            "integer",
+            "(x integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer",
+            "(integer) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+        ),
+        (
+            "integer",
+            "(a int DEFAULT 3) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        // The modifier is discarded from every routine argument, catalogued or
+        // not, so the declared spelling and the identity differ on purpose.
+        (
+            "numeric",
+            "(a numeric(10, 2)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "character varying",
+            "(a character varying(5)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "double precision",
+            "(a double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "double precision",
+            "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$",
+        ),
+        // `OUT` is the one mode that keeps a parameter out of `proargtypes`,
+        // and it may be written on either side of the name.
+        ("", "(out x text) LANGUAGE sql AS $$ SELECT 'q' $$"),
+        ("", "(a out integer) LANGUAGE sql AS $$ SELECT 1 $$"),
+        (
+            "integer",
+            "(a integer, out b text) LANGUAGE sql AS $$ SELECT 'q' $$",
+        ),
+        (
+            "integer",
+            "(a inout integer) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "text[]",
+            "(variadic a text[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer",
+            "(\"a,b\" integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "integer,text",
+            "(a integer, b text DEFAULT ',)') RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        ("", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+        (
+            "integer",
+            "/* the id */ (a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        // A bare user type in the body and the qualified spelling in the key:
+        // `format_type` under the empty read path always qualifies one
+        // (ADR-0013 §3), and the write path is what makes the bare name find
+        // it. The gate cannot know that it does, so it does not refuse — and
+        // this measures that the two really are one object.
+        (
+            "%S%.my_type",
+            "(a my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+        (
+            "%S%.my_type",
+            "(a %S%.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("f{at}");
+        // The key is written the way a declaration writes one, with the user
+        // type qualified because that is what `format_type` reads back under
+        // the empty path (ADR-0013 §3).
+        let args = args.replace("%S%", &s);
+        let definition = definition.replace("%S%", &s);
+        let definition = definition.as_str();
+        let key = if args.is_empty() {
+            format!("{s}.{name}()")
+        } else {
+            format!("{s}.{name}({args})")
+        };
+        let id: pbps_model::ModuleId = key.parse().unwrap_or_else(|e| panic!("{key}: {e}"));
+        let module = module(pbps_model::ModuleKind::Function, definition);
+        let refusals = pg.validate_module(&id, &module);
+        assert!(
+            refusals.is_empty(),
+            "the gate refused `{key}` over `{definition}`: {:?}",
+            refusals.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+        for statement in pg
+            .emit(
+                &pbps_model::Change::CreateModule {
+                    id: id.clone(),
+                    module: Box::new(module.clone()),
+                },
+                Strategy::default(),
+            )
+            .expect("emit the create")
+        {
+            conn.execute(&statement.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", statement.sql));
+        }
+        let written = text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc p
+                  WHERE p.pronamespace = '{s}'::regnamespace AND p.proname = '{name}'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            written, key,
+            "`{definition}` under the key `{key}` created another object"
+        );
+    }
+
+    // And the other direction, because a gate that never refuses is not one.
+    // The engine takes this statement happily; what it creates is `g(text)`,
+    // under a declaration that says `g(integer)`.
+    let wrong: pbps_model::ModuleId = format!("{s}.g(integer)").parse().expect("a module id");
+    let body = module(
+        pbps_model::ModuleKind::Function,
+        "(x text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+    );
+    assert!(
+        !pg.validate_module(&wrong, &body).is_empty(),
+        "a body that creates another identity has to be refused offline"
+    );
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.g(x text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+    ))
+    .await
+    .expect("the engine accepts it without a word, which is the whole problem");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc p
+                  WHERE p.pronamespace = '{s}'::regnamespace AND p.proname = 'g'"
+            )
+        )
+        .await,
+        format!("{s}.g(text)"),
+        "the identity comes from the parameter list, not from the key"
+    );
+
+    drop_schema(&mut conn, &s).await;
 }
 
 /// The one assertion that ties ADR-0009 §1's fold to the engine: a routine
@@ -6249,6 +6597,10 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "text[][]",
         format!("{s}.\"odd(name)\"").as_str(),
         format!("{s}.money_amount").as_str(),
+        // The engine accepts a space around a qualified type's dot and never
+        // writes one back. Unfolded, the declared key and the catalog key are
+        // two keys for one routine, and every plan drops and creates it again.
+        format!("{s} . money_amount").as_str(),
     ]
     .map(str::to_owned);
 
@@ -6277,9 +6629,7 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     .expect("the engine accepts every declared spelling");
 
     let pulled = our_modules(&pull(&mut conn).await, &s);
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 
     let expected: pbps_model::ModuleId = format!("{s}.f({})", folded.join(","))
         .parse()
@@ -6414,7 +6764,5 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         .expect_err("and the key that says `t` finds nothing, a plan later");
     assert_eq!(sqlstate(&not_there), "42704", "{not_there:?}");
 
-    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
-        .await
-        .expect("drop");
+    drop_schema(&mut conn, &s).await;
 }

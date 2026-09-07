@@ -1021,7 +1021,7 @@ pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
 ///
 /// One `[]` comes back however many went in, and a dimension is not part of
 /// the identity: **measured**, `text[][]` and `text[3]` are both `text[]`.
-fn peel_array(text: &str) -> (&str, bool) {
+pub(crate) fn peel_array(text: &str) -> (&str, bool) {
     let mut element = text.trim_end();
     let mut array = false;
     while let Some(without) = element.strip_suffix(']') {
