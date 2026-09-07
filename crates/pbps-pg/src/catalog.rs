@@ -37,8 +37,17 @@ use crate::introspect::{
 ///
 /// `pg_catalog` and `information_schema` are the engine's; `pg_toast` and the
 /// `pg_temp_*`/`pg_toast_temp_*` schemas are its bookkeeping.
-const NOT_A_PROJECTS_SCHEMA: &str =
-    "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%'";
+///
+/// `left(nspname, 3)` rather than `LIKE 'pg\_%'`, and **not** because it reads
+/// better. A backslash in an ordinary string literal is only a backslash while
+/// `standard_conforming_strings` is on; with it off the engine eats it —
+/// measured, with a warning nothing here reads — the pattern becomes `pg_%`,
+/// the `_` turns into a wildcard, and a project'"'"'s schema called `pga` vanishes
+/// from the pull. The canonical scope pins that setting (DECISIONS 252), and
+/// this predicate does not depend on it having worked: a filter with no escape
+/// in it cannot be read two ways.
+const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND pg_catalog.left(n.nspname, 3) <> 'pg_'";
 
 /// This tool's own tables, which arrive at Phase 5 step 8. They must never
 /// enter the managed set, or the tool would plan changes to itself.
@@ -122,12 +131,21 @@ fn partitioned_query() -> String {
 /// function takes a *text* table name and would have to be handed one built by
 /// interpolation.
 ///
-/// **Both dependency types**, because they are two different things wearing one
-/// shape. An identity's sequence is `deptype = 'i'`, internal: it is part of the
-/// column. A `serial`'s is `deptype = 'a'`, auto: a separate object the column
-/// merely defaults from, and one this model has nowhere to put. Reading only
-/// `'i'` returned a `serial` column as an ordinary integer whose default happens
-/// to say `nextval(...)`, with no word about the sequence that default needs.
+/// **Two joins, not one widened**, because they are two different things wearing
+/// one shape. An identity's sequence is `deptype = 'i'`, internal: it is part of
+/// the column. A `serial`'s is `deptype = 'a'`, auto: a separate object the
+/// column merely defaults from, and one this model has nowhere to put. Reading
+/// only `'i'` returned a `serial` column as an ordinary integer whose default
+/// happens to say `nextval(...)`, with no word about the sequence that default
+/// needs.
+///
+/// `IN ('i', 'a')` is what that first fix reached for, and it is wrong for a
+/// reason measured here: `ALTER SEQUENCE s OWNED BY t.c` on a column that is
+/// **already** an identity is legal, and then the column has both rows. One
+/// join returned it twice, the identity's seed and increment were taken from
+/// whichever row the engine handed back first, and the assembler's map kept the
+/// last. Two joins give one row per column and take each fact from the
+/// dependency that means it.
 fn columns_query() -> String {
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
@@ -138,7 +156,6 @@ fn columns_query() -> String {
             a.attgenerated::text AS generated,
             s.seqstart::int8 AS seq_start,
             s.seqincrement::int8 AS seq_increment,
-            dep.deptype::text AS sequence_dependency,
             seq.relname AS sequence_name,
             s.seqmin::int8 AS seq_min, s.seqmax::int8 AS seq_max, s.seqcycle AS seq_cycle,
             s.seqcache::int8 AS seq_cache,
@@ -164,12 +181,17 @@ fn columns_query() -> String {
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-       LEFT JOIN (pg_catalog.pg_depend dep
+       LEFT JOIN (pg_catalog.pg_depend own
                   JOIN pg_catalog.pg_class seq
-                    ON seq.oid = dep.objid AND seq.relkind = 'S')
-              ON dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum
-             AND dep.classid = 'pg_class'::regclass AND dep.deptype IN ('i', 'a')
-       LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid = dep.objid
+                    ON seq.oid = own.objid AND seq.relkind = 'S')
+              ON own.refobjid = a.attrelid AND own.refobjsubid = a.attnum
+             AND own.classid = 'pg_class'::regclass AND own.deptype = 'a'
+       LEFT JOIN (pg_catalog.pg_depend idep
+                  JOIN pg_catalog.pg_sequence s ON s.seqrelid = idep.objid
+                  JOIN pg_catalog.pg_class iseq
+                    ON iseq.oid = idep.objid AND iseq.relkind = 'S')
+              ON idep.refobjid = a.attrelid AND idep.refobjsubid = a.attnum
+             AND idep.classid = 'pg_class'::regclass AND idep.deptype = 'i'
       WHERE c.relkind = 'r'
         AND {NOT_A_PROJECTS_SCHEMA}
         AND a.attnum > 0
@@ -327,7 +349,8 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
        pg_catalog.set_config('intervalstyle', 'postgres', true),
        pg_catalog.set_config('timezone', 'UTC', true),
        pg_catalog.set_config('bytea_output', 'hex', true),
-       pg_catalog.set_config('extra_float_digits', '1', true)";
+       pg_catalog.set_config('extra_float_digits', '1', true),
+       pg_catalog.set_config('standard_conforming_strings', 'on', true)";
 
 /// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
@@ -470,13 +493,10 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             }),
             _ => None,
         };
-        // `a` is the `serial` case: a sequence the column defaults from and
-        // does not contain. `i` is the identity's, which the column does.
-        let owned_sequence =
-            match first_char(&optional_text(&row, "sequence_dependency")?.unwrap_or_default()) {
-                Some('a') => optional_text(&row, "sequence_name")?,
-                _ => None,
-            };
+        // The `serial` case: a sequence the column defaults from and does not
+        // contain. The identity's own sequence is the other join and never
+        // reaches here.
+        let owned_sequence = optional_text(&row, "sequence_name")?;
         raw.columns.push(RawColumn {
             table_oid: number(&row, "table_oid")?,
             attnum: small(&row, "attnum")?,
@@ -774,5 +794,25 @@ mod tests {
             // time, and the pull would report it absent.
             assert!(!sql.contains("pbps\\_%"), "{name}: {sql}");
         }
+    }
+
+    /// A backslash in an ordinary string literal is only a backslash while
+    /// `standard_conforming_strings` is on. The canonical scope pins it, and no
+    /// query relies on that having worked: measured, with it off the engine
+    /// eats the backslash, `'pg\_%'` becomes the pattern `pg_%`, and a
+    /// project's schema called `pga` disappears from the pull.
+    #[test]
+    fn no_query_reads_differently_under_the_other_string_literal_mode() {
+        for (name, sql) in [
+            ("TABLES", tables_query()),
+            ("PARTITIONED", partitioned_query()),
+            ("COLUMNS", columns_query()),
+            ("CONSTRAINTS", constraints_query()),
+            ("INDEXES", indexes_query()),
+        ] {
+            assert!(!sql.contains('\\'), "{name} carries a backslash: {sql}");
+        }
+        assert!(!NOT_A_PROJECTS_SCHEMA.contains('\\'));
+        assert!(CANONICAL_PATH.contains("standard_conforming_strings"));
     }
 }

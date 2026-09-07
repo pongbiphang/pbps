@@ -1400,6 +1400,46 @@ async fn a_pull_inside_the_callers_own_transaction_is_refused() {
         .expect("drop");
 }
 
+/// Two settings that decide how the pull's *own SQL* is read, rather than how
+/// the answer is printed: the string-literal mode a `LIKE` pattern is parsed
+/// under, and a schema whose name that pattern can swallow.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_schema_a_broken_pattern_would_swallow_is_in_the_pull() {
+    let mut conn = connect().await;
+    // Not under the probe schema: the name has to begin `pg`, which is what a
+    // pattern of `pg_%` — what `'pg\_%'` becomes when the engine eats the
+    // backslash — matches with its `_` acting as a wildcard.
+    let s = format!("pga_{}", std::process::id());
+    build(&mut conn, &s, &format!("CREATE TABLE {s}.t (id integer)")).await;
+
+    // Measured: with this off the engine consumes the backslash and warns,
+    // and nothing in the driver reads that warning.
+    conn.execute("SET standard_conforming_strings = off")
+        .await
+        .expect("set the literal mode");
+    let swallowed = truth(
+        &mut conn,
+        &format!("SELECT '{s}' LIKE 'pg\\_%' AS swallowed"),
+    )
+    .await;
+    assert!(
+        swallowed,
+        "the session really does read the pattern that way"
+    );
+
+    let pulled = pull(&mut conn).await;
+    assert!(
+        ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "t")),
+        "a project schema is not the engine's bookkeeping: {:?}",
+        ours(&pulled, &s)
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// Every kind of object the model cannot hold, in one database, each measured
 /// to be **named** rather than missing.
 ///
@@ -1473,6 +1513,14 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              -- these — for the ordinary one as much as for the pattern one.
              CREATE INDEX collated_vpat ON {s}.collated (c varchar_pattern_ops);
              CREATE INDEX collated_vplain ON {s}.collated (d);
+             -- Measured: a column that is already an identity may also own a
+             -- second sequence, and then `pg_depend` has both an `i` row and
+             -- an `a` row for it. One join returned the column twice and took
+             -- the seed from whichever came back first.
+             CREATE TABLE {s}.twinned (
+                 id integer GENERATED ALWAYS AS IDENTITY (START WITH 7 INCREMENT BY 3));
+             CREATE SEQUENCE {s}.spare START 900 INCREMENT 11;
+             ALTER SEQUENCE {s}.spare OWNED BY {s}.twinned.id;
              CREATE TABLE {s}.bounded (
                  id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
              CREATE TABLE {s}.cached (
@@ -1594,6 +1642,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "`collated_vpat` on",
         // A sequence that hands out values in blocks.
         "`CACHE 100`",
+        // The sequence a column owns without defaulting from it.
+        "`spare`",
         // A key that asks about ranges, wearing an ordinary key's `contype`.
         // Named down to the phrase: the fixture's table is called `temporal`
         // too, so the bare word is satisfied by any warning about it.
@@ -1718,6 +1768,19 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "a check that stops at this table is not the check a plan would write"
     );
 
+    // One row per column, and each fact from the dependency that means it.
+    let twinned = &pulled.schema.tables[&pbps_model::TableName::new(&s, "twinned")];
+    assert_eq!(twinned.columns.len(), 1, "{:?}", twinned.columns);
+    let identity = twinned.columns["id"]
+        .identity
+        .as_ref()
+        .expect("the identity is read");
+    assert_eq!(
+        (identity.seed, identity.increment),
+        (7, 3),
+        "the identity's own sequence, not the one merely owned by the column"
+    );
+
     let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
     assert!(
         restricted.foreign_keys.is_empty(),
@@ -1831,6 +1894,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "silent"),
             pbps_model::TableName::new(&s, "stops"),
             pbps_model::TableName::new(&s, "temporal"),
+            pbps_model::TableName::new(&s, "twinned"),
             pbps_model::TableName::new(&s, "unchecked"),
             pbps_model::TableName::new(&s, "unenforced"),
         ],

@@ -670,6 +670,21 @@ It was caught by the live test asserting that an ordinary table earns **no
 warning at all** — the negative case, which is the one that noticed a warning
 appearing where nothing had changed.
 
+**And the widening was wrong a second way, which the narrowing did not fix.**
+`IN ('i', 'a')` still asks one question of two relationships that can both hold
+at once: measured, `ALTER SEQUENCE s OWNED BY t.c` on a column that is *already*
+an identity is legal, and then the column has an `i` row and an `a` row. The
+join returned the column twice, `RawIdentity` was built from whichever row came
+back first, and the assembler's map kept the last — so a column declared
+`IDENTITY (START WITH 7 INCREMENT BY 3)` read back as `START WITH 900 INCREMENT
+BY 11`, the unrelated sequence's. Two joins now, one per dependency type, each
+supplying the fact it means.
+
+**The general form:** a set in an `IN` says "either of these", and the row set
+says "both of these, sometimes". Widening a filter to a second kind is only safe
+where the two kinds are exclusive, and nothing in the query says whether they
+are.
+
 **The same shape, one field over.** `pg_constraint.conindid` is "the index this
 constraint is enforced by", and the pull built its skip set — the indexes not to
 report again under `indexes:`, because they *are* a constraint — from every

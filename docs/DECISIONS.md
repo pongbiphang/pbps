@@ -4409,3 +4409,18 @@ SPEC is in sync with all of these.
     This is the third time in this file that a decision was reachable through a
     map built before the decision was made — 250's `confkey`, round 8's refused
     table, and this. The shape is in PITFALLS.
+
+255. **The pull's own SQL carries no backslash escape.** 252 pins the settings
+    that decide how the engine *prints* an answer. This is the other direction:
+    `standard_conforming_strings` decides how the engine *reads* the query's own
+    string literals, and with it off a backslash in an ordinary literal is
+    consumed — measured, with a warning nothing here reads. `'pg\_%'` becomes
+    the pattern `pg_%`, its `_` becomes a wildcard, and a project's schema
+    called `pga` disappears from the pull, which is a plan that creates tables
+    that are already there.
+
+    The setting is now pinned in the canonical scope, and no query depends on
+    that having worked: the schema filter is `left(nspname, 3) <> 'pg_'`, and a
+    test asserts that no query contains a backslash at all. A filter with no
+    escape in it cannot be read two ways, which is worth more than a filter that
+    is correct as long as a `SET` succeeded.
