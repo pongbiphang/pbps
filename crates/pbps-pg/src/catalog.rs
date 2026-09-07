@@ -487,9 +487,41 @@ const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
 ///
 /// A custom GUC under this tool's own prefix, so that a caller whose transaction
 /// this refuses is left holding nothing it did not already have.
-const PROBE_SET: &str = "SELECT pg_catalog.set_config('pbps.in_a_transaction', 'yes', true)";
-const PROBE_READ: &str =
+pub(crate) const PROBE_READ: &str =
     "SELECT COALESCE(current_setting('pbps.in_a_transaction', true), '') AS probe";
+
+/// A value this call invents, because a constant one can already be sitting in
+/// the session.
+///
+/// The probe is `set_config(…, is_local => true)` in one statement and
+/// `current_setting` in the next: inside a transaction the setting survives to
+/// be read, and outside one the implicit transaction ends and it does not.
+/// Compared against a constant, that read has a third outcome nobody asked
+/// for — a session that already carries
+/// `SET pbps.in_a_transaction = 'yes'` answers `'yes'` on an autocommit
+/// connection, and every caller of the probe then believes something the
+/// engine never said. On the rebuild's side that means `LOCK TABLE` released
+/// at the end of its own statement, and a carried-state read that is not
+/// serialized with the `DROP` at all: a guard still in the code and no longer
+/// guarding. On the pull's side it means the opposite and just as bad — a
+/// connection with no transaction refused as though it had one.
+///
+/// A value invented per call cannot be sitting in the session. The read is
+/// then only equal if *this* call's `set_config` survived, which is exactly
+/// the question. Hex and `-` only, because it is interpolated into a
+/// statement.
+pub(crate) fn probe_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    format!("{:x}-{:x}-{:x}", std::process::id(), nanos, n)
+}
+
+pub(crate) fn probe_set(token: &str) -> String {
+    format!("SELECT pg_catalog.set_config('pbps.in_a_transaction', '{token}', true)")
+}
 
 /// `true` is `is_local`: the setting belongs to this transaction and goes back
 /// when it ends, whichever way it ends.
@@ -835,10 +867,11 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
 /// transaction would answer from their uncommitted writes, which is not what
 /// "what the database looks like" means.
 async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
-    conn.query(PROBE_SET).await?;
+    let token = probe_token();
+    conn.query(&probe_set(&token)).await?;
     let rows = conn.query(PROBE_READ).await?;
     let row = rows.first().ok_or_else(|| missing("probe"))?;
-    if text(row, "probe")? == "yes" {
+    if text(row, "probe")? == token {
         return Err(DbError::Driver {
             code: None,
             message: "this connection already has an open transaction, and a pull cannot run \
@@ -1058,8 +1091,18 @@ mod tests {
         // Set, then read in a *separate* statement: the whole probe is that a
         // `SET LOCAL` outlives its own statement only inside a transaction.
         // Pinned live by `a_pull_inside_the_callers_own_transaction_is_refused`.
-        assert!(PROBE_SET.contains("'pbps.in_a_transaction', 'yes', true"));
+        assert!(probe_set("abc").contains("'pbps.in_a_transaction', 'abc', true"));
         assert!(PROBE_READ.contains("current_setting('pbps.in_a_transaction', true)"));
+        // And the value is this call's, not a constant a session can already
+        // hold: two probes never agree, so a retained setting cannot answer
+        // for one of them.
+        assert_ne!(probe_token(), probe_token());
+        assert!(
+            probe_token()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "the token is interpolated into a statement"
+        );
     }
 
     /// The filters ADR-0012 §6 and this file's own documentation turn on. A

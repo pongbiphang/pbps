@@ -39,7 +39,7 @@
 //! by the crate's own live suite, against a real server, which is the bar every
 //! step of #76 is held to.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param, Row};
 use pbps_model::{ModuleId, ModuleKind, ObjectName, Schema, TableName};
@@ -182,6 +182,16 @@ pub async fn before_a_rebuild(
     let serialized = serialize(conn, id, kind, oid)
         .await
         .map_err(|e| the_engine_broke_a_tie(id, e))?;
+    // The list below is the enumeration ADR-0009 §3 obliges, and it has been
+    // wrong twice by being short — a column ACL, then a comment. What makes it
+    // complete rather than longer is the other half, measured: everything else
+    // a `DROP` destroys is either carried back by the declaration or cannot
+    // exist. `pg_get_functiondef` writes the volatility, `SECURITY DEFINER`,
+    // `LEAKPROOF`, `COST` and every `SET` clause, so a routine's settings come
+    // back with its body; a view's column cannot hold `attoptions` at all
+    // (`ALTER VIEW … ALTER COLUMN … SET` is `not supported for views`); and a
+    // trigger or a rule attached to a view is a *dependent*, which
+    // [`dependents`] enumerates and refuses on its own terms.
     let mut carries = Vec::new();
     match kind {
         ModuleKind::View => {
@@ -189,15 +199,21 @@ pub async fn before_a_rebuild(
             read_column_acls(conn, oid, &mut carries).await?;
             read_view_column_defaults(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "r", &mut carries).await?;
+            read_comments(conn, oid, "pg_class", &mut carries).await?;
         }
         ModuleKind::Function | ModuleKind::Procedure => {
             read_routine(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "f", &mut carries).await?;
+            read_comments(conn, oid, "pg_proc", &mut carries).await?;
         }
         // A trigger has no owner and no ACL of its own — it is not a grantable
         // object — and `pg_default_acl` has no entry kind that reaches one. Its
-        // whole carried state is the switch an operator can turn off.
-        ModuleKind::Trigger => read_trigger_enabled(conn, oid, &mut carries).await?,
+        // carried state is the switch an operator can turn off, and the note
+        // one may have left on it.
+        ModuleKind::Trigger => {
+            read_trigger_enabled(conn, oid, &mut carries).await?;
+            read_comments(conn, oid, "pg_trigger", &mut carries).await?;
+        }
     }
     Ok(Rebuild {
         id: id.clone(),
@@ -570,6 +586,69 @@ fn push_acl(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
     Ok(())
 }
 
+/// What somebody wrote on the object, which a `DROP` takes with it.
+///
+/// **Measured**, on all three kinds and on a view's columns:
+///
+/// ```text
+/// COMMENT ON VIEW mk.v … / FUNCTION mk.f(int) … / TRIGGER au ON mk.t …
+/// drop and create each     ->  <gone>  <gone>  <gone>
+/// ```
+///
+/// `pg_get_viewdef` and `pg_get_functiondef` do not carry it, so the
+/// declaration this project holds cannot put it back — and `Module` has a
+/// `description`, but nothing writes it to the database (the `COMMENT ON`
+/// round trip is a decision of its own, and `SetColumnDeprecated` says so on
+/// the other side). A comment in the catalog is therefore somebody else's
+/// state, exactly like an ACL or an owner, and it refuses for the reason
+/// DECISIONS 288 gives for all of them.
+///
+/// A column's comment is here too: it is a row on the same object with
+/// `objsubid > 0`, and a rebuild destroys it just as completely. The name is
+/// looked up only for a relation, because for `pg_proc` and `pg_trigger` the
+/// `objoid` is not an `attrelid` and a join on it would match another table's
+/// column by coincidence.
+async fn read_comments(
+    conn: &mut Conn,
+    oid: i64,
+    class: &str,
+    carries: &mut Vec<Carried>,
+) -> Result<(), DbError> {
+    let column = if class == "pg_class" {
+        "(SELECT a.attname FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid = d.objoid AND a.attnum = d.objsubid)"
+    } else {
+        "NULL::name"
+    };
+    let rows = conn
+        .query_with(
+            &format!(
+                "SELECT d.objsubid::int8 AS sub, d.description AS note,
+                        COALESCE({column}::text, '') AS column_name
+                   FROM pg_catalog.pg_description d
+                  WHERE d.classoid = 'pg_catalog.{class}'::regclass
+                    AND d.objoid = ($1::int8)::oid
+                  ORDER BY 1"
+            ),
+            &[Param::I64(oid)],
+        )
+        .await?;
+    for row in rows {
+        let note = text(&row, "note")?;
+        let column_name = text(&row, "column_name")?;
+        let detail = if column_name.is_empty() {
+            note
+        } else {
+            format!("on column `{column_name}`: {note}")
+        };
+        carries.push(Carried {
+            what: "a comment, which a `DROP` destroys and no declaration here can restore",
+            detail,
+        });
+    }
+    Ok(())
+}
+
 /// The same probe the pull uses, asking the opposite question.
 ///
 /// The pull refuses a caller's transaction because it needs its own snapshot;
@@ -577,13 +656,11 @@ fn push_acl(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
 /// the `DROP` runs. Both failures are the same class — a read that means
 /// something different from what it looks like — so both are refused by name.
 async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError> {
-    conn.query("SELECT pg_catalog.set_config('pbps.in_a_transaction', 'yes', true) AS was_set")
-        .await?;
-    let rows = conn
-        .query("SELECT COALESCE(pg_catalog.current_setting('pbps.in_a_transaction', true), '') AS probe")
-        .await?;
+    let token = crate::catalog::probe_token();
+    conn.query(&crate::catalog::probe_set(&token)).await?;
+    let rows = conn.query(crate::catalog::PROBE_READ).await?;
     let probe = rows.first().map(|r| text(r, "probe")).transpose()?;
-    if probe.as_deref() == Some("yes") {
+    if probe.as_deref() == Some(token.as_str()) {
         return Ok(());
     }
     Err(DbError::Driver {
@@ -841,47 +918,139 @@ pub async fn dependents(
         return Err(not_in_the_catalog(id));
     };
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Every dependent once, and every edge between two of them — the edges are
+    // what the order is built from, and a walk that kept only depths cannot
+    // reconstruct them.
+    let mut found: BTreeMap<String, Dependent> = BTreeMap::new();
+    let mut depends_on_me: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut visited: BTreeSet<ModuleId> = [id.clone()].into_iter().collect();
-    let mut frontier = vec![(oid, kind)];
-    let mut levels: Vec<Vec<Dependent>> = Vec::new();
+    // Nodes that turned out to depend on the module this walk started from.
+    let mut back_to_the_root: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<(i64, ModuleKind, Option<String>)> = vec![(oid, kind, None)];
     while !frontier.is_empty() {
-        let mut level = Vec::new();
         let mut next = Vec::new();
-        for (oid, kind) in std::mem::take(&mut frontier) {
-            for found in direct_dependents(conn, oid, kind).await? {
+        for (oid, kind, parent) in std::mem::take(&mut frontier) {
+            for dependent in direct_dependents(conn, oid, kind).await? {
+                let described = dependent.described.clone();
+                // The walk came back to where it started. The module is not
+                // one of its own dependents, and what this really says is that
+                // it is in a cycle: measured, `CREATE OR REPLACE` closes one
+                // between two `BEGIN ATOMIC` routines, and then neither can be
+                // dropped first. The parent carries the refusal, because it is
+                // the object a plan would have had to drop.
+                if let Holds::Module(child) = &dependent.holds
+                    && child == id
+                {
+                    if let Some(parent) = &parent {
+                        back_to_the_root.insert(parent.clone());
+                    }
+                    continue;
+                }
+                // The edge is recorded even when the object is already known:
+                // that is the whole of the diamond. Measured, with `a` and `b`
+                // both direct dependents of `v` and `b` also a dependent of
+                // `a`, one query returns `a` and `b` together — and the second
+                // edge, `b` depends on `a`, arrives only when `a` is walked,
+                // by which time `b` has been seen.
+                if let Some(parent) = &parent {
+                    depends_on_me
+                        .entry(parent.clone())
+                        .or_default()
+                        .insert(described.clone());
+                }
                 // The same object can be reached twice — two views of one
                 // table, a routine used by both — and a plan that drops it
                 // twice is a plan that fails the second time.
-                if !seen.insert(found.described.clone()) {
+                if found.contains_key(&described) {
                     continue;
                 }
-                if let Holds::Module(child) = &found.holds
+                if let Holds::Module(child) = &dependent.holds
                     && visited.insert(child.clone())
                     && let Some(child_kind) = walkable(child)
                     && let Some(child_oid) = module_oid(conn, child, child_kind).await?
                 {
-                    next.push((child_oid, child_kind));
+                    next.push((child_oid, child_kind, Some(described.clone())));
                 }
-                level.push(found);
+                found.insert(described, dependent);
             }
-        }
-        if !level.is_empty() {
-            levels.push(level);
         }
         frontier = next;
     }
-    // Deepest first, which is drop order: measured, a plan that dropped only
-    // the direct dependent failed at that statement —
-    //
-    // ```text
-    // v <- v2 <- v3, and dropping v2 without v3:
-    //     ERROR:  cannot drop view mb.v2 because other objects depend on it
-    // ```
-    //
-    // — which is the applyable-and-predictably-fails outcome again, one level
-    // further out. A caller creates them back in the reverse of this order.
-    Ok(levels.into_iter().rev().flatten().collect())
+    for node in back_to_the_root {
+        if let Some(dependent) = found.get_mut(&node) {
+            dependent.holds = Holds::Unrepresentable(format!(
+                "depended on by `{id}` as well as depending on it, which is a cycle a rebuild \
+                 has no order to drop"
+            ));
+        }
+    }
+    Ok(drop_order(found, &depends_on_me))
+}
+
+/// The dependents, ordered so that each one is dropped before anything it
+/// depends on.
+///
+/// **Not a depth.** A breadth-first level is a depth from the root, and a
+/// dependent reachable by two paths of different lengths gets the shorter one;
+/// two objects at the same depth are then emitted in whatever order the
+/// catalog gave them. Measured, that is wrong on a diamond:
+///
+/// ```text
+/// a and b are both views over v, and b is also over a
+///     DROP VIEW mj.a  ->  cannot drop view mj.a because other objects
+///                         depend on it
+///                         DETAIL:  view mj.b depends on view mj.a
+/// ```
+///
+/// which is the applyable-and-predictably-fails outcome SPEC §7.5 exists to
+/// prevent — the same one the depth walk was added to fix, one shape further
+/// out. So the order comes from the edges: a node is ready when everything
+/// that depends on it has already gone. Ties are broken by name, so a plan is
+/// the same plan twice.
+///
+/// A caller creates them back in the reverse of this order.
+fn drop_order(
+    mut found: BTreeMap<String, Dependent>,
+    depends_on_me: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Dependent> {
+    let mut remaining: BTreeSet<String> = found.keys().cloned().collect();
+    let mut out = Vec::new();
+    while !remaining.is_empty() {
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|node| {
+                depends_on_me
+                    .get(*node)
+                    .is_none_or(|theirs| theirs.iter().all(|d| !remaining.contains(d)))
+            })
+            .cloned()
+            .collect();
+        // Nothing is ready and something is left: every remaining node is
+        // waiting on another one. `CREATE OR REPLACE` can put two routines in
+        // that state, so it is a case and not an impossibility — and there is
+        // no order that works, so each is named rather than emitted in one
+        // that does not.
+        if ready.is_empty() {
+            for node in std::mem::take(&mut remaining) {
+                if let Some(mut dependent) = found.remove(&node) {
+                    dependent.holds = Holds::Unrepresentable(
+                        "part of a cycle of dependents, which has no order a plan could drop \
+                         them in"
+                            .to_owned(),
+                    );
+                    out.push(dependent);
+                }
+            }
+            break;
+        }
+        for node in ready {
+            remaining.remove(&node);
+            if let Some(dependent) = found.remove(&node) {
+                out.push(dependent);
+            }
+        }
+    }
+    out
 }
 
 /// Which kind to walk a module dependent's own edges as, or `None` where there

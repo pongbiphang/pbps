@@ -5971,6 +5971,25 @@ SPEC is in sync with all of these.
     as the cases somebody thought of, and each was corrected by finding the next
     one. What ends that sequence is not a longer list.
 
+    **Amended: a comment is a carried attribute, and the list is now closed by
+    measurement rather than by memory.** `COMMENT ON` puts a row in
+    `pg_description`; a `DROP` takes it and a `CREATE` does not bring it back —
+    measured on all three kinds and on a view's column. `Module` has a
+    `description`, but nothing writes it to the database (the `COMMENT ON`
+    round trip is a decision of its own, and `SetColumnDeprecated` says so from
+    the other side), so there is nothing to restore it from and it refuses like
+    the rest.
+
+    That is the second time this enumeration was short — a column ACL was the
+    first — so this time the other half was measured too, and it is what makes
+    the list *closed* rather than merely longer: `pg_get_functiondef` writes
+    the volatility, `SECURITY DEFINER`, `LEAKPROOF`, `COST` and every `SET`
+    clause, so a routine's settings come back with its body; a view's column
+    cannot hold `attoptions` at all, since `ALTER VIEW … ALTER COLUMN … SET` is
+    `not supported for views`; and a trigger or a rule attached to a view is a
+    *dependent*, enumerated and refused on its own terms. **A list is closed by
+    saying what is not on it and why, not by growing.**
+
     **Amended: a fallback covers a missing arm, not a leaky one.** The next
     case arrived inside a class the list already knew. A domain's check
     constraint is a `pg_constraint` row with `conrelid = 0` — measured, it
@@ -6116,3 +6135,52 @@ SPEC is in sync with all of these.
     Found by the live suite, where fifty tests read the catalog while a handful
     lock objects. The suite retries, and says in the helper that the retry is
     its own concurrency rather than the product's.
+
+293. **The drop order for dependents is a topological order, not a depth.**
+    A breadth-first walk gives each dependent the depth of the *shortest* path
+    to it, and two dependents at one depth come out in whatever order the
+    catalog gave. Measured, that is wrong the moment a diamond appears:
+
+    ```text
+    a and b are both views over v, and b is also over a
+        DROP VIEW mj.a  ->  cannot drop view mj.a because other objects
+                            depend on it
+                            DETAIL:  view mj.b depends on view mj.a
+    ```
+
+    which is the applyable-and-predictably-fails outcome SPEC §7.5 exists to
+    prevent — the same one the depth walk was added to fix, one shape further
+    out. So the walk records the *edges* and the order comes from them: a node
+    is ready when everything that depends on it has already gone, ties broken
+    by name so that a plan is the same plan twice.
+
+    **A cycle is a case, not an impossibility.** `CREATE OR REPLACE` closes one
+    between two `BEGIN ATOMIC` routines — measured, `pg_depend` then holds both
+    directions and neither routine can be dropped first. There is no order, so
+    each member is named as something the plan cannot put back rather than
+    emitted in an order that fails. The same for a cycle that runs through the
+    module being rebuilt: it is not one of its own dependents, and what the
+    walk coming back to it really says is that no rebuild of it is possible
+    without `CASCADE`, which SPEC 14.3 does not offer.
+
+    A depth is the answer to "how far", and the question was "in what order".
+
+294. **The transaction probe compares against a value it invented, not against
+    a constant.** Both sides of it — the pull refusing a caller's transaction,
+    the rebuild requiring one — are `set_config(…, is_local => true)` in one
+    statement and `current_setting` in the next: inside a transaction the
+    setting survives to be read, outside one the implicit transaction ends and
+    it does not.
+
+    Against the constant `'yes'` that read had a third outcome nobody asked
+    for. A session carrying `SET pbps.in_a_transaction = 'yes'` answers `'yes'`
+    on an autocommit connection, and the two sides fail in opposite directions:
+    the rebuild believes its reads are serialized when `LOCK TABLE` has already
+    been released at the end of its own statement, and the pull refuses a
+    connection that has no transaction at all. The first is a guard still in
+    the code and no longer guarding; the second is a valid plan refused.
+
+    A value invented per call cannot be sitting in the session, so the read is
+    equal only if *this* call's `set_config` survived — which is the question
+    being asked. A type that cannot hold the bad value beats a branch that
+    checks for it, and here the value is the type.

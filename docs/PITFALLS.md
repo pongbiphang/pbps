@@ -1392,6 +1392,36 @@ makes them safe to run beside each other. Two fixtures broke that:
 Anything database-wide — an extension, a role, a cast — is shared with every
 other test in the run and with every other run on the container.
 
+## A probe that compares against a constant
+
+Two guards here ask the engine "is there a transaction open?" by setting a
+transaction-local GUC in one statement and reading it back in the next. Both
+compared the answer against `'yes'` — and `'yes'` is a value a session can be
+holding already, at session scope, where a transaction-local set cannot clear
+it. The read then answers correctly-shaped nonsense, and the two guards fail in
+opposite directions: one waves a rebuild through with no lock, the other
+refuses a pull that is doing nothing wrong.
+
+**The rule.** A probe whose whole content is "did *my* write survive?" has to
+compare against a value only this call could have written. A constant makes the
+question "is this value present?", which is a different question with the same
+shape — and the difference is invisible until somebody's session supplies the
+constant.
+
+## A depth is not an order
+
+A breadth-first walk gives each node the length of the *shortest* path to it,
+and nodes at one depth come out in catalog order. That is an answer to "how
+far", and drop order is an answer to "before what". They agree on a chain and
+disagree on the first diamond: `a` and `b` both over `v`, `b` also over `a` —
+one level holds both, and dropping `a` first fails because `b` is still there.
+
+**The rule.** When the output is an order, record the edges and sort them. A
+depth is a summary of the edges, and the thing that was thrown away is exactly
+the thing the order needed. And a topological sort has a failure case a depth
+walk cannot even represent — a cycle — so it has to say so rather than emit an
+order that does not exist.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

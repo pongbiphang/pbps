@@ -5413,6 +5413,21 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         ),
         format!("CREATE TRIGGER off AFTER UPDATE ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
         format!("ALTER TABLE {s}.t DISABLE TRIGGER off"),
+        // A note somebody wrote, on each of the three kinds and on a view's
+        // column. Measured, `pg_get_viewdef` and `pg_get_functiondef` do not
+        // carry it and a drop-and-create loses it outright — and nothing in
+        // this project writes `COMMENT ON`, so there is nothing to put it
+        // back.
+        format!("CREATE VIEW {s}.noted AS SELECT id, a FROM {s}.t"),
+        format!("COMMENT ON VIEW {s}.noted IS 'why this view exists'"),
+        format!("CREATE VIEW {s}.column_noted AS SELECT id, a FROM {s}.t"),
+        format!("COMMENT ON COLUMN {s}.column_noted.a IS 'what this column means'"),
+        format!("CREATE FUNCTION {s}.noted_fn(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        format!("COMMENT ON FUNCTION {s}.noted_fn(int) IS 'why this routine exists'"),
+        format!(
+            "CREATE TRIGGER noted AFTER DELETE ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"
+        ),
+        format!("COMMENT ON TRIGGER noted ON {s}.t IS 'why this trigger exists'"),
     ] {
         conn.execute(&sql)
             .await
@@ -5438,6 +5453,23 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         (format!("{s}.closed(integer)"), Function, Some("=X/")),
         (format!("{s}.t.live"), Trigger, None),
         (format!("{s}.t.off"), Trigger, Some("disabled")),
+        // A comment is carried state on every kind, and on a column of one.
+        (format!("{s}.noted"), View, Some("why this view exists")),
+        (
+            format!("{s}.column_noted"),
+            View,
+            Some("on column `a`: what this column means"),
+        ),
+        (
+            format!("{s}.noted_fn(integer)"),
+            Function,
+            Some("why this routine exists"),
+        ),
+        (
+            format!("{s}.t.noted"),
+            Trigger,
+            Some("why this trigger exists"),
+        ),
     ];
     for (id, kind, expected) in &cases {
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
@@ -5967,6 +5999,193 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         .await
         .expect_err("the level below has to go first");
     assert_eq!(sqlstate(&out_of_order), "2BP01", "{out_of_order:?}");
+
+    // A depth is not an order. `d2` and `d3` are both direct dependents of
+    // `d1`, and `d3` is a dependent of `d2` as well — so one query returns
+    // them together, and a walk that only recorded how deep each was emitted
+    // them in the order the catalog gave: `d2` first, which is the one that
+    // cannot go first.
+    for sql in [
+        format!("CREATE VIEW {s}.d1 AS SELECT id FROM {s}.t"),
+        format!("CREATE VIEW {s}.d2 AS SELECT id FROM {s}.d1"),
+        format!("CREATE VIEW {s}.d3 AS SELECT x.id FROM {s}.d1 x JOIN {s}.d2 y ON y.id = x.id"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let d1: pbps_model::ModuleId = format!("{s}.d1").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let diamond = pbps_pg::modules::dependents(&mut conn, &d1, pbps_model::ModuleKind::View)
+        .await
+        .expect("read the dependents");
+    rollback(&mut conn).await;
+    assert_eq!(
+        diamond
+            .iter()
+            .map(|d| d.described.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("rule _RETURN on view {s}.d3"),
+            format!("rule _RETURN on view {s}.d2"),
+        ],
+        "`d3` depends on `d2`, so it goes first whatever their depths from `d1` are"
+    );
+    // And the order is not a preference: measured, the other one fails.
+    let wrong_way = conn
+        .execute(&format!("DROP VIEW {s}.d2"))
+        .await
+        .expect_err("`d3` depends on `d2`");
+    assert_eq!(sqlstate(&wrong_way), "2BP01", "{wrong_way:?}");
+    for view in ["d3", "d2", "d1"] {
+        conn.execute(&format!("DROP VIEW {s}.{view}"))
+            .await
+            .unwrap_or_else(|e| panic!("{view}: {e}"));
+    }
+
+    // A cycle, which `CREATE OR REPLACE` can close between two `BEGIN ATOMIC`
+    // routines: measured, `pg_depend` then holds both directions and neither
+    // routine can be dropped first. There is no order, so the answer is to say
+    // so rather than to emit one that fails.
+    for sql in [
+        format!("CREATE FUNCTION {s}.cg() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END"),
+        format!(
+            "CREATE FUNCTION {s}.cf() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT {s}.cg(); END"
+        ),
+        format!(
+            "CREATE OR REPLACE FUNCTION {s}.cg() RETURNS int LANGUAGE sql \
+             BEGIN ATOMIC SELECT {s}.cf(); END"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cf: pbps_model::ModuleId = format!("{s}.cf()").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let looped = pbps_pg::modules::dependents(&mut conn, &cf, pbps_model::ModuleKind::Function)
+        .await
+        .expect("read the dependents");
+    rollback(&mut conn).await;
+    assert_eq!(
+        looped
+            .iter()
+            .map(|d| d.described.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("function {s}.cg()")],
+        "the module is not one of its own dependents, however the walk reached it"
+    );
+    assert!(
+        matches!(&looped[0].holds, pbps_pg::modules::Holds::Unrepresentable(why)
+                 if why.contains("cycle")),
+        "a cycle is something a plan cannot order, not something it can drop: {:?}",
+        looped[0].holds
+    );
+    let cycle_refusal = pbps_pg::modules::unmanaged_refusal(&cf, &looped, &nothing)
+        .expect("a cycle refuses whatever the declarations hold");
+    assert!(cycle_refusal.contains("cycle"), "{cycle_refusal}");
+    // And the engine agrees that there is no order: neither one goes first.
+    for routine in ["cf", "cg"] {
+        let refused = conn
+            .execute(&format!("DROP FUNCTION {s}.{routine}()"))
+            .await
+            .expect_err("each is held up by the other");
+        assert_eq!(sqlstate(&refused), "2BP01", "{routine}: {refused:?}");
+    }
+
+    drop_schema(&mut conn, &s).await;
+}
+
+/// The probe that decides whether there is a transaction has to be asking the
+/// engine, not reading back something the session was already holding.
+///
+/// Both sides of it are a `set_config(…, is_local => true)` in one statement
+/// and a `current_setting` in the next: inside a transaction the setting
+/// survives to be read, outside one the implicit transaction ends and it does
+/// not. Compared against a constant, a session that already carries
+/// `SET pbps.in_a_transaction = 'yes'` answers `'yes'` on an autocommit
+/// connection — and then the rebuild's reads believe they are serialized when
+/// `LOCK TABLE` has already been released, and the pull refuses a connection
+/// that has no transaction at all. One is a guard that no longer guards, the
+/// other is a valid plan refused.
+///
+/// The token is invented per call, so the only way the read can equal it is if
+/// this call's own `set_config` survived — which is the question.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_session_setting_left_behind_cannot_answer_the_transaction_probe() {
+    let s = emit_schema("probe");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (id int)"))
+        .await
+        .expect("a table");
+    conn.execute(&format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"))
+        .await
+        .expect("a view");
+    let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+
+    // The exact spoof: the value the probe used to compare against, left in
+    // the session where a `SET LOCAL` cannot clear it.
+    conn.execute("SET pbps.in_a_transaction = 'yes'")
+        .await
+        .expect("a session may set its own GUCs");
+    assert_eq!(
+        text(
+            &mut conn,
+            "SELECT current_setting('pbps.in_a_transaction', true)"
+        )
+        .await,
+        "yes",
+        "the spoof has to be in place for this test to be testing anything"
+    );
+
+    // No transaction is open, so both of these must still refuse.
+    for what in ["rebuild", "dependents"] {
+        let refused = match what {
+            "rebuild" => {
+                pbps_pg::modules::before_a_rebuild(&mut conn, &v, pbps_model::ModuleKind::View)
+                    .await
+                    .err()
+            }
+            _ => pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
+                .await
+                .err(),
+        };
+        let refused = refused.unwrap_or_else(|| {
+            panic!(
+                "`{what}` accepted an autocommit connection as a \
+                                       transaction because the session said so"
+            )
+        });
+        assert!(
+            refused
+                .to_string()
+                .contains("has to run inside the transaction"),
+            "{refused:?}"
+        );
+    }
+
+    // And the same setting must not make the pull refuse a connection that is
+    // doing nothing wrong: the pull asks the opposite question of the same
+    // probe, so a constant defeats it in the opposite direction.
+    // Through the suite's retry helper, because the rest of this file is
+    // applying DDL while this runs — what is being asserted is that the pull
+    // is *not refused*, not that nothing else is happening.
+    let pulled = pull(&mut conn).await;
+    assert!(
+        pulled.schema.modules.contains_key(&v),
+        "the pull ran and read this schema"
+    );
+
+    // Inside a real transaction it still says yes, which is the half a broken
+    // probe would also get right and this pins anyway.
+    in_a_transaction(&mut conn).await;
+    let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &v, pbps_model::ModuleKind::View)
+        .await
+        .expect("a real transaction is a transaction");
+    rollback(&mut conn).await;
+    assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
 
     drop_schema(&mut conn, &s).await;
 }
