@@ -120,6 +120,7 @@ fn columns_query() -> String {
             dep.deptype::text AS sequence_dependency,
             seq.relname AS sequence_name,
             s.seqmin::int8 AS seq_min, s.seqmax::int8 AS seq_max, s.seqcycle AS seq_cycle,
+            s.seqcache::int8 AS seq_cache,
             CASE WHEN a.attcollation <> ty.typcollation
                  THEN (SELECT co.collname FROM pg_catalog.pg_collation co
                         WHERE co.oid = a.attcollation)
@@ -169,6 +170,21 @@ fn constraints_query() -> String {
     )
 }
 
+/// The default operator class is resolved the way the engine resolves it, not
+/// by matching `opcintype` to the column's type. **Measured**: an index on a
+/// `character varying` column has no exact match at all — there is no default
+/// btree opclass whose `opcintype` is `varchar` — so the exact-match subquery
+/// returned NULL, `indclass <> NULL` was unknown, and `varchar_pattern_ops`
+/// read back as an ordinary index. `GetDefaultOpClass` falls back to a
+/// *preferred* type in the same category that the column's type is binary
+/// coercible to, which is how `varchar` reaches `text_ops`; the `count(*) = 1`
+/// guard is its "ambiguous operator class" case.
+///
+/// A domain is unwrapped to its base type first, for the same reason the engine
+/// does it. And the comparison is `IS DISTINCT FROM`, so a default this query
+/// cannot resolve reports the index rather than passing it as ordinary — not
+/// being able to tell is not the same as there being nothing to tell.
+///
 /// `indkey` and `indoption` are `int2vector`s, which no driver here reads.
 /// Rendered as text they are space-separated, so they arrive as a list this
 /// file parses — and `indoption` covers the **key** columns only, never the
@@ -187,18 +203,33 @@ fn indexes_query() -> String {
             i.indexprs IS NOT NULL AS has_expressions,
             am.amname AS method,
             EXISTS (
-              SELECT 1 FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
-               WHERE i.indclass[k.n - 1] <> (
-                       SELECT oc.oid FROM pg_catalog.pg_opclass oc
-                        WHERE oc.opcmethod = ic.relam
-                          AND oc.opcintype = (SELECT a.atttypid FROM pg_catalog.pg_attribute a
-                                               WHERE a.attrelid = i.indrelid
-                                                 AND a.attnum = i.indkey[k.n - 1])
-                          AND oc.opcdefault)
+              SELECT 1
+                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+                CROSS JOIN LATERAL (
+                  SELECT COALESCE(
+                    (SELECT t.typbasetype FROM pg_catalog.pg_type t
+                      WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
+                    a.atttypid) AS coltype,
+                    a.attcollation AS colcollation
+                    FROM pg_catalog.pg_attribute a
+                   WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]) AS col
+               WHERE i.indclass[k.n - 1] IS DISTINCT FROM COALESCE(
+                       (SELECT oc.oid FROM pg_catalog.pg_opclass oc
+                         WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                           AND oc.opcintype = col.coltype),
+                       (SELECT CASE WHEN count(*) = 1 THEN min(oc.oid) END
+                          FROM pg_catalog.pg_opclass oc
+                          JOIN pg_catalog.pg_type tt ON tt.oid = oc.opcintype
+                          JOIN pg_catalog.pg_type st ON st.oid = col.coltype
+                         WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                           AND tt.typispreferred AND tt.typcategory = st.typcategory
+                           AND EXISTS (SELECT 1 FROM pg_catalog.pg_cast ct
+                                        WHERE ct.castsource = col.coltype
+                                          AND ct.casttarget = oc.opcintype
+                                          AND ct.castmethod = 'b'
+                                          AND ct.castcontext = 'i')))
                   OR (i.indcollation[k.n - 1] <> 0
-                      AND i.indcollation[k.n - 1] <> (
-                            SELECT a.attcollation FROM pg_catalog.pg_attribute a
-                             WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]))
+                      AND i.indcollation[k.n - 1] <> col.colcollation)
             ) AS nondefault_column_options
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
@@ -212,6 +243,23 @@ fn indexes_query() -> String {
 }
 
 const BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+
+/// The two halves of the probe that says whether a transaction is already open.
+///
+/// A `SET LOCAL` lives exactly as long as the transaction it runs in. Outside a
+/// transaction block that is the statement itself, so a second statement reads
+/// the setting back empty; inside the caller's transaction the value is still
+/// there. **Measured through this driver**, which is the point: every other way
+/// of asking reads the same in both states here, because the extended query
+/// protocol starts the implicit transaction before the statement's own clock —
+/// `xact_start = query_start` and `transaction_timestamp() =
+/// statement_timestamp()` are both false even outside a transaction.
+///
+/// A custom GUC under this tool's own prefix, so that a caller whose transaction
+/// this refuses is left holding nothing it did not already have.
+const PROBE_SET: &str = "SELECT pg_catalog.set_config('pbps.in_a_transaction', 'yes', true)";
+const PROBE_READ: &str =
+    "SELECT COALESCE(current_setting('pbps.in_a_transaction', true), '') AS probe";
 
 /// `true` is `is_local`: the setting belongs to this transaction and goes back
 /// when it ends, whichever way it ends.
@@ -239,6 +287,7 @@ const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', tr
 /// makes "a read that failed halfway leaves the session changed" not a case to
 /// handle but a case that cannot arise.
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
+    refuse_a_caller_owned_transaction(conn).await?;
     conn.execute(BEGIN).await?;
     let raw = match read_all(conn).await {
         Ok(raw) => {
@@ -322,6 +371,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
                 min: number(&row, "seq_min")?,
                 max: number(&row, "seq_max")?,
                 cycles: flag(&row, "seq_cycle")?,
+                cache: number(&row, "seq_cache")?,
             }),
             _ => None,
         };
@@ -413,6 +463,43 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
 /// it a schema; with it, the read fails. What is left is to say so, because the
 /// driver renders `XX000` as `db error` and an unreadable failure is the third
 /// thing CLAUDE.md's rule names (issue #167).
+/// The one question that has to be asked **before** `BEGIN`.
+///
+/// PostgreSQL does not nest: inside an open transaction a plain `BEGIN` is a
+/// warning and nothing more, so the `COMMIT` at the end of a successful read
+/// would commit the caller's transaction — and whatever it had written — while
+/// the snapshot and the read-only guarantee this whole framing exists for were
+/// never established at all. There is no `COMMIT` that means "only mine".
+///
+/// Measured, this framing's own `BEGIN ISOLATION LEVEL ...` does fail inside a
+/// transaction that has already run a statement, because `SET TRANSACTION` may
+/// not follow a query. But that is an accident of when the caller last spoke,
+/// not a guarantee, and it fails by poisoning their transaction rather than by
+/// leaving it alone. The probe is asked first so that the answer is the same
+/// either way.
+///
+/// It is a refusal rather than an accommodation. Reading inside somebody's
+/// transaction would answer from their uncommitted writes, which is not what
+/// "what the database looks like" means.
+async fn refuse_a_caller_owned_transaction(conn: &mut Conn) -> Result<(), DbError> {
+    conn.query(PROBE_SET).await?;
+    let rows = conn.query(PROBE_READ).await?;
+    let row = rows.first().ok_or_else(|| missing("probe"))?;
+    if text(row, "probe")? == "yes" {
+        return Err(DbError::Driver {
+            code: None,
+            message: "this connection already has an open transaction, and a pull cannot run \
+                      inside one.\nThe read takes its own `REPEATABLE READ READ ONLY` \
+                      transaction so that its five queries cannot disagree about what exists. \
+                      PostgreSQL does not nest transactions, so running here would neither get \
+                      that snapshot nor be able to end without committing yours. Commit or roll \
+                      back first."
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn schema_changed_underneath(e: DbError) -> DbError {
     match &e {
         DbError::Driver { code, .. } if code.as_deref() == Some("XX000") => DbError::Driver {
@@ -535,6 +622,15 @@ mod tests {
         assert!(BEGIN.contains("REPEATABLE READ"));
         assert!(BEGIN.contains("READ ONLY"));
         assert!(CANONICAL_PATH.contains("'search_path', '', true"));
+        // Asked of this backend, and of the statement rather than the
+        // transaction: `xact_start = query_start` is what "no transaction was
+        // open before this one" looks like. Pinned live by
+        // `a_pull_inside_the_callers_own_transaction_is_refused`.
+        // Set, then read in a *separate* statement: the whole probe is that a
+        // `SET LOCAL` outlives its own statement only inside a transaction.
+        // Pinned live by `a_pull_inside_the_callers_own_transaction_is_refused`.
+        assert!(PROBE_SET.contains("'pbps.in_a_transaction', 'yes', true"));
+        assert!(PROBE_READ.contains("current_setting('pbps.in_a_transaction', true)"));
     }
 
     /// The filters ADR-0012 §6 and this file's own documentation turn on. A

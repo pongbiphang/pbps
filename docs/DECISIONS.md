@@ -4337,3 +4337,22 @@ SPEC is in sync with all of these.
     columns of every table in the pull are already in the assembler: no parse,
     no second query, and an attnum with nothing behind it is the same named
     limitation as everywhere else.
+
+251. **A pull inside the caller's own transaction is refused, not
+    accommodated.** PostgreSQL does not nest transactions: inside an open one a
+    plain `BEGIN` is a warning, so the `COMMIT` that ends a successful read
+    would commit whatever the caller had written, while the `REPEATABLE READ
+    READ ONLY` snapshot 248 exists for was never established. A savepoint would
+    give back the framing but not the meaning — a read inside somebody's
+    transaction answers from their uncommitted writes, which is not what "what
+    the database looks like" is. So the pull asks first and refuses.
+
+    The asking is a `SET LOCAL` on a custom GUC, read back in a second
+    statement: a local setting outlives its own statement only inside a
+    transaction block. Every cheaper question was measured and reads the same in
+    both states **through this driver** — `xact_start = query_start` and
+    `transaction_timestamp() = statement_timestamp()` are both false even
+    outside a transaction, because the extended query protocol opens the
+    implicit transaction before the statement's own clock starts. Measured with
+    `psql`, which speaks the simple protocol, both looked like reliable
+    detectors.

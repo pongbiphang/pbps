@@ -113,6 +113,10 @@ pub struct RawIdentity {
     pub min: i64,
     pub max: i64,
     pub cycles: bool,
+    /// `seqcache`. Not a bound but an allocation: with `CACHE n` a session
+    /// takes `n` values at once, so a restart skips the ones it had not used
+    /// and two sessions interleave in blocks rather than one at a time.
+    pub cache: i64,
 }
 
 /// One row of `pg_constraint`, whatever its kind.
@@ -391,6 +395,10 @@ fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Ve
     out
 }
 
+/// The `CACHE` a sequence has when nothing asks for one — **measured**, and the
+/// one a plan that recreates an identity would get.
+const DEFAULT_SEQUENCE_CACHE: i64 = 1;
+
 fn note(pulled: &mut Pulled, table: &TableName, detail: String) {
     pulled.warnings.push(detail.clone());
     pulled.limitations.push(Limitation {
@@ -523,6 +531,23 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                     id.min,
                     id.max,
                     if id.cycles { " and cycles" } else { "" }
+                ),
+            );
+        }
+        // `CACHE` is not a bound, so it earns its own sentence: what it
+        // changes is not where the sequence stops but which values are handed
+        // out, and how many are lost when a session ends.
+        if id.cache != DEFAULT_SEQUENCE_CACHE {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "column `{}`.`{}` has an `identity:` whose sequence is `CACHE {}`, and this \
+                     model holds only the seed and the increment. Read back it is an identity \
+                     with this engine's default `CACHE {DEFAULT_SEQUENCE_CACHE}`: recreating it \
+                     changes how many values a session takes at once, and so how many are \
+                     skipped when one ends.",
+                    parts.name, raw.name, id.cache
                 ),
             );
         }
@@ -1463,6 +1488,7 @@ mod tests {
                 min: 1,
                 max: i64::from(i32::MAX),
                 cycles: false,
+                cache: 1,
             });
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
@@ -1767,11 +1793,14 @@ mod tests {
     #[test]
     fn an_identity_whose_sequence_is_not_the_default_one_is_named() {
         let default_max = i64::from(i32::MAX);
-        for (min, max, cycles, reported) in [
-            (1, default_max, false, false),
-            (5, 99, false, true),
-            (1, default_max, true, true),
-            (1, 99, false, true),
+        for (min, max, cycles, cache, reported) in [
+            (1, default_max, false, 1, false),
+            (5, 99, false, 1, true),
+            (1, default_max, true, 1, true),
+            (1, 99, false, 1, true),
+            // Not a bound: `CACHE` decides which values are handed out and how
+            // many a session that ends takes with it.
+            (1, default_max, false, 100, true),
         ] {
             let mut column = col(1, 1, "id", "integer");
             column.nullable = false;
@@ -1782,6 +1811,7 @@ mod tests {
                 min,
                 max,
                 cycles,
+                cache,
             });
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
@@ -1793,7 +1823,7 @@ mod tests {
             assert_eq!(
                 !pulled.warnings.is_empty(),
                 reported,
-                "{min}..={max} cycles={cycles}: {:?}",
+                "{min}..={max} cycles={cycles} cache={cache}: {:?}",
                 pulled.warnings
             );
             assert!(only(&pulled).columns["id"].identity.is_some());

@@ -1301,6 +1301,60 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
         .expect("drop");
 }
 
+/// PostgreSQL does not nest transactions, so a pull that ran inside the
+/// caller's would commit it — and would not have the snapshot it committed for.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_pull_inside_the_callers_own_transaction_is_refused() {
+    let mut conn = connect().await;
+    let s = probe_schema("xact");
+    build(
+        &mut conn,
+        &s,
+        &format!("CREATE TABLE {s}.kept (id integer)"),
+    )
+    .await;
+
+    // A transaction with a write in it, which the pull must not commit.
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute(&format!("CREATE TABLE {s}.uncommitted (id integer)"))
+        .await
+        .expect("create inside the transaction");
+
+    let e = pbps_pg::catalog::introspect(&mut conn)
+        .await
+        .expect_err("a pull inside a caller's transaction is refused");
+    let message = e.to_string();
+    assert!(
+        message.contains("already has an open transaction"),
+        "{message}"
+    );
+
+    // The caller's transaction is still the caller's: rolling it back takes the
+    // write with it. A `COMMIT` inside the pull would have made this table
+    // permanent, which is the failure the refusal exists for.
+    conn.execute("ROLLBACK").await.expect("rollback");
+    let survived = truth(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = '{s}' AND c.relname = 'uncommitted')"
+        ),
+    )
+    .await;
+    assert!(!survived, "the pull committed the caller's transaction");
+
+    // And the connection is usable afterwards: a refusal is not a broken
+    // session.
+    let pulled = pull(&mut conn).await;
+    assert!(ours(&pulled, &s).contains(&pbps_model::TableName::new(&s, "kept")));
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// Every kind of object the model cannot hold, in one database, each measured
 /// to be **named** rather than missing.
 ///
@@ -1360,10 +1414,18 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.guarded (id integer PRIMARY KEY);
              ALTER TABLE {s}.guarded ENABLE ROW LEVEL SECURITY;
              CREATE UNLOGGED TABLE {s}.volatile_ (id integer);
-             CREATE TABLE {s}.collated (a text, b text COLLATE \"C\");
+             CREATE TABLE {s}.collated (a text, b text COLLATE \"C\",
+                 c varchar(20), d varchar(20));
              CREATE INDEX collated_pat ON {s}.collated (a text_pattern_ops);
+             -- Measured: no default btree operator class has `opcintype =
+             -- varchar`, so an exact-type lookup answers NULL for both of
+             -- these — for the ordinary one as much as for the pattern one.
+             CREATE INDEX collated_vpat ON {s}.collated (c varchar_pattern_ops);
+             CREATE INDEX collated_vplain ON {s}.collated (d);
              CREATE TABLE {s}.bounded (
                  id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
+             CREATE TABLE {s}.cached (
+                 id integer GENERATED ALWAYS AS IDENTITY (CACHE 100));
              CREATE TABLE {s}.setnull (a integer, b integer,
                  CONSTRAINT setnull_fk FOREIGN KEY (a) REFERENCES {s}.odd (id)
                      ON DELETE SET NULL (a));
@@ -1433,8 +1495,14 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "and cycles",
         // A `SET NULL` that names its columns.
         "ON DELETE SET",
-        // An operator class that is not the column's own.
+        // An operator class that is not the column's own — on `text`, where
+        // the type has a default operator class of its own, and on `varchar`,
+        // where it does not and the engine resolves one through a preferred
+        // type it is binary coercible to.
         "operator class",
+        "`collated_vpat` on",
+        // A sequence that hands out values in blocks.
+        "`CACHE 100`",
         // A key constraint whose index covers more than its key.
         "INCLUDE",
         // The sequence a `serial` owns and this model cannot hold.
@@ -1465,6 +1533,19 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         odd.indexes.contains_key("odd_nulls"),
         "an index the model holds all but one property of is still read back"
     );
+    // The other side of that resolution: an ordinary index on a `varchar`
+    // column has no exact-type default operator class either, and it is not a
+    // limitation. A rule that reported every `varchar` index would be silence
+    // of a different kind — a warning nobody reads.
+    let collated = &pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")];
+    assert!(
+        collated.indexes.contains_key("collated_vplain")
+            && !collated.indexes.contains_key("collated_vpat")
+            && !collated.indexes.contains_key("collated_pat"),
+        "{:?}",
+        collated.indexes
+    );
+
     let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
     assert!(
         restricted.foreign_keys.is_empty(),
@@ -1497,12 +1578,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .indexes
             .is_empty(),
         "an index the planner will not use is not an index"
-    );
-    assert!(
-        pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")]
-            .indexes
-            .is_empty(),
-        "an index ordered by an operator class the model cannot hold is left out"
     );
     assert!(
         pulled.schema.tables[&pbps_model::TableName::new(&s, "setnull")]
@@ -1558,6 +1633,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             // The inheritance parent is an ordinary table and stays.
             pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "bounded"),
+            pbps_model::TableName::new(&s, "cached"),
             pbps_model::TableName::new(&s, "collated"),
             pbps_model::TableName::new(&s, "covering"),
             pbps_model::TableName::new(&s, "full_match"),

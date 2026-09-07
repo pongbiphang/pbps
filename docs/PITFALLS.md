@@ -601,6 +601,26 @@ avoid it:** an arm that matches both orderings of a pair needs its comment to
 say something about each, or it needs to be two arms. Splitting it is what
 forced the measurement that found the precision.
 
+## Measured on the right engine, through the wrong client
+
+`psql` speaks the simple query protocol; `tokio-postgres` speaks the extended
+one. Asked from `psql`, `xact_start < query_start` on `pg_stat_activity` was
+exactly "a transaction was already open when this statement began" — equal
+outside a transaction block, earlier inside one, and earlier too for a caller
+that had run `BEGIN` and nothing else. Three cases, all correct, and the check
+built on it refused **every** pull: through the driver the two timestamps differ
+in both states, because Parse opens the implicit transaction before Execute
+starts the statement's clock. `transaction_timestamp() =
+statement_timestamp()` fails the same way and for the same reason.
+
+**"Measure against a real engine" is not enough when the client is part of the
+answer.** The question here was not what PostgreSQL stores but what this
+connection can observe about itself, and only the driver the code actually uses
+can answer that. What survived is a probe whose mechanism is the transaction
+itself rather than a clock: `SET LOCAL` a custom GUC, read it back in a second
+statement, and a value that is still there is a transaction block that outlived
+the statement.
+
 ## The snapshot the rendering functions do not read from
 
 `REPEATABLE READ` was added to the PostgreSQL pull so that five catalog queries
