@@ -21,7 +21,7 @@
 //! ```
 
 use pbps_db::{Conn, DbError, Driver};
-use pbps_dialect::Dialect;
+use pbps_dialect::{Dialect, TypeChangeRisk};
 use pbps_model::ColumnType;
 use pbps_pg::Postgres;
 
@@ -453,4 +453,579 @@ async fn a_session_the_connection_string_excludes_is_refused() {
         // failure, because the fix is a different server and not an open port.
         assert!(!error.to_string().contains("cannot reach"), "{error}");
     }
+}
+
+/// Every spelling the catalogue admits, declared against a real server and read
+/// back — the test that would have caught `serial`, applied to the whole table.
+///
+/// The comparison is between **values**, not strings: `format_type` renders
+/// `numeric(10,2)` and this model renders `numeric(10, 2)`, and it is the
+/// parsed type that introspection will compare (ADR-0011 Amendment 3). What the
+/// contract promises is that the two are the same type, and a rendering that
+/// differs by a space is not a second type.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
+    let mut conn = connect().await;
+    let table = format!("pbps_types_{}", std::process::id());
+
+    // Each declared spelling, and nothing else: the dialect's answer is not
+    // consulted until after the engine has given its own.
+    let declared = [
+        "int",
+        "int4",
+        "integer",
+        "int2",
+        "smallint",
+        "int8",
+        "bigint",
+        "decimal(10,2)",
+        "dec(10,2)",
+        "numeric(10,2)",
+        "numeric(10)",
+        "numeric",
+        "decimal",
+        "real",
+        "float4",
+        "float",
+        "float8",
+        "double precision",
+        "float(1)",
+        "float(24)",
+        "float(25)",
+        "float(53)",
+        "bool",
+        "boolean",
+        "char(5)",
+        "character(5)",
+        "char",
+        "character",
+        "varchar",
+        "varchar(9)",
+        "character varying",
+        "character varying(9)",
+        "text",
+        "date",
+        "bytea",
+        "time",
+        "timetz",
+        "time with time zone",
+        "timestamp",
+        "timestamptz",
+        "timestamp with time zone",
+        "timestamp without time zone",
+        "interval",
+        "interval(3)",
+        "json",
+        "jsonb",
+        "uuid",
+    ];
+
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+    let columns: Vec<String> = declared
+        .iter()
+        .enumerate()
+        .map(|(i, spelling)| format!("c{i} {spelling}"))
+        .collect();
+    conn.execute(&format!("CREATE TABLE {table} ({})", columns.join(", ")))
+        .await
+        .expect("create one column per declared spelling");
+
+    for (i, spelling) in declared.iter().enumerate() {
+        let read_back = text(
+            &mut conn,
+            &format!(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = '{table}'::regclass AND a.attname = 'c{i}'"
+            ),
+        )
+        .await;
+        let engine: ColumnType = read_back
+            .parse()
+            .unwrap_or_else(|e| panic!("the engine's own spelling `{read_back}` must parse: {e}"));
+        let normalized = Postgres
+            .normalize_type(&spelling.parse().expect("a type parses"))
+            .unwrap_or_else(|e| panic!("`{spelling}` should normalize: {e}"));
+        assert_eq!(
+            normalized, engine,
+            "declared `{spelling}`: the dialect says `{normalized}` and the engine says \
+             `{read_back}`, so every run would report a change that is not there"
+        );
+        // And the contract's other half, against the engine's own spelling
+        // rather than against this crate's idea of it.
+        let again = Postgres.normalize_type(&engine).expect("idempotent");
+        assert_eq!(again, engine, "normalizing the read-back form moved it");
+    }
+
+    conn.execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("drop");
+}
+
+/// `Incompatible` has to mean exactly "this engine refuses the conversion", and
+/// the only way to know is to ask it. Twenty types, four hundred ordered pairs,
+/// on an **empty** table: with no rows the only thing that can fail is the
+/// conversion itself, which is the question the class answers.
+///
+/// A pair called incompatible that the engine accepts blocks a plan that would
+/// have worked; a pair called narrowing that the engine refuses fails half way
+/// through an apply, after the changes before it have run.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible() {
+    let mut conn = connect().await;
+    let table = format!("pbps_risk_{}", std::process::id());
+    let types = [
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric(10,2)",
+        "real",
+        "double precision",
+        "boolean",
+        "character(5)",
+        "character varying(9)",
+        "text",
+        "bytea",
+        "date",
+        "time without time zone",
+        "time with time zone",
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "interval",
+        "uuid",
+        "json",
+        "jsonb",
+    ];
+
+    for from in types {
+        for to in types {
+            conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+                .await
+                .expect("drop");
+            conn.execute(&format!("CREATE TABLE {table} (c {from})"))
+                .await
+                .unwrap_or_else(|e| panic!("create `{from}`: {e}"));
+            let accepted = conn
+                .execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
+                .await
+                .is_ok();
+
+            let normalize = |s: &str| {
+                Postgres
+                    .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+                    .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
+            };
+            let judged = Postgres.type_change_risk(&normalize(from), &normalize(to));
+            assert_eq!(
+                judged != TypeChangeRisk::Incompatible,
+                accepted,
+                "`{from}` -> `{to}`: the dialect says {judged:?} and the engine {} it",
+                if accepted { "accepts" } else { "refuses" }
+            );
+        }
+    }
+
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0012 §6's first trap, measured here so that introspection (Phase 5 step
+/// 3) does not walk into it: **a dropped column does not leave**. The catalog
+/// keeps the slot with a placeholder name, `attnum` keeps the hole, and the
+/// type is not readable at all.
+///
+/// This is CLAUDE.md's rule wearing its worst disguise: absent, empty and
+/// unreadable are three different things, and this row is the third dressed as
+/// the first. A reader that does not filter `attisdropped` reports a phantom
+/// column whose type cannot be parsed.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_dropped_column_keeps_its_slot_and_its_type_is_not_readable() {
+    let mut conn = connect().await;
+    let table = format!("pbps_dropped_{}", std::process::id());
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+    conn.execute(&format!(
+        "CREATE TABLE {table} (keep integer, gone text, later integer)"
+    ))
+    .await
+    .expect("create");
+    conn.execute(&format!("ALTER TABLE {table} DROP COLUMN gone"))
+        .await
+        .expect("drop the column");
+
+    let rows = conn
+        .query(&format!(
+            "SELECT a.attnum::text || ' ' || a.attname || ' ' || a.attisdropped::text AS c \
+             FROM pg_attribute a WHERE a.attrelid = '{table}'::regclass AND a.attnum > 0 \
+             ORDER BY a.attnum"
+        ))
+        .await
+        .expect("read the columns back");
+    let slots: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.try_get::<&str>("c")
+                .expect("text")
+                .expect("not null")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        slots.len(),
+        3,
+        "the dropped column keeps its slot: {slots:?}"
+    );
+    assert!(slots[1].contains("true"), "{slots:?}");
+    assert!(slots[1].contains("pg.dropped.2"), "{slots:?}");
+    // And `attnum` is not a position: the third column is still numbered 3.
+    assert!(slots[2].starts_with("3 later"), "{slots:?}");
+
+    // The type of the slot is not merely uninteresting — it cannot be read.
+    // `format_type` answers `-`, which is no type this model can parse, so a
+    // reader that got this far would fail on the parse rather than on the flag
+    // it should have checked.
+    let ty = text(
+        &mut conn,
+        &format!(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+             WHERE a.attrelid = '{table}'::regclass AND a.attisdropped"
+        ),
+    )
+    .await;
+    assert_eq!(ty, "-");
+    assert!(ty.parse::<ColumnType>().is_err(), "`{ty}` must not parse");
+
+    conn.execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("drop");
+}
+
+/// An argument the engine changes **without saying so**. Measured:
+/// `interval(7)` is stored as `interval(6)`, with no error and no notice worth
+/// the name — the identifier-truncation shape again, one layer down.
+///
+/// So the dialect refuses it, and this test asserts both halves together: what
+/// the engine does with the declaration, and that the dialect will not let it
+/// get that far.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_interval_precision_the_engine_would_quietly_reduce_is_refused() {
+    let mut conn = connect().await;
+    let table = format!("pbps_interval_{}", std::process::id());
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("CREATE TABLE {table} (c interval(7))"))
+        .await
+        .expect("the engine accepts a precision it will not keep");
+    let read_back = text(
+        &mut conn,
+        &format!(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+             WHERE a.attrelid = '{table}'::regclass AND a.attname = 'c'"
+        ),
+    )
+    .await;
+    assert_eq!(read_back, "interval(6)", "the engine reduced it silently");
+
+    let refusal = Postgres
+        .normalize_type(&"interval(7)".parse::<ColumnType>().expect("parses"))
+        .expect_err("the dialect refuses what the engine would quietly change")
+        .to_string();
+    assert!(refusal.contains("between 0 and 6"), "{refusal}");
+
+    conn.execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("drop");
+}
+
+/// What `Safe` promises, against real rows: the statement runs, and the value
+/// that comes out is the value that went in.
+///
+/// The matrix above uses empty tables, which is the right shape for
+/// `Incompatible` and blind to everything else — a classification can be wrong
+/// about a boundary value without a single pair changing category. Each row
+/// here carries the value that finds the boundary, and the assertion is one
+/// implication: **if the dialect says `Safe`, nothing may fail and nothing may
+/// change.** Narrowing is not asserted the other way round; that a change *can*
+/// lose is not a promise that this row does.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
+    let mut conn = connect().await;
+    let table = format!("pbps_safe_{}", std::process::id());
+
+    // (from, to, a value at the edge of `from`).
+    let cases = [
+        // Ten digits either side, and one of them stops at 2147483647.
+        ("numeric(10,0)", "integer", "9999999999"),
+        ("numeric(9,0)", "integer", "999999999"),
+        ("numeric(5,0)", "smallint", "99999"),
+        ("numeric(4,0)", "smallint", "9999"),
+        ("numeric(19,0)", "bigint", "9999999999999999999"),
+        // `NaN` is a value every `numeric` holds and no integer type does, so
+        // it is the row that decides that direction whatever the widths are.
+        ("numeric(4,0)", "smallint", "'NaN'"),
+        ("numeric(9,0)", "integer", "'NaN'"),
+        // 32767 needs five digits, not four.
+        ("smallint", "numeric(5,0)", "32767"),
+        ("smallint", "numeric(4,0)", "32767"),
+        // A scale larger than the precision still bounds the value.
+        ("numeric(2,3)", "numeric(2,4)", "0.099"),
+        ("numeric(2,4)", "numeric(2,3)", "0.0099"),
+        ("numeric(2,3)", "numeric(3,3)", "0.099"),
+        // The first integer a binary float cannot hold.
+        ("integer", "real", "16777217"),
+        ("smallint", "real", "32767"),
+        ("numeric(5,0)", "real", "99999"),
+        ("bigint", "double precision", "9007199254740993"),
+        ("integer", "double precision", "2147483647"),
+        // A `time` into an `interval` at both ends of the day and at the last
+        // microsecond, and into the precision that rounds it away.
+        ("time", "interval", "'24:00:00'"),
+        ("time", "interval", "'23:59:59.999999'"),
+        ("time", "interval", "'00:00:00'"),
+        ("time", "interval(0)", "'12:34:56.654321'"),
+        ("time", "interval(5)", "'12:34:56.654321'"),
+        ("interval", "time", "'30 hours'"),
+        // The seconds precision the family used to drop.
+        ("interval(0)", "interval(6)", "'1 sec'"),
+        ("interval(6)", "interval(0)", "'1.234567 sec'"),
+        ("interval", "interval(3)", "'1.234567 sec'"),
+        ("interval(3)", "interval", "'1.234 sec'"),
+        ("numeric(10,2)", "numeric(12,2)", "12345678.90"),
+        ("numeric(10,2)", "numeric(10,4)", "12345678.90"),
+        // A `date` runs to 5874897 AD and a `timestamp` stops at 294276 AD.
+        ("date", "timestamp without time zone", "'300000-01-01'"),
+        ("date", "timestamp without time zone", "'2026-01-02'"),
+        ("character varying(10)", "character varying(20)", "'abc'"),
+        (
+            "character varying(20)",
+            "character varying(10)",
+            "'abcdefghijklmnop'",
+        ),
+    ];
+
+    for (from, to, value) in cases {
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+        conn.execute(&format!("CREATE TABLE {table} (c {from})"))
+            .await
+            .unwrap_or_else(|e| panic!("create `{from}`: {e}"));
+        conn.execute(&format!("INSERT INTO {table} VALUES ({value})"))
+            .await
+            .unwrap_or_else(|e| panic!("insert {value} into `{from}`: {e}"));
+        let before = text(&mut conn, &format!("SELECT c::text FROM {table}")).await;
+
+        let altered = conn
+            .execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
+            .await
+            .is_ok();
+        let after = if altered {
+            Some(text(&mut conn, &format!("SELECT c::text FROM {table}")).await)
+        } else {
+            None
+        };
+
+        let normalize = |s: &str| {
+            Postgres
+                .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+                .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
+        };
+        if Postgres.type_change_risk(&normalize(from), &normalize(to)) == TypeChangeRisk::Safe {
+            assert_eq!(
+                after.as_deref(),
+                Some(before.as_str()),
+                "`{from}` -> `{to}` is called Safe, and `{value}` did not survive it"
+            );
+        }
+    }
+
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+}
+
+/// The loss a value's own printing hides.
+///
+/// `0.1` in a `real` prints as `0.1`, because the engine renders the shortest
+/// decimal that reads back as the same float — so the test above, and every
+/// round trip through `::text`, says the value survived. It did not: the stored
+/// number is `0.10000000149011612`, and the arithmetic says so. This is why the
+/// classification asks whether the float holds the value **exactly** rather
+/// than whether its digits fit.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change() {
+    let mut conn = connect().await;
+
+    // What the engine stores, seen through a wider type rather than through
+    // the printing that rounds it back.
+    let stored = text(
+        &mut conn,
+        "SELECT (0.1::numeric(2,1)::real::double precision)::text",
+    )
+    .await;
+    assert_eq!(stored, "0.10000000149011612");
+    // And it is not academic: ten of them do not add up.
+    let summed = text(
+        &mut conn,
+        "SELECT SUM(c)::text FROM (SELECT 0.1::real AS c FROM generate_series(1, 10)) s",
+    )
+    .await;
+    let exact = text(
+        &mut conn,
+        "SELECT SUM(c)::text FROM (SELECT 0.1::numeric(2,1) AS c FROM generate_series(1, 10)) s",
+    )
+    .await;
+    assert_eq!(summed, "1.0000001");
+    assert_eq!(exact, "1.0");
+
+    let normalize = |s: &str| {
+        Postgres
+            .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+            .expect("normalizes")
+    };
+    assert_eq!(
+        Postgres.type_change_risk(&normalize("numeric(2,1)"), &normalize("real")),
+        TypeChangeRisk::Narrowing,
+        "an exact decimal into a binary float is a change that needs approval"
+    );
+}
+
+/// The identity rule, asked of the engine rather than of the documentation.
+///
+/// `validate` refuses an `identity:` on anything but the three integers, and
+/// refuses it beside a `default:` or a `nullable: true`. Each of those is a
+/// sentence this engine prints, so each is asked here in the form the emitter
+/// would produce: if the dialect and the engine ever part company, the pair
+/// that disagrees is named.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
+    let mut conn = connect().await;
+    let table = "pbps_live_identity";
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
+
+    for declared in [
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric(10,0)",
+        "numeric",
+        "text",
+        "uuid",
+        "real",
+        "double precision",
+    ] {
+        let engine = conn
+            .execute(&format!(
+                "CREATE TABLE {table} (id {declared} GENERATED ALWAYS AS IDENTITY)"
+            ))
+            .await;
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+
+        let mut declaration = pbps_model::Table::default();
+        let mut column = pbps_model::Column::new(declared.parse::<ColumnType>().expect("parses"));
+        // An identity is NOT NULL on both sides, and `Column::new` is nullable.
+        column.nullable = false;
+        column.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        declaration.columns.insert("id".to_owned(), column);
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+
+        assert_eq!(
+            engine.is_ok(),
+            found.is_empty(),
+            "`{declared}` as an identity: the engine {}, and pbps says {found:?}",
+            if engine.is_ok() { "took it" } else { "refused" }
+        );
+    }
+
+    // The refusals that are not about the type. Each is the engine's, and each
+    // is what `validate` says without connecting.
+    for (definition, refused) in [
+        ("id integer NULL GENERATED ALWAYS AS IDENTITY", "nullable"),
+        (
+            "id integer DEFAULT 7 GENERATED ALWAYS AS IDENTITY",
+            "a default",
+        ),
+        (
+            "id integer GENERATED ALWAYS AS IDENTITY (INCREMENT BY 0)",
+            "an increment of zero",
+        ),
+    ] {
+        let engine = conn
+            .execute(&format!("CREATE TABLE {table} ({definition})"))
+            .await;
+        assert!(engine.is_err(), "the engine took {refused}");
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+    }
+
+    // The seed, which is bounded by the sequence behind the column and not by
+    // the column: a `0` fits every one of these types and the engine still
+    // refuses it, and counting down inverts which end is too far.
+    for (declared, seed, increment) in [
+        ("smallint", 1_i64, 1_i64),
+        ("smallint", 32767, 1),
+        ("smallint", 32768, 1),
+        ("integer", 0, 1),
+        ("integer", -5, 1),
+        ("integer", -5, -1),
+        ("integer", 5, -1),
+        ("smallint", -32768, -1),
+        ("smallint", -32769, -1),
+    ] {
+        let engine = conn
+            .execute(&format!(
+                "CREATE TABLE {table} (id {declared} GENERATED ALWAYS AS IDENTITY \
+                 (START WITH {seed} INCREMENT BY {increment}))"
+            ))
+            .await;
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop");
+
+        let mut declaration = pbps_model::Table::default();
+        let mut column = pbps_model::Column::new(declared.parse::<ColumnType>().expect("parses"));
+        column.nullable = false;
+        column.identity = Some(pbps_model::Identity { seed, increment });
+        declaration.columns.insert("id".to_owned(), column);
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+
+        assert_eq!(
+            engine.is_ok(),
+            found.is_empty(),
+            "`{declared}` starting at {seed} by {increment}: the engine {}, and pbps says {found:?}",
+            if engine.is_ok() { "took it" } else { "refused" }
+        );
+    }
+
+    // And the rule that is SQL Server's alone: that dialect refuses a second
+    // IDENTITY column, this engine takes one per column. `validate` carries no
+    // such rule here, and this is what says so.
+    conn.execute(&format!(
+        "CREATE TABLE {table} (a integer GENERATED ALWAYS AS IDENTITY, \
+         b integer GENERATED ALWAYS AS IDENTITY)"
+    ))
+    .await
+    .expect("two identity columns in one table");
+    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .expect("drop");
 }

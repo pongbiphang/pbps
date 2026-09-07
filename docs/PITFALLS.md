@@ -459,6 +459,148 @@ emitted. The repair is one predicate all three call.
 the caller the finding happened to name.** A rule that lives in three places is
 three chances to be measured once and fixed once.
 
+## One property of a type standing in for what it holds
+
+Five instances over four review rounds, four of them in the classification that
+decides whether a change needs a human's approval, all in the direction that
+skips one. Each rule named a real property of the type — its digit count, its
+significant digits, its components, its range — and each time the property was
+true and not the whole answer.
+
+- **`numeric(10,0)` and `integer` are both "ten digits".** Measured,
+  `9999999999` into an `integer` is `integer out of range`; on SQL Server,
+  `decimal(10,0)` into `int` is `Arithmetic overflow`. The integer types are not
+  powers of ten, and a digit count cannot say so.
+- **"the digits fit in the float" is not "the float holds the value".** `0.1` in
+  a `real` is `0.10000000149011612`. The engine prints the shortest decimal that
+  reads back as the same float, so `0.1::real::text` is `0.1` and every round
+  trip through text agrees the value survived; ten of them sum to `1.0000001`
+  where the exact sum is `1.0`.
+
+- **"it stores every component the other one does" is not "it holds every
+  value".** A `date` runs to 5874897 AD and a `timestamp` stops at 294276 AD,
+  so adding a time to a date — the textbook widening — fails on
+  `'300000-01-01'` with `date out of range for timestamp`.
+
+- **"the seed fits the column" is not "the sequence will start there".** An
+  `identity:` the model can spell carries a seed and an increment and nothing
+  else, so the sequence behind it takes PostgreSQL's default bounds — `1 ..
+  type_max` counting up, `type_min .. -1` counting down. A seed of `0` fits
+  every integer type the engine will carry an identity on and is refused,
+  `START value (0) cannot be less than MINVALUE (1)`; a seed of `5` counting
+  down is refused for being too *large*. The column's range is the wrong range
+  at both ends, and it is the one a reader reaches for.
+
+Every one reads as obviously correct, and a test written by the same hand asks
+the same question the rule does. **What catches them is a row at the boundary,
+on a real server**: the largest value the source holds, and a value the target
+cannot represent, with the promise asserted as *the statement runs and the value
+does not change*. A classification cannot be checked against itself, and the
+second one cannot be checked against the engine's own printing either.
+
+## The engine accepted the declaration and stored a different one
+
+Not an error, not a warning worth the name, and not visible again until the
+next run reports a change nobody made. Measured on PostgreSQL 18.6:
+
+| Declared | Stored | How you find out |
+|---|---|---|
+| an identifier of 64 bytes | truncated to 63 | a `NOTICE` nothing reads |
+| `interval(7)` | `interval(6)` | nothing at all |
+| `time(7)`, `timestamp(7)` | `time(6)`, `timestamp(6)` | nothing at all |
+
+Each one records itself at one value and reads back at another, so the drift
+report never goes quiet and no plan can settle it — and each is *accepted*,
+which is why none of them shows up in a test that only checks statements
+succeed. Two names differing after byte 63 go further and **collide**: the
+second `CREATE TABLE` fails naming a table the declarations do not contain.
+
+**The rule.** A dialect enforces the engine's limits itself wherever the engine
+*adjusts* rather than refuses. Where the engine refuses, the limit may be left
+to it — the failure is loud and names itself. The two are found the same way,
+and only one way: declare the out-of-range value and read the catalog back.
+
+## A blanket refusal removed, and only part of it replaced
+
+The PostgreSQL crate refused every table outright while the type catalogue was
+unbuilt. Building the catalogue turned that one refusal into a real
+`validate_table` — and the replacement covered the schema name, the table name,
+the column names and the column types, because those are what the step was
+about. It did not cover the primary key's name, the keys of `unique`,
+`foreign_keys`, `checks` and `indexes`, nor any rule about `identity:`. Every
+one of those had been refused the day before, by the blanket, and was silently
+admitted the day after.
+
+Nothing in the diff looked wrong. The new code was strictly more useful than
+what it replaced, and each thing it checked, it checked correctly. The gap only
+exists relative to what the blanket used to cover, and a diff does not show
+that.
+
+**The shape:** a coarse refusal is replaced by a precise one, and the precise
+one is written from the feature that motivated it rather than from the set the
+coarse one held. Anything the blanket covered incidentally is now permitted.
+
+**How to avoid it:** when you delete a refusal, enumerate what it was refusing —
+not what you are about to allow — and account for every item. Here that means
+every name the object owns and every field of the declaration, not only the
+ones the current step reads.
+
+## The second implementation did not inherit the first one's scar
+
+`Dialect::type_change_risk` documents that the caller normalizes the types
+first. The SQL Server dialect normalizes them again anyway, with a comment
+saying why: *a dialect that only works when it is called correctly is a trap,
+and normalizing twice is free.* The PostgreSQL dialect, written from the trait,
+did not — the trait is where the contract is written, and the contract says the
+caller does it.
+
+One caller cannot. `validate_saved_plan` re-derives a plan file's risks
+*because the file may have been edited*, so its types are spelled however the
+editor liked. Measured on the unguarded version: `int -> integer` came back
+`Incompatible` and would block a plan that changes nothing, and
+`character(5) -> character` came back `Safe` — an argument-free `character`
+looks unbounded and is `character(1)` — which is a narrowing walking past the
+gate.
+
+**The shape:** a precondition stated on an interface, defended in the first
+implementation and re-stated nowhere. The scar is in the older implementation's
+comment, not in the trait, so the next implementation is written against the
+contract and repeats the bug. This is the failure the phased dialects invite
+most: eight more steps of #76 each re-implement methods SQL Server has already
+been burned by.
+
+**How to avoid it:** when a defensive measure exists in one implementation and
+not in the interface, move the *reason* to the interface. The trait now says
+the implementation must not depend on the caller having normalized, and names
+the caller that cannot. Reading the sibling implementation beside the trait is
+the other half, and it is what a call-site sweep is for.
+
+## One match arm, two directions, one direction's reason
+
+`change_risk` classified `time -> interval` and `interval -> time` in a single
+arm, and the comment above it argued one of them: *`interval '30 hours'` into
+`time` is accepted and stores `06:00:00` — a day and a half is gone.* True, and
+it says nothing at all about the other direction, which is a length of time
+keeping its length. Measured, every boundary a `time` has — `00:00:00`,
+`24:00:00`, `23:59:59.999999` — reads back from an `interval` unchanged.
+
+The arm is the tell. Two orderings joined by `|` produce one answer, so the
+author writes the reason for whichever ordering they were thinking about, and
+the other rides along under it. Both were `Narrowing` here, which is the
+harmless direction to be wrong in — a gate asked for on a change that never
+loses — and the same construction with the answer `Safe` is a gate skipped.
+
+It is also not a case of "the reviewer was right and the fix is the opposite
+answer". The review asked for `time -> interval` to be `Safe`, and that is
+wrong too: measured, `12:34:56.654321` into `interval(0)` **rounds** to
+`12:34:57`, and into `interval(5)` to `12:34:56.65432`. The answer depends on
+the target's seconds precision, and neither of the two blanket answers is it.
+
+**The shape:** an arm serving two directions, justified for one. **How to
+avoid it:** an arm that matches both orderings of a pair needs its comment to
+say something about each, or it needs to be two arms. Splitting it is what
+forced the measurement that found the precision.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run
@@ -509,7 +651,8 @@ dependency tree ended up with.
 
 ## A comment that describes a check the code does not make
 
-Two in one review round, in code written the same week:
+Three now, and the third is the shape at its most flattering: a comment that
+*reasons* rather than states, and is right about half its subject.
 
 - `pbps-db::postgres::endpoint` fell back to `localhost` for a connection
   string it could not read, under a comment saying the connection would then
@@ -520,10 +663,28 @@ Two in one review round, in code written the same week:
   characters" and enforced no limit at all, while the SQL Server counterpart it
   was written from enforces one.
 
+- `pbps-pg`'s `type_change_risk` fell back to the declared type when
+  normalization failed, under a comment saying that value "no family claims and
+  every pair therefore calls `Incompatible` — the conservative answer". True of
+  an unknown *base*. Not true of a rejected *modifier* on a known base, which
+  keeps the base every family does claim: `numeric(1000) -> numeric(1001)` came
+  out `Safe` on a precision this engine does not have, and
+  `interval(6) -> interval(7)` came out `Safe` on the precision the engine
+  silently stores as 6 — which is the round trip the catalogue refuses the
+  declaration for. The unit test that was meant to pin the claim asked it only
+  of `serial` and `nonesuch`, both unknown bases, so it passed on the half that
+  was true. The same fallback is in the shipped SQL Server dialect, where
+  `decimal(38,0) -> decimal(39,0)` reads `Safe` past a maximum precision of 38.
+
 A comment stating a rule reads, to the next person and to the reviewer skimming
 for one, as a rule that is applied. **When a comment names a limit or a
 guarantee, the line that enforces it should be the next one** — and when it
 cannot be, the comment has to say that the check is somewhere else and where.
+A comment that argues *why* the code is safe needs the argument's cases
+enumerated and each one tested, or the test pins the case the author was
+already thinking of. **Prefer removing the fallback to reasoning about it**: the
+fixed version returns `Incompatible` when either side fails to normalize, and
+there is no longer a case to be half right about.
 
 ## A round trip tested only on the simple case
 

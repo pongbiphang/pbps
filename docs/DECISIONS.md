@@ -3942,3 +3942,172 @@ SPEC is in sync with all of these.
     dropped, however long the run. The tests ask `scannable` directly rather
     than going through `references`, because the bare-name fallback matches a
     half-closed gap too and would hide the difference.
+240. **The PostgreSQL catalogue is closed, and every bound in it is the
+    engine's own — including the two the engine does not enforce.** A name the
+    table does not hold is refused, never passed through. Passed through, a
+    base name no catalog ever returns makes a column that reads as changed on
+    every run and no plan can fix: ADR-0012 §1 names that trap for `text ARRAY`,
+    which loads happily as the base name `text array` because spaces are legal
+    in one. Both array spellings are refused for the same reason, and so is
+    `bpchar` — measured, `bpchar(5)` reads back as `character(5)` and a bare
+    `bpchar` reads back as `bpchar`, so any single alias for it would be right
+    in one case and wrong in the other.
+
+    The bounds are the engine's and **not SQL Server's**, which is the half that
+    had to be measured rather than recalled. `numeric(10,-5)` is legal here and
+    reads back as itself, so the SQL Server rule `0 <= scale <= precision` would
+    refuse a column this engine will happily make; the scale's real range is
+    -1000..=1000 and the precision's is 1..=1000. A bare `numeric` stays
+    unbounded rather than gaining the `(18,0)` SQL Server fills in, `character`
+    gains the `(1)` that SQL Server also gives it, and `character varying`
+    gains nothing — three different answers to "what does an omitted argument
+    mean", and one rule for all three would have been wrong twice.
+
+    Two bounds are enforced here **although the engine does not enforce them**,
+    and that is the identifier-truncation shape one layer down: measured,
+    `interval(7)` is stored as `interval(6)` and `time(7)` as `time(6)`, with no
+    error. A declaration the engine quietly reduces records itself at one value
+    and reads back at another, which is a drift report that never goes quiet.
+
+241. **The cost of a change stays out of `TypeChangeRisk`.** ADR-0012 §3's
+    boundary, written down with the catalogue rather than with the estimate that
+    will use it, because that is the moment the pressure to blur it is lowest.
+
+    **Measured on PostgreSQL 18.6**, by comparing `pg_class.relfilenode` either
+    side of the statement — the engine's own answer to "was this table rebuilt",
+    not a proxy for it:
+
+    | Change | Rebuilt? | Risk |
+    |---|---|---|
+    | `integer` → `bigint` | **REWRITE** | `Safe` |
+    | `character varying(10)` → `character varying(20)` | no | `Safe` |
+    | `character varying(20)` → `text` | no | `Safe` |
+    | `text` → `character varying(20)` | **REWRITE** | `Narrowing` |
+    | `numeric(10,2)` → `numeric(12,2)` | no | `Safe` |
+    | `numeric(10,2)` → `numeric(10,4)` | **REWRITE** | `Narrowing` |
+    | `ADD COLUMN d integer DEFAULT 7` | no | — |
+    | `ADD COLUMN d uuid DEFAULT gen_random_uuid()` | **REWRITE** | — |
+    | `SET NOT NULL`, `DROP COLUMN`, `ADD COLUMN` with no default | no | — |
+
+    `DROP COLUMN` is in that table for a reason that is not about risk at all:
+    it rewrites nothing, and it also **does not reclaim the space**. "The drop
+    was cheap" and "the table got smaller" are different claims, and an estimate
+    that conflated them would be wrong in the direction that surprises an
+    operator (ADR-0012 §6).
+
+    The first row is the whole argument: the textbook widening rebuilds a
+    million-row table in 410ms against 0.662ms for one that does not, under an
+    `AccessExclusiveLock` that blocks readers — and it is `Safe`, correctly,
+    because a rewrite loses nothing and cannot fail. Reclassifying it as
+    `Narrowing` would lie twice: `Narrowing` tells a reviewer the change may
+    *fail or lose data*, and the class's criterion is deliberately
+    data-independent (SPEC §7.2) while a rewrite's cost is entirely a function
+    of how many rows there are.
+
+    The rewrite is also **not always a property of the declaration**, which is
+    why this is a boundary and not a second column in the same table. Measured:
+    `timestamp` → `timestamptz` is free under a `UTC` session and rewrites under
+    `America/New_York`, and `ADD COLUMN ... DEFAULT` depends on the expression's
+    volatility, which this tool does not parse. The estimate (SPEC 14.1) answers
+    `unknown` for those rather than guessing *cheap*, which is the direction
+    every probe in this project already leans. Phase 5 step 9 builds it; this
+    entry is what it is built against.
+
+242. **A precision on `time` or `timestamp` is refused, because this model
+    cannot hold the engine's own spelling of it.** Measured: `timestamptz(3)`
+    reads back as `timestamp(3) with time zone` — the modifier goes **inside**
+    the name — and `timestamp with time zone(3)` is a *syntax error*. A
+    `ColumnType` is a base name followed by its arguments, so there is no value
+    `normalize_type` could return that both introspection reads back and the
+    emitter can spell, and ADR-0011 Amendment 3 says a spelling for which that
+    is impossible is an error rather than something to normalize.
+
+    Refused rather than normalized to the unmodified type: `timestamp(3)` and
+    `timestamp` are different columns to the catalog, so folding one into the
+    other would be the phantom change `serial` already demonstrated. Refused as
+    `NotBuilt` rather than `Unsupported`, because the engine has the feature and
+    pbps does not — and a reader sent to PostgreSQL's documentation for a
+    limitation of this tool looks in the wrong place. Lifting it is a
+    `pbps-model` change, exactly as arrays are (issue #130), and the refusal
+    names the declaration to write in the meantime.
+
+243. **`Incompatible` is defined by a measured matrix, not by a rule.** The
+    class means "this engine refuses the conversion outright", so what it must
+    agree with is the engine. Twenty types, four hundred ordered pairs, each
+    `ALTER TABLE ... ALTER COLUMN ... TYPE` run on an **empty** table — with no
+    rows the only thing that can fail is the conversion itself, which is exactly
+    the question the class answers. The matrix is in `pbps-pg`'s unit tests and
+    the live suite re-measures it against a real server, so the two disagree the
+    moment either the engine or the classification moves.
+
+    A rule would have been wrong, and it was: `timestamptz` converts to `timetz`
+    and `timestamp` does not, and no property of the two types predicts it.
+    `interval` converts to `time` and to neither `timetz` nor `timestamp`, so a
+    classification phrased as "anything with a time part" called two refusals a
+    narrowing — found by the matrix, in the first run.
+
+    Getting it wrong is expensive in both directions: a pair called
+    `Incompatible` that the engine accepts refuses a plan that would have
+    worked, and a pair called `Narrowing` that the engine refuses fails half way
+    through an apply, after the changes before it have run.
+
+244. **`Safe` is decided by what a type *holds*, not by how many digits it
+    has.** Two rules that look right and are not, both found by review on the
+    PostgreSQL catalogue (#131) and both measured:
+
+    - **A digit count is not a magnitude.** `numeric(10,0)` and `integer` are
+      both "ten digits", and `9999999999` into an `integer` is `integer out of
+      range`. The same holds for `numeric(5,0)` into `smallint` and
+      `numeric(19,0)` into `bigint`. The integer types are not powers of ten, so
+      the classification carries the largest value each one holds and compares
+      *that*.
+    - **A decimal that prints back is not a decimal the float holds.** `0.1` in
+      a `real` is `0.10000000149011612`, and ten of them sum to `1.0000001`
+      where the exact sum is `1.0`. The engine renders the shortest decimal that
+      reads back as the same float, so `0.1::real::text` is `0.1` and every
+      round trip through text says the value survived. So the question is
+      whether the float holds the value **exactly** — no fraction, and no gap
+      below its magnitude, which is 2^24 for `real` and 2^53 for `double
+      precision`. Measured: `16777217` into a `real` reads back as `16777200`.
+
+    The next round found two more of the same shape, and both are about
+    `numeric` being a wider thing than its width says:
+
+    - **`NaN` is a value every `numeric` holds**, whatever its precision —
+      measured, `'NaN'::numeric(4,0)` is accepted — and no integer type has one:
+      `cannot convert NaN to smallint`. So a `numeric` never reaches an integer
+      type safely, however narrow it is, and the widths are not the question.
+      (`NaN` and infinity both pass into a float unchanged, so that direction
+      keeps its bound.)
+    - **A scale larger than the precision still bounds the value.**
+      `numeric(2,3)` holds values below `0.1` and `numeric(2,4)` below `0.01`,
+      and measured, `0.099` into the second is `numeric field overflow`. The
+      integer-part exponent is `p - s` and it is kept **signed**; clamping it at
+      "no integer part" made two different capacities compare equal.
+
+    The round after that found the same shape in the date types, where the
+    property standing in for the answer was *which components a type stores*:
+
+    - **A `date` reaches further than a `timestamp`.** Measured,
+      `'5874897-01-01'::date` is accepted, `'294276-12-31'` is the last date
+      that converts, and `'300000-01-01'::date::timestamp` is `date out of range
+      for timestamp`. Adding a time to a date looks like the textbook widening
+      and is not one. With that, **no change between two date-or-time types is
+      `Safe` except a type to itself** — each of the rest drops a component,
+      moves with the session's time zone, or runs off the end of the calendar.
+
+    Every one was `Safe`, which is the class that bypasses the gate entirely, so
+    every one was a plan approved by nobody that fails or silently changes data
+    at the apply. The common shape is worth naming: each rule described a type
+    by *one* of its properties — its digit count, its components, its width —
+    and each time the property was true and not the whole answer. Both are also **in `pbps-mssql`**, measured on SQL Server 2022:
+    `decimal(10,0)` into `int` is `Arithmetic overflow error converting
+    expression to data type int`, and `decimal(2,1)` into `real` stores
+    `1.000000014901161e-001`. That is issue #135; it is a shipped dialect and a
+    change to it needs its own measurements.
+
+    The general lesson is the one the live suite is built around: a
+    classification cannot be checked against itself. What catches these is a row
+    at the boundary — the largest value the source holds, and a value the target
+    cannot represent — put through a real server, with `Safe` asserted as *the
+    statement runs and the value does not change*.

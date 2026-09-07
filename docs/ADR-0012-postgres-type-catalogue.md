@@ -325,6 +325,38 @@ replacement is a declared transformation with its own ADR, not a flag.
 - **Everything here is proposed**, and falsifiable by the PostgreSQL live suite,
   which is Phase 5's first deliverable.
 
+## Amendment 1: what building it added to §1
+
+Written when the catalogue landed (Phase 5 step 2, issue #77), against the same
+pinned image. Nothing below contradicts §1; each is a row it did not have.
+
+- **A modifier can go inside the name.** `timestamptz(3)` reads back as
+  `timestamp(3) with time zone`, and `timestamp with time zone(3)` is a *syntax
+  error*. §1 measured the four time types only without a precision, so this
+  never came up. A `ColumnType` cannot hold it, and the declaration is refused
+  rather than folded into the unmodified type — DECISIONS 242, model change
+  in issue #130.
+- **`numeric`'s scale may be negative, and may exceed the precision.**
+  `numeric(10,-5)` reads back as itself. SQL Server's `0 <= scale <= precision`
+  would refuse a column this engine makes (DECISIONS 240).
+- **An omitted argument means three different things.** `character` gains
+  `(1)`, `character varying` gains nothing, and bare `numeric` stays unbounded
+  rather than gaining the `(18,0)` SQL Server fills in.
+- **`bpchar` is not an alias of `character`.** `bpchar(5)` reads back as
+  `character(5)` and a bare `bpchar` reads back as `bpchar`, so it is left out
+  of the closed catalogue rather than aliased half-correctly.
+- **The engine adjusts two arguments silently.** `interval(7)` is stored as
+  `interval(6)` and `time(7)` as `time(6)`, with no error — the identifier
+  truncation §1 records, one layer down. The dialect enforces both bounds
+  itself.
+- **§2's classification is now a measured matrix**, twenty types by twenty on an
+  empty table (DECISIONS 243). It confirmed §2 and corrected a rule derived from
+  it: `timestamptz` converts to `timetz` and `timestamp` does not, and
+  `interval` converts to `time` and to neither `timetz` nor `timestamp`.
+- **`numeric(10,2)` → `numeric(10,4)` can fail** — `numeric field overflow` —
+  though §3 lists the same change among the rewrites. The two axes really are
+  different questions, in both directions.
+
 ## Placement
 
 Phase 5, with the catalogue. The one item that should not wait for it is §3's

@@ -24,6 +24,8 @@ use std::borrow::Cow;
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
+mod types;
+
 /// A part of the dialect that Phase 5 has not built yet.
 ///
 /// One place, so that "what is missing" is a list rather than a habit, and so
@@ -32,7 +34,6 @@ use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 /// pbps cannot do, and it does not pretend the answer is "nothing to do".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
-    TypeCatalogue,
     Introspection,
     Emitter,
     Modules,
@@ -45,7 +46,6 @@ pub enum Unbuilt {
 impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
-            Unbuilt::TypeCatalogue => "the type catalogue (Phase 5 step 2)",
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
             Unbuilt::Emitter => "generating statements (Phase 5 step 4)",
             Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
@@ -62,45 +62,6 @@ impl Unbuilt {
             part: self.step().to_owned(),
         }
     }
-}
-
-/// The `serial` family: spellings that are not types (ADR-0011 Amendment 3).
-///
-/// Refused rather than normalized, and the reason is the contract on
-/// [`Dialect::normalize_type`] — its output is what introspection reads back
-/// for a column declared that way. PostgreSQL expands each of these into an
-/// integer column plus an owned sequence and reads the column back as that
-/// integer type, so no normalization can make the declared spelling equal the
-/// one that comes back. Left alone it is a schema that differs from itself on
-/// every run: the permanent phantom change.
-///
-/// The replacement is named in the refusal, because ADR-0010 §7 measured that
-/// it also disposes of a second problem: an identity column needs no sequence
-/// privilege, and a `serial` one does (`ERROR: permission denied for sequence
-/// ser_id_seq`). Measured on PostgreSQL 18.6 by the live suite in this crate,
-/// which is where the read-back spellings below come from (DECISIONS 227).
-fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> {
-    let base = ty.base.to_ascii_lowercase();
-    let reads_back = match base.as_str() {
-        "smallserial" | "serial2" => "smallint",
-        "bigserial" | "serial8" => "bigint",
-        "serial" | "serial4" => "integer",
-        // Not one of them, and that is the answer: this function refuses a
-        // closed list and normalizes nothing.
-        _ => return None,
-    };
-    let at = column.map_or_else(String::new, |name| format!("column `{name}`: "));
-    Some(DialectError::Invalid {
-        dialect: "postgres",
-        message: format!(
-            "{at}`{declared}` is a macro, not a type. The column is created as `{reads_back}` \
-             with an owned sequence, and `{reads_back}` is what introspection reads back, so a \
-             declared `{declared}` would differ from itself on every run. Declare \
-             `{reads_back}` with an `identity:` instead, which this engine emits as \
-             GENERATED ... AS IDENTITY and which needs no sequence privilege.",
-            declared = ty.base,
-        ),
-    })
 }
 
 /// PostgreSQL's limit on one identifier: 63 bytes, which is `NAMEDATALEN - 1`.
@@ -120,6 +81,69 @@ fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectError> 
 ///   `CREATE TABLE` fails with `relation "aaa…" already exists`, naming a
 ///   table the declarations do not contain.
 const MAX_IDENT_BYTES: usize = 63;
+
+/// What this engine refuses about an `identity:`, each measured on 18.6.
+///
+/// `validate` is where a declaration should fail, and until the catalogue
+/// existed this could not be asked: `validate_table` refused every table
+/// outright, so nothing reached the question.
+fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
+    let Some(identity) = declared.identity else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: "postgres",
+        message,
+    };
+    match types::identity_seed_range(&declared.ty, identity.increment) {
+        None => found.push(invalid(format!(
+            "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
+             identity column type must be smallint, integer, or bigint. A `numeric` is refused \
+             here even with a scale of zero, where SQL Server admits one.",
+            declared.ty
+        ))),
+        // The seed is checked against the sequence's bounds, not the column's:
+        // see [`types::identity_seed_range`] for why those are not the same
+        // range, and for the two seeds that fit the type and are still refused.
+        Some(accepted) if !accepted.contains(&identity.seed) => found.push(invalid(format!(
+            "column `{column}` has an `identity:` with a seed of {}, and an `identity:` on `{}` \
+             counting by {} starts somewhere in {}..={}: the engine refuses the table with START \
+             value ({}) out of the sequence's own bounds.",
+            identity.seed,
+            declared.ty,
+            identity.increment,
+            accepted.start(),
+            accepted.end(),
+            identity.seed
+        ))),
+        Some(_) => {}
+    }
+    // `GENERATED ... AS IDENTITY` implies NOT NULL, and saying both is
+    // `conflicting NULL/NOT NULL declarations`.
+    if declared.nullable {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:`, so it cannot be nullable: the engine refuses \
+             the pair as conflicting NULL/NOT NULL declarations."
+        )));
+    }
+    // `INCREMENT must not be zero`, and it is worth saying why rather than
+    // quoting: a step of zero hands every row the same value.
+    if identity.increment == 0 {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:` with an increment of 0, which never advances: \
+             the engine refuses it as INCREMENT must not be zero."
+        )));
+    }
+    // `both default and identity specified for column`.
+    if declared.default.is_some() {
+        found.push(invalid(format!(
+            "column `{column}` has an `identity:` and a `default:`. The engine refuses both on \
+             one column, and the identity is the one that supplies the value."
+        )));
+    }
+    found
+}
 
 /// The PostgreSQL dialect.
 pub struct Postgres;
@@ -155,21 +179,38 @@ impl Dialect for Postgres {
         }
     }
 
-    /// The catalogue is step 2, so almost everything here is still a refusal —
-    /// but the contract this method carries rules one family of spellings out
-    /// for good, and that refusal is not "not built yet". See [`refuse_serial`].
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-        if let Some(refusal) = refuse_serial(ty, None) {
-            return Err(refusal);
-        }
-        Err(Unbuilt::TypeCatalogue.refuse())
+        types::normalize(ty)
     }
 
-    fn type_change_risk(&self, _from: &ColumnType, _to: &ColumnType) -> TypeChangeRisk {
-        // Not a refusal, because the signature has nowhere to put one — so it
-        // answers with the class that stops a plan rather than the one that
-        // waves it through. An unbuilt catalogue must never read as "safe".
-        TypeChangeRisk::Narrowing
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+        // Normalized again here, as the SQL Server dialect does and for the
+        // same reason: the trait says the caller normalizes first, but a
+        // dialect that only works when it is called correctly is a trap, and
+        // normalizing twice is free.
+        //
+        // The caller that does not is `validate_saved_plan`, which re-derives
+        // the risks of a plan file **because it may have been edited**, and an
+        // edited file spells its types however the editor liked. Unnormalized,
+        // `int -> integer` reads as `Incompatible` and blocks a plan that
+        // changes nothing, and `character(5) -> character` reads as `Safe`
+        // because an argument-free `character` looks unbounded — it is
+        // `character(1)`, and that is a narrowing walking past the gate.
+        //
+        // A type that does not normalize ends the question here rather than
+        // travelling on in its declared form. Falling back to the declared
+        // value is the answer that looks conservative and is not: an
+        // unknown *base* is claimed by no family and comes out `Incompatible`,
+        // but a rejected *modifier* on a known base keeps that base, and the
+        // family reads the modifier as if the engine would accept it —
+        // `numeric(1000) -> numeric(1001)` comes out `Safe` on a precision
+        // this engine does not have, and `interval(6) -> interval(7)` comes
+        // out `Safe` on the precision it silently stores as 6, which is the
+        // round trip the catalogue refuses the declaration for.
+        let (Ok(from), Ok(to)) = (types::normalize(from), types::normalize(to)) else {
+            return TypeChangeRisk::Incompatible;
+        };
+        types::change_risk(&from, &to)
     }
 
     /// Unquoted identifiers fold to **lower** case, where SQL Server folds to
@@ -215,17 +256,61 @@ impl Dialect for Postgres {
         Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
     }
 
-    /// Every column is checked for the one thing this crate can already answer.
-    /// A `serial` has to be refused **by name** rather than swallowed by "the
-    /// type catalogue is not built yet": the second sends its reader away to
-    /// wait for a release, and the first is a declaration to change today.
-    fn validate_table(&self, _name: &TableName, table: &Table) -> Vec<DialectError> {
-        let mut found: Vec<_> = table
-            .columns
-            .iter()
-            .filter_map(|(name, column)| refuse_serial(&column.ty, Some(name.as_str())))
-            .collect();
-        found.push(Unbuilt::TypeCatalogue.refuse());
+    /// Every column's type, through the catalogue.
+    ///
+    /// A `serial` is refused **by name** here rather than by the same message
+    /// the catalogue gives elsewhere, because this is where a user is looking
+    /// at the declaration: the refusal names the column to change, and the one
+    /// from `normalize_type` cannot.
+    ///
+    /// Returns every problem rather than the first — a schema with three
+    /// unspellable columns should need one pass, not three.
+    fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
+        let mut found = Vec::new();
+        // The names first, and this is not a formality: `quote_ident` refuses
+        // an identifier over [`MAX_IDENT_BYTES`], so a table this method called
+        // clean is one the emitter cannot spell. `validate` is the command that
+        // exists to say so before anything connects.
+        for part in [&name.schema, &name.name] {
+            if let Err(e) = self.quote_ident(part) {
+                found.push(e);
+            }
+        }
+        // Every other name the table owns, which the engine truncates at the
+        // same limit and which the emitter has to spell just as often: the
+        // primary key's, and the keys of the four maps.
+        let owned = table
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_deref())
+            .into_iter()
+            .chain(table.unique.keys().map(String::as_str))
+            .chain(table.foreign_keys.keys().map(String::as_str))
+            .chain(table.checks.keys().map(String::as_str))
+            .chain(table.indexes.keys().map(String::as_str));
+        for object in owned {
+            if let Err(e) = self.quote_ident(object) {
+                found.push(e);
+            }
+        }
+
+        for (column_name, column) in &table.columns {
+            if let Err(e) = self.quote_ident(column_name) {
+                found.push(e);
+            }
+            if let Some(named) = types::refuse_serial(&column.ty, Some(column_name)) {
+                found.push(named);
+                // Everything below asks a question about the type, and asking
+                // it of one the catalogue has already refused is noise on top
+                // of the real error.
+                continue;
+            }
+            if let Err(e) = types::normalize(&column.ty) {
+                found.push(e);
+                continue;
+            }
+            found.extend(identity_problems(column_name, column));
+        }
         found
     }
 
@@ -244,7 +329,6 @@ mod tests {
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
-            Unbuilt::TypeCatalogue,
             Unbuilt::Introspection,
             Unbuilt::Emitter,
             Unbuilt::Modules,
@@ -267,13 +351,14 @@ mod tests {
     /// error, and the type is what makes that so.
     #[test]
     fn an_unbuilt_emitter_is_an_error_and_not_an_empty_plan() {
-        let risk = Postgres.type_change_risk(&ty("int"), &ty("bigint"));
-        assert_eq!(
-            risk,
-            TypeChangeRisk::Narrowing,
-            "an unbuilt catalogue must not answer `Safe`"
-        );
-        assert!(Postgres.normalize_type(&ty("int")).is_err());
+        let change = Change::DropTable {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: "app.t".parse().expect("a table name parses"),
+        };
+        let refusal = Postgres
+            .emit(&change, Strategy::default())
+            .expect_err("nothing can be emitted yet");
+        assert!(refusal.to_string().contains("Phase 5 step 4"), "{refusal}");
     }
 
     /// Unquoted identifiers fold down, not away: this is the difference from
@@ -392,12 +477,16 @@ mod tests {
     /// same letters is the catalogue's business, not this refusal's.
     #[test]
     fn a_type_that_is_not_in_the_serial_family_is_left_to_the_catalogue() {
-        for spelling in ["integer", "serialized", "bigserialx", "text"] {
+        for spelling in ["integer", "text"] {
+            assert!(Postgres.normalize_type(&ty(spelling)).is_ok(), "{spelling}");
+        }
+        for spelling in ["serialized", "bigserialx"] {
             let message = Postgres
                 .normalize_type(&ty(spelling))
-                .expect_err("the catalogue is not built")
+                .expect_err("the catalogue does not hold it")
                 .to_string();
-            assert!(message.contains("does not implement"), "{message}");
+            assert!(message.contains("has no type"), "{message}");
+            assert!(!message.contains("macro, not a type"), "{message}");
         }
     }
 
@@ -420,14 +509,270 @@ mod tests {
             .collect();
         assert_eq!(serial.len(), 1, "{found:?}");
         assert!(serial[0].contains("column `id`"), "{}", serial[0]);
-        // The catalogue is still unbuilt, and saying so is not optional: a
-        // table that validates clean here would be the silent wrong answer.
+        // And the `text` column beside it is fine, so the refusal names the
+        // one declaration to change rather than the whole table.
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// A name the emitter cannot spell is a table `validate` must not call
+    /// clean. The limit is `quote_ident`'s, and it is enforced nowhere else:
+    /// the server truncates instead of refusing, so a declaration that got
+    /// past here would make an object under a name nobody asked for.
+    #[test]
+    fn validating_a_table_refuses_a_name_the_emitter_could_not_spell() {
+        let long = "a".repeat(MAX_IDENT_BYTES + 1);
+        let mut table = Table::default();
+        table
+            .columns
+            .insert(long.clone(), pbps_model::Column::new(ty("integer")));
+        let found = Postgres.validate_table(&TableName::new(long.clone(), long.clone()), &table);
+        // The schema, the table and the column: three names, three refusals.
+        assert_eq!(found.len(), 3, "{found:?}");
         assert!(
             found
                 .iter()
-                .any(|e| e.to_string().contains("does not implement")),
+                .all(|e| matches!(e, DialectError::UnquotableIdent(_))),
             "{found:?}"
         );
+
+        // And a table whose names all fit is clean, so this is a limit and not
+        // a blanket refusal.
+        let mut ok = Table::default();
+        ok.columns
+            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        assert!(
+            Postgres
+                .validate_table(&"app.t".parse().unwrap(), &ok)
+                .is_empty()
+        );
+    }
+
+    /// The names a table owns are not only its own and its columns'. Each of
+    /// these is emitted as an identifier and truncated by the server at the
+    /// same limit, so `validate` has to ask about all of them or a plan fails
+    /// on a name it printed itself.
+    #[test]
+    fn validating_a_table_refuses_every_owned_name_the_emitter_could_not_spell() {
+        let long = "a".repeat(MAX_IDENT_BYTES + 1);
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some(long.clone()),
+            columns: vec!["id".to_owned()],
+        });
+        table.unique.insert(
+            long.clone(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["id".to_owned()],
+            },
+        );
+        table.checks.insert(
+            long.clone(),
+            pbps_model::CheckConstraint {
+                expression: "id > 0".to_owned(),
+            },
+        );
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        // The primary key, the unique constraint and the check: three names.
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|e| matches!(e, DialectError::UnquotableIdent(_))),
+            "{found:?}"
+        );
+    }
+
+    /// Measured on 18.6, and the engine says it in so many words: `identity
+    /// column type must be smallint, integer, or bigint`. A `numeric` is
+    /// refused even with a scale of zero, which is where SQL Server's rule and
+    /// this one part company.
+    #[test]
+    fn an_identity_is_refused_on_a_type_this_engine_will_not_carry_one_on() {
+        for (declared, accepted) in [
+            ("smallint", true),
+            ("integer", true),
+            ("bigint", true),
+            ("numeric(10,0)", false),
+            ("numeric", false),
+            ("text", false),
+            ("uuid", false),
+            ("real", false),
+        ] {
+            let mut table = Table::default();
+            let mut column = pbps_model::Column::new(ty(declared));
+            column.nullable = false;
+            column.identity = Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            table.columns.insert("id".to_owned(), column);
+            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            assert_eq!(
+                found.is_empty(),
+                accepted,
+                "`{declared}` as an identity: {found:?}"
+            );
+            if !accepted {
+                assert!(
+                    found[0]
+                        .to_string()
+                        .contains("smallint, integer, or bigint")
+                );
+            }
+        }
+    }
+
+    /// The three the engine refuses for a reason that is not the type:
+    /// `conflicting NULL/NOT NULL declarations`, `both default and identity
+    /// specified for column`, and `INCREMENT must not be zero`. Each is a rule
+    /// the shipped SQL Server dialect carries too; the one that does *not*
+    /// cross over is "only one IDENTITY per table", which this engine allows.
+    #[test]
+    fn an_identity_that_is_nullable_or_defaulted_or_never_advances_is_refused() {
+        let mut table = Table::default();
+        let mut column = pbps_model::Column::new(ty("integer"));
+        column.nullable = true;
+        column.default = Some("7".to_owned());
+        column.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 0,
+        });
+        table.columns.insert("id".to_owned(), column.clone());
+        // A second identity column, which this engine takes: it must not add a
+        // refusal of its own, only the three this one already earns.
+        table.columns.insert("other".to_owned(), {
+            let mut c = pbps_model::Column::new(ty("bigint"));
+            c.nullable = false;
+            c.identity = Some(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            });
+            c
+        });
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().any(|e| e.to_string().contains("nullable")));
+        assert!(found.iter().any(|e| e.to_string().contains("`default:`")));
+        assert!(
+            found
+                .iter()
+                .any(|e| e.to_string().contains("never advances"))
+        );
+    }
+
+    /// The seed is bounded by the sequence, not by the column.
+    ///
+    /// Every pair here was measured on 18.6. Two of them are the point: `0` on
+    /// an `integer` fits the type by any reading and is refused, and `5`
+    /// counting down fits the type and is refused for being too *large*.
+    #[test]
+    fn an_identity_seed_outside_the_sequences_own_bounds_is_refused() {
+        for (declared, seed, increment, accepted) in [
+            ("smallint", 1, 1, true),
+            ("smallint", 32767, 1, true),
+            ("smallint", 32768, 1, false),
+            ("integer", 2_147_483_647, 1, true),
+            ("integer", 2_147_483_648, 1, false),
+            // Fits every integer type this engine will carry an identity on,
+            // and the sequence starts at 1.
+            ("integer", 0, 1, false),
+            ("integer", -5, 1, false),
+            // Counting down, the sequence runs `type_min ..= -1`.
+            ("integer", -5, -1, true),
+            ("integer", 5, -1, false),
+            ("smallint", -32768, -1, true),
+            ("smallint", -32769, -1, false),
+            ("bigint", i64::MAX, 1, true),
+            ("bigint", i64::MIN, -1, true),
+        ] {
+            let mut table = Table::default();
+            let mut column = pbps_model::Column::new(ty(declared));
+            column.nullable = false;
+            column.identity = Some(pbps_model::Identity { seed, increment });
+            table.columns.insert("id".to_owned(), column);
+            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            assert_eq!(
+                found.is_empty(),
+                accepted,
+                "`{declared}` starting at {seed} by {increment}: {found:?}"
+            );
+        }
+    }
+
+    /// The classification is asked of the normalized types even when the
+    /// caller forgot, because one caller cannot remember: `validate_saved_plan`
+    /// re-derives a plan file's risks precisely because the file may have been
+    /// edited, and an editor writes whatever spelling it likes.
+    ///
+    /// Both directions are here. The alias that reads as `Incompatible` blocks
+    /// a plan that changes nothing; the omitted argument that reads as `Safe`
+    /// walks a narrowing past the gate.
+    #[test]
+    fn a_risk_is_judged_on_the_normalized_types_even_if_the_caller_forgot() {
+        for (from, to, expected) in [
+            // `character` is `character(1)`, not an unbounded string.
+            ("character(5)", "character", TypeChangeRisk::Narrowing),
+            ("char(5)", "char(10)", TypeChangeRisk::Safe),
+            // Aliases, which name the same type and change nothing.
+            ("int", "integer", TypeChangeRisk::Safe),
+            ("integer", "int", TypeChangeRisk::Safe),
+            ("numeric(10,2)", "decimal(10,2)", TypeChangeRisk::Safe),
+            // And a real narrowing that the alias spelling used to hide.
+            ("varchar(50)", "varchar(10)", TypeChangeRisk::Narrowing),
+            ("int8", "int4", TypeChangeRisk::Narrowing),
+            // A type the catalogue will not spell stays refused rather than
+            // falling through to a family. Both halves matter: an unknown base
+            // no family claims, and — the one that reads as safe if the
+            // declared value travels on — a rejected modifier on a base that
+            // every family does claim.
+            ("serial", "integer", TypeChangeRisk::Incompatible),
+            ("nonesuch", "integer", TypeChangeRisk::Incompatible),
+            // Past this engine's own precision, in the direction that looks
+            // like widening.
+            (
+                "numeric(1000)",
+                "numeric(1001)",
+                TypeChangeRisk::Incompatible,
+            ),
+            (
+                "numeric(1001)",
+                "numeric(1000)",
+                TypeChangeRisk::Incompatible,
+            ),
+            // The precision the engine takes and silently stores as 6, which
+            // is why the catalogue refuses to spell it at all.
+            ("interval(6)", "interval(7)", TypeChangeRisk::Incompatible),
+            // And a length past the engine's maximum for a string.
+            (
+                "varchar(10485760)",
+                "varchar(10485761)",
+                TypeChangeRisk::Incompatible,
+            ),
+        ] {
+            assert_eq!(
+                Postgres.type_change_risk(&ty(from), &ty(to)),
+                expected,
+                "`{from}` -> `{to}`"
+            );
+        }
+    }
+
+    /// A column the catalogue cannot spell is reported here too, where a user
+    /// is looking at the declaration — `validate` is the command that exists
+    /// to say so before anything connects.
+    #[test]
+    fn validating_a_table_reports_every_type_it_cannot_spell() {
+        let mut table = Table::default();
+        for (name, ty_) in [("a", "widget"), ("b", "timestamp(3)"), ("c", "integer")] {
+            table
+                .columns
+                .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));
+        }
+        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     fn ty(s: &str) -> ColumnType {
