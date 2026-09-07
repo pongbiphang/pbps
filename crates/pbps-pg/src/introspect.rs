@@ -99,6 +99,14 @@ pub struct RawColumn {
     /// `pg_depend` entry is `deptype = 'a'`. An identity's sequence is not
     /// here: that one is part of the column, and arrives as [`RawIdentity`].
     pub owned_sequence: Option<String>,
+    /// The sequences this column's default *uses* without owning any of them —
+    /// `DEFAULT nextval('app.s')` over a sequence somebody created separately.
+    ///
+    /// Pre-rendered as one list rather than a `Vec`, because no driver here
+    /// reads a `text[]` and the only thing it is for is the message. It is
+    /// `None` when the default uses no sequence the column does not own, which
+    /// is not the same as the column having no default.
+    pub default_sequences: Option<String>,
     /// The column's collation, when it is not the one its type carries.
     pub collation: Option<String>,
 }
@@ -497,6 +505,28 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                  shape `serial` creates. This model holds the default and has nowhere to put the \
                  sequence, so a declaration pulled from here does not create it, and a rebuild \
                  of this table can drop it before the default is applied again.",
+                parts.name, raw.name
+            ),
+        );
+    }
+
+    // The other half of that: a default that uses a sequence the column does
+    // **not** own. `pg_depend` records this one from the `pg_attrdef` row, not
+    // from the sequence to the column, so the join that finds a `serial`'s
+    // sequence cannot see it — and the difference matters more, not less: the
+    // sequence is nobody's to recreate, and `nextval` resolves its argument as
+    // a `regclass` at execution, so the table cannot even be created without
+    // it.
+    if let Some(sequences) = &raw.default_sequences {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "column `{}`.`{}` defaults from the sequence {sequences}, which it does not own. \
+                 This model holds the default and has nowhere to put the sequence, so a \
+                 declaration pulled from here creates a table whose default names an object that \
+                 is not there — and `nextval` resolves that name when the table is created, not \
+                 when a row is inserted.",
                 parts.name, raw.name
             ),
         );
@@ -1176,6 +1206,7 @@ mod tests {
             identity: None,
             generated: false,
             owned_sequence: None,
+            default_sequences: None,
             collation: None,
         }
     }
@@ -2060,6 +2091,43 @@ mod tests {
                 pulled.warnings
             );
         }
+    }
+
+    /// A default over somebody else's sequence is not a `serial`, and the
+    /// dependency that records it hangs off the default rather than the column.
+    #[test]
+    fn a_default_over_a_sequence_the_column_does_not_own_is_carried_and_named() {
+        let mut column = col(1, 1, "id", "integer");
+        column.default = Some("nextval('app.s'::regclass)".to_owned());
+        column.default_sequences = Some("`app.s`".to_owned());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![column],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        // Carried: the default is exactly what the model says. Named: the
+        // sequence it needs is not in the pull and cannot be created from it.
+        assert_eq!(
+            only(&pulled).columns["id"].default.as_deref(),
+            Some("nextval('app.s'::regclass)")
+        );
+        assert!(
+            pulled.warnings[0].contains("does not own"),
+            "{:?}",
+            pulled.warnings
+        );
+        assert!(pulled.warnings[0].contains("`app.s`"));
+
+        // The negative case: an ordinary default earns nothing.
+        let mut plain = col(1, 1, "id", "integer");
+        plain.default = Some("7".to_owned());
+        let raw = RawCatalog {
+            columns: vec![plain],
+            ..raw
+        };
+        assert!(assemble(&raw).warnings.is_empty());
     }
 
     /// A `NO INHERIT` check stops at this table; an ordinary one reaches every

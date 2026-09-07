@@ -62,6 +62,9 @@ fn tables_query() -> String {
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
         AND NOT c.relrowsecurity
         AND c.relpersistence = 'p'
+        AND c.relreplident = 'd'
+        AND NOT c.relhasrules
+        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -77,16 +80,23 @@ fn tables_query() -> String {
 fn partitioned_query() -> String {
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
-            c.relrowsecurity AS row_security, c.relpersistence::text AS persistence
+            c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
+            c.relreplident::text AS replica_identity,
+            c.relhasrules AS has_rules, am.amname AS access_method
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
       WHERE {NOT_A_PROJECTS_SCHEMA}
         AND c.relname NOT LIKE '\\_\\_pbps\\_%'
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
                       OR c.relrowsecurity
-                      OR c.relpersistence <> 'p')))
+                      OR c.relpersistence <> 'p'
+                      OR c.relreplident <> 'd'
+                      OR c.relhasrules
+                      OR c.relam <> (SELECT am.oid FROM pg_catalog.pg_am am
+                                      WHERE am.amname = 'heap'))))
       ORDER BY n.nspname, c.relname"
     )
 }
@@ -121,6 +131,19 @@ fn columns_query() -> String {
             seq.relname AS sequence_name,
             s.seqmin::int8 AS seq_min, s.seqmax::int8 AS seq_max, s.seqcycle AS seq_cycle,
             s.seqcache::int8 AS seq_cache,
+            (SELECT pg_catalog.string_agg(
+                      DISTINCT pg_catalog.format('`%I.%I`', sn.nspname, sq.relname), ', ')
+               FROM pg_catalog.pg_depend dd
+               JOIN pg_catalog.pg_class sq ON sq.oid = dd.refobjid AND sq.relkind = 'S'
+               JOIN pg_catalog.pg_namespace sn ON sn.oid = sq.relnamespace
+              WHERE dd.classid = 'pg_attrdef'::regclass
+                AND dd.objid = d.oid
+                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend od
+                                 WHERE od.classid = 'pg_class'::regclass
+                                   AND od.objid = sq.oid
+                                   AND od.refobjid = a.attrelid
+                                   AND od.refobjsubid = a.attnum
+                                   AND od.deptype IN ('i', 'a'))) AS default_sequences,
             CASE WHEN a.attcollation <> ty.typcollation
                  THEN (SELECT co.collname FROM pg_catalog.pg_collation co
                         WHERE co.oid = a.attcollation)
@@ -339,6 +362,30 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             }
             "r" if text(&row, "persistence")? == "u" => "an UNLOGGED table",
             "r" if text(&row, "persistence")? == "t" => "a temporary table",
+            // Which old-row data logical replication publishes, and whether a
+            // replicated `UPDATE` or `DELETE` is allowed at all. `d` is the
+            // default — the primary key — and is the only one the model can
+            // read back, because it is the only one that is not a choice.
+            "r" if text(&row, "replica_identity")? == "f" => {
+                "a table with `REPLICA IDENTITY FULL`, which publishes every old column"
+            }
+            "r" if text(&row, "replica_identity")? == "n" => {
+                "a table with `REPLICA IDENTITY NOTHING`, which no replicated `UPDATE` or \
+                 `DELETE` may touch"
+            }
+            "r" if text(&row, "replica_identity")? == "i" => {
+                "a table whose `REPLICA IDENTITY` is a named index rather than its primary key"
+            }
+            // A `DO INSTEAD` rule decides what an `INSERT` on this table
+            // actually does — including nothing at all.
+            "r" if flag(&row, "has_rules")? => {
+                "a table with rewrite rules, which decide what a write to it does"
+            }
+            // Not heap: how the rows are stored, and what the table can do
+            // with them. The model has one kind of table.
+            "r" if optional_text(&row, "access_method")?.as_deref() != Some("heap") => {
+                "a table on a table access method other than `heap`"
+            }
             "r" => "a table that inherits from another",
             other => &format!("a relation of kind `{other}`"),
         };
@@ -394,6 +441,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             identity,
             generated: first_char(&text(&row, "generated")?).is_some(),
             owned_sequence,
+            default_sequences: optional_text(&row, "default_sequences")?,
             collation: optional_text(&row, "collation")?,
         });
     }

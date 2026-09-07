@@ -1437,6 +1437,12 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE {s}.unenforced (
                  id integer, CONSTRAINT unenforced_ck CHECK (id > 0) NOT ENFORCED);
+             CREATE SEQUENCE {s}.loose;
+             CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
+             CREATE TABLE {s}.published (id integer PRIMARY KEY);
+             ALTER TABLE {s}.published REPLICA IDENTITY FULL;
+             CREATE TABLE {s}.rewritten (id integer);
+             CREATE RULE rewritten_swallows AS ON INSERT TO {s}.rewritten DO INSTEAD NOTHING;
              CREATE TABLE {s}.stops (
                  id integer, CONSTRAINT stops_ck CHECK (id > 0) NO INHERIT);
              -- The referenced table's own standalone unique index, which the
@@ -1530,6 +1536,12 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "constraint `unenforced_ck` on",
         // A check that reaches this table's rows and no child's.
         "`stops_ck` on",
+        // A default over a sequence nobody in the pull owns.
+        "which it does not own",
+        // A table whose old rows reach logical replication differently.
+        "REPLICA IDENTITY FULL",
+        // A table where an `INSERT` does whatever a rule says instead.
+        "rewrite rules",
         // A key constraint whose index covers more than its key.
         "INCLUDE",
         // The sequence a `serial` owns and this model cannot hold.
@@ -1694,6 +1706,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         [
             // The inheritance parent is an ordinary table and stays.
             pbps_model::TableName::new(&s, "ancestor"),
+            pbps_model::TableName::new(&s, "borrowing"),
             pbps_model::TableName::new(&s, "bounded"),
             pbps_model::TableName::new(&s, "cached"),
             pbps_model::TableName::new(&s, "collated"),
@@ -1738,6 +1751,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "descendant"),
             pbps_model::TableName::new(&s, "guarded"),
             pbps_model::TableName::new(&s, "parted"),
+            pbps_model::TableName::new(&s, "published"),
+            pbps_model::TableName::new(&s, "rewritten"),
             pbps_model::TableName::new(&s, "volatile_"),
         ],
         "a limitation about a table that is in the pull must name it, and the \
