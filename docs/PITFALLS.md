@@ -836,8 +836,11 @@ Three now, and the third is the shape at its most flattering: a comment that
   silently stores as 6 — which is the round trip the catalogue refuses the
   declaration for. The unit test that was meant to pin the claim asked it only
   of `serial` and `nonesuch`, both unknown bases, so it passed on the half that
-  was true. The same fallback is in the shipped SQL Server dialect, where
-  `decimal(38,0) -> decimal(39,0)` reads `Safe` past a maximum precision of 38.
+  was true. The same fallback was in the shipped SQL Server dialect, and stayed
+  there after the PostgreSQL half was fixed, because the finding was written
+  about the file it was found in and closing it there read as closing it:
+  `decimal(38,0) -> decimal(39,0)` and `varchar(8000) -> varchar(9000)` read
+  `Safe` past a maximum precision of 38 and a maximum length of 8000 (#160).
 
 A comment stating a rule reads, to the next person and to the reviewer skimming
 for one, as a rule that is applied. **When a comment names a limit or a
