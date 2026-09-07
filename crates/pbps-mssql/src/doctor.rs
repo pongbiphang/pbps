@@ -732,9 +732,14 @@ impl Columns<'_> {
         match self {
             // The column list is `sys.columns`, joined in the server.
             Self::Catalog => 0,
-            // Three per column: the object's two parts again, so the list can
-            // be matched back to the object it belongs to, and the name.
-            Self::Declared(declared) => 3 * declared.get(object).map_or(0, |columns| columns.len()),
+            // One per column: the name. What ties the column to its object is
+            // the object's **position in this statement**, written as a
+            // literal on both sides, so the two parts of the name are bound
+            // once however wide the table is. Bound per column instead, at
+            // three slots each, a table of 698 columns alone crossed
+            // `MAX_PARAMETERS` — a table SQL Server takes without complaint,
+            // and `doctor` would have failed the whole permission read on it.
+            Self::Declared(declared) => declared.get(object).map_or(0, Vec::len),
         }
     }
 }
@@ -774,10 +779,10 @@ fn object_permissions_sql<'a>(
         ));
     }
     let mut object_slots = Vec::new();
-    for o in objects {
+    for (i, o) in objects.iter().enumerate() {
         params.push(Param::from(o.schema.as_str()));
         params.push(Param::from(o.name.as_str()));
-        object_slots.push(format!("(@P{}, @P{})", params.len() - 1, params.len()));
+        object_slots.push(format!("(@P{}, @P{}, {i})", params.len() - 1, params.len()));
     }
     let (any_column, ungranted_column) = match columns {
         Columns::Catalog => (
@@ -788,17 +793,15 @@ fn object_permissions_sql<'a>(
         ),
         Columns::Declared(declared) => {
             let mut column_slots = Vec::new();
-            for o in objects {
+            for (i, o) in objects.iter().enumerate() {
                 for column in declared.get(o).map_or(&[][..], Vec::as_slice) {
-                    params.push(Param::from(o.schema.as_str()));
-                    params.push(Param::from(o.name.as_str()));
                     params.push(Param::from(column.as_str()));
-                    column_slots.push(format!(
-                        "(@P{}, @P{}, @P{})",
-                        params.len() - 2,
-                        params.len() - 1,
-                        params.len()
-                    ));
+                    // The object is named by its position in this statement,
+                    // a literal on both sides. Binding its two parts again
+                    // per column is what a table of a few hundred columns
+                    // cannot afford; a position costs nothing and cannot be
+                    // spelled wrongly.
+                    column_slots.push(format!("({i}, @P{})", params.len()));
                 }
             }
             // `VALUES ()` is not T-SQL, and a chunk whose objects declare no
@@ -810,12 +813,12 @@ fn object_permissions_sql<'a>(
                 // The same `@P` names in both predicates. A parameter may be
                 // read as often as the statement likes, so spelling the list
                 // twice costs no second binding — which is what keeps a wide
-                // table at three slots per column rather than six.
-                let list = format!("(VALUES {}) AS c(s, n, col)", column_slots.join(", "));
+                // table at one slot per column rather than two.
+                let list = format!("(VALUES {}) AS c(i, col)", column_slots.join(", "));
                 (
-                    format!("EXISTS (SELECT 1 FROM {list} WHERE c.s = o.s AND c.n = o.n)"),
+                    format!("EXISTS (SELECT 1 FROM {list} WHERE c.i = o.i)"),
                     format!(
-                        "EXISTS (SELECT 1 FROM {list} WHERE c.s = o.s AND c.n = o.n \
+                        "EXISTS (SELECT 1 FROM {list} WHERE c.i = o.i \
                          AND HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0)"
                     ),
                 )
@@ -833,7 +836,7 @@ fn object_permissions_sql<'a>(
               WHEN {ungranted_column} THEN 0 \
               WHEN {any_column} THEN 1 \
               ELSE 0 END AS held \
-         FROM (VALUES {}) AS o(s, n) \
+         FROM (VALUES {}) AS o(s, n, i) \
          CROSS APPLY (VALUES (QUOTENAME(o.s) + N'.' + QUOTENAME(o.n))) AS x(q) \
          CROSS JOIN (VALUES {}) AS p(n, col){filter};",
         object_slots.join(", "),
@@ -861,9 +864,16 @@ const MAX_PARAMETERS: usize = 2098;
 /// and `doctor` reported an estate it could have checked as unreadable.
 ///
 /// Packed rather than divided, because an object no longer costs a fixed two
-/// slots — under [`Columns::Declared`] it costs three more per declared row
+/// slots — under [`Columns::Declared`] it costs one more per declared row
 /// column, so one wide table can be worth a hundred narrow ones and a fixed
 /// chunk size would be sized for either the widest table or none of them.
+///
+/// No single object can exceed the budget on its own, and that is a property
+/// of the slot cost rather than of this loop: SQL Server takes 1,024 columns
+/// in a table, so the widest one it can hold costs 1,025 slots against 2,095.
+/// The "asked alone" branch below is what happens if that ever stops being
+/// true — a statement the server refuses, loudly, rather than an object
+/// dropped from the answer, which would read as ready.
 fn object_statements<'a>(
     objects: &'a [ObjectName],
     perms: usize,
@@ -1629,11 +1639,11 @@ mod tests {
                 "{sql}"
             );
             assert!(!sql.contains("HAS_PERMS_BY_NAME(o.n"), "{sql}");
-            assert!(sql.contains("AS o(s, n)"), "{sql}");
+            assert!(sql.contains("AS o(s, n, i)"), "{sql}");
             // One permission, then two slots per object: the parts, never
             // the joined name.
             assert_eq!(params.len(), 1 + 2 * objects.len(), "{sql}");
-            assert!(sql.contains("(@P2, @P3), (@P4, @P5)"), "{sql}");
+            assert!(sql.contains("(@P2, @P3, 0), (@P4, @P5, 1)"), "{sql}");
             assert_eq!(
                 sql.contains("WHERE OBJECT_ID(x.q, N'U') IS NOT NULL"),
                 existing == Existing::Only,
@@ -1697,18 +1707,18 @@ mod tests {
             Existing::Only,
             Columns::Declared(&declared),
         );
-        assert_eq!(params.len(), 1 + 2 * 2 + 3 * 2, "{sql}");
-        assert!(sql.contains("AS c(s, n, col)"), "{sql}");
+        // One slot a column, and the object's two parts bound once each.
+        assert_eq!(params.len(), 1 + 2 * 2 + 2, "{sql}");
+        assert!(sql.contains("AS c(i, col)"), "{sql}");
         assert!(
             sql.contains("HAS_PERMS_BY_NAME(x.q, 'OBJECT', p.n, c.col, 'COLUMN') = 0"),
             "{sql}"
         );
+        // The object is named by its position, a literal on both sides.
+        assert!(sql.contains("(@P2, @P3, 0), (@P4, @P5, 1)"), "{sql}");
         // Twice in the statement, and the same slots both times.
-        assert_eq!(
-            sql.matches("(@P6, @P7, @P8), (@P9, @P10, @P11)").count(),
-            2,
-            "{sql}"
-        );
+        assert_eq!(sql.matches("(0, @P6), (0, @P7)").count(), 2, "{sql}");
+        assert_eq!(sql.matches("WHERE c.i = o.i").count(), 2, "{sql}");
         // Nothing declared at all leaves the object answer standing rather
         // than an empty `VALUES`, which is not T-SQL.
         let empty: BTreeMap<ObjectName, Vec<String>> = BTreeMap::new();
@@ -1718,7 +1728,7 @@ mod tests {
             Existing::Only,
             Columns::Declared(&empty),
         );
-        assert!(!sql.contains("AS c(s, n, col)"), "{sql}");
+        assert!(!sql.contains("AS c(i, col)"), "{sql}");
         assert!(sql.contains("WHEN 1 = 0 THEN"), "{sql}");
         assert_eq!(params.len(), 1 + 2 * 2, "{sql}");
     }
@@ -1766,21 +1776,36 @@ mod tests {
     #[test]
     fn declared_columns_are_counted_into_the_parameter_limit() {
         let perms = ["INSERT", "UPDATE", "DELETE"];
+        // The widest table SQL Server will hold is 1,024 columns, so 1,023 is
+        // the most an `UPDATE` could ever have to be held on. It has to fit
+        // one statement *by itself*: bound at three slots a column, a table
+        // of 698 crossed the limit, and `doctor` failed the whole permission
+        // read on a table the engine takes without complaint.
+        let widest: Vec<String> = (0..1_023).map(|i| format!("c{i}")).collect();
+        let one = [ObjectName::new("app", "wide")];
+        let declared: BTreeMap<ObjectName, Vec<String>> =
+            [(one[0].clone(), widest)].into_iter().collect();
+        let columns = Columns::Declared(&declared);
+        assert_eq!(object_statements(&one, perms.len(), columns).len(), 1);
+        let (_, params) = object_permissions_sql(&one, &perms, Existing::Only, columns);
+        assert!(params.len() <= MAX_PARAMETERS, "{} params", params.len());
+
+        // Across objects the packing still bites, and it is the columns that
+        // decide it: the same forty tables fit one statement when the column
+        // list comes from the catalog.
         let wide: Vec<String> = (0..100).map(|i| format!("c{i}")).collect();
-        let objects: Vec<ObjectName> = (0..20)
+        let objects: Vec<ObjectName> = (0..40)
             .map(|i| ObjectName::new("app", format!("t{i}")))
             .collect();
         let declared: BTreeMap<ObjectName, Vec<String>> =
             objects.iter().map(|o| (o.clone(), wide.clone())).collect();
         let columns = Columns::Declared(&declared);
         let chunks = object_statements(&objects, perms.len(), columns);
-        // Twenty tables, well under the count that fills a statement on the
-        // object slots alone, and still more than one statement.
         assert!(chunks.len() > 1, "{} chunks", chunks.len());
         assert_eq!(
             object_statements(&objects, perms.len(), Columns::Catalog).len(),
             1,
-            "the same twenty objects fit one statement when the columns come \
+            "the same forty objects fit one statement when the columns come \
              from the catalog"
         );
         let mut seen = 0;
@@ -1790,12 +1815,12 @@ mod tests {
             seen += chunk.len();
         }
         assert_eq!(seen, objects.len(), "every table is in exactly one chunk");
-        // A table wider than one statement can hold is asked alone and fails
-        // on the server, rather than being dropped — a dropped table reads
-        // as ready.
+        // A declaration wider than any table the engine would create is asked
+        // alone and fails loudly on the server, rather than being dropped —
+        // a dropped table reads as ready.
         let huge: BTreeMap<ObjectName, Vec<String>> = [(
             objects[0].clone(),
-            (0..2_000).map(|i| format!("c{i}")).collect(),
+            (0..4_000).map(|i| format!("c{i}")).collect(),
         )]
         .into_iter()
         .collect();
