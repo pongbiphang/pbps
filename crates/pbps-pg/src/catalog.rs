@@ -123,6 +123,14 @@ fn not_an_extensions(oid: &str, class: &str) -> String {
         .replace("%CLASS%", &format!("'pg_catalog.{class}'"))
 }
 
+/// Which `pg_proc` rows are modules this model holds.
+///
+/// One spelling, used by both the module query and the argument query, and the
+/// reason is not tidiness: a routine whose row the first query returns and the
+/// second does not is keyed as `f()` — a different object from `f(integer)`,
+/// under a name that looks right. One rule, one home (PITFALLS).
+const ROUTINE_IS_A_MODULE: &str = "p.prokind IN ('f', 'p')";
+
 /// Views, functions, procedures and triggers, each with the text this engine
 /// deparses for it (ADR-0009 §2).
 ///
@@ -155,7 +163,7 @@ fn modules_query() -> String {
                 pg_catalog.pg_get_functiondef(p.oid)
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-          WHERE p.prokind IN ('f', 'p')
+          WHERE {ROUTINE_IS_A_MODULE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {proc_not_extension}
           UNION ALL
@@ -185,7 +193,7 @@ fn module_args_query() -> String {
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
       CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes)
                     WITH ORDINALITY AS u(ty, pos)
-          WHERE p.prokind IN ('f', 'p')
+          WHERE {ROUTINE_IS_A_MODULE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {proc_not_extension}
           ORDER BY 1, 2"
@@ -1022,6 +1030,27 @@ mod tests {
     /// between them: `validate_table` refuses a declaration naming one of these
     /// tables because the reader hides it, so a name added to one and not the
     /// other is a table that is created and then never seen again.
+    /// The module query and the argument query have to agree about which
+    /// `pg_proc` rows are modules, and the failure if they do not is silent:
+    /// a routine the first returns and the second does not is keyed `f()`,
+    /// which is a different object from `f(integer)` under a name that looks
+    /// right.
+    #[test]
+    fn a_routine_and_its_arguments_are_selected_by_one_predicate() {
+        for query in [modules_query(), module_args_query()] {
+            assert!(query.contains(ROUTINE_IS_A_MODULE), "{query}");
+            // And no second one: a query that filtered `prokind` twice could
+            // satisfy the line above and still disagree with the other query.
+            // The `prokind` the module query *selects* is not a filter.
+            assert_eq!(query.matches("prokind IN").count(), 1, "{query}");
+        }
+        // The extension filter is the other half of "the same rows", and it is
+        // built by one function for both.
+        for query in [modules_query(), module_args_query()] {
+            assert!(query.contains("d.deptype = 'e'"), "{query}");
+        }
+    }
+
     #[test]
     fn the_filter_hides_exactly_the_names_the_validation_refuses() {
         for name in OURS {
