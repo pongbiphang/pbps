@@ -299,6 +299,12 @@ it back is refused for ever (DECISIONS 266). The rest of the other dialect's
 key-column checks are absent here and are issue #175 — they fail at the server,
 which is late but not silent.
 
+`CREATE TABLE` names `USING heap` rather than leaving the access method to
+`default_table_access_method`: the reader accepts only heap, so a table created
+under another method is created successfully and then unreadable as a managed
+one. It is a clause and not a session pin because a clause survives the rendered
+`--sql` script, which carries no framing (DECISIONS 272).
+
 The live suite runs the three shapes issue #79 named — a created table with a
 foreign key, a table already there gaining a column, a key, a unique, an index
 and a foreign key, and a bootstrap whose next plan must be empty — each as

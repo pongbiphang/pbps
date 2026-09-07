@@ -4900,3 +4900,36 @@ SPEC is in sync with all of these.
     issue #180 — because emitting a drop-and-re-add for an unchanged default
     would put two lines in every plan that widens a defaulted column, on both
     engines, for one engine's constraint model.
+272. **`CREATE TABLE` names its access method, and does so in the statement.**
+    The reader accepts a table only when `relam` is heap (`catalog.rs`), which
+    is deliberate — everything below the model, from column storage to the way
+    a page is read, is heap's. An unqualified `CREATE TABLE` takes its method
+    from `default_table_access_method`, so under a role whose setting names
+    another installed method the table is created *successfully* and then reads
+    back as an unsupported object: absent from the pulled schema, planned again
+    as a `CREATE` the engine refuses for already existing, and the deployment
+    cannot converge. The apply reported success and the recording says the
+    table is as declared.
+
+    **In the statement, not in the transaction framing** beside the session
+    pins of DECISIONS 267, and the difference is the point: those settings
+    cannot be said in the statement they affect — there is no way to spell
+    `DateStyle` inside a check constraint — while this one can. A clause cannot
+    be answered differently by a session, on any path, including the rendered
+    `--sql` script an operator runs through `psql` with no framing around it
+    (issue #174). Where both are available, the one that cannot be defeated is
+    the one to write.
+
+    `default_tablespace` is the same kind of setting and is deliberately left
+    alone: the reader does not filter on it, nothing in the model speaks about
+    where a table's storage lives, and a plan that neither declares nor records
+    it has nothing to be wrong about. There is no equivalent for indexes —
+    measured, `default_table_access_method` is the only such setting on 18.6,
+    and an index's method comes from its own `USING` with `btree` as the
+    grammar's default rather than a session's.
+
+    **The divergence itself is not measured, and that is stated rather than
+    hidden.** The pinned image ships exactly one table access method, so there
+    is no second one to create a divergent table with. Both halves are
+    measured — the setting exists and is validated against the installed
+    methods, and `USING heap` fixes `relam` — and the reader's rule is code.

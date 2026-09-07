@@ -2217,6 +2217,21 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
     let pulled = pull(&mut conn).await;
     let ours = ours_only(&pulled, &s);
     let limitations = ours_limitations(&pulled, &s);
+    // The property behind the `USING heap` this emitter writes: the reader
+    // accepts a table only when its access method is heap, so a table created
+    // under any other one is created successfully and then read back as an
+    // unsupported object. The clause says it in the statement, where no
+    // session and no rendered script can answer differently.
+    let methods = text(
+        &mut conn,
+        &format!(
+            "SELECT string_agg(DISTINCT am.amname, ',') FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_am am ON am.oid = c.relam \
+             WHERE n.nspname = '{s}' AND c.relkind = 'r'"
+        ),
+    )
+    .await;
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
@@ -2226,6 +2241,7 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
         "what this emitter writes must read back whole: {limitations:?}"
     );
     assert_eq!(ours, normalized(&declared));
+    assert_eq!(methods, "heap");
 }
 
 /// Issue #79's third named live test: a bootstrap, and the plan straight after

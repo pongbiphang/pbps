@@ -865,10 +865,32 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         body.push(primary_key_clause(pk)?);
     }
 
+    // `USING heap` is written out, not left to `default_table_access_method`.
+    // The reader accepts a table only when `relam` is heap (`catalog.rs`), so a
+    // table created under a role whose setting names another installed method
+    // is created *successfully* and then read back as an unsupported object:
+    // absent from the pulled schema, planned as a `CREATE` that the engine
+    // refuses for already existing, and the deployment cannot converge. The
+    // apply reports success and the recording says the table is as declared.
+    //
+    // In the statement rather than in the transaction framing beside the other
+    // session pins (DECISIONS 267), because this one *can* be said in the
+    // statement: a clause cannot be defeated by any session, on any path,
+    // including the rendered `--sql` script an operator runs through `psql`
+    // outside the framing (issue #174). A pin would leave that path open.
+    //
+    // Not measured end to end, and the reason is worth the line: the pinned
+    // image ships exactly one table access method, so there is no second one
+    // to create a divergent table with. What is measured is each half — the
+    // setting exists and is validated against the installed methods, and
+    // `USING heap` fixes `relam` — and the reader's rule is code, not a guess.
     let mut out = vec![on(
         pg,
         name,
-        &format!("CREATE TABLE {q} (\n    {}\n);", body.join(",\n    ")),
+        &format!(
+            "CREATE TABLE {q} (\n    {}\n) USING heap;",
+            body.join(",\n    ")
+        ),
     )?];
 
     for (n, u) in &table.unique {
@@ -1041,6 +1063,41 @@ mod tests {
             vec![
                 "SET search_path = \"app\";\n\
                  ALTER TABLE \"app\".\"t\" ALTER COLUMN \"at\" TYPE character varying(20);\n\
+                 RESET search_path;"
+            ]
+        );
+    }
+
+    /// The access method is in the statement, not left to the session.
+    ///
+    /// The reader accepts `relam = heap` and nothing else, so a table created
+    /// under a role whose `default_table_access_method` names another installed
+    /// method succeeds and then reads back as an unsupported object — absent
+    /// from the pulled schema, planned again as a `CREATE` the engine refuses
+    /// for already existing. A clause cannot be answered differently by a
+    /// session, which a framing pin could be on the one path that has no
+    /// framing: the rendered `--sql` script.
+    #[test]
+    fn a_created_table_names_the_access_method_it_will_be_read_back_under() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        let sql = sql_of(
+            &Postgres::new(),
+            &Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: name("app", "t"),
+                table: Box::new(table),
+            },
+        );
+        assert_eq!(
+            sql,
+            vec![
+                "SET search_path = \"app\";\n\
+                 CREATE TABLE \"app\".\"t\" (\n\
+                 \x20   \"id\" integer NOT NULL\n\
+                 ) USING heap;\n\
                  RESET search_path;"
             ]
         );
