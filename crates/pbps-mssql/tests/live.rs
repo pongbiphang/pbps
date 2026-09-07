@@ -7182,3 +7182,117 @@ async fn a_retyped_column_gives_up_its_old_default_before_the_type_moves() {
     assert_eq!(refused, Ok(()), "the plan has to apply");
     assert_eq!(state.schema, normalized(&b));
 }
+
+/// A declared expression ending in a line comment reaches the engine with the
+/// emitter's own syntax intact.
+///
+/// The declaration is valid — measured, SQL Server accepts every one of these
+/// with its closer on the next line and refuses it on the same one — so
+/// without the newline this is a valid plan the tool cannot apply, and the
+/// refusal arrives from the server at `apply` rather than from the gate.
+///
+/// What is pinned is that all three expressions arrived and none of them took
+/// the syntax behind it away. It cannot be pinned by reading the comments back:
+/// the engine stores the parsed expression, so `DEFAULT (0 -- why)` comes back
+/// as `((0))` with the comment gone. Only running the statements shows this.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_expression_ending_in_a_line_comment_still_applies() {
+    let mut t = Table::default();
+    t.columns
+        .insert("id".into(), Column::new(ty("int")).not_null());
+    let mut status = Column::new(ty("tinyint")).not_null();
+    status.default = Some("0 -- the default status".into());
+    t.columns.insert("status".into(), status);
+    t.columns
+        .insert("amount".into(), Column::new(ty("int")).not_null());
+    t.primary_key = Some(PrimaryKey {
+        name: Some("pk_commented".into()),
+        columns: vec!["id".into()],
+    });
+    t.checks.insert(
+        "ck_commented_amount".into(),
+        pbps_model::CheckConstraint {
+            expression: "[amount]>=(0) -- never negative".into(),
+        },
+    );
+    t.indexes.insert(
+        "ix_commented_status".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "status".into(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: Some("[status] IS NOT NULL -- only the set ones".into()),
+        },
+    );
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert(TableName::new("dbo", "commented"), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    // And the same expressions through the sites a *later* plan uses: a
+    // default added on its own, and a check added on its own.
+    let mut later = declared.clone();
+    let table = later
+        .tables
+        .get_mut(&TableName::new("dbo", "commented"))
+        .expect("table");
+    table.columns.get_mut("amount").expect("column").default =
+        Some("1 -- and this one is added later".into());
+    table.checks.insert(
+        "ck_commented_status".into(),
+        pbps_model::CheckConstraint {
+            expression: "[status]>=(0) -- added later too".into(),
+        },
+    );
+    let ids_later = mint_ids(&later, &ids, &[]);
+
+    let mut db = TestDb::create("commented").await;
+    let bootstrap = try_apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+    let added = try_apply(&mut db.conn, &plan(&declared, &ids, &later, &ids_later)).await;
+    let state = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    assert_eq!(bootstrap, Ok(()), "the bootstrap has to apply");
+    assert_eq!(added, Ok(()), "the later plan has to apply");
+    // The engine keeps none of the comments, so what came back is the parsed
+    // expression — three of them, which is the point: each arrived whole.
+    let pulled = state
+        .schema
+        .tables
+        .get(&TableName::new("dbo", "commented"))
+        .expect("the table was created");
+    assert_eq!(
+        pulled.columns["status"].default.as_deref(),
+        Some("0"),
+        "the column default arrived"
+    );
+    assert_eq!(
+        pulled.columns["amount"].default.as_deref(),
+        Some("1"),
+        "the default added later arrived"
+    );
+    assert_eq!(
+        pulled.checks["ck_commented_amount"].expression, "[amount]>=(0)",
+        "the check arrived"
+    );
+    assert_eq!(
+        pulled.checks["ck_commented_status"].expression, "[status]>=(0)",
+        "the check added later arrived"
+    );
+    assert_eq!(
+        pulled.indexes["ix_commented_status"].filter.as_deref(),
+        Some("[status] IS NOT NULL"),
+        "the index filter arrived"
+    );
+}

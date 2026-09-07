@@ -461,6 +461,16 @@ per site, because each site spelled the interpolation itself. The fix is one
 newline, in one helper the five sites call, so the sixth has somewhere to reach
 for (DECISIONS 281).
 
+**The SQL Server emitter had it too, and it was found by looking rather than
+by an apply.** The same three expressions, the same syntax behind them —
+`) FOR [column];` after a default that is altered, `,` after one in a column
+list, `);` after a check, `);` and any `ONLINE` clause after an index filter.
+Measured on SQL Server 2025, `CREATE TABLE dbo.t (n int, CONSTRAINT ck CHECK (n
+> 0 -- reason));` is `Incorrect syntax near '0'.` and the same text with the
+closer on the next line is accepted. Two dialects wrote the same defect
+independently, which is what "the emitter's syntax goes on its own line" being
+a helper rather than a habit is for.
+
 **And the guard that reads such text needs the same question asked of both
 ends.** The bare-literal guard was taught that a comment is whitespace, then
 that the grouping unwrap must step over data — and the gap between those two

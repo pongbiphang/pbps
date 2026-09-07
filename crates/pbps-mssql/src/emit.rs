@@ -446,8 +446,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             }
             if let Some(expr) = to {
                 sql.push_str(&format!(
-                    "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT ({expr}) FOR {};",
+                    "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT ({}) FOR {};",
                     quote(&default_constraint_name(&column.table, &column.name))?,
+                    verbatim(expr),
                     quote(&column.name)?
                 ));
             }
@@ -512,7 +513,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
             qualified(table)?,
             quote(name)?,
-            constraint.expression
+            verbatim(&constraint.expression)
         )),
 
         // No ONLINE clause on any of the three, for two different reasons. A
@@ -1223,6 +1224,32 @@ fn null_clause(nullable: bool) -> &'static str {
     if nullable { "NULL" } else { "NOT NULL" }
 }
 
+/// A declared expression, followed by the newline that closes any comment in
+/// it.
+///
+/// This dialect writes three things verbatim — a column default, a check
+/// expression, an index filter (ADR-0013 §3) — and its own syntax follows them
+/// on the same line. A line comment at the end of the user's text then takes
+/// that syntax away. **Measured** on SQL Server 2025, where the declaration is
+/// valid and only the emitted statement is not:
+///
+/// ```text
+/// CREATE TABLE dbo.t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+///   -> Incorrect syntax near '0'.
+/// CREATE TABLE dbo.t (a int CONSTRAINT df DEFAULT (1 -- why), b int);
+///   -> Incorrect syntax near '1'.
+/// CREATE TABLE dbo.t (a int CONSTRAINT df DEFAULT (1 -- why ⏎ ), b int);
+///   -> accepted
+/// ```
+///
+/// The same fix the PostgreSQL emitter took, for the same reason, and it lives
+/// in one helper rather than at each site so that the next site has somewhere
+/// to reach for (DECISIONS 281). A carriage return would end the comment too,
+/// but that direction needs no thought here: the newline is the emitter's own.
+fn verbatim(expression: &str) -> String {
+    format!("{expression}\n")
+}
+
 fn column_list(columns: &[String]) -> Result<String, DialectError> {
     Ok(columns
         .iter()
@@ -1245,8 +1272,9 @@ fn column_definition(
     s.push_str(null_clause(column.nullable));
     if let Some(expr) = &column.default {
         s.push_str(&format!(
-            " CONSTRAINT {} DEFAULT ({expr})",
-            quote(&default_constraint_name(table, name))?
+            " CONSTRAINT {} DEFAULT ({})",
+            quote(&default_constraint_name(table, name))?,
+            verbatim(expr)
         ));
     }
     Ok(s)
@@ -1327,7 +1355,7 @@ fn create_index(
         s.push_str(&format!(" INCLUDE ({})", column_list(&index.include)?));
     }
     if let Some(filter) = &index.filter {
-        s.push_str(&format!(" WHERE ({filter})"));
+        s.push_str(&format!(" WHERE ({})", verbatim(filter)));
     }
     s.push_str(online(strategy));
     s.push(';');
@@ -1369,7 +1397,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         out.push(Statement::new(format!(
             "ALTER TABLE {qualified_name} ADD CONSTRAINT {} CHECK ({});",
             quote(n)?,
-            c.expression
+            verbatim(&c.expression)
         )));
     }
     for (n, fk) in &table.foreign_keys {
@@ -1564,7 +1592,7 @@ mod tests {
         });
         assert!(sql[0].contains("[id] bigint IDENTITY(1,1) NOT NULL"));
         assert!(
-            sql[0].contains("[status] tinyint NOT NULL CONSTRAINT [DF_t_status] DEFAULT (0)"),
+            sql[0].contains("[status] tinyint NOT NULL CONSTRAINT [DF_t_status] DEFAULT (0\n)"),
             "{}",
             sql[0]
         );
@@ -1755,7 +1783,7 @@ mod tests {
             name: table.clone(),
             table: Box::new(t),
         });
-        assert!(created[0].contains(&format!("CONSTRAINT [{name}] DEFAULT (0)")));
+        assert!(created[0].contains(&format!("CONSTRAINT [{name}] DEFAULT (0\n)")));
 
         let altered = sql_of(&Change::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
@@ -1764,7 +1792,7 @@ mod tests {
             to: Some("1".into()),
         });
         assert!(
-            altered[0].contains(&format!("ADD CONSTRAINT [{name}] DEFAULT (1) FOR")),
+            altered[0].contains(&format!("ADD CONSTRAINT [{name}] DEFAULT (1\n) FOR")),
             "{}",
             altered[0]
         );
@@ -1877,7 +1905,7 @@ mod tests {
             to: Some("1".into()),
         });
         assert!(sql[0].contains("sys.default_constraints"));
-        assert!(sql[0].contains("ADD CONSTRAINT [DF_t_status] DEFAULT (1) FOR [status]"));
+        assert!(sql[0].contains("ADD CONSTRAINT [DF_t_status] DEFAULT (1\n) FOR [status]"));
 
         let add_only = sql_of(&Change::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
@@ -1928,6 +1956,92 @@ mod tests {
         assert_eq!(named, ["ALTER TABLE [dbo].[t] DROP CONSTRAINT [pk_t];"]);
     }
 
+    /// Every site that writes a declared expression puts the emitter's own
+    /// syntax on the next line, so a trailing line comment cannot swallow it.
+    /// The declaration is valid — the engine takes the same expression with its
+    /// closer on the next line — so without the newline a valid plan produces a
+    /// statement that cannot run.
+    #[test]
+    fn a_line_comment_at_the_end_of_an_expression_keeps_the_syntax_behind_it() {
+        // A column default, in a column list: `,` or `)` follows it.
+        let mut status = Column::new(ty("tinyint")).not_null();
+        status.default = Some("0 -- why".into());
+        let mut t = Table::default();
+        t.columns.insert("status".into(), status);
+        t.checks.insert(
+            "ck_positive".into(),
+            CheckConstraint {
+                expression: "amount > 0 -- reason".into(),
+            },
+        );
+        let created = sql_of(&Change::CreateTable {
+            uid: uid("t_k7x2mq"),
+            name: tname("dbo.t"),
+            table: Box::new(t),
+        });
+        assert!(
+            created[0].contains("DEFAULT (0 -- why\n)"),
+            "{}",
+            created[0]
+        );
+        // And a check written in the same `CREATE TABLE`, which is emitted as a
+        // statement of its own.
+        assert!(
+            created
+                .iter()
+                .any(|s| s.contains("CHECK (amount > 0 -- reason\n);")),
+            "{created:?}"
+        );
+
+        // A default added on its own: `) FOR [column];` follows it.
+        let altered = sql_of(&Change::AlterColumnDefault {
+            uid: uid("c_k7x2mq"),
+            column: cref("dbo.t.status"),
+            from: None,
+            to: Some("1 -- why".into()),
+        });
+        assert!(
+            altered[0].contains("DEFAULT (1 -- why\n) FOR [status];"),
+            "{}",
+            altered[0]
+        );
+
+        // A check added on its own.
+        let check = sql_of(&Change::AddCheck {
+            table: tname("dbo.t"),
+            name: "ck_positive".into(),
+            constraint: CheckConstraint {
+                expression: "amount > 0 -- reason".into(),
+            },
+        });
+        assert_eq!(
+            check,
+            ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [ck_positive] CHECK (amount > 0 -- reason\n);"]
+        );
+
+        // An index filter, which has both the closing parenthesis and whatever
+        // `ONLINE` clause the strategy asks for behind it.
+        let index = sql_of(&Change::AddIndex {
+            table: tname("dbo.t"),
+            name: "ix_t_a".into(),
+            index: Box::new(Index {
+                columns: vec![IndexColumn {
+                    name: "a".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: Some("a IS NOT NULL -- only the live ones".into()),
+            }),
+        });
+        assert_eq!(
+            index,
+            [
+                "CREATE INDEX [ix_t_a] ON [dbo].[t] ([a] ASC) WHERE (a IS NOT NULL -- only the live ones\n);"
+            ]
+        );
+    }
+
     #[test]
     fn indexes_render_direction_include_and_filter() {
         let sql = sql_of(&Change::AddIndex {
@@ -1952,7 +2066,7 @@ mod tests {
         assert_eq!(
             sql,
             [
-                "CREATE UNIQUE INDEX [ix_t_a] ON [dbo].[t] ([a] ASC, [b] DESC) INCLUDE ([c]) WHERE (a IS NOT NULL);"
+                "CREATE UNIQUE INDEX [ix_t_a] ON [dbo].[t] ([a] ASC, [b] DESC) INCLUDE ([c]) WHERE (a IS NOT NULL\n);"
             ]
         );
     }
@@ -1968,7 +2082,7 @@ mod tests {
         });
         assert_eq!(
             sql,
-            ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [ck_positive] CHECK (amount > 0);"]
+            ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [ck_positive] CHECK (amount > 0\n);"]
         );
     }
 
