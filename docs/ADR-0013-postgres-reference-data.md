@@ -1028,9 +1028,13 @@ reads deterministic would have made them depend on the declarations.
   qualify every name, which is the spelling a snapshot should hold. `pg_catalog`
   stays reachable with an empty path (measured: the catalog query answers), so
   introspection itself is unaffected.
-- **Writes use a path built per statement: the object's own schema first, then
-  the project's configured extras — and the path each module was created under
-  is recorded with it.** The extras are ordered, so their order is part of what
+- **Writes use a path built per statement: the object's own schema first among
+  the schemas the path names, then the project's configured extras — and the
+  path each module was created under is recorded with it.** `pg_catalog` is
+  ahead of all of them, because PostgreSQL searches it implicitly wherever a
+  path does not name it, and it is deliberately not named (DECISIONS 276) — an
+  extra that names it is refused rather than dropped, since naming it is what
+  moves it (DECISIONS 277). The extras are ordered, so their order is part of what
   a declaration *means*, and **measured**, a view keeps the binding it was
   created with while a fresh one takes the new order:
 

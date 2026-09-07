@@ -2046,11 +2046,22 @@ fn refuse_unplanned_movement(
         // checkpoint read be recorded as the plan's own result — while the
         // created-table block above already held its columns to the
         // declaration, in the same fields (DECISIONS 189).
-        let mut expected_promises: Vec<(pbps_model::ColumnRef, pbps_model::ColumnPromise<'_>)> =
-            Vec::new();
+        //
+        // Keyed by field, and for the reason the parts above are keyed by
+        // name: a column that changes type and replaces its default gives up
+        // the old default, changes type and takes the new one (DECISIONS 271),
+        // so one field carries `Default(false)` and then `Default(true)` and
+        // no read can satisfy both. The plan is in `order_key` order, so the
+        // last promise about a field is the net one (DECISIONS 280).
+        let mut expected_promises: BTreeMap<
+            (pbps_model::ColumnRef, pbps_model::ColumnField),
+            pbps_model::ColumnPromise<'_>,
+        > = BTreeMap::new();
         for p in &changes.changes {
             expected_columns.extend(p.change.columns_after());
-            expected_promises.extend(p.change.columns_promised());
+            for (column, promise) in p.change.columns_promised() {
+                expected_promises.insert((column, promise.field()), promise);
+            }
             if let Some(part) = p.change.constraints() {
                 expected_parts.insert((part.table, part.part(), part.name), part.after);
             }
@@ -2072,7 +2083,7 @@ fn refuse_unplanned_movement(
                 _ => {}
             }
         }
-        for (column, promise) in expected_promises {
+        for ((column, _), promise) in expected_promises {
             let Some(now) = after
                 .tables
                 .get(&column.table)

@@ -15,6 +15,9 @@ pbps-dialect.workspace = true
 pbps-db.workspace = true
 
 [dev-dependencies]
+# The live suite plans a migration the way `plan --db` does, so that what it
+# applies is a real `ChangeSet` and not a hand-built list of changes.
+pbps-diff.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
 
 [lints]

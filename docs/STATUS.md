@@ -253,8 +253,75 @@ with its own definition rather than folded into the nearest kind it knows; the
 `NOT NULL` rows PostgreSQL 18 added to `pg_constraint` are what that rule is
 for (DECISIONS 247).
 
-What remains is steps 4 to 10: the emitter, modules, roles, reference data, the
-ledger, probes, and the suite in full.
+Step 4 of ten (issue #79) is the **emitter**: `CREATE`, `ALTER` and `DROP` for
+tables, columns, keys, constraints and indexes. Every statement it writes sets
+the write `search_path` — the object's own schema, then the project's
+configured extras — and gives it back in the same batch, because the three
+verbatim expressions the model holds bind an unqualified name at creation and
+all three are *refused* under a path that is only the object's own schema
+(ADR-0013 §3, DECISIONS 259). The two settings that decide how a definition
+parses cannot ride there at all: a simple query is lexed as a whole before any
+of it runs, so `standard_conforming_strings = on` and `check_function_bodies =
+on` are pinned by the transaction framing, the earlier batch a transactional
+apply runs (DECISIONS 260), and so are the seven that decide what a declared
+expression *means* or what a conversion writes back — `DateStyle`, `TimeZone`,
+`IntervalStyle`, `timezone_abbreviations`, `transform_null_equals`,
+`bytea_output` and `extra_float_digits`. They are constants rather
+than per-object, and measured, the same check constraint stores a different day,
+a different instant, an interval with the opposite sign, a time fifteen and a
+half hours out, and a predicate that is no longer the one that was written —
+without a word (DECISIONS 267). A staged apply opens no
+transaction and needs the same pin on its connection; it lands with the ledger
+in step 8, which is the step that builds that connection.
+
+Four refusals are the step's substance rather than its edges. A bare-literal
+default on a setting-sensitive column is refused offline with the resolved
+spelling named — measured, the same declaration stores 2026-01-02 under
+`DateStyle` MDY and 2026-02-01 under DMY, silently either way (DECISIONS 261). A
+type change this engine will not make on its own is refused where the plan is
+built, with `USING` named and the two-step remedy, and never performed under a
+cast nobody declared (ADR-0012 §5, DECISIONS 263), and so is one it *will*
+make but only by consulting the session: a change that gains or loses the time
+zone stores a different instant depending on the zone the applying session
+happens to hold, so it is refused by name with the zone written out in the
+remedy (DECISIONS 268). And `online` becomes
+`CONCURRENTLY` only for an index with no filter, because a concurrent build
+cannot share a batch with the path a filter would be bound under — the
+statement says `non_transactional` and `own_batch` about itself, so a plan
+carrying one is refused at plan time rather than halfway through an apply
+(DECISIONS 262).
+
+Two rules came out of the emitter's own fixpoint rather than from the issue.
+A table the pull would never read is refused offline — a schema of
+`pg_catalog`, `information_schema` or any name beginning with `pg_`, or a table
+called `__pbps_state` or `__pbps_lock`, which the reader hides in every schema
+(DECISIONS 274) — and a schema named `$user`, which every `search_path` reads
+as the deploying role's own schema however it is quoted, so the table would be
+created and its unqualified names would bind somewhere else (DECISIONS 275).
+The pull never reads the first group — and
+`pg_temp` is worse than invisible: measured, it is the parser's alias for the
+session's temporary schema, so the declaration yields a `pg_temp_58.t` that
+disappears with the connection (DECISIONS 273). And a nullable primary key
+column. SQL Server refuses the table; measured, this engine
+accepts it and sets `NOT NULL` itself, so the declaration and the database
+disagree from the moment the table exists and the `DROP NOT NULL` that would put
+it back is refused for ever (DECISIONS 266). The rest of the other dialect's
+key-column checks are absent here and are issue #175 — they fail at the server,
+which is late but not silent.
+
+`CREATE TABLE` names `USING heap` rather than leaving the access method to
+`default_table_access_method`: the reader accepts only heap, so a table created
+under another method is created successfully and then unreadable as a managed
+one. It is a clause and not a session pin because a clause survives the rendered
+`--sql` script, which carries no framing (DECISIONS 272).
+
+The live suite runs the three shapes issue #79 named — a created table with a
+foreign key, a table already there gaining a column, a key, a unique, an index
+and a foreign key, and a bootstrap whose next plan must be empty — each as
+emit, read back, compare, against a plan the differ produced.
+
+What remains is steps 5 to 10: modules, roles, reference data, the ledger,
+probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

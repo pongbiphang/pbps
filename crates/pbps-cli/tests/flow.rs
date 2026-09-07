@@ -8257,8 +8257,14 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 
     // The same table, reshaped in every way a plan can reshape one without
-    // dropping anything. `code` keeps its type: it carries the old key, and
-    // the engine refuses to retype a key column under its constraint.
+    // dropping a column or a table. `code` keeps its type: it carries the old
+    // key, and the engine refuses to retype a key column under its constraint.
+    //
+    // The key is *replaced*, which is two changes and not one (DECISIONS 270):
+    // `pk_t` is dropped and the new key added, at opposite ends of the plan.
+    // So this plan is `destructive` as well as `constraint`, and the `--allow`
+    // below says both — the old key really does go, and a gate told only about
+    // the addition was told half of it.
     d.table(
         "table: dbo.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  region: {type: varchar(10), nullable: false}\n  flag: {type: bit}\n  note: {type: nvarchar(100), default: \"N''\"}\n  amount: {type: decimal, nullable: false, default: \"0\"}\n  p_id: {type: int}\nprimary_key: [code, region]\nunique:\n  uq_t_note: [note]\nindexes:\n  ix_t_p:\n    columns: [p_id, region desc]\n    include: [note]\nforeign_keys:\n  fk_t_p:\n    columns: [p_id]\n    references: dbo.p(id)\n    on_delete: cascade\n",
     );
@@ -8294,14 +8300,92 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
         plan.to_str().unwrap(),
         "--checksum",
         &plan_checksum(&plan),
-        // The key, the unique and the foreign key are `constraint` risk.
+        // The new key, the unique and the foreign key are `constraint` risk;
+        // the old key's drop is `destructive`.
         "--allow",
-        "constraint",
+        "constraint,destructive",
     ]);
     assert_eq!(
         code(&o),
         0,
         "the plan's own definitions must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
+/// A column that **changes type and replaces its default** in one plan,
+/// applied for real.
+///
+/// The ordering that makes this work is three phases — the old default out,
+/// the type changed, the new default in (DECISIONS 271) — and it is the first
+/// plan in which one column carries *two* promises about one field: `to: None`
+/// from the drop and `to: Some(_)` from the set. A guard that collected both
+/// and held the closing read to each would refuse every such plan after
+/// applying it, which is DECISIONS 169's shape one field along.
+///
+/// Only the engine can say the guard is not refusing its own plan.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_retyped_column_that_also_replaces_its_default_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "retypedefault");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("retypedefault");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  n: {type: int, nullable: false, default: \"0\"}\nprimary_key: {name: pk_t, columns: [id]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The same column, a wider type and a different default.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  n: {type: bigint, nullable: false, default: \"1\"}\nprimary_key: {name: pk_t, columns: [id]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // Two default changes and a type change, or the test proves nothing: the
+    // split is what puts two promises on one field.
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    assert_eq!(
+        planned.matches("alter_column_default").count(),
+        2,
+        "the retype has to split the default in two: {planned}"
+    );
+    assert!(
+        planned.contains("alter_column_type"),
+        "and the type change stands between them: {planned}"
+    );
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // Dropping the old default is `destructive`.
+        "--allow",
+        "constraint,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own default must not read as movement: {}{}",
         stdout(&o),
         stderr(&o)
     );

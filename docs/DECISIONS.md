@@ -4439,3 +4439,850 @@ SPEC is in sync with all of these.
     value the column will actually be recorded with — one function decides that
     value for both the guard and the construction, because a check on something
     *like* what is stored is a check on nothing.
+
+259. **The write `search_path` is set per statement, in the statement's own
+    batch, and given back in the same one.** ADR-0013 §3 decides the value —
+    the object's own schema first, then the project's configured extras — and
+    leaves how it is carried to the emitter. Three spellings were available and
+    two of them fail somewhere.
+
+    `SET LOCAL` is the precise one inside a transaction and a **no-op with a
+    warning outside one**, and `bootstrap --sql` renders a script a human runs
+    through `psql`, statement by statement, in no transaction at all. A scope
+    that quietly does nothing on the disaster-recovery path is the failure the
+    scope exists to prevent. A session-level `SET` in a *preceding* statement
+    survives that, and does not survive a staged apply resuming on a new
+    connection — the path would be missing for exactly the statement that
+    needed it.
+
+    So the `SET`, the statement and the `RESET` are one batch. Measured, that
+    works: `SET LOCAL search_path = bt, btx; CREATE TABLE bt.t (… CHECK (f(id) >
+    0))` binds `f` through the new path, because a simple query is *analysed*
+    one statement at a time. Inside a transaction the `RESET` is rolled back
+    with everything else; outside one it hands the connection back as the
+    operator's environment left it.
+
+260. **The two settings that decide how a definition *parses* are pinned by the
+    transaction framing, not by the statement.** They cannot be pinned by the
+    statement. Measured on 18.6, a multi-statement simple query is **lexed as a
+    whole before any of it runs**:
+
+    ```text
+    one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+                -> syntax error — the batch was lexed under the old value
+    two:        SET standard_conforming_strings = off;  then  the same SELECT
+                -> one literal, length 9
+    ```
+
+    so a `SET` in front of the statement it is meant to protect protects
+    nothing. The pin has to be established on an earlier batch, and `begin` is
+    the earlier batch a transactional apply runs — the same place SQL Server's
+    `SET XACT_ABORT ON` lives (DECISIONS 194), for the same structural reason.
+
+    **A staged apply opens no transaction, so `begin` does not cover it**, and
+    an earlier version of this entry said "every connection" and was wrong. The
+    pin belongs on the connection there, and it cannot be moved into the
+    emitter's own statements: a staged run checkpoints after each one, and a
+    `--resume` on a fresh connection starts at the next unexecuted statement,
+    which is exactly the one whose pin was two statements back. No staged apply
+    can reach this dialect yet — `main.rs`'s `dialect()` refuses it and
+    `apply_staged_under_lock` calls `pbps_mssql::state` by name — so the
+    connection-level pin lands with the PostgreSQL ledger and staged path
+    (issue #83), which is the step that builds the connection it belongs on.
+
+    Both are the ones ADR-0013 §3 names. `standard_conforming_strings = on` is
+    what makes ADR-0011's scanner rule true: measured under `off`, `CHECK (label
+    <> 'it\'s  here')` is **accepted** as one literal while the normalizer
+    closes it at the escaped quote, so a whitespace edit inside that literal
+    compares equal and is never planned; under `on` the same text is a syntax
+    error. `check_function_bodies = on` is what makes ADR-0009's opaque-caller
+    exemption true: measured, a SQL body naming a relation that does not exist
+    is created silently under `off` and fails the first time it is called.
+
+    The third exception ADR-0013 names, the write `search_path`, is per
+    statement and does work in the statement's own batch (259) — name
+    resolution happens per statement where lexing does not.
+
+261. **A bare-literal default on a setting-sensitive column is refused, offline,
+    with the resolved spelling named.** ADR-0013 §3 says such a default reaches
+    the server as the resolved typed spelling, canonicalized by the engine at
+    plan time, and that the offline path refuses instead. The emitter is the
+    offline path: it has no connection and cannot ask.
+
+    Measured, the identical `CREATE TABLE` under two `DateStyle`s stores two
+    different dates and says nothing either way:
+
+    ```text
+    DEFAULT '01/02/2026' on a date, created under MDY:  '2026-01-02'::date
+    the same declaration created under DMY:             '2026-02-01'::date
+    DEFAULT '2026-01-02'::date under either:            '2026-01-02'::date
+    ```
+
+    The test is *whole expression is one string literal*, and nothing more: an
+    expression carrying a cast, a call or an operator is emitted as written.
+
+    **A cast resolves nothing, and a first version of this entry said it did.**
+    Measured, `'01/02/2026'::date`, `DATE '01/02/2026'` and `CAST('01/02/2026'
+    AS date)` all store 2026-01-02 under MDY and 2026-02-01 under DMY, exactly
+    as the uncast spelling does. What decides the value is whether the
+    *spelling* is ambiguous, which is a question about a value and therefore the
+    engine's to answer.
+
+    So the boundary this draws is between *provably* unresolved and *possibly*
+    resolved. Measured, this engine reads every string default back with a cast
+    welded on — `'unnamed'` becomes `'unnamed'::text` — so a bare literal is
+    certainly not the engine's own rendering and certainly not canonical, and
+    refusing it costs nothing a declaration could want. A cast form may be that
+    rendering, and usually is: it is what `pull` writes.
+
+    A **typed** literal that is not the engine's rendering keeps the session
+    dependence and is not refused, and that gap is deliberate: the only offline
+    rule that closes it also refuses `'2026-01-02'::date`, which is a correct
+    declaration and the one `pull` itself writes, with no remedy a message could
+    name. ADR-0013 §3 closes it at plan time, connected, and that resolver
+    arrives with the step that has a caller for it (issue #173).
+
+    **None of this is about the plan converging**, and a first version of this
+    paragraph said it was. The state records what each object was declared as
+    beside what it read back (DECISIONS 207–209), so a declaration in any
+    spelling goes quiet after the apply that records it — that is what closed
+    the shipped SQL Server loop (DECISIONS 208), and it closes this one too.
+    What it does not close is a column defaulting to February in one environment
+    and January in another.
+
+    **One literal has four spellings here, and a first version knew one.**
+    Measured, `'01/02/2026'`, `E'01/02/2026'`, `$$01/02/2026$$` and
+    `U&'01/02/2026'` on a `date` all store 2026-01-02 under MDY and 2026-02-01
+    under DMY — identical behaviour, and three of them would have walked past a
+    check written around the quote character. The one form left over is
+    `U&'…' UESCAPE '…'`, which is two literals with a keyword between them; it
+    answers "not a bare literal" and is named in the code so the gap is
+    recorded rather than unnoticed.
+
+    Which types are on the list is ADR-0013's derivation and not this file's
+    judgement: `date`, `time`, `timetz`, `timestamp`, `timestamptz`,
+    `interval`, `real` and `double precision`. `time` is on it because the ADR
+    put it there, and narrowing a recorded list because today's probe did not
+    reach one of its rows is how a list stops being the rule it came from.
+
+    **The question is asked in `validate_table`, and the emitter's copy is the
+    later of the two.** `Change::AlterColumnDefault` carries a column reference
+    and two expressions and *no type*, so on the one path that changes a default
+    on a column already there, `emit` cannot tell a bare `'01/02/2026'` on a
+    `date` from the same text on a `text` — and only one of those is a value
+    the applying session decides. Putting the rule in the emitter alone would
+    have covered `CreateTable` and `AddColumn` and left the third open, which is
+    the sweep this project has failed before. `validate_table` sees the
+    declaration with its types, and every command that hands statements to a
+    database runs it (DECISIONS 141), so the change is never planned at all.
+
+    **A string constant continued across a newline is one literal**, and the
+    continuation rule is narrower than "another literal beside it". Measured:
+
+    ```text
+    'a' ⏎ 'b'       -> ab        E'a' ⏎ 'b'  -> ab       U&'a' ⏎ 'b' -> ab
+    'a'   'b'       -> syntax error: on one line they are two constants
+    'a' ⏎ E'b'      -> syntax error: a continuation is a plain literal
+    $$a$$ ⏎ $$b$$   -> syntax error: dollar quoting does not continue
+    'a' ⏎ 'b\'c'    -> unterminated: the backslash does not escape in a
+                       continuation, even after an `E'…'` first piece
+    ```
+
+    So `DEFAULT '01/02/'` ⏎ `'2026'` on a `date` is the same declaration as the
+    one-piece spelling and stores the same session-decided value — measured,
+    `'2026-01-02'::date` under MDY — and a guard that stopped at the first
+    closing quote let it past. The scanner now reads pieces: the first in
+    whichever of the three forms opened it, each later one plain and preceded
+    by whitespace that contains a newline.
+
+    **Grouping parentheses are taken off first, and that is the boundary of
+    what this guard reads.** Measured, `DEFAULT ('01/02/2026')` on a `date`
+    stores `'2026-01-02'` under MDY and `'2026-02-01'` under DMY exactly as the
+    unparenthesised form does, with the parentheses dropped from what the
+    engine keeps — so a test that looked only at the first character let it
+    past. `without_grouping` strips balanced outer parentheses by a depth that
+    must not return to zero before the end, counting every parenthesis
+    including ones inside literals. Counting them is what keeps this from
+    becoming a parser: a stray parenthesis in a literal can only make the test
+    *fail*, which costs a refusal and never causes one, and stripping the first
+    and last characters can produce a single complete literal only if what was
+    there was `(` literal `)`. Anything more structural — a cast, a
+    concatenation, a function call — stays outside on purpose (DECISIONS 174),
+    covered by the settings the framing pins.
+
+262. **`online` builds an index concurrently only when it has no filter.**
+    Measured, `CREATE INDEX CONCURRENTLY` cannot share a batch with anything at
+    all — `cannot run inside a transaction block` — so it cannot carry the write
+    `search_path` of 259, and a path set by a preceding statement is not there
+    after a staged apply resumes on a new connection. An index *with* a filter
+    is therefore built the ordinary way and the hint is dropped, which is the
+    trait's own rule for a hint a dialect cannot honour on this statement: the
+    destination is the same either way, and refusing would turn a performance
+    hint into an outage. An index *without* one has no expression to bind and
+    needs no path, so nothing is lost by leaving the scope off it.
+
+    The concurrent statement says both things about itself —
+    `Statement::non_transactional` and `Statement::own_batch` — so a plan
+    carrying one is refused at plan time with the whole plan intact, rather than
+    halfway through an apply. That also makes `own_batch`'s own comment false
+    where it said PostgreSQL has no batch restriction; it has exactly this one.
+
+    A unique constraint gets no concurrent path either, and for a different
+    reason: the online spelling is `CREATE UNIQUE INDEX CONCURRENTLY` followed
+    by `ADD CONSTRAINT … USING INDEX`, whose halves commit separately. One
+    declared constraint arriving as two committed steps is a state the gate
+    never approved.
+
+263. **A type change this engine refuses outright is refused by the emitter,
+    with the clause named.** ADR-0012 §5 decides that no `USING` is emitted; the
+    placement is this step's. The catalogue already knows which conversions the
+    engine will not make — `TypeChangeRisk::Incompatible` is defined as exactly
+    those (DECISIONS 243) — so the refusal is made where the plan is built, in
+    the message that names `USING` and the two-step remedy, rather than left to
+    a server error halfway through an apply.
+
+    Both ends are normalized before the catalogue is asked, and that is not
+    hygiene: the families are keyed on the spelling the engine gives back, so an
+    unnormalized `varchar(10)` is a type the catalogue does not know and *every*
+    change from one reads as `Incompatible`. A widening would have been refused
+    for needing a clause it does not need. The trait says the caller normalizes
+    first; a dialect that only works when it is called correctly is a trap, and
+    normalizing twice is free (the same correction as DECISIONS 244).
+
+264. **The `DO` block's dollar-quote tag is chosen against the body it wraps.**
+    Dropping a primary key the declaration did not name means asking the catalog
+    for its name, which means dynamic SQL, which on this engine means a `DO`
+    block. PostgreSQL's lexer looks for a dollar-quote's closing tag
+    **literally**, without regard for quotes inside it — so a table named
+    `x$pbps$y`, which is a legal identifier `pull` would adopt, ends the block
+    where its name appears and hands the rest of it to the server as top-level
+    SQL. The tag is therefore the first of `$pbps$`, `$pbps1$`, … that the body
+    does not contain, which makes the failure unrepresentable rather than
+    checked for.
+
+265. **The write path's extras live on the dialect value, and the `pbps.yml` key
+    waits for a reader.** `Dialect::emit` takes a change and a strategy, and a
+    strategy says how to get there and never where (ADR-0003), so the extras
+    have to be state on `Postgres`. They are not yet configuration: the CLI
+    refuses this dialect outright (`main.rs`'s `dialect()`), so a key in
+    `pbps.yml` would be one nothing reads — which is worse than none, because a
+    user who sets it would have every reason to believe it took effect. The key
+    lands with the step that can read it.
+
+266. **A nullable primary key column is refused on PostgreSQL too, and for the
+    opposite reason.** SQL Server refuses the table at `CREATE`, so its rule
+    (`validate.rs`) only moves the failure earlier. **Measured, this engine
+    accepts it** and sets `NOT NULL` itself:
+
+    ```text
+    CREATE TABLE t (id integer, CONSTRAINT pk PRIMARY KEY (id));  accepted
+    the column afterwards:                                        attnotnull = t
+    ALTER TABLE t ALTER COLUMN id DROP NOT NULL;
+        -> ERROR 42P16: column "id" is in a primary key
+    ```
+
+    So the declaration and the database disagree from the moment the table
+    exists, the pull reads `nullable: false`, every plan proposes the
+    `DROP NOT NULL` that would put the declaration back, and the engine refuses
+    that one for ever. A declaration an engine silently rewrites is worse than
+    one it rejects, and the rule is more necessary here than on the engine it
+    came from.
+
+    Written from the measurement rather than inherited: `pbps-pg` had no
+    key-column checks at all, which is PITFALLS' "the second implementation did
+    not inherit the first one's scar" with the scar in the wrong shape as well
+    as missing. The rest of `pbps-mssql`'s `key_columns` — a key naming a column
+    the table does not have, naming one twice, naming none, or naming one whose
+    type cannot be part of a key — is missing here too and is issue #175: those
+    four fail loudly at the server, which is late but not silent, and this one
+    does not fail at all.
+
+267. **Every setting that changes what a declared expression means is pinned in
+    the transaction framing, not around each statement.** The three verbatim
+    expressions the model carries — a column default, a check expression and an
+    index filter (ADR-0013 §3) — are text the engine reads through an input
+    function or a parser rule, and five settings decide what that text means.
+    Two more decide what a *conversion* writes back, below.
+    Measured on 18.6, the identical declaration created by two sessions:
+
+    ```text
+    CHECK (d >= '01/02/2026')       MDY -> '2026-01-02'   DMY -> '2026-02-01'
+    CHECK (at >= '2026-01-02 00:00')
+      on a timestamptz              UTC -> 00:00:00+00    New_York -> 05:00:00+00
+    CHECK (i >= '-1 2:00:00')       postgres -> -1 days +02:00:00
+                                    sql_standard -> -1 days -02:00:00
+    CHECK (at >= '2026-01-15 12:00:00 CST')
+                                    Default -> 18:00:00+00   Australia -> 02:30:00+00
+    CHECK (x = NULL)                off -> (x = NULL::integer)   on -> (x IS NULL)
+    ```
+
+    A different day, a different instant, an interval with the opposite sign, a
+    time fifteen and a half hours out, and a predicate that stopped being the
+    one that was written. No error, no warning, and nothing afterwards can say
+    which session decided it.
+
+    **The list is a rule, not a set of temporal traps**, and the last two are
+    what say so. `timezone_abbreviations` is a dictionary `TimeZone` does not
+    cover, so pinning the zone does not pin the abbreviation; and
+    `transform_null_equals` is not an input function at all but a *parser*
+    rewrite, which changes the predicate rather than a value inside it. The
+    rule is: **a setting that changes what the declared text means is pinned**.
+    Both were found by review after the first three shipped, and a list closed
+    against its rule would have taken a third round to find the fourth.
+
+    **`bytea_output` and `extra_float_digits` are the seventh and eighth, and
+    were left out on a measurement that was true of what it measured.** A
+    declared expression stores the same constraint under `hex`/`1` and under
+    `escape`/`0`, because nothing in `CHECK (b >= '\x0102')` runs a value
+    through an *output* function. An `ALTER COLUMN … TYPE text` does:
+
+    ```text
+    bytea -> text             hex -> \x0102              escape -> \001\002
+    double precision -> text  1 -> 0.12345678901234568   -3 -> 0.123456789012
+    ```
+
+    Same stored bytes, same approved statement, two different strings left in
+    the table. The rule reaches this and the exclusion did not, because
+    "output-only" was a statement about where the setting is *read* rather than
+    about whether a plan's result depends on it. Pinning is the complete answer
+    where refusing the conversion would be an enumeration: every cast to text
+    goes through an output function, and the list of which ones consult a
+    setting is exactly the list the pin makes irrelevant. The values are the
+    read scope's, so what a plan writes is what the next `pull` reads back.
+
+    `lc_monetary` is in the class and is deliberately out, for the reason
+    `catalog.rs` gives on the read side: `SET` fails outright on a locale the
+    server does not have, so pinning it would turn a database that deploys into
+    one that cannot. Its reach is a `money` literal, and this dialect's type
+    catalogue refuses `money`.
+
+    They go in `begin` and not in the per-statement scope because they are
+    *constants*: unlike `search_path`, which is the object's own schema and
+    therefore varies per statement (DECISIONS 259), one value serves the whole
+    plan. Nine `SET`s and nine `RESET`s around every line of `plan.sql` would
+    bury the SQL a reviewer has to read (SPEC §14.1) to say the same thing
+    once.
+
+    `bytea_output` and `extra_float_digits` are named by ADR-0013 §3 and are
+    deliberately **not** here. Measured, both are output-only — identical stored
+    constraints under `hex`/`1` and under `escape`/`0` — so they belong to the
+    read scope, which already sets them, and pinning them on the write side
+    would suggest they decide something they do not.
+
+    This is also the answer to a check constraint that a `Column::default`
+    guard cannot reach (DECISIONS 261): a default is refused when its literal
+    is bare because the column's type is known there, while a check names
+    columns and carries no type, and no offline rule can tell `'01/02/2026'`
+    inside one from a string that merely looks like a date. Pinning the reader
+    is what makes the text mean one thing.
+
+268. **A type change the session's `TimeZone` would answer is refused, the way
+    a `USING` clause is.** `timestamp` → `timestamptz` and its relatives do not
+    fail on this engine — they are *answered* from the session's `TimeZone`.
+    Measured, one stored value under one `ALTER`, twice:
+
+    ```text
+    timestamp -> timestamptz, stored 2026-01-02 12:00
+      TimeZone = UTC               -> 2026-01-02 12:00:00 UTC
+      TimeZone = America/New_York  -> 2026-01-02 17:00:00 UTC
+
+    timestamptz -> timetz, stored 2026-01-02 12:00:00+00
+      TimeZone = UTC               -> 12:00:00+00
+      TimeZone = America/New_York  -> 07:00:00-05
+    ```
+
+    **The second shape arrived a round later and it is what the rule is.** The
+    predicate was first written as "the offset is gained or lost", which is the
+    shape the first measurement had. `timestamptz` → `timetz` keeps its offset
+    on both sides and is still the session's answer, because what moves is the
+    *date* part: a value is being read out of a day, and a zone decides which
+    day it was in. So the question is not "does the offset change" but "does
+    the session decide", and the predicate is now `(ao || bo) && (ao != bo ||
+    ad != bd)` — a zone has to be involved at all, and then either end of it
+    moves.
+
+    **With one exception, and finding it took a third round.** `timetz` → `time`
+    involves a zone and moves it and is still *not* the session's: `timetz`
+    stores a local time and its offset side by side, so dropping the offset
+    keeps the time that is already there. Measured, `12:00:00+03` becomes
+    `12:00:00` from a `UTC` session and from an `America/New_York` one alike.
+    `timestamptz` is the opposite, and that is why the exception is exactly
+    this narrow: it holds an *instant*, so writing it without a zone means
+    choosing one — measured, the same value into `timestamp` is `12:00:00`
+    under UTC and `07:00:00` under New York. What decides it is what the type
+    holds, not which way the offset went. Refusing the projection would have
+    refused a valid plan, and the loss it does carry is what `Narrowing` is
+    for.
+
+    `types::change_risk` already knows the shape and answers `Narrowing`, with a
+    comment naming exactly this. That is not enough: `Narrowing` is a risk class
+    a human clears at the gate, and what the human cleared was the *loss*. The
+    zone was never in the plan to approve.
+
+    The framing (267) pins `TimeZone` to UTC, which makes the result
+    reproducible — and reproducible is not declared. Under the pin the change
+    would silently reinterpret every stored value as UTC, which is a data
+    transformation nobody wrote down and nobody reviewed: the same ground
+    ADR-0012 §5 refuses a `USING` clause on. So the emitter asks a separate
+    question, `types::depends_on_the_session_time_zone`, and refuses on it by
+    name with the two-step remedy — add the column, fill it in a declared step
+    with the zone written out, drop the old one.
+
+269. **A primary key that is only dropped is ordered with the constraint drops;
+    one that is replaced is not.** `order_key` had every `SetPrimaryKey` in the
+    addition class (13), below every column change, because one variant carries
+    both directions. So a declaration that gives up a key and relaxes the
+    column it held produced a plan whose first statement neither engine would
+    perform:
+
+    ```text
+    ALTER TABLE t ALTER COLUMN id DROP NOT NULL;   -- 42P16 on PostgreSQL:
+                                                   -- column "id" is in a primary key
+    ALTER TABLE t DROP CONSTRAINT pk_t;            -- never reached
+    ```
+
+    **Measured on both engines**, which is what makes this the differ's problem
+    and not a dialect's: SQL Server refuses the same shape with 5074, "the
+    object 'pk_pkord' is dependent on column 'id'", and 4922 behind it. A
+    valid, reviewed plan, refused.
+
+    The drop now sits in class 2 with `DropIndex`, `DropUnique`,
+    `DropForeignKey` and `DropCheck` — where a constraint drop belongs, and
+    where it also lands ahead of `DropColumn` at 5, the other statement a
+    standing key blocks. No new class and no renumbering: `dependency_rank`
+    already keeps a foreign-key drop ahead of the key it references *inside*
+    this class, which is the order the engine requires and the reason that rank
+    was written (DECISIONS 237).
+
+    **Conditioned on `to: None`, not on the variant**, because a key being
+    replaced is no longer one change — see DECISIONS 270.
+
+270. **A replaced primary key is planned as two changes, its drop and its
+    add.** DECISIONS 269 put a key's drop with the constraint drops by keying
+    the class on `to: None`, and left the replacement where it was. Review
+    found the half that leaves open, and it is the same defect: a declaration
+    turning `PRIMARY KEY (id)` into `PRIMARY KEY (other)` while relaxing `id`
+    still ran `DROP NOT NULL` against a column `pk_t` held — `42P16` on
+    PostgreSQL, 5074 with 4922 behind it on SQL Server.
+
+    One change cannot be ordered correctly here, and no class can rescue it.
+    The drop must precede every column change a standing key blocks; the add
+    must follow every column its new shape may name, including one this same
+    plan adds at class 8. Opposite ends, so: two changes.
+
+    Nothing else moves. The model is unchanged, and both emitters already
+    emitted the two statements independently — `if let Some(pk) = from` then
+    `if let Some(pk) = to` — so the SQL is the SQL it was and only the
+    positions change. `from: None` on the add half is accurate where it runs,
+    because the drop half has already taken the key away.
+
+    **The risk classes follow, and that is the intended consequence rather
+    than a side effect.** A replacement used to answer `Constraint` alone;
+    now its drop answers `Destructive` and its add `Constraint`. That is what
+    the database does — the old key and its index are gone — and a gate that
+    was told only about the constraint was told half of it. A policy that
+    denies `Destructive` will now stop a key replacement, which is the
+    conversation that should have been happening.
+
+    The plan a reviewer reads changes shape with it: one line becomes two, in
+    different places, each with its own risk. That is more to read and it is
+    the truth about what runs; the alternative is one line that hides a drop
+    among the additions.
+
+271. **A column with a default and a new type is three phases, one rank each.**
+    Both change kinds are ordering class 9, so the tiebreaker decided which ran
+    first, and the tiebreaker is the change's `Debug` rendering — which puts
+    `AlterColumnDefault` ahead of `AlterColumnType` by the alphabet and nothing
+    else. Each end of that is refused, by a different engine, and both are
+    measured:
+
+    ```text
+    the default first, PostgreSQL:
+      ALTER TABLE t ALTER COLUMN n SET DEFAULT 'abc';
+          -> ERROR: invalid input syntax for type integer: "abc"
+    the type first, SQL Server:
+      ALTER TABLE t ALTER COLUMN n bigint NULL;
+          -> Msg 5074: the object 'df_dn2' is dependent on column 'n'
+    ```
+
+    So neither order works and the answer is three phases: **drop the default
+    the old type gave meaning to, change the type, install the default written
+    for the new one.** `dependency_rank` answers `-2` for
+    `AlterColumnDefault { to: None }`, `-1` for `AlterColumnType` and `0` for
+    `AlterColumnDefault { to: Some(_) }` — the same instrument, and for the same
+    reason, as the foreign key's rank: the dependency is a layering rather than
+    a graph, so a constant says it exactly. No new class and no renumbering.
+
+    A *replaced* default is two changes when the column is retyped, because the
+    type change has to run between the halves — the third instance of "one
+    variant carrying both directions cannot be ordered by direction"
+    (DECISIONS 270, PITFALLS). **Only** when the type moves: a default replaced
+    on a column that keeps its type needs no drop, since `SET DEFAULT` replaces
+    on PostgreSQL and the SQL Server emitter already drops and adds inside its
+    one statement, and splitting it would put two lines at opposite ends of a
+    plan where one says it better (SPEC §14.1).
+
+    The nullability needs no rank of its own: `Change::AlterColumnType` carries
+    both ends, so the differ never emits a nullability change beside a type
+    change on one column — and measured, SQL Server accepts the nullability
+    form of `ALTER COLUMN` with a default standing, so the dependency is the
+    type's alone.
+
+    **The second measurement arrived by breaking it.** The rank went in with
+    only PostgreSQL's end measured, `AlterColumnType` at `-1`, and that reversed
+    an order SQL Server had been relying on by accident: with the default's drop
+    sorted first by the alphabet, a retyped column's constraint had always
+    happened to be gone. Nothing in the suite covered it. The regression test is
+    `a_retyped_column_gives_up_its_old_default_before_the_type_moves`, on the
+    engine that refuses it.
+
+    The tiebreaker's own comment said this would happen: "anything with a real
+    order between them belongs in separate classes; this tiebreaker cannot
+    express it." A rank is the third way, and it is the one that costs no
+    renumbering.
+
+    What this does not reach is a type change on a column whose default the
+    plan does not touch: there is no `AlterColumnDefault` to order, and SQL
+    Server refuses that statement too. It is that engine's emitter to fix —
+    issue #180 — because emitting a drop-and-re-add for an unchanged default
+    would put two lines in every plan that widens a defaulted column, on both
+    engines, for one engine's constraint model.
+272. **`CREATE TABLE` names its access method, and does so in the statement.**
+    The reader accepts a table only when `relam` is heap (`catalog.rs`), which
+    is deliberate — everything below the model, from column storage to the way
+    a page is read, is heap's. An unqualified `CREATE TABLE` takes its method
+    from `default_table_access_method`, so under a role whose setting names
+    another installed method the table is created *successfully* and then reads
+    back as an unsupported object: absent from the pulled schema, planned again
+    as a `CREATE` the engine refuses for already existing, and the deployment
+    cannot converge. The apply reported success and the recording says the
+    table is as declared.
+
+    **In the statement, not in the transaction framing** beside the session
+    pins of DECISIONS 267, and the difference is the point: those settings
+    cannot be said in the statement they affect — there is no way to spell
+    `DateStyle` inside a check constraint — while this one can. A clause cannot
+    be answered differently by a session, on any path, including the rendered
+    `--sql` script an operator runs through `psql` with no framing around it
+    (issue #174). Where both are available, the one that cannot be defeated is
+    the one to write.
+
+    `default_tablespace` is the same kind of setting and is deliberately left
+    alone: the reader does not filter on it, nothing in the model speaks about
+    where a table's storage lives, and a plan that neither declares nor records
+    it has nothing to be wrong about. There is no equivalent for indexes —
+    measured, `default_table_access_method` is the only such setting on 18.6,
+    and an index's method comes from its own `USING` with `btree` as the
+    grammar's default rather than a session's.
+
+    **The divergence itself is not measured, and that is stated rather than
+    hidden.** The pinned image ships exactly one table access method, so there
+    is no second one to create a divergent table with. Both halves are
+    measured — the setting exists and is validated against the installed
+    methods, and `USING heap` fixes `relam` — and the reader's rule is code.
+
+273. **A table declared in a schema the pull never reads is refused offline.**
+    The reader skips `pg_catalog`, `information_schema` and every schema whose
+    name begins with `pg_` (`catalog.rs`), so a table declared in one is
+    created and then invisible: absent from the pulled schema, planned again as
+    a `CREATE` the engine refuses for already existing. The rule is derived
+    from the reader's own list rather than written beside it, which is why it
+    lives in this dialect and not in the loader — the excluded set is this
+    engine's.
+
+    **`pg_temp` is why the rule is not only about visibility**, and it is what
+    makes this the class DECISIONS 266 wrote an offline rule for rather than
+    one to leave to the engine. Measured, `pg_temp` is the parser's alias for
+    the session's temporary schema:
+
+    ```text
+    CREATE TABLE "pg_temp"."t" (id integer);       accepted
+    the relation afterwards:  pg_temp_58.t, relpersistence = 't'
+    ```
+
+    A session-local table, under a name the declaration never wrote, gone when
+    the connection closes. An engine that refuses by name can be left to refuse
+    — that is the line #175 and #179 are answered on — and one that hands back
+    something else cannot.
+
+    The negative half is in the test and is the reason the check is `starts_with
+    ("pg_")` and not a looser match: the reader compares the first three
+    characters, so a project's schema called `pga` is a project's schema, and a
+    validation that refused it would refuse a declaration the pull reads
+    perfectly well (the same trap `catalog.rs` avoids by not writing the filter
+    as a `LIKE` pattern, DECISIONS 254).
+
+
+274. **The two table names this tool owns are refused in every schema.** The
+    reader hides `__pbps_state` and `__pbps_lock` wherever they appear
+    (`catalog.rs`), so a declaration using one is created and then invisible:
+    the pull reports it absent, the next plan creates it again, and the engine
+    refuses that for already existing. The apply reported success and the
+    recording says the table is as declared — the shape DECISIONS 273 refused a
+    schema for, now for a name.
+
+    **By name and never by prefix**, which is the reader's own hard-won
+    narrowing; its comment records the bug, that `NOT LIKE '\_\_pbps\_%'` also hid
+    a project's `app.__pbps_customers` and nothing refused *that* declaration
+    either. So the validation is derived from the same list, `catalog::OURS`,
+    and `the_filter_hides_exactly_the_names_the_validation_refuses` ties them
+    together in both directions: a name the validation refuses that the filter
+    does not hide is a false refusal, and a name the filter hides that the
+    validation does not refuse is this bug again.
+
+    SPEC §8.1 defines the two, and a step that adds a third adds it to `OURS`,
+    where the filter and the validation both read it.
+
+275. **`$user` is refused as a schema name and as a write-path extra.**
+    ADR-0013 §3 scopes every write statement with `SET search_path = <the
+    object's own schema>, <the project's extras>`, and one name cannot travel
+    in that list. **Measured on 18.6**, with a schema literally called `$user`
+    holding a function, under role `postgres` with a `postgres` schema beside
+    it:
+
+    ```text
+    SET search_path = "$user";
+    SELECT current_setting('search_path'), which();
+        -> "$user" | the role schema
+    ```
+
+    The quotes survive into the setting and change nothing: the engine
+    substitutes that entry for the current role's own schema. So a table
+    declared in a schema of that name would be created — its statements name it
+    in full — and then every unqualified name inside a check, a filter or a
+    default would resolve through whatever the deploying role owns, binding a
+    different object or none. That is the property
+    `an_unqualified_name_in_a_declared_expression_binds_through_the_write_path`
+    exists to hold, silently inverted.
+
+    Refused rather than worked around, because there is no spelling that makes
+    the entry literal — quoting is the obvious attempt and it is the one
+    measured above. Refused from **both** ends, since the path has two sources:
+    the table's own schema (`validate_table`) and the configured extras
+    (`emit::write_path`), and an extra is not seen by any table's validation.
+
+    The comparison is exact and case-sensitive because the engine's is: `$USER`
+    and `$users` are ordinary schema names, and refusing them would refuse a
+    declaration that works.
+
+276. **`pg_catalog` is left out of the write path, so it is searched first.**
+    ADR-0013 §3 says the write scope puts the object's own schema first, and
+    **measured**, that is true only among the schemas the path names:
+
+    ```text
+    CREATE FUNCTION shad.lower(text) RETURNS text AS 'the project function';
+    SET search_path = shad;               SELECT lower('X');  -> x
+    SET search_path = shad, pg_catalog;   SELECT lower('X');  -> the project function
+    ```
+
+    PostgreSQL searches `pg_catalog` ahead of every listed schema whenever the
+    path does not name it. So a project function or operator with the same
+    signature as a built-in never wins inside a declared expression, and the
+    ordering the ADR promised is not the whole ordering.
+
+    **The obvious repair makes a worse hazard, and the emitter cannot defend
+    against that one.** Naming `pg_catalog` last would let a project *type*
+    shadow a built-in: a `CREATE DOMAIN app.text` in the table's own schema
+    would change what every `c text` column in that schema means, silently, and
+    the pull would then read the column back as a type the closed catalogue
+    does not hold and report it unsupported. The emitter cannot write around it
+    — `character varying`, `double precision` and `timestamp with time zone`
+    have no schema-qualified spelling, so there is no `pg_catalog.` prefix to
+    put on the names that matter. The type catalogue is a closed list of this
+    engine's own names (ADR-0012 §1) and `text` has to keep meaning `text`.
+
+    The hazard that is left has a remedy the user holds: an expression that
+    means the project's `lower` can say `app.lower`. The one the repair would
+    create has none. So the path stays as it is and the claim is corrected
+    instead — in this file, in `emit.rs`'s module docs and in ADR-0013 §3,
+    which all said "first" without saying first *among what*.
+
+277. **`pg_catalog` is refused as a write-path extra, not dropped from the
+    path.** 276 records why the emitter leaves it out; a caller may still put
+    it in through `Postgres::with_write_path_extras`, and then the path names
+    it and the engine stops searching it first. The same measurement runs the
+    other way:
+
+    ```text
+    SET search_path = "shad";                CHECK (lower(c) = c) -> pg_catalog.lower
+    SET search_path = "shad", "pg_catalog";  CHECK (lower(c) = c) -> shad.lower
+    ```
+
+    Both statements are accepted, neither says anything, and the constraint
+    stored by the second calls a different function from the one the
+    declaration reads as.
+
+    Refused rather than silently dropped, for the reason an unquotable extra
+    is refused where it is used: a path one entry short — or one entry
+    different — binds a name somewhere the caller did not ask for and says
+    nothing. Refusing is also the only answer that stays true if the
+    entry ever *does* mean what it says: dropping it would be right today and
+    wrong the day the reason changed. It joins `$user` (275) as the second
+    entry a path cannot hold, and for the mirror reason: `$user` is a name the
+    engine reads as something else, `pg_catalog` is a name the engine reads
+    differently for having been written at all.
+
+278. **A comment is whitespace to the bare-literal guard, and the two comment
+    forms are not the same whitespace.** The unresolved-default rule (266,
+    ADR-0013 §3) asks whether a declared default is one bare literal. The
+    scanner read the gap between two pieces of a continued string constant
+    with `trim_start`, which is Rust's idea of whitespace and not this
+    engine's. **Measured** on 18.6:
+
+    ```text
+    '01/02/' -- c ⏎ '2026'        -> 01/02/2026     one constant
+    '01/02/' -- /* x ⏎ '2026'     -> 01/02/2026     the block opener is comment text
+    '01/02/2026' -- c             -> 01/02/2026     trailing, after the last piece
+    '01/02/2026' /* c */          -> 01/02/2026     trailing, either form
+    '01/02/' /* c */ ⏎ '2026'     -> syntax error   a block comment ends the
+    '01/02/' ⏎ /* c */ '2026'     -> syntax error   possibility of a continuation
+    '01/02/' /* /* x */ */ ⏎ '2026' -> syntax error and they nest
+    ```
+
+    So a `--` comment is part of the gap *and* supplies the newline a
+    continuation needs, while a `/* … */` comment is whitespace everywhere
+    except in that gap. The guard now scans both, at either end of the
+    expression as well as between pieces, because a declaration that hides an
+    ambiguous literal behind a comment is the same hazard as one that does
+    not — and this guard's silence means *accepted*, so every form it cannot
+    read is a form that gets through.
+
+    An unterminated `/*` is left alone: the engine refuses that by name
+    (`unterminated /* comment`), and 266 draws the line there.
+
+279. **The grouping unwrap counts only the parentheses that are code.** The
+    same guard as 278, the same polarity, one round later. `without_grouping`
+    takes `DEFAULT ('01/02/2026')` down to the literal it wraps, by finding a
+    paren depth that does not return to zero before the end. It counted every
+    parenthesis, including ones inside literals and comments, and the code said
+    that was deliberate: a stray one can only make the test *fail*, failing to
+    unwrap only costs a refusal, and this guard is allowed to be wrong in that
+    direction.
+
+    The first half is true and the second is backwards. The guard refuses when
+    it answers *yes*, so an expression it cannot unwrap is one it **permits**,
+    and a single parenthesis that is data is enough to write the hazard down:
+
+    ```text
+    CREATE TABLE t (d date DEFAULT (/* ) */ '01/02/2026'))
+        -> stores 2026-01-02 under DateStyle MDY, 2026-02-01 under DMY
+    ```
+
+    Measured, and accepted silently either way. So the scan now steps over
+    literals and comments through one helper — the same constructs the
+    bare-literal scanner already knows, listed once — and it is still not an
+    expression parser: it never asks what any of it means. What stays outside
+    remains outside (174): a cast, a concatenation or a function is structure,
+    and this guard does not read structure.
+
+
+280. **The apply guard keys a column's promises by field, and the last one
+    wins.** 271 splits a retyped column's default into two changes — the old
+    default out, the type changed, the new one in — and the apply guard
+    collects what a plan promises about each column field, holding the closing
+    read to every entry. Two changes about one field meant two promises about
+    it, `Default(false)` and `Default(true)`, and no read satisfies both:
+    measured through the CLI, the statements applied and the guard then called
+    its own result movement —
+
+    ```text
+    error: `…/pbps_cli_retypedefault` moved while this plan was running, and
+    not because of it:
+      dbo.t column `n` does not have the default this plan gives it
+    ```
+
+    — and rolled the transaction back, so the migration could not be applied at
+    all.
+
+    This is DECISIONS 169 one field along: there, a constraint redefined under
+    one name promised `Absent` from its drop and `Present` from its add, and the
+    fix was to key the parts by name and keep the last word. The column fields
+    were a `Vec` only because, until 271, no plan said two things about one
+    field. They are keyed by `(column, field)` now, and the plan is in
+    `order_key` order, so the last promise about a field is the net one.
+
+    The pairing of a promise to its field lives on `ColumnPromise::field` in
+    the model rather than at the guard: the caller that must key them is not the
+    place to decide what each promise is about, and a second caller would have
+    spelled it again.
+
+281. **A declared expression is followed by a newline before any syntax the
+    emitter owns, and a line ends at `\r` as much as at `\n`.** Two halves of
+    one fact about comments, found in the same round.
+
+    **The emission.** This dialect writes three things verbatim — a default, a
+    check expression, an index filter (ADR-0013 §3) — and put its own syntax
+    behind them on the same line. Measured, a comment at the end of the user's
+    text takes it away:
+
+    ```text
+    CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+      -> ERROR: syntax error at end of input
+    CREATE TABLE t (a int DEFAULT 1 -- why, b int);
+      -> ERROR: syntax error at end of input
+    CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason ⏎ ));
+      -> accepted, and stored as CHECK ((n > 0))
+    ```
+
+    So a valid declaration produced a statement that cannot run, at each of the
+    five sites that interpolate one. One newline is the whole fix; it lives in
+    a `verbatim` helper rather than at each site, so that a sixth site has
+    somewhere to reach for. The engine keeps none of the comments — the stored
+    definition is the parsed expression — which is why nothing but the apply
+    could have shown this.
+
+    **The scan.** The gap scanner of 278 asked for `'\n'`, and this lexer ends
+    a line at either character. Measured, `'01/02/' <CR> '2026'` is the one
+    constant `01/02/2026`, and so is `'01/02/' -- c <CR> '2026'`: a bare
+    carriage return both ends a line comment and supplies the newline a
+    continued constant needs. A default written that way walked past the guard
+    that exists to refuse it.
+
+    **Both scanners, and the first fix only reached one.** `skip_datum` — the
+    one 279 added, which the grouping unwrap uses to step over data — kept its
+    own `find('\n')` through that commit, so `( -- ) <CR> '01/02/2026')` had
+    its closing parenthesis swallowed by a comment that had already ended,
+    the grouping went unwrapped, and the same default walked past the same
+    guard by the other road. Measured, that expression is 2026-01-02 under MDY
+    and 2026-02-01 under DMY. The character class is a named constant now
+    (`NEWLINE`) rather than a literal at each site, which is what makes the
+    next scanner's omission visible.
+
+    The repo had already recorded this shape for SQL Server (PITFALLS, "A
+    comment ends at a carriage return"), which is the part worth keeping: a
+    scanner written years later went in with one line ending anyway, and then
+    the fix for it missed its own sibling one screen away. Two more instances
+    of the same family are filed against the SQL Server pull's header scanner
+    (#197), which ends a line comment at LF alone and does not nest block
+    comments.
+
+282. **Trailing whitespace and comments are stripped before the grouping test,
+    by walking the expression forward.** 278 taught the guard that a comment is
+    whitespace and stripped it from the front; 279 taught the grouping unwrap
+    to step over data. Between them was a gap neither closed: the unwrap is a
+    test about the expression's **last character**, and a trailing comment is
+    what the last character then is.
+
+    ```text
+    CREATE TABLE t (d date DEFAULT ('01/02/2026') -- note ⏎ )
+      -> stored as '2026-01-02'::date under DateStyle MDY,
+         '2026-02-01'::date under DMY
+    ```
+
+    Measured, along with `('01/02/2026') /* note */`,
+    `(('01/02/2026') -- inner ⏎ ) -- outer` and
+    `$$01/02/2026$$ /* note */`: all four are accepted, all four move with the
+    session, and all four answered "not a literal" because the grouping could
+    not be unwrapped.
+
+    **Forward, not backward.** A `--` comment is recognisable only from its
+    opening, so there is no trailing-trivia trim that works from the end: the
+    scan walks the whole expression, steps over literals through `skip_datum`
+    so that a `--` inside one is not read as a comment, and remembers where the
+    last code character was. An unterminated `/*` is left standing as code, the
+    same answer `after_the_gap` gives, so the engine refuses it by name
+    (266).
+
+    The three strippers — leading gap, trailing trivia, grouping — now run to a
+    fixed point in `is_a_bare_literal`, because each can expose work for
+    another: `(('x') -- inner ⏎ ) -- outer` needs all three, twice.

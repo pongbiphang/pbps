@@ -25,6 +25,7 @@ use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
 pub mod catalog;
+mod emit;
 pub mod introspect;
 mod types;
 
@@ -37,7 +38,6 @@ mod types;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Emitter,
     Modules,
     Roles,
     ReferenceData,
@@ -49,7 +49,6 @@ impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Emitter => "generating statements (Phase 5 step 4)",
             Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
@@ -148,7 +147,84 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
 }
 
 /// The PostgreSQL dialect.
-pub struct Postgres;
+///
+/// It carries one thing, and that is not decoration: the schemas that follow
+/// an object's own on the **write** `search_path` (ADR-0013 §3). Measured on
+/// 18.6, all three of the verbatim expressions this model holds — a column's
+/// default, a check's expression and an index's filter — are *refused* at
+/// creation when an unqualified name in them resolves nowhere:
+///
+/// ```text
+/// search_path = ''         ->  refused: function floorish(integer) does not exist
+/// search_path = wp         ->  refused: function floorish(integer) does not exist
+/// search_path = wp, wpx    ->  accepted
+/// ```
+///
+/// The middle line is the one that decides the shape. A path of the object's
+/// own schema alone is not enough — an extension installed in `public` is the
+/// ordinary case — so the extras have to come from somewhere, and the only
+/// honest somewhere is the project. They are held here rather than passed to
+/// [`Dialect::emit`] because the trait takes a change and a strategy, and a
+/// strategy says how to get there and never where (ADR-0003).
+///
+/// Empty is the value every caller has today: `pbps.yml` has no key for this
+/// yet, because the CLI cannot select this dialect at all (`main.rs`'s
+/// `dialect()` refuses it) and a configuration key nothing reads is worse than
+/// none. The key arrives with the step that can read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Postgres {
+    write_path_extras: Vec<String>,
+}
+
+impl Postgres {
+    /// The dialect with nothing after an object's own schema on the write path.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The dialect with `extras` after an object's own schema, in that order.
+    ///
+    /// The order is part of what a declaration means, and ADR-0013 measured it:
+    /// a view created under `(m_ea, m_eb)` keeps the binding it was created
+    /// with, while a fresh one under `(m_eb, m_ea)` takes the other. So this
+    /// takes a sequence and never a set.
+    #[must_use]
+    pub fn with_write_path_extras(extras: Vec<String>) -> Self {
+        Self {
+            write_path_extras: extras,
+        }
+    }
+
+    /// The schemas after an object's own on the write path.
+    #[must_use]
+    pub fn write_path_extras(&self) -> &[String] {
+        &self.write_path_extras
+    }
+}
+
+/// Quotes one identifier, or refuses a string that cannot be one.
+///
+/// A free function because two callers need it and only one of them has a
+/// `Postgres` to hand: [`Dialect::quote_ident`] is this, and the emitter is
+/// this without having to build a dialect value to ask.
+fn quote(ident: &str) -> Result<String, DialectError> {
+    // A double quote inside an identifier is doubled; a NUL cannot be in
+    // one at all, and the engine's own limit is bytes, not characters.
+    if ident.is_empty() {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    if ident.contains('\0') {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    // The limit is enforced here because the server does not enforce it:
+    // it **truncates** and says so in a `NOTICE` that nothing reads. See
+    // [`MAX_IDENT_BYTES`].
+    if ident.len() > MAX_IDENT_BYTES {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+}
 
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
@@ -170,10 +246,123 @@ impl Dialect for Postgres {
 
     /// PostgreSQL runs DDL inside a transaction, and a failed statement aborts
     /// the whole one — which is what SQL Server needs `SET XACT_ABORT ON` to
-    /// approximate. Nothing else has to be said, so nothing else is.
+    /// approximate.
+    ///
+    /// `begin` carries two settings anyway, and they are here rather than in
+    /// the emitter because **measured on 18.6, a setting cannot take effect in
+    /// the batch it appears in**. A multi-statement simple query is *lexed as a
+    /// whole* before any of it runs, so a `SET standard_conforming_strings`
+    /// in front of the statement it is meant to protect protects nothing:
+    ///
+    /// ```text
+    /// one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+    ///             -> syntax error: the batch was lexed under the old value
+    /// two:        SET standard_conforming_strings = off;  then  the same SELECT
+    ///             -> one literal of length 9
+    /// ```
+    ///
+    /// So the pin has to be established on an *earlier* batch, and `begin` is
+    /// the earlier batch a transactional apply runs — the same place SQL
+    /// Server's `SET XACT_ABORT ON` lives, for the same structural reason.
+    ///
+    /// **A staged apply opens no transaction and is therefore not covered
+    /// here.** The pin belongs on the connection in that mode, and it cannot be
+    /// moved into the emitter's statements: a staged run checkpoints after each
+    /// one, and a `--resume` on a fresh connection starts at the next
+    /// unexecuted statement — which is the one whose pin was two statements
+    /// back. Nothing can reach that path on this dialect yet, and it lands with
+    /// the ledger and the staged path in Phase 5 step 8.
+    ///
+    /// - **`standard_conforming_strings = on`** is what makes ADR-0011's
+    ///   scanner rule — a plain literal escapes by doubling — true.
+    ///   Measured under `off`, `CHECK (label <> 'it\'s  here')` is *accepted*
+    ///   as one literal, while the normalizer closes it at the escaped quote:
+    ///   a whitespace edit inside that literal then compares equal and is
+    ///   never planned. Under `on` the same text is a syntax error, which is
+    ///   the loud failure (ADR-0013 §3).
+    /// - **`check_function_bodies = on`** is what makes ADR-0009's
+    ///   opaque-caller exemption true. Measured, a SQL body naming a relation
+    ///   that does not exist is created *silently* under `off` and fails the
+    ///   first time it is called; under `on` the `CREATE` is refused.
+    ///
+    /// **The rest are here for a different reason: they are constants, and each
+    /// one decides what a declared expression *means*.** All three verbatim
+    /// expressions this model holds — a default, a check, an index filter
+    /// (ADR-0013 §3) — are text the engine reads through an input function or
+    /// a parser rule, and the same declaration then creates a different object
+    /// under two settings, silently. Measured, one row per setting:
+    ///
+    /// ```text
+    /// CHECK (d >= '01/02/2026')       MDY -> '2026-01-02'   DMY -> '2026-02-01'
+    /// CHECK (t >= '2026-01-02 00:00') UTC -> 00:00:00+00    America/New_York -> 05:00:00+00
+    /// CHECK (i >= '-1 2:00:00')       postgres -> -1 days +02:00:00
+    ///                                 sql_standard -> -1 days -02:00:00
+    /// CHECK (t >= '2026-01-15 12:00:00 CST')
+    ///                                 Default -> 18:00:00+00   Australia -> 02:30:00+00
+    /// CHECK (x = NULL)                off -> (x = NULL::integer)   on -> (x IS NULL)
+    /// ```
+    ///
+    /// One is the sign and one is the whole predicate, which are the kinds of
+    /// difference nobody reads twice. `timezone_abbreviations` is a dictionary
+    /// `TimeZone` does not cover — fifteen and a half hours apart above — and
+    /// `transform_null_equals` is not an input function at all but a *parser*
+    /// rewrite, which is why the list cannot be "the settings temporal input
+    /// reads": it is **every setting that changes what the declared text
+    /// means**, and that is the rule to extend it by.
+    ///
+    /// They could ride in the statement's own scope — unlike the two above,
+    /// these are read at parse *analysis*, and measured, a `SET LOCAL
+    /// DateStyle` does reach the rest of its own batch — but they do not vary
+    /// per statement the way `search_path` does, and putting nine settings and
+    /// nine `RESET`s around every line of a plan would bury the SQL a reviewer
+    /// is there to read (SPEC §14.1). A constant belongs where the constants
+    /// are.
+    ///
+    /// **`bytea_output` and `extra_float_digits` are here too, and were not.**
+    /// They were excluded as *output-only*, and that was measured and true of
+    /// the case it was measured on: a declared expression stores the same
+    /// constraint under `hex`/`1` and under `escape`/`0`, because nothing in
+    /// `CHECK (b >= '\x0102')` runs a value through an output function. A
+    /// **type conversion** does. Measured:
+    ///
+    /// ```text
+    /// bytea -> text            hex -> \x0102        escape -> \001\002
+    /// double precision -> text 1 -> 0.12345678901234568   -3 -> 0.123456789012
+    /// ```
+    ///
+    /// Same stored bytes, same approved `ALTER`, two different strings left in
+    /// the table. Pinning them is the complete answer where refusing the
+    /// conversion would be an enumeration — every cast to text goes through an
+    /// output function, and the list of which ones read a setting is exactly
+    /// the list this pin makes irrelevant. The values are the read scope's, so
+    /// what a plan writes is what the next `pull` reads back.
+    ///
+    /// `lc_monetary` belongs to this class and is deliberately absent, for the
+    /// reason `catalog.rs` gives on the read side: `SET` fails outright on a
+    /// locale the server does not have, so pinning it would turn a database
+    /// that deploys into one that cannot. Its reach is a `money` literal, and
+    /// this dialect's type catalogue refuses `money` outright.
+    ///
+    /// **Two settings the canonical *read* scope pins are deliberately not
+    /// here**, and that is derived rather than trimmed: `bytea_output` and
+    /// `extra_float_digits` decide how a value is *rendered*, not how one is
+    /// read. Measured, `CHECK (b >= '\x0102' AND f >= 0.1)` stores the same
+    /// constraint under `hex`/`1` and under `escape`/`0`.
+    ///
+    /// None is spelled `SET LOCAL`: a rendered script is run statement by
+    /// statement outside any transaction, where `SET LOCAL` is a warning and a
+    /// no-op — and a pin that quietly does nothing is the failure it exists to
+    /// prevent. Inside the transaction this opens they are undone by the
+    /// rollback, and outside one they are on the connection pbps opened for
+    /// this deployment.
     fn transaction_framing(&self) -> TransactionFraming {
         TransactionFraming {
-            begin: "BEGIN;",
+            begin: "SET standard_conforming_strings = on; SET check_function_bodies = on; \
+                    SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
+                    SET IntervalStyle = 'postgres'; \
+                    SET timezone_abbreviations = 'Default'; \
+                    SET transform_null_equals = off; \
+                    SET bytea_output = 'hex'; SET extra_float_digits = 1; BEGIN;",
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.
@@ -241,21 +430,7 @@ impl Dialect for Postgres {
     }
 
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
-        // A double quote inside an identifier is doubled; a NUL cannot be in
-        // one at all, and the engine's own limit is bytes, not characters.
-        if ident.is_empty() {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        if ident.contains('\0') {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        // The limit is enforced here because the server does not enforce it:
-        // it **truncates** and says so in a `NOTICE` that nothing reads. See
-        // [`MAX_IDENT_BYTES`].
-        if ident.len() > MAX_IDENT_BYTES {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+        quote(ident)
     }
 
     /// Every column's type, through the catalogue.
@@ -278,6 +453,80 @@ impl Dialect for Postgres {
                 found.push(e);
             }
         }
+        // A schema the *reader* excludes, refused here rather than left to an
+        // engine that will not object. The pull skips `pg_catalog`,
+        // `information_schema` and every name beginning with `pg_`
+        // (`catalog.rs`), so a table declared in one is created and then
+        // invisible: absent from the pulled schema, planned again as a
+        // `CREATE` the engine refuses for already existing.
+        //
+        // `pg_temp` is the one that is not merely invisible. **Measured**, it
+        // is the parser's alias for the session's temporary schema, so
+        // `CREATE TABLE "pg_temp"."t"` succeeds and leaves `pg_temp_58.t` with
+        // `relpersistence = 't'` — a session-local table under a name the
+        // declaration never wrote, gone when the connection closes. That is
+        // the silent rewrite DECISIONS 266 wrote this class of rule for: an
+        // engine that refuses by name can be left to refuse, and one that
+        // hands back something else cannot.
+        let schema = name.schema.as_str();
+        // The other name a schema cannot usefully have here, and it fails
+        // somewhere else entirely: `$user` is what this engine substitutes for
+        // the current role's own schema inside a `search_path`, quoted or not
+        // (`emit::NOT_A_SCHEMA_A_PATH_CAN_NAME`). The table would be created —
+        // its statements name it in full — and every unqualified name inside a
+        // check, a filter or a default would bind through the deployment
+        // role's schema instead of this one.
+        if schema == emit::NOT_A_SCHEMA_A_PATH_CAN_NAME {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` is declared in a schema named `{schema}`, which this engine \
+                     reads as the current role's own schema wherever a `search_path` names it — \
+                     quoting does not make it literal. The table would be created and then \
+                     every unqualified name in its checks, filters and defaults would resolve \
+                     through whatever schema the deploying role owns. Declare it under a name \
+                     the path can carry."
+                ),
+            });
+        }
+        if schema == "information_schema" || schema.starts_with("pg_") {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` is declared in `{schema}`, which this dialect's pull \
+                     never reads: `pg_catalog`, `information_schema` and every schema whose \
+                     name begins with `pg_` are excluded from the managed set. The engine \
+                     would create the table and no plan could ever see it again — and \
+                     `pg_temp` is worse than invisible, because it is this engine's alias for \
+                     the session's temporary schema: measured, `CREATE TABLE \"pg_temp\".\"t\"` \
+                     leaves a `pg_temp_58.t` that disappears with the connection. Declare the \
+                     table in a schema of the project's own."
+                ),
+            });
+        }
+        // The two tables this tool owns, refused for the same reason and from
+        // the same list the reader hides them by (`catalog::OURS`). A
+        // declaration naming one is created and then invisible: the pull
+        // reports it absent and the next plan creates it again, which the
+        // engine refuses for already existing.
+        //
+        // By name and in every schema, because that is how the filter reads —
+        // `catalog.rs` narrowed it from a prefix on purpose, so that a
+        // project's own `app.__pbps_customers` stays a project's table
+        // (DECISIONS 274).
+        if catalog::OURS.contains(&name.name.as_str()) {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` uses the name `{}`, which is one of the two this tool owns \
+                     (SPEC §8.1) and which this dialect's pull hides in every schema. The engine \
+                     would create the table and no plan could ever see it again. Only these two \
+                     names are taken: a table of your own called `{}_customers`, or anything \
+                     else beginning with the same letters, is read back normally.",
+                    name.name, name.name
+                ),
+            });
+        }
         // Every other name the table owns, which the engine truncates at the
         // same limit and which the emitter has to spell just as often: the
         // primary key's, and the keys of the four maps.
@@ -296,6 +545,31 @@ impl Dialect for Postgres {
             }
         }
 
+        // A primary key column that the declaration calls nullable. SQL Server
+        // refuses this at `CREATE`; **measured, this engine does not** — it
+        // accepts the table and sets `NOT NULL` itself, so the declaration and
+        // the database disagree from the moment the table exists. The pull then
+        // reads `nullable: false`, every plan proposes `DROP NOT NULL`, and the
+        // engine refuses that with `column "id" is in a primary key`: a plan
+        // that can never converge and can never succeed. Refused here, where a
+        // user is looking at the declaration, and worded as the other dialect
+        // words it because it is the same mistake.
+        if let Some(pk) = &table.primary_key {
+            for column in &pk.columns {
+                if table.columns.get(column).is_some_and(|c| c.nullable) {
+                    found.push(DialectError::Invalid {
+                        dialect: types::DIALECT,
+                        message: format!(
+                            "primary key column `{column}` is nullable; a primary key column must \
+                             be NOT NULL. This engine does not refuse the table — it sets \
+                             `NOT NULL` for you — and then no plan can ever make the column match \
+                             the declaration again."
+                        ),
+                    });
+                }
+            }
+        }
+
         for (column_name, column) in &table.columns {
             if let Err(e) = self.quote_ident(column_name) {
                 found.push(e);
@@ -307,17 +581,32 @@ impl Dialect for Postgres {
                 // of the real error.
                 continue;
             }
-            if let Err(e) = types::normalize(&column.ty) {
+            let normalized = match types::normalize(&column.ty) {
+                Ok(ty) => ty,
+                Err(e) => {
+                    found.push(e);
+                    continue;
+                }
+            };
+            // A default whose value the applying session would decide
+            // (ADR-0013 §3). Asked here and not only in the emitter, because
+            // `AlterColumnDefault` carries no type and the emitter therefore
+            // cannot ask it on the one path that changes a default on a column
+            // that is already there. This is where a user is looking at the
+            // declaration, and every command that hands statements to a
+            // database runs these checks (DECISIONS 141).
+            if let Some(expr) = &column.default
+                && let Some(e) = emit::refuse_an_unresolved_default(column_name, &normalized, expr)
+            {
                 found.push(e);
-                continue;
             }
             found.extend(identity_problems(column_name, column));
         }
         found
     }
 
-    fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
-        Err(Unbuilt::Emitter.refuse())
+    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
+        emit::emit(self, change, strategy)
     }
 }
 
@@ -325,14 +614,13 @@ impl Dialect for Postgres {
 mod tests {
     use super::*;
 
-    /// The refusals are the point of this crate until step 4 lands, so what
-    /// they say is tested like any other output: each names the step that
-    /// supplies it, and none of them reads as "there is nothing to do".
+    /// A refusal is output like any other, so what it says is tested: each
+    /// names the step that supplies it, and none of them reads as "there is
+    /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
             Unbuilt::Introspection,
-            Unbuilt::Emitter,
             Unbuilt::Modules,
             Unbuilt::Roles,
             Unbuilt::ReferenceData,
@@ -349,28 +637,198 @@ mod tests {
     }
 
     /// `emit` returning an empty statement list would be a plan that applies
-    /// cleanly and changes nothing — the silent wrong answer. It has to be an
-    /// error, and the type is what makes that so.
+    /// cleanly and changes nothing — the silent wrong answer. A part this
+    /// crate has not built has to be an error, and the type is what makes that
+    /// so. The structural half is built (step 4); the three that are not each
+    /// name their own step.
     #[test]
-    fn an_unbuilt_emitter_is_an_error_and_not_an_empty_plan() {
-        let change = Change::DropTable {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
-            name: "app.t".parse().expect("a table name parses"),
+    fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
+        let unbuilt = [
+            (
+                Change::DropModule {
+                    id: "app.v".parse().expect("a module id parses"),
+                    kind: pbps_model::ModuleKind::View,
+                },
+                "Phase 5 step 5",
+            ),
+            (
+                Change::CreateRole {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
+                    name: "analyst".to_owned(),
+                },
+                "Phase 5 step 6",
+            ),
+            (
+                Change::DeleteRow {
+                    table: "app.t".parse().expect("a table name parses"),
+                    key_column: "code".to_owned(),
+                    key: pbps_model::RowKey::from("a"),
+                    cause: pbps_model::change::DeleteCause::Undeclared,
+                    row: std::collections::BTreeMap::new(),
+                    types: std::collections::BTreeMap::new(),
+                    after_types: std::collections::BTreeMap::new(),
+                },
+                "Phase 5 step 7",
+            ),
+        ];
+        for (change, step) in unbuilt {
+            let refusal = Postgres::new()
+                .emit(&change, Strategy::default())
+                .expect_err("this part is not built");
+            assert!(refusal.to_string().contains(step), "{refusal}");
+        }
+    }
+
+    /// The one rule the emitter cannot enforce on every path, enforced where it
+    /// can be.
+    ///
+    /// `AlterColumnDefault` carries a column reference and two expressions and
+    /// no type, so `emit` cannot tell a bare `'01/02/2026'` on a `date` from
+    /// one on a `text` — and it is only on a `date` that the applying session
+    /// decides the value. `validate_table` sees the declaration, and every
+    /// command that hands statements to a database runs it (DECISIONS 141), so
+    /// the change never gets planned in the first place.
+    #[test]
+    fn validating_a_table_names_a_default_the_applying_session_would_decide() {
+        let mut table = Table::default();
+        let mut d = pbps_model::Column::new("date".parse().expect("a type"));
+        d.default = Some("'01/02/2026'".into());
+        table.columns.insert("d".into(), d);
+        // The same text on a type whose input function reads no setting is not
+        // a problem, and saying it were would refuse a valid declaration.
+        let mut label = pbps_model::Column::new("text".parse().expect("a type"));
+        label.default = Some("'01/02/2026'".into());
+        table.columns.insert("label".into(), label);
+        // Nor is the resolved spelling, which is what the pull reads back.
+        let mut ok = pbps_model::Column::new("date".parse().expect("a type"));
+        ok.default = Some("'2026-01-02'::date".into());
+        table.columns.insert("resolved".into(), ok);
+
+        let problems =
+            Postgres::new().validate_table(&"app.t".parse().expect("a table name parses"), &table);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let message = problems[0].to_string();
+        assert!(message.contains("column `d`"), "{message}");
+        assert!(message.contains("DateStyle"), "{message}");
+    }
+
+    /// A table declared where the pull will not look is refused before
+    /// anything connects, and `pg_temp` is why the rule is not only about
+    /// visibility.
+    ///
+    /// Measured, `pg_temp` is this engine's alias for the session's temporary
+    /// schema: `CREATE TABLE "pg_temp"."t"` succeeds and leaves `pg_temp_58.t`
+    /// with `relpersistence = 't'`, under a name the declaration never wrote
+    /// and gone when the connection closes. An engine that refuses by name can
+    /// be left to refuse; one that hands back something else cannot
+    /// (DECISIONS 266).
+    #[test]
+    fn validating_a_table_refuses_a_schema_the_pull_would_never_read() {
+        let one = |name: &str| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().expect("a type")),
+            );
+            Postgres::new().validate_table(&name.parse().expect("a table name parses"), &table)
         };
-        let refusal = Postgres
-            .emit(&change, Strategy::default())
-            .expect_err("nothing can be emitted yet");
-        assert!(refusal.to_string().contains("Phase 5 step 4"), "{refusal}");
+        for name in [
+            "pg_temp.t",
+            "pg_catalog.t",
+            "information_schema.t",
+            "pg_toast.t",
+        ] {
+            let problems = one(name);
+            assert_eq!(problems.len(), 1, "`{name}`: {problems:?}");
+            let message = problems[0].to_string();
+            assert!(message.contains("never reads"), "`{name}`: {message}");
+        }
+        // The negative case, and it is the one that matters: a project schema
+        // whose name merely begins with the same letters as the reader's
+        // exclusion is not excluded by it — the reader compares the first
+        // three characters against `pg_`, so `pga` is a project's schema and
+        // has to stay one.
+        for name in ["pga.t", "app.t", "public.t", "pg.t"] {
+            assert!(one(name).is_empty(), "`{name}` is a project's own");
+        }
+    }
+
+    /// A schema named `$user` is refused for a different reason from the
+    /// hidden ones: the table would be created and read back fine, and what
+    /// breaks is every unqualified name inside it.
+    #[test]
+    fn validating_a_table_refuses_the_schema_name_a_path_substitutes() {
+        let mut table = Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().expect("a type")),
+        );
+        let problems =
+            Postgres::new().validate_table(&pbps_model::TableName::new("$user", "t"), &table);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].to_string().contains("role's own schema"),
+            "{}",
+            problems[0]
+        );
+        // Exactly that name, because the engine compares exactly that name.
+        for ok in ["$users", "$USER", "app"] {
+            assert!(
+                Postgres::new()
+                    .validate_table(&pbps_model::TableName::new(ok, "t"), &table)
+                    .is_empty(),
+                "`{ok}` is an ordinary schema"
+            );
+        }
+    }
+
+    /// A table named as one of the two this tool owns is refused, in any
+    /// schema, because the reader hides it in any schema.
+    ///
+    /// The negative case is the whole reason the reader's filter names the two
+    /// rather than matching a prefix: a project's own `__pbps_customers` is a
+    /// project's table, and refusing it would refuse a declaration the pull
+    /// reads perfectly well.
+    #[test]
+    fn validating_a_table_refuses_the_two_names_this_tool_owns() {
+        let one = |name: &str| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().expect("a type")),
+            );
+            Postgres::new().validate_table(&name.parse().expect("a table name parses"), &table)
+        };
+        for name in ["app.__pbps_state", "app.__pbps_lock", "public.__pbps_state"] {
+            let problems = one(name);
+            assert_eq!(problems.len(), 1, "`{name}`: {problems:?}");
+            assert!(
+                problems[0].to_string().contains("this tool owns"),
+                "`{name}`: {}",
+                problems[0]
+            );
+        }
+        for name in [
+            "app.__pbps_customers",
+            "app.__pbps_statement",
+            "app.pbps_state",
+            "app.customers",
+        ] {
+            assert!(one(name).is_empty(), "`{name}` is a project's own");
+        }
     }
 
     /// Unquoted identifiers fold down, not away: this is the difference from
     /// SQL Server that the loader sees before anything connects.
     #[test]
     fn an_unquoted_identifier_folds_to_lower_case() {
-        assert_eq!(Postgres.fold_ident("Customer"), "customer");
-        assert_eq!(Postgres.fold_ident("CUSTOMER"), "customer");
+        assert_eq!(Postgres::new().fold_ident("Customer"), "customer");
+        assert_eq!(Postgres::new().fold_ident("CUSTOMER"), "customer");
         // Already lower: borrowed, not copied.
-        assert!(matches!(Postgres.fold_ident("customer"), Cow::Borrowed(_)));
+        assert!(matches!(
+            Postgres::new().fold_ident("customer"),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// And it folds the ASCII letters **only**. Measured on 18.6,
@@ -379,12 +837,12 @@ mod tests {
     /// declaration as `aä`, which introspection never returns.
     #[test]
     fn folding_leaves_every_letter_the_engine_leaves() {
-        assert_eq!(Postgres.fold_ident("AÄ"), "aÄ");
-        assert_eq!(Postgres.fold_ident("STRASSE"), "strasse");
-        assert_eq!(Postgres.fold_ident("Straße"), "straße");
+        assert_eq!(Postgres::new().fold_ident("AÄ"), "aÄ");
+        assert_eq!(Postgres::new().fold_ident("STRASSE"), "strasse");
+        assert_eq!(Postgres::new().fold_ident("Straße"), "straße");
         // A name with no ASCII upper case at all is untouched, and borrowed.
-        assert!(matches!(Postgres.fold_ident("Ä"), Cow::Borrowed(_)));
-        assert_eq!(Postgres.fold_ident("Ä"), "Ä");
+        assert!(matches!(Postgres::new().fold_ident("Ä"), Cow::Borrowed(_)));
+        assert_eq!(Postgres::new().fold_ident("Ä"), "Ä");
     }
 
     /// The server truncates a long identifier instead of refusing it, and says
@@ -392,9 +850,13 @@ mod tests {
     /// server naming the same object.
     #[test]
     fn a_name_the_server_would_truncate_is_refused_by_bytes_not_characters() {
-        assert!(Postgres.quote_ident(&"a".repeat(MAX_IDENT_BYTES)).is_ok());
         assert!(
-            Postgres
+            Postgres::new()
+                .quote_ident(&"a".repeat(MAX_IDENT_BYTES))
+                .is_ok()
+        );
+        assert!(
+            Postgres::new()
                 .quote_ident(&"a".repeat(MAX_IDENT_BYTES + 1))
                 .is_err()
         );
@@ -404,19 +866,25 @@ mod tests {
         let long = "ä".repeat(32);
         assert_eq!(long.chars().count(), 32);
         assert_eq!(long.len(), 64);
-        assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
-        assert!(Postgres.quote_ident(&long).is_err());
+        assert!(Postgres::new().quote_ident(&"ä".repeat(31)).is_ok());
+        assert!(Postgres::new().quote_ident(&long).is_err());
     }
 
     /// Quoting is what stops a name from being read as syntax, so the
     /// negative cases are the ones worth having.
     #[test]
     fn quoting_doubles_an_embedded_quote_and_refuses_what_cannot_be_a_name() {
-        assert_eq!(Postgres.quote_ident("customer").unwrap(), "\"customer\"");
-        assert_eq!(Postgres.quote_ident("Odd Name").unwrap(), "\"Odd Name\"");
-        assert_eq!(Postgres.quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
-        assert!(Postgres.quote_ident("").is_err());
-        assert!(Postgres.quote_ident("a\0b").is_err());
+        assert_eq!(
+            Postgres::new().quote_ident("customer").unwrap(),
+            "\"customer\""
+        );
+        assert_eq!(
+            Postgres::new().quote_ident("Odd Name").unwrap(),
+            "\"Odd Name\""
+        );
+        assert_eq!(Postgres::new().quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
+        assert!(Postgres::new().quote_ident("").is_err());
+        assert!(Postgres::new().quote_ident("a\0b").is_err());
     }
 
     /// The three rows of ADR-0011 Amendment 2's table, through this dialect.
@@ -427,24 +895,24 @@ mod tests {
     fn a_definition_is_scanned_with_this_engines_literals_and_not_sql_servers() {
         // `$tag$…$tag$` holds data, and no escape can close it early.
         assert_ne!(
-            Postgres.normalize_definition("SELECT $tag$a  b$tag$"),
-            Postgres.normalize_definition("SELECT $tag$a b$tag$")
+            Postgres::new().normalize_definition("SELECT $tag$a  b$tag$"),
+            Postgres::new().normalize_definition("SELECT $tag$a b$tag$")
         );
         // `\'` does not close an `E'…'` string: measured, `E'it\'s  here'` is
         // one ten-character literal.
         assert_ne!(
-            Postgres.normalize_definition(r"SELECT E'it\'s  here'"),
-            Postgres.normalize_definition(r"SELECT E'it\'s here'")
+            Postgres::new().normalize_definition(r"SELECT E'it\'s  here'"),
+            Postgres::new().normalize_definition(r"SELECT E'it\'s here'")
         );
         // A `[` is a subscript here, so a reindent inside one is not a change.
         assert_eq!(
-            Postgres.normalize_definition("SELECT a[1  +  2] FROM t"),
-            Postgres.normalize_definition("SELECT a[1 + 2] FROM t")
+            Postgres::new().normalize_definition("SELECT a[1  +  2] FROM t"),
+            Postgres::new().normalize_definition("SELECT a[1 + 2] FROM t")
         );
         // And a plain literal is still data, as on any engine.
         assert_ne!(
-            Postgres.normalize_definition("SELECT 'a  b'"),
-            Postgres.normalize_definition("SELECT 'a b'")
+            Postgres::new().normalize_definition("SELECT 'a  b'"),
+            Postgres::new().normalize_definition("SELECT 'a b'")
         );
     }
 
@@ -462,7 +930,7 @@ mod tests {
             ("bigserial", "bigint"),
             ("serial8", "bigint"),
         ] {
-            let error = Postgres
+            let error = Postgres::new()
                 .normalize_type(&ty(declared))
                 .expect_err("a macro is not a type");
             let message = error.to_string();
@@ -480,10 +948,13 @@ mod tests {
     #[test]
     fn a_type_that_is_not_in_the_serial_family_is_left_to_the_catalogue() {
         for spelling in ["integer", "text"] {
-            assert!(Postgres.normalize_type(&ty(spelling)).is_ok(), "{spelling}");
+            assert!(
+                Postgres::new().normalize_type(&ty(spelling)).is_ok(),
+                "{spelling}"
+            );
         }
         for spelling in ["serialized", "bigserialx"] {
-            let message = Postgres
+            let message = Postgres::new()
                 .normalize_type(&ty(spelling))
                 .expect_err("the catalogue does not hold it")
                 .to_string();
@@ -503,7 +974,7 @@ mod tests {
         table
             .columns
             .insert("note".to_owned(), pbps_model::Column::new(ty("text")));
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let serial: Vec<_> = found
             .iter()
             .map(ToString::to_string)
@@ -527,7 +998,8 @@ mod tests {
         table
             .columns
             .insert(long.clone(), pbps_model::Column::new(ty("integer")));
-        let found = Postgres.validate_table(&TableName::new(long.clone(), long.clone()), &table);
+        let found =
+            Postgres::new().validate_table(&TableName::new(long.clone(), long.clone()), &table);
         // The schema, the table and the column: three names, three refusals.
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(
@@ -543,7 +1015,7 @@ mod tests {
         ok.columns
             .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
         assert!(
-            Postgres
+            Postgres::new()
                 .validate_table(&"app.t".parse().unwrap(), &ok)
                 .is_empty()
         );
@@ -557,9 +1029,12 @@ mod tests {
     fn validating_a_table_refuses_every_owned_name_the_emitter_could_not_spell() {
         let long = "a".repeat(MAX_IDENT_BYTES + 1);
         let mut table = Table::default();
-        table
-            .columns
-            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+        table.columns.insert(
+            "id".to_owned(),
+            // `not_null` because a nullable key column is its own finding, and
+            // this test is about names.
+            pbps_model::Column::new(ty("integer")).not_null(),
+        );
         table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some(long.clone()),
             columns: vec!["id".to_owned()],
@@ -576,7 +1051,7 @@ mod tests {
                 expression: "id > 0".to_owned(),
             },
         );
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         // The primary key, the unique constraint and the check: three names.
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(
@@ -611,7 +1086,7 @@ mod tests {
                 increment: 1,
             });
             table.columns.insert("id".to_owned(), column);
-            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
                 accepted,
@@ -654,7 +1129,7 @@ mod tests {
             });
             c
         });
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found.iter().any(|e| e.to_string().contains("nullable")));
         assert!(found.iter().any(|e| e.to_string().contains("`default:`")));
@@ -695,7 +1170,7 @@ mod tests {
             column.nullable = false;
             column.identity = Some(pbps_model::Identity { seed, increment });
             table.columns.insert("id".to_owned(), column);
-            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
                 accepted,
@@ -755,7 +1230,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                Postgres.type_change_risk(&ty(from), &ty(to)),
+                Postgres::new().type_change_risk(&ty(from), &ty(to)),
                 expected,
                 "`{from}` -> `{to}`"
             );
@@ -773,7 +1248,7 @@ mod tests {
                 .columns
                 .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));
         }
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         assert_eq!(found.len(), 2, "{found:?}");
     }
 

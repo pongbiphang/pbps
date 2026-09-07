@@ -376,6 +376,29 @@ refused — see above):
 And the consequence the check exists to prevent: `ALTER TABLE … ADD c int NOT
 NULL DEFAULT --x<CR>NULL` on a table with one row fails with **Msg 515**.
 
+**It happened again in the PostgreSQL emitter, in a scanner written years
+after this section.** The rule there is the same on both counts — measured,
+`'01/02/' <CR> '2026'` is one string constant and `'01/02/' -- c <CR> '2026'`
+is too, because a bare CR both ends a line comment and supplies the newline a
+continued constant needs. The gap scanner was written against `'\n'` alone, so
+a session-decided default written across a CR walked past the guard that exists
+to refuse it (DECISIONS 281).
+
+The lesson is not "remember CR". It is that *this file already said so*, and
+the second scanner still went in with one line ending — and then **the fix for
+it missed its own sibling one screen away**: the same file's `skip_datum`, used
+by the grouping unwrap, kept an LF-only search through that commit, so
+`( -- ) <CR> '01/02/2026')` had its closing parenthesis swallowed and the same
+default walked past the same guard by the other road. The next review found it.
+
+Two things follow. When you write a predicate about where a line ends, in any
+language, grep this file for the character class before choosing one — the
+shape recurs because `\n` is what a person types when they mean "end of line".
+And when you fix one, **grep the file you are editing for the literal you just
+replaced** before pushing: a character class that lives in a named constant is
+what makes the next omission visible, and two spellings of the same rule in one
+file is the state that produced this.
+
 ## `shell_arg` has been wrong about shells five times
 
 **The test written to pin the second fix asserted the bug.**
@@ -407,6 +430,42 @@ was perfectly well formed. Absent, empty and unreadable are three different
 things, and a test that asserts an exit code cannot tell them apart.
 
 `-z` and split on NUL. Never `lines()`, never `trim()`.
+
+## The user's text and our syntax, on one line
+
+Three things a declaration holds are written into the statement **verbatim**,
+because only the engine can say what they mean: a column default, a check
+expression and an index filter (ADR-0013 §3). The emitter's own syntax followed
+each of them on the same line — `);` after a check, `,` after a default in a
+column list, `);` after an index filter, `;` after a `SET DEFAULT`. A line
+comment at the end of the user's text then swallowed it. Measured:
+
+```text
+CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+  -> ERROR: syntax error at end of input
+CREATE TABLE t (a int DEFAULT 1 -- why, b int);
+  -> ERROR: syntax error at end of input
+```
+
+A valid declaration produced a statement that cannot run — in five places, one
+per site, because each site spelled the interpolation itself. The fix is one
+newline, in one helper the five sites call, so the sixth has somewhere to reach
+for (DECISIONS 281).
+
+**And the guard that reads such text needs the same question asked of both
+ends.** The bare-literal guard was taught that a comment is whitespace, then
+that the grouping unwrap must step over data — and the gap between those two
+fixes stayed open for two more rounds: the unwrap tests the *last character*,
+so `('01/02/2026') -- note` could not be unwrapped and the ambiguous default
+went through (DECISIONS 282). Each fix was correct and neither asked what the
+*other* end of the expression looked like.
+
+The general shape: **verbatim text ends in a state, not just in a character.**
+Text copied from a declaration into generated code can leave the reader inside
+a comment, a string or a quote, and everything the generator writes after it on
+that line is then data. Any generator that interpolates user text has to ask
+what state the text can end in, and close it — the same question a templating
+engine answers with escaping and this one answers with a newline.
 
 ## A remedy written where the finding is made
 
@@ -448,6 +507,285 @@ one, every interpolation is in literal position, including the parts that look
 like code. Build the fragment, then hand the whole thing to `literal` — the
 shape `rows.rs` already used for its dynamic collation statement. Then a name
 cannot be interpolated raw, because there is nowhere left to interpolate it.
+
+**And the second engine's counterpart got it wrong in the same place.**
+PostgreSQL's `drop_primary_key` has no `EXEC`; it has a `DO` block whose body
+runs `format('ALTER TABLE … DROP CONSTRAINT %I', pk)`. The first interpolation,
+into `'…'::regclass`, went through `literal` correctly. The second — the format
+string, which *looks* like the statement and is a literal — took the
+bracket-free quoted name raw, and `app."it's"` closed it at the apostrophe. Two
+crates, two dynamic-SQL helpers, one shape, and the second one was written by
+someone who had read the first.
+
+There is one twist worth stating, because getting it wrong the other way is
+just as easy: the `DO` body is *dollar*-quoted, so the format string needs
+**one** level of doubling and not two. The nesting to count is the number of
+single-quoted strings the name sits inside, not the number of quotes of any
+kind.
+
+## A tag a name can spell
+
+The same `DO` block introduced a second way for a name to escape. PostgreSQL's
+lexer scans a dollar-quoted string for its closing tag **literally**, paying no
+attention to quotes inside it — so `$pbps$` appearing anywhere in the body,
+including inside a `'…'` literal, ends the block there. A table named
+`x$pbps$y` is a legal identifier, and `pull` adopts whatever it finds.
+
+Escaping cannot fix this: there is no escape inside a dollar-quoted string, by
+definition. What fixes it is choosing the tag *after* building the body — the
+first of `$pbps$`, `$pbps1$`, … that the body does not contain. A delimiter
+picked before the content is a delimiter the content can forge.
+
+## A setting that cannot take effect where it is written
+
+The obvious way to pin a session setting around one statement is to put the
+`SET` in front of it. Measured on PostgreSQL 18.6, that works for some settings
+and silently does not for others, and which is which is not a matter of taste:
+a multi-statement simple query is **lexed as a whole** before any of it runs,
+and then analysed and executed one statement at a time.
+
+```text
+one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+            -> syntax error: the batch was lexed under the old value
+one batch:  SET LOCAL search_path = bt, btx; CREATE TABLE bt.t (… CHECK (f(id) > 0));
+            -> accepted: `f` resolved through the new path
+```
+
+`search_path` is read at parse *analysis*, so it takes effect for the next
+statement of the same batch. `standard_conforming_strings` is read by the
+*lexer*, so it does not — and the failure is the one that looks like success:
+the emitter would carry a pin it believed in and the server would parse the
+user's literal under whatever the operator's role had set.
+
+The rule that falls out is per-setting, not per-statement: a setting that
+decides how the text *parses* has to be established on an earlier batch, which
+is what `transaction_framing().begin` is for; one that decides how a name
+*resolves* can ride in the statement's own batch. Asking which of the two a
+setting is takes one measurement and cannot be reasoned out from the
+documentation, which describes both as session settings.
+
+## A guard shaped for one carrier of a hazard the model carries three ways
+
+`pbps-pg` learned that a session setting decides what a verbatim expression
+means, and grew a guard: a bare literal default on a date-or-time column is
+refused, because the applying session's `DateStyle` would pick the day. The
+guard was right and it was one third of the sweep. ADR-0013 §3 names **three**
+verbatim expressions — `Column::default`, `CheckConstraint::expression`,
+`Index::filter` — and `CHECK (d >= '01/02/2026')` stores a different date under
+a different `DateStyle` exactly as the default does. Review found it, and the
+fix that covers all three is not a bigger guard.
+
+The two halves are worth separating, because the second was the trap:
+
+- The guard is **type-directed**. A default sits on a column whose type is
+  right there, so "is this literal read through a session-sensitive input
+  function" is answerable. A check expression names columns and carries no
+  type, and no offline rule can tell `'01/02/2026'` inside one from a string
+  that merely looks like a date. Extending the guard by shape would have
+  refused `CHECK (status <> 'deleted')` — a valid plan refused, which is the
+  one outcome worse than the hazard.
+- So the fix went to the **reader** instead of to each carrier: pin the three
+  settings in the transaction framing (DECISIONS 267) and the same text means
+  one thing wherever it appears. One change, all three expressions, and nothing
+  correct refused.
+
+When a hazard is "a setting decides what this text means", count the places the
+model can carry that text before writing the check, and ask whether the fix
+belongs on the text or on the thing reading it. A guard per carrier is a sweep
+you have to repeat every time the model grows a fourth.
+
+**And then the list was closed against the wrong rule twice.** The pin went in with three
+settings — the three that decide what a *temporal* literal is — and the next
+review found a fourth, `timezone_abbreviations`, which `TimeZone = 'UTC'` does
+not cover and which puts the same declared instant fifteen and a half hours
+away. Sweeping for that one found a fifth, `transform_null_equals`, which is
+not an input function at all: it is a parser rewrite that turns
+`CHECK (x = NULL)` into `CHECK (x IS NULL)`, a different predicate from the one
+in the approved plan. Three of the five were already named by ADR-0013 §3 and
+the implementation carried the ones the case at hand had shown.
+
+The list was closed against the wrong rule. "The settings temporal input reads"
+is a category the first three fit and the next two do not; the rule the entries
+were derived from is "a setting that changes what the declared text means",
+which reaches all five and says how to test a sixth. When a list is derived,
+write the derivation next to it — a list whose rule is left implicit gets
+extended by resemblance to its existing members.
+
+**And the exclusions need the same treatment as the entries.** Two settings
+were kept out with a measurement and a reason: `bytea_output` and
+`extra_float_digits` are *output-only*, measured, since a declared expression
+stores the same constraint under `hex`/`1` as under `escape`/`0`. Both halves
+were true and the conclusion was wrong, because "output-only" is a fact about
+where the engine *reads* the setting and the question was whether a plan's
+result depends on it. A cast to text runs a stored value through an output
+function: measured, one approved `ALTER COLUMN b TYPE text` leaves `\x0102`
+under `hex` and `\001\002` under `escape`.
+
+An exclusion carries a claim as load-bearing as an entry's, and it is the half
+nobody re-reads — the entries get exercised by every test that uses them, while
+the reason a setting is absent is exercised by nothing. Write the exclusion's
+measurement *and the case it was measured on*, so the next reader can see what
+it does not cover.
+
+## One change carrying both directions, in a list that orders directions
+
+`order_key` sorts a plan by what each change *is*, and the classes are laid out
+by direction: drops early, so they stop blocking, and adds late, so what they
+name exists. `SetPrimaryKey` carries `from` and `to` in one variant, so it is a
+drop and an add at once — and a variant can only be in one class. It was in the
+addition class, which meant a key that was only being dropped was ordered as if
+it were being added, behind every column change it blocks. Measured, the plan
+that falls out is refused on both engines (DECISIONS 269).
+
+The tell is in `order_key`'s own comment, written for a different case: *"Anything
+with a real order between them belongs in separate classes; this tiebreaker
+cannot express it."* A change that is two directions at once has a real order
+against itself, and no class expresses that.
+
+The first fix keyed the class on the change's *contents* — `to: None` is a drop
+and travels with the drops — because it needed no new class and no renumbering.
+That closed the shape only where one direction is absent, and the next review
+found the other half by the same reasoning: a *replacement* is both directions
+at once, no class is right for it, and the same plan is refused. So the
+replacement became two changes, one per direction, and the ordering question
+answers itself.
+
+Then it happened a third time, to `AlterColumnDefault`, which carries `from`
+and `to` the same way — a default *replaced* on a column that is also being
+retyped has to have the type change run between its halves, and one change
+cannot. Three instances is not a coincidence; it is the shape.
+
+The lesson is the second half, not the first. A variant with one entry per
+*object* rather than one per *direction* cannot be ordered by direction, and
+patching the case where one direction happens to be absent leaves the case
+where neither is. When a model has such a variant, the question is not "which
+class does this belong in" but "does this change have one answer" — and if it
+does not, it is not one change. Splitting it costs the plan a line, and buys
+each half its own class, its own risk and its own place in what a reviewer
+reads.
+
+**And splitting has a downstream cost, which the next review found.** A plan is
+read by things that were written when one change meant one word about a field.
+The apply guard collects what the plan *promises* about each column field and
+holds the closing read to all of it; with the default split in two, one column
+carried `Default(false)` and then `Default(true)`, and no database can satisfy
+both. Measured through the CLI, the three statements applied and the guard then
+called its own result movement — `dbo.t column ``n`` does not have the default
+this plan gives it` — and rolled the whole thing back, so a valid migration
+could not be applied at all.
+
+The same collector already had the answer beside it: the *parts* are keyed by
+name rather than collected, because a redefinition is a drop and an add under
+one name and holding both outcomes refused every one (DECISIONS 169). The
+column fields were a `Vec` because until the split no plan said two things
+about one field. So when you split a change in two, grep for what reads the
+plan as a list of promises — a collector that was correct under "one change,
+one promise" is a contradiction under two, and it fails *after* the statements
+have run, which is the most expensive place to find out (DECISIONS 280).
+
+## An accidental order that was load-bearing
+
+`order_key` puts a column's type change and its default change in the same
+class, and within a class the tiebreaker is the change's `Debug` rendering. So
+`AlterColumnDefault` ran before `AlterColumnType` — by the alphabet, and by
+nothing else. Measured on SQL Server, that alphabet was holding a plan up: an
+`ALTER COLUMN` that changes a type is refused while a default constraint stands
+on the column (5074, with 4922 behind it), and the default's drop happening to
+sort first was the only reason a retyped defaulted column had ever worked.
+
+PostgreSQL needs the opposite for the other half — a default written for the new
+type cannot be set against the old one — so the rank went in as
+`AlterColumnType => -1`, measured on that engine, and quietly broke the other.
+Nothing in either suite covered a retyped column that has a default: the whole
+guarantee lived in a sort that nobody had written down as a guarantee.
+
+Two things to take from it. When you change an order, ask what was relying on
+the old one — including the parts that were relying on it by accident, which
+are exactly the parts no comment mentions. And when a fix is measured on one
+engine, measure the same statement on the other before believing the rank:
+here each engine refuses a *different* end of the same pair, and only running
+both says the answer is three phases rather than two.
+
+## A predicate written from the shape of the first measurement
+
+The guard against a conversion the session's `TimeZone` answers went in with
+one measurement behind it: `timestamp` → `timestamptz` stores a different
+instant under a different zone. The predicate written from it asked **"does the
+offset change"**, which is what that pair does, and the review found the pair
+that does not: `timestamptz` → `timetz` keeps its offset on both sides and is
+still the session's answer — measured, `12:00:00+00` from a `UTC` session and
+`07:00:00-05` from `America/New_York` — because what moves is the *date* part,
+and a zone decides which day a value was in.
+
+The measurement was right and the generalisation was drawn from its silhouette.
+The rule the guard exists for is "the session decides"; "the offset changes" is
+one way that happens, and a predicate that spells the symptom passes everything
+that reaches the same place by another route.
+
+The tell is available before the review: the guard's own doc comment said
+"True for exactly one shape", and a rule that is true for exactly one shape is
+usually a rule that has only been looked at once. When you write a predicate
+from a measurement, enumerate the family the measurement belongs to — here, the
+six date-and-time types and the conversions between them — and check each
+member against the *rule*, not against the example.
+
+## The scanner's rule, respelled from memory in the crate that needed it
+
+`pbps-dialect` records PostgreSQL's identifier grammar as a **byte** rule
+(DECISIONS 233): `[A-Za-z\200-\377_0-9$]`, so every byte of a non-ASCII
+character continues an identifier, and its comment carries the measurement —
+`á` spelled `a` then U+0301 continues a name for the engine and ends one for
+`char::is_alphanumeric`.
+
+`pbps-pg`'s emitter then needed to know where a dollar-quoted literal ends, and
+wrote the tag rule again: `c.is_alphabetic()`, `c.is_alphanumeric()`. The same
+`á` measured the same way — `$á$…$á$` is one literal on 18.6 — read as *not* a
+literal, so the guard that refuses an ambiguous date default never looked at
+it. The rule had been decided, measured and written down, in a crate this one
+already depends on, and the second spelling still went in.
+
+The fix is not a better predicate, it is one predicate: `continues_ident` is
+public now and the emitter calls it. When you find yourself writing a
+character-class test for another system's grammar, search for it first — a rule
+subtle enough to need a DECISIONS entry is subtle enough that your second
+attempt will differ from your first.
+
+## The host language's whitespace, standing in for the engine's
+
+The same shape as the section above, one guard along. The unresolved-default
+guard asks whether a declared default is one bare literal, and a string
+constant may be *continued*: two quoted pieces separated by whitespace with a
+newline in it are one constant. The scanner read that gap with `trim_start`.
+
+`trim_start` is Rust's whitespace. The engine's `{whitespace}` counts a `--`
+comment among it — measured, `'01/02/' -- c ⏎ '2026'` is the single constant
+`01/02/2026` — so a default written that way read as *not* a bare literal and
+went through the guard unrefused, to store February in one environment and
+January in another. And the sibling form is not the sibling rule: a
+`/* … */` comment is whitespace everywhere in this engine *except* in that
+gap, where it ends the continuation outright (DECISIONS 278).
+
+Two lessons, and the second is the one that cost the round:
+
+- A lexical class named the same in two languages is not the same class.
+  `whitespace`, `identifier`, `digit` and `newline` all differ between Rust and
+  PostgreSQL, and `trim_start` is as much a respelling from memory as
+  `is_alphanumeric` was.
+- **Ask which way the guard fails silent.** This one refuses when it says
+  *yes*, so every form it cannot read is a form that gets through. A guard with
+  that polarity has to be told what it does not understand; leaving a
+  construct unhandled is not neutral there, it is a permit.
+
+The second lesson came back in the next round, in the same guard. The unwrap
+that takes `('01/02/2026')` down to its literal counted **every** parenthesis,
+and a comment beside the code said so on purpose: a stray one in a literal can
+only make the test fail, and failing to unwrap merely costs a refusal. Same
+mistake, written down and reviewed and kept — `(/* ) */ '01/02/2026')` is one
+`)` of comment text, and the ambiguous default sails through (DECISIONS 279).
+
+When a comment argues that a guard is *allowed* to be wrong in one direction,
+check that direction against what the guard's answer does, not against how the
+sentence sounds. Both of these read as caution and both were permits.
 
 ## A guard built twice is a guard that fires early
 
@@ -598,6 +936,22 @@ not in the interface, move the *reason* to the interface. The trait now says
 the implementation must not depend on the caller having normalized, and names
 the caller that cannot. Reading the sibling implementation beside the trait is
 the other half, and it is what a call-site sweep is for.
+
+**And a scar can be the wrong shape on the second engine, not just missing.**
+`pbps-mssql` refuses a nullable primary key column because SQL Server refuses
+the table; the rule buys an earlier, clearer failure and nothing else.
+`pbps-pg` had no such rule, and measured, PostgreSQL does not refuse the table
+— it sets `NOT NULL` itself and says nothing. The same missing rule is
+therefore a *different and worse* defect on the second engine: not a late
+failure but no failure, a declaration silently rewritten, and every plan
+afterwards proposing a `DROP NOT NULL` the engine refuses with `column "id" is
+in a primary key`.
+
+Copying the rule across would have got the right behaviour for the wrong
+reason, and the comment would have said "the engine refuses this" about an
+engine that does not. Port the *question* the rule asks, then measure the
+second engine's answer — it can be worse than the first one's, which is not
+what "inherit the scar" leads you to expect.
 
 ## One match arm, two directions, one direction's reason
 

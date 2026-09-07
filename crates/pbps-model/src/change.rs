@@ -687,6 +687,27 @@ pub enum ColumnPromise<'a> {
     Default(bool),
 }
 
+impl ColumnPromise<'_> {
+    /// Which field this promise is about.
+    ///
+    /// The pairing is here rather than at the caller because one plan can
+    /// carry **two promises about one field**: a column that changes type and
+    /// replaces its default gives up the old one, changes type and takes the
+    /// new one (DECISIONS 271), which promises `Default(false)` and then
+    /// `Default(true)`. A caller holding the closing read to both would refuse
+    /// every such plan after applying it — DECISIONS 169's shape, one field
+    /// along — so it needs to key them, and keying needs one spelling of what
+    /// a promise is about.
+    pub fn field(&self) -> ColumnField {
+        match self {
+            ColumnPromise::Whole(_) => ColumnField::Whole,
+            ColumnPromise::Type(_) => ColumnField::Type,
+            ColumnPromise::Nullable(_) => ColumnField::Nullable,
+            ColumnPromise::Default(_) => ColumnField::Default,
+        }
+    }
+}
+
 /// Whether a name is there once this plan has run.
 ///
 /// For the caller that has to check a plan did what it said: a `CREATE` that

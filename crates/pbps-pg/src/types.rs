@@ -730,6 +730,78 @@ fn temporal_cast_exists(from: Components, to: Components) -> bool {
     )
 }
 
+/// Whether the result of this change is decided by the applying session's
+/// `TimeZone` rather than by anything declared.
+///
+/// True for two shapes, and both are the same question asked twice: a
+/// date-or-time type gaining or losing its offset, and one keeping its offset
+/// while the date part comes or goes.
+/// The engine reads a naive value in the session's zone on the way in, and
+/// writes one back out in it on the way out — **measured**, the same
+/// `ALTER COLUMN t TYPE timestamptz` over a stored `2026-01-02 12:00` gives
+/// `12:00:00+00` from a `UTC` session and `17:00:00+00` from
+/// `America/New_York`. Two operators applying the same approved plan store two
+/// different instants, and nothing afterwards can tell which happened.
+///
+/// [`change_risk`] already knows this — its temporal arm requires `ao == bo`
+/// and says why — but it can only answer `Narrowing`, and `Narrowing` is a risk
+/// class a human clears at the gate. What a human cleared was the loss, not the
+/// zone: the zone was never in the plan to approve. So this is a separate
+/// question with a separate answer, and the emitter refuses on it the way it
+/// refuses a `USING` clause (ADR-0012 §5) — a transformation nobody declared is
+/// not one a tool gets to choose.
+///
+/// Both types must already be normalized, as everywhere else here.
+pub fn depends_on_the_session_time_zone(from: &ColumnType, to: &ColumnType) -> bool {
+    match (family(from), family(to)) {
+        (
+            Family::Temporal {
+                has_date: ad,
+                has_offset: ao,
+                ..
+            },
+            Family::Temporal {
+                has_date: bd,
+                has_offset: bo,
+                ..
+            },
+        ) => {
+            // A zone has to be involved at all — with no offset on either side
+            // there is nothing for `TimeZone` to be read into, and `date` into
+            // `timestamp` is midnight either way.
+            //
+            // And one pair with a zone is still not the session's: `timetz`
+            // physically stores a local time *and* its offset, so dropping the
+            // offset keeps the time that is already there. Measured,
+            // `12:00:00+03` into `time` is `12:00:00` from a `UTC` session and
+            // from an `America/New_York` one alike. `timestamptz` is the
+            // opposite, and that is why the exception is this narrow: it holds
+            // an *instant*, so writing it without a zone means choosing one —
+            // measured, the same value into `timestamp` is `12:00:00` under
+            // UTC and `07:00:00` under New York. What decides it is what the
+            // type holds, not which way the offset went.
+            let a_projection = ao && !bo && !ad && !bd;
+            (ao || bo)
+                // Then either end of the zone moves: the offset is gained or
+                // lost, or the value is rebased because the *date* is. The
+                // second is the one an earlier version of this missed, because
+                // it read the hazard as "the offset changes" rather than as
+                // "the session decides". `timestamptz` into `timetz` keeps its
+                // offset and is still the session's answer — measured, one
+                // stored `2026-01-02 12:00:00+00` becomes `12:00:00+00` from a
+                // `UTC` session and `07:00:00-05` from `America/New_York`.
+                //
+                // On the pair rather than on one side, because both directions
+                // are the same question: a date part appearing is a value
+                // being placed in a day, and one disappearing is a value being
+                // read out of one, and a zone decides both.
+                && (ao != bo || ad != bd)
+                && !a_projection
+        }
+        _ => false,
+    }
+}
+
 /// A date-or-time type as `(has_date, has_time, has_offset)`.
 type Components = (bool, bool, bool);
 
@@ -1505,6 +1577,69 @@ mod tests {
             assert_eq!(
                 risk(from, to),
                 TypeChangeRisk::Narrowing,
+                "`{from}` -> `{to}`"
+            );
+        }
+    }
+
+    fn normalized(name: &str) -> ColumnType {
+        normalize(&ty(name)).expect("normalizes")
+    }
+
+    /// The zone question is asked of the pair, not of the risk class: every row
+    /// below is `Narrowing` (above), and a human clearing a `Narrowing` at the
+    /// gate has cleared the loss, not a reinterpretation nobody wrote down.
+    #[test]
+    fn a_conversion_that_gains_or_loses_the_zone_is_the_sessions_to_decide() {
+        for (from, to) in [
+            ("timestamp", "timestamptz"),
+            ("timestamptz", "timestamp"),
+            ("time", "timetz"),
+            // No time part on one end and a zone gained on the other is the
+            // same hazard: midnight, in whichever zone the session holds.
+            ("date", "timestamptz"),
+            ("timestamptz", "date"),
+            // The offset survives and the answer is still the session's: the
+            // date part is what moves, and the value is rebased to lose it.
+            ("timestamptz", "timetz"),
+            ("timetz", "timestamptz"),
+        ] {
+            assert!(
+                depends_on_the_session_time_zone(&normalized(from), &normalized(to)),
+                "`{from}` -> `{to}`"
+            );
+        }
+    }
+
+    /// The negative half, and the one that matters: this must not become a
+    /// second name for "temporal". Every pair here converts under a rule the
+    /// engine holds, not under a setting, and refusing one would refuse a
+    /// declaration a plan is allowed to make.
+    #[test]
+    fn a_conversion_that_keeps_the_zone_where_it_was_is_not() {
+        for (from, to) in [
+            ("timestamp", "date"),
+            ("date", "timestamp"),
+            ("timestamptz", "timestamptz"),
+            // The one pair with a zone that is still not the session's:
+            // `timetz` stores the offset beside the local time, so dropping it
+            // keeps what is already there. Refusing it would refuse a valid
+            // plan, and the loss it does carry is what `Narrowing` is for.
+            ("timetz", "time"),
+            // Both ends carry an offset *and* a date part, so nothing is
+            // rebased — the pin against the widened rule becoming "any two
+            // types that can hold a zone".
+            ("timetz", "timetz"),
+            ("timestamp", "timestamp"),
+            ("time", "time"),
+            ("interval", "interval"),
+            // Not temporal at all on one end: nothing to read a zone in.
+            ("text", "timestamptz"),
+            ("timestamptz", "text"),
+            ("integer", "bigint"),
+        ] {
+            assert!(
+                !depends_on_the_session_time_zone(&normalized(from), &normalized(to)),
                 "`{from}` -> `{to}`"
             );
         }

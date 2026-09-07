@@ -376,6 +376,7 @@ fn diff_columns(
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        let retyped = from_ty != to_ty;
         // A type change subsumes a nullability change rather than sitting beside
         // one: `ALTER COLUMN` restates the whole definition, so two changes would
         // mean two statements where the second undoes half of the first.
@@ -397,12 +398,35 @@ fn diff_columns(
             });
         }
         if base_col.default != col.default {
+            // A default that is *replaced* on a column this same plan retypes
+            // is two changes, because the type change has to run between them.
+            // Measured on SQL Server, an `ALTER COLUMN` that changes the type
+            // is refused while any default constraint stands — 5074, "the
+            // object 'df_dn2' is dependent on column 'n'", with 4922 behind it
+            // — and the nullability form of the same statement is accepted, so
+            // the dependency is the type's and not `ALTER COLUMN`'s.
+            //
+            // Only when the type moves, and only when there is an old default
+            // *and* a new one. A default replaced on a column that keeps its
+            // type needs no drop: `SET DEFAULT` replaces on PostgreSQL, and
+            // the SQL Server emitter already drops and adds inside its one
+            // statement. Splitting it there would put two lines at opposite
+            // ends of the plan where one says it better (SPEC §14.1).
+            let split = retyped && base_col.default.is_some() && col.default.is_some();
             changes.push(Change::AlterColumnDefault {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 from: base_col.default.clone(),
-                to: col.default.clone(),
+                to: if split { None } else { col.default.clone() },
             });
+            if split {
+                changes.push(Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: declared_ref.clone(),
+                    from: None,
+                    to: col.default.clone(),
+                });
+            }
         }
         if base_col.deprecated != col.deprecated {
             changes.push(Change::SetColumnDeprecated {
@@ -485,11 +509,42 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         (b, d) => b != d,
     };
     if pk_differs {
+        // A key that is *replaced* is emitted as two changes: the old one's
+        // drop, and the new one's add. One change carrying both directions can
+        // only be in one ordering class, and the two halves need opposite
+        // ones — the drop before every column change a standing key blocks
+        // (DECISIONS 269), the add after every column its new shape may name.
+        // Measured, the plan that came out of one change was refused:
+        // `PRIMARY KEY (id)` becoming `PRIMARY KEY (other)` while `id` is
+        // relaxed ran `DROP NOT NULL` against a column `pk_t` still held —
+        // `42P16` on PostgreSQL, 5074 with 4922 behind it on SQL Server.
+        //
+        // No model change and no new SQL: both emitters already emit the two
+        // halves independently, so the statements are the ones they were and
+        // only their positions move. `from: None` on the add half is accurate
+        // where it runs, because the drop half has already taken the key away.
+        //
+        // The risk classes follow, and follow correctly: a replacement now
+        // carries `Destructive` for the key it gives up as well as
+        // `Constraint` for the key it takes, which is what happens to the
+        // database (DECISIONS 270).
+        let split = base.primary_key.is_some() && declared.primary_key.is_some();
         changes.push(Change::SetPrimaryKey {
             table: name.clone(),
             from: base.primary_key.clone(),
-            to: declared.primary_key.clone(),
+            to: if split {
+                None
+            } else {
+                declared.primary_key.clone()
+            },
         });
+        if split {
+            changes.push(Change::SetPrimaryKey {
+                table: name.clone(),
+                from: None,
+                to: declared.primary_key.clone(),
+            });
+        }
     }
 
     macro_rules! by_name {
@@ -954,9 +1009,7 @@ fn dependency_rank(
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
@@ -985,6 +1038,29 @@ fn dependency_rank(
         // tiebreaker it had.
         Change::AddForeignKey { .. } => 1,
         Change::DropForeignKey { .. } => -1,
+        // A column's new type goes in before a default written for it. They
+        // share class 9 and the tiebreaker below is the change's rendering,
+        // which sorts `AlterColumnDefault` ahead of `AlterColumnType` by the
+        // alphabet — so a default that only fits the new type was set against
+        // the old one. Measured, PostgreSQL refuses `SET DEFAULT 'abc'` on an
+        // `integer` column with "invalid input syntax for type integer", and
+        // the plan that widened the column to `text` in the next statement
+        // rolled back.
+        //
+        // A constant, like the foreign key's above and for the same reason:
+        // the dependency is a layering, not a graph. A type change never needs
+        // a default that is already there, and the nullability travels inside
+        // the type change rather than beside it.
+        Change::AlterColumnType { .. } => -1,
+        // And the old default goes before the type, which makes the three
+        // phases a column can need one rank each: drop the default the old
+        // type gave meaning to, change the type, install the default written
+        // for the new one. Measured, SQL Server refuses the middle statement
+        // while the first one's constraint stands (5074 with 4922 behind it),
+        // and `diff_columns` splits a *replaced* default into these two halves
+        // when the type moves, so both ranks have something to order.
+        Change::AlterColumnDefault { to: None, .. } => -2,
+        Change::AlterColumnDefault { to: Some(_), .. } => 0,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -1222,10 +1298,29 @@ fn order_key(c: &Change) -> u8 {
         // asking which columns a check's expression names, which this tool
         // deliberately never parses (DECISIONS 174). `DropForeignKey`'s rank
         // travels with them and still puts it ahead of the key it references.
+        //
+        // A primary key that is *only* dropped is one of these drops and
+        // travels with them. It was left in the addition class below because
+        // one variant carries both directions, and a key that is still there
+        // blocks the column changes every class from here down can make:
+        // measured, `DROP NOT NULL` on a key column is `42P16` on PostgreSQL
+        // and 5074 with 4922 behind it on SQL Server, and dropping the column
+        // outright is the same 5074. So a declaration that gives up a key and
+        // relaxes its column produced a plan neither engine would perform.
+        //
+        // Only `to: None`, and that is not a partial answer: a key being
+        // *replaced* is emitted as two changes, its drop and its add (see
+        // `diff_constraints`), so the drop arrives here and the add stays
+        // below, where the columns its new shape may name have been added.
+        //
+        // `dependency_rank` already keeps a foreign-key drop ahead of it
+        // inside this class, which is the order the engine requires and the
+        // reason that rank exists.
         Change::DropIndex { .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. } => 2,
+        | Change::DropCheck { .. }
+        | Change::SetPrimaryKey { to: None, .. } => 2,
         // A class of its own, after the table renames: `sp_rename` on a column
         // names the table, and `resolve_columns` iterates the *declared*
         // schema, so a `RenameColumn` always carries the post-rename table.
@@ -2663,6 +2758,182 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
             "{blockers:?}"
+        );
+    }
+
+    /// A declaration that gives up a primary key and relaxes the column it
+    /// held produces a plan that runs the key's drop first, because neither
+    /// engine will relax a column a key still names.
+    ///
+    /// Measured, both refuse: PostgreSQL answers `42P16`, "column \"id\" is in
+    /// a primary key", and SQL Server answers 5074 with 4922 behind it. The
+    /// plan was valid, reviewed and unapplicable — the shape this ordering
+    /// exists to prevent.
+    ///
+    /// The same class also puts the drop ahead of `DropColumn` at 5, which is
+    /// the other half: SQL Server refuses to drop a column its key names, with
+    /// the same 5074.
+    #[test]
+    fn a_key_is_dropped_before_the_column_it_held_is_relaxed() {
+        let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+        base_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let base = schema_of("dbo.t", base_t);
+        let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
+
+        let cs = run(&base, &declared, &[]);
+        let order: Vec<_> = cs
+            .changes
+            .iter()
+            .map(|p| std::mem::discriminant(&p.change))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                std::mem::discriminant(&Change::SetPrimaryKey {
+                    table: "dbo.t".parse().unwrap(),
+                    from: None,
+                    to: None,
+                }),
+                std::mem::discriminant(&Change::AlterColumnNullability {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                    column: pbps_model::ColumnRef {
+                        table: "dbo.t".parse().unwrap(),
+                        name: "id".to_owned(),
+                    },
+                    ty: ty("int"),
+                    to_nullable: true,
+                }),
+            ],
+            "the key has to go first: {:#?}",
+            cs.changes
+        );
+    }
+
+    /// A column with a default and a new type is three phases, one rank each:
+    /// the old default out, the type changed, the new default in.
+    ///
+    /// Both kinds are class 9, so the tiebreaker decided the order, and the
+    /// tiebreaker is the change's rendering — which puts `AlterColumnDefault`
+    /// ahead of `AlterColumnType` by the alphabet and nothing else. Each end of
+    /// that is refused by an engine, and both are measured:
+    ///
+    /// - the new default first: `SET DEFAULT 'abc'` on an `integer` column is
+    ///   "invalid input syntax for type integer" on PostgreSQL;
+    /// - the type first: `ALTER COLUMN n bigint` is refused by SQL Server while
+    ///   a default constraint stands on the column — 5074, with 4922 behind it.
+    ///   The nullability form of the same statement is *accepted*, so the
+    ///   dependency belongs to the type change and not to `ALTER COLUMN`.
+    ///
+    /// So a replaced default on a retyped column is split into its two halves
+    /// (`diff_columns`), and the three ranks put the type between them.
+    #[test]
+    fn a_retyped_column_drops_its_old_default_changes_type_then_takes_the_new_one() {
+        let with = |t: &str, d: &str| Column {
+            default: Some(d.to_owned()),
+            ..Column::new(ty(t))
+        };
+        let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+        let declared = schema_of("dbo.t", table(&[("n", with("nvarchar(10)", "'abc'"))]));
+        let cs = run(&base, &declared, &[]);
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+        };
+        let out = at(|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
+        let retype = at(|c| matches!(c, Change::AlterColumnType { .. }));
+        let into = at(|c| matches!(c, Change::AlterColumnDefault { to: Some(_), .. }));
+        assert!(
+            out < retype && retype < into,
+            "out {out}, retype {retype}, into {into}: {:#?}",
+            cs.changes
+        );
+    }
+
+    /// The negative half: a default replaced on a column that keeps its type
+    /// stays one change. Nothing has to run between the halves, `SET DEFAULT`
+    /// replaces on PostgreSQL, and SQL Server's emitter already drops and adds
+    /// inside its own statement — so splitting would put two lines at opposite
+    /// ends of a plan where one says it better.
+    #[test]
+    fn a_default_replaced_without_a_retype_stays_one_change() {
+        let with = |t: &str, d: &str| Column {
+            default: Some(d.to_owned()),
+            ..Column::new(ty(t))
+        };
+        let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+        let declared = schema_of("dbo.t", table(&[("n", with("int", "1"))]));
+        let cs = run(&base, &declared, &[]);
+        assert_eq!(
+            cs.changes.len(),
+            1,
+            "one change, not two: {:#?}",
+            cs.changes
+        );
+        assert!(
+            matches!(
+                cs.changes[0].change,
+                Change::AlterColumnDefault {
+                    from: Some(_),
+                    to: Some(_),
+                    ..
+                }
+            ),
+            "{:#?}",
+            cs.changes
+        );
+    }
+
+    /// A key that is **replaced** is two changes, and they go to opposite ends
+    /// of the plan: the old one's drop with the constraint drops, the new
+    /// one's add after every column its shape may name.
+    ///
+    /// One change cannot do it. The add may name a column this same plan is
+    /// still adding at class 8 — so a replacement could not simply join the
+    /// drops — and the drop has to precede every column change a standing key
+    /// blocks. The halves need opposite classes, so they are separate changes;
+    /// both emitters already emitted the two statements independently, and
+    /// only their positions move.
+    #[test]
+    fn a_replaced_key_is_dropped_before_its_old_columns_and_added_after_its_new_ones() {
+        let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+        base_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let base = schema_of("dbo.t", base_t);
+        // The declaration replaces the key, adds the column the new key names,
+        // and relaxes the column the old key held — every dependency in one
+        // plan.
+        let mut declared_t = table(&[
+            ("id", Column::new(ty("int"))),
+            ("other", Column::new(ty("int")).not_null()),
+        ]);
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["other".to_owned()],
+        });
+        let declared = schema_of("dbo.t", declared_t);
+
+        let cs = run(&base, &declared, &[]);
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+        };
+        let drop = at(|c| matches!(c, Change::SetPrimaryKey { to: None, .. }));
+        let relaxed = at(|c| matches!(c, Change::AlterColumnNullability { .. }));
+        let added = at(|c| matches!(c, Change::AddColumn { .. }));
+        let add = at(|c| matches!(c, Change::SetPrimaryKey { from: None, .. }));
+        assert!(
+            drop < relaxed && added < add,
+            "drop {drop}, relaxed {relaxed}, added {added}, add {add}: {:#?}",
+            cs.changes
         );
     }
 
@@ -4460,8 +4731,14 @@ mod tests {
             &mut changes,
         );
         assert!(
-            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
-            "{changes:?}"
+            matches!(
+                changes.as_slice(),
+                [
+                    Change::SetPrimaryKey { to: None, .. },
+                    Change::SetPrimaryKey { from: None, .. }
+                ]
+            ),
+            "a replaced key is its drop and its add: {changes:?}"
         );
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
@@ -4475,7 +4752,13 @@ mod tests {
             &mut changes,
         );
         assert!(
-            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
+            matches!(
+                changes.as_slice(),
+                [
+                    Change::SetPrimaryKey { to: None, .. },
+                    Change::SetPrimaryKey { from: None, .. }
+                ]
+            ),
             "a named key is compared in full: {changes:?}"
         );
     }
