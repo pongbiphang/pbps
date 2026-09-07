@@ -36,12 +36,20 @@ use crate::introspect::{
 /// The schemas that are never a project's.
 ///
 /// `pg_catalog` and `information_schema` are the engine's; `pg_toast` and the
-/// `pg_temp_*`/`pg_toast_temp_*` schemas are its bookkeeping. The `__pbps_`
-/// filter drops this tool's own state and lock tables, which arrive at Phase 5
-/// step 8 — they must never enter the managed set, or the tool would plan
-/// changes to itself.
+/// `pg_temp_*`/`pg_toast_temp_*` schemas are its bookkeeping.
 const NOT_A_PROJECTS_SCHEMA: &str =
     "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%'";
+
+/// This tool's own tables, which arrive at Phase 5 step 8. They must never
+/// enter the managed set, or the tool would plan changes to itself.
+///
+/// **By name, not by prefix.** `NOT LIKE '\_\_pbps\_%'` also hides a
+/// project's own `app.__pbps_customers`, and nothing refuses that declaration —
+/// so the pull reported the table absent and the next plan tried to create one
+/// that was already there. The two names SPEC §8.1 defines are the two tables
+/// this tool owns; a step that adds a third adds it here, where a reader can
+/// see what the list is for. The SQL Server pull still filters by prefix (#170).
+const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
 
 /// `relkind = 'r'`, and the filter is the whole point: `pg_attribute` holds a
 /// row for every index and sequence column too, so a reader without it reports
@@ -58,7 +66,7 @@ fn tables_query() -> String {
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
         AND {NOT_A_PROJECTS_SCHEMA}
-        AND c.relname NOT LIKE '\\_\\_pbps\\_%'
+        AND {NOT_ONE_OF_OURS}
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
         AND NOT c.relrowsecurity
         AND c.relpersistence = 'p'
@@ -89,7 +97,7 @@ fn partitioned_query() -> String {
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
       WHERE {NOT_A_PROJECTS_SCHEMA}
-        AND c.relname NOT LIKE '\\_\\_pbps\\_%'
+        AND {NOT_ONE_OF_OURS}
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
@@ -760,7 +768,11 @@ mod tests {
             ("TABLES", tables_query()),
             ("PARTITIONED", partitioned_query()),
         ] {
-            assert!(sql.contains("\\_\\_pbps\\_%"), "{name}: {sql}");
+            assert!(sql.contains(NOT_ONE_OF_OURS), "{name}: {sql}");
+            // By name: a prefix would also hide a project's own table
+            // (`app.__pbps_customers`), which nothing refuses at declaration
+            // time, and the pull would report it absent.
+            assert!(!sql.contains("pbps\\_%"), "{name}: {sql}");
         }
     }
 }

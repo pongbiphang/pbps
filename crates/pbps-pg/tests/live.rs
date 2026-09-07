@@ -1512,7 +1512,11 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
-             CREATE TABLE {s}.__pbps_state (id integer)"
+             CREATE TABLE {s}.__pbps_state (id integer);
+             CREATE TABLE {s}.__pbps_lock (id integer);
+             -- Not this tool's: nothing refuses this declaration, so hiding it
+             -- would report a table that is there as absent.
+             CREATE TABLE {s}.__pbps_customers (id integer)"
         ),
     )
     .await;
@@ -1781,6 +1785,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     assert_eq!(
         ours(&pulled, &s),
         [
+            // Not this tool's table: the filter that keeps `__pbps_state` and
+            // `__pbps_lock` out names them, and a prefix would have reported a
+            // project's own table as absent.
+            pbps_model::TableName::new(&s, "__pbps_customers"),
             // The inheritance parent is an ordinary table and stays.
             pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "borrowing"),
