@@ -792,6 +792,16 @@ stop mending the bookkeeping and derive the answer from the thing itself.**
 
 ## Tests that pass for the wrong reason
 
+**And its mirror: a test that is green under the command you happened to run.**
+The three introspection live tests each built a probe schema named from the
+process id, and each dropped it before creating it. Run with
+`--test-threads=1` — the command a developer reaches for while writing one —
+all three passed. Run through `scripts/live-tests-pg.sh`, which does not
+serialise, two of them destroyed the third's schema mid-read. The failure was
+loud, so this cost minutes rather than a release; the lesson is that **the local
+command and the CI command are two different tests**, and only one of them
+counts. A fixture name must be unique per test, not per process.
+
 Eleven so far, every one invisible in a green run. **Assert the specific failure,
 not merely that something failed.**
 

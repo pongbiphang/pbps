@@ -10,12 +10,11 @@ repository.workspace = true
 [dependencies]
 pbps-model.workspace = true
 pbps-dialect.workspace = true
-
-# The live suite connects, so it needs the seam — as a dev-dependency, because
-# nothing in this crate holds a connection yet. Introspection (Phase 5 step 3)
-# is what promotes it.
-[dev-dependencies]
+# Promoted from a dev-dependency by introspection (Phase 5 step 3): `catalog`
+# holds a connection, and it is the only file in this crate that does.
 pbps-db.workspace = true
+
+[dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
 
 [lints]

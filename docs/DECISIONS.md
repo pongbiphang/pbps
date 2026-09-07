@@ -4266,3 +4266,35 @@ SPEC is in sync with all of these.
     the declarations and the ids file and so is in neither `appeared` nor
     `disappeared`. A test pins that, so nobody widens the guard onto a case
     that is covered.
+247. **A catalog row of a kind the reader does not know is reported, never
+    folded into the nearest kind it does.** `pg_constraint.contype` is an open
+    set at the engine's end, and PostgreSQL 18 proved it: every `NOT NULL` now
+    has a constraint row of kind `n`. A reader that had parsed the characters it
+    knew into an enum and let the rest fall through to "a check" would have
+    started reporting one phantom check per `NOT NULL` column on an engine
+    upgrade — and the differ would have planned to drop each one. So the kind
+    travels as the engine's own character, the assembler matches the kinds it
+    holds, and anything else becomes a named limitation carrying the
+    constraint's own definition. The cost is a warning on a database using a
+    feature pbps does not manage; the alternative is a plan against a phantom.
+
+248. **A foreign key whose referential action the model cannot spell is left
+    out and named, not read back as the nearest action it can.** PostgreSQL has
+    `RESTRICT` and `ReferentialAction` does not. The two are close enough to
+    tempt: `NO ACTION` and `RESTRICT` both refuse the delete. They are not the
+    same — `NO ACTION` is checked at the end of the statement and can be
+    deferred, `RESTRICT` fires immediately — so a pull that folded one into the
+    other would let a plan replace a key's behaviour while reporting no change
+    at all. The key is therefore absent from the pull and present in the
+    warnings, which is the shape every other unexpressible fact takes here.
+
+249. **A foreign key's referenced columns are read out of
+    `pg_get_constraintdef`, not resolved with a second catalog join.**
+    `confkey` holds attnums on the *referenced* table, which the constrained
+    table's attnum map cannot answer for. Resolving them properly means another
+    join, and it would put the answer inside the query file — where no test can
+    reach it without a server. The definition already spells them and its shape
+    is fixed, so the assembler parses it there, in the pure half, and refuses
+    the parse when the column count disagrees with `confkey`. A misparse
+    becomes a named limitation rather than a foreign key over the wrong
+    columns.
