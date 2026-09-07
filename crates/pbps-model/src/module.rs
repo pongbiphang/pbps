@@ -431,7 +431,7 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 /// `creation_order` takes the *widest* of these that still tells the
 /// declarations apart. Which one that is cannot be decided per database — the
 /// scan runs in the loader, with nothing to ask — but it can be decided per
-/// name, from the declarations themselves (DECISIONS 240).
+/// name, from the declarations themselves (DECISIONS 245).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
     /// The usual answer: a database collation is case-insensitive far more
@@ -644,7 +644,7 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
 /// comparison said it would -- `CAFÉ` and `café` are one table, and so are `Σ`
 /// and `σ`. An ASCII fold left the accented halves untouched, so the scan found
 /// no edge and `creation_order` was free to put a view before the table it
-/// reads (DECISIONS 240).
+/// reads (DECISIONS 245).
 ///
 /// It is an approximation, not the collation. Every single-character
 /// lower-case mapping in the BMP was put to the engine: this fold agrees with
@@ -763,7 +763,7 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
     // folds nothing there either — but it does not have to, because both
     // colliding declarations are right here. Each name therefore gets the
     // widest fold that still tells it from every other declaration
-    // (DECISIONS 240).
+    // (DECISIONS 245).
     //
     // Grouped by the name each fold reads, and counted by the *distinct*
     // spellings in a group, so that two overloads of one routine — the same
@@ -1119,7 +1119,7 @@ mod tests {
     ///
     /// The collision is visible without a connection, so the pair is compared
     /// with the widest fold that still separates them — here the ASCII one,
-    /// which every case-insensitive collation performs (DECISIONS 240).
+    /// which every case-insensitive collation performs (DECISIONS 245).
     #[test]
     fn two_declarations_that_fold_to_one_name_are_told_apart() {
         let upper = "dbo.CAF\u{c9}";
@@ -1636,7 +1636,7 @@ mod tests {
     /// agreeing on. No fold short of the collation itself gets this right: the
     /// engine folds U+212B to `å` and does *not* fold U+212A to `k`, and for
     /// 149 of the 216 the three collations do not even agree with each other
-    /// (DECISIONS 240).
+    /// (DECISIONS 245).
     ///
     /// `creation_order` narrows what this costs: where both spellings are
     /// *declared*, it sees the collision and drops back to the ASCII fold,

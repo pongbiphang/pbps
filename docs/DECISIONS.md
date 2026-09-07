@@ -4112,8 +4112,7 @@ SPEC is in sync with all of these.
     cannot represent — put through a real server, with `Safe` asserted as *the
     statement runs and the value does not change*.
 
-
-240. **The dependency scan folds case for the whole alphabet, character for
+245. **The dependency scan folds case for the whole alphabet, character for
     character, and is knowingly wider than the collation in three places.**
     `references` lower-cased both sides with `to_ascii_lowercase`. The two
     sides agreed with each other, so ASCII names were right; they did not
