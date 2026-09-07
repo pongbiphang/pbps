@@ -416,6 +416,13 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // findable under neither the baseline's name nor the plan's.
         Change::RenameTable { from, to, .. } => rename_table(pg, from, to),
 
+        // No `own_batch`, and that is the difference from T-SQL rather than an
+        // omission: measured, `ALTER TABLE t ADD COLUMN c int; ALTER TABLE t
+        // ADD CONSTRAINT ck CHECK (c > 0); CREATE INDEX ix ON t (c);` is
+        // accepted as one batch here, because PostgreSQL analyses each
+        // statement of a simple query when it reaches it. What it *does* read
+        // up front is the whole batch's *lexis*, which is why
+        // `standard_conforming_strings` is pinned by the framing and not here.
         Change::AddColumn {
             table,
             name,
@@ -434,11 +441,6 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             .creating(Created::Column(table.clone(), name.clone())),
         ]),
 
-        // No `own_batch`: unlike T-SQL, a statement later in the same batch may
-        // name a column an earlier one added — PostgreSQL analyses each
-        // statement of a simple query when it reaches it, not the batch up
-        // front. (What it *does* lex up front is the whole batch, which is why
-        // `standard_conforming_strings` is pinned by the framing and not here.)
         Change::DropColumn { column, .. } => one(
             pg,
             &column.table,
