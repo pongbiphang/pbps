@@ -4528,18 +4528,27 @@ SPEC is in sync with all of these.
     *spelling* is ambiguous, which is a question about a value and therefore the
     engine's to answer.
 
-    So the boundary this draws is a different one, and it is worth stating
-    exactly: a **bare** literal is the one shape that can never round-trip,
-    because `pg_get_expr` always reads a default back with a cast welded on
-    (ADR-0013 §4) — the declaration and the database would disagree on every
-    plan after the bootstrap, for ever, which is the shipped SQL Server loop
-    DECISIONS 208 closed. A **typed** literal that is not the engine's own
-    rendering keeps the session dependence and is not refused, and that gap is
-    deliberate: the only offline rule that closes it also refuses
-    `'2026-01-02'::date`, which is a correct declaration and the one `pull`
-    itself writes, with no remedy a message could name. ADR-0013 §3 closes it at
-    plan time, connected, and that resolver arrives with the step that has a
-    caller for it.
+    So the boundary this draws is between *provably* unresolved and *possibly*
+    resolved. Measured, this engine reads every string default back with a cast
+    welded on — `'unnamed'` becomes `'unnamed'::text` — so a bare literal is
+    certainly not the engine's own rendering and certainly not canonical, and
+    refusing it costs nothing a declaration could want. A cast form may be that
+    rendering, and usually is: it is what `pull` writes.
+
+    A **typed** literal that is not the engine's rendering keeps the session
+    dependence and is not refused, and that gap is deliberate: the only offline
+    rule that closes it also refuses `'2026-01-02'::date`, which is a correct
+    declaration and the one `pull` itself writes, with no remedy a message could
+    name. ADR-0013 §3 closes it at plan time, connected, and that resolver
+    arrives with the step that has a caller for it (issue #173).
+
+    **None of this is about the plan converging**, and a first version of this
+    paragraph said it was. The state records what each object was declared as
+    beside what it read back (DECISIONS 207–209), so a declaration in any
+    spelling goes quiet after the apply that records it — that is what closed
+    the shipped SQL Server loop (DECISIONS 208), and it closes this one too.
+    What it does not close is a column defaulting to February in one environment
+    and January in another.
 
     **One literal has four spellings here, and a first version knew one.**
     Measured, `'01/02/2026'`, `E'01/02/2026'`, `$$01/02/2026$$` and

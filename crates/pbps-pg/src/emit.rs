@@ -178,14 +178,36 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
 ///
 /// ADR-0013 §3: a plain-literal default on a setting-sensitive column reaches
 /// the server as the resolved typed spelling, canonicalized by the engine at
-/// plan time. This function is the offline half of that decision — the emitter
-/// has no connection and cannot ask — and it refuses rather than guesses,
-/// because the two spellings differ in the value stored and in nothing a later
-/// read could tell apart.
+/// plan time. This is the offline half of that decision — nothing here has a
+/// connection to ask.
 ///
-/// A default that already carries a cast is what the engine itself reads back
-/// (`pg_get_expr` welds one on, ADR-0013 §4), so a declaration pulled from a
-/// live database is never refused here.
+/// **What a cast buys, measured, because an earlier version of this comment
+/// said it bought the whole thing.** A cast does *not* make the value
+/// session-independent: `'01/02/2026'::date`, `DATE '01/02/2026'` and
+/// `CAST('01/02/2026' AS date)` all store 2026-01-02 under `DateStyle` MDY and
+/// 2026-02-01 under DMY, exactly as the uncast spelling does. What decides the
+/// value is whether the *spelling* is ambiguous — a question about a value, and
+/// therefore the engine's to answer.
+///
+/// So the line drawn here is between *provably* unresolved and *possibly*
+/// resolved. Measured, this engine reads every string default back with a cast
+/// welded on — `'unnamed'` becomes `'unnamed'::text` — so a bare literal is
+/// certainly not the engine's own rendering, certainly not canonical, and
+/// refusing it costs nothing a declaration could want. A cast form may be that
+/// rendering, and usually is: it is what `pull` writes.
+///
+/// **The typed-but-ambiguous case is the residue, and it is deliberate.** The
+/// only offline rule that closes it refuses `'2026-01-02'::date` as well — a
+/// correct declaration, the one `pull` writes, with no remedy a message could
+/// name. ADR-0013 §3 closes it at plan time, connected, and that resolver
+/// arrives with the step that has a caller for it (issue #173).
+///
+/// None of this is about the plan converging. The state records what each
+/// object was declared as beside what it read back (DECISIONS 207–209), so a
+/// declaration in any spelling goes quiet after the apply that records it. What
+/// does not go away is a column defaulting to February in one environment and
+/// January in another.
+///
 /// Its caller in `validate` is not a second guard, it is the *earlier* one, and
 /// it is where the whole rule is actually enforced: [`Change::AlterColumnDefault`]
 /// carries a `ColumnRef` and two expressions and **no type**, so the emitter
@@ -202,13 +224,12 @@ pub(crate) fn refuse_an_unresolved_default(
         return None;
     }
     Some(invalid(format!(
-        "column `{column}` is `{ty}` and its default is the bare literal {default}. Two things \
-         are wrong with that. What the text means is decided by the session that runs the \
-         `CREATE` — measured, `'01/02/2026'` on a `date` stores 2026-01-02 under `DateStyle` MDY \
-         and 2026-02-01 under DMY, with no error either way — and a bare literal is not the \
-         spelling this engine reads a default back in, so the declaration and the database would \
-         disagree on every plan after the first. Write it as the engine renders it, with the cast \
-         it welds on: `'2026-01-02'::date` (ADR-0013 §3, §4)."
+        "column `{column}` is `{ty}` and its default is the bare literal {default}. What that \
+         text means is decided by the session that runs the `CREATE`: measured, `'01/02/2026'` on \
+         a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
+         either way — so this column would default to February in one environment and January in \
+         another. Write it the way the engine renders it, with the cast it welds on and a \
+         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 §3, §4)."
     )))
 }
 

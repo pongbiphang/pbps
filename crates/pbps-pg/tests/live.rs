@@ -2101,9 +2101,14 @@ fn rich_schema(s: &str) -> Schema {
     region
         .columns
         .insert("region_id".into(), Column::new(ty("integer")).not_null());
-    region
-        .columns
-        .insert("name".into(), Column::new(ty("varchar(100)")).not_null());
+    // A *string* default, in the spelling the engine reads it back in.
+    // Measured, this engine welds a cast onto every one of them — `'unnamed'`
+    // becomes `'unnamed'::character varying` — so a fixture without one would
+    // never exercise the shape that made the SQL Server plan restate a default
+    // on every run.
+    let mut region_name = Column::new(ty("varchar(100)")).not_null();
+    region_name.default = Some("'unnamed'::character varying".into());
+    region.columns.insert("name".into(), region_name);
     region.primary_key = Some(PrimaryKey {
         name: Some("pk_region".into()),
         columns: vec!["region_id".into()],
