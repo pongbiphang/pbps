@@ -160,7 +160,9 @@ fn constraints_query() -> String {
             pg_catalog.pg_get_expr(con.conbin, con.conrelid) AS expression,
             con.confmatchtype::text AS match_type,
             pg_catalog.array_to_string(con.confdelsetcols, ',') AS delete_set_columns,
-            con.conindid::int8 AS index_oid
+            con.conindid::int8 AS index_oid,
+            con.conenforced AS enforced, con.conperiod AS period,
+            con.connoinherit AS no_inherit
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -420,6 +422,9 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
                 let oid = number(&row, "index_oid")?;
                 (oid != 0).then_some(oid)
             },
+            enforced: flag(&row, "enforced")?,
+            period: flag(&row, "period")?,
+            no_inherit: flag(&row, "no_inherit")?,
         });
     }
     for row in conn.query(&indexes_query()).await? {

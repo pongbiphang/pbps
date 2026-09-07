@@ -1431,6 +1431,22 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                      ON DELETE SET NULL (a));
              CREATE TABLE {s}.covering (a integer, b integer,
                  CONSTRAINT covering_pk PRIMARY KEY (a) INCLUDE (b));
+             CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA {s};
+             CREATE TABLE {s}.temporal (
+                 id integer, valid daterange,
+                 CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+             CREATE TABLE {s}.unenforced (
+                 id integer, CONSTRAINT unenforced_ck CHECK (id > 0) NOT ENFORCED);
+             CREATE TABLE {s}.stops (
+                 id integer, CONSTRAINT stops_ck CHECK (id > 0) NO INHERIT);
+             -- The referenced table's own standalone unique index, which the
+             -- engine records in the foreign key's `conindid`. It belongs to
+             -- `referenced`, not to the key, and it has to survive the pull.
+             CREATE TABLE {s}.referenced (a integer);
+             CREATE UNIQUE INDEX referenced_uq ON {s}.referenced (a);
+             CREATE TABLE {s}.referring (
+                 a integer, CONSTRAINT referring_fk FOREIGN KEY (a)
+                     REFERENCES {s}.referenced (a));
              CREATE TABLE {s}.parted (id integer, at date) PARTITION BY RANGE (at);
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
@@ -1503,6 +1519,17 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "`collated_vpat` on",
         // A sequence that hands out values in blocks.
         "`CACHE 100`",
+        // A key that asks about ranges, wearing an ordinary key's `contype`.
+        // Named down to the phrase: the fixture's table is called `temporal`
+        // too, so the bare word is satisfied by any warning about it.
+        "is temporal — `WITHOUT OVERLAPS`",
+        // A constraint the engine records and never checks. Not `NOT VALID`,
+        // which does check every new row — the two are one field apart in the
+        // catalog and opposite in what they promise. Named down to the
+        // constraint, because the definition it quotes says `NOT ENFORCED` too.
+        "constraint `unenforced_ck` on",
+        // A check that reaches this table's rows and no child's.
+        "`stops_ck` on",
         // A key constraint whose index covers more than its key.
         "INCLUDE",
         // The sequence a `serial` owns and this model cannot hold.
@@ -1544,6 +1571,41 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             && !collated.indexes.contains_key("collated_pat"),
         "{:?}",
         collated.indexes
+    );
+
+    // A foreign key's backing index is the *referenced* table's, and skipping
+    // it would drop the only uniqueness the key is legal against — a pull that
+    // compares clean and describes a schema that cannot be built.
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referenced")]
+            .indexes
+            .contains_key("referenced_uq"),
+        "{:?}",
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referenced")].indexes
+    );
+    assert_eq!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "referring")]
+            .foreign_keys
+            .len(),
+        1
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "temporal")]
+            .primary_key
+            .is_none(),
+        "a temporal key is not an ordinary one"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "unenforced")]
+            .checks
+            .is_empty(),
+        "a check the engine never applies is not a check"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "stops")]
+            .checks
+            .is_empty(),
+        "a check that stops at this table is not the check a plan would write"
     );
 
     let restricted = &pulled.schema.tables[&pbps_model::TableName::new(&s, "restricted")];
@@ -1643,10 +1705,15 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "partly"),
             pbps_model::TableName::new(&s, "pointing"),
             pbps_model::TableName::new(&s, "quoted"),
+            pbps_model::TableName::new(&s, "referenced"),
+            pbps_model::TableName::new(&s, "referring"),
             pbps_model::TableName::new(&s, "restricted"),
             pbps_model::TableName::new(&s, "serialised"),
             pbps_model::TableName::new(&s, "setnull"),
+            pbps_model::TableName::new(&s, "stops"),
+            pbps_model::TableName::new(&s, "temporal"),
             pbps_model::TableName::new(&s, "unchecked"),
+            pbps_model::TableName::new(&s, "unenforced"),
         ],
         "the partitioned table, the inheritance child, the row-level-secured \
          table, the UNLOGGED table and this tool's own tables are not in the \

@@ -670,6 +670,31 @@ It was caught by the live test asserting that an ordinary table earns **no
 warning at all** — the negative case, which is the one that noticed a warning
 appearing where nothing had changed.
 
+**The same shape, one field over.** `pg_constraint.conindid` is "the index this
+constraint is enforced by", and the pull built its skip set — the indexes not to
+report again under `indexes:`, because they *are* a constraint — from every
+constraint's `conindid`. Measured, a foreign key's `conindid` is the unique
+index on the **referenced** table: another table's ordinary standalone index,
+enforcing nothing for this key, and the only thing that makes the key legal. The
+skip set swallowed it, so the pull compared clean while describing a schema that
+cannot be built — adding the foreign key back would fail for want of the index
+the pull did not mention. The filter said "constraints that have an index" where
+it meant "constraints whose index is their own": `p`, `u`, `x`, and not `f`.
+
+**And once more, in `pg_constraint`'s flags.** PostgreSQL 18 keeps `contype`
+unchanged for two constraints that are not ordinary ones — `conperiod` marks
+`WITHOUT OVERLAPS` / `PERIOD`, `conenforced = false` marks `NOT ENFORCED` — and
+`connoinherit` has done the same for checks since long before. Each was read
+back as the ordinary constraint it wears the type of. `NOT ENFORCED` is the
+sharpest: it sits beside `convalidated`, which the pull *did* read, and the two
+say opposite things — a `NOT VALID` constraint checks every new row, a
+`NOT ENFORCED` one checks nothing and never will.
+
+**The shape both share:** the catalog answers "what kind of thing is this?" in
+one column and "and is it that kind of thing after all?" in another. A reader
+that switches on the first and never looks at the second is not reading the
+catalog, it is reading half of it.
+
 ## Bugs only the live suite could catch
 
 The unit suite is structurally unable to find these. Run

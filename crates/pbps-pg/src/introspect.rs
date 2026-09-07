@@ -164,7 +164,19 @@ pub struct RawConstraint {
     pub delete_set_columns: Vec<i32>,
     /// `conindid`: the index this constraint is enforced by, if any. It is how
     /// a unique index that *is* a constraint is told from one that is not.
+    ///
+    /// For a foreign key it is not the key's own index at all: **measured**, it
+    /// is the unique index on the *referenced* table that the key points at.
     pub index_oid: Option<i64>,
+    /// `conenforced` (PostgreSQL 18+). `false` is `NOT ENFORCED`: the engine
+    /// records the constraint and checks nothing, ever.
+    pub enforced: bool,
+    /// `conperiod` (PostgreSQL 18+). `true` is `WITHOUT OVERLAPS` on a key or
+    /// `PERIOD` on a foreign key, with the `contype` of an ordinary one.
+    pub period: bool,
+    /// `connoinherit`. `true` is a check that applies to this table's own rows
+    /// and to no table that inherits from it.
+    pub no_inherit: bool,
 }
 
 /// One row of `pg_index`, joined to what it needs from `pg_class` and `pg_am`.
@@ -341,8 +353,19 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // again under `indexes:` would make every primary key look like a primary
     // key plus a unique index — a difference the differ would then try to
     // remove, by dropping an index the engine will not let go of.
-    let constraint_indexes: BTreeSet<i64> =
-        raw.constraints.iter().filter_map(|c| c.index_oid).collect();
+    //
+    // Only the kinds whose index is *their own*. **Measured**: a foreign key's
+    // `conindid` is the unique index on the **referenced** table that it points
+    // at — an ordinary standalone index, belonging to another table and
+    // enforcing nothing for this constraint. Skipping it dropped the only
+    // uniqueness the foreign key is valid against, so the pull compared clean
+    // and the schema it described could not be built.
+    let constraint_indexes: BTreeSet<i64> = raw
+        .constraints
+        .iter()
+        .filter(|c| matches!(c.kind, 'p' | 'u' | 'x'))
+        .filter_map(|c| c.index_oid)
+        .collect();
 
     for raw_table in &raw.tables {
         let name = TableName::new(&raw_table.schema, &raw_table.name);
@@ -582,6 +605,62 @@ fn add_constraint(
         // already carries it, and a reader that let this fall through to the
         // check arm would report one phantom check per NOT NULL column.
         'n' => {}
+
+        // `NOT ENFORCED` is not `NOT VALID`, and the difference is the whole
+        // constraint: a `NOT VALID` one still checks every new row, while this
+        // one checks nothing and never will. Carried as an ordinary constraint
+        // it would be recreated as one that enforces, and the rebuilt schema
+        // would start refusing writes the live database accepts.
+        'p' | 'u' | 'f' | 'c' | 'x' if !raw.enforced => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is `NOT ENFORCED`: the engine records it and checks \
+                     nothing against it, ever. This model has no word for that — read back it is \
+                     an ordinary constraint, which a plan would recreate as one that enforces — \
+                     so it is left out. Its definition is `{}`.",
+                    raw.name, parts.name, raw.definition
+                ),
+            );
+        }
+
+        // `NO INHERIT` is a check that stops at this table. Read back as an
+        // ordinary one it would be recreated as a check the children have too,
+        // which refuses rows they accept today. Found by sweeping for the
+        // shape `conenforced` has: a flag beside an unchanged `contype`.
+        'c' if raw.no_inherit => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "check constraint `{}` on `{}` is `NO INHERIT`: it holds for this table's own \
+                     rows and for no table that inherits from it. This model holds only the \
+                     expression, so it is left out rather than read back as a check a plan would \
+                     recreate on the children too. Its definition is `{}`.",
+                    raw.name, parts.name, raw.definition
+                ),
+            );
+        }
+
+        // A temporal key keeps the `contype` of an ordinary one, so nothing but
+        // `conperiod` tells them apart. `WITHOUT OVERLAPS` makes uniqueness a
+        // question about ranges rather than values, and `PERIOD` makes a
+        // foreign key ask whether the referencing row's range is *covered*.
+        'p' | 'u' | 'f' | 'c' | 'x' if raw.period => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is temporal — `WITHOUT OVERLAPS` on a key, `PERIOD` \
+                     on a foreign key — and it carries the `contype` of an ordinary one. What it \
+                     asks is about ranges, not values, and this model holds only the columns, so \
+                     it is left out rather than read back as the constraint it is not. Its \
+                     definition is `{}`.",
+                    raw.name, parts.name, raw.definition
+                ),
+            );
+        }
 
         // A key whose check can be put off is a different key, and the model
         // holds neither word. Named on every kind that can carry it, before
@@ -1119,6 +1198,9 @@ mod tests {
             match_type: 's',
             delete_set_columns: Vec::new(),
             index_oid: None,
+            enforced: true,
+            period: false,
+            no_inherit: false,
         }
     }
 
@@ -1902,6 +1984,168 @@ mod tests {
         assert!(only(&pulled).primary_key.is_none());
         assert!(only(&pulled).indexes.is_empty());
         assert!(pulled.warnings[0].contains("INCLUDE"));
+    }
+
+    /// A foreign key's `conindid` is the unique index on the table it points
+    /// at, not one of its own. Skipping it would drop a real index — the very
+    /// one the foreign key needs to exist.
+    #[test]
+    fn a_foreign_keys_backing_index_belongs_to_the_referenced_table_and_stays() {
+        let mut fk = constraint(2, "c_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(1);
+        // The referenced table's standalone unique index, which the engine
+        // records here because it is what makes the key legal.
+        fk.index_oid = Some(50);
+        let mut referenced = index(50, 1, "p_uq");
+        referenced.unique = true;
+        referenced.columns = vec![1];
+        referenced.key_count = 1;
+        let raw = RawCatalog {
+            tables: vec![table(1, "p"), table(2, "c")],
+            columns: vec![col(1, 1, "a", "integer"), col(2, 1, "a", "integer")],
+            constraints: vec![fk],
+            indexes: vec![referenced],
+        };
+        let pulled = assemble(&raw);
+        let p = &pulled.schema.tables[&TableName::new("app", "p")];
+        assert!(
+            p.indexes.contains_key("p_uq"),
+            "the referenced table's own index is not the foreign key's: {:?}",
+            p.indexes
+        );
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .len(),
+            1
+        );
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// `NOT ENFORCED` checks nothing, ever. `NOT VALID` checks every new row.
+    /// Reading the first as the second recreates a constraint that starts
+    /// refusing writes the live database accepts.
+    #[test]
+    fn a_constraint_the_engine_does_not_enforce_is_left_out_and_named() {
+        for kind in ['c', 'f', 'p', 'u'] {
+            let mut c = constraint(1, "t_c", kind);
+            c.columns = vec![1];
+            c.expression = Some("(a > 0)".to_owned());
+            c.definition = "CHECK ((a > 0)) NOT ENFORCED".to_owned();
+            if kind == 'f' {
+                c.ref_columns = vec![1];
+                c.ref_table = Some(1);
+            }
+            c.enforced = false;
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "integer")],
+                constraints: vec![c],
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            let t = only(&pulled);
+            assert!(
+                t.checks.is_empty()
+                    && t.foreign_keys.is_empty()
+                    && t.primary_key.is_none()
+                    && t.unique.is_empty(),
+                "{kind}: {t:?}"
+            );
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains("NOT ENFORCED")),
+                "{kind}: {:?}",
+                pulled.warnings
+            );
+        }
+    }
+
+    /// A `NO INHERIT` check stops at this table; an ordinary one reaches every
+    /// table that inherits from it.
+    #[test]
+    fn a_check_that_stops_at_this_table_is_left_out_and_named() {
+        let mut c = constraint(1, "t_ck", 'c');
+        c.expression = Some("(a > 0)".to_owned());
+        c.definition = "CHECK ((a > 0)) NO INHERIT".to_owned();
+        c.no_inherit = true;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: vec![c],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).checks.is_empty());
+        assert!(
+            pulled.warnings[0].contains("NO INHERIT"),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // The negative case: the same check without the flag is an ordinary
+        // one, carried and unremarked.
+        let mut ordinary = constraint(1, "t_ck", 'c');
+        ordinary.expression = Some("(a > 0)".to_owned());
+        let raw = RawCatalog {
+            constraints: vec![ordinary],
+            ..raw
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(only(&pulled).checks.len(), 1);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// A temporal key keeps an ordinary key's `contype`, so nothing but
+    /// `conperiod` tells them apart.
+    #[test]
+    fn a_temporal_key_is_left_out_and_named_rather_than_read_as_an_ordinary_one() {
+        for kind in ['p', 'u', 'f'] {
+            let mut c = constraint(1, "t_pk", kind);
+            c.columns = vec![1, 2];
+            c.definition = "PRIMARY KEY (id, valid WITHOUT OVERLAPS)".to_owned();
+            if kind == 'f' {
+                c.ref_columns = vec![1, 2];
+                c.ref_table = Some(1);
+            }
+            c.period = true;
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "id", "integer"), col(1, 2, "valid", "daterange")],
+                constraints: vec![c],
+                indexes: Vec::new(),
+            };
+            let pulled = assemble(&raw);
+            let t = only(&pulled);
+            assert!(
+                t.primary_key.is_none() && t.unique.is_empty() && t.foreign_keys.is_empty(),
+                "{kind}: {t:?}"
+            );
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains("temporal")),
+                "{kind}: {:?}",
+                pulled.warnings
+            );
+            // The negative case: the same constraint without the flag is an
+            // ordinary key, and reporting it would be noise nobody reads.
+            let mut ordinary = constraint(1, "t_pk", kind);
+            ordinary.columns = vec![1, 2];
+            if kind == 'f' {
+                ordinary.ref_columns = vec![1, 2];
+                ordinary.ref_table = Some(1);
+            }
+            let raw = RawCatalog {
+                constraints: vec![ordinary],
+                ..raw
+            };
+            let ordinary = assemble(&raw);
+            assert!(
+                !ordinary.warnings.iter().any(|w| w.contains("temporal")),
+                "{kind}: {:?}",
+                ordinary.warnings
+            );
+        }
     }
 
     /// Every limitation carries its table, so a caller can tell drift inside
