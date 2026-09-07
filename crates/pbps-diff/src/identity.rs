@@ -136,7 +136,7 @@ pub fn resolve(
     // equality rather than by index: the guard's own bookkeeping was the wrong
     // place for this, and three review rounds found three ways for an index to
     // go missing before the shape was moved here, where a contender cannot be
-    // both reported as contested and reported as a likely typo (DECISIONS 240).
+    // both reported as contested and reported as a likely typo (DECISIONS 246).
     let contested: BTreeSet<Intent> = blockers
         .iter()
         .filter_map(|b| {

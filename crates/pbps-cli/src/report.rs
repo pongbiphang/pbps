@@ -179,9 +179,13 @@ fn one_blocker(b: &Blocker) -> String {
             // declarations sends the user to delete the annotation that is
             // right — after which the column it explained is an unexplained
             // addition and the old one an unexplained drop.
+            // "the rest", not "the other": three columns can each carry
+            // `renamed_from: old`, and an instruction to remove one of them
+            // leaves two and the same blocker on the next run.
             s.push_str(
-                "\n    keep one and drop the other where it was written: a `renamed_from:` \
-                 line in the declarations, or the `pbps rename` you have just run\n",
+                "\n    keep one and drop the rest, each where it was written: a \
+                 `renamed_from:` line in the declarations, or the `pbps rename` you \
+                 have just run\n",
             );
             s
         }
@@ -992,6 +996,32 @@ mod tests {
             f.remedy.as_deref().is_some_and(|r| r.contains("keep one")),
             "{f:?}"
         );
+    }
+
+    /// Three claimants need two deletions, and the remedy has to say so.
+    ///
+    /// Nothing stops a third column carrying `renamed_from: old`. Told to drop
+    /// "the other", a user removes one, runs again and meets the same blocker
+    /// — a remedy that has to be applied twice without saying it is one that
+    /// reads as not having worked.
+    #[test]
+    fn a_rename_conflict_asks_for_every_extra_claimant() {
+        let claim = |to: &str| Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: to.into(),
+        };
+        let text = one_blocker(&Blocker::ConflictingRenameIntents {
+            side: RenameSide::Source,
+            name: "dbo.t.old".into(),
+            intents: vec![claim("aaa"), claim("mmm"), claim("zzz")],
+        });
+        assert!(text.contains("3 intents"), "{text}");
+        assert!(
+            !text.contains("drop the other"),
+            "with three claimants, dropping one leaves two: {text}"
+        );
+        assert!(text.contains("drop the rest"), "{text}");
     }
 
     /// The remedy does not say where the contradiction lives, because it does
