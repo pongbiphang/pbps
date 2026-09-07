@@ -73,8 +73,30 @@ impl Dialect for Mssql {
         // The trait says the caller normalizes first, but a dialect that only
         // works when it is called correctly is a trap, and normalizing twice is
         // free.
-        let norm = |t: &ColumnType| types::normalize(t).unwrap_or_else(|_| t.clone());
-        types::change_risk(&norm(from), &norm(to))
+        //
+        // The caller that cannot honour it is `validate_saved_plan`, which
+        // re-derives a plan file's risks **because the file may have been
+        // edited**, and an edited file spells its types however the editor
+        // liked.
+        //
+        // A type that does not normalize ends the question here rather than
+        // travelling on in its declared form. Falling back to the declared
+        // value is the answer that looks conservative and is not: an unknown
+        // *base* is claimed by no family and comes out `Incompatible` anyway,
+        // but a rejected *modifier* keeps a base every family does claim, and
+        // the family then reads the modifier as one this engine would accept —
+        // `decimal(38,0) -> decimal(39,0)` comes out `Safe` past a maximum
+        // precision of 38, and `varchar(8000) -> varchar(9000)` comes out
+        // `Safe` past the 8000 a non-`max` string caps at. `Safe` contributes
+        // no risk class, so an edited `risks: []` is accepted and the change
+        // goes through the gate unreviewed.
+        //
+        // The same rule as `Postgres::type_change_risk`, which the trait states
+        // for every implementation.
+        let (Ok(from), Ok(to)) = (types::normalize(from), types::normalize(to)) else {
+            return TypeChangeRisk::Incompatible;
+        };
+        types::change_risk(&from, &to)
     }
 
     /// SQL Server keeps identifiers exactly as written.
@@ -189,5 +211,70 @@ mod tests {
             Mssql.normalize_definition("SELECT   $1.00  +  total$"),
             "SELECT $1.00 + total$"
         );
+    }
+
+    /// The classification is asked of the normalized types even when the
+    /// caller forgot, because one caller cannot remember: `validate_saved_plan`
+    /// re-derives a plan file's risks precisely because the file may have been
+    /// edited, and an editor writes whatever spelling it likes.
+    ///
+    /// Both halves of that are here. The alias that reads as `Incompatible`
+    /// blocks a plan that changes nothing; the rejected modifier that reads as
+    /// `Safe` walks a change this engine will refuse past the gate.
+    #[test]
+    fn a_risk_is_judged_on_the_normalized_types_even_if_the_caller_forgot() {
+        let mut wrong = Vec::new();
+        for (from, to, expected) in [
+            // Aliases, which name the same type and change nothing.
+            ("integer", "int", TypeChangeRisk::Safe),
+            ("numeric(10,2)", "decimal(10,2)", TypeChangeRisk::Safe),
+            ("character varying(50)", "varchar(50)", TypeChangeRisk::Safe),
+            // And a real narrowing, which the alias spelling must not hide.
+            ("varchar(50)", "varchar(10)", TypeChangeRisk::Narrowing),
+            // A type the catalogue will not spell stays refused rather than
+            // falling through to a family. Both halves matter: an unknown base
+            // that no family claims, and — the one that reads as safe when the
+            // declared value travels on — a rejected modifier on a base that
+            // every family does claim.
+            ("nonesuch", "int", TypeChangeRisk::Incompatible),
+            // Past this engine's maximum precision of 38, in the direction
+            // that looks like widening.
+            (
+                "decimal(38,0)",
+                "decimal(39,0)",
+                TypeChangeRisk::Incompatible,
+            ),
+            (
+                "decimal(39,0)",
+                "decimal(38,0)",
+                TypeChangeRisk::Incompatible,
+            ),
+            // Past the 8000 a non-`max` string caps at.
+            (
+                "varchar(8000)",
+                "varchar(9000)",
+                TypeChangeRisk::Incompatible,
+            ),
+            // A scale larger than its own precision, which the family reads as
+            // an ordinary narrowing of a type that does not exist.
+            (
+                "decimal(10,2)",
+                "decimal(10,99)",
+                TypeChangeRisk::Incompatible,
+            ),
+        ] {
+            let got = Mssql.type_change_risk(&ty(from), &ty(to));
+            if got != expected {
+                wrong.push(format!("`{from}` -> `{to}`: {got:?}, want {expected:?}"));
+            }
+        }
+        // Collected rather than asserted one at a time: the first mismatch
+        // would hide the rest, and the rejected-modifier cases are three
+        // separate ways for a modifier to be refused.
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    fn ty(s: &str) -> ColumnType {
+        s.parse().unwrap()
     }
 }
