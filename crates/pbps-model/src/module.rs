@@ -646,6 +646,14 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
 /// no edge and `creation_order` was free to put a view before the table it
 /// reads (DECISIONS 240).
 ///
+/// It is an approximation, not the collation. Every single-character
+/// lower-case mapping in the BMP was put to the engine: this fold agrees with
+/// all three collations on 964 of the 1180, and of the 216 it does not, 149
+/// are pairs the three collations answer differently *from each other*. No
+/// offline rule can be right about those, which is why `creation_order` also
+/// asks a question the loader can answer -- whether two declarations collide
+/// under the fold -- rather than trusting it alone.
+///
 /// # Why not `str::to_lowercase`
 ///
 /// Full lower-casing is allowed to return more characters than it was given,
@@ -757,34 +765,42 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
     // widest fold that still tells it from every other declaration
     // (DECISIONS 240).
     //
-    // Grouped by the name each fold reads, and counted by the *distinct* names
-    // in a group, so that two overloads of one routine — the same name twice —
-    // are not mistaken for a collision.
-    let group = |case: Case| {
-        let mut folds: BTreeMap<String, BTreeSet<ObjectName>> = BTreeMap::new();
+    // Grouped by the name each fold reads, and counted by the *distinct*
+    // spellings in a group, so that two overloads of one routine — the same
+    // name twice — are not mistaken for a collision.
+    //
+    // Both needles are grouped, because both can collide. The bare one is
+    // grouped by the object name alone and counted by spelling, not by
+    // identity: `dbo.t` and `sales.t` share a bare name without differing in
+    // case, which is the scan's ordinary ambiguity and not this one.
+    let group = |case: Case, of: fn(&ObjectName, Case) -> (String, String)| {
+        let mut folds: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for name in &names {
             if let Some(referenced) = name.referenced_name() {
-                folds
-                    .entry(qualified(&referenced, case))
-                    .or_default()
-                    .insert(referenced);
+                let (key, spelling) = of(&referenced, case);
+                folds.entry(key).or_default().insert(spelling);
             }
         }
         folds
     };
-    let grouped = [
-        (Case::Folded, group(Case::Folded)),
-        (Case::Ascii, group(Case::Ascii)),
-    ];
+    let by_qualified =
+        |name: &ObjectName, case| (qualified(name, case), qualified(name, Case::Exact));
+    let by_bare = |name: &ObjectName, case| (cased(&name.name, case), name.name.clone());
+    let grouped: Vec<(Case, _, _)> = [Case::Folded, Case::Ascii]
+        .into_iter()
+        .map(|case| (case, group(case, by_qualified), group(case, by_bare)))
+        .collect();
     let widest_that_separates = |name: &ObjectName| {
         grouped
             .iter()
-            .find(|(case, folds)| {
-                folds
-                    .get(&qualified(name, *case))
-                    .is_none_or(|declared| declared.len() == 1)
+            .find(|(case, qualified_folds, bare_folds)| {
+                let alone = |folds: &BTreeMap<String, BTreeSet<String>>, key: &str| {
+                    folds.get(key).is_none_or(|declared| declared.len() == 1)
+                };
+                alone(qualified_folds, &qualified(name, *case))
+                    && alone(bare_folds, &cased(&name.name, *case))
             })
-            .map_or(Case::Exact, |(case, _)| *case)
+            .map_or(Case::Exact, |(case, _, _)| *case)
     };
 
     // needs[a] = the modules `a` must follow.
@@ -1175,6 +1191,42 @@ mod tests {
             &n("dbo.ktbl"),
             Case::Ascii
         ));
+    }
+
+    /// The scan looks for the bare object name as well as the qualified one, so
+    /// the bare form can collide on its own: `s9.ktbl` and `s2.\u{212a}tbl` are
+    /// two names with one folded bare spelling, and a definition in `s9`
+    /// writing plain `ktbl` would be attached to both. One false edge and one
+    /// real one the other way is a cycle, and a cycle is emitted in name order.
+    ///
+    /// Counted by *spelling* rather than by identity, because `dbo.t` beside
+    /// `sales.t` share a bare name without differing in case — that is the
+    /// scan's ordinary ambiguity, and narrowing the fold would not help it.
+    #[test]
+    fn a_bare_name_that_two_declarations_fold_onto_is_told_apart_too() {
+        let kelvin = "s2.\u{212a}tbl";
+        let m = modules(&[
+            (kelvin, "SELECT * FROM s9.a"),
+            ("s9.a", "SELECT * FROM ktbl"),
+            ("s9.ktbl", "SELECT 3"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("s9.ktbl"), id("s9.a"), id(kelvin)],
+            "the bare `ktbl` names `s9.ktbl` alone, so there is no cycle"
+        );
+
+        // Two schemas holding the same bare name is not this collision, and
+        // must keep the fold: `dbo.t` is what `SALES.V` means by `DBO.T`.
+        let m = modules(&[
+            ("dbo.t", "SELECT 1"),
+            ("sales.t", "SELECT 2"),
+            ("sales.v", "SELECT * FROM DBO.T"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.t"), id("sales.t"), id("sales.v")]
+        );
     }
 
     /// Two declarations that even the ASCII fold reads as one can only be held
@@ -1579,10 +1631,12 @@ mod tests {
     /// reader sees the price rather than rediscovers it.
     ///
     /// Measured unequal on the engine, and equal after a simple lower-case:
-    /// the Kelvin sign, the Ohm sign, and capital sharp s. No fold short of the
-    /// collation itself gets this right — the engine folds U+212B to `å` and
-    /// does *not* fold U+212A to `k`, which is not a rule anything outside the
-    /// collation can follow (DECISIONS 240).
+    /// the Kelvin sign, the Ohm sign, and capital sharp s — three of the 216
+    /// such pairs in the BMP, and three the sweep found all three collations
+    /// agreeing on. No fold short of the collation itself gets this right: the
+    /// engine folds U+212B to `å` and does *not* fold U+212A to `k`, and for
+    /// 149 of the 216 the three collations do not even agree with each other
+    /// (DECISIONS 240).
     ///
     /// `creation_order` narrows what this costs: where both spellings are
     /// *declared*, it sees the collision and drops back to the ASCII fold,
@@ -1591,7 +1645,7 @@ mod tests {
     /// which is the scan's ordinary over-reach and has `depends_on:` for an
     /// escape hatch.
     #[test]
-    fn the_fold_is_wider_than_the_engines_in_three_measured_places() {
+    fn the_fold_is_wider_than_the_engines_in_measured_places() {
         for (what, declared, written) in [
             ("Kelvin sign", "dbo.ktbl", "dbo.\u{212a}tbl"),
             ("Ohm sign", "dbo.\u{3c9}tbl", "dbo.\u{2126}tbl"),

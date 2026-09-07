@@ -4136,40 +4136,51 @@ SPEC is in sync with all of these.
     `dbo.i`, measured and pinned. One character in and one character out is
     also what a collation does, which is the comparison being approximated.
 
-    Three measured cases go the other way: the engine folds neither the Kelvin
-    sign to `k`, nor the Ohm sign to `ω`, nor capital sharp s to `ß`, and a
-    simple lower-case folds all three. It does fold U+212B to `å`, the same
-    class of character and the opposite answer — there is no rule short of the
-    collation itself that gets all four right, and the model does not carry a
-    collation (§8.2).
+    The fold and the engine do not agree everywhere, and cannot be made to.
+    Every single-character lower-case mapping in the BMP — 1180 of them — was
+    put to SQL Server 2022: 216 are pairs the fold reads as one letter and at
+    least one of the three collations does not, and for 149 of those the three
+    collations disagree with *each other*. The Kelvin sign is not `k` and the
+    Ohm sign is not `ω` under any of them, while U+212B is `å` under all
+    three. There is no offline rule that gets this right, because the right
+    answer is a property of the database and the loader has none to ask
+    (§8.2). The fold is an approximation, and a much closer one than ASCII: it
+    agrees on 964 of the 1180.
 
-    The wider question those three raise is the one a case-sensitive database
-    asks of *every* letter: `dbo.CAFÉ` and `dbo.café` are two objects under a
-    `CS_AS` collation, and any fold reads them as one. `creation_order`
-    answers it without a connection, because it does not need one: two
-    declarations that a fold reads as one name are both in front of it. Each
-    name therefore gets the *widest* fold that still tells it from every other
-    declaration — the whole alphabet where nothing collides, ASCII where
-    something does, and exact where even ASCII collides. Two over-answers make
-    an ordering cycle out of modules that have none, and a cycle is emitted in
-    name order, so this is the difference between a `CREATE VIEW` that works
-    and one that fails inside the plan's transaction.
+    What that costs is bounded by asking a second question the loader *can*
+    answer. Two declarations that a fold reads as one name are a question that
+    fold cannot answer — asked whether a definition names either of them it
+    would say *both*, and two such over-answers make an ordering cycle out of
+    modules that have none, which `creation_order` then emits in name order.
+    But both colliding declarations are right in front of it. Each name
+    therefore gets the *widest* fold that still tells it from every other
+    declaration: the whole alphabet where nothing collides, ASCII where
+    something does, exact where even ASCII collides.
 
     Widest and not narrowest, because a collision is not evidence of a
-    case-sensitive database: the three characters above are ones *this scan*
-    folds and the engine does not, so `dbo.ktbl` and `dbo.Ktbl` — with the
-    Kelvin sign — can both be declared against a case-insensitive server, and
-    there `SELECT * FROM DBO.KTBL` still means `dbo.ktbl`. Comparing that pair
-    exactly would drop a real edge over an ASCII case difference no
-    case-insensitive collation keeps. The ASCII fold separates them and keeps
-    the case-insensitivity the engine does have; only a pair that collides
-    under it as well — `dbo.Z` beside `dbo.z` — is compared exactly, and
-    only a case-sensitive database can be holding that pair. The collision is
-    counted over *distinct* names, so two overloads of one routine are not
-    mistaken for one.
+    case-sensitive database: where the fold is wider than the collation — the
+    Kelvin sign, say — a case-insensitive server can be holding `dbo.ktbl`
+    and `dbo.Ktbl` at once, and there `SELECT * FROM DBO.KTBL` still means
+    `dbo.ktbl`. Comparing that pair exactly would drop a real edge over an
+    ASCII case difference no case-insensitive collation keeps. The ASCII fold
+    separates them and keeps the case-insensitivity every collation does have;
+    only a pair that collides under it as well — `dbo.Z` beside `dbo.z` — is
+    compared exactly, and only a case-sensitive database can hold that pair.
 
-    What is left of the price is a definition that names a spelling nothing
-    declares: the fold may then attach it to a declaration it does not belong
-    to. That is the scan's ordinary over-reach, the same one that matches a
-    bare name inside a longer qualified one, and `depends_on:` is the escape
-    hatch for it as it is everywhere else.
+    The collision is counted over *distinct spellings*, so two overloads of
+    one routine are not mistaken for one, and it is asked of both needles: the
+    scan looks for the bare object name as well as the qualified one, and
+    `s9.ktbl` beside `s2.Ktbl` is one folded bare spelling for two names. The
+    bare form is counted by spelling rather than by identity, because `dbo.t`
+    beside `sales.t` shares a bare name without differing in case — the scan's
+    ordinary ambiguity, which a narrower fold does not help.
+
+    Two prices are left, both of them the scan's ordinary over-reach and both
+    with `depends_on:` for an escape hatch. A definition may name a spelling
+    nothing declares, and the fold then attaches it to a declaration it does
+    not belong to. And a name narrowed by a collision is narrowed everywhere,
+    so where a definition writes a *different* part of that name in another
+    case — `CAFÉ.KTBL` for the declared `café.ktbl`, with `café.Ktbl` also
+    declared — the edge is missed. Narrowing only the colliding character
+    would need the scan to match by comparator rather than by substring, which
+    is a rewrite of it and not this entry.
