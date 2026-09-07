@@ -452,6 +452,14 @@ per site, because each site spelled the interpolation itself. The fix is one
 newline, in one helper the five sites call, so the sixth has somewhere to reach
 for (DECISIONS 281).
 
+**And the guard that reads such text needs the same question asked of both
+ends.** The bare-literal guard was taught that a comment is whitespace, then
+that the grouping unwrap must step over data — and the gap between those two
+fixes stayed open for two more rounds: the unwrap tests the *last character*,
+so `('01/02/2026') -- note` could not be unwrapped and the ambiguous default
+went through (DECISIONS 282). Each fix was correct and neither asked what the
+*other* end of the expression looked like.
+
 The general shape: **verbatim text ends in a state, not just in a character.**
 Text copied from a declaration into generated code can leave the reader inside
 a comment, a string or a quote, and everything the generator writes after it on

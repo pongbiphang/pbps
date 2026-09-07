@@ -5255,3 +5255,34 @@ SPEC is in sync with all of these.
     of the same family are filed against the SQL Server pull's header scanner
     (#197), which ends a line comment at LF alone and does not nest block
     comments.
+
+282. **Trailing whitespace and comments are stripped before the grouping test,
+    by walking the expression forward.** 278 taught the guard that a comment is
+    whitespace and stripped it from the front; 279 taught the grouping unwrap
+    to step over data. Between them was a gap neither closed: the unwrap is a
+    test about the expression's **last character**, and a trailing comment is
+    what the last character then is.
+
+    ```text
+    CREATE TABLE t (d date DEFAULT ('01/02/2026') -- note ⏎ )
+      -> stored as '2026-01-02'::date under DateStyle MDY,
+         '2026-02-01'::date under DMY
+    ```
+
+    Measured, along with `('01/02/2026') /* note */`,
+    `(('01/02/2026') -- inner ⏎ ) -- outer` and
+    `$$01/02/2026$$ /* note */`: all four are accepted, all four move with the
+    session, and all four answered "not a literal" because the grouping could
+    not be unwrapped.
+
+    **Forward, not backward.** A `--` comment is recognisable only from its
+    opening, so there is no trailing-trivia trim that works from the end: the
+    scan walks the whole expression, steps over literals through `skip_datum`
+    so that a `--` inside one is not read as a comment, and remembers where the
+    last code character was. An unterminated `/*` is left standing as code, the
+    same answer `after_the_gap` gives, so the engine refuses it by name
+    (266).
+
+    The three strippers — leading gap, trailing trivia, grouping — now run to a
+    fixed point in `is_a_bare_literal`, because each can expose work for
+    another: `(('x') -- inner ⏎ ) -- outer` needs all three, twice.

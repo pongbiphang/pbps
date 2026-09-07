@@ -243,11 +243,11 @@ fn skip_datum(rest: &str) -> Option<usize> {
 fn is_a_bare_literal(expression: &str) -> bool {
     // A comment is whitespace to this engine, at either end of an expression
     // as much as between two pieces of a continued one, and either can wrap a
-    // grouping that wraps another comment. Both strippers hand back a
+    // grouping that wraps another comment. All three strippers hand back a
     // subslice, so the length settling is the text settling.
     let mut e = expression;
     loop {
-        let next = without_grouping(after_the_gap(e).0);
+        let next = without_grouping(without_trailing_trivia(after_the_gap(e).0));
         if next.len() == e.len() {
             break;
         }
@@ -364,6 +364,60 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
             return (rest, newline && !blocked);
         }
     }
+}
+
+/// The expression with the whitespace and comments that *follow* it removed.
+///
+/// [`after_the_gap`] strips them from the front, and the trailing side cannot
+/// be done the same way: a `--` comment is recognisable only from its opening,
+/// so finding where the code ends means walking the expression forward and
+/// stepping over literals, or a `--` inside one reads as a comment.
+///
+/// **Measured**, and it is the grouping unwrap that needs it: that test is
+/// about the *last character*, and a trailing comment is what the last
+/// character then is.
+///
+/// ```text
+/// CREATE TABLE t (d date DEFAULT ('01/02/2026') -- note ⏎ )
+///   -> stored as '2026-01-02'::date under DateStyle MDY,
+///      '2026-02-01'::date under DMY
+/// ```
+///
+/// Nothing is unwrapped, the literal scan answers `false`, and the guard
+/// permits it (DECISIONS 282).
+fn without_trailing_trivia(e: &str) -> &str {
+    let mut end = 0usize;
+    let mut consumed_to = 0usize;
+    for (i, ch) in e.char_indices() {
+        if i < consumed_to {
+            continue;
+        }
+        let rest = &e[i..];
+        if rest.starts_with("--") {
+            consumed_to = i + rest.find(NEWLINE).map_or(rest.len(), |at| at + 1);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*")
+            && let Some(tail) = end_of_block_comment(after)
+        {
+            consumed_to = e.len() - tail.len();
+            continue;
+        }
+        if let Some(len) = skip_datum(rest) {
+            // A literal, which is code. An *unterminated* block comment reaches
+            // here too, because the branch above wanted a closed one: it stays
+            // code, so the expression reaches the engine as written and is
+            // refused by name (DECISIONS 266), which is what `after_the_gap`
+            // decides about the same text.
+            consumed_to = i + len;
+            end = consumed_to;
+            continue;
+        }
+        if !ch.is_whitespace() {
+            end = i + ch.len_utf8();
+        }
+    }
+    &e[..end]
 }
 
 /// The characters this engine ends a line with, either of them alone.
@@ -1639,6 +1693,15 @@ mod tests {
             // closes the grouping. Measured, this is 2026-01-02 under MDY and
             // 2026-02-01 under DMY, which is the whole hazard behind one CR.
             "( -- )\r '01/02/2026')",
+            // Trailing trivia is not only whitespace, and the grouping unwrap
+            // is a test about the last character — measured, this stores
+            // 2026-01-02 under MDY and 2026-02-01 under DMY as a `date`
+            // default, with the parentheses and the comment both dropped from
+            // what the engine keeps.
+            "('01/02/2026') -- note",
+            "('01/02/2026') /* note */",
+            "(('01/02/2026') -- inner\n) -- outer",
+            "$$01/02/2026$$ /* note */",
             // A parenthesis that is data cannot be the one that closes the
             // grouping. Measured, each of these is the same session-decided
             // value as the same declaration without the comment — the first
@@ -1702,6 +1765,13 @@ mod tests {
             // The other newline does not change what a block comment does to
             // a continuation either.
             "'01/02/' /* c */\r'2026'",
+            // Trailing trivia is stripped, and what is left still has to be
+            // one literal: these are two groups and an operator either way.
+            "('a') || ('b') -- note",
+            // Nothing closes the comment, so it is not trivia — the engine
+            // refuses the whole expression by name and this leaves it to say
+            // so (DECISIONS 266).
+            "('01/02/2026') /* unterminated",
             "'01/02/'\n/* c */ '2026'",
             // Block comments nest, so this is one comment in the gap and not
             // two — and the `--` inside one is comment text, which leaves the
