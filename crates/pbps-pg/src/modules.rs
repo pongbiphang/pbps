@@ -135,6 +135,33 @@ impl Rebuild {
 /// ALTER VIEW jj.v SET (security_invoker = true);
 ///     ERROR:  canceling statement due to lock timeout
 /// ```
+///
+/// # It is asked twice, and the second time is the one that makes it safe
+///
+/// ADR-0009 §3's obligation is two-sided: before the `DROP`, that the object
+/// still carries what the plan recorded, and again **after the `CREATE`**, that
+/// the new object carries exactly that and nothing else. This function is both
+/// — the second call is the same question asked of the object the `CREATE` just
+/// made, and on this dialect an empty [`Rebuild::carries`] is the whole of the
+/// intended state.
+///
+/// The second call is not belt and braces. **Measured**, an
+/// `ALTER DEFAULT PRIVILEGES` entry added *after* a preflight and *before* the
+/// `CREATE` still lands on the object the transaction creates:
+///
+/// ```text
+/// session A (the apply):  BEGIN; preflight sees 0 default-ACL entries; …
+/// session B, meanwhile:   ALTER DEFAULT PRIVILEGES … GRANT SELECT … TO dp_bystander;
+/// session A continues:    CREATE VIEW dp.v …
+///     the view this transaction created has acl=
+///         {dp_deploy=arwdDxtm/dp_deploy, dp_bystander=r/dp_deploy}
+/// ```
+///
+/// Nothing locks that catalog, so a precondition can only describe the world
+/// before the statement — and what has to be true is a fact about the
+/// statement's own result. Anything else aborts the transaction, and SPEC
+/// §7.5's all-or-nothing makes the whole apply a no-op rather than a silent
+/// widening.
 pub async fn before_a_rebuild(
     conn: &mut Conn,
     id: &ModuleId,

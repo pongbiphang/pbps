@@ -18,6 +18,15 @@
 //! answer: a dialect that reports "no changes" because its emitter is a stub
 //! would be the silent wrong answer this tool exists to prevent, and *absent,
 //! empty and unreadable are three different things*.
+//!
+//! # Where the connected answers live
+//!
+//! [`catalog`] and [`modules`] are the two places that run SQL, and they ask
+//! different kinds of question. `catalog` reads the whole managed set in one
+//! read-only snapshot and hands rows to [`introspect`]'s pure assembler;
+//! `modules` answers what a plan has to know **before it rebuilds one object**,
+//! inside the caller's own transaction and under that object's lock, because
+//! its answer has to still be true when the `DROP` runs (ADR-0009 §3).
 
 use std::borrow::Cow;
 

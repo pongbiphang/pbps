@@ -5456,6 +5456,31 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     assert!(refusal.contains("pg_default_acl"), "{refusal}");
     assert!(refusal.contains(&reader), "{refusal}");
 
+    // The other side of the same obligation, and the one that makes it safe:
+    // the question asked again of the object a `CREATE` just made. Nothing
+    // locks `pg_default_acl`, so a plan-time read can only describe the world
+    // before the statement — what has to be true is a fact about the
+    // statement's own result. Measured here: a view created while the entry is
+    // in force arrives already granted to a role no declaration mentions, and
+    // the postcondition reports the ACL rather than the prediction.
+    conn.execute(&format!("CREATE VIEW {s}.arrived AS SELECT id FROM {s}.t"))
+        .await
+        .expect("a view created while the default privilege is in force");
+    let arrived: pbps_model::ModuleId = format!("{s}.arrived").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let after = pbps_pg::modules::before_a_rebuild(&mut conn, &arrived, View)
+        .await
+        .expect("read");
+    rollback(&mut conn).await;
+    let landed = after
+        .refusal()
+        .expect("the object the CREATE made carries a grant nothing declared");
+    assert!(
+        landed.contains(&format!("{reader}=r/")),
+        "the postcondition must report the ACL the object has, not the one \
+         predicted: {landed}"
+    );
+
     conn.execute(&format!(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} REVOKE SELECT ON TABLES FROM {reader}"
     ))
