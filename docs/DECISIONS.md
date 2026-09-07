@@ -5175,3 +5175,33 @@ SPEC is in sync with all of these.
     remains outside (174): a cast, a concatenation or a function is structure,
     and this guard does not read structure.
 
+
+280. **The apply guard keys a column's promises by field, and the last one
+    wins.** 271 splits a retyped column's default into two changes — the old
+    default out, the type changed, the new one in — and the apply guard
+    collects what a plan promises about each column field, holding the closing
+    read to every entry. Two changes about one field meant two promises about
+    it, `Default(false)` and `Default(true)`, and no read satisfies both:
+    measured through the CLI, the statements applied and the guard then called
+    its own result movement —
+
+    ```text
+    error: `…/pbps_cli_retypedefault` moved while this plan was running, and
+    not because of it:
+      dbo.t column `n` does not have the default this plan gives it
+    ```
+
+    — and rolled the transaction back, so the migration could not be applied at
+    all.
+
+    This is DECISIONS 169 one field along: there, a constraint redefined under
+    one name promised `Absent` from its drop and `Present` from its add, and the
+    fix was to key the parts by name and keep the last word. The column fields
+    were a `Vec` only because, until 271, no plan said two things about one
+    field. They are keyed by `(column, field)` now, and the plan is in
+    `order_key` order, so the last promise about a field is the net one.
+
+    The pairing of a promise to its field lives on `ColumnPromise::field` in
+    the model rather than at the guard: the caller that must key them is not the
+    place to decide what each promise is about, and a second caller would have
+    spelled it again.

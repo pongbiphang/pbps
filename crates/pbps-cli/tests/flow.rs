@@ -8318,6 +8318,83 @@ fn a_plan_that_reshapes_an_existing_table_applies() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// A column that **changes type and replaces its default** in one plan,
+/// applied for real.
+///
+/// The ordering that makes this work is three phases — the old default out,
+/// the type changed, the new default in (DECISIONS 271) — and it is the first
+/// plan in which one column carries *two* promises about one field: `to: None`
+/// from the drop and `to: Some(_)` from the set. A guard that collected both
+/// and held the closing read to each would refuse every such plan after
+/// applying it, which is DECISIONS 169's shape one field along.
+///
+/// Only the engine can say the guard is not refusing its own plan.
+#[test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+fn a_retyped_column_that_also_replaces_its_default_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "retypedefault");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("retypedefault");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  n: {type: int, nullable: false, default: \"0\"}\nprimary_key: {name: pk_t, columns: [id]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The same column, a wider type and a different default.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  n: {type: bigint, nullable: false, default: \"1\"}\nprimary_key: {name: pk_t, columns: [id]}\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // Two default changes and a type change, or the test proves nothing: the
+    // split is what puts two promises on one field.
+    let planned = std::fs::read_to_string(&plan).unwrap();
+    assert_eq!(
+        planned.matches("alter_column_default").count(),
+        2,
+        "the retype has to split the default in two: {planned}"
+    );
+    assert!(
+        planned.contains("alter_column_type"),
+        "and the type change stands between them: {planned}"
+    );
+
+    let o = d.run(&[
+        "apply",
+        "--db",
+        &connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        // Dropping the old default is `destructive`.
+        "--allow",
+        "constraint,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the plan's own default must not read as movement: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // And the environment it recorded is the one it left: no drift.
+    let o = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// A plan that returns a declared cell to its column's default, applied for
 /// real. The guard holds such a cell to *being* at its default at the closing
 /// read, which is a claim about how the engine reads it back: the row reader

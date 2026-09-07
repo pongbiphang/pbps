@@ -605,6 +605,25 @@ does not, it is not one change. Splitting it costs the plan a line, and buys
 each half its own class, its own risk and its own place in what a reviewer
 reads.
 
+**And splitting has a downstream cost, which the next review found.** A plan is
+read by things that were written when one change meant one word about a field.
+The apply guard collects what the plan *promises* about each column field and
+holds the closing read to all of it; with the default split in two, one column
+carried `Default(false)` and then `Default(true)`, and no database can satisfy
+both. Measured through the CLI, the three statements applied and the guard then
+called its own result movement — `dbo.t column ``n`` does not have the default
+this plan gives it` — and rolled the whole thing back, so a valid migration
+could not be applied at all.
+
+The same collector already had the answer beside it: the *parts* are keyed by
+name rather than collected, because a redefinition is a drop and an add under
+one name and holding both outcomes refused every one (DECISIONS 169). The
+column fields were a `Vec` because until the split no plan said two things
+about one field. So when you split a change in two, grep for what reads the
+plan as a list of promises — a collector that was correct under "one change,
+one promise" is a contradiction under two, and it fails *after* the statements
+have run, which is the most expensive place to find out (DECISIONS 280).
+
 ## An accidental order that was load-bearing
 
 `order_key` puts a column's type change and its default change in the same
