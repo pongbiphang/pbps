@@ -14,15 +14,22 @@ use crate::introspect::{
     RawKeyColumn, RawModule, RawTable, Securable, assemble,
 };
 
-/// `is_ms_shipped = 0` drops the system tables; the `__pbps_` filter drops this
-/// tool's own state and lock tables — they must never enter the managed set, or
-/// the tool would plan changes to itself.
+/// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
+/// own state and lock tables — they must never enter the managed set, or the
+/// tool would plan changes to itself.
+///
+/// **By name, not by prefix.** `NOT LIKE '\_\_pbps\_%'` also hid a project's
+/// own `app.__pbps_customers`, which nothing refuses at declaration time: the
+/// pull reported that table absent and the next plan tried to create one that
+/// was already there. The two names SPEC §8.1 defines are the two tables this
+/// tool owns, and they are what the PostgreSQL pull already lists; a step that
+/// adds a third adds it here, where a reader can see what the list is for.
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
-   AND t.name NOT LIKE '\\_\\_pbps\\_%' ESCAPE '\\'
+   AND t.name NOT IN ('__pbps_state', '__pbps_lock')
  ORDER BY s.name, t.name;";
 
 const COLUMNS: &str = "\
@@ -808,5 +815,23 @@ mod tests {
         assert!(all.contains("sys.external_languages"));
         // A well-formed derived table: one `UNION ALL` fewer than arms.
         assert_eq!(all.matches("UNION ALL").count() + 1, OWNABLE.len());
+    }
+
+    /// The table filter names the ledger's own two tables, and names nothing
+    /// else: a pattern here hid a project's `dbo.__pbps_customers` and reported
+    /// a table that is there as absent (issue #170). Asking
+    /// [`pbps_db::ledger`] for the names rather than repeating them keeps a
+    /// rename of the ledger from leaving the filter behind.
+    #[test]
+    fn the_table_filter_names_the_ledgers_own_tables_and_matches_no_pattern() {
+        for qualified in [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE] {
+            let (schema, name) = qualified.split_once('.').expect("a qualified name");
+            assert_eq!(schema, "dbo", "SPEC §8.1 puts the ledger in dbo");
+            assert!(TABLES.contains(&format!("'{name}'")), "{qualified}");
+        }
+        assert!(
+            !TABLES.contains("LIKE"),
+            "a pattern hides more than the two tables it is for"
+        );
     }
 }

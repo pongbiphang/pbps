@@ -7,8 +7,10 @@
 //!
 //! # Why these two tables are not part of the managed set
 //!
-//! [`crate::catalog`]'s table query excludes anything named `__pbps_*`, so the
-//! tool never introspects its own bookkeeping and never plans a change to it.
+//! [`crate::catalog`]'s table query excludes these two names — and only these
+//! two, not the whole `__pbps_` prefix, which would also hide a project's own
+//! table — so the tool never introspects its own bookkeeping and never plans a
+//! change to it.
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
