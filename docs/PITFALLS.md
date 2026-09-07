@@ -690,6 +690,17 @@ sharpest: it sits beside `convalidated`, which the pull *did* read, and the two
 say opposite things — a `NOT VALID` constraint checks every new row, a
 `NOT ENFORCED` one checks nothing and never will.
 
+**And the second order of the fix itself.** The guard that takes a table out of
+the pull for a name the declaration cannot write was a `continue` in the
+per-table loop — after the lookup maps were built from every table the catalog
+returned. A foreign key is assembled on the *referencing* table's turn, which
+can come first, so it still resolved its target through a map that had not heard
+about the refusal, and the pull recorded a key pointing at a table it had just
+decided not to record. **A guard placed after the thing it guards is a guard for
+one caller.** The decision now runs before anything that names a table is built,
+and the maps describe the tables in the pull rather than the tables the catalog
+returned.
+
 **The shape both share:** the catalog answers "what kind of thing is this?" in
 one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the

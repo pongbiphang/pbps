@@ -1486,6 +1486,11 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
              CREATE TABLE {s}.published (id integer PRIMARY KEY);
              ALTER TABLE {s}.published REPLICA IDENTITY FULL;
+             -- A column name the declaration format cannot write, and a key
+             -- that points at the table carrying it.
+             CREATE TABLE {s}.dotted (a integer PRIMARY KEY, \"x.y\" integer);
+             CREATE TABLE {s}.dotting (a integer,
+                 CONSTRAINT dotting_fk FOREIGN KEY (a) REFERENCES {s}.dotted (a));
              CREATE TYPE {s}.shape AS (a integer, b text);
              CREATE TABLE {s}.shaped OF {s}.shape;
              CREATE TABLE {s}.pointed_at (a integer PRIMARY KEY);
@@ -1595,6 +1600,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "rewrite rules",
         // A table whose row shape follows a composite type.
         "composite type",
+        // A column name that does not survive the declaration format, and the
+        // key that pointed at its table.
+        "cannot write back",
+        "`dotting_fk`",
         // A foreign key whose triggers are not running, while the catalog
         // still calls it validated and enforced.
         "ordinary enable mode",
@@ -1668,6 +1677,12 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .checks
             .is_empty(),
         "a check the engine never applies is not a check"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "dotting")]
+            .foreign_keys
+            .is_empty(),
+        "a key pointing at a table the pull refused is not a key"
     );
     assert!(
         pulled.schema.tables[&pbps_model::TableName::new(&s, "silent")]
@@ -1773,6 +1788,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "cached"),
             pbps_model::TableName::new(&s, "collated"),
             pbps_model::TableName::new(&s, "covering"),
+            pbps_model::TableName::new(&s, "dotting"),
             pbps_model::TableName::new(&s, "full_match"),
             pbps_model::TableName::new(&s, "half_built"),
             pbps_model::TableName::new(&s, "nulls"),
@@ -1813,6 +1829,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         refused,
         vec![
             pbps_model::TableName::new(&s, "descendant"),
+            pbps_model::TableName::new(&s, "dotted"),
             pbps_model::TableName::new(&s, "guarded"),
             pbps_model::TableName::new(&s, "parted"),
             pbps_model::TableName::new(&s, "published"),

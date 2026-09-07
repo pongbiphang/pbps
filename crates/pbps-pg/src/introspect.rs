@@ -292,11 +292,20 @@ fn action_name(c: char) -> &'static str {
 /// the alternative was a signature long enough that adding the next one would
 /// mean reading every call site to see what moved.
 struct Lookups<'a> {
-    /// Every table in the pull, by oid — a foreign key's target.
+    /// Every table **in the pull**, by oid — a foreign key's target. A table
+    /// the pull refuses is not here, so a key that points at one cannot
+    /// resolve and is left out and named.
     tables: HashMap<i64, TableName>,
     /// Every column in the pull, by table and attnum. A foreign key's
     /// `confkey` names attnums on the **referenced** table, which the
     /// constrained table's own map cannot answer for (DECISIONS 250).
+    ///
+    /// Refused tables are absent here too. Either exclusion alone would leave
+    /// the key out — measured, by removing each and watching the test still
+    /// pass, and both and watching it fail — and both are here because what
+    /// these maps describe is "the tables in the pull", not "the tables the
+    /// catalog returned". A reader who removes one as dead weight has changed
+    /// what the struct means.
     columns: HashMap<(i64, i32), &'a str>,
     /// The indexes that admit at most one null key. A unique constraint is
     /// enforced by an index, so this is a property of the constraint too, and
@@ -336,15 +345,44 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut pulled = Pulled::default();
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
+
+    // Which tables can be recorded at all, decided **before** anything is built
+    // that names one. A table left out for a name the declaration cannot write
+    // must not be reachable as a foreign key's target either: the key would
+    // point at a table that is not in the pull, and its own declaration would
+    // carry the very name that was refused.
+    //
+    // The per-table `continue` below cannot do this. It runs after the lookups
+    // are built, and a foreign key is assembled from the *referencing* table's
+    // turn — which may come first.
+    let refused: BTreeSet<i64> = raw
+        .tables
+        .iter()
+        .filter(|t| {
+            let name = TableName::new(&t.schema, &t.name);
+            let columns = columns_by_table.get(&t.oid).map_or(&[][..], Vec::as_slice);
+            match a_name_the_declaration_cannot_write(&name, columns) {
+                Some(detail) => {
+                    note(&mut pulled, &name, detail);
+                    true
+                }
+                None => false,
+            }
+        })
+        .map(|t| t.oid)
+        .collect();
+
     let lookups = Lookups {
         tables: raw
             .tables
             .iter()
+            .filter(|t| !refused.contains(&t.oid))
             .map(|t| (t.oid, TableName::new(&t.schema, &t.name)))
             .collect(),
         columns: raw
             .columns
             .iter()
+            .filter(|c| !refused.contains(&c.table_oid))
             .map(|c| ((c.table_oid, c.attnum), c.name.as_str()))
             .collect(),
         nulls_not_distinct: raw
@@ -386,8 +424,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let raw_columns = columns_by_table
             .get(&raw_table.oid)
             .map_or(&[][..], Vec::as_slice);
-        if let Some(detail) = a_name_the_declaration_cannot_write(&name, raw_columns) {
-            note(&mut pulled, &name, detail);
+        if refused.contains(&raw_table.oid) {
             continue;
         }
         let parts = Parts {
@@ -2291,6 +2328,64 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// A table the pull refuses is not a table a foreign key may point at.
+    /// The referencing table is assembled on its own turn, which can come
+    /// first, so the decision has to be made before anything is built.
+    #[test]
+    fn a_foreign_key_pointing_at_a_refused_table_is_left_out_and_named() {
+        // The referencing table comes first, so its turn is taken before the
+        // refused one's would have been.
+        let mut target = table(2, "t");
+        target.schema = "a.b".to_owned();
+        let mut fk = constraint(1, "c_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(2);
+        let raw = RawCatalog {
+            tables: vec![table(1, "c"), target],
+            columns: vec![col(1, 1, "a", "integer"), col(2, 1, "a", "integer")],
+            constraints: vec![fk],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.tables.len(), 1, "{:?}", pulled.schema.tables);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .is_empty(),
+            "a key pointing at a table that is not in the pull is not a key"
+        );
+        // Both facts reach the operator: the table that could not be written,
+        // and the key that could not be kept because of it.
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("cannot write back")),
+            "{:?}",
+            pulled.warnings
+        );
+        assert!(
+            pulled.warnings.iter().any(|w| w.contains("c_fk")),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // The negative case: the same key at a table whose name round-trips.
+        let raw = RawCatalog {
+            tables: vec![table(1, "c"), table(2, "t")],
+            ..raw
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .len(),
+            1
+        );
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
 
