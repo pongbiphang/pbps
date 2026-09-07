@@ -1019,6 +1019,7 @@ mod tests {
             ("timestamp", "timestamptz", "time zone"),
             ("timestamptz", "timestamp", "time zone"),
             ("date", "timestamptz", "time zone"),
+            ("timestamptz", "timetz", "time zone"),
             ("character varying(10)", "integer", "USING"),
         ] {
             let refusal = pg

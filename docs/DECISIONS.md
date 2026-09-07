@@ -4742,15 +4742,30 @@ SPEC is in sync with all of these.
     inside one from a string that merely looks like a date. Pinning the reader
     is what makes the text mean one thing.
 
-268. **A type change that gains or loses the time zone is refused, the way a
-    `USING` clause is.** `timestamp` → `timestamptz` and its three relatives do
-    not fail on this engine — they are *answered* from the session's `TimeZone`.
-    Measured, one stored `2026-01-02 12:00` under one `ALTER`:
+268. **A type change the session's `TimeZone` would answer is refused, the way
+    a `USING` clause is.** `timestamp` → `timestamptz` and its relatives do not
+    fail on this engine — they are *answered* from the session's `TimeZone`.
+    Measured, one stored value under one `ALTER`, twice:
 
     ```text
-    session TimeZone = UTC               -> 2026-01-02 12:00:00 UTC
-    session TimeZone = America/New_York  -> 2026-01-02 17:00:00 UTC
+    timestamp -> timestamptz, stored 2026-01-02 12:00
+      TimeZone = UTC               -> 2026-01-02 12:00:00 UTC
+      TimeZone = America/New_York  -> 2026-01-02 17:00:00 UTC
+
+    timestamptz -> timetz, stored 2026-01-02 12:00:00+00
+      TimeZone = UTC               -> 12:00:00+00
+      TimeZone = America/New_York  -> 07:00:00-05
     ```
+
+    **The second shape arrived a round later and it is what the rule is.** The
+    predicate was first written as "the offset is gained or lost", which is the
+    shape the first measurement had. `timestamptz` → `timetz` keeps its offset
+    on both sides and is still the session's answer, because what moves is the
+    *date* part: a value is being read out of a day, and a zone decides which
+    day it was in. So the question is not "does the offset change" but "does
+    the session decide", and the predicate is now `(ao || bo) && (ao != bo ||
+    ad != bd)` — a zone has to be involved at all, and then either end of it
+    moves.
 
     `types::change_risk` already knows the shape and answers `Narrowing`, with a
     comment naming exactly this. That is not enough: `Narrowing` is a risk class

@@ -733,7 +733,9 @@ fn temporal_cast_exists(from: Components, to: Components) -> bool {
 /// Whether the result of this change is decided by the applying session's
 /// `TimeZone` rather than by anything declared.
 ///
-/// True for exactly one shape: a date-or-time type gaining or losing its offset.
+/// True for two shapes, and both are the same question asked twice: a
+/// date-or-time type gaining or losing its offset, and one keeping its offset
+/// while the date part comes or goes.
 /// The engine reads a naive value in the session's zone on the way in, and
 /// writes one back out in it on the way out — **measured**, the same
 /// `ALTER COLUMN t TYPE timestamptz` over a stored `2026-01-02 12:00` gives
@@ -754,20 +756,35 @@ pub fn depends_on_the_session_time_zone(from: &ColumnType, to: &ColumnType) -> b
     match (family(from), family(to)) {
         (
             Family::Temporal {
-                has_time: at,
+                has_date: ad,
                 has_offset: ao,
                 ..
             },
             Family::Temporal {
-                has_time: bt,
+                has_date: bd,
                 has_offset: bo,
                 ..
             },
-            // A type with no time part has no zone to read one in: `date` into
-            // `timestamptz` is midnight in the session's zone, which is the
-            // same hazard, so the test is on the *pair* having a time part
-            // somewhere rather than on both.
-        ) => ao != bo && (at || bt),
+        ) => {
+            // A zone has to be involved at all — with no offset on either side
+            // there is nothing for `TimeZone` to be read into, and `date` into
+            // `timestamp` is midnight either way.
+            (ao || bo)
+                // Then either end of the zone moves: the offset is gained or
+                // lost, or the value is rebased because the *date* is. The
+                // second is the one an earlier version of this missed, because
+                // it read the hazard as "the offset changes" rather than as
+                // "the session decides". `timestamptz` into `timetz` keeps its
+                // offset and is still the session's answer — measured, one
+                // stored `2026-01-02 12:00:00+00` becomes `12:00:00+00` from a
+                // `UTC` session and `07:00:00-05` from `America/New_York`.
+                //
+                // On the pair rather than on one side, because both directions
+                // are the same question: a date part appearing is a value
+                // being placed in a day, and one disappearing is a value being
+                // read out of one, and a zone decides both.
+                && (ao != bo || ad != bd)
+        }
         _ => false,
     }
 }
@@ -1570,6 +1587,10 @@ mod tests {
             // same hazard: midnight, in whichever zone the session holds.
             ("date", "timestamptz"),
             ("timestamptz", "date"),
+            // The offset survives and the answer is still the session's: the
+            // date part is what moves, and the value is rebased to lose it.
+            ("timestamptz", "timetz"),
+            ("timetz", "timestamptz"),
         ] {
             assert!(
                 depends_on_the_session_time_zone(&normalized(from), &normalized(to)),
@@ -1588,6 +1609,10 @@ mod tests {
             ("timestamp", "date"),
             ("date", "timestamp"),
             ("timestamptz", "timestamptz"),
+            // Both ends carry an offset *and* a date part, so nothing is
+            // rebased — the pin against the widened rule becoming "any two
+            // types that can hold a zone".
+            ("timetz", "timetz"),
             ("timestamp", "timestamp"),
             ("time", "time"),
             ("interval", "interval"),

@@ -3283,6 +3283,11 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
 
     // What the refusal is about, on this server. The same stored value, the
     // same `ALTER`, two sessions, two instants.
+    //
+    // Twice, because the guard covers two shapes: the offset gained, and the
+    // offset *kept* while the date part goes. The second was missed by a
+    // predicate that asked whether the offset changed rather than whether the
+    // session decided.
     let mut instants = Vec::new();
     for zone in ["UTC", "America/New_York"] {
         conn.execute(&format!(
@@ -3320,8 +3325,39 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
         "the conversion reads the naive value in the session's zone"
     );
 
-    // So pbps does not emit it. The message names the zone and the two-step
-    // remedy, because a refusal a reader cannot act on is a wall.
+    // The second shape, on the same server: `timestamptz` keeps its offset
+    // into `timetz` and the wall clock is still the session's.
+    let s2 = emit_schema("zone2");
+    fresh(&mut conn, &s2).await;
+    let mut kept = Vec::new();
+    for zone in ["UTC", "America/New_York"] {
+        conn.execute(&format!(
+            "SET TimeZone = '{zone}'; \
+             CREATE TABLE {s2}.z (at timestamptz); \
+             INSERT INTO {s2}.z VALUES ('2026-01-02 12:00:00+00'); \
+             ALTER TABLE {s2}.z ALTER COLUMN at TYPE timetz"
+        ))
+        .await
+        .expect("the engine performs this one without a word either");
+        conn.execute("SET TimeZone = 'UTC'")
+            .await
+            .expect("one reader");
+        kept.push(text(&mut conn, &format!("SELECT at::text FROM {s2}.z")).await);
+        conn.execute(&format!("DROP TABLE {s2}.z"))
+            .await
+            .expect("drop");
+    }
+    conn.execute(&format!("DROP SCHEMA {s2} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        kept,
+        vec!["12:00:00+00".to_owned(), "07:00:00-05".to_owned()],
+        "the offset survives and the session still decided the wall clock"
+    );
+
+    // So pbps does not emit either of them. The message names the zone and the
+    // two-step remedy, because a refusal a reader cannot act on is a wall.
     let refusal = Postgres::new()
         .emit(
             &pbps_model::Change::AlterColumnType {
@@ -3341,6 +3377,27 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     let message = refusal.to_string();
     assert!(message.contains("time zone"), "{message}");
     assert!(message.contains("AT TIME ZONE"), "{message}");
+
+    let kept_refusal = Postgres::new()
+        .emit(
+            &pbps_model::Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: pbps_model::ColumnRef {
+                    table: TableName::new(&s, "z"),
+                    name: "at".into(),
+                },
+                from: ty("timestamptz"),
+                to: ty("timetz"),
+                from_nullable: true,
+                to_nullable: true,
+            },
+            Strategy::default(),
+        )
+        .expect_err("keeping the offset does not make it pbps's to choose");
+    assert!(
+        kept_refusal.to_string().contains("time zone"),
+        "{kept_refusal}"
+    );
 }
 
 /// A declaration that gives up its primary key and relaxes the column it held

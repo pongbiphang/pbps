@@ -628,6 +628,29 @@ engine, measure the same statement on the other before believing the rank:
 here each engine refuses a *different* end of the same pair, and only running
 both says the answer is three phases rather than two.
 
+## A predicate written from the shape of the first measurement
+
+The guard against a conversion the session's `TimeZone` answers went in with
+one measurement behind it: `timestamp` → `timestamptz` stores a different
+instant under a different zone. The predicate written from it asked **"does the
+offset change"**, which is what that pair does, and the review found the pair
+that does not: `timestamptz` → `timetz` keeps its offset on both sides and is
+still the session's answer — measured, `12:00:00+00` from a `UTC` session and
+`07:00:00-05` from `America/New_York` — because what moves is the *date* part,
+and a zone decides which day a value was in.
+
+The measurement was right and the generalisation was drawn from its silhouette.
+The rule the guard exists for is "the session decides"; "the offset changes" is
+one way that happens, and a predicate that spells the symptom passes everything
+that reaches the same place by another route.
+
+The tell is available before the review: the guard's own doc comment said
+"True for exactly one shape", and a rule that is true for exactly one shape is
+usually a rule that has only been looked at once. When you write a predicate
+from a measurement, enumerate the family the measurement belongs to — here, the
+six date-and-time types and the conversions between them — and check each
+member against the *rule*, not against the example.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second
