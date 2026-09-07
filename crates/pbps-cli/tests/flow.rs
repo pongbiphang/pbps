@@ -11194,6 +11194,54 @@ fn state_list_refuses_a_limit_of_zero() {
     );
 }
 
+/// The published schema refuses a `state list` envelope whose limit is zero.
+///
+/// The refusal above is `clap`'s, and it protects this tool's own runs. The
+/// envelope is read by consumers this tool did not write (ADR-0015 decision 1),
+/// and the schema described `limit` as any `u32` — so the one shape the field's
+/// meaning rules out validated: `entries: []` beside `limit: 0` is "nothing was
+/// asked for", while `state.no-entries` renders it as "the ledger is empty".
+/// The bound is the payload's own, not the parser's; the parser's ceiling is a
+/// T-SQL fact (DECISIONS 217) and is deliberately not published (issue #116).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_state_list_envelope_with_a_zero_limit_is_refused_by_the_published_schema() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "statelimitschema");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("statelimitschema");
+    d.table(ONE_COLUMN);
+    d.commit();
+
+    // A real envelope from the command, not one written here: what is asserted
+    // is the document against output this tool actually produces.
+    let o = d.run(&["state", "list", "--db", &connection, "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let mut v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("JSON");
+
+    let validator = jsonschema::validator_for(&envelope_schema()).expect("the schema compiles");
+    // The premise: as emitted, it validates, and it carries the field at all.
+    validator
+        .validate(&v)
+        .expect("the envelope this build emits");
+    assert!(
+        v["data"]["limit"].as_u64().expect("a limit") >= 1,
+        "the emitted limit is the bound's own subject: {v}"
+    );
+
+    v["data"]["limit"] = serde_json::json!(0);
+    assert!(
+        validator.validate(&v).is_err(),
+        "a limit of zero must not validate: {v}"
+    );
+    // And not merely because the value changed: one is accepted again, so the
+    // refusal is the bound and not the edit.
+    v["data"]["limit"] = serde_json::json!(1);
+    validator.validate(&v).expect("a limit of one");
+}
+
 /// One entry this build cannot read does not erase the history above it, and
 /// the two ways it can be unreadable stay apart.
 ///

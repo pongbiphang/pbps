@@ -987,10 +987,10 @@
           "type": "boolean"
         },
         "limit": {
-          "description": "How many rows were asked for, so a reader knows whether the list is the\nwhole history or the head of it.",
+          "description": "How many rows were asked for, so a reader knows whether the list is the\nwhole history or the head of it.\n\nAt least one: an empty `entries` beside it means the ledger is empty,\nnot that nothing was asked for.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1
         },
         "entries": {
           "description": "Newest first, like the ledger's own order.",
