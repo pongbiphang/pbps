@@ -3352,9 +3352,9 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
 /// that fixes it belongs to the differ and not to either dialect
 /// (`a_key_is_dropped_before_the_column_it_held_is_relaxed`).
 ///
-/// The half this does not cover is a key being *replaced*, which travels as
-/// one change because its add may name a column the same plan is adding —
-/// issue #178.
+/// A key being *replaced* is the same shape and is covered by the same
+/// ordering, because it is planned as two changes rather than one — see
+/// `a_key_is_replaced_around_the_columns_both_of_its_shapes_name`.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
@@ -3393,6 +3393,70 @@ async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
     // The whole migration, statement by statement, in the plan's own order —
     // `apply` panics with the SQL and the engine's word if any of it is
     // refused.
+    apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
+
+    let pulled = pull(&mut conn).await;
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    let state = ours_only(&pulled, &s);
+    assert_eq!(state, normalized(&b));
+    let again = plan(&state, &ids_b, &b, &ids_b);
+    assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+}
+
+/// A declaration that replaces its primary key, adds the column the new key
+/// names and relaxes the column the old key held — every dependency in one
+/// plan — applies and converges.
+///
+/// This is the shape one `SetPrimaryKey` could not order: its drop has to
+/// precede the `DROP NOT NULL` on `id`, which this engine refuses with `42P16`
+/// while the key stands, and its add has to follow the `ADD COLUMN` that makes
+/// `other` exist. Opposite ends of the plan, so the differ emits the two halves
+/// as two changes (DECISIONS 270); the statements are the ones the emitter
+/// always produced.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
+    let s = emit_schema("pkswap");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let table = TableName::new(&s, "t");
+
+    let mut before = Table::default();
+    before
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    before.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+    });
+    let mut a = Schema::default();
+    a.tables.insert(table.clone(), before);
+
+    let mut after = Table::default();
+    after
+        .columns
+        .insert("id".into(), Column::new(ty("integer")));
+    after
+        .columns
+        .insert("other".into(), Column::new(ty("integer")).not_null());
+    after.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["other".into()],
+    });
+    let mut b = Schema::default();
+    b.tables.insert(table.clone(), after);
+
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+    let ids_b = mint_ids(&b, &ids_a, &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
     apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
 
     let pulled = pull(&mut conn).await;

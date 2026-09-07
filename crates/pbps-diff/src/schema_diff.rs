@@ -485,11 +485,42 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         (b, d) => b != d,
     };
     if pk_differs {
+        // A key that is *replaced* is emitted as two changes: the old one's
+        // drop, and the new one's add. One change carrying both directions can
+        // only be in one ordering class, and the two halves need opposite
+        // ones — the drop before every column change a standing key blocks
+        // (DECISIONS 269), the add after every column its new shape may name.
+        // Measured, the plan that came out of one change was refused:
+        // `PRIMARY KEY (id)` becoming `PRIMARY KEY (other)` while `id` is
+        // relaxed ran `DROP NOT NULL` against a column `pk_t` still held —
+        // `42P16` on PostgreSQL, 5074 with 4922 behind it on SQL Server.
+        //
+        // No model change and no new SQL: both emitters already emit the two
+        // halves independently, so the statements are the ones they were and
+        // only their positions move. `from: None` on the add half is accurate
+        // where it runs, because the drop half has already taken the key away.
+        //
+        // The risk classes follow, and follow correctly: a replacement now
+        // carries `Destructive` for the key it gives up as well as
+        // `Constraint` for the key it takes, which is what happens to the
+        // database (DECISIONS 270).
+        let split = base.primary_key.is_some() && declared.primary_key.is_some();
         changes.push(Change::SetPrimaryKey {
             table: name.clone(),
             from: base.primary_key.clone(),
-            to: declared.primary_key.clone(),
+            to: if split {
+                None
+            } else {
+                declared.primary_key.clone()
+            },
         });
+        if split {
+            changes.push(Change::SetPrimaryKey {
+                table: name.clone(),
+                from: None,
+                to: declared.primary_key.clone(),
+            });
+        }
     }
 
     macro_rules! by_name {
@@ -1232,10 +1263,10 @@ fn order_key(c: &Change) -> u8 {
         // outright is the same 5074. So a declaration that gives up a key and
         // relaxes its column produced a plan neither engine would perform.
         //
-        // Only `to: None`. A key being *replaced* carries its add along with
-        // it, and an add may name a column this plan is still adding at class
-        // 8 — so it stays below, and the replacement's own half of this
-        // problem is issue #178.
+        // Only `to: None`, and that is not a partial answer: a key being
+        // *replaced* is emitted as two changes, its drop and its add (see
+        // `diff_constraints`), so the drop arrives here and the add stays
+        // below, where the columns its new shape may name have been added.
         //
         // `dependency_rank` already keeps a foreign-key drop ahead of it
         // inside this class, which is the order the engine requires and the
@@ -2736,21 +2767,29 @@ mod tests {
         );
     }
 
-    /// The negative half, and the reason the class is conditioned on `to`
-    /// rather than on the variant: a key being **replaced** carries its add
-    /// with it, and an add may name a column this same plan is still adding at
-    /// class 8. So a replacement stays below the column classes, where it
-    /// works, and the half of the problem that follows it is issue #178.
+    /// A key that is **replaced** is two changes, and they go to opposite ends
+    /// of the plan: the old one's drop with the constraint drops, the new
+    /// one's add after every column its shape may name.
+    ///
+    /// One change cannot do it. The add may name a column this same plan is
+    /// still adding at class 8 — so a replacement could not simply join the
+    /// drops — and the drop has to precede every column change a standing key
+    /// blocks. The halves need opposite classes, so they are separate changes;
+    /// both emitters already emitted the two statements independently, and
+    /// only their positions move.
     #[test]
-    fn a_key_being_replaced_stays_after_the_columns_its_new_shape_may_need() {
+    fn a_replaced_key_is_dropped_before_its_old_columns_and_added_after_its_new_ones() {
         let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
             columns: vec!["id".to_owned()],
         });
         let base = schema_of("dbo.t", base_t);
+        // The declaration replaces the key, adds the column the new key names,
+        // and relaxes the column the old key held — every dependency in one
+        // plan.
         let mut declared_t = table(&[
-            ("id", Column::new(ty("int")).not_null()),
+            ("id", Column::new(ty("int"))),
             ("other", Column::new(ty("int")).not_null()),
         ]);
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
@@ -2760,17 +2799,21 @@ mod tests {
         let declared = schema_of("dbo.t", declared_t);
 
         let cs = run(&base, &declared, &[]);
-        let key = cs
-            .changes
-            .iter()
-            .position(|p| matches!(p.change, Change::SetPrimaryKey { .. }))
-            .expect("the key is replaced");
-        let column = cs
-            .changes
-            .iter()
-            .position(|p| matches!(p.change, Change::AddColumn { .. }))
-            .expect("the column it will name is added");
-        assert!(column < key, "{:#?}", cs.changes);
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+        };
+        let drop = at(|c| matches!(c, Change::SetPrimaryKey { to: None, .. }));
+        let relaxed = at(|c| matches!(c, Change::AlterColumnNullability { .. }));
+        let added = at(|c| matches!(c, Change::AddColumn { .. }));
+        let add = at(|c| matches!(c, Change::SetPrimaryKey { from: None, .. }));
+        assert!(
+            drop < relaxed && added < add,
+            "drop {drop}, relaxed {relaxed}, added {added}, add {add}: {:#?}",
+            cs.changes
+        );
     }
 
     /// A plan that renames a table **and** drops one of its columns names the
@@ -4567,8 +4610,14 @@ mod tests {
             &mut changes,
         );
         assert!(
-            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
-            "{changes:?}"
+            matches!(
+                changes.as_slice(),
+                [
+                    Change::SetPrimaryKey { to: None, .. },
+                    Change::SetPrimaryKey { from: None, .. }
+                ]
+            ),
+            "a replaced key is its drop and its add: {changes:?}"
         );
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
@@ -4582,7 +4631,13 @@ mod tests {
             &mut changes,
         );
         assert!(
-            matches!(changes.as_slice(), [Change::SetPrimaryKey { .. }]),
+            matches!(
+                changes.as_slice(),
+                [
+                    Change::SetPrimaryKey { to: None, .. },
+                    Change::SetPrimaryKey { from: None, .. }
+                ]
+            ),
             "a named key is compared in full: {changes:?}"
         );
     }

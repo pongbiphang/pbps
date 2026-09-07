@@ -567,13 +567,22 @@ with a real order between them belongs in separate classes; this tiebreaker
 cannot express it."* A change that is two directions at once has a real order
 against itself, and no class expresses that.
 
-The fix here was to key the class on the change's *contents* — `to: None` is a
-drop and travels with the drops — because it needed no new class and no
-renumbering. It closes the shape only where one direction is absent; a genuine
-both-directions change still sits in one place, and the residue is the issue
-that says so. When a model has one variant per *object* rather than one per
-*direction*, ordering is where it will surface, and the question to ask of each
-such variant is: what does this sort as when only half of it is real?
+The first fix keyed the class on the change's *contents* — `to: None` is a drop
+and travels with the drops — because it needed no new class and no renumbering.
+That closed the shape only where one direction is absent, and the next review
+found the other half by the same reasoning: a *replacement* is both directions
+at once, no class is right for it, and the same plan is refused. So the
+replacement became two changes, one per direction, and the ordering question
+answers itself.
+
+The lesson is the second half, not the first. A variant with one entry per
+*object* rather than one per *direction* cannot be ordered by direction, and
+patching the case where one direction happens to be absent leaves the case
+where neither is. When a model has such a variant, the question is not "which
+class does this belong in" but "does this change have one answer" — and if it
+does not, it is not one change. Splitting it costs the plan a line, and buys
+each half its own class, its own risk and its own place in what a reviewer
+reads.
 
 ## A guard built twice is a guard that fires early
 

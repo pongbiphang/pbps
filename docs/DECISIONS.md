@@ -4771,11 +4771,37 @@ SPEC is in sync with all of these.
     this class, which is the order the engine requires and the reason that rank
     was written (DECISIONS 237).
 
-    **Conditioned on `to: None`, not on the variant.** A key being replaced
-    carries its add with it, and an add may name a column the same plan is
-    still adding at class 8, so a replacement in class 2 would fail the other
-    way. It stays below, and the half of the problem that follows it — a
-    replacement beside a nullability change on the column leaving the key — is
-    issue #178, whose fix is to emit the replacement as two changes. That
-    changes the shape of a plan a reviewer approves, so it belongs in a change
-    that is about it rather than in the one that found it.
+    **Conditioned on `to: None`, not on the variant**, because a key being
+    replaced is no longer one change — see DECISIONS 270.
+
+270. **A replaced primary key is planned as two changes, its drop and its
+    add.** DECISIONS 269 put a key's drop with the constraint drops by keying
+    the class on `to: None`, and left the replacement where it was. Review
+    found the half that leaves open, and it is the same defect: a declaration
+    turning `PRIMARY KEY (id)` into `PRIMARY KEY (other)` while relaxing `id`
+    still ran `DROP NOT NULL` against a column `pk_t` held — `42P16` on
+    PostgreSQL, 5074 with 4922 behind it on SQL Server.
+
+    One change cannot be ordered correctly here, and no class can rescue it.
+    The drop must precede every column change a standing key blocks; the add
+    must follow every column its new shape may name, including one this same
+    plan adds at class 8. Opposite ends, so: two changes.
+
+    Nothing else moves. The model is unchanged, and both emitters already
+    emitted the two statements independently — `if let Some(pk) = from` then
+    `if let Some(pk) = to` — so the SQL is the SQL it was and only the
+    positions change. `from: None` on the add half is accurate where it runs,
+    because the drop half has already taken the key away.
+
+    **The risk classes follow, and that is the intended consequence rather
+    than a side effect.** A replacement used to answer `Constraint` alone;
+    now its drop answers `Destructive` and its add `Constraint`. That is what
+    the database does — the old key and its index are gone — and a gate that
+    was told only about the constraint was told half of it. A policy that
+    denies `Destructive` will now stop a key replacement, which is the
+    conversation that should have been happening.
+
+    The plan a reviewer reads changes shape with it: one line becomes two, in
+    different places, each with its own risk. That is more to read and it is
+    the truth about what runs; the alternative is one line that hides a drop
+    among the additions.
