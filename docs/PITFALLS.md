@@ -535,7 +535,7 @@ model can carry that text before writing the check, and ask whether the fix
 belongs on the text or on the thing reading it. A guard per carrier is a sweep
 you have to repeat every time the model grows a fourth.
 
-**And then the same shape moved to the list.** The pin went in with three
+**And then the list was closed against the wrong rule twice.** The pin went in with three
 settings — the three that decide what a *temporal* literal is — and the next
 review found a fourth, `timezone_abbreviations`, which `TimeZone = 'UTC'` does
 not cover and which puts the same declared instant fifteen and a half hours
@@ -551,6 +551,22 @@ were derived from is "a setting that changes what the declared text means",
 which reaches all five and says how to test a sixth. When a list is derived,
 write the derivation next to it — a list whose rule is left implicit gets
 extended by resemblance to its existing members.
+
+**And the exclusions need the same treatment as the entries.** Two settings
+were kept out with a measurement and a reason: `bytea_output` and
+`extra_float_digits` are *output-only*, measured, since a declared expression
+stores the same constraint under `hex`/`1` as under `escape`/`0`. Both halves
+were true and the conclusion was wrong, because "output-only" is a fact about
+where the engine *reads* the setting and the question was whether a plan's
+result depends on it. A cast to text runs a stored value through an output
+function: measured, one approved `ALTER COLUMN b TYPE text` leaves `\x0102`
+under `hex` and `\001\002` under `escape`.
+
+An exclusion carries a claim as load-bearing as an entry's, and it is the half
+nobody re-reads — the entries get exercised by every test that uses them, while
+the reason a setting is absent is exercised by nothing. Write the exclusion's
+measurement *and the case it was measured on*, so the next reader can see what
+it does not cover.
 
 ## One change carrying both directions, in a list that orders directions
 

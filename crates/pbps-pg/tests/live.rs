@@ -3468,3 +3468,117 @@ async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     let again = plan(&state, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
 }
+
+/// A conversion to text runs the stored value through the type's *output*
+/// function, so the two settings the framing was told were output-only decide
+/// what it leaves behind.
+///
+/// They were excluded on a measurement that was true of what it measured: a
+/// declared expression stores the same constraint under `hex`/`1` and under
+/// `escape`/`0`, because nothing in `CHECK (b >= '\x0102')` renders a value.
+/// An `ALTER COLUMN … TYPE text` does, and the same approved statement then
+/// leaves two different strings in the table. Pinning them is the whole answer
+/// where refusing the conversion would be an enumeration: every cast to text
+/// goes through an output function.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_operators() {
+    let s = emit_schema("render");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (b bytea, f double precision); \
+         INSERT INTO {s}.t VALUES ('\\x0102', 0.1234567890123456789)"
+    ))
+    .await
+    .expect("the row both conversions render");
+    // The operator's environment, as an `ALTER ROLE … SET` would leave it.
+    conn.execute("SET bytea_output = 'escape'; SET extra_float_digits = -3")
+        .await
+        .expect("the operator's settings");
+
+    let table = TableName::new(&s, "t");
+    let pg = Postgres::new();
+    let retype = |column: &str, from: &str| pbps_model::Change::AlterColumnType {
+        uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+        column: pbps_model::ColumnRef {
+            table: table.clone(),
+            name: column.to_owned(),
+        },
+        from: ty(from),
+        to: ty("text"),
+        from_nullable: true,
+        to_nullable: true,
+    };
+
+    let framing = pg.transaction_framing();
+    conn.begin(framing).await.expect("begin");
+    for change in [retype("b", "bytea"), retype("f", "double precision")] {
+        for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+    let rendered = text(&mut conn, &format!("SELECT b || ' ' || f FROM {s}.t")).await;
+    conn.rollback(framing).await.expect("rollback");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    // What the pin decided, not what the session held: `escape` would have
+    // stored `\001\002` and `-3` would have stopped at twelve digits.
+    assert_eq!(rendered, "\\x0102 0.12345678901234568");
+}
+
+/// A column's new type goes in before a default written for it.
+///
+/// Both changes are class 9 and the tiebreaker there is the change's
+/// rendering, which sorted `AlterColumnDefault` first by the alphabet. Measured
+/// here, that plan cannot apply: this engine refuses `SET DEFAULT 'abc'` on an
+/// `integer` column outright, and the statement that would have made the column
+/// `text` is the next one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
+    let s = emit_schema("retype");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let table = TableName::new(&s, "t");
+
+    let with = |t: &str, d: &str| Column {
+        default: Some(d.to_owned()),
+        ..Column::new(ty(t))
+    };
+    let mut before = Table::default();
+    before.columns.insert("n".into(), with("integer", "0"));
+    let mut a = Schema::default();
+    a.tables.insert(table.clone(), before);
+
+    let mut after = Table::default();
+    after
+        .columns
+        .insert("n".into(), with("text", "'abc'::text"));
+    let mut b = Schema::default();
+    b.tables.insert(table.clone(), after);
+
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+    let ids_b = mint_ids(&b, &ids_a, &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
+    apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
+
+    let pulled = pull(&mut conn).await;
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    let state = ours_only(&pulled, &s);
+    assert_eq!(state, normalized(&b));
+    let again = plan(&state, &ids_b, &b, &ids_b);
+    assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+}

@@ -263,9 +263,10 @@ all three are *refused* under a path that is only the object's own schema
 parses cannot ride there at all: a simple query is lexed as a whole before any
 of it runs, so `standard_conforming_strings = on` and `check_function_bodies =
 on` are pinned by the transaction framing, the earlier batch a transactional
-apply runs (DECISIONS 260), and so are the five that decide what a declared
-expression *means* — `DateStyle`, `TimeZone`, `IntervalStyle`,
-`timezone_abbreviations` and `transform_null_equals`. They are constants rather
+apply runs (DECISIONS 260), and so are the seven that decide what a declared
+expression *means* or what a conversion writes back — `DateStyle`, `TimeZone`,
+`IntervalStyle`, `timezone_abbreviations`, `transform_null_equals`,
+`bytea_output` and `extra_float_digits`. They are constants rather
 than per-object, and measured, the same check constraint stores a different day,
 a different instant, an interval with the opposite sign, a time fifteen and a
 half hours out, and a predicate that is no longer the one that was written —

@@ -985,7 +985,6 @@ fn dependency_rank(
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
         | Change::SetColumnDeprecated { .. }
@@ -1016,6 +1015,20 @@ fn dependency_rank(
         // tiebreaker it had.
         Change::AddForeignKey { .. } => 1,
         Change::DropForeignKey { .. } => -1,
+        // A column's new type goes in before a default written for it. They
+        // share class 9 and the tiebreaker below is the change's rendering,
+        // which sorts `AlterColumnDefault` ahead of `AlterColumnType` by the
+        // alphabet — so a default that only fits the new type was set against
+        // the old one. Measured, PostgreSQL refuses `SET DEFAULT 'abc'` on an
+        // `integer` column with "invalid input syntax for type integer", and
+        // the plan that widened the column to `text` in the next statement
+        // rolled back.
+        //
+        // A constant, like the foreign key's above and for the same reason:
+        // the dependency is a layering, not a graph. A type change never needs
+        // a default that is already there, and the nullability travels inside
+        // the type change rather than beside it.
+        Change::AlterColumnType { .. } => -1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -2763,6 +2776,38 @@ mod tests {
                 }),
             ],
             "the key has to go first: {:#?}",
+            cs.changes
+        );
+    }
+
+    /// A column's new type goes in before a default that was written for it.
+    ///
+    /// Both are class 9, so the tiebreaker decided, and the tiebreaker is the
+    /// change's rendering — which puts `AlterColumnDefault` ahead of
+    /// `AlterColumnType` by the alphabet and nothing else. Measured on 18.6,
+    /// `SET DEFAULT 'abc'` on an `integer` column is refused outright, "invalid
+    /// input syntax for type integer", so a declaration that retypes the column
+    /// to `text` and gives it a text default produced a plan that rolled back
+    /// on its first statement.
+    #[test]
+    fn a_new_type_goes_in_before_a_default_written_for_it() {
+        let with = |t: &str, d: &str| Column {
+            default: Some(d.to_owned()),
+            ..Column::new(ty(t))
+        };
+        let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+        let declared = schema_of("dbo.t", table(&[("n", with("nvarchar(10)", "'abc'"))]));
+        let cs = run(&base, &declared, &[]);
+        let at = |f: fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+        };
+        assert!(
+            at(|c| matches!(c, Change::AlterColumnType { .. }))
+                < at(|c| matches!(c, Change::AlterColumnDefault { .. })),
+            "{:#?}",
             cs.changes
         );
     }

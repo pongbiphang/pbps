@@ -313,10 +313,29 @@ impl Dialect for Postgres {
     /// They could ride in the statement's own scope — unlike the two above,
     /// these are read at parse *analysis*, and measured, a `SET LOCAL
     /// DateStyle` does reach the rest of its own batch — but they do not vary
-    /// per statement the way `search_path` does, and putting seven settings and
-    /// seven `RESET`s around every line of a plan would bury the SQL a reviewer
+    /// per statement the way `search_path` does, and putting nine settings and
+    /// nine `RESET`s around every line of a plan would bury the SQL a reviewer
     /// is there to read (SPEC §14.1). A constant belongs where the constants
     /// are.
+    ///
+    /// **`bytea_output` and `extra_float_digits` are here too, and were not.**
+    /// They were excluded as *output-only*, and that was measured and true of
+    /// the case it was measured on: a declared expression stores the same
+    /// constraint under `hex`/`1` and under `escape`/`0`, because nothing in
+    /// `CHECK (b >= '\x0102')` runs a value through an output function. A
+    /// **type conversion** does. Measured:
+    ///
+    /// ```text
+    /// bytea -> text            hex -> \x0102        escape -> \001\002
+    /// double precision -> text 1 -> 0.12345678901234568   -3 -> 0.123456789012
+    /// ```
+    ///
+    /// Same stored bytes, same approved `ALTER`, two different strings left in
+    /// the table. Pinning them is the complete answer where refusing the
+    /// conversion would be an enumeration — every cast to text goes through an
+    /// output function, and the list of which ones read a setting is exactly
+    /// the list this pin makes irrelevant. The values are the read scope's, so
+    /// what a plan writes is what the next `pull` reads back.
     ///
     /// `lc_monetary` belongs to this class and is deliberately absent, for the
     /// reason `catalog.rs` gives on the read side: `SET` fails outright on a
@@ -342,7 +361,8 @@ impl Dialect for Postgres {
                     SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
                     SET IntervalStyle = 'postgres'; \
                     SET timezone_abbreviations = 'Default'; \
-                    SET transform_null_equals = off; BEGIN;",
+                    SET transform_null_equals = off; \
+                    SET bytea_output = 'hex'; SET extra_float_digits = 1; BEGIN;",
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.

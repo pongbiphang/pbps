@@ -4668,6 +4668,7 @@ SPEC is in sync with all of these.
     expressions the model carries — a column default, a check expression and an
     index filter (ADR-0013 §3) — are text the engine reads through an input
     function or a parser rule, and five settings decide what that text means.
+    Two more decide what a *conversion* writes back, below.
     Measured on 18.6, the identical declaration created by two sessions:
 
     ```text
@@ -4695,6 +4696,26 @@ SPEC is in sync with all of these.
     Both were found by review after the first three shipped, and a list closed
     against its rule would have taken a third round to find the fourth.
 
+    **`bytea_output` and `extra_float_digits` are the seventh and eighth, and
+    were left out on a measurement that was true of what it measured.** A
+    declared expression stores the same constraint under `hex`/`1` and under
+    `escape`/`0`, because nothing in `CHECK (b >= '\x0102')` runs a value
+    through an *output* function. An `ALTER COLUMN … TYPE text` does:
+
+    ```text
+    bytea -> text             hex -> \x0102              escape -> \001\002
+    double precision -> text  1 -> 0.12345678901234568   -3 -> 0.123456789012
+    ```
+
+    Same stored bytes, same approved statement, two different strings left in
+    the table. The rule reaches this and the exclusion did not, because
+    "output-only" was a statement about where the setting is *read* rather than
+    about whether a plan's result depends on it. Pinning is the complete answer
+    where refusing the conversion would be an enumeration: every cast to text
+    goes through an output function, and the list of which ones consult a
+    setting is exactly the list the pin makes irrelevant. The values are the
+    read scope's, so what a plan writes is what the next `pull` reads back.
+
     `lc_monetary` is in the class and is deliberately out, for the reason
     `catalog.rs` gives on the read side: `SET` fails outright on a locale the
     server does not have, so pinning it would turn a database that deploys into
@@ -4704,7 +4725,7 @@ SPEC is in sync with all of these.
     They go in `begin` and not in the per-statement scope because they are
     *constants*: unlike `search_path`, which is the object's own schema and
     therefore varies per statement (DECISIONS 259), one value serves the whole
-    plan. Seven `SET`s and seven `RESET`s around every line of `plan.sql` would
+    plan. Nine `SET`s and nine `RESET`s around every line of `plan.sql` would
     bury the SQL a reviewer has to read (SPEC §14.1) to say the same thing
     once.
 
@@ -4805,3 +4826,32 @@ SPEC is in sync with all of these.
     different places, each with its own risk. That is more to read and it is
     the truth about what runs; the alternative is one line that hides a drop
     among the additions.
+
+271. **A column's new type is applied before a default written for it.** Both
+    changes are ordering class 9, so the tiebreaker decided which ran first,
+    and the tiebreaker is the change's `Debug` rendering — which puts
+    `AlterColumnDefault` ahead of `AlterColumnType` by the alphabet and nothing
+    else. Measured, that is not an order the engine accepts:
+
+    ```text
+    ALTER TABLE t ALTER COLUMN n SET DEFAULT 'abc';
+        -> ERROR: invalid input syntax for type integer: "abc"
+    ALTER TABLE t ALTER COLUMN n TYPE text;   -- never reached
+    ```
+
+    A declaration retyping `integer DEFAULT 0` to `text DEFAULT 'abc'` is
+    valid, reviewed, and could not be applied.
+
+    The fix is a rank inside the class rather than a new class:
+    `dependency_rank` answers `-1` for `AlterColumnType`, which is what it
+    already does for a foreign-key drop and for the same reason — the
+    dependency is a layering, not a graph, and a constant says it exactly. A
+    type change never needs a default that is already there, and the
+    nullability travels *inside* the type change rather than beside it
+    (`Change::AlterColumnType` carries both ends), so there is no third
+    direction to order.
+
+    The tiebreaker's own comment already said this would happen: "anything with
+    a real order between them belongs in separate classes; this tiebreaker
+    cannot express it." A rank is the third way, and it is the one that costs
+    no renumbering.
