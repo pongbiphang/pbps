@@ -2525,6 +2525,94 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
     assert!(refusal.to_string().contains("pg_catalog"), "{refusal}");
 }
 
+/// A declared expression ending in a comment still runs, in every place this
+/// dialect writes one verbatim.
+///
+/// The emitter's own syntax follows the user's text on the same line — `);`
+/// after a check, `,` after a default in a column list, `);` after an index
+/// filter — and a line comment swallows whatever is behind it. **Measured**,
+/// before the fix: `CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 --
+/// reason));` is `syntax error at end of input`, and so is a column list whose
+/// default ends in one. So a valid declaration produced a statement that could
+/// not run at all, which is why this is a live test: only the engine can say
+/// the newline is in the right place, at every site.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
+    let s = emit_schema("trailingcomment");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+
+    let mut n = Column::new(ty("integer")).not_null();
+    n.default = Some("1 -- the reason for the default".into());
+    let mut t = Table::default();
+    t.columns.insert("n".into(), n);
+    t.checks.insert(
+        "ck_n".into(),
+        CheckConstraint {
+            expression: "n > 0 -- the reason for the check".into(),
+        },
+    );
+    t.indexes.insert(
+        "ix_n".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "n".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: Some("n > 0 -- the reason for the filter".into()),
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(TableName::new(&s, "commented"), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    let pg = Postgres::new();
+    apply(&mut conn, &pg, &cs).await;
+
+    // And a second plan, so the `ALTER … SET DEFAULT` site is exercised too:
+    // that one ends the statement with `;` right behind the expression.
+    let mut second = declared.clone();
+    second
+        .tables
+        .get_mut(&TableName::new(&s, "commented"))
+        .expect("the table")
+        .columns
+        .get_mut("n")
+        .expect("the column")
+        .default = Some("2 -- the reason for the new default".into());
+    let cs = plan(&declared, &ids, &second, &ids);
+    assert!(
+        !cs.changes.is_empty(),
+        "the second plan has to carry the default change"
+    );
+    apply(&mut conn, &pg, &cs).await;
+
+    let pulled = pull(&mut conn).await;
+    let ours = ours_only(&pulled, &s);
+    let table = &ours.tables[&TableName::new(&s, "commented")];
+    let read = format!(
+        "{:?} {:?} {:?}",
+        table.columns["n"].default, table.checks["ck_n"].expression, table.indexes["ix_n"].filter
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    // The engine keeps none of the comments — `pg_get_constraintdef` renders
+    // the parsed expression — so what this asserts is that all three arrived
+    // and none of them took the syntax behind it away.
+    assert!(
+        !read.contains("the reason"),
+        "the engine does not store the comments: {read}"
+    );
+    assert!(
+        read.contains('2'),
+        "the new default has to be there: {read}"
+    );
+}
+
 /// `standard_conforming_strings` is pinned by the transaction framing, and the
 /// pin has to survive the operator having turned it off.
 ///

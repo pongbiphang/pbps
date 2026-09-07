@@ -340,10 +340,10 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
     let mut blocked = false;
     loop {
         let trimmed = rest.trim_start();
-        newline |= rest[..rest.len() - trimmed.len()].contains('\n');
+        newline |= rest[..rest.len() - trimmed.len()].contains(NEWLINE);
         rest = trimmed;
         if let Some(after) = rest.strip_prefix("--") {
-            let Some(at) = after.find('\n') else {
+            let Some(at) = after.find(NEWLINE) else {
                 // Runs to the end of the text: nothing can follow it, so this
                 // is the whole gap and no continuation is coming.
                 return ("", newline);
@@ -365,6 +365,21 @@ fn after_the_gap(tail: &str) -> (&str, bool) {
         }
     }
 }
+
+/// The characters this engine ends a line with, either of them alone.
+///
+/// **Measured**, and the reason this is a set and not `'\n'`: a bare carriage
+/// return is a newline to this lexer, in both places one matters here.
+///
+/// ```text
+/// '01/02/' ⏎(CR) '2026'      -> 01/02/2026   it continues a string constant
+/// '01/02/' -- c ⏎(CR) '2026' -> 01/02/2026   and it ends a line comment
+/// ```
+///
+/// The repo has met this before, in the module scanner: a comment ends at a
+/// carriage return, and a rule written for `\n` alone reads the rest of the
+/// file as commented (PITFALLS, "A comment ends at a carriage return").
+const NEWLINE: [char; 2] = ['\n', '\r'];
 
 /// The text after the `*/` closing the block comment whose `/*` was just
 /// consumed, or `None` when nothing closes it.
@@ -521,6 +536,31 @@ pub(crate) fn refuse_an_unresolved_default(
     )))
 }
 
+/// A declared expression, followed by the newline that closes any comment in
+/// it.
+///
+/// The three expressions this dialect writes verbatim — a default, a check and
+/// an index filter (ADR-0013 §3) — are the user's text, and the emitter's own
+/// syntax follows them on the same line. A trailing line comment then swallows
+/// it. **Measured**, both halves:
+///
+/// ```text
+/// CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+///   -> ERROR: syntax error at end of input
+/// CREATE TABLE t (a int DEFAULT 1 -- why, b int);
+///   -> ERROR: syntax error at end of input
+/// CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason ⏎ ));
+///   -> accepted, and stored as CHECK ((n > 0))
+/// ```
+///
+/// So a valid declaration produced a statement that cannot run, in every one
+/// of the five places an expression is interpolated. One newline is the whole
+/// fix, and it goes here rather than at each site so that a sixth place has
+/// somewhere to reach for (DECISIONS 281).
+fn verbatim(expression: &str) -> String {
+    format!("{expression}\n")
+}
+
 fn null_clause(nullable: bool) -> &'static str {
     if nullable { "NULL" } else { "NOT NULL" }
 }
@@ -547,7 +587,7 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
         if let Some(e) = refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr) {
             return Err(e);
         }
-        s.push_str(&format!(" DEFAULT {expr}"));
+        s.push_str(&format!(" DEFAULT {}", verbatim(expr)));
     }
     Ok(s)
 }
@@ -655,7 +695,7 @@ fn create_index(
         s.push_str(&format!(" INCLUDE ({})", column_list(&index.include)?));
     }
     if let Some(filter) = &index.filter {
-        s.push_str(&format!(" WHERE ({filter})"));
+        s.push_str(&format!(" WHERE ({})", verbatim(filter)));
     }
     s.push(';');
     Ok(s)
@@ -1020,9 +1060,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             &column.table,
             match to {
                 Some(expr) => format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {expr};",
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                     qualified(&column.table)?,
-                    quote(&column.name)?
+                    quote(&column.name)?,
+                    verbatim(expr)
                 ),
                 None => format!(
                     "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
@@ -1104,7 +1145,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
                 qualified(table)?,
                 quote(name)?,
-                constraint.expression
+                verbatim(&constraint.expression)
             ),
         ),
 
@@ -1259,7 +1300,7 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
             &format!(
                 "ALTER TABLE {q} ADD CONSTRAINT {} CHECK ({});",
                 quote(n)?,
-                c.expression
+                verbatim(&c.expression)
             ),
         )?);
     }
@@ -1587,6 +1628,12 @@ mod tests {
             "/* leading */ '2026-01-02'",
             "(/* inside the grouping */ '2026-01-02')",
             "$$2026-01-02$$ -- trailing",
+            // A bare carriage return is a newline to this lexer, both as the
+            // gap a continuation needs and as the end of a line comment —
+            // measured, all three of these are the one constant `01/02/2026`.
+            "'01/02/'\r'2026'",
+            "'01/02/'\r\n'2026'",
+            "'01/02/' -- c\r'2026'",
             // A parenthesis that is data cannot be the one that closes the
             // grouping. Measured, each of these is the same session-decided
             // value as the same declaration without the comment — the first
@@ -1647,6 +1694,9 @@ mod tests {
             // syntax error whether the newline stands before the comment or
             // after it, so neither is a declaration to refuse.
             "'01/02/' /* c */\n'2026'",
+            // The other newline does not change what a block comment does to
+            // a continuation either.
+            "'01/02/' /* c */\r'2026'",
             "'01/02/'\n/* c */ '2026'",
             // Block comments nest, so this is one comment in the gap and not
             // two — and the `--` inside one is comment text, which leaves the
@@ -1883,9 +1933,88 @@ mod tests {
         )
         .remove(0);
         assert!(
-            sql.contains("ADD CONSTRAINT \"ck\" CHECK ((n > 0));"),
+            sql.contains("ADD CONSTRAINT \"ck\" CHECK ((n > 0)\n);"),
             "{sql}"
         );
+
+        // And the newline is not decoration: a comment in the declared text
+        // ends at one, so the syntax that closes the statement has to be past
+        // it. Measured, `CHECK (n > 0 -- reason));` is a syntax error and the
+        // same text with the closer on the next line is accepted.
+        for (expression, tail) in [
+            ("n > 0 -- reason", "-- reason\n);"),
+            ("n > 0 /* reason */", "/* reason */\n);"),
+        ] {
+            let sql = sql_of(
+                &Postgres::new(),
+                &Change::AddCheck {
+                    table: name("app", "t"),
+                    name: "ck".into(),
+                    constraint: CheckConstraint {
+                        expression: expression.into(),
+                    },
+                },
+            )
+            .remove(0);
+            assert!(sql.contains(tail), "{expression}: {sql}");
+        }
+
+        // The same for the other two expressions this dialect writes
+        // verbatim, at every site each of them reaches.
+        let mut column = Column::new(ty("integer"));
+        column.default = Some("1 -- why".into());
+        let mut table = Table::default();
+        table.columns.insert("n".into(), column.clone());
+        let created = sql_of(
+            &Postgres::new(),
+            &Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: name("app", "t"),
+                table: Box::new(table),
+            },
+        )
+        .remove(0);
+        assert!(created.contains("DEFAULT 1 -- why\n"), "{created}");
+        let added = sql_of(
+            &Postgres::new(),
+            &Change::AddColumn {
+                uid: Uid::generate(UidKind::Column),
+                table: name("app", "t"),
+                name: "n".into(),
+                column: Box::new(column),
+            },
+        )
+        .remove(0);
+        assert!(added.contains("DEFAULT 1 -- why\n"), "{added}");
+        let set = sql_of(
+            &Postgres::new(),
+            &Change::AlterColumnDefault {
+                uid: Uid::generate(UidKind::Column),
+                column: name("app", "t").column("n"),
+                from: None,
+                to: Some("1 -- why".into()),
+            },
+        )
+        .remove(0);
+        assert!(set.contains("SET DEFAULT 1 -- why\n;"), "{set}");
+        let indexed = sql_of(
+            &Postgres::new(),
+            &Change::AddIndex {
+                table: name("app", "t"),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: vec![IndexColumn {
+                        name: "n".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: Some("n > 0 -- why".into()),
+                }),
+            },
+        )
+        .remove(0);
+        assert!(indexed.contains("WHERE (n > 0 -- why\n);"), "{indexed}");
     }
 
     /// A table with no columns is not a table this engine will make, and the

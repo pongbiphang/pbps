@@ -5205,3 +5205,37 @@ SPEC is in sync with all of these.
     the model rather than at the guard: the caller that must key them is not the
     place to decide what each promise is about, and a second caller would have
     spelled it again.
+
+281. **A declared expression is followed by a newline before any syntax the
+    emitter owns, and a line ends at `\r` as much as at `\n`.** Two halves of
+    one fact about comments, found in the same round.
+
+    **The emission.** This dialect writes three things verbatim — a default, a
+    check expression, an index filter (ADR-0013 §3) — and put its own syntax
+    behind them on the same line. Measured, a comment at the end of the user's
+    text takes it away:
+
+    ```text
+    CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+      -> ERROR: syntax error at end of input
+    CREATE TABLE t (a int DEFAULT 1 -- why, b int);
+      -> ERROR: syntax error at end of input
+    CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason ⏎ ));
+      -> accepted, and stored as CHECK ((n > 0))
+    ```
+
+    So a valid declaration produced a statement that cannot run, at each of the
+    five sites that interpolate one. One newline is the whole fix; it lives in
+    a `verbatim` helper rather than at each site, so that a sixth site has
+    somewhere to reach for. The engine keeps none of the comments — the stored
+    definition is the parsed expression — which is why nothing but the apply
+    could have shown this.
+
+    **The scan.** The gap scanner of 278 asked for `'\n'`, and this lexer ends
+    a line at either character. Measured, `'01/02/' <CR> '2026'` is the one
+    constant `01/02/2026`, and so is `'01/02/' -- c <CR> '2026'`: a bare
+    carriage return both ends a line comment and supplies the newline a
+    continued constant needs. A default written that way walked past the guard
+    that exists to refuse it. The repo had already recorded this shape for
+    SQL Server (PITFALLS, "A comment ends at a carriage return"), which is the
+    part worth keeping: a second scanner went in with one line ending anyway.

@@ -376,6 +376,20 @@ refused — see above):
 And the consequence the check exists to prevent: `ALTER TABLE … ADD c int NOT
 NULL DEFAULT --x<CR>NULL` on a table with one row fails with **Msg 515**.
 
+**It happened again in the PostgreSQL emitter, in a scanner written years
+after this section.** The rule there is the same on both counts — measured,
+`'01/02/' <CR> '2026'` is one string constant and `'01/02/' -- c <CR> '2026'`
+is too, because a bare CR both ends a line comment and supplies the newline a
+continued constant needs. The gap scanner was written against `'\n'` alone, so
+a session-decided default written across a CR walked past the guard that exists
+to refuse it (DECISIONS 281).
+
+The lesson is not "remember CR". It is that *this file already said so*, and
+the second scanner still went in with one line ending. When you write a
+predicate about where a line ends, in any language, grep this file for the
+character class before choosing one — the shape recurs because `\n` is what a
+person types when they mean "end of line".
+
 ## `shell_arg` has been wrong about shells five times
 
 **The test written to pin the second fix asserted the bug.**
@@ -407,6 +421,34 @@ was perfectly well formed. Absent, empty and unreadable are three different
 things, and a test that asserts an exit code cannot tell them apart.
 
 `-z` and split on NUL. Never `lines()`, never `trim()`.
+
+## The user's text and our syntax, on one line
+
+Three things a declaration holds are written into the statement **verbatim**,
+because only the engine can say what they mean: a column default, a check
+expression and an index filter (ADR-0013 §3). The emitter's own syntax followed
+each of them on the same line — `);` after a check, `,` after a default in a
+column list, `);` after an index filter, `;` after a `SET DEFAULT`. A line
+comment at the end of the user's text then swallowed it. Measured:
+
+```text
+CREATE TABLE t (n int, CONSTRAINT ck CHECK (n > 0 -- reason));
+  -> ERROR: syntax error at end of input
+CREATE TABLE t (a int DEFAULT 1 -- why, b int);
+  -> ERROR: syntax error at end of input
+```
+
+A valid declaration produced a statement that cannot run — in five places, one
+per site, because each site spelled the interpolation itself. The fix is one
+newline, in one helper the five sites call, so the sixth has somewhere to reach
+for (DECISIONS 281).
+
+The general shape: **verbatim text ends in a state, not just in a character.**
+Text copied from a declaration into generated code can leave the reader inside
+a comment, a string or a quote, and everything the generator writes after it on
+that line is then data. Any generator that interpolates user text has to ask
+what state the text can end in, and close it — the same question a templating
+engine answers with escaping and this one answers with a newline.
 
 ## A remedy written where the finding is made
 
