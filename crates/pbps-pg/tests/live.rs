@@ -5678,9 +5678,12 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
     for one in &described {
         assert!(refusal.contains(one), "{one} is missing from:\n{refusal}");
     }
+    // The engine's own `HINT` for this refusal is `Use DROP ... CASCADE`, and
+    // this tool's answer says the opposite in as many words: the plan names
+    // every object it drops, or it does not drop (SPEC 14.3).
     assert!(
-        !refusal.to_uppercase().contains("USE DROP ... CASCADE"),
-        "the plan names every object it drops, or it does not drop: {refusal}"
+        refusal.contains("`DROP … CASCADE` is not offered"),
+        "{refusal}"
     );
 
     // Declared, the two representable table parts become the plan's to drop

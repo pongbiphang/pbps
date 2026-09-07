@@ -1266,8 +1266,14 @@ mod tests {
         let refusal = unmanaged_refusal(&id("app.g(integer)"), &one_missing, &declared)
             .expect("an undeclared dependent refuses");
         assert!(refusal.contains("app.other"), "{refusal}");
-        // The shortest way out is the one SPEC 14.3 refuses to offer.
-        assert!(!refusal.contains("CASCADE the"), "{refusal}");
+        // The shortest way out is named as one this tool does not offer,
+        // rather than left for a reader to reach for. Asserted as the
+        // sentence it is: a `!contains("CASCADE")` would pass on a message
+        // that never mentioned the subject at all.
+        assert!(
+            refusal.contains("`DROP … CASCADE` is not offered"),
+            "{refusal}"
+        );
         assert!(to_rebuild(&one_missing, &declared).is_empty());
     }
 
