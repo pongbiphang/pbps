@@ -725,6 +725,18 @@ made is a decision that has not happened yet.** The foreign keys now run in a
 second pass, against what the constraint and index arms actually recorded
 (DECISIONS 254).
 
+**A guard whose condition is narrower than its reason.** The pull refused a
+table with `relrowsecurity`, and the message said why: "whose policies this
+model does not hold". The policies were the reason; the switch was the
+condition. Measured, `CREATE POLICY` without `ENABLE ROW LEVEL SECURITY` leaves
+`relrowsecurity` false and the policy rows there, so the table came through as
+an ordinary one — and a rebuild drops the policies, after which whoever turns
+row-level security on gets a table that is open where this one was about to be
+closed. `relforcerowsecurity` is a third flag, independent of both. **Read the
+guard's own sentence and check the code says the same thing**: when the reason
+names an object and the condition names a switch, the condition is the narrower
+of the two.
+
 **The shape both share:** the catalog answers "what kind of thing is this?" in
 one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the

@@ -78,6 +78,8 @@ fn tables_query() -> String {
         AND {NOT_ONE_OF_OURS}
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
         AND NOT c.relrowsecurity
+        AND NOT c.relforcerowsecurity
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid)
         AND c.relpersistence = 'p'
         AND c.relreplident = 'd'
         AND NOT c.relhasrules
@@ -99,6 +101,9 @@ fn partitioned_query() -> String {
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
             c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
+            c.relforcerowsecurity AS force_row_security,
+            (SELECT pg_catalog.count(*) FROM pg_catalog.pg_policy p
+              WHERE p.polrelid = c.oid)::int8 AS policies,
             c.relreplident::text AS replica_identity,
             c.relhasrules AS has_rules, am.amname AS access_method,
             c.reloftype::regtype::text AS of_type
@@ -111,6 +116,9 @@ fn partitioned_query() -> String {
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
                       OR c.relrowsecurity
+                      OR c.relforcerowsecurity
+                      OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
+                                  WHERE p.polrelid = c.oid)
                       OR c.relpersistence <> 'p'
                       OR c.relreplident <> 'd'
                       OR c.relhasrules
@@ -421,6 +429,23 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             "f" => "a foreign table",
             "r" if flag(&row, "row_security")? => {
                 "a table with row-level security enabled, whose policies this model does not hold"
+            }
+            // `FORCE` makes the policies apply to the table's owner too, and
+            // it is a separate flag: measured, a table can carry it with row
+            // level security not enabled at all.
+            "r" if flag(&row, "force_row_security")? => {
+                "a table with `FORCE ROW LEVEL SECURITY`, which decides whether its own owner is \
+                 subject to the policies"
+            }
+            // Policies with the switch off. They do nothing today, and that is
+            // the trap: a rebuild drops them, and whoever turns row-level
+            // security on afterwards gets a table with no policies — open,
+            // where this one was about to be closed.
+            "r" if number(&row, "policies")? > 0 => {
+                "a table with row-level security policies that are not in force, which this model \
+                 does not hold. They do nothing while the switch is off, so a rebuild would drop \
+                 them silently and enabling row-level security afterwards would leave the table \
+                 open"
             }
             "r" if text(&row, "persistence")? == "u" => "an UNLOGGED table",
             "r" if text(&row, "persistence")? == "t" => "a temporary table",

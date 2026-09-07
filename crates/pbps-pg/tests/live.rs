@@ -1504,6 +1504,15 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                      REFERENCES {s}.quoted (x, \"a)b\"));
              CREATE TABLE {s}.guarded (id integer PRIMARY KEY);
              ALTER TABLE {s}.guarded ENABLE ROW LEVEL SECURITY;
+             -- A policy with the switch off does nothing today, which is the
+             -- trap: a rebuild drops it, and turning the switch on afterwards
+             -- gives a table with no policies at all.
+             CREATE TABLE {s}.dormant (id integer);
+             CREATE POLICY dormant_p ON {s}.dormant USING (id > 0);
+             -- And `FORCE` is its own flag, which a table can carry with
+             -- row-level security not enabled.
+             CREATE TABLE {s}.forced (id integer);
+             ALTER TABLE {s}.forced FORCE ROW LEVEL SECURITY;
              CREATE UNLOGGED TABLE {s}.volatile_ (id integer);
              CREATE TABLE {s}.collated (a text, b text COLLATE \"C\",
                  c varchar(20), d varchar(20));
@@ -1621,8 +1630,11 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "NULLS NOT DISTINCT",
         // An index the planner will not use.
         "indisvalid = false",
-        // A table whose rows are not all a reader's to see.
+        // A table whose rows are not all a reader's to see, one whose
+        // policies are not in force, and one whose owner is not exempt.
         "row-level security",
+        "not in force",
+        "FORCE ROW LEVEL SECURITY",
         // A table that does not survive a crash.
         "UNLOGGED",
         // A collation that decides which values compare equal. Named down to
@@ -1919,7 +1931,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         refused,
         vec![
             pbps_model::TableName::new(&s, "descendant"),
+            pbps_model::TableName::new(&s, "dormant"),
             pbps_model::TableName::new(&s, "dotted"),
+            pbps_model::TableName::new(&s, "forced"),
             pbps_model::TableName::new(&s, "guarded"),
             pbps_model::TableName::new(&s, "parted"),
             pbps_model::TableName::new(&s, "published"),
