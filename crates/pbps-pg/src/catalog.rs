@@ -43,7 +43,7 @@ use crate::introspect::{
 /// `standard_conforming_strings` is on; with it off the engine eats it —
 /// measured, with a warning nothing here reads — the pattern becomes `pg_%`,
 /// the `_` turns into a wildcard, and a project'"'"'s schema called `pga` vanishes
-/// from the pull. The canonical scope pins that setting (DECISIONS 252), and
+/// from the pull. The canonical scope pins that setting (DECISIONS 254), and
 /// this predicate does not depend on it having worked: a filter with no escape
 /// in it cannot be read two ways.
 const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -767,7 +767,7 @@ mod tests {
         assert!(BEGIN.contains("REPEATABLE READ"));
         assert!(BEGIN.contains("READ ONLY"));
         assert!(CANONICAL_PATH.contains("'search_path', '', true"));
-        // How a value prints, not only how a name does (DECISIONS 252). Each
+        // How a value prints, not only how a name does (DECISIONS 254). Each
         // was measured to change a rendered expression; pinned live by
         // `the_pull_does_not_move_when_the_sessions_search_path_does`.
         for setting in [

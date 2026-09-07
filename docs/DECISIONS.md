@@ -4299,7 +4299,7 @@ SPEC is in sync with all of these.
     becomes a named limitation rather than a foreign key over the wrong
     columns.
 
-248. **The whole catalog read is one `REPEATABLE READ READ ONLY` transaction,
+250. **The whole catalog read is one `REPEATABLE READ READ ONLY` transaction,
     and the canonical search path is set inside it.** Five autocommit
     statements are five snapshots. A table dropped between the tables query and
     the columns query comes back as a live table with no columns — which
@@ -4313,7 +4313,7 @@ SPEC is in sync with all of these.
     "a read failed halfway and left the session changed" and making it
     unrepresentable.
 
-249. **A property of an object the model cannot hold means the object is left
+251. **A property of an object the model cannot hold means the object is left
     out; a fact about the rows already there means it is carried.** Both are
     named either way, and the line decides which way the resulting plan is
     wrong. `RESTRICT`, `DEFERRABLE`, a `gin` index: carried, each compares
@@ -4325,24 +4325,24 @@ SPEC is in sync with all of these.
     recreating it changes is which rows get checked. Carried and named, that is
     a plan that may fail on apply rather than one that lies.
 
-250. **A foreign key's referenced columns are resolved against the referenced
-    table's own columns, which the pull already has. Supersedes 247.** That
+252. **A foreign key's referenced columns are resolved against the referenced
+    table's own columns, which the pull already has. Supersedes 249.** That
     entry chose to parse them out of `pg_get_constraintdef`, on the grounds that
     `confkey` names attnums on the *other* table and a second catalog join would
     put the answer where no test can reach it. The parse is wrong on a legal
     name: `FOREIGN KEY (x, y) REFERENCES q(x, "a)b")` stops at the `)` inside
     the quoted identifier, produces two items, passes its own count check
     against `confkey`, and records the column `"a`. The count check was the
-    guard, and it agreed with the wrong answer. What 247 missed is that the
+    guard, and it agreed with the wrong answer. What 249 missed is that the
     columns of every table in the pull are already in the assembler: no parse,
     no second query, and an attnum with nothing behind it is the same named
     limitation as everywhere else.
 
-251. **A pull inside the caller's own transaction is refused, not
+253. **A pull inside the caller's own transaction is refused, not
     accommodated.** PostgreSQL does not nest transactions: inside an open one a
     plain `BEGIN` is a warning, so the `COMMIT` that ends a successful read
     would commit whatever the caller had written, while the `REPEATABLE READ
-    READ ONLY` snapshot 248 exists for was never established. A savepoint would
+    READ ONLY` snapshot 250 exists for was never established. A savepoint would
     give back the framing but not the meaning — a read inside somebody's
     transaction answers from their uncommitted writes, which is not what "what
     the database looks like" is. So the pull asks first and refuses.
@@ -4357,8 +4357,8 @@ SPEC is in sync with all of these.
     `psql`, which speaks the simple protocol, both looked like reliable
     detectors.
 
-252. **The pull's canonical scope pins how values print, not only how names
-    do.** 248 set `search_path` empty so that a rendered name does not depend on
+254. **The pull's canonical scope pins how values print, not only how names
+    do.** 250 set `search_path` empty so that a rendered name does not depend on
     the reader's session. The expressions this pull carries are carried verbatim
     (ADR-0013 §4), and the same argument applies to every setting the deparser
     consults: measured on 18.6, `quote_all_identifiers` turns `id > 0` into
@@ -4375,7 +4375,7 @@ SPEC is in sync with all of these.
     which would turn a readable database into an unreadable one for a difference
     nobody has yet shown.
 
-253. **A name is round-tripped through the declaration format, not checked
+255. **A name is round-tripped through the declaration format, not checked
     against a rule.** `TableName` is written `schema.name` and read back by
     splitting on every `.`; `ColumnRef` the same with three parts. PostgreSQL
     will hand out a schema called `"a.b"`, and then a pull that succeeded
@@ -4390,12 +4390,12 @@ SPEC is in sync with all of these.
     goes, not the offending column, because a table missing one column is a
     table a plan would add it to.
 
-254. **The foreign keys are assembled in a second pass, after everything that
+256. **The foreign keys are assembled in a second pass, after everything that
     could take their uniqueness away.** A foreign key is legal only against a
     unique index on the referenced table, and `conindid` says which one. That
     index may not reach the pull — its key constraint carries an `INCLUDE`
     payload, or is `NULLS NOT DISTINCT`, or is deferrable, or any of the other
-    reasons 249 leaves an object out — and a key recorded against it describes a
+    reasons 251 leaves an object out — and a key recorded against it describes a
     schema that cannot be built: adding the key back fails for want of a
     uniqueness nothing mentions.
 
@@ -4407,10 +4407,10 @@ SPEC is in sync with all of these.
     second opinion that can fall out of step with the first.
 
     This is the third time in this file that a decision was reachable through a
-    map built before the decision was made — 250's `confkey`, round 8's refused
+    map built before the decision was made — 252's `confkey`, round 8's refused
     table, and this. The shape is in PITFALLS.
 
-255. **The pull's own SQL carries no backslash escape.** 252 pins the settings
+257. **The pull's own SQL carries no backslash escape.** 254 pins the settings
     that decide how the engine *prints* an answer. This is the other direction:
     `standard_conforming_strings` decides how the engine *reads* the query's own
     string literals, and with it off a backslash in an ordinary literal is
@@ -4424,3 +4424,18 @@ SPEC is in sync with all of these.
     test asserts that no query contains a backslash at all. A filter with no
     escape in it cannot be read two ways, which is worth more than a filter that
     is correct as long as a `SET` succeeded.
+
+258. **The declaration round trip asks for the same value, not for a value.**
+    255 made the pull perform the round trip rather than reason about it, and
+    the first version of it for a column's type asked the wrong question: does
+    the spelling parse. Measured, `bit(3)` is a legal type this catalogue does
+    not hold, so it is stored opaque — the base `bit(3)` with no arguments — and
+    it writes out as `bit(3)` and parses back as the base `bit` with the
+    argument `3`. That parses, and it is a different type: a schema written and
+    reloaded is not the schema that was pulled, and wherever equality falls back
+    to the raw spelling it is a difference no plan can act on.
+
+    The check is now `render, parse, compare equal`, and it is asked of the
+    value the column will actually be recorded with — one function decides that
+    value for both the guard and the construction, because a check on something
+    *like* what is stored is a check on nothing.

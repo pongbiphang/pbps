@@ -298,7 +298,7 @@ struct Lookups<'a> {
     tables: HashMap<i64, TableName>,
     /// Every column in the pull, by table and attnum. A foreign key's
     /// `confkey` names attnums on the **referenced** table, which the
-    /// constrained table's own map cannot answer for (DECISIONS 250).
+    /// constrained table's own map cannot answer for (DECISIONS 252).
     ///
     /// Refused tables are absent here too. Either exclusion alone would leave
     /// the key out — measured, by removing each and watching the test still
@@ -534,12 +534,16 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
     // both refused on the way back, one for the dot and one for the words after
     // the parenthesis. Carrying them produces exactly the failure the name
     // check exists to prevent, one field over.
-    // Every one of them, not the first: the table is out either way, and an
-    // operator reading this is deciding what to do about the columns, not about
-    // the guard.
+    // The question is whether the type comes back as **the same value**, not
+    // whether it parses: `bit(3)` stored opaque writes out as `bit(3)` and
+    // parses back as `bit` with an argument, which is a different type.
+    //
+    // Every offending column, not the first: the table is out either way, and
+    // an operator reading this is deciding what to do about the columns, not
+    // about the guard.
     let unwritable: Vec<String> = columns
         .iter()
-        .filter(|c| ColumnType::from_str(&raw_type_as_written(&c.ty)).is_err())
+        .filter(|c| !survives_the_declaration(&stored_type(&c.ty).unwrap_or_else(|opaque| opaque)))
         .map(|c| format!("`{}` (`{}`)", c.name, c.ty))
         .collect();
     if !unwritable.is_empty() {
@@ -579,11 +583,37 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
     })
 }
 
-/// What [`column`] would store as an opaque type's `base`: the engine's own
-/// spelling, unchanged. Named so that the round-trip check and the construction
-/// cannot drift apart.
-fn raw_type_as_written(ty: &str) -> String {
-    String::from(ColumnType::new(ty.to_owned(), Vec::new()))
+/// The [`ColumnType`] a column will be recorded with, and whether the catalogue
+/// could read it. One function, because the guard that refuses a type and the
+/// code that stores it have to be looking at the same value — a check on
+/// something *like* what is stored is a check on nothing.
+///
+/// `Err` is the opaque case (issue #130): the engine's spelling kept whole as
+/// the base, with no arguments. A type pbps cannot normalize compares unequal
+/// to every declaration, so the differ reports a change it will refuse to emit
+/// rather than reporting nothing.
+fn stored_type(ty: &str) -> Result<ColumnType, ColumnType> {
+    // The type is the engine's own spelling, so it is already in the form
+    // `normalize` promises to return (ADR-0011 Amendment 3). Parsing it can
+    // still fail, and it must fail loudly: a column whose type pbps cannot
+    // read is not a column with no type.
+    ty.parse::<ColumnType>()
+        .ok()
+        .filter(|t| types::normalize(t).is_ok_and(|normalized| &normalized == t))
+        .ok_or_else(|| ColumnType::new(ty.to_owned(), Vec::new()))
+}
+
+/// Whether a type survives being written to a declaration and read back as
+/// **the same value**.
+///
+/// Not "does it parse". Measured, `bit(3)` is a legal spelling this catalogue
+/// does not hold, so it is stored opaque — base `bit(3)`, no arguments — and it
+/// writes out as `bit(3)` and parses back as base `bit` with the argument 3.
+/// That parses perfectly and is a different type, so a schema written and
+/// reloaded is not the schema that was pulled, and anywhere equality falls back
+/// to the raw spelling it is a difference no plan can act on.
+fn survives_the_declaration(ty: &ColumnType) -> bool {
+    ColumnType::from_str(&String::from(ty.clone())).as_ref() == Ok(ty)
 }
 
 /// The `CACHE` a sequence has when nothing asks for one — **measured**, and the
@@ -607,18 +637,9 @@ fn note(pulled: &mut Pulled, table: &TableName, detail: String) {
 
 /// One column, and everything about it the model has nowhere to put.
 fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
-    // The type is the engine's own spelling, so it is already in the form
-    // `normalize` promises to return (ADR-0011 Amendment 3). Parsing it can
-    // still fail, and it must fail loudly: a column whose type pbps cannot
-    // read is not a column with no type.
-    let ty = raw.ty.parse::<ColumnType>().ok().filter(|t| {
-        types::normalize(t)
-            .map(|normalized| &normalized == t)
-            .unwrap_or(false)
-    });
-    let ty = match ty {
-        Some(ty) => ty,
-        None => {
+    let ty = match stored_type(&raw.ty) {
+        Ok(ty) => ty,
+        Err(opaque) => {
             note(
                 pulled,
                 &parts.name,
@@ -629,10 +650,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                     parts.name, raw.name, raw.ty
                 ),
             );
-            // Kept as the engine spelled it. A type pbps cannot normalize
-            // compares unequal to every declaration, so the differ reports a
-            // change it will refuse to emit rather than reporting nothing.
-            ColumnType::new(raw.ty.clone(), Vec::new())
+            opaque
         }
     };
 
@@ -1231,7 +1249,7 @@ fn add_foreign_key(
 /// inside the quoted identifier, yields two items, passes a count check against
 /// `confkey`, and records the column `"a`. The columns of every table in the
 /// pull are already here, so they answer it instead — no parse, and no second
-/// query either (DECISIONS 250, superseding 247).
+/// query either (DECISIONS 252, superseding 249).
 fn reference_columns(
     raw: &RawConstraint,
     by_table_and_attnum: &HashMap<(i64, i32), &str>,
@@ -1811,7 +1829,15 @@ mod tests {
     /// after the parenthesis. Silence would be worse than either.
     #[test]
     fn a_type_the_catalogue_cannot_spell_takes_its_table_out_and_is_named() {
-        for spelling in ["timestamp(3) with time zone", "app.money_amount"] {
+        for spelling in [
+            "timestamp(3) with time zone",
+            "app.money_amount",
+            // The one that *parses* and comes back a different value: stored
+            // opaque as the base `bit(3)` with no arguments, it reads back as
+            // the base `bit` with the argument 3. A guard that asked only
+            // whether it parses let this through.
+            "bit(3)",
+        ] {
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
                 columns: vec![col(1, 1, "when", spelling)],
@@ -2620,6 +2646,36 @@ mod tests {
             1
         );
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// The round trip is asked of the value that is stored, and it asks for
+    /// equality. Parsing is not the question: a spelling can parse into a
+    /// different type than the one written out.
+    #[test]
+    fn a_type_that_parses_back_as_a_different_value_does_not_survive() {
+        // Opaque, because this catalogue does not hold `bit`. Written out and
+        // read back it is `bit` with an argument, which is not this value.
+        let opaque = stored_type("bit(3)").expect_err("the catalogue cannot read it");
+        assert_eq!(opaque.base, "bit(3)");
+        assert!(opaque.args.is_empty());
+        assert!(
+            ColumnType::from_str(&String::from(opaque.clone())).is_ok(),
+            "it parses, which is why parsing was the wrong question"
+        );
+        assert!(!survives_the_declaration(&opaque));
+
+        // And the two that do not even parse.
+        for spelling in ["app.money_amount", "timestamp(3) with time zone"] {
+            let opaque = stored_type(spelling).expect_err(spelling);
+            assert!(!survives_the_declaration(&opaque), "{spelling}");
+        }
+
+        // The negative case: a type the catalogue reads survives, and so does
+        // one it reads with arguments.
+        for spelling in ["integer", "numeric(10,2)", "timestamp with time zone"] {
+            let ty = stored_type(spelling).expect(spelling);
+            assert!(survives_the_declaration(&ty), "{spelling}");
+        }
     }
 
     /// A `NO INHERIT` check stops at this table; an ordinary one reaches every

@@ -723,7 +723,7 @@ key still went in because the arm checked only that the target table and columns
 existed. **A decision reachable through a map built before the decision was
 made is a decision that has not happened yet.** The foreign keys now run in a
 second pass, against what the constraint and index arms actually recorded
-(DECISIONS 254).
+(DECISIONS 256).
 
 **A guard whose condition is narrower than its reason.** The pull refused a
 table with `relrowsecurity`, and the message said why: "whose policies this
@@ -736,6 +736,17 @@ closed. `relforcerowsecurity` is a third flag, independent of both. **Read the
 guard's own sentence and check the code says the same thing**: when the reason
 names an object and the condition names a switch, the condition is the narrower
 of the two.
+
+**A round trip that asked whether it parses.** The guard that refuses a value
+the declaration format cannot write back was performed rather than reasoned
+about — and then asked `is_err()`. `bit(3)` parses. It parses into a *different
+type* than the one written out, because the pull stores an unreadable spelling
+whole as the base and the parser splits it at the parenthesis. **"It parses" and
+"it comes back the same" are two questions, and only the second one is the round
+trip.** The check is now render-parse-compare-equal, and it is asked of the
+value that is actually stored: one function decides that value for both the
+guard and the construction, because a check on something *like* what is stored
+is a check on nothing.
 
 **The shape both share:** the catalog answers "what kind of thing is this?" in
 one column and "and is it that kind of thing after all?" in another. A reader
