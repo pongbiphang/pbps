@@ -500,7 +500,19 @@ fn build(change: &Change, names: &AsStored) -> Result<Vec<Probe>, DialectError> 
                     &quote(&stored.name)?,
                 )?);
             }
-            if types::change_risk(from, to).risk_class().is_some() {
+            // A `timestamp` on either end is asked nothing. The engine refuses
+            // the statement whatever the rows hold (4928 out of the type, 4927
+            // into it), so there is no data question — and the probe that would
+            // otherwise be built answers the wrong one confidently: measured,
+            // `CONVERT(timestamp, 0xAB)` succeeds as an expression, so
+            // `TRY_CONVERT` finds nothing wrong and the pre-flight line reads
+            // as a pass. Classifying the change `Incompatible` is what stops
+            // it; a probe beside that would only argue with it
+            // (DECISIONS 283).
+            if types::change_risk(from, to).risk_class().is_some()
+                && !types::alter_column_is_refused(from)
+                && !types::alter_column_is_refused(to)
+            {
                 out.extend(conversion_probe(column, &stored, to)?);
             }
             Ok(out)
@@ -1992,6 +2004,53 @@ mod tests {
             sql[0].contains("TRY_CONVERT(int, [balance]) IS NULL"),
             "{sql:?}"
         );
+    }
+
+    /// A probe answers a question about the rows. Changing into or out of
+    /// `timestamp` raises no such question: the engine will not compile the
+    /// statement whatever the rows hold (4928 out of the type, 4927 into it).
+    ///
+    /// The probe that used to be built here is worse than useless, which is
+    /// why this is a test and not a comment. Measured on the pinned image,
+    /// `CONVERT(timestamp, 0xAB)` succeeds and returns
+    /// `0xAB00000000000000`, and `DATALENGTH` over a `rowversion` is 8 — so
+    /// both shapes count zero rows and print as a pass under a change the
+    /// server refuses outright.
+    ///
+    /// `bigint -> varbinary(8)` is the negative case: the same
+    /// `Incompatible` classification, no engine prohibition, and it keeps its
+    /// probe.
+    #[test]
+    fn a_type_change_the_engine_refuses_outright_is_not_probed() {
+        for (from, to) in [
+            ("timestamp", "varbinary(8)"),
+            ("varbinary(8)", "timestamp"),
+            ("rowversion", "varbinary(8)"),
+            ("varbinary(8)", "rowversion"),
+        ] {
+            assert!(
+                sql_of(&Change::AlterColumnType {
+                    uid: uid("c_aaaaaa"),
+                    column: cref("dbo.customer.v"),
+                    from: ty(from),
+                    to: ty(to),
+                    from_nullable: false,
+                    to_nullable: false,
+                })
+                .is_empty(),
+                "`{from}` -> `{to}` was probed"
+            );
+        }
+        let sql = sql_of(&Change::AlterColumnType {
+            uid: uid("c_aaaaaa"),
+            column: cref("dbo.customer.v"),
+            from: ty("bigint"),
+            to: ty("varbinary(8)"),
+            from_nullable: false,
+            to_nullable: false,
+        });
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].contains("DATALENGTH([v]) > 8"), "{sql:?}");
     }
 
     /// Widening cannot fail, so it is not probed — the same principle as

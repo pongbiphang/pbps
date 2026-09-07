@@ -5286,3 +5286,34 @@ SPEC is in sync with all of these.
     The three strippers — leading gap, trailing trivia, grouping — now run to a
     fixed point in `is_a_bare_literal`, because each can expose work for
     another: `(('x') -- inner ⏎ ) -- outer` needs all three, twice.
+
+283. **`timestamp` is classified as opaque, not as a binary type with the width
+    `sys.types` reports.** SQL Server's `timestamp` (`rowversion`) sat in the
+    `varbinary` arm of the type-family classifier, so every change it took part
+    in was answered by comparing capacities. Measured on the pinned image, the
+    engine refuses `ALTER COLUMN` on either end of it, whatever those capacities
+    are: `Msg 4928` leaving the type, `Msg 4927` arriving at it — including
+    `ALTER COLUMN v timestamp` on a column that is already one, which fails at
+    compile time and takes the whole batch with it.
+
+    Giving the alias its real width is the repair that suggests itself and it is
+    the wrong one. The classifier was deriving the width from absent arguments
+    and getting 1; correcting that to the 8 `sys.types` reports turns
+    `timestamp -> varbinary(8)` from an accidental `Safe` into a deliberate one.
+    The capacity is not what governs. Opaque is, because every pair an opaque
+    type takes part in falls to the `Incompatible` arm, and `Incompatible` is
+    already this codebase's answer for a conversion the engine can refuse.
+
+    The identity is untouched. `change_risk` returns `Safe` for `from == to`
+    before any family is asked for, and `rowversion` normalizes to `timestamp`,
+    so a column that keeps its type still produces no change — which matters
+    more than it looks: a phantom change on every table carrying a `rowversion`
+    would be proposed for ever and could never be applied.
+
+    **And the pre-flight probe for such a change is not built.** A probe answers
+    a question about the rows, and there is no such question here — the
+    prohibition is on the column. Worse, the probe answers confidently: measured,
+    `CONVERT(timestamp, 0xAB)` succeeds and returns `0xAB00000000000000`, so
+    `TRY_CONVERT` finds nothing to report and the pre-flight line reads as a
+    pass under a statement that will not compile. A probe that cannot see a
+    prohibition must not stand beside the classification that can (#141).
