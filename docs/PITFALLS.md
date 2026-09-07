@@ -385,10 +385,19 @@ a session-decided default written across a CR walked past the guard that exists
 to refuse it (DECISIONS 281).
 
 The lesson is not "remember CR". It is that *this file already said so*, and
-the second scanner still went in with one line ending. When you write a
-predicate about where a line ends, in any language, grep this file for the
-character class before choosing one — the shape recurs because `\n` is what a
-person types when they mean "end of line".
+the second scanner still went in with one line ending — and then **the fix for
+it missed its own sibling one screen away**: the same file's `skip_datum`, used
+by the grouping unwrap, kept an LF-only search through that commit, so
+`( -- ) <CR> '01/02/2026')` had its closing parenthesis swallowed and the same
+default walked past the same guard by the other road. The next review found it.
+
+Two things follow. When you write a predicate about where a line ends, in any
+language, grep this file for the character class before choosing one — the
+shape recurs because `\n` is what a person types when they mean "end of line".
+And when you fix one, **grep the file you are editing for the literal you just
+replaced** before pushing: a character class that lives in a named constant is
+what makes the next omission visible, and two spellings of the same rule in one
+file is the state that produced this.
 
 ## `shell_arg` has been wrong about shells five times
 

@@ -229,7 +229,7 @@ fn skip_datum(rest: &str) -> Option<usize> {
         });
     }
     if rest.starts_with("--") {
-        return Some(rest.find('\n').map_or(rest.len(), |at| at + 1));
+        return Some(rest.find(NEWLINE).map_or(rest.len(), |at| at + 1));
     }
     if let Some(after) = rest.strip_prefix("/*") {
         return Some(match end_of_block_comment(after) {
@@ -1634,6 +1634,11 @@ mod tests {
             "'01/02/'\r'2026'",
             "'01/02/'\r\n'2026'",
             "'01/02/' -- c\r'2026'",
+            // The same character class, at the other scanner: a comment that
+            // a carriage return closes cannot swallow the parenthesis that
+            // closes the grouping. Measured, this is 2026-01-02 under MDY and
+            // 2026-02-01 under DMY, which is the whole hazard behind one CR.
+            "( -- )\r '01/02/2026')",
             // A parenthesis that is data cannot be the one that closes the
             // grouping. Measured, each of these is the same session-decided
             // value as the same declaration without the comment — the first

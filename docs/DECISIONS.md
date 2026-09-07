@@ -5236,6 +5236,22 @@ SPEC is in sync with all of these.
     constant `01/02/2026`, and so is `'01/02/' -- c <CR> '2026'`: a bare
     carriage return both ends a line comment and supplies the newline a
     continued constant needs. A default written that way walked past the guard
-    that exists to refuse it. The repo had already recorded this shape for
-    SQL Server (PITFALLS, "A comment ends at a carriage return"), which is the
-    part worth keeping: a second scanner went in with one line ending anyway.
+    that exists to refuse it.
+
+    **Both scanners, and the first fix only reached one.** `skip_datum` — the
+    one 279 added, which the grouping unwrap uses to step over data — kept its
+    own `find('\n')` through that commit, so `( -- ) <CR> '01/02/2026')` had
+    its closing parenthesis swallowed by a comment that had already ended,
+    the grouping went unwrapped, and the same default walked past the same
+    guard by the other road. Measured, that expression is 2026-01-02 under MDY
+    and 2026-02-01 under DMY. The character class is a named constant now
+    (`NEWLINE`) rather than a literal at each site, which is what makes the
+    next scanner's omission visible.
+
+    The repo had already recorded this shape for SQL Server (PITFALLS, "A
+    comment ends at a carriage return"), which is the part worth keeping: a
+    scanner written years later went in with one line ending anyway, and then
+    the fix for it missed its own sibling one screen away. Two more instances
+    of the same family are filed against the SQL Server pull's header scanner
+    (#197), which ends a line comment at LF alone and does not nest block
+    comments.
