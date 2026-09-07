@@ -6743,3 +6743,58 @@ async fn fixed_binary_growth_changes_the_payload_and_requires_approval() {
     }
     db.drop().await;
 }
+
+/// The pull hides this tool's own two tables and nothing else that looks like
+/// them. `NOT LIKE '\_\_pbps\_%'` also hid `dbo.__pbps_customers`, and the bare
+/// names still hid `app.__pbps_state`; no rule refuses either declaration, so
+/// the pull reported a table that is there as absent and the next plan tried to
+/// create it again (issue #170).
+///
+/// The ledger here is the real one, created by `ensure_tables` rather than by
+/// hand, so the test asserts against the names this tool actually installs.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn the_pull_hides_this_tools_two_tables_and_not_a_projects_own() {
+    let mut db = TestDb::create("ourtables").await;
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("create the ledger");
+    // Its own batch: SQL Server wants `CREATE SCHEMA` first in one.
+    db.conn
+        .execute("CREATE SCHEMA app;")
+        .await
+        .expect("create the schema");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.__pbps_customers (id int NOT NULL);
+             -- The ledger's own names, in a schema that is not the ledger's.
+             CREATE TABLE app.__pbps_state (id int NOT NULL);
+             CREATE TABLE app.__pbps_lock (id int NOT NULL);",
+        )
+        .await
+        .expect("create a project's own tables");
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let names = pulled.schema.tables.keys().cloned().collect::<Vec<_>>();
+    for theirs in [
+        TableName::new("dbo", "__pbps_customers"),
+        TableName::new("app", "__pbps_state"),
+        TableName::new("app", "__pbps_lock"),
+    ] {
+        assert!(
+            names.contains(&theirs),
+            "a project's own table must be in the pull: {theirs:?} in {names:?}"
+        );
+    }
+    // The negative case, and the reason the filter exists: introspecting the
+    // ledger would make the first plan after a snapshot propose dropping it.
+    assert!(
+        !names.contains(&TableName::new("dbo", "__pbps_state"))
+            && !names.contains(&TableName::new("dbo", "__pbps_lock")),
+        "this tool's own tables must never enter the managed set: {names:?}"
+    );
+}
