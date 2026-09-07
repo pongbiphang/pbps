@@ -2394,6 +2394,13 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
 /// each of them by name, which is the failure the scope prevents — and it is a
 /// refusal of a declaration PostgreSQL would accept under the project's own
 /// path, not a silent difference.
+///
+/// The second half measures the limit of "first": `pg_catalog` is searched
+/// ahead of every schema the path names, so a project function with a built-in's
+/// signature does not win, and only a path that names `pg_catalog` explicitly
+/// would let it. DECISIONS 276 says why this dialect leaves it implicit — the
+/// repair would let a project *type* shadow a built-in one, and multi-word type
+/// names have no qualified spelling for the emitter to defend with.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_path() {
@@ -2477,6 +2484,36 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
         bindings.matches(&format!("{ext}.floorish")).count(),
         3,
         "each of the three had to bind to the helper in the extra schema: {bindings}"
+    );
+
+    // What "first" does not reach, measured beside the property above.
+    let shadow = emit_schema("shadow");
+    fresh(&mut conn, &shadow).await;
+    conn.execute(&format!(
+        "CREATE FUNCTION {shadow}.lower(text) RETURNS text LANGUAGE sql IMMUTABLE \
+         AS $fn$ SELECT 'the project function' $fn$"
+    ))
+    .await
+    .expect("a function with a built-in's signature");
+    conn.execute(&format!("SET search_path = {shadow}"))
+        .await
+        .expect("the path this dialect writes");
+    let implicit = text(&mut conn, "SELECT lower('X')").await;
+    conn.execute(&format!("SET search_path = {shadow}, pg_catalog"))
+        .await
+        .expect("the path that would name it");
+    let explicit = text(&mut conn, "SELECT lower('X')").await;
+    conn.execute("RESET search_path").await.expect("reset");
+    conn.execute(&format!("DROP SCHEMA {shadow} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        implicit, "x",
+        "the built-in wins wherever the path omits it"
+    );
+    assert_eq!(
+        explicit, "the project function",
+        "and only naming it explicitly would change that"
     );
 }
 

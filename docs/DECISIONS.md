@@ -5045,3 +5045,35 @@ SPEC is in sync with all of these.
     The comparison is exact and case-sensitive because the engine's is: `$USER`
     and `$users` are ordinary schema names, and refusing them would refuse a
     declaration that works.
+
+276. **`pg_catalog` is left out of the write path, so it is searched first.**
+    ADR-0013 §3 says the write scope puts the object's own schema first, and
+    **measured**, that is true only among the schemas the path names:
+
+    ```text
+    CREATE FUNCTION shad.lower(text) RETURNS text AS 'the project function';
+    SET search_path = shad;               SELECT lower('X');  -> x
+    SET search_path = shad, pg_catalog;   SELECT lower('X');  -> the project function
+    ```
+
+    PostgreSQL searches `pg_catalog` ahead of every listed schema whenever the
+    path does not name it. So a project function or operator with the same
+    signature as a built-in never wins inside a declared expression, and the
+    ordering the ADR promised is not the whole ordering.
+
+    **The obvious repair makes a worse hazard, and the emitter cannot defend
+    against that one.** Naming `pg_catalog` last would let a project *type*
+    shadow a built-in: a `CREATE DOMAIN app.text` in the table's own schema
+    would change what every `c text` column in that schema means, silently, and
+    the pull would then read the column back as a type the closed catalogue
+    does not hold and report it unsupported. The emitter cannot write around it
+    — `character varying`, `double precision` and `timestamp with time zone`
+    have no schema-qualified spelling, so there is no `pg_catalog.` prefix to
+    put on the names that matter. The type catalogue is a closed list of this
+    engine's own names (ADR-0012 §1) and `text` has to keep meaning `text`.
+
+    The hazard that is left has a remedy the user holds: an expression that
+    means the project's `lower` can say `app.lower`. The one the repair would
+    create has none. So the path stays as it is and the claim is corrected
+    instead — in this file, in `emit.rs`'s module docs and in ADR-0013 §3,
+    which all said "first" without saying first *among what*.

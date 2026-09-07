@@ -13,6 +13,16 @@
 //! and an index's filter (ADR-0013 §3, and the same section's correction that
 //! the rule is scoped to what the model can represent).
 //!
+//! "First" means first **among the schemas the path names**, and that is not
+//! the whole ordering. `pg_catalog` is searched ahead of every listed schema
+//! whenever the path does not name it — measured, with a `shad.lower(text)`
+//! defined and `search_path = shad`, `lower('X')` is the built-in's `x`, and
+//! only `search_path = shad, pg_catalog` reaches the project's function. The
+//! path is left that way on purpose (DECISIONS 276): naming `pg_catalog` last
+//! would let a project type shadow a built-in one, and the emitter cannot
+//! defend against that — `character varying` and `timestamp with time zone`
+//! have no schema-qualified spelling to write instead.
+//!
 //! It is per statement and not per session for the reason ADR-0013 measured: a
 //! scope held over a statement is also a scope over everything that statement
 //! fires. Nothing here fires a user's trigger — this is DDL — but the rule is
@@ -1056,7 +1066,9 @@ mod tests {
     /// The scope is the object's own schema first and the extras after it, in
     /// the order they were configured — because the order is what a name
     /// resolves through, and ADR-0013 measured a view keeping the binding its
-    /// creation order gave it.
+    /// creation order gave it. First among the *listed* schemas: `pg_catalog`
+    /// is searched ahead of all of them because the path does not name it, and
+    /// DECISIONS 276 says why it is left out.
     #[test]
     fn every_statement_sets_the_write_path_and_gives_it_back() {
         let pg = Postgres::with_write_path_extras(vec!["shared".into(), "public".into()]);
