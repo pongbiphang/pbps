@@ -4278,6 +4278,17 @@ async fn apply_staged_under_lock(
         (0, watching)
     };
 
+    // The settings this dialect's writes must run under, on the connection,
+    // because this mode opens no transaction to carry them (`session_pins`).
+    // Established here rather than once per statement: it covers a `--resume`
+    // on a fresh connection, which starts partway through the plan, and every
+    // statement after the one that fails.
+    if let Some(pins) = dialect.session_pins() {
+        conn.execute(pins)
+            .await
+            .context("the session settings this dialect's statements depend on could not be set")?;
+    }
+
     let total = statements.len();
     // The names the catalog has right now. It starts at whatever the newest
     // entry recorded — the last ordinary state on a fresh run, the checkpoint

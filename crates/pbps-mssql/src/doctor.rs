@@ -199,12 +199,13 @@ const fn req(name: &'static str, why: &'static str, needed: Needed) -> Requireme
     Requirement { name, why, needed }
 }
 
-/// The schema the ledger and the lock live in.
-pub const LEDGER_SCHEMA: &str = "dbo";
+/// The schema the ledger and the lock live in, asked of the module whose
+/// statements put them there rather than spelled a second time here.
+pub use crate::state::LEDGER_SCHEMA;
 
 /// The tables `state::ensure_tables` creates, and therefore the ones whose
 /// absence still requires the create-time permission.
-pub const LEDGER_TABLES: [&str; 2] = [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE];
+pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
 pub const REQUIRED: [Requirement; 20] = [
     req(

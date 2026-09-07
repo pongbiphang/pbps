@@ -3853,3 +3853,813 @@ async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
     let again = plan(&state, &ids_b, &b, &ids_b);
     assert!(again.is_empty(), "the plan after convergence: {again:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 step 8: the ledger, the lock and `doctor`, against a real server.
+//
+// Every test here works in a database of its own, because the ledger is one
+// pair of tables in `public` and two tests sharing them would take each other's
+// lock. That is also how the SQL Server suite does it, and it is what lets this
+// suite keep running its tests in parallel.
+// ---------------------------------------------------------------------------
+
+use pbps_db::LedgerError;
+use pbps_db::ledger::LockInfo;
+use pbps_model::{ObjectName, StateKind, StateSnapshot, Unreadable};
+use pbps_pg::{doctor, state};
+
+/// A throwaway database that removes itself.
+///
+/// A **database**, not a schema: the ledger lives in `public` (SPEC §8.1, and
+/// `pbps_pg::state`'s header for why `public`), so there is exactly one of it
+/// per database and nothing smaller can isolate two tests from each other.
+struct TestDb {
+    name: String,
+    conn: Conn,
+}
+
+impl TestDb {
+    async fn create(tag: &str) -> TestDb {
+        // The pid keeps two concurrent `cargo test` runs apart; the tag keeps
+        // this run's own tests apart.
+        let name = format!("pbps_test_{tag}_{}", std::process::id());
+        let mut admin = connect().await;
+        // `WITH (FORCE)` disconnects whatever is still attached — a previous
+        // run killed halfway leaves a database behind, and `DROP DATABASE`
+        // without it fails while anything is connected.
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .expect("create the test database");
+        let conn = Conn::connect(Driver::Postgres, &conn_str_for(&name))
+            .await
+            .expect("connect to the test database");
+        TestDb { name, conn }
+    }
+
+    /// Opens a second connection to the same database, for the tests that need
+    /// two — a lock has to be contended by somebody.
+    async fn second(&self) -> Conn {
+        Conn::connect(Driver::Postgres, &conn_str_for(&self.name))
+            .await
+            .expect("a second connection to the test database")
+    }
+
+    async fn drop(self) {
+        let name = self.name;
+        // Dropped before the database is: `WITH (FORCE)` would terminate this
+        // very connection, and a test that cleans up by killing itself reads
+        // as a flake later.
+        std::mem::drop(self.conn);
+        let mut admin = connect().await;
+        // Failure to clean up must not obscure the test's own verdict; the
+        // container is throwaway anyway.
+        let _ = admin
+            .execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .await;
+    }
+}
+
+/// The suite's connection string, pointed at another database on the same
+/// server.
+///
+/// Keyword form only, which is what `scripts/live-tests-pg.sh` exports. A URL
+/// is accepted by the driver and deliberately not rewritten here: guessing at
+/// which part of a URL is the database name is how a suite ends up running
+/// against the wrong one, and these tests create and drop databases.
+fn conn_str_for(database: &str) -> String {
+    settings_with(&[("dbname", database)])
+}
+
+/// The same, as another role.
+fn conn_str_as(role: &str, password: &str, database: &str) -> String {
+    settings_with(&[("dbname", database), ("user", role), ("password", password)])
+}
+
+fn settings_with(overrides: &[(&str, &str)]) -> String {
+    let base = conn_str();
+    assert!(
+        !base.contains("://"),
+        "these tests need PBPS_TEST_PG_DB in libpq keyword form (`host=... dbname=...`), \
+         not a URL: {base}"
+    );
+    let mut parts: Vec<String> = base
+        .split_whitespace()
+        .filter(|p| {
+            !overrides
+                .iter()
+                .any(|(key, _)| p.starts_with(&format!("{key}=")))
+        })
+        .map(str::to_owned)
+        .collect();
+    for (key, value) in overrides {
+        parts.push(format!("{key}={value}"));
+    }
+    parts.join(" ")
+}
+
+/// A role that holds nothing but the right to connect, and its password.
+///
+/// The SQL Server suite creates one for the reason this one needs it too:
+/// `postgres` is a superuser, a superuser passes every permission question
+/// without asking the catalog, and *that* is how three permission bugs survived
+/// the first live test on the other engine.
+async fn least_privilege_role(db: &mut TestDb, tag: &str) -> String {
+    let role = format!("pbps_dep_{tag}_{}", std::process::id());
+    // Roles are cluster objects, not database ones (ADR-0010 §1), so one left
+    // by an earlier run is still here. Dropping it can fail while it still owns
+    // something in another database; the create below then says so loudly.
+    let _ = db
+        .conn
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    db.conn
+        .execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'live-test'"))
+        .await
+        .expect("create the least-privilege role");
+    role
+}
+
+fn snapshot(kind: StateKind) -> StateSnapshot {
+    StateSnapshot::new(kind, Schema::default(), IdsFile::default(), "live-test")
+}
+
+/// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
+/// downstream — drift, the plan checksum, `status` — reads this row, so a
+/// serialization that lost a field would make every one of them quietly wrong.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_ledger_returns_exactly_what_was_recorded() {
+    let mut db = TestDb::create("ledger").await;
+
+    let mut first = snapshot(StateKind::Baseline);
+    first.reason = Some("adopting the database as it stands".into());
+    first.git_sha = Some("bd4be74".into());
+    let id = state::record(&mut db.conn, &first).await.expect("record");
+
+    let back = state::latest(&mut db.conn)
+        .await
+        .expect("latest")
+        .expect("an entry");
+    assert_eq!(back.id, id);
+    assert_eq!(
+        back.snapshot, first,
+        "the snapshot must survive the round trip"
+    );
+    // The server's clock, rendered as ISO 8601 by the query rather than cast.
+    assert_eq!(back.applied_at.len(), 23, "{}", back.applied_at);
+    assert!(back.applied_at.contains('T'), "{}", back.applied_at);
+
+    // Recording again must append, never overwrite: the ledger is a history.
+    let second = snapshot(StateKind::Apply);
+    let second_id = state::record(&mut db.conn, &second)
+        .await
+        .expect("record again");
+    assert!(second_id > id);
+    assert_eq!(
+        state::latest(&mut db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .kind,
+        StateKind::Apply
+    );
+
+    let removed = state::prune(&mut db.conn, 1).await.expect("prune");
+    assert_eq!(removed, 1, "one old entry removed");
+    let history = state::history(&mut db.conn, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].id, second_id,
+        "the newest is the one that survives"
+    );
+
+    db.drop().await;
+}
+
+/// The three answers this project keeps getting bitten by, kept apart on a real
+/// server: *absent, empty and unreachable are three different things, and only
+/// one of them is good news.*
+///
+/// The direction that matters is the last one. A connection failure rendered as
+/// an empty history is a `status` screen that says "never deployed" about a
+/// database nobody could reach — and the remedy it prints is `bootstrap`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_stay_three_answers() {
+    let mut db = TestDb::create("three_answers").await;
+
+    // Never initialized: there is no ledger, and the remedy is `baseline` or
+    // `bootstrap`.
+    assert!(!state::is_initialized(&mut db.conn).await.expect("probe"));
+    assert!(matches!(
+        state::latest(&mut db.conn).await,
+        Err(LedgerError::NotInitialized)
+    ));
+    assert!(matches!(
+        state::history(&mut db.conn, 10).await,
+        Err(LedgerError::NotInitialized)
+    ));
+    assert!(matches!(
+        state::timeline(&mut db.conn, 10).await,
+        Err(LedgerError::NotInitialized)
+    ));
+
+    // Empty: the ledger is there and holds nothing. Nothing to compare
+    // against, and nothing to fix either — this is a database that was
+    // initialized and then pruned to nothing.
+    state::ensure_tables(&mut db.conn).await.expect("create");
+    assert!(state::is_initialized(&mut db.conn).await.expect("probe"));
+    assert!(matches!(state::latest(&mut db.conn).await, Ok(None)));
+    assert_eq!(state::timeline(&mut db.conn, 10).await.unwrap(), Vec::new());
+
+    // Unreachable: not a ledger answer at all. No call in this module can be
+    // reached without a connection, and the failure that stops one being opened
+    // stays a connection failure with the address in it.
+    let error = refusal("host=127.0.0.1 port=1 user=postgres").await;
+    assert!(
+        matches!(&error, DbError::Connect { addr, .. } if addr == "127.0.0.1:1"),
+        "a server that cannot be reached is not an empty ledger: {error:?}"
+    );
+
+    // And the fourth answer, which is neither of the three and is measured
+    // here because it looks like the first: a database that does not exist is
+    // refused **by the server**, so it arrives as a driver error carrying
+    // `3D000` (`invalid_catalog_name`) rather than as a failure to connect. It
+    // is still not an empty history, which is the only thing any caller may
+    // conclude from it.
+    let error = refusal(&conn_str_for("no_such_database_here")).await;
+    match &error {
+        DbError::Driver { code, .. } => assert_eq!(code.as_deref(), Some("3D000"), "{error:?}"),
+        // Named rather than wildcarded, as the connection-failure tests name
+        // them: a category added later has to be looked at here.
+        other @ (DbError::BadConnectionString(_)
+        | DbError::Connect { .. }
+        | DbError::ConnectTimeout { .. }
+        | DbError::WrongSession { .. }
+        | DbError::BadRow(_)) => {
+            panic!("a database that is not there is refused by the server: {other:?}")
+        }
+    }
+
+    db.drop().await;
+}
+
+/// The distinction the other engine needs a measured error number for, made
+/// here by the engine itself — and asserted, because "I could not look"
+/// reported as "there is no ledger" ends in `bootstrap` against a database that
+/// already has one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_ledger_this_role_may_not_read_is_not_an_uninitialized_one() {
+    let mut db = TestDb::create("denied_ledger").await;
+    state::ensure_tables(&mut db.conn).await.expect("create");
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .expect("record");
+
+    let role = least_privilege_role(&mut db, "denied").await;
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    // The premise: the table is there and this role holds nothing on it.
+    let error = state::is_initialized(&mut theirs)
+        .await
+        .expect_err("a role with no privileges must not be told the ledger is absent");
+    assert_eq!(sqlstate(&error), "42501", "{error:?}");
+
+    // And the other half of the same question, so the answer cannot be "it
+    // errors either way": once the read is granted, the same call says yes.
+    db.conn
+        .execute(&format!("GRANT SELECT ON {} TO {role}", state::STATE_TABLE))
+        .await
+        .expect("grant the read");
+    assert!(state::is_initialized(&mut theirs).await.expect("probe"));
+
+    // A role that may read the ledger and not the lock is a third state again:
+    // nothing holds the lock is what `None` means, and it must not be what
+    // "you may not look" means.
+    let error = state::lock_holder(&mut theirs)
+        .await
+        .expect_err("a lock table this role cannot read is not an empty one");
+    assert_eq!(sqlstate(&error), "42501", "{error:?}");
+
+    db.drop().await;
+}
+
+/// SPEC §11.5: the lock admits exactly one holder, and the second caller is
+/// told who has it. The mechanism is this engine's; the invariant is not.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_lock_admits_one_holder_and_names_it_to_the_second() {
+    let mut db = TestDb::create("lock").await;
+    let mut other = db.second().await;
+
+    state::lock(&mut db.conn, "pipeline-one")
+        .await
+        .expect("the first caller takes the lock");
+
+    match state::lock(&mut other, "pipeline-two").await {
+        Err(LedgerError::Locked(LockInfo {
+            locked_by,
+            locked_at,
+        })) => {
+            assert_eq!(locked_by, "pipeline-one");
+            assert_eq!(locked_at.len(), 23, "{locked_at}");
+            assert!(locked_at.contains('T'), "{locked_at}");
+        }
+        other => panic!("the second caller must be refused and told who holds it: {other:?}"),
+    }
+
+    // Released by whoever runs `pbps unlock`, which is not necessarily the
+    // holder — a pipeline that died cannot release its own lock, and that is
+    // the case the command exists for.
+    assert!(state::unlock(&mut other).await.expect("unlock"));
+    assert!(
+        !state::unlock(&mut other).await.expect("unlock again"),
+        "a lock that was not held must say so rather than reporting a release"
+    );
+    state::lock(&mut other, "pipeline-two")
+        .await
+        .expect("the lock is free again");
+
+    db.drop().await;
+}
+
+/// The shape the other dialect's lock cannot be ported in: on this engine a
+/// failed statement aborts the whole transaction, so "insert, and read the
+/// holder when the insert fails" would leave the caller in `25P02` with no
+/// holder to name.
+///
+/// Measured here through the real thing: the lock is taken inside a caller's
+/// transaction, the refusal names the holder, and the transaction is still
+/// usable afterwards.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_contended_lock_inside_a_transaction_names_its_holder_and_leaves_it_alive() {
+    let mut db = TestDb::create("lock_in_tx").await;
+    let mut other = db.second().await;
+    state::lock(&mut db.conn, "pipeline-one")
+        .await
+        .expect("take the lock");
+
+    other.execute("BEGIN").await.expect("open a transaction");
+    match state::lock(&mut other, "pipeline-two").await {
+        Err(LedgerError::Locked(info)) => assert_eq!(info.locked_by, "pipeline-one"),
+        other => panic!("expected the holder to be named: {other:?}"),
+    }
+    // The premise of the whole design: the caller's transaction survived the
+    // contention. The bare `INSERT` the other dialect uses would have aborted
+    // it, and this read is what proves it did not.
+    assert_eq!(number(&mut other, "SELECT 1").await, 1);
+    other.execute("ROLLBACK").await.expect("close it");
+
+    db.drop().await;
+}
+
+/// ADR-0003: a staged apply's checkpoint is what makes a mid-way failure
+/// visible rather than mysterious, and what `--resume` starts from. It only
+/// does that if the marker survives `state_json`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_staged_checkpoint_survives_the_ledger() {
+    let mut db = TestDb::create("staged").await;
+
+    let mut checkpoint = snapshot(StateKind::Staged);
+    checkpoint.plan_checksum = Some("a".repeat(64));
+    checkpoint.staged = Some(pbps_model::StagedProgress {
+        completed: 1,
+        total: 2,
+        last_statement: "CREATE INDEX \"ix_live\" ON \"app\".\"customer\" (\"email\")".into(),
+    });
+    state::record(&mut db.conn, &checkpoint)
+        .await
+        .expect("record the checkpoint");
+
+    let back = state::latest(&mut db.conn)
+        .await
+        .expect("latest")
+        .expect("an entry");
+    assert_eq!(back.snapshot, checkpoint);
+    assert!(
+        !back
+            .snapshot
+            .staged
+            .expect("the progress marker")
+            .is_finished()
+    );
+
+    // The closing entry carries no marker, and its absence is what tells every
+    // later command the environment is no longer mid-deployment.
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .expect("record the finish");
+    assert!(
+        state::latest(&mut db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .staged
+            .is_none()
+    );
+
+    db.drop().await;
+}
+
+/// Two entries written inside one transaction carry the times they were
+/// written, not the time the transaction began.
+///
+/// `now()` is the transaction's start and does not move inside it — measured,
+/// two reads 300ms apart in one transaction return the same value — so a ledger
+/// defaulting to it would stamp a staged checkpoint and the entry that follows
+/// it with the same instant, and the history would show them as simultaneous.
+/// The sleep is what makes the difference bigger than the column's millisecond
+/// resolution, so the assertion is about the clock and not about how fast the
+/// test ran.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn two_entries_recorded_in_one_transaction_carry_the_times_they_were_written() {
+    let mut db = TestDb::create("clock").await;
+    state::ensure_tables(&mut db.conn).await.expect("create");
+
+    db.conn.execute("BEGIN").await.expect("open a transaction");
+    state::record(&mut db.conn, &snapshot(StateKind::Staged))
+        .await
+        .expect("the checkpoint");
+    db.conn
+        .query("SELECT pg_sleep(0.01)")
+        .await
+        .expect("longer than the column's resolution");
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .expect("the entry that closes it");
+    db.conn.execute("COMMIT").await.expect("commit");
+
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert_ne!(
+        rows[0].applied_at, rows[1].applied_at,
+        "two entries of one transaction must not read as simultaneous"
+    );
+
+    db.drop().await;
+}
+
+/// The recorded time is the server's, and it reads the same however the session
+/// asking for it renders dates.
+///
+/// The negative half is the point: the same column cast to text under this
+/// session really is unreadable, so the test cannot pass because the setting
+/// failed to take.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_recorded_time_reads_the_same_under_a_session_that_renders_dates_differently() {
+    let mut db = TestDb::create("datestyle").await;
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .expect("record");
+
+    db.conn
+        .execute("SET DateStyle = 'German, DMY'")
+        .await
+        .expect("a session that renders dates its own way");
+
+    let back = state::latest(&mut db.conn)
+        .await
+        .expect("latest")
+        .expect("an entry");
+    assert!(
+        back.applied_at.contains('T') && back.applied_at.len() == 23,
+        "the ledger's own rendering must not move with the session: {}",
+        back.applied_at
+    );
+
+    let cast = text(
+        &mut db.conn,
+        "SELECT applied_at::text FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
+    )
+    .await;
+    assert!(
+        !cast.contains('T') && cast.contains('.'),
+        "the premise is wrong if the session setting did not take: {cast}"
+    );
+
+    db.drop().await;
+}
+
+/// A reason as wide as the column can hold is stored whole, and one character
+/// more is refused rather than silently cut. The unit is characters here and
+/// UTF-16 code units on the other engine, so this is measured rather than
+/// carried over.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused() {
+    let mut db = TestDb::create("reason").await;
+
+    // Emoji, because this is exactly where the two engines disagree: 1000 of
+    // them are 2000 UTF-16 units and do not fit an `NVARCHAR(1000)`.
+    let full = "😀".repeat(state::REASON_CHARS);
+    let mut wide = snapshot(StateKind::Baseline);
+    wide.reason = Some(full.clone());
+    state::record(&mut db.conn, &wide)
+        .await
+        .expect("a reason of exactly the declared width");
+    assert_eq!(
+        state::latest(&mut db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .reason,
+        Some(full.clone())
+    );
+
+    let mut over = snapshot(StateKind::Baseline);
+    over.reason = Some(format!("{full}😀"));
+    let error = state::record(&mut db.conn, &over)
+        .await
+        .expect_err("one character too many must be refused, not truncated");
+    match error {
+        LedgerError::Db(e) => assert_eq!(sqlstate(&e), "22001", "{e:?}"),
+        other @ (LedgerError::NotInitialized
+        | LedgerError::Locked(_)
+        | LedgerError::BadEntry { .. }) => panic!("expected the server's refusal: {other:?}"),
+    }
+
+    // And the audit paths, which cut rather than fail: what `truncate_reason`
+    // leaves fits by construction.
+    let mut cut = snapshot(StateKind::Failed);
+    cut.reason = Some(state::truncate_reason(&format!("{full}😀")));
+    state::record(&mut db.conn, &cut)
+        .await
+        .expect("a truncated reason fits");
+
+    db.drop().await;
+}
+
+/// An entry this build cannot read is refused **by its version**, and it does
+/// not erase the history above it (DECISIONS 218, 222). The reader is
+/// `StateSnapshot::from_json`, and there is no second path to it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_entry_from_a_newer_build_is_refused_by_its_version_and_still_appears_in_the_timeline() {
+    let mut db = TestDb::create("unreadable").await;
+    state::ensure_tables(&mut db.conn).await.expect("create");
+
+    // A row written by a pbps that does not exist yet. Only the version is
+    // needed: the reader asks for it before it asks about the shape.
+    db.conn
+        .execute_with(
+            "INSERT INTO public.__pbps_state (kind, state_json, operator, reason) \
+             VALUES ('apply', $1, 'a-later-pbps', 'from the future')",
+            &[r#"{"version":999}"#.into()],
+        )
+        .await
+        .expect("write the row by hand");
+
+    let error = state::latest(&mut db.conn)
+        .await
+        .expect_err("a state this build cannot read is not a state");
+    match error {
+        LedgerError::BadEntry { message, .. } => {
+            assert!(message.contains("999"), "{message}");
+        }
+        other @ (LedgerError::Db(_) | LedgerError::NotInitialized | LedgerError::Locked(_)) => {
+            panic!("expected the entry to be refused by its version: {other:?}")
+        }
+    }
+
+    // The timeline is the other question: every row of it exists whether or not
+    // this build understands the snapshot inside, or "when was this database
+    // last applied to?" is answered with an error.
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].operator, "a-later-pbps");
+    assert_eq!(rows[0].kind, "apply");
+    assert_eq!(rows[0].reason.as_deref(), Some("from the future"));
+    assert!(
+        matches!(&rows[0].state, Err(Unreadable::UnsupportedVersion(m)) if m.contains("999")),
+        "{:?}",
+        rows[0].state
+    );
+
+    // And a readable row above it is still readable: one bad row must not take
+    // the history with it.
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .expect("record");
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].state.is_ok(), "{:?}", rows[0].state);
+    assert!(rows[1].state.is_err(), "{:?}", rows[1].state);
+
+    // `history` is not the timeline and must not pretend to be: a caller
+    // asking for states wants states, and half a state is not one.
+    assert!(matches!(
+        state::history(&mut db.conn, 10).await,
+        Err(LedgerError::BadEntry { .. })
+    ));
+
+    db.drop().await;
+}
+
+/// `ensure_tables` is run by every command that writes a ledger row, so two
+/// pipelines starting together really do race on it. `IF NOT EXISTS` is not
+/// atomic; the loser sees the table it wanted.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
+    let mut db = TestDb::create("concurrent_create").await;
+    let mut other = db.second().await;
+
+    let (first, second) = tokio::join!(
+        state::ensure_tables(&mut db.conn),
+        state::ensure_tables(&mut other)
+    );
+    first.expect("the first creator");
+    second.expect("the second creator must find the table, not a duplicate-key failure");
+
+    assert!(state::is_initialized(&mut db.conn).await.expect("probe"));
+    assert!(
+        state::lock_holder(&mut other)
+            .await
+            .expect("read the lock")
+            .is_none()
+    );
+
+    db.drop().await;
+}
+
+/// `doctor` against a **real least-privilege role**, which is the only way this
+/// answer means anything: `postgres` is a superuser and passes every question
+/// without the catalog being asked.
+///
+/// The measurement this test exists for: every privilege PostgreSQL has to give
+/// on a table, held, and not one statement of a plan can run. A readiness check
+/// that asked only about privileges would call this environment ready.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
+    let mut db = TestDb::create("doctor").await;
+    let role = least_privilege_role(&mut db, "doctor").await;
+
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.customer (id integer PRIMARY KEY, email text); \
+             GRANT USAGE, CREATE ON SCHEMA app TO {role}; \
+             GRANT ALL PRIVILEGES ON app.customer TO {role}"
+        ))
+        .await
+        .expect("a schema this role may use and a table it does not own");
+
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the least-privilege role");
+
+    let version = doctor::server_version(&mut theirs)
+        .await
+        .expect("the server's version");
+    assert!(version.number >= 180_000, "{version:?}");
+    assert!(version.text.starts_with("18."), "{version:?}");
+
+    let customer = ObjectName {
+        schema: "app".to_owned(),
+        name: "customer".to_owned(),
+    };
+    let ask = doctor::Ask {
+        managed_schemas: &["app".to_owned()],
+        managed_tables: std::slice::from_ref(&customer),
+        referenced: &[],
+    };
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read what this role holds");
+
+    // The premise, asserted rather than assumed: the role really does hold
+    // every table privilege, and really does not own the table.
+    let rights = &held.tables[&customer];
+    assert!(rights.privileges.contains("SELECT"), "{rights:?}");
+    assert!(rights.privileges.contains("INSERT"), "{rights:?}");
+    assert!(rights.privileges.contains("REFERENCES"), "{rights:?}");
+    assert!(!rights.owned, "{rights:?}");
+
+    // And the engine agrees with the gap: this is the statement a plan is made
+    // of, run by the role the check just described.
+    let refused = theirs
+        .execute("ALTER TABLE app.customer ADD COLUMN note text")
+        .await
+        .expect_err("a non-owner must not be able to alter the table");
+    assert_eq!(sqlstate(&refused), "42501", "{refused:?}");
+
+    let gaps = doctor::missing(&held);
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == doctor::OWNERSHIP
+                && g.securable() == "TABLE \"app\".\"customer\""),
+        "the ownership gap is what makes this check worth running: {gaps:?}"
+    );
+    // The ledger's create-time gap, which every fresh PostgreSQL has: since 15,
+    // `public` grants `USAGE` to every role and `CREATE` to none.
+    assert!(
+        gaps.iter()
+            .any(|g| g.permission == "CREATE" && g.securable() == "SCHEMA \"public\""),
+        "{gaps:?}"
+    );
+
+    // Both remedies applied, and the gaps go: ownership is transferred, the
+    // ledger's schema is opened, and the ledger is created by the role itself
+    // — which then owns it, so the writes need no further grant.
+    db.conn
+        .execute(&format!(
+            "ALTER TABLE app.customer OWNER TO {role}; \
+             GRANT CREATE ON SCHEMA public TO {role}"
+        ))
+        .await
+        .expect("apply the remedies");
+    state::ensure_tables(&mut theirs)
+        .await
+        .expect("the role can now create the ledger it was told it could not");
+    let held = doctor::permissions(&mut theirs, &ask)
+        .await
+        .expect("read again");
+    assert_eq!(
+        doctor::missing(&held),
+        Vec::new(),
+        "a role granted exactly what the report named must pass"
+    );
+
+    db.drop().await;
+}
+
+/// A managed schema that is not there is not a permission problem, and not
+/// nothing either: the emitter never writes `CREATE SCHEMA`, so the first
+/// statement of the plan would fail.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap() {
+    let mut db = TestDb::create("absent_schema").await;
+
+    let ask = doctor::Ask {
+        managed_schemas: &["not_here".to_owned()],
+        managed_tables: &[],
+        referenced: &[],
+    };
+    let held = doctor::permissions(&mut db.conn, &ask)
+        .await
+        .expect("read permissions");
+    assert!(held.absent_schemas.contains("not_here"), "{held:?}");
+    assert!(held.schemas.is_empty(), "{held:?}");
+    assert!(
+        !doctor::missing(&held)
+            .iter()
+            .any(|g| g.securable().contains("not_here")),
+        "there is nothing to grant on a schema that does not exist"
+    );
+
+    db.drop().await;
+}
+
+/// The pins a staged apply needs, which no `BEGIN` establishes for it.
+///
+/// Both halves are measured: the pins really do reach the connection, and the
+/// `SET LOCAL` they are deliberately not spelled as really would do nothing
+/// outside a transaction — which is how a pin that looks right silently stops
+/// pinning anything.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_settings_a_staged_run_depends_on_reach_a_connection_that_opens_no_transaction() {
+    let mut conn = connect().await;
+    conn.execute("SET standard_conforming_strings = off; SET DateStyle = 'German, DMY'")
+        .await
+        .expect("a session that means something else by the same text");
+
+    let pins = Postgres::new()
+        .session_pins()
+        .expect("this dialect pins its session");
+    conn.execute(pins).await.expect("pin the session");
+    assert_eq!(
+        text(&mut conn, "SHOW standard_conforming_strings").await,
+        "on"
+    );
+    assert_eq!(text(&mut conn, "SHOW DateStyle").await, "ISO, MDY");
+
+    // The negative case, on the same connection: `SET LOCAL` outside a
+    // transaction lasts exactly as long as the statement it is in.
+    conn.execute("SET LOCAL DateStyle = 'German, DMY'")
+        .await
+        .expect("the engine accepts it and warns");
+    assert_eq!(
+        text(&mut conn, "SHOW DateStyle").await,
+        "ISO, MDY",
+        "`SET LOCAL` outside a transaction is a no-op, which is why the pins are not spelled \
+         that way"
+    );
+}

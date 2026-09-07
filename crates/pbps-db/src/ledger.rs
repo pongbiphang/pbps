@@ -28,10 +28,21 @@ use pbps_model::StateSnapshot;
 
 use crate::DbError;
 
-/// The tool's own tables. They are excluded from the managed set by the catalog
-/// queries, so the tool never plans changes to itself.
-pub const STATE_TABLE: &str = "dbo.__pbps_state";
-pub const LOCK_TABLE: &str = "dbo.__pbps_lock";
+/// The tool's own two tables, by the names SPEC §8.1 gives them. They are
+/// excluded from the managed set by the catalog queries, so the tool never
+/// plans changes to itself.
+///
+/// **The name, not the qualified spelling.** These two are the same word on
+/// every engine — they are this tool's, not the database's — but the schema
+/// they live in is a dialect's answer: `dbo` on SQL Server (SPEC §8.1), and
+/// `public` on PostgreSQL, which has no `dbo` and whose counterpart of it is
+/// the schema every database is created with. So the qualified spelling lives
+/// with the statements that use it (`pbps_mssql::state::STATE_TABLE`,
+/// `pbps_pg::state::STATE_TABLE`), and each of those is tested to be its own
+/// schema plus the name here. A single `dbo.`-qualified constant in this
+/// dialect-free crate was the shape that could not survive a second engine.
+pub const STATE_TABLE_NAME: &str = "__pbps_state";
+pub const LOCK_TABLE_NAME: &str = "__pbps_lock";
 
 /// One row of the ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +109,7 @@ pub enum LedgerError {
     /// This database has never been bootstrapped, baselined or snapshotted, so
     /// there is nothing to compare against and no history to read.
     #[error(
-        "this database has no `{STATE_TABLE}`: pbps has never recorded a state here.\n\
+        "this database has no `{STATE_TABLE_NAME}`: pbps has never recorded a state here.\n\
          Run `pbps baseline --db ... --reason ...` to adopt the database as it stands, \
          or `pbps bootstrap --db ...` to build it from the declarations."
     )]

@@ -831,7 +831,7 @@ mod tests {
     /// the filter behind.
     #[test]
     fn the_table_filter_names_the_ledgers_own_qualified_tables_and_matches_no_pattern() {
-        for qualified in [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE] {
+        for qualified in [crate::state::STATE_TABLE, crate::state::LOCK_TABLE] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
             assert!(
                 TABLES.contains(&format!("s.name = '{schema}'")),

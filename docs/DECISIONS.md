@@ -5317,3 +5317,167 @@ SPEC is in sync with all of these.
     `TRY_CONVERT` finds nothing to report and the pre-flight line reads as a
     pass under a statement that will not compile. A probe that cannot see a
     prohibition must not stand beside the classification that can (#141).
+## Phase 5 — the ledger, the lock and `doctor` (step 8, #83)
+
+283. **The PostgreSQL ledger lives in `public`, and the qualified names move
+    out of `pbps-db` into the dialects.** SPEC §8.1 puts the two tables in
+    `dbo`, which is a SQL Server schema, and `pbps_db::ledger` held
+    `dbo.__pbps_state` as a constant — in the crate documented as holding no
+    engine SQL. It now holds `STATE_TABLE_NAME` and `LOCK_TABLE_NAME`, the two
+    words that are the same on every engine because they are this tool's own,
+    and each dialect holds the qualified spelling beside the statements that
+    use it. Each is asserted to be its own `LEDGER_SCHEMA` plus that name, so a
+    schema edited in one place and not the other cannot leave two constants
+    that each look right.
+
+    `public` rather than a `pbps` schema of its own, decided on what it costs
+    the deployment role: creating a schema needs `CREATE` **on the database**,
+    which covers creating *any* schema, while creating two tables in `public`
+    needs `CREATE` on that one schema. The narrower grant is the one a tool
+    that argues against `db_owner` should be asking for. `public` is also the
+    schema every database is created with, which is what `dbo` is on the other
+    engine.
+
+    Measured on 18.6, and it is why `doctor` asks about it: since PostgreSQL 15
+    `public` is `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`
+    — every role has `USAGE` and none has `CREATE` — so a fresh deployment role
+    cannot create the ledger until somebody grants it.
+
+    This is what #185 was waiting for: the pull's exclusion filter hides
+    `__pbps_state` in *every* schema because it has no schema to name. It has
+    one now, and qualifying the filter stays that issue's work with that
+    issue's tests.
+
+284. **The lock is a table on this engine too, not an advisory lock.**
+    `pg_advisory_lock` is the obvious PostgreSQL answer and it answers a
+    different question: it is held by a *session*, and measured, `pg_locks`
+    shows nothing of a `pg_try_advisory_lock(42)` once the connection that took
+    it has gone. SPEC §8.1's lock is the one thing here that must **survive**
+    the pipeline that took it — a pipeline killed mid-apply is exactly when the
+    next one must not start — which is also why `pbps unlock` exists as a
+    command rather than as a timeout. A row in a table is what a dead process
+    leaves behind.
+
+285. **The lock is taken with `INSERT ... ON CONFLICT (id) DO NOTHING`, and
+    zero rows affected is the refusal.** The SQL Server ledger inserts and, when
+    the insert *fails*, reads the holder to name it. That shape cannot be
+    ported: measured on 18.6, a failed statement aborts the whole transaction,
+    so the `SELECT` that would name the holder comes back
+    `25P02: current transaction is aborted, commands ignored until end of
+    transaction block`. A lock taken inside a caller's transaction would report
+    nothing and destroy the transaction on the way.
+
+    `ON CONFLICT` is still a gate rather than a check-then-act: a second
+    inserter blocks on the primary key's index until the first commits and then
+    does nothing, so exactly one caller ever sees a row count of 1. If the first
+    rolled back, the second gets the lock. The live suite pins both halves,
+    including that the contending caller's transaction is still usable
+    afterwards.
+
+    The one case the read cannot answer is a holder that released between the
+    insert and the read. That is reported as contention without a name rather
+    than as a lock this call did not win, because claiming it would be a claim
+    that is false.
+
+286. **The ledger's times are defaulted from `clock_timestamp()` and read
+    through `to_char`, never cast.** Two measurements, one per half.
+
+    `now()` is the transaction's start time and does not move inside it —
+    measured, two reads 300ms apart in one transaction return the same value —
+    so a staged checkpoint and the entry that closes it would carry the same
+    instant and read as simultaneous. `clock_timestamp()` is the statement's,
+    which is what `SYSUTCDATETIME()` gives the other ledger.
+
+    And the text is rendered rather than cast, because a cast is the reading
+    session's business: measured, under `DateStyle = 'German, DMY'` the same
+    value casts to `31.08.2026 09:14:22.517` — not sortable as text, not
+    parseable as ISO 8601, and produced by an operator's own setting rather
+    than by anything this tool did. `to_char(applied_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS')`
+    holds no locale-sensitive field (`TM` is what would make one), so it renders
+    the same under every `DateStyle` and every `lc_time`. The column is
+    `timestamp(3)` holding a UTC wall clock rather than a `timestamptz`, for the
+    same reason one step further out: a `timestamptz` is rendered in whatever
+    `TimeZone` the reading session has.
+
+287. **`is_initialized` attempts a statement here too, and this engine answers
+    the three cases apart in the SQLSTATE.** DECISIONS 219 had to find that out
+    by measurement on SQL Server, whose catalog *hides* an object a login has no
+    permission on: `OBJECT_ID` and `HAS_PERMS_BY_NAME` both answer as if the
+    table were absent, so "not authorized to look" arrived at every caller as
+    "there is no ledger". Measured on 18.6, PostgreSQL separates them itself:
+    `42P01` for a relation that is not there, `42501` for one that is and may
+    not be read — and `42501` again where the *schema* is closed, which is the
+    same answer for the same reason.
+
+    The lookup is still not used, and that is measured too: `to_regclass` does
+    not return NULL for an object in a schema this role cannot enter, it raises
+    `42501`. So the guard would have to handle an error anyway, and where it
+    does not raise it is silent about the difference. An absent *schema* answers
+    `42P01` like an absent table, which is the right answer to "is there a
+    ledger": there is not, and `bootstrap` makes both absences visible.
+
+288. **`doctor` asks about ownership on this engine, because no privilege
+    authorizes DDL.** Measured on 18.6, as a role holding
+    `GRANT ALL PRIVILEGES ON own.t`:
+
+    ```text
+    has_table_privilege('own.t', 'SELECT,INSERT,UPDATE,DELETE,REFERENCES,TRIGGER')  ->  t
+    ALTER TABLE own.t ADD COLUMN c int   ->  42501: must be owner of table t
+    CREATE INDEX ix_t ON own.t (v)       ->  42501: must be owner of table t
+    DROP TABLE own.t                     ->  42501: must be owner of table t
+    ```
+
+    Every privilege the engine has to give, held, and not one statement a plan
+    is made of could run. The SQL Server list ported across would have asked
+    `has_table_privilege` about a vocabulary that is real here, got `true` for
+    all of it, and reported an environment ready that cannot alter a single
+    table — the under-demand `pbps_mssql::doctor::Needed` exists to remove,
+    arriving through the front door. The question is
+    `pg_has_role(current_user, relowner, 'USAGE')`, which is the one the engine
+    asks itself, and the remedy is `ALTER TABLE ... OWNER TO` or
+    `GRANT <owner> TO <deployer>` rather than a `GRANT` on the table.
+
+    The scopes are this engine's for the same reason: a schema takes `USAGE` and
+    `CREATE` and nothing else, there is no database-scoped `CREATE TABLE`, and
+    `CREATE` on the database is deliberately not demanded — the emitter never
+    writes `CREATE SCHEMA`, so an absent managed schema is reported as absent
+    (as on the other engine) rather than covered by a grant that also permits
+    creating any schema at all.
+
+289. **A staged apply pins its session, through `Dialect::session_pins`.**
+    `Postgres::transaction_framing`'s `begin` carries nine settings, because
+    each of them decides what a declared expression *means* (DECISIONS 254 and
+    the method's own comment). A staged apply opens no transaction, so `begin`
+    is never sent — and `--resume` is worse, because it starts on a fresh
+    connection partway through the plan. The same text is now available without
+    the `BEGIN`, and the staged runner establishes it on the connection before
+    its first statement.
+
+    The trait's default is `None`, which is the right answer for SQL Server: its
+    framing carries `SET XACT_ABORT ON`, which governs a transaction and means
+    nothing outside one. One macro produces the text for both call sites here,
+    so the transactional and staged paths cannot pin different things — the
+    failure this replaces, where the staged path pinned nothing at all.
+
+290. **A reason is cut by characters here and by UTF-16 units there.** The
+    column is `varchar(1000)` and this engine counts characters: measured,
+    `varchar(4)` accepts four emoji and reports `length = 4,
+    octet_length = 16`, where `NVARCHAR(4)` refuses them. A shared helper would
+    have to be wrong on one of the two engines, so each dialect has its own with
+    its own unit and its own test.
+
+    The engine has two answers about overflow and only one of them is loud:
+    measured, `'😀😀😀😀😀'::varchar(4)` truncates silently and returns four,
+    while inserting the same value into a `varchar(4)` column is
+    `22001: value too long`. The user-supplied `--reason` therefore reaches the
+    column as it was written and fails loudly; only the best-effort audit paths
+    truncate, where a failed attempt that cannot be recorded is the opposite of
+    what the row exists for.
+
+291. **`ensure_tables` treats a concurrent creator's failure as success.**
+    `CREATE TABLE IF NOT EXISTS` is not atomic against another session doing the
+    same thing: the check and the create are two steps, and the loser gets
+    `23505` on `pg_class_relname_nsp_index` or `42P07`. Both mean the table is
+    there now, which is what the caller asked for; anything else is still a
+    failure. Every command that writes a ledger row calls this, so two
+    pipelines starting together really do race on it.

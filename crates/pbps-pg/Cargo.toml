@@ -13,6 +13,9 @@ pbps-dialect.workspace = true
 # Promoted from a dev-dependency by introspection (Phase 5 step 3): `catalog`
 # holds a connection, and it is the only file in this crate that does.
 pbps-db.workspace = true
+# The ledger writes one snapshot per row as JSON (Phase 5 step 8); the shape is
+# `pbps_model::StateSnapshot`'s, and this is what serializes it.
+serde_json.workspace = true
 
 [dev-dependencies]
 # The live suite plans a migration the way `plan --db` does, so that what it

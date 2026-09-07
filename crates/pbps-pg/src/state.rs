@@ -1,0 +1,706 @@
+//! The `__pbps_state` ledger and the `__pbps_lock` lock, in PostgreSQL
+//! (SPEC §8.1).
+//!
+//! The types and the meaning live in `pbps_db::ledger`; only the statements are
+//! here, for the same reason [`crate::catalog`]'s queries are: they are
+//! PostgreSQL, they are T-SQL in `pbps_mssql::state`, and `pbps-db` is the
+//! crate documented as holding no engine SQL. Nothing in this file interpolates
+//! a user-supplied value into SQL — every one of them is bound.
+//!
+//! # Where this engine's ledger lives, and why it is `public`
+//!
+//! SPEC §8.1 puts the two tables in `dbo`, which is a SQL Server schema. The
+//! counterpart here is `public`: the schema every PostgreSQL database is
+//! created with, the one `dbo` corresponds to in every migration guide, and the
+//! only schema this tool can name without inventing one.
+//!
+//! A dedicated `pbps` schema was the alternative and was rejected on what it
+//! costs the deployment account. Creating a schema needs `CREATE` **on the
+//! database**, which is granted by the database's owner and covers creating
+//! *any* schema; creating the two tables in `public` needs `CREATE` on that one
+//! schema. The narrower grant is the one a tool that argues against
+//! `db_owner` should be asking for.
+//!
+//! Measured on 18.6, and it is why `doctor` asks: since PostgreSQL 15 the
+//! `public` schema no longer carries `CREATE` for `PUBLIC` —
+//! `nspacl = {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}` —
+//! so an ordinary deployment role has `USAGE` there and **not** `CREATE`, and
+//! the first `bootstrap` fails at the ledger unless someone has granted it.
+//!
+//! # Why these two tables are not part of the managed set
+//!
+//! [`crate::catalog`]'s table query excludes them by name, so the tool never
+//! introspects its own bookkeeping and never plans a change to it. Qualifying
+//! that filter with [`LEDGER_SCHEMA`] — so that a project's own
+//! `app.__pbps_state` stays visible — is #185, which was waiting on this module
+//! to say where the ledger lives.
+
+use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry, ids_to_prune};
+use pbps_db::{Conn, DbError, Row};
+use pbps_model::StateSnapshot;
+
+/// The schema this engine's ledger lives in. See the module header.
+pub const LEDGER_SCHEMA: &str = "public";
+
+/// The two tables, as this engine spells them.
+///
+/// The names are `pbps_db::ledger`'s, which is where the *meaning* of a ledger
+/// row lives; the schema in front of them is this dialect's. Whoever has to
+/// name these tables from outside — the pull's exclusion filter, `doctor`'s
+/// permission questions — asks here rather than repeating the spelling.
+pub const STATE_TABLE: &str = "public.__pbps_state";
+pub const LOCK_TABLE: &str = "public.__pbps_lock";
+
+/// `CREATE TABLE IF NOT EXISTS` rather than a catalog check and a branch:
+/// creating the ledger must be safe to run on every command that writes one,
+/// and re-running must not disturb the rows already there.
+///
+/// `GENERATED ALWAYS AS IDENTITY`, not `bigserial`. The dialect refuses
+/// `serial` in a declaration (step 2, DECISIONS 245) because it is a spelling
+/// the catalog never gives back; this tool's own DDL is held to the rule it
+/// enforces.
+///
+/// `timestamp(3)`, not `timestamptz`. What is stored is a UTC wall clock, as
+/// SQL Server's `DATETIME2(3)` is, and a `timestamptz` would be *rendered* in
+/// whatever `TimeZone` the reading session happens to have — the same class of
+/// setting-dependence [`crate::catalog`]'s canonical scope exists to close.
+///
+/// `clock_timestamp()`, not `now()`. **Measured**: `now()` is the transaction's
+/// start time and does not move inside it, so two entries recorded in one apply
+/// — a staged checkpoint and the entry that follows it — would carry the same
+/// instant and read as simultaneous. `clock_timestamp()` is the statement's,
+/// which is what SQL Server's `SYSUTCDATETIME()` gives the other ledger.
+const CREATE_STATE: &str = "\
+CREATE TABLE IF NOT EXISTS public.__pbps_state (
+    id            bigint GENERATED ALWAYS AS IDENTITY
+                  CONSTRAINT pk___pbps_state PRIMARY KEY,
+    applied_at    timestamp(3)   NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'),
+    kind          varchar(16)    NOT NULL,
+    git_sha       varchar(40)    NULL,
+    plan_checksum varchar(64)    NULL,
+    state_json    text           NOT NULL,
+    operator      varchar(128)   NOT NULL,
+    reason        varchar(1000)  NULL
+)";
+
+/// The width of `__pbps_state.reason`, in the unit `varchar(n)` is measured in
+/// on this engine: **characters**.
+///
+/// Not the same unit as the other ledger's, and the difference is the point.
+/// `NVARCHAR(1000)` counts UTF-16 code units, so 1000 emoji do not fit there;
+/// measured on 18.6, `varchar(4)` accepts four emoji and reports
+/// `length = 4, octet_length = 16`. A truncation written in the other engine's
+/// unit would cut a reason in half here for no reason at all.
+pub const REASON_CHARS: usize = 1000;
+
+/// Cuts a reason down to what the ledger column can hold.
+///
+/// Used on the best-effort audit paths, where a failed attempt that cannot be
+/// recorded is the opposite of what the row exists for; a user-supplied
+/// `--reason` is not truncated and fails loudly instead, since an audit text
+/// silently shortened is a different kind of loss.
+///
+/// **Measured, and the reason this is not left to the engine**: a cast
+/// truncates silently — `'😀😀😀😀😀'::varchar(4)` returns four emoji and no
+/// warning — while an insert of the same value into a `varchar(4)` column
+/// fails with `22001: value too long`. One engine, two answers, and the silent
+/// one is the one a `::text` in the wrong place would reach.
+pub fn truncate_reason(text: &str) -> String {
+    text.chars().take(REASON_CHARS).collect()
+}
+
+/// The lock, whose one row is the gate.
+///
+/// A **table**, not `pg_advisory_lock`. The advisory lock is the obvious
+/// PostgreSQL answer and it answers a different question: it is held by a
+/// *session* and released when that session ends — measured, `pg_locks` shows
+/// nothing of a `pg_try_advisory_lock(42)` once the connection that took it has
+/// gone. SPEC §8.1's lock is the one thing here that must **survive** the
+/// pipeline that took it, because a pipeline killed mid-apply is exactly when
+/// the next one must not start; that is also why `pbps unlock` exists as a
+/// command rather than as a timeout. A row in a table is what a dead process
+/// leaves behind.
+const CREATE_LOCK: &str = "\
+CREATE TABLE IF NOT EXISTS public.__pbps_lock (
+    id        integer NOT NULL
+              CONSTRAINT pk___pbps_lock PRIMARY KEY
+              CONSTRAINT ck___pbps_lock_single CHECK (id = 1),
+    locked_by varchar(256) NOT NULL,
+    locked_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC')
+)";
+
+/// ISO 8601, rendered by the server and stored by the client as text — the
+/// driver is used without a date library here for the same reason the other one
+/// is: a dependency for one column is a dependency the audit has to read.
+///
+/// `to_char` with an explicit pattern, **not** `applied_at::text`. Measured on
+/// 18.6: under `DateStyle = 'German, DMY'` the same value casts to
+/// `31.08.2026 09:14:22.517`, which is not sortable as text, not parseable as
+/// ISO 8601, and produced by an operator's own session setting rather than by
+/// anything this tool did. The pattern here holds no locale-sensitive field
+/// (`TM` is what would make one), so it renders the same under every
+/// `DateStyle` and every `lc_time`.
+const TIMESTAMP_PATTERN: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS.MS'";
+
+/// One timestamp column, rendered. Written once and asked for by every
+/// statement that returns a time, so that the pattern cannot drift between
+/// two of them while both still look right.
+fn rendered(column: &str) -> String {
+    format!("to_char({column}, {TIMESTAMP_PATTERN}) AS {column}")
+}
+
+/// The newest entry. `LIMIT`, where the other dialect writes `TOP`.
+///
+/// Built rather than written out, like [`crate::catalog`]'s queries and for the
+/// same reason: [`rendered`] is one pattern used by four statements, and
+/// four copies of a `to_char` pattern would each look right on their own
+/// while two of them drifted.
+fn select_latest() -> String {
+    let applied_at = rendered("applied_at");
+    format!(
+        "SELECT id, {applied_at}, state_json
+  FROM {STATE_TABLE}
+ ORDER BY id DESC LIMIT 1"
+    )
+}
+
+fn select_history() -> String {
+    let applied_at = rendered("applied_at");
+    format!(
+        "SELECT id, {applied_at}, state_json
+  FROM {STATE_TABLE}
+ ORDER BY id DESC LIMIT $1"
+    )
+}
+
+/// The timeline reads the projected columns, so a row whose `state_json` this
+/// build cannot parse is still a row.
+fn select_timeline() -> String {
+    let applied_at = rendered("applied_at");
+    format!(
+        "SELECT id, {applied_at}, kind, git_sha, plan_checksum, operator, reason, state_json
+  FROM {STATE_TABLE}
+ ORDER BY id DESC LIMIT $1"
+    )
+}
+
+/// `RETURNING id` is one round trip and cannot be confused by a trigger someone
+/// added to the ledger — the reason the other dialect writes
+/// `OUTPUT INSERTED.id` rather than reading a session-wide identity.
+const INSERT_STATE: &str = "\
+INSERT INTO public.__pbps_state (kind, git_sha, plan_checksum, state_json, operator, reason)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id";
+
+const SELECT_IDS: &str = "SELECT id FROM public.__pbps_state ORDER BY id DESC";
+
+const DELETE_UP_TO: &str = "DELETE FROM public.__pbps_state WHERE id <= $1";
+
+fn select_lock() -> String {
+    let locked_at = rendered("locked_at");
+    format!(
+        "SELECT locked_by, {locked_at}
+  FROM {LOCK_TABLE} WHERE id = 1"
+    )
+}
+
+/// `ON CONFLICT (id) DO NOTHING`, and the zero rows it reports are the answer.
+///
+/// The other dialect inserts and reads the holder when the insert *fails*.
+/// That shape cannot be ported: measured on 18.6, a failed statement aborts the
+/// whole transaction — the `SELECT` that would name the holder comes back
+/// `25P02: current transaction is aborted` — so a lock taken inside a
+/// transaction would report the wrong thing, or nothing. `ON CONFLICT` is still
+/// a gate: a second inserter blocks on the primary key's index until the first
+/// commits and then does nothing, so exactly one caller sees a row count of 1.
+/// If the first rolled back, the second gets the lock.
+const INSERT_LOCK: &str =
+    "INSERT INTO public.__pbps_lock (id, locked_by) VALUES (1, $1) ON CONFLICT (id) DO NOTHING";
+
+const DELETE_LOCK: &str = "DELETE FROM public.__pbps_lock WHERE id = 1";
+
+/// The cheapest statement that resolves the ledger and checks the permission to
+/// read it without returning a row. See [`is_initialized`] for why it is a
+/// statement at all.
+const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0";
+
+/// Creates the ledger and lock tables if they are not there yet.
+///
+/// One batch, which on this engine is one transaction: PostgreSQL's DDL is
+/// transactional, so the pair arrives whole or not at all. The other engine
+/// can leave the ledger created and the lock missing, and its callers have to
+/// cope; here that state is unreachable.
+pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
+    match conn
+        .execute(&format!("{CREATE_STATE};\n{CREATE_LOCK};"))
+        .await
+    {
+        Ok(()) => Ok(()),
+        // `IF NOT EXISTS` is not atomic against a concurrent creator: measured,
+        // two sessions creating the same table at once leave one of them with
+        // `23505` on `pg_class_relname_nsp_index` or `42P07`, because the check
+        // and the create are two steps under one lock the second session does
+        // not hold. Both mean the table is there now, which is what the caller
+        // asked for. Anything else is still a failure.
+        Err(e) if made_by_someone_else(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether this database has a ledger at all.
+///
+/// Every read has to ask first: querying a table that does not exist fails with
+/// `relation "public.__pbps_state" does not exist`, which tells the user
+/// nothing about what to do. The answer they need is "run baseline or
+/// bootstrap", and only this distinction can produce it.
+///
+/// # Why the statement is attempted rather than the catalog asked
+///
+/// The obvious guard is `to_regclass('public.__pbps_state') IS NULL`, and it
+/// cannot separate the three answers. **Measured on 18.6**, as a role with no
+/// rights on the schema, `SELECT to_regclass('hidden.t')` does not return NULL
+/// — it raises `42501: permission denied for schema hidden`. So the guard has
+/// to handle an error anyway, and where it does not raise it is silent about
+/// the difference between "no table" and "a table you may not read".
+///
+/// The statement separates them, and this engine says so in the code rather
+/// than in the sentence: `42P01` when the relation is not there, `42501` when
+/// it is there and this role may not read it — or when the schema itself is
+/// closed to it. Only the first is `false`; the second stays an error, because
+/// "I could not look" reported as "there is no ledger" is the direction that
+/// ends in `bootstrap` against a database that already has one. (The other
+/// engine needs the same distinction and gets it from 208 against 229 — that
+/// one had to be found by measurement, because its catalog *hides* an object a
+/// login has no permission on and answers NULL for it, DECISIONS 219.)
+pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
+    match conn.query(PROBE_STATE).await {
+        Ok(_) => Ok(true),
+        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The newest state, which is the environment's current baseline.
+///
+/// `Ok(None)` means the ledger exists but is empty — a database that was
+/// initialized and then pruned to nothing. `Err(NotInitialized)` means there is
+/// no ledger at all. The two need different remedies, so they are different
+/// answers.
+pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = conn.query(&select_latest()).await?;
+    rows.first().map(entry_from_row).transpose()
+}
+
+/// The most recent `limit` entries, newest first.
+///
+/// Every one of them has to be readable: a caller asking for entries wants the
+/// states, and half a state is not one. [`timeline`] is the other question.
+pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = conn
+        .query_with(&select_history(), &[rows_wanted(limit).into()])
+        .await?;
+    rows.iter().map(entry_from_row).collect()
+}
+
+/// The most recent `limit` rows as a timeline, newest first.
+///
+/// A row whose recorded state this build cannot read is carried with its
+/// reason rather than failing the call: an environment upgraded across a
+/// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
+/// one of them must not erase the history above it (DECISIONS 218).
+pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = conn
+        .query_with(&select_timeline(), &[rows_wanted(limit).into()])
+        .await?;
+    rows.iter().map(timeline_from_row).collect()
+}
+
+/// `LIMIT` takes a `bigint`, and the count is a `u32`.
+///
+/// Every value fits, so there is nothing to saturate and nothing to check —
+/// which is worth a line only because the other dialect's `TOP` takes a signed
+/// 32-bit integer, where `--limit 4294967295` wrapped to `-1` and the server
+/// refused the query (DECISIONS 217). Two engines, one count, and the
+/// conversion that is a hazard there is total here.
+fn rows_wanted(limit: u32) -> i64 {
+    i64::from(limit)
+}
+
+/// Appends one state to the ledger and returns its id.
+///
+/// The columns beside `state_json` are projected from the snapshot rather than
+/// passed separately: they exist so `status` can filter without parsing JSON,
+/// and a caller able to set them independently could make them lie.
+pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
+    ensure_tables(conn).await?;
+    let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
+        id: 0,
+        message: format!("the snapshot could not be serialized: {e}"),
+    })?;
+
+    let kind = snapshot.kind.as_str();
+    let rows = conn
+        .query_with(
+            INSERT_STATE,
+            &[
+                kind.into(),
+                snapshot.git_sha.as_deref().into(),
+                snapshot.plan_checksum.as_deref().into(),
+                state_json.as_str().into(),
+                snapshot.operator.as_str().into(),
+                snapshot.reason.as_deref().into(),
+            ],
+        )
+        .await?;
+    match rows.first() {
+        Some(row) => Ok(number(row, "id")?),
+        None => Err(LedgerError::Db(DbError::BadRow(
+            "the ledger insert returned no id".into(),
+        ))),
+    }
+}
+
+/// Deletes all but the `keep` newest entries; returns how many went.
+pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let ids: Vec<i64> = conn
+        .query(SELECT_IDS)
+        .await?
+        .iter()
+        .map(|row| number(row, "id"))
+        .collect::<Result<_, _>>()?;
+
+    // The policy is decided in `pbps-db` and tested without a server; all that
+    // is left here is the delete. Because ids come from an identity column and
+    // the list is newest-first, the prunable set is always a contiguous tail,
+    // so one `<=` covers it exactly.
+    let doomed = ids_to_prune(&ids, keep);
+    let Some(highest) = doomed.first().copied() else {
+        return Ok(0);
+    };
+    Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
+}
+
+/// Takes the apply lock, or reports who already holds it.
+///
+/// The insert is the gate, not the read that follows it: a check-then-insert
+/// would let two pipelines through the check together. The read only happens
+/// once the insert has reported that it changed nothing, and then only to name
+/// the holder.
+pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
+    ensure_tables(conn).await?;
+    if conn.execute_with(INSERT_LOCK, &[holder.into()]).await? > 0 {
+        return Ok(());
+    }
+    match lock_holder(conn).await? {
+        Some(info) => Err(LedgerError::Locked(info)),
+        // The row was there when the insert ran and is gone now: whoever held
+        // the lock released it in between. Reporting a holder this call cannot
+        // name would be a sentence with a hole in it, and claiming the lock
+        // would be a claim this call did not win, so it is neither — the caller
+        // is told the lock was contended and can try again.
+        None => Err(LedgerError::Locked(LockInfo {
+            locked_by: "another operation, which released the lock while this one was reading it"
+                .to_owned(),
+            locked_at: "just now".to_owned(),
+        })),
+    }
+}
+
+/// `undefined_table`: the relation this statement names is not there. **Not**
+/// the code for one that is there and may not be read — that is `42501`,
+/// `insufficient_privilege`, and keeping the two apart is the whole point of
+/// asking by SQLSTATE.
+const UNDEFINED_TABLE: &str = "42P01";
+
+/// `duplicate_table` and `unique_violation`: what a concurrent creator leaves
+/// behind. See [`ensure_tables`].
+const DUPLICATE_TABLE: &str = "42P07";
+const UNIQUE_VIOLATION: &str = "23505";
+
+/// Whether a failure means "that table does not exist".
+///
+/// A schema that is not there answers the same way — measured, a reference to
+/// `no_such_schema.t` is `42P01: relation "no_such_schema.t" does not exist`,
+/// not `3F000` — which is the right answer for a caller asking whether the
+/// ledger is there: it is not, and `bootstrap` or `baseline` is what makes both
+/// the schema's absence and the ledger's visible.
+fn is_missing_table(e: &DbError) -> bool {
+    e.server_error_code().as_deref() == Some(UNDEFINED_TABLE)
+}
+
+/// Whether a failure means "somebody else created it first".
+fn made_by_someone_else(e: &DbError) -> bool {
+    matches!(
+        e.server_error_code().as_deref(),
+        Some(DUPLICATE_TABLE | UNIQUE_VIOLATION)
+    )
+}
+
+/// Releases the lock. `false` means it was not held.
+pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
+    // The *lock* table, not the state table. Guarding on `is_initialized` would
+    // mean a database whose `__pbps_state` had been dropped by hand reported
+    // "not held" and left a live lock in place — with no command able to clear
+    // it.
+    match conn.execute_with(DELETE_LOCK, &[]).await {
+        Ok(n) => Ok(n > 0),
+        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Who holds the deployment lock, if anyone.
+///
+/// A missing lock table answers `None` rather than failing: nothing can be
+/// holding a lock that does not exist. That is deliberately *not* the same as
+/// the table being unreadable, which stays an error — callers report the two
+/// differently, and "I could not look" must never be flattened into "nothing
+/// there".
+pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
+    let rows = match conn.query(&select_lock()).await {
+        Ok(rows) => rows,
+        Err(e) if is_missing_table(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match rows.first() {
+        Some(row) => Ok(Some(LockInfo {
+            locked_by: text(row, "locked_by")?,
+            locked_at: text(row, "locked_at")?,
+        })),
+        None => Ok(None),
+    }
+}
+
+fn entry_from_row(row: &Row) -> Result<LedgerEntry, LedgerError> {
+    let id: i64 = number(row, "id")?;
+    let state_json = text(row, "state_json")?;
+    // `from_json`, not `from_str` then `check_version`: an entry written by an
+    // older pbps is refused by its version and the remedy that goes with it,
+    // rather than by whichever field of its older shape serde reached first.
+    // This is the reader #74 added, and there is no second path to it.
+    let snapshot = StateSnapshot::from_json(&state_json)
+        .map_err(|message| LedgerError::BadEntry { id, message })?;
+    Ok(LedgerEntry {
+        id,
+        applied_at: text(row, "applied_at")?,
+        snapshot,
+    })
+}
+
+fn timeline_from_row(row: &Row) -> Result<TimelineEntry, LedgerError> {
+    let id: i64 = number(row, "id")?;
+    let state_json = text(row, "state_json")?;
+
+    // `read_json`, the same reader `entry_from_row` uses through `from_json`:
+    // the version before the shape, so an older row is refused by its version
+    // rather than by whichever field of its older shape serde reached first.
+    // The failure is carried on the row rather than returned — this is the one
+    // reader whose answer is the list itself — and the two kinds stay apart,
+    // because their remedies do (DECISIONS 222).
+    let state = StateSnapshot::read_json(&state_json);
+
+    Ok(TimelineEntry {
+        id,
+        applied_at: text(row, "applied_at")?,
+        // The projected columns, which are what makes an unreadable row still
+        // a row worth showing.
+        kind: text(row, "kind")?,
+        git_sha: optional_text(row, "git_sha")?,
+        plan_checksum: optional_text(row, "plan_checksum")?,
+        operator: text(row, "operator")?,
+        reason: optional_text(row, "reason")?,
+        state,
+    })
+}
+
+/// A column the ledger declares `NOT NULL` that came back NULL, or one the
+/// statement did not return at all.
+///
+/// Reported rather than defaulted: an empty string here would put a blank date
+/// on a status screen or an empty operator in an audit record, which is the
+/// silent wrong answer in the one place that exists to be read after the fact.
+fn missing(column: &str) -> DbError {
+    DbError::BadRow(format!(
+        "the ledger row has no `{column}`, which means the statement and this code have gone out \
+         of step"
+    ))
+}
+
+fn text(row: &Row, column: &str) -> Result<String, DbError> {
+    optional_text(row, column)?.ok_or_else(|| missing(column))
+}
+
+fn optional_text(row: &Row, column: &str) -> Result<Option<String>, DbError> {
+    Ok(row.try_get::<&str>(column)?.map(str::to_owned))
+}
+
+fn number(row: &Row, column: &str) -> Result<i64, DbError> {
+    row.try_get::<i64>(column)?.ok_or_else(|| missing(column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_db::ledger::{LOCK_TABLE_NAME, STATE_TABLE_NAME};
+
+    /// Every statement this module can send, in one list, so that a rule
+    /// asserted about "the SQL here" cannot quietly stop covering a statement
+    /// somebody adds. Three of them are built rather than written, which is
+    /// why the list holds `String`s.
+    fn state_statements() -> Vec<String> {
+        [
+            CREATE_STATE,
+            INSERT_STATE,
+            SELECT_IDS,
+            DELETE_UP_TO,
+            PROBE_STATE,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([select_latest(), select_history(), select_timeline()])
+        .collect()
+    }
+
+    fn lock_statements() -> Vec<String> {
+        [CREATE_LOCK, INSERT_LOCK, DELETE_LOCK]
+            .into_iter()
+            .map(str::to_owned)
+            .chain([select_lock()])
+            .collect()
+    }
+
+    fn every_statement() -> Vec<String> {
+        let mut all = state_statements();
+        all.extend(lock_statements());
+        all
+    }
+
+    /// A count larger than the other engine's `TOP` can hold is an ordinary
+    /// number here. The test is the boundary the other dialect gets wrong, run
+    /// against the conversion that cannot.
+    #[test]
+    fn every_count_a_caller_can_ask_for_survives_the_conversion() {
+        assert_eq!(rows_wanted(1), 1);
+        assert_eq!(rows_wanted(i32::MAX as u32), i64::from(i32::MAX));
+        assert_eq!(rows_wanted(i32::MAX as u32 + 1), i64::from(i32::MAX) + 1);
+        assert_eq!(rows_wanted(u32::MAX), i64::from(u32::MAX));
+    }
+
+    /// The constant and the DDL have to agree, or the truncation is measured
+    /// against a width the column does not have.
+    #[test]
+    fn the_reason_width_is_the_one_the_ddl_declares() {
+        assert!(
+            CREATE_STATE.contains(&format!("reason        varchar({REASON_CHARS})  NULL")),
+            "{CREATE_STATE}"
+        );
+    }
+
+    /// This engine counts a `varchar`'s width in characters, so an emoji costs
+    /// one and the whole declared width is usable. The SQL Server counterpart
+    /// cuts the same text in half, and a shared helper would have to be wrong
+    /// on one of the two engines.
+    #[test]
+    fn a_reason_is_cut_by_characters_and_never_inside_one() {
+        let ascii = "x".repeat(REASON_CHARS);
+        assert_eq!(truncate_reason(&ascii), ascii);
+        assert_eq!(truncate_reason(&format!("{ascii}y")), ascii);
+
+        let emoji = "😀".repeat(REASON_CHARS);
+        assert_eq!(truncate_reason(&emoji), emoji);
+        assert_eq!(truncate_reason(&format!("{emoji}😀")), emoji);
+
+        // A cut never splits a character, so what remains is still text.
+        let cut = truncate_reason(&format!("{emoji}x"));
+        assert_eq!(cut.chars().count(), REASON_CHARS);
+        assert!(cut.chars().all(|c| c == '😀'));
+    }
+
+    /// The two table names in the SQL must be the ones `pbps-db` documents and
+    /// the ones the catalog query excludes; a mismatch would have the tool
+    /// planning changes to its own ledger.
+    ///
+    /// The qualified spellings are this crate's and the bare names are
+    /// `pbps-db`'s, so the assertion is the join of the two rather than a
+    /// literal: a schema edited here and not there would otherwise leave two
+    /// constants that each look right on their own.
+    #[test]
+    fn the_statements_name_the_documented_tables() {
+        assert_eq!(STATE_TABLE, format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME}"));
+        assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
+        for sql in state_statements() {
+            assert!(sql.contains(STATE_TABLE), "{sql}");
+        }
+        for sql in lock_statements() {
+            assert!(sql.contains(LOCK_TABLE), "{sql}");
+        }
+    }
+
+    /// Every statement names its table with the schema in front of it. An
+    /// unqualified `__pbps_state` would resolve through whatever `search_path`
+    /// the session has — and this crate's own reads pin that path to empty,
+    /// which would leave the ledger unreachable from the very sessions that
+    /// read the catalog (DECISIONS 254).
+    #[test]
+    fn no_statement_leaves_its_table_to_the_search_path() {
+        for sql in every_statement() {
+            for bare in [STATE_TABLE_NAME, LOCK_TABLE_NAME] {
+                for (at, _) in sql.match_indices(bare) {
+                    // A constraint name (`pk___pbps_state`) contains the table
+                    // name and is not a reference to the table.
+                    let before = &sql[..at];
+                    assert!(
+                        before.ends_with(&format!("{LEDGER_SCHEMA}.")) || before.ends_with('_'),
+                        "`{bare}` is named without its schema in: {sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every user-supplied value reaches the server as a parameter. A `'` in an
+    /// operator's name or a drop reason must not be able to end a statement.
+    #[test]
+    fn no_statement_interpolates_a_value() {
+        for sql in every_statement() {
+            assert!(
+                !sql.contains("'{") && !sql.contains("{}"),
+                "a format placeholder in ledger SQL means a value is being pasted: {sql}"
+            );
+        }
+        assert!(INSERT_STATE.contains("$6"), "all six values are bound");
+    }
+
+    /// The timestamp is rendered by a pattern and never cast, on every
+    /// statement that returns one. A `::text` here would read differently in a
+    /// session whose `DateStyle` is not this one's.
+    #[test]
+    fn every_timestamp_is_rendered_by_a_pattern_that_no_setting_moves() {
+        for sql in [
+            select_latest(),
+            select_history(),
+            select_timeline(),
+            select_lock(),
+        ] {
+            assert!(
+                sql.contains("to_char(") && sql.contains("YYYY-MM-DD\"T\"HH24:MI:SS.MS"),
+                "{sql}"
+            );
+            assert!(!sql.contains("::text"), "{sql}");
+            // `TM` is what makes `to_char` read `lc_time`; nothing here may.
+            assert!(!sql.contains("TM"), "{sql}");
+        }
+    }
+}
