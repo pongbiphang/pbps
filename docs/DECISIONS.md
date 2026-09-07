@@ -5096,3 +5096,56 @@ SPEC is in sync with all of these.
     create has none. So the path stays as it is and the claim is corrected
     instead — in this file, in `emit.rs`'s module docs and in ADR-0013 §3,
     which all said "first" without saying first *among what*.
+
+277. **`pg_catalog` is refused as a write-path extra, not dropped from the
+    path.** 276 records why the emitter leaves it out; a caller may still put
+    it in through `Postgres::with_write_path_extras`, and then the path names
+    it and the engine stops searching it first. The same measurement runs the
+    other way:
+
+    ```text
+    SET search_path = "shad";                CHECK (lower(c) = c) -> pg_catalog.lower
+    SET search_path = "shad", "pg_catalog";  CHECK (lower(c) = c) -> shad.lower
+    ```
+
+    Both statements are accepted, neither says anything, and the constraint
+    stored by the second calls a different function from the one the
+    declaration reads as.
+
+    Refused rather than silently dropped, for the reason an unquotable extra
+    is refused where it is used: a path one entry short — or one entry
+    different — binds a name somewhere the caller did not ask for and says
+    nothing. Refusing is also the only answer that stays true if the
+    entry ever *does* mean what it says: dropping it would be right today and
+    wrong the day the reason changed. It joins `$user` (275) as the second
+    entry a path cannot hold, and for the mirror reason: `$user` is a name the
+    engine reads as something else, `pg_catalog` is a name the engine reads
+    differently for having been written at all.
+
+278. **A comment is whitespace to the bare-literal guard, and the two comment
+    forms are not the same whitespace.** The unresolved-default rule (266,
+    ADR-0013 §3) asks whether a declared default is one bare literal. The
+    scanner read the gap between two pieces of a continued string constant
+    with `trim_start`, which is Rust's idea of whitespace and not this
+    engine's. **Measured** on 18.6:
+
+    ```text
+    '01/02/' -- c ⏎ '2026'        -> 01/02/2026     one constant
+    '01/02/' -- /* x ⏎ '2026'     -> 01/02/2026     the block opener is comment text
+    '01/02/2026' -- c             -> 01/02/2026     trailing, after the last piece
+    '01/02/2026' /* c */          -> 01/02/2026     trailing, either form
+    '01/02/' /* c */ ⏎ '2026'     -> syntax error   a block comment ends the
+    '01/02/' ⏎ /* c */ '2026'     -> syntax error   possibility of a continuation
+    '01/02/' /* /* x */ */ ⏎ '2026' -> syntax error and they nest
+    ```
+
+    So a `--` comment is part of the gap *and* supplies the newline a
+    continuation needs, while a `/* … */` comment is whitespace everywhere
+    except in that gap. The guard now scans both, at either end of the
+    expression as well as between pieces, because a declaration that hides an
+    ambiguous literal behind a comment is the same hazard as one that does
+    not — and this guard's silence means *accepted*, so every form it cannot
+    read is a form that gets through.
+
+    An unterminated `/*` is left alone: the engine refuses that by name
+    (`unterminated /* comment`), and 266 draws the line there.

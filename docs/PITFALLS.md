@@ -672,6 +672,32 @@ character-class test for another system's grammar, search for it first — a rul
 subtle enough to need a DECISIONS entry is subtle enough that your second
 attempt will differ from your first.
 
+## The host language's whitespace, standing in for the engine's
+
+The same shape as the section above, one guard along. The unresolved-default
+guard asks whether a declared default is one bare literal, and a string
+constant may be *continued*: two quoted pieces separated by whitespace with a
+newline in it are one constant. The scanner read that gap with `trim_start`.
+
+`trim_start` is Rust's whitespace. The engine's `{whitespace}` counts a `--`
+comment among it — measured, `'01/02/' -- c ⏎ '2026'` is the single constant
+`01/02/2026` — so a default written that way read as *not* a bare literal and
+went through the guard unrefused, to store February in one environment and
+January in another. And the sibling form is not the sibling rule: a
+`/* … */` comment is whitespace everywhere in this engine *except* in that
+gap, where it ends the continuation outright (DECISIONS 278).
+
+Two lessons, and the second is the one that cost the round:
+
+- A lexical class named the same in two languages is not the same class.
+  `whitespace`, `identifier`, `digit` and `newline` all differ between Rust and
+  PostgreSQL, and `trim_start` is as much a respelling from memory as
+  `is_alphanumeric` was.
+- **Ask which way the guard fails silent.** This one refuses when it says
+  *yes*, so every form it cannot read is a form that gets through. A guard with
+  that polarity has to be told what it does not understand; leaving a
+  construct unhandled is not neutral there, it is a permit.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

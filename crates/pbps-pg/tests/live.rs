@@ -2515,6 +2515,14 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
         explicit, "the project function",
         "and only naming it explicitly would change that"
     );
+    // Which is why an extra of that name is refused rather than quietly
+    // dropped: the caller asking for it is asking for the second path.
+    let named = Postgres::with_write_path_extras(vec!["pg_catalog".into()]);
+    let first = &cs.changes[0];
+    let refusal = named
+        .emit(&first.change, first.strategy)
+        .expect_err("a path that lists pg_catalog moves it behind the object's own schema");
+    assert!(refusal.to_string().contains("pg_catalog"), "{refusal}");
 }
 
 /// `standard_conforming_strings` is pinned by the transaction framing, and the
@@ -2746,8 +2754,13 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
     }
     // Every spelling of one literal, because a rule about `'…'` alone would
     // have let the other three through with exactly this behaviour.
+    // The last one is the same constant written in two pieces with a comment
+    // between them: measured, this engine reads a `--` comment as part of the
+    // whitespace a string constant may be continued across, so it is one
+    // ambiguous literal and not an expression.
     let columns = "d date DEFAULT '01/02/2026', e date DEFAULT E'01/02/2026', \
-                   f date DEFAULT $$01/02/2026$$, g date DEFAULT U&'01/02/2026'";
+                   f date DEFAULT $$01/02/2026$$, g date DEFAULT U&'01/02/2026', \
+                   h date DEFAULT '01/02/' -- split here\n'2026'";
     conn.execute(&format!(
         "SET DateStyle = 'ISO, MDY'; CREATE TABLE {s}.mdy ({columns})"
     ))
@@ -2816,6 +2829,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         r"E'01/02/2026'",
         "$$01/02/2026$$",
         "U&'01/02/2026'",
+        "'01/02/' -- split here\n'2026'",
     ] {
         let refusal = Postgres::new()
             .emit(&table(spelling), Strategy::default())

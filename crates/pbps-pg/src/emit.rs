@@ -173,7 +173,18 @@ fn without_grouping(expression: &str) -> &str {
 }
 
 fn is_a_bare_literal(expression: &str) -> bool {
-    let e = without_grouping(expression);
+    // A comment is whitespace to this engine, at either end of an expression
+    // as much as between two pieces of a continued one, and either can wrap a
+    // grouping that wraps another comment. Both strippers hand back a
+    // subslice, so the length settling is the text settling.
+    let mut e = expression;
+    loop {
+        let next = without_grouping(after_the_gap(e).0);
+        if next.len() == e.len() {
+            break;
+        }
+        e = next;
+    }
     if e.starts_with('$') {
         return is_one_dollar_quoted_literal(e);
     }
@@ -211,8 +222,15 @@ fn is_a_bare_literal(expression: &str) -> bool {
     // newline — on one line the same text is a syntax error, which is why the
     // newline is checked rather than assumed.
     while !tail.is_empty() {
-        let after_gap = tail.trim_start();
-        if !tail[..tail.len() - after_gap.len()].contains('\n') {
+        let (after_gap, continues) = after_the_gap(tail);
+        // Nothing but whitespace and comments left: the expression is that one
+        // literal, trailing comment and all — measured, `'01/02/2026' -- c` is
+        // the same constant as `'01/02/2026'`, and a guard that read the
+        // comment as structure would let the hazard through behind one.
+        if after_gap.is_empty() {
+            return true;
+        }
+        if !continues {
             return false;
         }
         let Some(next) = after_gap.strip_prefix('\'') else {
@@ -224,6 +242,91 @@ fn is_a_bare_literal(expression: &str) -> bool {
         tail = &next[end..];
     }
     true
+}
+
+/// Past the whitespace and comments that follow one piece of a string
+/// constant, and whether what they separate can still be a *continuation* of
+/// it.
+///
+/// **Measured**, and neither half is the obvious one:
+///
+/// ```text
+/// '01/02/' -- c ⏎ '2026'     -> 01/02/2026     a line comment is part of the
+/// '01/02/' -- /* x ⏎ '2026'  -> 01/02/2026     gap, and the newline that ends
+///                                              it is the newline a
+///                                              continuation needs
+/// '01/02/' /* c */ ⏎ '2026'  -> syntax error   a block comment ends the
+/// '01/02/' ⏎ /* c */ '2026'  -> syntax error   possibility of a continuation,
+/// '01/02/' /* -- x ⏎ */ '2026' -> syntax error wherever the newline stands
+/// '01/02/2026' -- c          -> 01/02/2026     after the last piece either
+/// '01/02/2026' /* c */       -> 01/02/2026     comment is only trailing text
+/// ```
+///
+/// So the two comment forms are not interchangeable here, which is why they
+/// are scanned rather than skipped together: the engine's `{whitespace}` rule
+/// counts a `--` comment among the things a continuation may be written
+/// across, and does not count a `/* … */` one (DECISIONS 278).
+fn after_the_gap(tail: &str) -> (&str, bool) {
+    let mut rest = tail;
+    let mut newline = false;
+    let mut blocked = false;
+    loop {
+        let trimmed = rest.trim_start();
+        newline |= rest[..rest.len() - trimmed.len()].contains('\n');
+        rest = trimmed;
+        if let Some(after) = rest.strip_prefix("--") {
+            let Some(at) = after.find('\n') else {
+                // Runs to the end of the text: nothing can follow it, so this
+                // is the whole gap and no continuation is coming.
+                return ("", newline);
+            };
+            newline = true;
+            rest = &after[at + 1..];
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            let Some(next) = end_of_block_comment(after) else {
+                // Nothing closes it. The engine refuses that by name
+                // (`unterminated /* comment`), and a declaration it refuses by
+                // name is left to it (DECISIONS 266) — so this is not a gap
+                // and the expression is not a literal this guard knows.
+                return (rest, false);
+            };
+            blocked = true;
+            rest = next;
+        } else {
+            return (rest, newline && !blocked);
+        }
+    }
+}
+
+/// The text after the `*/` closing the block comment whose `/*` was just
+/// consumed, or `None` when nothing closes it.
+///
+/// These nest — measured, `/* /* x */ */` is one comment — so a `/*` inside
+/// one opens another, and a `--` inside one is comment text rather than a
+/// comment.
+fn end_of_block_comment(after: &str) -> Option<&str> {
+    let bytes = after.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(&after[i..]);
+                }
+            }
+            // Every other byte, multi-byte continuation bytes included: none
+            // of them can begin either delimiter, both of which are ASCII.
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The byte index just past the closing quote of the literal that starts at
@@ -273,12 +376,15 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
         return false;
     }
     let delim = format!("${tag}$");
-    let Some(body) = e[delim.len()..].strip_suffix(&delim) else {
+    let rest = &e[delim.len()..];
+    let Some(close) = rest.find(&delim) else {
         return false;
     };
-    // Nothing inside can close it, which is the whole point of the form — but
-    // a *second* pair of the same tag would mean two literals side by side.
-    !body.contains(&delim)
+    // Whitespace and comments may follow it and nothing else: a *second* pair
+    // of the same tag would be two literals side by side, and — measured —
+    // this form does not continue across a newline the way a quoted one does
+    // (`$$a$$ ⏎ $$b$$` is a syntax error).
+    after_the_gap(&rest[close + delim.len()..]).0.is_empty()
 }
 
 /// Refuses a default whose value would be decided by whoever applies it.
@@ -572,9 +678,40 @@ fn literal(s: &str) -> String {
 /// refuse a schema name this engine treats as ordinary.
 pub(crate) const NOT_A_SCHEMA_A_PATH_CAN_NAME: &str = "$user";
 
+/// The schema a path changes the meaning of by *listing* it.
+///
+/// `pg_catalog` is searched first while a path leaves it out, and sits where
+/// it is written when a path names it. Measured, in a schema `shad` holding a
+/// function `lower(text)` of its own:
+///
+/// ```text
+/// SET search_path = "shad";                  CHECK (lower(c) = c) -> pg_catalog.lower
+/// SET search_path = "shad", "pg_catalog";    CHECK (lower(c) = c) -> shad.lower
+/// ```
+///
+/// Both statements are accepted and neither says anything; the constraint the
+/// second one stores calls a different function from the one the declaration
+/// reads as. So an extra of this name is refused rather than dropped from the
+/// path: an emitted definition whose meaning depends on where a caller put
+/// `pg_catalog` is exactly what the write path exists to prevent
+/// (ADR-0013 §3, DECISIONS 276 and 277).
+pub(crate) const NOT_A_SCHEMA_A_PATH_MAY_LIST: &str = "pg_catalog";
+
 fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectError> {
     let mut parts = Vec::new();
     for part in std::iter::once(schema).chain(pg.write_path_extras().iter().map(String::as_str)) {
+        if part == NOT_A_SCHEMA_A_PATH_MAY_LIST {
+            return Err(invalid(format!(
+                "`{part}` cannot be part of a write `search_path`: this engine searches it first \
+                 only while a path leaves it out, and a path that names it puts it where it is \
+                 written. Measured, a schema holding a `lower(text)` of its own binds \
+                 `CHECK (lower(c) = c)` to the built-in under `SET search_path = \"shad\"` and to \
+                 its own function under `SET search_path = \"shad\", \"pg_catalog\"`, with no \
+                 error either way — so listing it would let a project object shadow a built-in \
+                 in a check, a filter or a default (ADR-0013 §3). Leave it out; it is already \
+                 first."
+            )));
+        }
         if part == NOT_A_SCHEMA_A_PATH_CAN_NAME {
             return Err(invalid(format!(
                 "`{part}` cannot be part of a write `search_path`: this engine reads that entry \
@@ -1174,6 +1311,50 @@ mod tests {
         }
     }
 
+    /// Listing `pg_catalog` is not the same statement as leaving it out, so an
+    /// extra of that name is refused rather than dropped: dropping it would
+    /// leave the caller believing a path they never got.
+    #[test]
+    fn the_one_schema_a_path_must_leave_out_is_refused_wherever_it_is_written() {
+        let drop_it = |pg: &Postgres, schema: &str| {
+            pg.emit(
+                &Change::DropTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: name(schema, "t"),
+                },
+                Strategy::default(),
+            )
+        };
+        for (pg, schema) in [
+            (Postgres::new(), "pg_catalog"),
+            (
+                Postgres::with_write_path_extras(vec!["pg_catalog".into()]),
+                "app",
+            ),
+            (
+                Postgres::with_write_path_extras(vec!["shared".into(), "pg_catalog".into()]),
+                "app",
+            ),
+        ] {
+            let refusal = drop_it(&pg, schema).expect_err("the path would not mean this");
+            assert!(refusal.to_string().contains("pg_catalog"), "{refusal}");
+        }
+        // A name that merely contains it is an ordinary schema, and a path
+        // that leaves it out is the ordinary case this refusal protects.
+        for (pg, schema) in [
+            (Postgres::new(), "pg_catalogue"),
+            (
+                Postgres::with_write_path_extras(vec!["shared".into()]),
+                "app",
+            ),
+        ] {
+            assert!(
+                drop_it(&pg, schema).is_ok(),
+                "`{schema}` is an ordinary path"
+            );
+        }
+    }
+
     /// An extra that cannot be an identifier is refused where it is used, not
     /// silently dropped from the path: a path one schema short binds a name
     /// somewhere else and says nothing.
@@ -1318,6 +1499,19 @@ mod tests {
             "  ( ( '01/02/2026' ) )  ",
             "($$01/02/2026$$)",
             "U&'2026-01-02'",
+            // A comment is whitespace, and these are the forms in which it is
+            // — measured, each of these is the same one constant to the engine
+            // as the same text without the comment.
+            "'01/02/' -- split here\n'2026'",
+            "'01/02/' --\n'2026'",
+            // A `/*` inside a line comment is comment text: the line comment
+            // still ends at the newline and the continuation still stands.
+            "'01/02/' -- /* x\n'2026'",
+            "'2026-01-02' -- trailing",
+            "'2026-01-02' /* trailing */",
+            "/* leading */ '2026-01-02'",
+            "(/* inside the grouping */ '2026-01-02')",
+            "$$2026-01-02$$ -- trailing",
         ] {
             assert!(is_a_bare_literal(yes), "{yes}");
         }
@@ -1362,6 +1556,28 @@ mod tests {
             "('(') || (b)",
             // The recorded gap: two literals with a keyword between them.
             "U&'a' UESCAPE '!'",
+            // A block comment is whitespace too, but not the kind a
+            // continuation may be written across: measured, each of these is a
+            // syntax error whether the newline stands before the comment or
+            // after it, so neither is a declaration to refuse.
+            "'01/02/' /* c */\n'2026'",
+            "'01/02/'\n/* c */ '2026'",
+            // Block comments nest, so this is one comment in the gap and not
+            // two — and the `--` inside one is comment text, which leaves the
+            // gap a block comment either way.
+            "'01/02/' /* /* x */ */\n'2026'",
+            "'01/02/' /* -- x\n*/ '2026'",
+            // Nothing closes the comment. The engine refuses that by name, so
+            // this guard leaves it alone rather than refuse it as something
+            // else (DECISIONS 266).
+            "'2026-01-02' /* unterminated",
+            // A comment gives a continuation nothing a newline would not
+            // have given it: the two forms that do not continue across a
+            // newline do not continue across a comment either, and an
+            // operator between two literals is still an operator.
+            "$$01/02/$$ -- c\n$$2026$$",
+            "'01/02/' -- c\nE'2026'",
+            "'a' -- c\n|| 'b'",
         ] {
             assert!(!is_a_bare_literal(no), "{no}");
         }
