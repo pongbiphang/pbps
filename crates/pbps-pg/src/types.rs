@@ -1017,6 +1017,22 @@ pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
     spelled.parse().unwrap_or_else(|_| arg.clone())
 }
 
+/// Whether this catalogue knows the spelling — with or without a modifier.
+///
+/// Not the same question as [`routine_arg`], which is total and hands an
+/// unknown spelling back unchanged: this one says *whether* it did that. The
+/// caller is the emitter's parameter-list gate, which reads a parameter as
+/// either `type` or `name type` and has to know when the first reading is
+/// already the whole answer. `double precision` is: splitting it again would
+/// read `double` as a name and `precision` as a type, and measured, with a
+/// user type `mq.precision` in the database, `CREATE FUNCTION mq.b(double
+/// precision)` still creates `mq.b(double precision)`. The engine does not
+/// offer that reading, so neither may the gate.
+pub(crate) fn catalogued(arg: &RoutineArg) -> bool {
+    let (element, _) = peel_array(arg.as_str());
+    folded(element).is_some() || folded(&without_modifier(element)).is_some()
+}
+
 /// `double precision[][]` -> `double precision`, and "it is an array".
 ///
 /// One `[]` comes back however many went in, and a dimension is not part of

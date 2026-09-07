@@ -6098,6 +6098,23 @@ SPEC is in sync with all of these.
     connected assertion that decides the rest is the split; a gate that guessed
     would be neither.
 
+    **Amended: the second reading is not offered for a spelling the catalogue
+    knows.** Trying both readings unconditionally introduced an ambiguity of
+    its own. `(double precision)` splits into a parameter named `double` of
+    type `precision`, and with a user type of that name the qualification rule
+    above then accepts the body under the key `f(app.precision)` — while the
+    engine creates `f(double precision)`. Measured, with `mq.precision` in the
+    database:
+
+    ```text
+    CREATE FUNCTION mq.b(double precision) …   ->  mq.b(double precision)
+    ```
+
+    The engine does not offer that reading, so neither may the gate: where the
+    whole remainder is a spelling this catalogue knows, that is the type and
+    there is no second reading. A gate is allowed to be undecided; it is not
+    allowed to invent a reading the grammar does not have.
+
 291. **A module the deparse could not find is the catalog moving, not a reader
     out of step with its query.** The pull reads the catalog in one
     `REPEATABLE READ READ ONLY` transaction so that it cannot report half of a
@@ -6229,3 +6246,30 @@ SPEC is in sync with all of these.
     resolves nothing, and the object is planned as absent. The emitters' own
     `unquoted` has always been `to_ascii_lowercase`; this is the same rule in
     the model, where the two were quietly disagreeing.
+
+296. **`pg_depend` holds a row per column a dependent uses, not a row per
+    dependent.** Measured, a routine reading three columns of a view has three
+    edges to it:
+
+    ```text
+    dependent | refobjsubid | edges
+    mq.uses() |     1       |   3
+    mq.uses() |     2       |   3
+    mq.uses() |     3       |   3
+    ```
+
+    Where a query returns one row per edge and the reader deduplicates by name,
+    that is harmless. Where a query *joins* on the edge, it is not: the
+    argument query cross-joined `unnest(proargtypes)` once per edge and rebuilt
+    a one-argument routine as `f(integer,integer,integer)` — an identity no
+    declaration holds, so an otherwise manageable rebuild was refused and the
+    walk could not resolve the object it had just named.
+
+    So the edge is deduplicated before the join, and the dependents query is
+    `DISTINCT` over its whole union as well. The second was already harmless —
+    the caller deduplicates by description — and it is done anyway: a reader
+    that has to remember to deduplicate is one edit away from not doing it.
+
+    **Duplication that repeats a row is a tidiness problem; duplication that
+    feeds a join is a wrong value.** The two look the same in the query and
+    nothing distinguishes them but knowing what the rows are for.

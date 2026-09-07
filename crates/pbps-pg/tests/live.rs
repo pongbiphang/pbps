@@ -6036,6 +6036,63 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         .expect_err("the level below has to go first");
     assert_eq!(sqlstate(&out_of_order), "2BP01", "{out_of_order:?}");
 
+    // One dependent, three edges. Measured, `pg_depend` holds a row per
+    // *column* a dependent uses — a routine reading three columns of a view
+    // has three edges to it — so a query that unnests `proargtypes` once per
+    // edge rebuilds a one-argument routine as `f(integer,integer,integer)`.
+    // That identity no declaration holds, so an otherwise manageable rebuild
+    // is refused and the walk cannot resolve the object it has just named.
+    for sql in [
+        format!("CREATE VIEW {s}.wide AS SELECT id, n, d FROM {s}.t"),
+        format!(
+            "CREATE FUNCTION {s}.reads(a int) RETURNS int LANGUAGE sql \
+             BEGIN ATOMIC SELECT a + x.id + x.n + x.d FROM {s}.wide x; END"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT pg_catalog.count(*)::int FROM pg_catalog.pg_depend d
+                  WHERE d.refclassid = 'pg_catalog.pg_class'::regclass
+                    AND d.refobjid = '{s}.wide'::regclass
+                    AND d.classid = 'pg_catalog.pg_proc'::regclass
+                    AND d.deptype <> 'i'"
+            )
+        )
+        .await,
+        3,
+        "the fixture has to have more than one edge, or it is testing nothing"
+    );
+    let wide: pbps_model::ModuleId = format!("{s}.wide").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let many_edges = pbps_pg::modules::dependents(&mut conn, &wide, pbps_model::ModuleKind::View)
+        .await
+        .expect("read the dependents");
+    rollback(&mut conn).await;
+    assert_eq!(
+        many_edges
+            .iter()
+            .map(|d| d.holds.clone())
+            .collect::<Vec<_>>(),
+        vec![pbps_pg::modules::Holds::Module(
+            format!("{s}.reads(integer)").parse().expect("a module id")
+        )],
+        "one routine, one identity, however many columns of the view it reads"
+    );
+    for sql in [
+        format!("DROP FUNCTION {s}.reads(int)"),
+        format!("DROP VIEW {s}.wide"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
     // A depth is not an order. `d2` and `d3` are both direct dependents of
     // `d1`, and `d3` is a dependent of `d2` as well — so one query returns
     // them together, and a walk that only recorded how deep each was emitted
@@ -6839,6 +6896,47 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             "`{definition}` under the key `{key}` created another object"
         );
     }
+
+    // A user type whose name is the second word of a built-in one. Split
+    // again, `(double precision)` reads as a parameter named `double` of type
+    // `precision`, and the qualification rule would then let `{s}.precision`
+    // through — while the engine creates `f(double precision)`. Measured here
+    // rather than argued.
+    conn.execute(&format!("CREATE DOMAIN {s}.precision AS int"))
+        .await
+        .expect("a user type named like the second word of a built-in one");
+    let ambiguous: pbps_model::ModuleId = format!("{s}.split({s}.precision)")
+        .parse()
+        .expect("a module id");
+    assert!(
+        !pg.validate_module(
+            &ambiguous,
+            &module(
+                pbps_model::ModuleKind::Function,
+                "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+        )
+        .is_empty(),
+        "a body the engine reads as `double precision` must not pass under a key that says \
+         `{s}.precision`"
+    );
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.split(double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
+    ))
+    .await
+    .expect("and the engine takes it, under the other identity");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc p
+                  WHERE p.pronamespace = '{s}'::regnamespace AND p.proname = 'split'"
+            )
+        )
+        .await,
+        format!("{s}.split(double precision)"),
+        "the engine does not offer the `name type` reading for a built-in it knows"
+    );
 
     // And the other direction, because a gate that never refuses is not one.
     // The engine takes this statement happily; what it creates is `g(text)`,

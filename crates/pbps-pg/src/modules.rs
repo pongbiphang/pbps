@@ -1270,17 +1270,38 @@ async fn direct_dependents(
     Ok(out)
 }
 
+/// One row per identity argument of each dependent routine.
+///
+/// **`DISTINCT` on the edge, before the arguments are unnested.** `pg_depend`
+/// holds one row per *column* a dependent uses, not one per dependent —
+/// measured, a routine reading three columns of a view has three edges to it:
+///
+/// ```text
+/// dependent | refobjsubid | edges
+/// mq.uses() |     1       |   3
+/// mq.uses() |     2       |   3
+/// mq.uses() |     3       |   3
+/// ```
+///
+/// Cross-joined once per edge, a one-argument routine came back as
+/// `f(integer,integer,integer)` — an identity no declaration holds, so an
+/// otherwise manageable rebuild was refused and the walk could not resolve the
+/// object it had just named. The rows that carry a name rather than a list are
+/// deduplicated where they are read; this one has to be deduplicated before
+/// the join, because duplication here changes a value instead of repeating
+/// one.
 fn dependent_routine_args_query(refclass: &str) -> String {
     format!(
-        "SELECT d.objid::int8 AS oid, u.pos::int8 AS pos,
+        "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
                 pg_catalog.format_type(u.ty, NULL) AS ty
-           FROM pg_catalog.pg_depend d
-           JOIN pg_catalog.pg_proc p ON p.oid = d.objid
+           FROM (SELECT DISTINCT d.objid
+                   FROM pg_catalog.pg_depend d
+                  WHERE d.refclassid = '{refclass}'::regclass
+                    AND d.refobjid = ($1::int8)::oid
+                    AND d.classid = 'pg_catalog.pg_proc'::regclass
+                    AND d.deptype <> 'i') e
+           JOIN pg_catalog.pg_proc p ON p.oid = e.objid
      CROSS JOIN LATERAL pg_catalog.unnest(p.proargtypes) WITH ORDINALITY AS u(ty, pos)
-          WHERE d.refclassid = '{refclass}'::regclass
-            AND d.refobjid = ($1::int8)::oid
-            AND d.classid = 'pg_catalog.pg_proc'::regclass
-            AND d.deptype <> 'i'
           ORDER BY 1, 2"
     )
 }
@@ -1319,8 +1340,14 @@ fn dependents_query(refclass: &str) -> String {
         .map(|c| format!("'{c}'::regclass"))
         .collect::<Vec<_>>()
         .join(", ");
+    // `DISTINCT` over the whole union, for the same reason: `pg_depend` holds
+    // one row per column a dependent uses, so a view over three columns of
+    // this one arrives three times. Deduplicated by `described` afterwards it
+    // did no harm, but a reader that had to remember to do that is one edit
+    // away from not doing it.
     format!(
-        "SELECT 'view' AS what, {described}, n2.nspname AS dep_schema, c2.relname AS dep_name,
+        "SELECT DISTINCT * FROM (
+         SELECT 'view' AS what, {described}, n2.nspname AS dep_schema, c2.relname AS dep_name,
                 '' AS part, 0::int8 AS dep_oid,
                 CASE WHEN c2.relkind = 'm'
                      THEN 'a materialized view, which this model does not hold'
@@ -1392,6 +1419,7 @@ fn dependents_query(refclass: &str) -> String {
                   || '`, which this reader has no rule for'
            FROM pg_catalog.pg_depend d
           WHERE {edge} AND d.classid NOT IN ({known})
+         ) every_edge
           ORDER BY 2"
     )
 }

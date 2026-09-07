@@ -1383,10 +1383,21 @@ fn before_the_default(text: &str) -> &str {
 /// that cannot read a spelling has not learned it is wrong.
 fn certainly_not(parameter: &str, identity: &RoutineArg) -> bool {
     let rest = without_trailing_trivia(before_the_default(after_the_mode(parameter).1));
-    let readings = [
-        Some(rest),
-        one_ident_len(rest).map(|n| after_the_gap(&rest[n..]).0),
-    ];
+    let whole = rest.parse::<RoutineArg>().ok();
+    // A spelling this catalogue knows is the whole type, and the second
+    // reading is not offered for it. Otherwise `(double precision)` is also
+    // read as a parameter named `double` of type `precision` — and with a user
+    // type of that name the gate accepts a body that creates
+    // `f(double precision)` under the key `f(app.precision)`. Measured, the
+    // engine does not offer that reading either: with `mq.precision` in the
+    // database, `CREATE FUNCTION mq.b(double precision)` still creates
+    // `mq.b(double precision)`.
+    let split = if whole.as_ref().is_some_and(types::catalogued) {
+        None
+    } else {
+        one_ident_len(rest).map(|n| after_the_gap(&rest[n..]).0)
+    };
+    let readings = [Some(rest), split];
     !readings.into_iter().flatten().any(|reading| {
         reading
             .parse::<RoutineArg>()
@@ -2096,6 +2107,15 @@ mod tests {
             (
                 "app.f(md.my_type)",
                 "(a other.my_type) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A spelling the catalogue knows is the whole type. Split again it
+            // reads as a parameter named `double` of type `precision`, and
+            // with a user type of that name the qualification rule would let
+            // `app.precision` through — while the engine creates
+            // `f(double precision)`. Measured: it does not offer that reading.
+            (
+                "app.f(app.precision)",
+                "(double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
             ),
             // The default is cut at the `=` outside the literal, and what is
             // left is still the wrong type.
