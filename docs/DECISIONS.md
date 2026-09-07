@@ -4520,6 +4520,17 @@ SPEC is in sync with all of these.
     put it there, and narrowing a recorded list because today's probe did not
     reach one of its rows is how a list stops being the rule it came from.
 
+    **The question is asked in `validate_table`, and the emitter's copy is the
+    later of the two.** `Change::AlterColumnDefault` carries a column reference
+    and two expressions and *no type*, so on the one path that changes a default
+    on a column already there, `emit` cannot tell a bare `'01/02/2026'` on a
+    `date` from the same text on a `text` — and only one of those is a value
+    the applying session decides. Putting the rule in the emitter alone would
+    have covered `CreateTable` and `AddColumn` and left the third open, which is
+    the sweep this project has failed before. `validate_table` sees the
+    declaration with its types, and every command that hands statements to a
+    database runs it (DECISIONS 141), so the change is never planned at all.
+
 262. **`online` builds an index concurrently only when it has no filter.**
     Measured, `CREATE INDEX CONCURRENTLY` cannot share a batch with anything at
     all — `cannot run inside a transaction block` — so it cannot carry the write

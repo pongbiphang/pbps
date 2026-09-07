@@ -31,8 +31,8 @@
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Change, Column, ForeignKey, Index, PrimaryKey, ReferentialAction, Strategy, Table, TableName,
-    UniqueConstraint,
+    Change, Column, ColumnType, ForeignKey, Index, PrimaryKey, ReferentialAction, Strategy, Table,
+    TableName, UniqueConstraint,
 };
 
 use crate::types::DIALECT;
@@ -127,16 +127,22 @@ fn is_a_bare_literal(expression: &str) -> bool {
 /// A default that already carries a cast is what the engine itself reads back
 /// (`pg_get_expr` welds one on, ADR-0013 §4), so a declaration pulled from a
 /// live database is never refused here.
-fn refuse_an_unresolved_default(
+/// Its caller in `validate` is not a second guard, it is the *earlier* one, and
+/// it is where the whole rule is actually enforced: [`Change::AlterColumnDefault`]
+/// carries a `ColumnRef` and two expressions and **no type**, so the emitter
+/// cannot ask this question on the one path that changes a default on a column
+/// that already exists. `validate_table` sees the declaration, types and all,
+/// and every command that hands statements to a database runs it
+/// (DECISIONS 141).
+pub(crate) fn refuse_an_unresolved_default(
     column: &str,
-    declared: &Column,
+    ty: &ColumnType,
     default: &str,
-) -> Result<(), DialectError> {
-    let ty = types::normalize(&declared.ty)?;
+) -> Option<DialectError> {
     if !SETTING_SENSITIVE.contains(&ty.base.as_str()) || !is_a_bare_literal(default) {
-        return Ok(());
+        return None;
     }
-    Err(invalid(format!(
+    Some(invalid(format!(
         "column `{column}` is `{ty}` and its default is the bare literal {default}. What that \
          text means is decided by the session that runs the `CREATE`: measured, `'01/02/2026'` on \
          a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
@@ -168,7 +174,9 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
     s.push(' ');
     s.push_str(null_clause(column.nullable));
     if let Some(expr) = &column.default {
-        refuse_an_unresolved_default(name, column, expr)?;
+        if let Some(e) = refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr) {
+            return Err(e);
+        }
         s.push_str(&format!(" DEFAULT {expr}"));
     }
     Ok(s)
