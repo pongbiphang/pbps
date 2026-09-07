@@ -5013,3 +5013,35 @@ SPEC is in sync with all of these.
 
     SPEC §8.1 defines the two, and a step that adds a third adds it to `OURS`,
     where the filter and the validation both read it.
+
+275. **`$user` is refused as a schema name and as a write-path extra.**
+    ADR-0013 §3 scopes every write statement with `SET search_path = <the
+    object's own schema>, <the project's extras>`, and one name cannot travel
+    in that list. **Measured on 18.6**, with a schema literally called `$user`
+    holding a function, under role `postgres` with a `postgres` schema beside
+    it:
+
+    ```text
+    SET search_path = "$user";
+    SELECT current_setting('search_path'), which();
+        -> "$user" | the role schema
+    ```
+
+    The quotes survive into the setting and change nothing: the engine
+    substitutes that entry for the current role's own schema. So a table
+    declared in a schema of that name would be created — its statements name it
+    in full — and then every unqualified name inside a check, a filter or a
+    default would resolve through whatever the deploying role owns, binding a
+    different object or none. That is the property
+    `an_unqualified_name_in_a_declared_expression_binds_through_the_write_path`
+    exists to hold, silently inverted.
+
+    Refused rather than worked around, because there is no spelling that makes
+    the entry literal — quoting is the obvious attempt and it is the one
+    measured above. Refused from **both** ends, since the path has two sources:
+    the table's own schema (`validate_table`) and the configured extras
+    (`emit::write_path`), and an extra is not seen by any table's validation.
+
+    The comparison is exact and case-sensitive because the engine's is: `$USER`
+    and `$users` are ordinary schema names, and refusing them would refuse a
+    declaration that works.

@@ -295,7 +295,10 @@ Two rules came out of the emitter's own fixpoint rather than from the issue.
 A table the pull would never read is refused offline — a schema of
 `pg_catalog`, `information_schema` or any name beginning with `pg_`, or a table
 called `__pbps_state` or `__pbps_lock`, which the reader hides in every schema
-(DECISIONS 274). The pull never reads one — and
+(DECISIONS 274) — and a schema named `$user`, which every `search_path` reads
+as the deploying role's own schema however it is quoted, so the table would be
+created and its unqualified names would bind somewhere else (DECISIONS 275).
+The pull never reads the first group — and
 `pg_temp` is worse than invisible: measured, it is the parser's alias for the
 session's temporary schema, so the declaration yields a `pg_temp_58.t` that
 disappears with the connection (DECISIONS 273). And a nullable primary key

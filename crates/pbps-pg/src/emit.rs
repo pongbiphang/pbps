@@ -509,10 +509,43 @@ fn literal(s: &str) -> String {
 }
 
 /// The write `search_path` for an object in `schema`.
+/// The one schema name a `search_path` cannot carry, quoted or not.
+///
+/// **Measured on 18.6**, with a schema literally named `$user` and a function
+/// in it, under role `postgres` with a `postgres` schema beside it:
+///
+/// ```text
+/// SET search_path = "$user";
+/// SELECT current_setting('search_path'), which();
+///   -> "$user" | the role schema
+/// ```
+///
+/// The quotes survive into the setting and change nothing: the engine
+/// substitutes the entry for the current role's own schema. So a path built
+/// for a table in a schema of that name silently scopes the statement
+/// somewhere else, and an unqualified name in a check, a filter or a default
+/// binds to whatever the deployment role happens to own — a different object,
+/// or none.
+///
+/// The comparison is exact and case-sensitive because the engine's is
+/// (`namespace.c` compares against `"$user"`): refusing `$USER` as well would
+/// refuse a schema name this engine treats as ordinary.
+pub(crate) const NOT_A_SCHEMA_A_PATH_CAN_NAME: &str = "$user";
+
 fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectError> {
-    let mut parts = vec![quote(schema)?];
-    for extra in pg.write_path_extras() {
-        parts.push(quote(extra)?);
+    let mut parts = Vec::new();
+    for part in std::iter::once(schema).chain(pg.write_path_extras().iter().map(String::as_str)) {
+        if part == NOT_A_SCHEMA_A_PATH_CAN_NAME {
+            return Err(invalid(format!(
+                "`{part}` cannot be part of a write `search_path`: this engine reads that entry \
+                 as the current role's own schema rather than as a schema of that name, and \
+                 quoting it does not help — measured, `SET search_path = \"$user\"` binds an \
+                 unqualified name through the deployment role's schema even where a schema \
+                 called `$user` exists. A statement scoped that way would resolve a name in a \
+                 check, a filter or a default against whatever that role owns (ADR-0013 §3)."
+            )));
+        }
+        parts.push(quote(part)?);
     }
     Ok(parts.join(", "))
 }
@@ -1059,6 +1092,44 @@ mod tests {
             sql,
             vec!["SET search_path = \"app\";\nDROP INDEX \"app\".\"ix\";\nRESET search_path;"]
         );
+    }
+
+    /// `$user` is refused wherever it would enter the path — as the table's own
+    /// schema and as a configured extra — because the engine substitutes it
+    /// rather than reading it as a name.
+    #[test]
+    fn the_one_schema_a_path_cannot_name_is_refused_from_either_end() {
+        let drop_it = |pg: &Postgres, schema: &str| {
+            pg.emit(
+                &Change::DropTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: name(schema, "t"),
+                },
+                Strategy::default(),
+            )
+        };
+        for (pg, schema) in [
+            (Postgres::new(), "$user"),
+            (
+                Postgres::with_write_path_extras(vec!["$user".into()]),
+                "app",
+            ),
+        ] {
+            let refusal = drop_it(&pg, schema).expect_err("the path would not mean this");
+            assert!(refusal.to_string().contains("$user"), "{refusal}");
+        }
+        // A name that merely contains it, or differs in case, is an ordinary
+        // schema: the engine compares the whole entry, exactly.
+        for (pg, schema) in [
+            (Postgres::new(), "$users"),
+            (Postgres::new(), "$USER"),
+            (Postgres::with_write_path_extras(vec!["user".into()]), "app"),
+        ] {
+            assert!(
+                drop_it(&pg, schema).is_ok(),
+                "`{schema}` is an ordinary name"
+            );
+        }
     }
 
     /// An extra that cannot be an identifier is refused where it is used, not

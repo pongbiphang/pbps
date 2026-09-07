@@ -469,6 +469,26 @@ impl Dialect for Postgres {
         // engine that refuses by name can be left to refuse, and one that
         // hands back something else cannot.
         let schema = name.schema.as_str();
+        // The other name a schema cannot usefully have here, and it fails
+        // somewhere else entirely: `$user` is what this engine substitutes for
+        // the current role's own schema inside a `search_path`, quoted or not
+        // (`emit::NOT_A_SCHEMA_A_PATH_CAN_NAME`). The table would be created —
+        // its statements name it in full — and every unqualified name inside a
+        // check, a filter or a default would bind through the deployment
+        // role's schema instead of this one.
+        if schema == emit::NOT_A_SCHEMA_A_PATH_CAN_NAME {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` is declared in a schema named `{schema}`, which this engine \
+                     reads as the current role's own schema wherever a `search_path` names it — \
+                     quoting does not make it literal. The table would be created and then \
+                     every unqualified name in its checks, filters and defaults would resolve \
+                     through whatever schema the deploying role owns. Declare it under a name \
+                     the path can carry."
+                ),
+            });
+        }
         if schema == "information_schema" || schema.starts_with("pg_") {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
@@ -730,6 +750,35 @@ mod tests {
         // has to stay one.
         for name in ["pga.t", "app.t", "public.t", "pg.t"] {
             assert!(one(name).is_empty(), "`{name}` is a project's own");
+        }
+    }
+
+    /// A schema named `$user` is refused for a different reason from the
+    /// hidden ones: the table would be created and read back fine, and what
+    /// breaks is every unqualified name inside it.
+    #[test]
+    fn validating_a_table_refuses_the_schema_name_a_path_substitutes() {
+        let mut table = Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().expect("a type")),
+        );
+        let problems =
+            Postgres::new().validate_table(&pbps_model::TableName::new("$user", "t"), &table);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].to_string().contains("role's own schema"),
+            "{}",
+            problems[0]
+        );
+        // Exactly that name, because the engine compares exactly that name.
+        for ok in ["$users", "$USER", "app"] {
+            assert!(
+                Postgres::new()
+                    .validate_table(&pbps_model::TableName::new(ok, "t"), &table)
+                    .is_empty(),
+                "`{ok}` is an ordinary schema"
+            );
         }
     }
 
