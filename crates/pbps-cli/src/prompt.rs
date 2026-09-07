@@ -177,6 +177,13 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // remedy is to edit the file, and offering an option here would invite
         // the user to confirm a typo into the identity file.
         Blocker::UnusedIntent { .. } => {}
+        // Nothing to choose here either, and for a sharper reason: the
+        // candidates are exactly the intents the user has already written down,
+        // so a prompt would ask them to pick one of their own contradictory
+        // statements and then record it — turning a caught mistake into a
+        // committed one. The file is where the contradiction lives and where it
+        // has to be resolved.
+        Blocker::ConflictingRenameIntents { .. } => {}
     }
     out
 }
@@ -323,6 +330,9 @@ fn question(b: &Blocker) -> String {
             format!("role {role} disappeared from the declarations")
         }
         Blocker::UnusedIntent { intent } => format!("{intent:?}"),
+        Blocker::ConflictingRenameIntents { name, intents, .. } => {
+            format!("{} rename intents claim {name}", intents.len())
+        }
     }
 }
 

@@ -874,6 +874,61 @@ fn fmt_normalises_and_check_mode_never_writes() {
     );
 }
 
+/// The way a user actually reaches this: two `renamed_from:` annotations name
+/// one column. A copy-paste, a bad merge, a half-finished edit.
+///
+/// `plan` used to succeed. It renamed the real column to whichever annotation
+/// the loader reached first and created the other name as a new empty column —
+/// so the data answered to a name the author did not choose, and the name they
+/// expected held nothing. Nothing said so, at plan or at apply.
+///
+/// End to end rather than at `resolve` alone, because the failure was one a
+/// user meets by editing YAML, and because the message has to name both
+/// annotations for them to know which to delete.
+#[test]
+fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
+    let d = Demo::new("twoclaims");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  old: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         aaa: {type: int, renamed_from: old}\n  zzz: {type: int, renamed_from: old}\n",
+    );
+
+    let o = d.run(&["plan"]);
+    assert_ne!(
+        code(&o),
+        0,
+        "a contested rename must not plan: {}",
+        stdout(&o)
+    );
+    let text = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        text.contains("dbo.t.aaa renamed_from old") && text.contains("dbo.t.zzz renamed_from old"),
+        "the message must name both annotations, or there is nothing to go and \
+         delete: {text}"
+    );
+
+    // And the plan really is refused, not merely reported: the ids file must
+    // not have taken a side.
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(
+        ids.contains("old"),
+        "the recorded name must be untouched: {ids}"
+    );
+    assert!(!ids.contains("aaa") && !ids.contains("zzz"), "{ids}");
+
+    // Deleting one of them is the whole remedy.
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         aaa: {type: int, renamed_from: old}\n  zzz: {type: int}\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// The split of side effects in SPEC §6.2: plan absorbs the annotation into the
 /// ids file but never touches the YAML; stripping the now-redundant line is
 /// fmt's job, and fmt must not strip one whose fact is not absorbed yet.
