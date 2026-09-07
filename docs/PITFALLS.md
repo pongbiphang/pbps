@@ -449,6 +449,62 @@ like code. Build the fragment, then hand the whole thing to `literal` — the
 shape `rows.rs` already used for its dynamic collation statement. Then a name
 cannot be interpolated raw, because there is nowhere left to interpolate it.
 
+**And the second engine's counterpart got it wrong in the same place.**
+PostgreSQL's `drop_primary_key` has no `EXEC`; it has a `DO` block whose body
+runs `format('ALTER TABLE … DROP CONSTRAINT %I', pk)`. The first interpolation,
+into `'…'::regclass`, went through `literal` correctly. The second — the format
+string, which *looks* like the statement and is a literal — took the
+bracket-free quoted name raw, and `app."it's"` closed it at the apostrophe. Two
+crates, two dynamic-SQL helpers, one shape, and the second one was written by
+someone who had read the first.
+
+There is one twist worth stating, because getting it wrong the other way is
+just as easy: the `DO` body is *dollar*-quoted, so the format string needs
+**one** level of doubling and not two. The nesting to count is the number of
+single-quoted strings the name sits inside, not the number of quotes of any
+kind.
+
+## A tag a name can spell
+
+The same `DO` block introduced a second way for a name to escape. PostgreSQL's
+lexer scans a dollar-quoted string for its closing tag **literally**, paying no
+attention to quotes inside it — so `$pbps$` appearing anywhere in the body,
+including inside a `'…'` literal, ends the block there. A table named
+`x$pbps$y` is a legal identifier, and `pull` adopts whatever it finds.
+
+Escaping cannot fix this: there is no escape inside a dollar-quoted string, by
+definition. What fixes it is choosing the tag *after* building the body — the
+first of `$pbps$`, `$pbps1$`, … that the body does not contain. A delimiter
+picked before the content is a delimiter the content can forge.
+
+## A setting that cannot take effect where it is written
+
+The obvious way to pin a session setting around one statement is to put the
+`SET` in front of it. Measured on PostgreSQL 18.6, that works for some settings
+and silently does not for others, and which is which is not a matter of taste:
+a multi-statement simple query is **lexed as a whole** before any of it runs,
+and then analysed and executed one statement at a time.
+
+```text
+one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+            -> syntax error: the batch was lexed under the old value
+one batch:  SET LOCAL search_path = bt, btx; CREATE TABLE bt.t (… CHECK (f(id) > 0));
+            -> accepted: `f` resolved through the new path
+```
+
+`search_path` is read at parse *analysis*, so it takes effect for the next
+statement of the same batch. `standard_conforming_strings` is read by the
+*lexer*, so it does not — and the failure is the one that looks like success:
+the emitter would carry a pin it believed in and the server would parse the
+user's literal under whatever the operator's role had set.
+
+The rule that falls out is per-setting, not per-statement: a setting that
+decides how the text *parses* has to be established on an earlier batch, which
+is what `transaction_framing().begin` is for; one that decides how a name
+*resolves* can ride in the statement's own batch. Asking which of the two a
+setting is takes one measurement and cannot be reasoned out from the
+documentation, which describes both as session settings.
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

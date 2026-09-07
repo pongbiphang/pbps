@@ -253,8 +253,38 @@ with its own definition rather than folded into the nearest kind it knows; the
 `NOT NULL` rows PostgreSQL 18 added to `pg_constraint` are what that rule is
 for (DECISIONS 247).
 
-What remains is steps 4 to 10: the emitter, modules, roles, reference data, the
-ledger, probes, and the suite in full.
+Step 4 of ten (issue #79) is the **emitter**: `CREATE`, `ALTER` and `DROP` for
+tables, columns, keys, constraints and indexes. Every statement it writes sets
+the write `search_path` — the object's own schema, then the project's
+configured extras — and gives it back in the same batch, because the three
+verbatim expressions the model holds bind an unqualified name at creation and
+all three are *refused* under a path that is only the object's own schema
+(ADR-0013 §3, DECISIONS 259). The two settings that decide how a definition
+parses cannot ride there at all: a simple query is lexed as a whole before any
+of it runs, so `standard_conforming_strings = on` and `check_function_bodies =
+on` are pinned by the transaction framing, the earlier batch every connection
+runs (DECISIONS 260).
+
+Three refusals are the step's substance rather than its edges. A bare-literal
+default on a setting-sensitive column is refused offline with the resolved
+spelling named — measured, the same declaration stores 2026-01-02 under
+`DateStyle` MDY and 2026-02-01 under DMY, silently either way (DECISIONS 261). A
+type change this engine will not make on its own is refused where the plan is
+built, with `USING` named and the two-step remedy, and never performed under a
+cast nobody declared (ADR-0012 §5, DECISIONS 263). And `online` becomes
+`CONCURRENTLY` only for an index with no filter, because a concurrent build
+cannot share a batch with the path a filter would be bound under — the
+statement says `non_transactional` and `own_batch` about itself, so a plan
+carrying one is refused at plan time rather than halfway through an apply
+(DECISIONS 262).
+
+The live suite runs the three shapes issue #79 named — a created table with a
+foreign key, a table already there gaining a column, a key, a unique, an index
+and a foreign key, and a bootstrap whose next plan must be empty — each as
+emit, read back, compare, against a plan the differ produced.
+
+What remains is steps 5 to 10: modules, roles, reference data, the ledger,
+probes, and the suite in full.
 
 **Phase 6** is the optional local UI (ADR-0006). The guardrail against a policy
 SaaS refuses *a control plane that holds the approval*, not a screen: the UI

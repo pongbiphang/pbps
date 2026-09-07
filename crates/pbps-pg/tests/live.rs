@@ -221,8 +221,8 @@ async fn the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition() {
     let one = text(&mut conn, "SELECT $tag$a b$tag$").await;
     assert_ne!(two, one, "the engine keeps the spacing inside $tag$…$tag$");
     assert_ne!(
-        Postgres.normalize_definition("SELECT $tag$a  b$tag$"),
-        Postgres.normalize_definition("SELECT $tag$a b$tag$"),
+        Postgres::new().normalize_definition("SELECT $tag$a  b$tag$"),
+        Postgres::new().normalize_definition("SELECT $tag$a b$tag$"),
         "and so does the scanner"
     );
 
@@ -234,8 +234,8 @@ async fn the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition() {
     );
     assert!(truth(&mut conn, r"SELECT E'it\'s  here' = 'it''s  here'").await);
     assert_ne!(
-        Postgres.normalize_definition(r"SELECT E'it\'s  here'"),
-        Postgres.normalize_definition(r"SELECT E'it\'s here'"),
+        Postgres::new().normalize_definition(r"SELECT E'it\'s  here'"),
+        Postgres::new().normalize_definition(r"SELECT E'it\'s here'"),
     );
 
     // In a plain literal the backslash is only a backslash and the quote after
@@ -247,22 +247,22 @@ async fn the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition() {
     // one only at the `*/` that matches its opener.
     assert_eq!(number(&mut conn, "SELECT /* a /* b */ c */ 1").await, 1);
     assert_ne!(
-        Postgres.normalize_definition("SELECT /* outer /* inner */ it's here */ 'a  b'"),
-        Postgres.normalize_definition("SELECT /* outer /* inner */ it's here */ 'a b'"),
+        Postgres::new().normalize_definition("SELECT /* outer /* inner */ it's here */ 'a  b'"),
+        Postgres::new().normalize_definition("SELECT /* outer /* inner */ it's here */ 'a b'"),
     );
 
     // A `[` is a subscript, not a quote: a reindent inside one is not a change.
     assert_eq!(number(&mut conn, "SELECT (ARRAY[1, 2])[1  +  1]").await, 2);
     assert_eq!(
-        Postgres.normalize_definition("SELECT a[1  +  2] FROM t"),
-        Postgres.normalize_definition("SELECT a[1 + 2] FROM t"),
+        Postgres::new().normalize_definition("SELECT a[1  +  2] FROM t"),
+        Postgres::new().normalize_definition("SELECT a[1 + 2] FROM t"),
     );
 
     // And `a$b$c` is one identifier, which is why a `$` that continues a name
     // opens nothing.
     assert_eq!(number(&mut conn, "SELECT 1 AS a$b$c").await, 1);
     assert_eq!(
-        Postgres.normalize_definition("SELECT a$b$c  ,  d FROM t"),
+        Postgres::new().normalize_definition("SELECT a$b$c  ,  d FROM t"),
         "SELECT a$b$c , d FROM t"
     );
 }
@@ -322,7 +322,7 @@ async fn a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns() {
         ("bigserial", "bigint"),
     ] {
         let ty: ColumnType = declared.parse().expect("a type parses");
-        let message = Postgres
+        let message = Postgres::new()
             .normalize_type(&ty)
             .expect_err("a macro is not a type")
             .to_string();
@@ -365,7 +365,7 @@ async fn the_engine_and_the_dialect_agree_on_what_a_name_becomes() {
     .await;
     assert_eq!(
         named,
-        Postgres.fold_ident(&declared),
+        Postgres::new().fold_ident(&declared),
         "the engine folded the name differently from the dialect"
     );
     conn.execute(&format!("DROP TABLE {declared}"))
@@ -399,10 +399,10 @@ async fn the_engine_and_the_dialect_agree_on_what_a_name_becomes() {
 
     // So the dialect refuses the name the server would silently rewrite, and
     // takes the one it would keep. Bytes, not characters: 32 `ä` is 64 bytes.
-    assert!(Postgres.quote_ident(&long).is_err());
-    assert!(Postgres.quote_ident(&long[..63]).is_ok());
-    assert!(Postgres.quote_ident(&"ä".repeat(32)).is_err());
-    assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
+    assert!(Postgres::new().quote_ident(&long).is_err());
+    assert!(Postgres::new().quote_ident(&long[..63]).is_ok());
+    assert!(Postgres::new().quote_ident(&"ä".repeat(32)).is_err());
+    assert!(Postgres::new().quote_ident(&"ä".repeat(31)).is_ok());
 }
 
 /// `target_session_attrs` is a constraint on *which server*, and this seam has
@@ -545,7 +545,7 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
         let engine: ColumnType = read_back
             .parse()
             .unwrap_or_else(|e| panic!("the engine's own spelling `{read_back}` must parse: {e}"));
-        let normalized = Postgres
+        let normalized = Postgres::new()
             .normalize_type(&spelling.parse().expect("a type parses"))
             .unwrap_or_else(|e| panic!("`{spelling}` should normalize: {e}"));
         assert_eq!(
@@ -555,7 +555,7 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
         );
         // And the contract's other half, against the engine's own spelling
         // rather than against this crate's idea of it.
-        let again = Postgres.normalize_type(&engine).expect("idempotent");
+        let again = Postgres::new().normalize_type(&engine).expect("idempotent");
         assert_eq!(again, engine, "normalizing the read-back form moved it");
     }
 
@@ -614,11 +614,11 @@ async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible()
                 .is_ok();
 
             let normalize = |s: &str| {
-                Postgres
+                Postgres::new()
                     .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
                     .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
             };
-            let judged = Postgres.type_change_risk(&normalize(from), &normalize(to));
+            let judged = Postgres::new().type_change_risk(&normalize(from), &normalize(to));
             assert_eq!(
                 judged != TypeChangeRisk::Incompatible,
                 accepted,
@@ -734,7 +734,7 @@ async fn an_interval_precision_the_engine_would_quietly_reduce_is_refused() {
     .await;
     assert_eq!(read_back, "interval(6)", "the engine reduced it silently");
 
-    let refusal = Postgres
+    let refusal = Postgres::new()
         .normalize_type(&"interval(7)".parse::<ColumnType>().expect("parses"))
         .expect_err("the dialect refuses what the engine would quietly change")
         .to_string();
@@ -835,11 +835,13 @@ async fn a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value() {
         };
 
         let normalize = |s: &str| {
-            Postgres
+            Postgres::new()
                 .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
                 .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
         };
-        if Postgres.type_change_risk(&normalize(from), &normalize(to)) == TypeChangeRisk::Safe {
+        if Postgres::new().type_change_risk(&normalize(from), &normalize(to))
+            == TypeChangeRisk::Safe
+        {
             assert_eq!(
                 after.as_deref(),
                 Some(before.as_str()),
@@ -889,12 +891,12 @@ async fn an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change() {
     assert_eq!(exact, "1.0");
 
     let normalize = |s: &str| {
-        Postgres
+        Postgres::new()
             .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
             .expect("normalizes")
     };
     assert_eq!(
-        Postgres.type_change_risk(&normalize("numeric(2,1)"), &normalize("real")),
+        Postgres::new().type_change_risk(&normalize("numeric(2,1)"), &normalize("real")),
         TypeChangeRisk::Narrowing,
         "an exact decimal into a binary float is a change that needs approval"
     );
@@ -945,7 +947,7 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
             increment: 1,
         });
         declaration.columns.insert("id".to_owned(), column);
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
 
         assert_eq!(
             engine.is_ok(),
@@ -1006,7 +1008,7 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
         column.nullable = false;
         column.identity = Some(pbps_model::Identity { seed, increment });
         declaration.columns.insert("id".to_owned(), column);
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &declaration);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
 
         assert_eq!(
             engine.is_ok(),
@@ -1069,7 +1071,13 @@ async fn build(conn: &mut Conn, schema: &str, body: &str) {
 /// the guard firing, not a defect, and the assertion here is that it fires with
 /// the message that says so rather than as a bare driver error.
 async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
-    for _ in 0..4 {
+    // Twenty, with a wait between them, and the number is not arbitrary: four
+    // in a row with no wait was enough while step 3 was the only thing building
+    // schemas here, and step 4's tests each build and drop one of their own. A
+    // retry budget sized to the suite as it was is a budget that expires the
+    // next time the suite grows, and it expires as a failure that reads like a
+    // defect in the pull.
+    for _ in 0..20 {
         match pbps_pg::catalog::introspect(conn).await {
             Ok(pulled) => return pulled,
             Err(e) => {
@@ -1078,10 +1086,11 @@ async fn pull(conn: &mut Conn) -> pbps_pg::introspect::Pulled {
                         .contains("the catalog changed while it was being read"),
                     "the pull failed for a reason this suite does not cause: {e}"
                 );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
-    panic!("four pulls in a row were taken across another test's DDL");
+    panic!("twenty pulls in a row were taken across another test's DDL");
 }
 
 /// The limitations this suite's own schema earned.
@@ -1955,4 +1964,1073 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+}
+
+// ---------------------------------------------------------------------------
+// The emitter (Phase 5 step 4)
+// ---------------------------------------------------------------------------
+
+use pbps_model::{
+    CheckConstraint, Column, ForeignKey, Identity, IdsFile, Index, IndexColumn, Intent, PrimaryKey,
+    ReferentialAction, Schema, Strategy, Table, TableName, UniqueConstraint,
+};
+
+/// A schema of this step's own, kept apart from step 3's by its prefix.
+fn emit_schema(test: &str) -> String {
+    format!("pbps_emit_{}_{test}", std::process::id())
+}
+
+async fn fresh(conn: &mut Conn, schema: &str) {
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .expect("drop the emit schema");
+    conn.execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("create the emit schema");
+}
+
+/// The `SQLSTATE` of a refusal, which is what this suite asserts on.
+///
+/// Not the message: `tokio-postgres`'s own `Display` is the two words `db
+/// error` and everything a reader wants is in its source chain (issue #167), so
+/// a test that matched on text would be asserting nothing. The code is carried
+/// through the seam as text because `42P01` has a letter in it (DECISIONS 193).
+fn sqlstate(e: &DbError) -> &str {
+    match e {
+        DbError::Driver { code, .. } => code.as_deref().unwrap_or("no code"),
+        // Named rather than wildcarded, for the reason the connection-failure
+        // test names them: a variant added later has to be looked at here.
+        other @ (DbError::BadConnectionString(_)
+        | DbError::Connect { .. }
+        | DbError::ConnectTimeout { .. }
+        | DbError::WrongSession { .. }
+        | DbError::BadRow(_)) => panic!("not a refusal from the server: {other:?}"),
+    }
+}
+
+/// Emits and executes every change of a plan, in plan order.
+///
+/// One statement at a time through [`Conn::execute`], which is what `apply`
+/// does: each emitted statement is one batch, and the write scope it carries
+/// only reaches the batch it is in.
+async fn apply(conn: &mut Conn, pg: &Postgres, cs: &pbps_model::ChangeSet) {
+    for p in &cs.changes {
+        for stmt in pg.emit(&p.change, p.strategy).expect("emit") {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
+        }
+    }
+}
+
+fn ctx() -> pbps_diff::Context {
+    pbps_diff::Context {
+        operator: "live-test".into(),
+        today: "2026-09-07".into(),
+    }
+}
+
+fn mint_ids(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFile {
+    pbps_diff::resolve(schema, base, intents, &ctx())
+        .expect("resolve")
+        .ids
+}
+
+fn plan(
+    base_schema: &Schema,
+    base_ids: &IdsFile,
+    declared: &Schema,
+    declared_ids: &IdsFile,
+) -> pbps_model::ChangeSet {
+    pbps_diff::diff(
+        pbps_diff::Side {
+            schema: base_schema,
+            ids: base_ids,
+        },
+        pbps_diff::Side {
+            schema: declared,
+            ids: declared_ids,
+        },
+        &Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .expect("diff")
+}
+
+/// The declared side normalized the way introspection reports it, so the two
+/// can be compared with `==`.
+fn normalized(schema: &Schema) -> Schema {
+    let mut s = schema.clone();
+    for table in s.tables.values_mut() {
+        for col in table.columns.values_mut() {
+            col.ty = Postgres::new().normalize_type(&col.ty).expect("normalize");
+        }
+    }
+    s
+}
+
+/// Only this test's own schema, as a [`Schema`] that can be compared whole.
+///
+/// The container is shared with every other test in this run and with other
+/// sessions, so a bare comparison against `pulled.schema` asserts something
+/// about tables nobody here created.
+fn ours_only(pulled: &pbps_pg::introspect::Pulled, schema: &str) -> Schema {
+    let mut out = Schema::default();
+    for (name, table) in &pulled.schema.tables {
+        if name.schema == schema {
+            out.tables.insert(name.clone(), table.clone());
+        }
+    }
+    out
+}
+
+fn ty(s: &str) -> ColumnType {
+    s.parse().expect("a type parses")
+}
+
+/// A schema using every construct the emitter can spell, in the spelling the
+/// engine stores.
+///
+/// The expressions are written the way `pg_get_expr` reads them back — casts
+/// welded on, parentheses and all (ADR-0013 §4) — for the reason the SQL Server
+/// suite writes `[amount]>=(0)`: this asserts that emit and introspection agree,
+/// and a declaration in a *different* spelling would be asserting that the
+/// engine respells nothing, which it does.
+fn rich_schema(s: &str) -> Schema {
+    let mut region = Table::default();
+    region
+        .columns
+        .insert("region_id".into(), Column::new(ty("integer")).not_null());
+    region
+        .columns
+        .insert("name".into(), Column::new(ty("varchar(100)")).not_null());
+    region.primary_key = Some(PrimaryKey {
+        name: Some("pk_region".into()),
+        columns: vec!["region_id".into()],
+    });
+
+    let mut customer = Table::default();
+    let mut id = Column::new(ty("bigint")).not_null();
+    id.identity = Some(Identity {
+        seed: 1,
+        increment: 1,
+    });
+    customer.columns.insert("id".into(), id);
+    customer
+        .columns
+        .insert("email".into(), Column::new(ty("varchar(255)")));
+    let mut status = Column::new(ty("smallint")).not_null();
+    status.default = Some("0".into());
+    customer.columns.insert("status".into(), status);
+    let mut amount = Column::new(ty("numeric(18,2)")).not_null();
+    amount.default = Some("0.00".into());
+    customer.columns.insert("amount".into(), amount);
+    customer
+        .columns
+        .insert("notes".into(), Column::new(ty("text")));
+    customer.columns.insert(
+        "created_at".into(),
+        Column::new(ty("timestamptz")).not_null(),
+    );
+    customer
+        .columns
+        .insert("region_id".into(), Column::new(ty("integer")));
+    customer.primary_key = Some(PrimaryKey {
+        name: Some("pk_customer".into()),
+        columns: vec!["id".into()],
+    });
+    customer.unique.insert(
+        "uq_customer_email".into(),
+        UniqueConstraint {
+            columns: vec!["email".into()],
+        },
+    );
+    customer.foreign_keys.insert(
+        "fk_customer_region".into(),
+        ForeignKey {
+            columns: vec!["region_id".into()],
+            references_table: TableName::new(s, "region"),
+            references_columns: vec!["region_id".into()],
+            on_delete: ReferentialAction::SetNull,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    customer.checks.insert(
+        "ck_customer_amount".into(),
+        CheckConstraint {
+            expression: "(amount >= (0)::numeric)".into(),
+        },
+    );
+    customer.indexes.insert(
+        "ix_customer_region".into(),
+        Index {
+            columns: vec![
+                IndexColumn {
+                    name: "region_id".into(),
+                    descending: false,
+                },
+                IndexColumn {
+                    name: "created_at".into(),
+                    descending: true,
+                },
+            ],
+            include: vec!["status".into()],
+            unique: false,
+            filter: Some("(region_id IS NOT NULL)".into()),
+        },
+    );
+
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new(s, "region"), region);
+    schema
+        .tables
+        .insert(TableName::new(s, "customer"), customer);
+    schema
+}
+
+/// SPEC §11.5 invariant 2, and the first of issue #79's three named live tests:
+/// a plan that *creates* a table with a foreign key, applied, read back, and
+/// equal to what was declared.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
+    let s = emit_schema("bootstrap");
+    let declared = rich_schema(&s);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::CreateTable { .. })),
+        "the plan has to create the tables it is about to read back"
+    );
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(&mut conn, &Postgres::new(), &cs).await;
+
+    let pulled = pull(&mut conn).await;
+    let ours = ours_only(&pulled, &s);
+    let limitations = ours_limitations(&pulled, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    assert!(
+        limitations.is_empty(),
+        "what this emitter writes must read back whole: {limitations:?}"
+    );
+    assert_eq!(ours, normalized(&declared));
+}
+
+/// Issue #79's third named live test: a bootstrap, and the plan straight after
+/// it, which must be empty.
+///
+/// On SQL Server this exact sequence restated a default, dropped and re-added a
+/// check and rebuilt a filtered index on every run, because the engine respells
+/// every expression it stores. Here the declaration is written in the stored
+/// spelling, which is the same fixpoint from the other side: what the emitter
+/// writes is what the pull returns, so the differ sees nothing.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_plan_straight_after_a_bootstrap_is_empty() {
+    let s = emit_schema("fixpoint");
+    let declared = rich_schema(&s);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(
+        &mut conn,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    let pulled = pull(&mut conn).await;
+    let ours = ours_only(&pulled, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    let again = plan(&ours, &ids, &declared, &ids);
+    assert!(
+        again.is_empty(),
+        "the plan straight after a bootstrap must be empty: {again:#?}"
+    );
+}
+
+/// Issue #79's second named live test, and SPEC §11.5 invariant 3: a table that
+/// is already there gains a column, a key, a unique, an index and a foreign
+/// key, and the plan that does it is computed against the *introspected* state,
+/// exactly as `plan --db` computes one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_foreign_key() {
+    let s = emit_schema("converge");
+    let mut a = Schema::default();
+    let mut parent = Table::default();
+    parent
+        .columns
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
+    parent.primary_key = Some(PrimaryKey {
+        name: Some("pk_parent".into()),
+        columns: vec!["code".into()],
+    });
+    let mut child = Table::default();
+    child
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    a.tables.insert(TableName::new(&s, "parent"), parent);
+    a.tables.insert(TableName::new(&s, "child"), child);
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(
+        &mut conn,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
+    let state_a = ours_only(&pull(&mut conn).await, &s);
+    assert_eq!(
+        state_a,
+        normalized(&a),
+        "precondition: A is what was written"
+    );
+
+    // B: the child gains a column, a primary key, a unique constraint, an
+    // index and a foreign key into the parent.
+    let mut b = a.clone();
+    {
+        let child = b.tables.get_mut(&TableName::new(&s, "child")).unwrap();
+        child
+            .columns
+            .insert("parent_code".into(), Column::new(ty("varchar(10)")));
+        child.primary_key = Some(PrimaryKey {
+            name: Some("pk_child".into()),
+            columns: vec!["id".into()],
+        });
+        child.unique.insert(
+            "uq_child_parent".into(),
+            UniqueConstraint {
+                columns: vec!["parent_code".into()],
+            },
+        );
+        child.indexes.insert(
+            "ix_child_parent".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "parent_code".into(),
+                    descending: true,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        child.foreign_keys.insert(
+            "fk_child_parent".into(),
+            ForeignKey {
+                columns: vec!["parent_code".into()],
+                references_table: TableName::new(&s, "parent"),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::Cascade,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+    }
+    let ids_b = mint_ids(&b, &ids_a, &[]);
+    let migration = plan(&state_a, &ids_a, &b, &ids_b);
+    let kinds: Vec<_> = migration
+        .changes
+        .iter()
+        .map(|p| std::mem::discriminant(&p.change))
+        .collect();
+    assert_eq!(kinds.len(), 5, "one change each: {migration:#?}");
+
+    apply(&mut conn, &Postgres::new(), &migration).await;
+    let pulled = pull(&mut conn).await;
+    let state_b = ours_only(&pulled, &s);
+    let limitations = ours_limitations(&pulled, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    assert!(limitations.is_empty(), "{limitations:?}");
+    assert_eq!(state_b, normalized(&b));
+    let again = plan(&state_b, &ids_b, &b, &ids_b);
+    assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+}
+
+/// The write `search_path` is what makes an unqualified name in a declared
+/// expression mean what the project means by it (ADR-0013 §3).
+///
+/// All three of the verbatim expressions this model holds are checked, because
+/// all three bind at creation and a rule written around one of them is the
+/// narrowing this branch has made before. Without the extras the engine refuses
+/// each of them by name, which is the failure the scope prevents — and it is a
+/// refusal of a declaration PostgreSQL would accept under the project's own
+/// path, not a silent difference.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_path() {
+    let s = emit_schema("writepath");
+    let ext = format!("{s}_ext");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &ext).await;
+    conn.execute(&format!(
+        "CREATE FUNCTION {ext}.floorish(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1'"
+    ))
+    .await
+    .expect("the helper the expressions call");
+
+    let mut t = Table::default();
+    let mut id = Column::new(ty("integer")).not_null();
+    id.default = Some("floorish(1)".into());
+    t.columns.insert("id".into(), id);
+    t.checks.insert(
+        "ck_floor".into(),
+        CheckConstraint {
+            expression: "floorish(id) > 0".into(),
+        },
+    );
+    t.indexes.insert(
+        "ix_floor".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: Some("floorish(id) > 0".into()),
+        },
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(TableName::new(&s, "bound"), t);
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
+
+    // Without the extras: the object's own schema alone, and every one of the
+    // three is refused.
+    let bare = Postgres::new();
+    let mut refusals = Vec::new();
+    for p in &cs.changes {
+        for stmt in bare.emit(&p.change, p.strategy).expect("emit") {
+            if let Err(e) = conn.execute(&stmt.sql).await {
+                refusals.push(sqlstate(&e).to_owned());
+            }
+        }
+    }
+    // `42883` is `undefined_function`: the `CREATE TABLE` carries the default
+    // and cannot find the helper, and the two statements after it cannot find
+    // the table the first one did not create (`42P01`).
+    assert_eq!(
+        refusals,
+        vec!["42883", "42P01", "42P01"],
+        "the default's own binding is what fails first"
+    );
+
+    // With them: accepted, and every expression bound to the helper.
+    let pg = Postgres::with_write_path_extras(vec![ext.clone()]);
+    apply(&mut conn, &pg, &cs).await;
+    let pulled = pull(&mut conn).await;
+    let ours = ours_only(&pulled, &s);
+    let table = &ours.tables[&TableName::new(&s, "bound")];
+    let bindings = format!(
+        "{:?} {:?} {:?}",
+        table.columns["id"].default,
+        table.checks["ck_floor"].expression,
+        table.indexes["ix_floor"].filter
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP SCHEMA {ext} CASCADE"))
+        .await
+        .expect("drop the extra");
+    assert_eq!(
+        bindings.matches(&format!("{ext}.floorish")).count(),
+        3,
+        "each of the three had to bind to the helper in the extra schema: {bindings}"
+    );
+}
+
+/// `standard_conforming_strings` is pinned by the transaction framing, and the
+/// pin has to survive the operator having turned it off.
+///
+/// Measured, and this is why the pin is not in the statement's own batch: a
+/// multi-statement simple query is lexed as a whole before any of it runs, so a
+/// `SET` in front of the statement it protects protects nothing. Under `off`
+/// the engine *accepts* `CHECK (label <> 'it\'s  here')` as one literal while
+/// this crate's scanner closes it at the escaped quote — a whitespace edit
+/// inside that literal would then compare equal and never be planned. Under the
+/// pin the same text is a syntax error, which is the loud failure.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
+    let s = emit_schema("pinned");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    // The operator's environment, as an `ALTER ROLE … SET` would leave it.
+    conn.execute("SET standard_conforming_strings = off; SET check_function_bodies = off")
+        .await
+        .expect("the operator's settings");
+
+    let mut t = Table::default();
+    t.columns
+        .insert("label".into(), Column::new(ty("text")).not_null());
+    t.checks.insert(
+        "ck_label".into(),
+        CheckConstraint {
+            // Two characters, a backslash and a quote, inside a plain literal.
+            expression: r"label <> 'it\'s  here'".into(),
+        },
+    );
+    let change = pbps_model::Change::CreateTable {
+        uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        name: TableName::new(&s, "pinned"),
+        table: Box::new(t),
+    };
+    let statements = Postgres::new()
+        .emit(&change, Strategy::default())
+        .expect("emit");
+
+    // Every statement of the change, because the check is added after the
+    // table: the one carrying the literal is the one the setting decides.
+    async fn run(conn: &mut Conn, statements: &[pbps_dialect::Statement]) -> Vec<String> {
+        let mut refusals = Vec::new();
+        for stmt in statements {
+            if let Err(e) = conn.execute(&stmt.sql).await {
+                refusals.push(sqlstate(&e).to_owned());
+            }
+        }
+        refusals
+    }
+
+    // Without the pin — the operator's environment as it stands — the engine
+    // accepts the text as one literal, and nothing anywhere says so.
+    assert!(
+        run(&mut conn, &statements).await.is_empty(),
+        "under `off` this is accepted, which is the silence the pin is for"
+    );
+    let swallowed = text(
+        &mut conn,
+        &format!(
+            "SELECT pg_catalog.pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint \
+             WHERE conrelid = '{s}.pinned'::pg_catalog.regclass AND conname = 'ck_label'"
+        ),
+    )
+    .await;
+    assert!(
+        swallowed.contains("it''s  here"),
+        "the backslash was consumed and the quote closed nothing: {swallowed}"
+    );
+    conn.execute(&format!("DROP TABLE {s}.pinned"))
+        .await
+        .expect("drop what the unpinned session accepted");
+
+    // With it, the same text is a syntax error — `42601` — and the settings
+    // the framing established are what made it one.
+    let framing = Postgres::new().transaction_framing();
+    conn.begin(framing).await.expect("begin");
+    assert_eq!(
+        text(
+            &mut conn,
+            "SELECT current_setting('standard_conforming_strings')"
+        )
+        .await,
+        "on"
+    );
+    assert_eq!(
+        text(&mut conn, "SELECT current_setting('check_function_bodies')").await,
+        "on"
+    );
+    let refusals = run(&mut conn, &statements).await;
+    conn.rollback(framing).await.expect("rollback");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(
+        refusals,
+        vec!["42601"],
+        "the pin's failure is the loud one, and it is the check that carries it"
+    );
+}
+
+/// `online: true` becomes `CONCURRENTLY`, and the statement says it cannot run
+/// inside a transaction rather than being special-cased in the runner.
+///
+/// The second half is the measured constraint that decides the first: a
+/// concurrent build cannot share a batch with anything, so it cannot carry the
+/// write `search_path` a filter would be bound under. An index with a filter is
+/// therefore built the ordinary way and the hint is dropped — the trait's own
+/// rule for a hint a dialect cannot honour on this statement.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transaction() {
+    let s = emit_schema("concurrent");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer NOT NULL, n integer)"
+    ))
+    .await
+    .expect("the table the indexes go on");
+
+    let table = TableName::new(&s, "t");
+    let plain = Index {
+        columns: vec![IndexColumn {
+            name: "id".into(),
+            descending: false,
+        }],
+        include: vec![],
+        unique: false,
+        filter: None,
+    };
+    let filtered = Index {
+        filter: Some("(n IS NOT NULL)".into()),
+        ..plain.clone()
+    };
+
+    let online = Strategy { online: true };
+    let add = |name: &str, index: &Index| pbps_model::Change::AddIndex {
+        table: table.clone(),
+        name: name.to_owned(),
+        index: Box::new(index.clone()),
+    };
+
+    let concurrent = Postgres::new()
+        .emit(&add("ix_plain", &plain), online)
+        .expect("emit");
+    assert_eq!(concurrent.len(), 1);
+    assert!(
+        concurrent[0].sql.contains("CONCURRENTLY"),
+        "{}",
+        concurrent[0].sql
+    );
+    assert!(!concurrent[0].transactional, "it has to say so itself");
+    assert!(concurrent[0].own_batch, "and that it is alone in its batch");
+    assert!(
+        !concurrent[0].sql.contains("search_path"),
+        "a scope would make it a transaction block: {}",
+        concurrent[0].sql
+    );
+
+    let ordinary = Postgres::new()
+        .emit(&add("ix_filtered", &filtered), online)
+        .expect("emit");
+    assert!(
+        !ordinary[0].sql.contains("CONCURRENTLY"),
+        "a filter needs the write path, and the write path needs a batch: {}",
+        ordinary[0].sql
+    );
+    assert!(ordinary[0].transactional);
+    assert!(
+        ordinary[0].sql.contains("SET search_path"),
+        "{}",
+        ordinary[0].sql
+    );
+
+    // Both run: the concurrent one outside any transaction, the filtered one
+    // inside the transaction the framing opens.
+    conn.execute(&concurrent[0].sql).await.expect("concurrent");
+    let framing = Postgres::new().transaction_framing();
+    conn.begin(framing).await.expect("begin");
+    conn.execute(&ordinary[0].sql).await.expect("filtered");
+    conn.commit(framing).await.expect("commit");
+
+    // And the engine's own refusal is what `non_transactional` is reporting.
+    conn.begin(framing).await.expect("begin");
+    let inside = conn
+        .execute(&concurrent[0].sql.replace("ix_plain", "ix_again"))
+        .await
+        .expect_err("a concurrent build inside a transaction");
+    conn.rollback(framing).await.expect("rollback");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    // `25001` is `active_sql_transaction`: `CREATE INDEX CONCURRENTLY cannot
+    // run inside a transaction block`, which is the engine's own words for
+    // what `Statement::non_transactional` reports at plan time.
+    assert_eq!(sqlstate(&inside), "25001");
+}
+
+/// A bare-literal default on a setting-sensitive column is refused, and the
+/// engine is what says the refusal is not pedantry.
+///
+/// Measured: the identical `CREATE TABLE` run under two `DateStyle`s stores two
+/// different dates, with no error and no warning either way — so which value a
+/// column defaults to would be decided by whoever ran the apply. The resolved
+/// typed spelling, which is what `pg_get_expr` reads back, stores the same
+/// value under both (ADR-0013 §3, §4).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_one_is_not() {
+    let s = emit_schema("datestyle");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+
+    // What the refusal is about, measured rather than asserted from memory.
+    async fn stored(conn: &mut Conn, table: &str) -> String {
+        text(
+            conn,
+            &format!(
+                "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) FROM pg_catalog.pg_attrdef d \
+                 WHERE d.adrelid = '{table}'::pg_catalog.regclass"
+            ),
+        )
+        .await
+    }
+    conn.execute(&format!(
+        "SET DateStyle = 'ISO, MDY'; CREATE TABLE {s}.mdy (d date DEFAULT '01/02/2026')"
+    ))
+    .await
+    .expect("under MDY");
+    conn.execute(&format!(
+        "SET DateStyle = 'ISO, DMY'; CREATE TABLE {s}.dmy (d date DEFAULT '01/02/2026')"
+    ))
+    .await
+    .expect("under DMY");
+    conn.execute(&format!(
+        "CREATE TABLE {s}.resolved (d date DEFAULT '2026-01-02'::date)"
+    ))
+    .await
+    .expect("the resolved spelling, still under DMY");
+    conn.execute("SET DateStyle = 'ISO, MDY'")
+        .await
+        .expect("back");
+    assert_eq!(
+        stored(&mut conn, &format!("{s}.mdy")).await,
+        "'2026-01-02'::date"
+    );
+    assert_eq!(
+        stored(&mut conn, &format!("{s}.dmy")).await,
+        "'2026-02-01'::date",
+        "the same declaration, a different value, and nothing said so"
+    );
+    assert_eq!(
+        stored(&mut conn, &format!("{s}.resolved")).await,
+        "'2026-01-02'::date",
+        "the resolved spelling does not move"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    // So the emitter refuses the first spelling and emits the second.
+    let table = |default: &str| {
+        let mut t = Table::default();
+        let mut d = Column::new(ty("date"));
+        d.default = Some(default.to_owned());
+        t.columns.insert("d".into(), d);
+        pbps_model::Change::CreateTable {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: TableName::new(&s, "t"),
+            table: Box::new(t),
+        }
+    };
+    let refusal = Postgres::new()
+        .emit(&table("'01/02/2026'"), Strategy::default())
+        .expect_err("a bare literal on a date");
+    let message = refusal.to_string();
+    assert!(message.contains("DateStyle"), "{message}");
+    assert!(message.contains("'2026-01-02'::date"), "{message}");
+    Postgres::new()
+        .emit(&table("'2026-01-02'::date"), Strategy::default())
+        .expect("the resolved typed spelling is emitted as written");
+    // And a type whose input function reads no setting is never in question.
+    let mut plain = Table::default();
+    let mut n = Column::new(ty("integer"));
+    n.default = Some("'7'".into());
+    plain.columns.insert("n".into(), n);
+    Postgres::new()
+        .emit(
+            &pbps_model::Change::CreateTable {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                name: TableName::new(&s, "plain"),
+                table: Box::new(plain),
+            },
+            Strategy::default(),
+        )
+        .expect("a bare literal on an integer is not setting-sensitive");
+}
+
+/// A type change this engine will not make on its own is refused with the
+/// clause named, and never performed under a cast pbps chose (ADR-0012 §5).
+///
+/// The engine's own refusal is measured here rather than assumed, because the
+/// emitter's refusal is only worth having if the alternative is a failure and
+/// not a silent conversion.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
+    let s = emit_schema("using");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TABLE {s}.t (c varchar(10) NOT NULL)"))
+        .await
+        .expect("the table");
+    // `42804` is `datatype_mismatch`: `column "c" cannot be cast automatically
+    // to type integer … You might need to specify "USING c::integer"`.
+    let engine = conn
+        .execute(&format!("ALTER TABLE {s}.t ALTER COLUMN c TYPE integer"))
+        .await
+        .expect_err("this engine will not choose the conversion either");
+    assert_eq!(sqlstate(&engine), "42804");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    let column = TableName::new(&s, "t").column("c");
+    let refusal = Postgres::new()
+        .emit(
+            &pbps_model::Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: column.clone(),
+                from: ty("varchar(10)"),
+                to: ty("integer"),
+                from_nullable: false,
+                to_nullable: false,
+            },
+            Strategy::default(),
+        )
+        .expect_err("a conversion the engine refuses outright");
+    let message = refusal.to_string();
+    assert!(message.contains("USING"), "{message}");
+    assert!(message.contains("`c`"), "{message}");
+    // And nothing here emits one.
+    let widened = Postgres::new()
+        .emit(
+            &pbps_model::Change::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column,
+                from: ty("varchar(10)"),
+                to: ty("varchar(20)"),
+                from_nullable: false,
+                to_nullable: true,
+            },
+            Strategy::default(),
+        )
+        .expect("a widening the engine makes on its own");
+    assert!(!widened[0].sql.contains("USING"), "{}", widened[0].sql);
+    // Both subcommands in one `ALTER TABLE` (ADR-0011, Amendment 1).
+    assert!(
+        widened[0]
+            .sql
+            .contains("TYPE character varying(20), ALTER COLUMN \"c\" DROP NOT NULL"),
+        "{}",
+        widened[0].sql
+    );
+}
+
+/// A rename that crosses a schema takes two statements, and each says what it
+/// does to the name so that a staged checkpoint can find the table in between.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table_went() {
+    let s = emit_schema("rename");
+    let to_schema = format!("{s}_to");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &to_schema).await;
+    conn.execute(&format!("CREATE TABLE {s}.before (id integer NOT NULL)"))
+        .await
+        .expect("the table");
+
+    let from = TableName::new(&s, "before");
+    let to = TableName::new(&to_schema, "after");
+    let statements = Postgres::new()
+        .emit(
+            &pbps_model::Change::RenameTable {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+    assert_eq!(statements.len(), 2);
+    // The transfer first, so the name in between is the old one in the new
+    // schema — and it is that name the checkpoint has to look under.
+    let between = TableName::new(&to_schema, "before");
+    assert_eq!(statements[0].renames, vec![(from, between.clone())]);
+    assert_eq!(statements[1].renames, vec![(between, to.clone())]);
+
+    for stmt in &statements {
+        conn.execute(&stmt.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{}\n{e}", stmt.sql));
+    }
+    let pulled = pull(&mut conn).await;
+    let landed = ours_only(&pulled, &to_schema);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP SCHEMA {to_schema} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(landed.tables.keys().collect::<Vec<_>>(), vec![&to]);
+}
+
+/// A primary key the declaration did not name is dropped by asking the catalog
+/// what it is called, never by guessing the name this engine would have made.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
+    let s = emit_schema("unnamedpk");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    // The constraint is named by hand as something no rule would derive, so a
+    // guess cannot pass — and the table's own name carries every character that
+    // has to survive being written into a `DO` block: an apostrophe, the `%` of
+    // `format`, and the dollar-quote tag itself.
+    let odd = "it's $pbps$ %s";
+    conn.execute(&format!(
+        "CREATE TABLE {s}.\"{odd}\" (id integer NOT NULL, CONSTRAINT nobody_would_guess_this PRIMARY KEY (id))"
+    ))
+    .await
+    .expect("the table");
+
+    let table = TableName::new(&s, odd);
+    let statements = Postgres::new()
+        .emit(
+            &pbps_model::Change::SetPrimaryKey {
+                table: table.clone(),
+                from: Some(PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                }),
+                to: None,
+            },
+            Strategy::default(),
+        )
+        .expect("emit");
+    assert_eq!(statements.len(), 1);
+    assert!(
+        !statements[0].sql.contains("nobody_would_guess_this"),
+        "the emitter cannot know the name: {}",
+        statements[0].sql
+    );
+    conn.execute(&statements[0].sql)
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{e}", statements[0].sql));
+
+    let pulled = pull(&mut conn).await;
+    let ours = ours_only(&pulled, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    assert_eq!(ours.tables[&table].primary_key, None);
+}
+
+/// SPEC §11.5 invariant 3 over the altering half: a rename, a widening, a
+/// nullability, a default, a dropped column, a dropped constraint and a dropped
+/// index, all planned against the introspected state and all converging.
+///
+/// The paths here are the ones the creating tests never reach, and each of them
+/// is a statement this engine spells differently from the other one: a
+/// nullability is a subcommand rather than a restated column definition, a
+/// default is a property rather than a named constraint, and a rename is
+/// `ALTER TABLE … RENAME` rather than a procedure call.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
+    let s = emit_schema("alters");
+    let mut a = Schema::default();
+    let mut t = Table::default();
+    t.columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    t.columns
+        .insert("email".into(), Column::new(ty("varchar(50)")));
+    t.columns.insert("notes".into(), Column::new(ty("text")));
+    let mut n = Column::new(ty("integer"));
+    n.default = Some("0".into());
+    t.columns.insert("n".into(), n);
+    t.primary_key = Some(PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+    });
+    t.checks.insert(
+        "ck_n".into(),
+        CheckConstraint {
+            expression: "(n >= 0)".into(),
+        },
+    );
+    t.indexes.insert(
+        "ix_n".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "n".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        },
+    );
+    a.tables.insert(TableName::new(&s, "t"), t);
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    apply(
+        &mut conn,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
+    let state_a = ours_only(&pull(&mut conn).await, &s);
+    assert_eq!(state_a, normalized(&a), "precondition");
+
+    let mut b = a.clone();
+    {
+        let t = b.tables.get_mut(&TableName::new(&s, "t")).unwrap();
+        let email = t.columns.shift_remove("email").expect("email");
+        t.columns.insert("contact_email".into(), email);
+        t.columns["contact_email"].ty = ty("varchar(200)");
+        // A column that was nullable becomes required, and one that had a
+        // default loses it.
+        t.columns["contact_email"].nullable = false;
+        t.columns["n"].default = None;
+        t.columns.shift_remove("notes");
+        t.checks.remove("ck_n");
+        t.indexes.remove("ix_n");
+    }
+    let intents = [
+        Intent::RenameColumn {
+            table: TableName::new(&s, "t"),
+            from: "email".into(),
+            to: "contact_email".into(),
+        },
+        Intent::DropColumn {
+            column: TableName::new(&s, "t").column("notes"),
+            reason: "merged elsewhere".into(),
+        },
+    ];
+    let ids_b = mint_ids(&b, &ids_a, &intents);
+    let migration = plan(&state_a, &ids_a, &b, &ids_b);
+    assert!(
+        migration
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. })),
+        "the rename must plan as a rename, not a drop plus an add: {migration:#?}"
+    );
+
+    apply(&mut conn, &Postgres::new(), &migration).await;
+    let pulled = pull(&mut conn).await;
+    let state_b = ours_only(&pulled, &s);
+    let limitations = ours_limitations(&pulled, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    assert!(limitations.is_empty(), "{limitations:?}");
+    assert_eq!(state_b, normalized(&b));
+    let again = plan(&state_b, &ids_b, &b, &ids_b);
+    assert!(again.is_empty(), "the plan after convergence: {again:#?}");
 }

@@ -25,6 +25,7 @@ use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming
 use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
 
 pub mod catalog;
+mod emit;
 pub mod introspect;
 mod types;
 
@@ -37,7 +38,6 @@ mod types;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Emitter,
     Modules,
     Roles,
     ReferenceData,
@@ -49,7 +49,6 @@ impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Emitter => "generating statements (Phase 5 step 4)",
             Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
@@ -148,7 +147,84 @@ fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<Dialect
 }
 
 /// The PostgreSQL dialect.
-pub struct Postgres;
+///
+/// It carries one thing, and that is not decoration: the schemas that follow
+/// an object's own on the **write** `search_path` (ADR-0013 §3). Measured on
+/// 18.6, all three of the verbatim expressions this model holds — a column's
+/// default, a check's expression and an index's filter — are *refused* at
+/// creation when an unqualified name in them resolves nowhere:
+///
+/// ```text
+/// search_path = ''         ->  refused: function floorish(integer) does not exist
+/// search_path = wp         ->  refused: function floorish(integer) does not exist
+/// search_path = wp, wpx    ->  accepted
+/// ```
+///
+/// The middle line is the one that decides the shape. A path of the object's
+/// own schema alone is not enough — an extension installed in `public` is the
+/// ordinary case — so the extras have to come from somewhere, and the only
+/// honest somewhere is the project. They are held here rather than passed to
+/// [`Dialect::emit`] because the trait takes a change and a strategy, and a
+/// strategy says how to get there and never where (ADR-0003).
+///
+/// Empty is the value every caller has today: `pbps.yml` has no key for this
+/// yet, because the CLI cannot select this dialect at all (`main.rs`'s
+/// `dialect()` refuses it) and a configuration key nothing reads is worse than
+/// none. The key arrives with the step that can read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Postgres {
+    write_path_extras: Vec<String>,
+}
+
+impl Postgres {
+    /// The dialect with nothing after an object's own schema on the write path.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The dialect with `extras` after an object's own schema, in that order.
+    ///
+    /// The order is part of what a declaration means, and ADR-0013 measured it:
+    /// a view created under `(m_ea, m_eb)` keeps the binding it was created
+    /// with, while a fresh one under `(m_eb, m_ea)` takes the other. So this
+    /// takes a sequence and never a set.
+    #[must_use]
+    pub fn with_write_path_extras(extras: Vec<String>) -> Self {
+        Self {
+            write_path_extras: extras,
+        }
+    }
+
+    /// The schemas after an object's own on the write path.
+    #[must_use]
+    pub fn write_path_extras(&self) -> &[String] {
+        &self.write_path_extras
+    }
+}
+
+/// Quotes one identifier, or refuses a string that cannot be one.
+///
+/// A free function because two callers need it and only one of them has a
+/// `Postgres` to hand: [`Dialect::quote_ident`] is this, and the emitter is
+/// this without having to build a dialect value to ask.
+fn quote(ident: &str) -> Result<String, DialectError> {
+    // A double quote inside an identifier is doubled; a NUL cannot be in
+    // one at all, and the engine's own limit is bytes, not characters.
+    if ident.is_empty() {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    if ident.contains('\0') {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    // The limit is enforced here because the server does not enforce it:
+    // it **truncates** and says so in a `NOTICE` that nothing reads. See
+    // [`MAX_IDENT_BYTES`].
+    if ident.len() > MAX_IDENT_BYTES {
+        return Err(DialectError::UnquotableIdent(ident.to_owned()));
+    }
+    Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+}
 
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
@@ -170,10 +246,46 @@ impl Dialect for Postgres {
 
     /// PostgreSQL runs DDL inside a transaction, and a failed statement aborts
     /// the whole one — which is what SQL Server needs `SET XACT_ABORT ON` to
-    /// approximate. Nothing else has to be said, so nothing else is.
+    /// approximate.
+    ///
+    /// `begin` carries two settings anyway, and they are here rather than in
+    /// the emitter because **measured on 18.6, a setting cannot take effect in
+    /// the batch it appears in**. A multi-statement simple query is *lexed as a
+    /// whole* before any of it runs, so a `SET standard_conforming_strings`
+    /// in front of the statement it is meant to protect protects nothing:
+    ///
+    /// ```text
+    /// one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+    ///             -> syntax error: the batch was lexed under the old value
+    /// two:        SET standard_conforming_strings = off;  then  the same SELECT
+    ///             -> one literal of length 9
+    /// ```
+    ///
+    /// So the pin has to be established on an *earlier* batch, and `begin` is
+    /// the earlier batch every connection runs — the same place SQL Server's
+    /// `SET XACT_ABORT ON` lives, for the same structural reason.
+    ///
+    /// - **`standard_conforming_strings = on`** is what makes ADR-0011's
+    ///   scanner rule — a plain literal escapes by doubling — true.
+    ///   Measured under `off`, `CHECK (label <> 'it\'s  here')` is *accepted*
+    ///   as one literal, while the normalizer closes it at the escaped quote:
+    ///   a whitespace edit inside that literal then compares equal and is
+    ///   never planned. Under `on` the same text is a syntax error, which is
+    ///   the loud failure (ADR-0013 §3).
+    /// - **`check_function_bodies = on`** is what makes ADR-0009's
+    ///   opaque-caller exemption true. Measured, a SQL body naming a relation
+    ///   that does not exist is created *silently* under `off` and fails the
+    ///   first time it is called; under `on` the `CREATE` is refused.
+    ///
+    /// Neither is spelled `SET LOCAL`: a rendered script is run statement by
+    /// statement outside any transaction, where `SET LOCAL` is a warning and a
+    /// no-op — and a pin that quietly does nothing is the failure it exists to
+    /// prevent. Inside the transaction this opens they are undone by the
+    /// rollback, and outside one they are on the connection pbps opened for
+    /// this deployment.
     fn transaction_framing(&self) -> TransactionFraming {
         TransactionFraming {
-            begin: "BEGIN;",
+            begin: "SET standard_conforming_strings = on; SET check_function_bodies = on; BEGIN;",
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.
@@ -241,21 +353,7 @@ impl Dialect for Postgres {
     }
 
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
-        // A double quote inside an identifier is doubled; a NUL cannot be in
-        // one at all, and the engine's own limit is bytes, not characters.
-        if ident.is_empty() {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        if ident.contains('\0') {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        // The limit is enforced here because the server does not enforce it:
-        // it **truncates** and says so in a `NOTICE` that nothing reads. See
-        // [`MAX_IDENT_BYTES`].
-        if ident.len() > MAX_IDENT_BYTES {
-            return Err(DialectError::UnquotableIdent(ident.to_owned()));
-        }
-        Ok(format!("\"{}\"", ident.replace('"', "\"\"")))
+        quote(ident)
     }
 
     /// Every column's type, through the catalogue.
@@ -316,8 +414,8 @@ impl Dialect for Postgres {
         found
     }
 
-    fn emit(&self, _change: &Change, _strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
-        Err(Unbuilt::Emitter.refuse())
+    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
+        emit::emit(self, change, strategy)
     }
 }
 
@@ -325,14 +423,13 @@ impl Dialect for Postgres {
 mod tests {
     use super::*;
 
-    /// The refusals are the point of this crate until step 4 lands, so what
-    /// they say is tested like any other output: each names the step that
-    /// supplies it, and none of them reads as "there is nothing to do".
+    /// A refusal is output like any other, so what it says is tested: each
+    /// names the step that supplies it, and none of them reads as "there is
+    /// nothing to do".
     #[test]
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
             Unbuilt::Introspection,
-            Unbuilt::Emitter,
             Unbuilt::Modules,
             Unbuilt::Roles,
             Unbuilt::ReferenceData,
@@ -349,28 +446,59 @@ mod tests {
     }
 
     /// `emit` returning an empty statement list would be a plan that applies
-    /// cleanly and changes nothing — the silent wrong answer. It has to be an
-    /// error, and the type is what makes that so.
+    /// cleanly and changes nothing — the silent wrong answer. A part this
+    /// crate has not built has to be an error, and the type is what makes that
+    /// so. The structural half is built (step 4); the three that are not each
+    /// name their own step.
     #[test]
-    fn an_unbuilt_emitter_is_an_error_and_not_an_empty_plan() {
-        let change = Change::DropTable {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
-            name: "app.t".parse().expect("a table name parses"),
-        };
-        let refusal = Postgres
-            .emit(&change, Strategy::default())
-            .expect_err("nothing can be emitted yet");
-        assert!(refusal.to_string().contains("Phase 5 step 4"), "{refusal}");
+    fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
+        let unbuilt = [
+            (
+                Change::DropModule {
+                    id: "app.v".parse().expect("a module id parses"),
+                    kind: pbps_model::ModuleKind::View,
+                },
+                "Phase 5 step 5",
+            ),
+            (
+                Change::CreateRole {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
+                    name: "analyst".to_owned(),
+                },
+                "Phase 5 step 6",
+            ),
+            (
+                Change::DeleteRow {
+                    table: "app.t".parse().expect("a table name parses"),
+                    key_column: "code".to_owned(),
+                    key: pbps_model::RowKey::from("a"),
+                    cause: pbps_model::change::DeleteCause::Undeclared,
+                    row: std::collections::BTreeMap::new(),
+                    types: std::collections::BTreeMap::new(),
+                    after_types: std::collections::BTreeMap::new(),
+                },
+                "Phase 5 step 7",
+            ),
+        ];
+        for (change, step) in unbuilt {
+            let refusal = Postgres::new()
+                .emit(&change, Strategy::default())
+                .expect_err("this part is not built");
+            assert!(refusal.to_string().contains(step), "{refusal}");
+        }
     }
 
     /// Unquoted identifiers fold down, not away: this is the difference from
     /// SQL Server that the loader sees before anything connects.
     #[test]
     fn an_unquoted_identifier_folds_to_lower_case() {
-        assert_eq!(Postgres.fold_ident("Customer"), "customer");
-        assert_eq!(Postgres.fold_ident("CUSTOMER"), "customer");
+        assert_eq!(Postgres::new().fold_ident("Customer"), "customer");
+        assert_eq!(Postgres::new().fold_ident("CUSTOMER"), "customer");
         // Already lower: borrowed, not copied.
-        assert!(matches!(Postgres.fold_ident("customer"), Cow::Borrowed(_)));
+        assert!(matches!(
+            Postgres::new().fold_ident("customer"),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// And it folds the ASCII letters **only**. Measured on 18.6,
@@ -379,12 +507,12 @@ mod tests {
     /// declaration as `aä`, which introspection never returns.
     #[test]
     fn folding_leaves_every_letter_the_engine_leaves() {
-        assert_eq!(Postgres.fold_ident("AÄ"), "aÄ");
-        assert_eq!(Postgres.fold_ident("STRASSE"), "strasse");
-        assert_eq!(Postgres.fold_ident("Straße"), "straße");
+        assert_eq!(Postgres::new().fold_ident("AÄ"), "aÄ");
+        assert_eq!(Postgres::new().fold_ident("STRASSE"), "strasse");
+        assert_eq!(Postgres::new().fold_ident("Straße"), "straße");
         // A name with no ASCII upper case at all is untouched, and borrowed.
-        assert!(matches!(Postgres.fold_ident("Ä"), Cow::Borrowed(_)));
-        assert_eq!(Postgres.fold_ident("Ä"), "Ä");
+        assert!(matches!(Postgres::new().fold_ident("Ä"), Cow::Borrowed(_)));
+        assert_eq!(Postgres::new().fold_ident("Ä"), "Ä");
     }
 
     /// The server truncates a long identifier instead of refusing it, and says
@@ -392,9 +520,13 @@ mod tests {
     /// server naming the same object.
     #[test]
     fn a_name_the_server_would_truncate_is_refused_by_bytes_not_characters() {
-        assert!(Postgres.quote_ident(&"a".repeat(MAX_IDENT_BYTES)).is_ok());
         assert!(
-            Postgres
+            Postgres::new()
+                .quote_ident(&"a".repeat(MAX_IDENT_BYTES))
+                .is_ok()
+        );
+        assert!(
+            Postgres::new()
                 .quote_ident(&"a".repeat(MAX_IDENT_BYTES + 1))
                 .is_err()
         );
@@ -404,19 +536,25 @@ mod tests {
         let long = "ä".repeat(32);
         assert_eq!(long.chars().count(), 32);
         assert_eq!(long.len(), 64);
-        assert!(Postgres.quote_ident(&"ä".repeat(31)).is_ok());
-        assert!(Postgres.quote_ident(&long).is_err());
+        assert!(Postgres::new().quote_ident(&"ä".repeat(31)).is_ok());
+        assert!(Postgres::new().quote_ident(&long).is_err());
     }
 
     /// Quoting is what stops a name from being read as syntax, so the
     /// negative cases are the ones worth having.
     #[test]
     fn quoting_doubles_an_embedded_quote_and_refuses_what_cannot_be_a_name() {
-        assert_eq!(Postgres.quote_ident("customer").unwrap(), "\"customer\"");
-        assert_eq!(Postgres.quote_ident("Odd Name").unwrap(), "\"Odd Name\"");
-        assert_eq!(Postgres.quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
-        assert!(Postgres.quote_ident("").is_err());
-        assert!(Postgres.quote_ident("a\0b").is_err());
+        assert_eq!(
+            Postgres::new().quote_ident("customer").unwrap(),
+            "\"customer\""
+        );
+        assert_eq!(
+            Postgres::new().quote_ident("Odd Name").unwrap(),
+            "\"Odd Name\""
+        );
+        assert_eq!(Postgres::new().quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
+        assert!(Postgres::new().quote_ident("").is_err());
+        assert!(Postgres::new().quote_ident("a\0b").is_err());
     }
 
     /// The three rows of ADR-0011 Amendment 2's table, through this dialect.
@@ -427,24 +565,24 @@ mod tests {
     fn a_definition_is_scanned_with_this_engines_literals_and_not_sql_servers() {
         // `$tag$…$tag$` holds data, and no escape can close it early.
         assert_ne!(
-            Postgres.normalize_definition("SELECT $tag$a  b$tag$"),
-            Postgres.normalize_definition("SELECT $tag$a b$tag$")
+            Postgres::new().normalize_definition("SELECT $tag$a  b$tag$"),
+            Postgres::new().normalize_definition("SELECT $tag$a b$tag$")
         );
         // `\'` does not close an `E'…'` string: measured, `E'it\'s  here'` is
         // one ten-character literal.
         assert_ne!(
-            Postgres.normalize_definition(r"SELECT E'it\'s  here'"),
-            Postgres.normalize_definition(r"SELECT E'it\'s here'")
+            Postgres::new().normalize_definition(r"SELECT E'it\'s  here'"),
+            Postgres::new().normalize_definition(r"SELECT E'it\'s here'")
         );
         // A `[` is a subscript here, so a reindent inside one is not a change.
         assert_eq!(
-            Postgres.normalize_definition("SELECT a[1  +  2] FROM t"),
-            Postgres.normalize_definition("SELECT a[1 + 2] FROM t")
+            Postgres::new().normalize_definition("SELECT a[1  +  2] FROM t"),
+            Postgres::new().normalize_definition("SELECT a[1 + 2] FROM t")
         );
         // And a plain literal is still data, as on any engine.
         assert_ne!(
-            Postgres.normalize_definition("SELECT 'a  b'"),
-            Postgres.normalize_definition("SELECT 'a b'")
+            Postgres::new().normalize_definition("SELECT 'a  b'"),
+            Postgres::new().normalize_definition("SELECT 'a b'")
         );
     }
 
@@ -462,7 +600,7 @@ mod tests {
             ("bigserial", "bigint"),
             ("serial8", "bigint"),
         ] {
-            let error = Postgres
+            let error = Postgres::new()
                 .normalize_type(&ty(declared))
                 .expect_err("a macro is not a type");
             let message = error.to_string();
@@ -480,10 +618,13 @@ mod tests {
     #[test]
     fn a_type_that_is_not_in_the_serial_family_is_left_to_the_catalogue() {
         for spelling in ["integer", "text"] {
-            assert!(Postgres.normalize_type(&ty(spelling)).is_ok(), "{spelling}");
+            assert!(
+                Postgres::new().normalize_type(&ty(spelling)).is_ok(),
+                "{spelling}"
+            );
         }
         for spelling in ["serialized", "bigserialx"] {
-            let message = Postgres
+            let message = Postgres::new()
                 .normalize_type(&ty(spelling))
                 .expect_err("the catalogue does not hold it")
                 .to_string();
@@ -503,7 +644,7 @@ mod tests {
         table
             .columns
             .insert("note".to_owned(), pbps_model::Column::new(ty("text")));
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let serial: Vec<_> = found
             .iter()
             .map(ToString::to_string)
@@ -527,7 +668,8 @@ mod tests {
         table
             .columns
             .insert(long.clone(), pbps_model::Column::new(ty("integer")));
-        let found = Postgres.validate_table(&TableName::new(long.clone(), long.clone()), &table);
+        let found =
+            Postgres::new().validate_table(&TableName::new(long.clone(), long.clone()), &table);
         // The schema, the table and the column: three names, three refusals.
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(
@@ -543,7 +685,7 @@ mod tests {
         ok.columns
             .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
         assert!(
-            Postgres
+            Postgres::new()
                 .validate_table(&"app.t".parse().unwrap(), &ok)
                 .is_empty()
         );
@@ -576,7 +718,7 @@ mod tests {
                 expression: "id > 0".to_owned(),
             },
         );
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         // The primary key, the unique constraint and the check: three names.
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(
@@ -611,7 +753,7 @@ mod tests {
                 increment: 1,
             });
             table.columns.insert("id".to_owned(), column);
-            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
                 accepted,
@@ -654,7 +796,7 @@ mod tests {
             });
             c
         });
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found.iter().any(|e| e.to_string().contains("nullable")));
         assert!(found.iter().any(|e| e.to_string().contains("`default:`")));
@@ -695,7 +837,7 @@ mod tests {
             column.nullable = false;
             column.identity = Some(pbps_model::Identity { seed, increment });
             table.columns.insert("id".to_owned(), column);
-            let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+            let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
                 accepted,
@@ -755,7 +897,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                Postgres.type_change_risk(&ty(from), &ty(to)),
+                Postgres::new().type_change_risk(&ty(from), &ty(to)),
                 expected,
                 "`{from}` -> `{to}`"
             );
@@ -773,7 +915,7 @@ mod tests {
                 .columns
                 .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));
         }
-        let found = Postgres.validate_table(&"app.t".parse().unwrap(), &table);
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         assert_eq!(found.len(), 2, "{found:?}");
     }
 

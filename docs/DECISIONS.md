@@ -4439,3 +4439,142 @@ SPEC is in sync with all of these.
     value the column will actually be recorded with — one function decides that
     value for both the guard and the construction, because a check on something
     *like* what is stored is a check on nothing.
+
+259. **The write `search_path` is set per statement, in the statement's own
+    batch, and given back in the same one.** ADR-0013 §3 decides the value —
+    the object's own schema first, then the project's configured extras — and
+    leaves how it is carried to the emitter. Three spellings were available and
+    two of them fail somewhere.
+
+    `SET LOCAL` is the precise one inside a transaction and a **no-op with a
+    warning outside one**, and `bootstrap --sql` renders a script a human runs
+    through `psql`, statement by statement, in no transaction at all. A scope
+    that quietly does nothing on the disaster-recovery path is the failure the
+    scope exists to prevent. A session-level `SET` in a *preceding* statement
+    survives that, and does not survive a staged apply resuming on a new
+    connection — the path would be missing for exactly the statement that
+    needed it.
+
+    So the `SET`, the statement and the `RESET` are one batch. Measured, that
+    works: `SET LOCAL search_path = bt, btx; CREATE TABLE bt.t (… CHECK (f(id) >
+    0))` binds `f` through the new path, because a simple query is *analysed*
+    one statement at a time. Inside a transaction the `RESET` is rolled back
+    with everything else; outside one it hands the connection back as the
+    operator's environment left it.
+
+260. **The two settings that decide how a definition *parses* are pinned by the
+    transaction framing, not by the statement.** They cannot be pinned by the
+    statement. Measured on 18.6, a multi-statement simple query is **lexed as a
+    whole before any of it runs**:
+
+    ```text
+    one batch:  SET LOCAL standard_conforming_strings = off; SELECT length('it\'s here');
+                -> syntax error — the batch was lexed under the old value
+    two:        SET standard_conforming_strings = off;  then  the same SELECT
+                -> one literal, length 9
+    ```
+
+    so a `SET` in front of the statement it is meant to protect protects
+    nothing. The pin has to be established on an earlier batch, and `begin` is
+    the earlier batch every connection runs — the same place SQL Server's `SET
+    XACT_ABORT ON` lives (DECISIONS 194), for the same structural reason.
+
+    Both are the ones ADR-0013 §3 names. `standard_conforming_strings = on` is
+    what makes ADR-0011's scanner rule true: measured under `off`, `CHECK (label
+    <> 'it\'s  here')` is **accepted** as one literal while the normalizer
+    closes it at the escaped quote, so a whitespace edit inside that literal
+    compares equal and is never planned; under `on` the same text is a syntax
+    error. `check_function_bodies = on` is what makes ADR-0009's opaque-caller
+    exemption true: measured, a SQL body naming a relation that does not exist
+    is created silently under `off` and fails the first time it is called.
+
+    The third exception ADR-0013 names, the write `search_path`, is per
+    statement and does work in the statement's own batch (259) — name
+    resolution happens per statement where lexing does not.
+
+261. **A bare-literal default on a setting-sensitive column is refused, offline,
+    with the resolved spelling named.** ADR-0013 §3 says such a default reaches
+    the server as the resolved typed spelling, canonicalized by the engine at
+    plan time, and that the offline path refuses instead. The emitter is the
+    offline path: it has no connection and cannot ask.
+
+    Measured, the identical `CREATE TABLE` under two `DateStyle`s stores two
+    different dates and says nothing either way:
+
+    ```text
+    DEFAULT '01/02/2026' on a date, created under MDY:  '2026-01-02'::date
+    the same declaration created under DMY:             '2026-02-01'::date
+    DEFAULT '2026-01-02'::date under either:            '2026-01-02'::date
+    ```
+
+    The test is *whole expression is one quoted literal*, and nothing more: an
+    expression carrying a cast, a call or an operator is emitted as written.
+    That is not a shortcut, it is the boundary — a default that already carries
+    a cast is the form `pg_get_expr` reads back (ADR-0013 §4), so a declaration
+    pulled from a live database is never refused, and the refusal falls only on
+    the one shape whose meaning the applying session decides.
+
+    Which types are on the list is ADR-0013's derivation and not this file's
+    judgement: `date`, `time`, `timetz`, `timestamp`, `timestamptz`,
+    `interval`, `real` and `double precision`. `time` is on it because the ADR
+    put it there, and narrowing a recorded list because today's probe did not
+    reach one of its rows is how a list stops being the rule it came from.
+
+262. **`online` builds an index concurrently only when it has no filter.**
+    Measured, `CREATE INDEX CONCURRENTLY` cannot share a batch with anything at
+    all — `cannot run inside a transaction block` — so it cannot carry the write
+    `search_path` of 259, and a path set by a preceding statement is not there
+    after a staged apply resumes on a new connection. An index *with* a filter
+    is therefore built the ordinary way and the hint is dropped, which is the
+    trait's own rule for a hint a dialect cannot honour on this statement: the
+    destination is the same either way, and refusing would turn a performance
+    hint into an outage. An index *without* one has no expression to bind and
+    needs no path, so nothing is lost by leaving the scope off it.
+
+    The concurrent statement says both things about itself —
+    `Statement::non_transactional` and `Statement::own_batch` — so a plan
+    carrying one is refused at plan time with the whole plan intact, rather than
+    halfway through an apply. That also makes `own_batch`'s own comment false
+    where it said PostgreSQL has no batch restriction; it has exactly this one.
+
+    A unique constraint gets no concurrent path either, and for a different
+    reason: the online spelling is `CREATE UNIQUE INDEX CONCURRENTLY` followed
+    by `ADD CONSTRAINT … USING INDEX`, whose halves commit separately. One
+    declared constraint arriving as two committed steps is a state the gate
+    never approved.
+
+263. **A type change this engine refuses outright is refused by the emitter,
+    with the clause named.** ADR-0012 §5 decides that no `USING` is emitted; the
+    placement is this step's. The catalogue already knows which conversions the
+    engine will not make — `TypeChangeRisk::Incompatible` is defined as exactly
+    those (DECISIONS 243) — so the refusal is made where the plan is built, in
+    the message that names `USING` and the two-step remedy, rather than left to
+    a server error halfway through an apply.
+
+    Both ends are normalized before the catalogue is asked, and that is not
+    hygiene: the families are keyed on the spelling the engine gives back, so an
+    unnormalized `varchar(10)` is a type the catalogue does not know and *every*
+    change from one reads as `Incompatible`. A widening would have been refused
+    for needing a clause it does not need. The trait says the caller normalizes
+    first; a dialect that only works when it is called correctly is a trap, and
+    normalizing twice is free (the same correction as DECISIONS 244).
+
+264. **The `DO` block's dollar-quote tag is chosen against the body it wraps.**
+    Dropping a primary key the declaration did not name means asking the catalog
+    for its name, which means dynamic SQL, which on this engine means a `DO`
+    block. PostgreSQL's lexer looks for a dollar-quote's closing tag
+    **literally**, without regard for quotes inside it — so a table named
+    `x$pbps$y`, which is a legal identifier `pull` would adopt, ends the block
+    where its name appears and hands the rest of it to the server as top-level
+    SQL. The tag is therefore the first of `$pbps$`, `$pbps1$`, … that the body
+    does not contain, which makes the failure unrepresentable rather than
+    checked for.
+
+265. **The write path's extras live on the dialect value, and the `pbps.yml` key
+    waits for a reader.** `Dialect::emit` takes a change and a strategy, and a
+    strategy says how to get there and never where (ADR-0003), so the extras
+    have to be state on `Postgres`. They are not yet configuration: the CLI
+    refuses this dialect outright (`main.rs`'s `dialect()`), so a key in
+    `pbps.yml` would be one nothing reads — which is worse than none, because a
+    user who sets it would have every reason to believe it took effect. The key
+    lands with the step that can read it.

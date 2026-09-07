@@ -123,9 +123,13 @@ pub struct Statement {
     ///
     /// Some SQL Server DDL cannot share a batch with statements that reference it
     /// (adding a column and referencing it in the same batch fails to compile).
-    /// PostgreSQL has no such restriction and can always leave this `false` — but
-    /// the field has to exist in the interface, or the executor has no way to know
-    /// whether to split.
+    ///
+    /// PostgreSQL has one restriction of its own, and an earlier version of this
+    /// comment said it had none: `CREATE INDEX CONCURRENTLY` cannot run inside a
+    /// transaction block, and a multi-statement simple query *is* one — measured,
+    /// `SET LOCAL search_path = s; CREATE INDEX CONCURRENTLY …` is refused where
+    /// the same `CREATE` alone is accepted. So the concurrent build is alone in
+    /// its batch, and it is [`Statement::non_transactional`] besides.
     pub own_batch: bool,
 
     /// Whether this statement can run inside a transaction.
