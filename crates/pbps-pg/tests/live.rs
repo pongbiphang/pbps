@@ -5839,6 +5839,9 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
     ] {
         conn.execute(&sql).await.expect("the views");
     }
+    conn.execute(&format!("CREATE VIEW {s}.v3 AS SELECT id FROM {s}.v2"))
+        .await
+        .expect("a third view, two levels away");
     let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
     in_a_transaction(&mut conn).await;
     let on_the_view = pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
@@ -5850,14 +5853,24 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
             .iter()
             .map(|d| d.described.as_str())
             .collect::<Vec<_>>(),
-        vec![format!("rule _RETURN on view {s}.v2")],
-        "a view's own `_RETURN` rule and row type are internal edges, not dependents"
+        vec![
+            format!("rule _RETURN on view {s}.v3"),
+            format!("rule _RETURN on view {s}.v2"),
+        ],
+        "a view's own `_RETURN` rule and row type are internal edges and not          dependents; `v3` is a dependent even though nothing joins it to `v`, and it comes          first because that is the order the drops go in"
     );
     assert_eq!(
-        on_the_view[0].holds,
+        on_the_view[1].holds,
         pbps_pg::modules::Holds::Module(format!("{s}.v2").parse().expect("a module id")),
         "the dependent is the view that holds the rule, not the rule"
     );
+    // And the reason the order is not a preference: measured, dropping the
+    // direct dependent without the one beyond it is refused.
+    let out_of_order = conn
+        .execute(&format!("DROP VIEW {s}.v2"))
+        .await
+        .expect_err("the level below has to go first");
+    assert_eq!(sqlstate(&out_of_order), "2BP01", "{out_of_order:?}");
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

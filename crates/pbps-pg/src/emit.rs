@@ -1072,6 +1072,19 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
 /// `CREATE TRIGGER name { BEFORE | AFTER | INSTEAD OF } event … ON table` —
 /// and `INSTEAD OF` is `OF`, not `ON`. Where it finds none, the caller refuses
 /// rather than guessing, which is the direction a scan may be wrong in.
+///
+/// **A bare `on` cannot be anything but the keyword, and that is the engine's
+/// rule rather than an assumption.** `ON` is reserved, so a column or schema
+/// of that name must be quoted — measured:
+///
+/// ```text
+/// CREATE TABLE ma.t1 (on int);   syntax error at or near "on"
+/// CREATE SCHEMA on;              syntax error at or near "on"
+/// CREATE TABLE ma.t2 (id int, "on" int);   accepted
+/// ```
+///
+/// and a quoted identifier is stepped over whole here, so
+/// `AFTER UPDATE OF "on" ON app.t` finds the clause and not the column.
 fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
     let mut depth = 0usize;
     let mut at = 0usize;
@@ -1965,6 +1978,11 @@ mod tests {
             "AFTER INSERT ON APP.T FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON \"app\".\"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER UPDATE OF other ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // A column called `on` has to be quoted — `ON` is reserved, and
+            // the engine refuses the unquoted spelling — so a quoted one is
+            // stepped over whole and the clause after it is the one found.
+            "AFTER UPDATE OF \"on\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER UPDATE OF \"a on b\" ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             // The keyword is found past a literal and a comment that both
             // contain something that looks like one.
             "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",

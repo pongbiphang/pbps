@@ -783,6 +783,13 @@ impl Dependent {
 /// `deptype <> 'i'` because an object's own internal edges are not dependents:
 /// a view's `_RETURN` rule and its row type both point at the view itself.
 ///
+/// **Transitively, and in drop order.** One level is never the right answer:
+/// `pg_depend` records `v2 -> v` and `v3 -> v2`, and nothing at all from `v3`
+/// to `v`, so a plan built from the direct edges drops `v2` and **measured**,
+/// that statement is refused because `v3` depends on it. The result is deepest
+/// first, which is the order the drops go in; the creates go back in its
+/// reverse.
+///
 /// **Inside the caller's transaction, like [`before_a_rebuild`], and for two
 /// reasons that both matter.** The answer has to hold until the `DROP` — a
 /// dependent created between this read and the rebuild is one the plan does not
@@ -804,6 +811,69 @@ pub async fn dependents(
     let Some(oid) = module_oid(conn, id, kind).await? else {
         return Err(not_in_the_catalog(id));
     };
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut visited: BTreeSet<ModuleId> = [id.clone()].into_iter().collect();
+    let mut frontier = vec![(oid, kind)];
+    let mut levels: Vec<Vec<Dependent>> = Vec::new();
+    while !frontier.is_empty() {
+        let mut level = Vec::new();
+        let mut next = Vec::new();
+        for (oid, kind) in std::mem::take(&mut frontier) {
+            for found in direct_dependents(conn, oid, kind).await? {
+                // The same object can be reached twice — two views of one
+                // table, a routine used by both — and a plan that drops it
+                // twice is a plan that fails the second time.
+                if !seen.insert(found.described.clone()) {
+                    continue;
+                }
+                if let Holds::Module(child) = &found.holds
+                    && visited.insert(child.clone())
+                    && let Some(child_kind) = walkable(child)
+                    && let Some(child_oid) = module_oid(conn, child, child_kind).await?
+                {
+                    next.push((child_oid, child_kind));
+                }
+                level.push(found);
+            }
+        }
+        if !level.is_empty() {
+            levels.push(level);
+        }
+        frontier = next;
+    }
+    // Deepest first, which is drop order: measured, a plan that dropped only
+    // the direct dependent failed at that statement —
+    //
+    // ```text
+    // v <- v2 <- v3, and dropping v2 without v3:
+    //     ERROR:  cannot drop view mb.v2 because other objects depend on it
+    // ```
+    //
+    // — which is the applyable-and-predictably-fails outcome again, one level
+    // further out. A caller creates them back in the reverse of this order.
+    Ok(levels.into_iter().rev().flatten().collect())
+}
+
+/// Which kind to walk a module dependent's own edges as, or `None` where there
+/// are none to walk.
+const fn walkable(id: &ModuleId) -> Option<ModuleKind> {
+    match id {
+        ModuleId::Named(_) => Some(ModuleKind::View),
+        // Either kind is a `pg_proc` entry, and the reads that tell them apart
+        // are not reached from here.
+        ModuleId::Routine(_) => Some(ModuleKind::Function),
+        // A trigger is the end of a chain: nothing can depend on one.
+        ModuleId::Trigger { .. } => None,
+    }
+}
+
+/// The reverse edges of one object, one level.
+async fn direct_dependents(
+    conn: &mut Conn,
+    oid: i64,
+    kind: ModuleKind,
+) -> Result<Vec<Dependent>, DbError> {
     let refclass = match kind {
         ModuleKind::View => "pg_catalog.pg_class",
         ModuleKind::Function | ModuleKind::Procedure => "pg_catalog.pg_proc",
@@ -1067,6 +1137,17 @@ pub fn unmanaged_refusal(
 /// restoring a check constraint revalidates the table and rebuilding an index
 /// locks it, so a one-line edit to a function can carry a table scan behind it.
 /// The reviewer is approving the scan, not just the function.
+///
+/// **A module in this list is a rebuild, and takes [`before_a_rebuild`] like
+/// any other.** ADR-0009 §4 says so in as many words — *"a synthesized rebuild
+/// destroys the object's grants exactly as an edited one does, so §3's
+/// two-directional ACL refusal stands in front of it too"* — and it is the
+/// caller's to do, because only the caller knows it is building a plan rather
+/// than answering a question. The rebuild pbps invented is held to the same bar
+/// as the rebuild the user asked for.
+///
+/// The order is [`dependents`]' order, which is deepest first: that is the
+/// order the drops go in, and the creates go back in its reverse.
 #[must_use]
 pub fn to_rebuild<'a>(dependents: &'a [Dependent], declared: &Schema) -> Vec<&'a Dependent> {
     dependents.iter().filter(|d| d.managed(declared)).collect()
@@ -1106,6 +1187,11 @@ pub fn to_rebuild<'a>(dependents: &'a [Dependent], declared: &Schema) -> Vec<&'a
 /// recreation and answers `bigint overload` through an implicit conversion.
 /// Suppressing the report on the strength of it would hide exactly the
 /// behaviour change the scan exists to surface.
+///
+/// The trigger for asking is "this plan rebuilds or removes a **routine**",
+/// which is the caller's to know: nothing in the arguments says whether the
+/// module is going or being replaced, and a view has the established edges
+/// §4's refusal is built on.
 #[must_use]
 pub fn callers_by_name(declared: &Schema, id: &ModuleId) -> Vec<ModuleId> {
     let name = id.object_name();
