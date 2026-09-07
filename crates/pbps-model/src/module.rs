@@ -382,24 +382,59 @@ impl fmt::Display for ModuleId {
 /// of the JSON map key its own `Display` had written (PITFALLS: a round trip
 /// tested only on the simple case).
 ///
-/// `None` if the parentheses do not balance, which the caller reports as a
+/// `None` if the brackets do not balance, which the caller reports as a
 /// malformed identity rather than guessing where the argument ended.
+///
+/// # It has to know every place a comma can hide, not one
+///
+/// A first version tracked parentheses only, which was the whole story while
+/// an argument was a [`crate::ColumnType`]. [`RoutineArg`] admits two more:
+/// `"a,b"` is one quoted type name PostgreSQL will hand back for a type
+/// created with that name, and a comma inside `[…]` is inside the argument
+/// too. Splitting on either produced two halves that each fail
+/// `RoutineArg`'s own balance check, so `app.f(s."a,b")` was a valid
+/// declaration its own `Display` could write and nothing could read back.
+///
+/// The states are exactly the ones [`RoutineArg::from_str`] tracks, and they
+/// are here rather than shared with it because that one is folding text as it
+/// goes and this one only has to find a boundary — two readers of one rule,
+/// which is a shape this project has been wrong about before
+/// (PITFALLS: one rule, spelled in three places). They are pinned together by
+/// `an_identity_holding_an_array_and_a_quoted_name_round_trips`.
 fn split_top_level(args: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
-    let mut depth = 0usize;
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    let mut quoted = false;
     let mut start = 0usize;
-    for (i, c) in args.char_indices() {
+    let mut chars = args.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if quoted {
+            if c == '"' {
+                // A doubled quote is a quote inside the name, and does not
+                // close the region.
+                if args[i + 1..].starts_with('"') {
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            }
+            continue;
+        }
         match c {
-            '(' => depth += 1,
-            ')' => depth = depth.checked_sub(1)?,
-            ',' if depth == 0 => {
+            '"' => quoted = true,
+            '(' => parens += 1,
+            ')' => parens = parens.checked_sub(1)?,
+            '[' => brackets += 1,
+            ']' => brackets = brackets.checked_sub(1)?,
+            ',' if parens == 0 && brackets == 0 => {
                 parts.push(&args[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
     }
-    if depth != 0 {
+    if quoted || parens != 0 || brackets != 0 {
         return None;
     }
     parts.push(&args[start..]);
@@ -1868,6 +1903,11 @@ mod tests {
             "app.f(\"char\",integer[])",
             "app.f(character varying,timestamp with time zone)",
             "app.f(id.pos)",
+            // The comma that is not a separator, in each of the three places
+            // it can hide: a modifier, a quoted name, and a bracket.
+            "app.f(numeric(10,2),text)",
+            "app.f(s.\"a,b\",integer)",
+            "app.f(\"a,b\"[],\"c\"\"d\")",
         ] {
             let parsed: ModuleId = spelling.parse().unwrap();
             assert_eq!(parsed.to_string(), spelling);

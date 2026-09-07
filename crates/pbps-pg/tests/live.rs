@@ -5348,6 +5348,12 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         format!("CREATE VIEW {s}.plain AS SELECT id FROM {s}.t"),
         format!("CREATE VIEW {s}.granted AS SELECT id FROM {s}.t"),
         format!("GRANT SELECT ON {s}.granted TO {reader}"),
+        // The grant that is not in the object's own ACL. Measured, `relacl`
+        // stays NULL and the privilege lives in `pg_attribute.attacl`, so an
+        // object-level check reports nothing carried and the rebuild removes
+        // it.
+        format!("CREATE VIEW {s}.column_granted AS SELECT id, a FROM {s}.t"),
+        format!("GRANT SELECT (a) ON {s}.column_granted TO {reader}"),
         format!("CREATE VIEW {s}.optioned WITH (security_invoker = true) AS SELECT id FROM {s}.t"),
         format!("CREATE VIEW {s}.defaulted AS SELECT id, a FROM {s}.t"),
         format!("ALTER VIEW {s}.defaulted ALTER COLUMN a SET DEFAULT 'from the view'"),
@@ -5374,6 +5380,11 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
         // Nothing attached: this is what a rebuild is allowed to do.
         (format!("{s}.plain"), View, None),
         (format!("{s}.granted"), View, Some(&reader)),
+        (
+            format!("{s}.column_granted"),
+            View,
+            Some("column `a` is granted"),
+        ),
         (format!("{s}.optioned"), View, Some("security_invoker")),
         (format!("{s}.defaulted"), View, Some("from the view")),
         (format!("{s}.open(integer)"), Function, None),
@@ -5406,6 +5417,24 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
             }
         }
     }
+
+    // And the guard that makes the case above the one it says it is: the
+    // object's own ACL is empty, so a reader that only looked there would have
+    // called this view safe to rebuild.
+    assert_eq!(
+        number(
+            &mut conn,
+            &format!(
+                "SELECT COALESCE(pg_catalog.array_length(c.relacl, 1), 0)
+                   FROM pg_catalog.pg_class c
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = '{s}' AND c.relname = 'column_granted'"
+            )
+        )
+        .await,
+        0,
+        "this fixture must exercise `attacl`, and its `relacl` is not empty"
+    );
 
     // The grant that arrives uninvited. Added after the objects exist, so the
     // *old* ACL of every one of them is still what it was — which is exactly
@@ -5754,6 +5783,51 @@ async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
         .expect_err("the engine refuses too");
     assert_eq!(sqlstate(&engine), "2BP01", "{engine:?}");
 
+    // A dependent in a catalog with no arm of its own. Measured, a function
+    // behind a cast has its reverse edge in `pg_cast`, and with six arms and
+    // no fallback the edge was dropped entirely — so this reader called the
+    // rebuild unblocked and the `DROP FUNCTION` it allowed failed at apply,
+    // which is the one outcome SPEC §7.5 exists to prevent.
+    for sql in [
+        // The cast's target is a domain of this schema's own: a cast is
+        // database-global, so one over two built-in types would collide with
+        // every other run on the shared server.
+        format!("CREATE DOMAIN {s}.label AS text"),
+        format!(
+            "CREATE FUNCTION {s}.tocast(a int) RETURNS {s}.label IMMUTABLE LANGUAGE sql AS $$ \
+             SELECT a::text $$"
+        ),
+        format!("CREATE CAST (int AS {s}.label) WITH FUNCTION {s}.tocast(int) AS ASSIGNMENT"),
+    ] {
+        conn.execute(&sql).await.expect("the cast");
+    }
+    let tocast: pbps_model::ModuleId = format!("{s}.tocast(integer)").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let behind_a_cast =
+        pbps_pg::modules::dependents(&mut conn, &tocast, pbps_model::ModuleKind::Function)
+            .await
+            .expect("read the dependents");
+    rollback(&mut conn).await;
+    assert_eq!(
+        behind_a_cast
+            .iter()
+            .map(|d| d.described.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("cast from integer to {s}.label")],
+        "an edge in a catalog with no arm of its own must still be reported"
+    );
+    let cast_refusal = pbps_pg::modules::unmanaged_refusal(&tocast, &behind_a_cast, &nothing)
+        .expect("a dependent this project cannot recreate refuses");
+    assert!(cast_refusal.contains("pg_cast"), "{cast_refusal}");
+    let engine_agrees = conn
+        .execute(&format!("DROP FUNCTION {s}.tocast(int)"))
+        .await
+        .expect_err("and the engine refuses the drop this reader would have allowed");
+    assert_eq!(sqlstate(&engine_agrees), "2BP01", "{engine_agrees:?}");
+    conn.execute(&format!("DROP CAST (int AS {s}.label)"))
+        .await
+        .expect("drop the cast");
+
     // A view's own edges are not its dependents, and this is the case that
     // shows it: `pg_depend` holds an *internal* edge from a view's `_RETURN`
     // rule and its row type to the view itself, so a reader that took every
@@ -6093,4 +6167,216 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
             "`{s}.{object}` was not named: {named:#?}"
         );
     }
+}
+
+/// The one assertion that ties ADR-0009 §1's fold to the engine: a routine
+/// declared in *this* spelling reads back under *that* key, and the dialect
+/// turns the first into the second without a connection.
+///
+/// This is the test the `bit varying(4)` finding needed. A modifier the closed
+/// column catalogue does not carry was left on the declared identity while the
+/// catalog reported it gone, so the routine was one to create and one to drop
+/// on every connected plan for ever — the cry-wolf loop ADR-0002 names as the
+/// failure to avoid, and a different and worse thing from one loud mismatch.
+///
+/// Measured here, end to end, over every shape the fold has a rule for: a
+/// modifier on a catalogued type, on an uncatalogued one and on a user type; a
+/// type whose modifier decides which type it is; a field qualifier written in
+/// words rather than parentheses; an array; and a quoted name whose own
+/// parentheses are part of it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
+    let s = emit_schema("identity");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!("CREATE TYPE {s}.\"odd(name)\" AS ENUM ('a')"))
+        .await
+        .expect("a type whose name has parentheses in it");
+    conn.execute(&format!("CREATE DOMAIN {s}.money_amount AS numeric(10, 2)"))
+        .await
+        .expect("a domain");
+
+    // Left: what a declaration may reasonably say. Right: nothing — the key is
+    // asserted against the catalog, not against a second copy of this list.
+    let declared = [
+        "varchar(10)",
+        "numeric(10,2)",
+        "int4",
+        "timestamp(3) with time zone",
+        "float(24)",
+        "bit varying(4)",
+        "bit(3)",
+        "interval hour to minute",
+        "text[][]",
+        format!("{s}.\"odd(name)\"").as_str(),
+        format!("{s}.money_amount").as_str(),
+    ]
+    .map(str::to_owned);
+
+    let pg = Postgres::new();
+    let folded: Vec<String> = declared
+        .iter()
+        .map(|d| {
+            let arg: pbps_model::RoutineArg = d.parse().expect("a routine argument");
+            pbps_dialect::Dialect::normalize_routine_arg(&pg, &arg)
+                .expect("normalize")
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.f({}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        declared
+            .iter()
+            .enumerate()
+            .map(|(i, d)| format!("a{i} {d}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .await
+    .expect("the engine accepts every declared spelling");
+
+    let pulled = our_modules(&pull(&mut conn).await, &s);
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    let expected: pbps_model::ModuleId = format!("{s}.f({})", folded.join(","))
+        .parse()
+        .expect("the folded identity parses");
+    assert_eq!(
+        pulled.keys().cloned().collect::<Vec<_>>(),
+        vec![expected.clone()],
+        "the dialect folded {declared:?} to {folded:?}, and the engine did not agree"
+    );
+
+    // And the fold is what makes them one key rather than two: the declared
+    // spellings, unfolded, are a different identity.
+    let unfolded: pbps_model::ModuleId = format!("{s}.f({})", declared.join(","))
+        .parse()
+        .expect("the declared identity parses");
+    assert_ne!(
+        unfolded, expected,
+        "this fixture has to exercise the fold, and these spellings do not"
+    );
+}
+
+/// The trigger check reads the name after `ON`, and this is why it has to.
+///
+/// **Measured**: a definition whose `ON` target is another table is accepted by
+/// the engine without a word and creates the trigger there — under the key this
+/// project believes points at `t`. A scan for the identity's table *anywhere*
+/// in the text says yes to `AFTER UPDATE OF t ON <other>`, because the column
+/// list mentions `t`, so the check that was supposed to prevent exactly this
+/// waved it through.
+///
+/// Both halves are asserted: every spelling the validator accepts creates the
+/// trigger on the table the identity names, and the one it refuses would have
+/// created it somewhere else.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
+    let s = emit_schema("trigger_on");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key, a text)"),
+        format!("CREATE TABLE {s}.other (id int primary key, t text)"),
+        format!(
+            "CREATE FUNCTION {s}.trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+    ] {
+        conn.execute(&sql).await.expect("build");
+    }
+
+    let id: pbps_model::ModuleId = format!("{s}.t.audit").parse().expect("a module id");
+    let pg = Postgres::new();
+    let on_table = |body: &str| module(pbps_model::ModuleKind::Trigger, &body.replace("$S", &s));
+
+    // Accepted, and each one lands on `t`.
+    for body in [
+        "AFTER INSERT ON $S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER UPDATE OF a ON $S.t FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON \"$S\".\"t\" FOR EACH ROW EXECUTE FUNCTION $S.trf()",
+        "AFTER INSERT ON $S.t FOR EACH ROW WHEN (new.a = 'on other') EXECUTE FUNCTION $S.trf()",
+    ] {
+        let m = on_table(body);
+        assert!(
+            pg.validate_module(&id, &m).is_empty(),
+            "{body} must be accepted"
+        );
+        for stmt in pg
+            .emit(
+                &pbps_model::Change::CreateModule {
+                    id: id.clone(),
+                    module: Box::new(m),
+                },
+                pbps_model::Strategy::default(),
+            )
+            .expect("emit")
+        {
+            conn.execute(&stmt.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{}\n{e}", stmt.sql));
+        }
+        assert_eq!(
+            text(
+                &mut conn,
+                &format!(
+                    "SELECT c.relname::text FROM pg_catalog.pg_trigger tg
+                       JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = '{s}' AND tg.tgname = 'audit' AND NOT tg.tgisinternal"
+                )
+            )
+            .await,
+            "t",
+            "{body} created the trigger on the wrong table"
+        );
+        conn.execute(&format!("DROP TRIGGER audit ON {s}.t"))
+            .await
+            .expect("drop the trigger");
+    }
+
+    // Refused — and this is what it would have done. The engine accepts it,
+    // creates it on `other`, and the identity that says `t` finds nothing.
+    let wrong = "AFTER UPDATE OF t ON $S.other FOR EACH ROW EXECUTE FUNCTION $S.trf()";
+    let m = on_table(wrong);
+    let refusal = pg.validate_module(&id, &m);
+    assert_eq!(refusal.len(), 1, "{refusal:?}");
+    assert!(refusal[0].to_string().contains(".other"), "{}", refusal[0]);
+
+    conn.execute(&format!(
+        "CREATE TRIGGER audit AFTER UPDATE OF t ON {s}.other FOR EACH ROW EXECUTE FUNCTION \
+         {s}.trf()"
+    ))
+    .await
+    .expect("the engine accepts it without a word");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT c.relname::text FROM pg_catalog.pg_trigger tg
+                   JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = '{s}' AND tg.tgname = 'audit' AND NOT tg.tgisinternal"
+            )
+        )
+        .await,
+        "other",
+        "precondition: this is the mismatch the validator exists to refuse"
+    );
+    let not_there = conn
+        .execute(&format!("DROP TRIGGER audit ON {s}.t"))
+        .await
+        .expect_err("and the key that says `t` finds nothing, a plan later");
+    assert_eq!(sqlstate(&not_there), "42704", "{not_there:?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
 }

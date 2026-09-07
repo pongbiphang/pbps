@@ -1056,6 +1056,133 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
     })
 }
 
+/// The table a `CREATE TRIGGER` body says it is on.
+///
+/// **Not `references`.** A scan for the name anywhere in the text answers yes
+/// to `AFTER UPDATE OF t ON app.other` under the identity `app.t.audit`,
+/// because the column list mentions `t` — so the check passed and the engine
+/// created the trigger on the wrong table, which is the exact silent mismatch
+/// the check exists to prevent. What decides the outcome is the name after
+/// `ON`, so that is what is read.
+///
+/// This is a lexical scan and not a parse: it steps over literals and comments
+/// with [`skip_datum`], counts parentheses so that an `ON` inside a `WHEN (…)`
+/// is not the clause, and stops at the first bare `on` at depth zero. The
+/// grammar puts nothing else there —
+/// `CREATE TRIGGER name { BEFORE | AFTER | INSTEAD OF } event … ON table` —
+/// and `INSTEAD OF` is `OF`, not `ON`. Where it finds none, the caller refuses
+/// rather than guessing, which is the direction a scan may be wrong in.
+fn the_table_the_body_is_on(definition: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < definition.len() {
+        if let Some(skip) = skip_datum(&definition[at..]) {
+            at += skip;
+            continue;
+        }
+        let c = definition[at..].chars().next()?;
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if pbps_dialect::continues_ident(c) && c != '"' => {
+                let end = at
+                    + definition[at..]
+                        .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+                        .unwrap_or(definition.len() - at);
+                if depth == 0 && definition[at..end].eq_ignore_ascii_case("on") {
+                    return qualified_name_at(definition[end..].trim_start());
+                }
+                at = end;
+                continue;
+            }
+            // A quoted identifier is never the keyword, and stepping over it
+            // whole is what keeps a `"on"` inside a name from ending the scan.
+            '"' => {
+                let rest = qualified_name_at(&definition[at..])?;
+                at += rest.len();
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    None
+}
+
+/// The qualified name at the front of `text`: `t`, `app.t`, `"App"."T"`.
+///
+/// Returns the slice the name occupies, so a caller can both read it and skip
+/// it. `None` where the text does not start with one.
+fn qualified_name_at(text: &str) -> Option<&str> {
+    let mut at = one_ident_len(text)?;
+    while text[at..].starts_with('.') {
+        let next = one_ident_len(&text[at + 1..])?;
+        at += 1 + next;
+    }
+    Some(&text[..at])
+}
+
+fn one_ident_len(text: &str) -> Option<usize> {
+    if !text.starts_with('"') {
+        let end = text
+            .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+            .unwrap_or(text.len());
+        return (end > 0).then_some(end);
+    }
+    // Every index here is into `text`, which is the whole reason this is not
+    // written against the tail after the opening quote: a first version mixed
+    // the two and read `"app"."t"` as one nine-character name.
+    let mut at = 1;
+    loop {
+        let close = at + text[at..].find('"')?;
+        at = close + 1;
+        // A doubled quote is a quote inside the name.
+        if text[at..].starts_with('"') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// Whether the name a trigger's body puts after `ON` is the table its identity
+/// names.
+///
+/// A bare name is the module's own schema, because that is what the write
+/// scope puts first on the `search_path` — and the object it would find there
+/// is the very table the identity names. An unquoted part folds to lower case
+/// the way this engine folds one; a quoted part keeps what it holds.
+fn names_the_same_table(named: &str, on: &TableName) -> bool {
+    let mut parts = Vec::new();
+    let mut rest = named;
+    loop {
+        let len = match one_ident_len(rest) {
+            Some(len) => len,
+            None => return false,
+        };
+        parts.push(unquoted(&rest[..len]));
+        match rest[len..].strip_prefix('.') {
+            Some(after) => rest = after,
+            None => break,
+        }
+    }
+    match parts.as_slice() {
+        [name] => *name == on.name,
+        [schema, name] => *schema == on.schema && *name == on.name,
+        _ => false,
+    }
+}
+
+fn unquoted(ident: &str) -> String {
+    ident
+        .strip_prefix('"')
+        .and_then(|i| i.strip_suffix('"'))
+        .map_or_else(
+            || ident.to_ascii_lowercase(),
+            |inner| inner.replace("\"\"", "\""),
+        )
+}
+
 fn empty_definition(id: &ModuleId) -> DialectError {
     invalid(format!("module `{id}` has an empty definition"))
 }
@@ -1089,22 +1216,25 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                 }
                 // The body carries the `ON <table>` this engine's grammar puts
                 // after the event list, so the identity and the text can
-                // disagree — and the engine accepts the disagreement. A scan
-                // is best-effort by nature (ADR-0002), which is why it is used
-                // in the direction where a miss is loud: a declaration that
-                // does name its table and spells it in a way the scan cannot
-                // see is refused here and fixed by qualifying it, whereas a
-                // trigger created on the wrong table is discovered a plan
-                // later, by a `DROP` that finds nothing.
-                if !pbps_model::module::references(&module.definition, on) {
-                    found.push(invalid(format!(
-                        "trigger `{id}` is declared on `{on}`, and its definition does not name \
-                         that table. On this engine the table is part of the statement the \
+                // disagree — and the engine accepts the disagreement without a
+                // word.
+                match the_table_the_body_is_on(&module.definition) {
+                    Some(named) if names_the_same_table(named, on) => {}
+                    Some(named) => found.push(invalid(format!(
+                        "trigger `{id}` is declared on `{on}`, and its definition puts it on \
+                         `{named}`. On this engine the table is part of the statement the \
                          declaration holds — `CREATE TRIGGER {} AFTER INSERT ON {on} …` — so a \
-                         definition that names another table creates the trigger there, under \
-                         this key, and the next plan cannot find it",
+                         definition naming another table creates the trigger there, under this \
+                         key, and the next plan cannot find it",
                         id.name()
-                    )));
+                    ))),
+                    None => found.push(invalid(format!(
+                        "trigger `{id}` has a definition this dialect cannot find an `ON \
+                         <table>` in. That clause is what decides which table the trigger is \
+                         created on, and it has to be the `{on}` this identity names — so a \
+                         definition whose target cannot be read is refused rather than created \
+                         somewhere this key does not point"
+                    ))),
                 }
             }
         },
@@ -1785,20 +1915,61 @@ mod tests {
     /// later cannot find it.
     #[test]
     fn a_trigger_whose_body_names_another_table_is_refused_offline() {
-        let elsewhere = module(
-            ModuleKind::Trigger,
+        // What decides the outcome is the name after `ON`, and nothing else.
+        // A scan for the identity's table *anywhere* in the text says yes to
+        // the second of these — the column list mentions `t` — and the engine
+        // then creates the trigger on `app.other` under this key.
+        for body in [
             "AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
-        );
-        let found = Postgres::new().validate_module(&id("app.t.audit"), &elsewhere);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].to_string().contains("app.t"), "{}", found[0]);
+            "AFTER UPDATE OF t ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON elsewhere.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert!(
+                found[0].to_string().contains("app.t"),
+                "{body}: {}",
+                found[0]
+            );
+        }
+
+        // And a definition with no readable `ON` at all is refused rather than
+        // guessed at: the clause decides where the object is created.
+        for body in [
+            "FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // Every `on` here is inside something: a literal, a comment, and
+            // the parenthesised `WHEN`.
+            "AFTER INSERT /* on app.t */ WHEN (new.a = 'on app.t') FOR EACH ROW EXECUTE \
+             FUNCTION app.trf()",
+        ] {
+            let found = Postgres::new()
+                .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body));
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert!(
+                found[0].to_string().contains("cannot find an `ON"),
+                "{body}: {}",
+                found[0]
+            );
+        }
 
         // Qualified or bare, a definition that does name its table passes: a
         // declaration written inside its own schema very often omits the
-        // qualifier, and refusing that would refuse valid work.
+        // qualifier, and refusing that would refuse valid work. Case folds the
+        // way this engine folds an unquoted name, and a quoted one is taken as
+        // it is written.
         for body in [
             "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
             "AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf()",
+            "AFTER INSERT ON APP.T FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON \"app\".\"t\" FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER UPDATE OF other ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            // The keyword is found past a literal and a comment that both
+            // contain something that looks like one.
+            "AFTER INSERT -- on app.other\nON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON app.t FOR EACH ROW WHEN (new.a = 'on app.other') EXECUTE \
+             FUNCTION app.trf()",
         ] {
             assert!(
                 Postgres::new()

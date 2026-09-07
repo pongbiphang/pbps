@@ -1004,7 +1004,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
 /// and the text goes back unchanged.
 pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
     let (element, array) = peel_array(arg.as_str());
-    let canonical = identity_element(element).unwrap_or_else(|| element.to_owned());
+    let canonical = identity_element(element);
     let spelled = if array {
         format!("{canonical}[]")
     } else {
@@ -1038,16 +1038,42 @@ fn peel_array(text: &str) -> (&str, bool) {
     (element, array)
 }
 
-/// One argument's element type as `format_type` prints it, or `None` where
-/// this catalogue has never heard of it.
-fn identity_element(element: &str) -> Option<String> {
-    // With the modifier first, because `float(24)` is `real` and `float` is
-    // `double precision`: which type the engine resolves depends on the
-    // argument, so throwing it away before asking would answer for the wrong
-    // one. Only the spellings that carry a modifier *inside* the name — issue
-    // #130's `timestamp(3) with time zone` — need the second attempt.
-    let normalized = folded(element).or_else(|| folded(&without_modifier(element)))?;
-    Some(normalized.base)
+/// One argument's element type as `format_type` prints it.
+///
+/// Total, and in three attempts, because two of the three rules the engine
+/// applies do not need a catalogue at all.
+///
+/// 1. **With the modifier**, because `float(24)` is `real` and `float` is
+///    `double precision`: which type the engine resolves depends on the
+///    argument, so throwing it away before asking would answer for the wrong
+///    one.
+/// 2. **Without it**, for the spellings that carry a modifier *inside* the
+///    name — issue #130's `timestamp(3) with time zone`.
+/// 3. **Without it, and unfolded.** Discarding the modifier is what the engine
+///    does to *every* routine argument, catalogued or not, so a type this
+///    closed catalogue does not carry still loses it. Left in, a declared
+///    `bit varying(4)` never equalled the `bit varying` the catalog reads back,
+///    and the routine was one to create and one to drop on every plan for
+///    ever — the cry-wolf loop ADR-0002 names as the failure to avoid, which
+///    is a different and worse thing from DECISIONS 285's one loud mismatch.
+fn identity_element(element: &str) -> String {
+    if let Some(folded) = folded(element) {
+        return folded.base;
+    }
+    let bare = without_modifier(element);
+    if let Some(folded) = folded(&bare) {
+        return folded.base;
+    }
+    // The one type this engine's grammar follows with words rather than a
+    // parenthesis. **Measured**, a parameter declared
+    // `interval hour to minute` is identified as `interval`, so the field
+    // qualifier goes the same way a modifier does.
+    if let Some(rest) = bare.strip_prefix("interval")
+        && rest.starts_with(char::is_whitespace)
+    {
+        return "interval".to_owned();
+    }
+    bare
 }
 
 fn folded(text: &str) -> Option<ColumnType> {
@@ -1055,8 +1081,13 @@ fn folded(text: &str) -> Option<ColumnType> {
 }
 
 /// `timestamp(3) with time zone` -> `timestamp with time zone`.
+///
+/// The parentheses are found **outside quotes**: a type created as
+/// `"odd(name)"` is one this engine will hand back with its parentheses
+/// intact, and cutting there would leave `"odd` — an argument that no longer
+/// balances and no longer names anything.
 fn without_modifier(element: &str) -> String {
-    let (Some(open), Some(close)) = (element.find('('), element.rfind(')')) else {
+    let (Some(open), Some(close)) = (code_find(element, '('), code_rfind(element, ')')) else {
         return element.to_owned();
     };
     if close < open {
@@ -1069,6 +1100,33 @@ fn without_modifier(element: &str) -> String {
         out.push_str(rest);
     }
     out
+}
+
+/// The first `c` that is not inside a quoted name, and the last.
+fn code_find(text: &str, c: char) -> Option<usize> {
+    outside_quotes(text)
+        .find(|(_, ch)| *ch == c)
+        .map(|(i, _)| i)
+}
+
+fn code_rfind(text: &str, c: char) -> Option<usize> {
+    outside_quotes(text)
+        .filter(|(_, ch)| *ch == c)
+        .last()
+        .map(|(i, _)| i)
+}
+
+fn outside_quotes(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quoted = false;
+    text.char_indices().filter(move |(_, ch)| {
+        if *ch == '"' {
+            // A doubled quote reads as two openers here, which lands on the
+            // same state as one closer and one opener: still inside the name.
+            quoted = !quoted;
+            return false;
+        }
+        !quoted
+    })
 }
 
 #[cfg(test)]
@@ -1106,6 +1164,18 @@ mod tests {
             // asked.
             ("float(24)", "real"),
             ("float", "double precision"),
+            // A modifier is discarded whatever the type is, and these are not
+            // in the column catalogue: left on, a declared `bit varying(4)`
+            // never equals the `bit varying` the catalog reads back, and the
+            // routine is one to create and one to drop on every plan for ever.
+            ("bit varying(4)", "bit varying"),
+            ("bit(3)", "bit"),
+            ("m2.money(2)", "m2.money"),
+            // The one type this grammar follows with words rather than a
+            // parenthesis. Measured: `interval hour to minute` is identified
+            // as `interval`.
+            ("interval hour to minute", "interval"),
+            ("interval second(3)", "interval"),
         ] {
             assert_eq!(arg(declared), identity, "{declared}");
         }
@@ -1121,6 +1191,10 @@ mod tests {
         for text in [
             // A quoted built-in whose case the engine keeps.
             "\"char\"",
+            // A quoted name with parentheses of its own, which are part of the
+            // name and not a modifier.
+            "\"odd(name)\"",
+            "m2.\"odd(name)\"",
             // A domain, an enum, a composite: qualified, because that is what
             // `format_type` prints under the empty search path.
             "m2.money_amount",
@@ -1134,6 +1208,7 @@ mod tests {
             "bit varying",
             "inet",
             "tsvector",
+            "interval",
         ] {
             assert_eq!(arg(text), text, "{text}");
         }
@@ -1151,6 +1226,9 @@ mod tests {
             "\"char\"",
             "m2.money_amount",
             "timestamp(3) with time zone",
+            "bit varying(4)",
+            "interval hour to minute",
+            "\"odd(name)\"",
         ] {
             assert_eq!(arg(&arg(text)), arg(text), "{text}");
         }

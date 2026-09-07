@@ -157,6 +157,7 @@ pub async fn before_a_rebuild(
     match kind {
         ModuleKind::View => {
             read_relation(conn, oid, &mut carries).await?;
+            read_column_acls(conn, oid, &mut carries).await?;
             read_view_column_defaults(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "r", &mut carries).await?;
         }
@@ -326,6 +327,52 @@ async fn read_routine(
     let row = rows.first().ok_or_else(|| vanished(oid))?;
     push_owner(row, carries)?;
     push_acl(row, carries)?;
+    Ok(())
+}
+
+/// The grants that live on a *column* rather than on the object.
+///
+/// The fifth attribute this enumeration was written without, and it is
+/// invisible to the check above rather than merely missing from it.
+/// **Measured**, after `GRANT SELECT (a) ON m9.v TO m9_reader`:
+///
+/// ```text
+/// pg_class.relacl:      NULL
+/// pg_attribute.attacl:  a -> {m9_reader=r/postgres}
+/// ```
+///
+/// So an object-level ACL check reports nothing carried, the rebuild goes
+/// ahead, and the column grant is gone — the easiest case to wave through
+/// being, again, the one that loses access silently. This is what ADR-0009 §3
+/// means by enumerating from the catalog rather than from memory, and it is the
+/// fifth time that sentence has been proved by finding another attribute.
+async fn read_column_acls(
+    conn: &mut Conn,
+    oid: i64,
+    carries: &mut Vec<Carried>,
+) -> Result<(), DbError> {
+    for row in conn
+        .query_with(
+            "SELECT a.attname AS column_name, a.attacl::text AS acl
+               FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid = ($1::int8)::oid
+                AND a.attnum > 0
+                AND a.attacl IS NOT NULL
+              ORDER BY a.attnum",
+            &[Param::I64(oid)],
+        )
+        .await?
+    {
+        carries.push(Carried {
+            what: "a grant on one column, in `pg_attribute.attacl`, which the object's own ACL \
+                   does not show",
+            detail: format!(
+                "column `{}` is granted {}",
+                text(&row, "column_name")?,
+                text(&row, "acl")?
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -819,8 +866,13 @@ pub async fn dependents(
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Index(part.clone()),
                 },
+                // `other` is the fallback arm, which already carries its own
+                // sentence in `unrepresentable` and never reaches here; a
+                // `what` this match has not heard of is a query and a reader
+                // that have drifted apart, and it is named rather than
+                // dropped.
                 other => Holds::Unrepresentable(format!(
-                    "a dependent of a kind this reader does not know (`{other}`)"
+                    "a dependent this reader has no rule for (`{other}`)"
                 )),
             }
         };
@@ -855,6 +907,11 @@ fn dependents_query(refclass: &str) -> String {
         "d.refclassid = '{refclass}'::regclass AND d.refobjid = ($1::int8)::oid AND d.deptype <> 'i'"
     );
     let described = "pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS described";
+    let known = KNOWN_DEPENDENT_CLASSES
+        .iter()
+        .map(|c| format!("'{c}'::regclass"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "SELECT 'view' AS what, {described}, n2.nspname AS dep_schema, c2.relname AS dep_name,
                 '' AS part, 0::int8 AS dep_oid,
@@ -918,9 +975,47 @@ fn dependents_query(refclass: &str) -> String {
            LEFT JOIN pg_catalog.pg_class c2 ON c2.oid = i.indrelid
            LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_class'::regclass
+          UNION ALL
+         SELECT 'other', {described}, '', '', '', 0::int8,
+                'a dependent in `' || d.classid::regclass::text
+                  || '`, which this reader has no rule for'
+           FROM pg_catalog.pg_depend d
+          WHERE {edge} AND d.classid NOT IN ({known})
           ORDER BY 2"
     )
 }
+
+/// The catalogs the arms above have a rule for.
+///
+/// The last arm is everything else, and it is not a tidy-up. **Measured**, a
+/// function behind a cast has its reverse edge in `pg_cast`:
+///
+/// ```text
+/// dep_class | deptype |           what
+/// pg_cast   |    n    | cast from integer to text
+/// ```
+///
+/// and an operator's is in `pg_operator`. With six arms and no fallback, such
+/// an edge was dropped entirely — so `dependents` reported the rebuild
+/// unblocked and the emitted `DROP FUNCTION` failed at apply, which is the
+/// applyable-and-predictably-fails outcome SPEC §7.5 exists to prevent and the
+/// one ADR-0009 §4 names in as many words.
+///
+/// This is the third time an enumeration in this design was written as a list
+/// of the cases somebody thought of. The rule the ADR states covers all three
+/// if it is read as written — **enumerate from the catalog, not from memory** —
+/// and a fallback is what makes a list obey it: a class nobody has met yet is
+/// named and refused rather than silently absent.
+///
+/// Pinned to the arms by `every_known_class_has_an_arm_and_the_rest_fall_through`.
+const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
+    "pg_catalog.pg_rewrite",
+    "pg_catalog.pg_proc",
+    "pg_catalog.pg_trigger",
+    "pg_catalog.pg_constraint",
+    "pg_catalog.pg_attrdef",
+    "pg_catalog.pg_class",
+];
 
 /// The refusal for dependents this project could not put back, or `None`.
 ///
@@ -1133,6 +1228,35 @@ mod tests {
             what,
             detail: detail.to_owned(),
         }
+    }
+
+    /// The list and the fallback are one rule, and this is what keeps them
+    /// one: every class the arms handle is in the constant the fallback
+    /// excludes, and nothing else is. A seventh arm added without touching the
+    /// constant would produce two rows for one dependent; a class removed from
+    /// the constant without removing its arm would produce none.
+    #[test]
+    fn every_known_class_has_an_arm_and_the_rest_fall_through() {
+        let sql = dependents_query("pg_catalog.pg_proc");
+        for class in KNOWN_DEPENDENT_CLASSES {
+            assert!(
+                sql.contains(&format!("d.classid = '{class}'::regclass")),
+                "`{class}` is excluded from the fallback and has no arm of its own"
+            );
+            assert!(
+                sql.contains(&format!("'{class}'::regclass,"))
+                    || sql.contains(&format!("'{class}'::regclass)")),
+                "`{class}` has an arm and is not excluded from the fallback"
+            );
+        }
+        // And the arms are exactly six: a `d.classid = …` that is not in the
+        // constant is an arm the fallback would double.
+        assert_eq!(
+            sql.matches("d.classid = '").count(),
+            KNOWN_DEPENDENT_CLASSES.len(),
+            "an arm exists for a class the fallback does not exclude"
+        );
+        assert!(sql.contains("d.classid NOT IN ("), "{sql}");
     }
 
     /// An object carrying nothing is the case a rebuild is allowed to take, and

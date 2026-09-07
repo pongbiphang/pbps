@@ -5790,6 +5790,27 @@ SPEC is in sync with all of these.
     `ModuleId::Trigger` is the table's, and there is nowhere else for it to
     come from.
 
+    **Amended in review: the check reads the `ON` clause, not the whole text.**
+    The first version asked ADR-0002's identifier scan whether the definition
+    mentioned the table *anywhere*, and that answers yes to
+
+    ```text
+    AFTER UPDATE OF t ON app.other ...        under the identity app.t.audit
+    ```
+
+    because the column list mentions `t`. Measured, the engine accepts it
+    without a word and creates the trigger on `app.other` — the exact silent
+    mismatch the check exists to prevent, waved through by the check. What
+    decides the outcome is the name after `ON`, so that is what is read: a
+    lexical scan that steps over literals and comments with the emitter's own
+    `skip_datum`, counts parentheses so an `ON` inside a `WHEN (…)` is not the
+    clause, and takes the first bare `on` at depth zero. The grammar puts
+    nothing else there, and `INSTEAD OF` is `OF`.
+
+    A definition with no readable `ON` is refused rather than guessed at, which
+    is the direction a scan may be wrong in: the remedy is to write the clause
+    where the engine expects it.
+
 285. **A routine argument this dialect's catalogue does not know is passed
     through, not refused.** `Postgres::normalize_type` refuses an unknown
     column type, and the obvious move was to answer the same way for a
@@ -5815,6 +5836,34 @@ SPEC is in sync with all of these.
     else goes through the column catalogue's alias table so `int4` is
     `integer`. `float(24)` is why the modifier is not thrown away *before* the
     catalogue is asked: it is `real`, and `float` is `double precision`.
+
+    **Amended in review: the modifier goes whether the catalogue knows the type
+    or not.** "Returned unchanged" was written as one rule and turned out to be
+    two. Discarding a modifier is what the engine does to *every* routine
+    argument; consulting a closed catalogue of column types is a different
+    question that only some arguments have an answer to. Tying the first to the
+    second left a declared `bit varying(4)` — a perfectly ordinary parameter,
+    absent from the column catalogue because ADR-0012 §1 has no need of it —
+    permanently unequal to the `bit varying` the catalog reads back, so the
+    routine was one to create and one to drop on **every** connected plan.
+
+    That is not the bargain this entry struck. DECISIONS 285 accepts one loud
+    mismatch that a user fixes by writing what `pull` showed them; it does not
+    accept the cry-wolf loop ADR-0002 names as the failure to avoid. So the
+    fold is three attempts — with the modifier, without it, and without it and
+    unfolded — and only the *fold* is the catalogue's. Measured on 18.6, the
+    identity of one function's five parameters:
+
+    ```text
+    bit varying(4)  bit(3)  interval hour to minute  interval second(3)  m8."odd(name)"
+    bit varying     bit     interval                 interval            m8."odd(name)"
+    ```
+
+    Two more rules fell out of that measurement. `interval` is the one type
+    this grammar follows with words rather than a parenthesis, and its field
+    qualifier goes the way a modifier does. And a quoted name's own parentheses
+    are part of the name — `m8."odd(name)"` keeps them — so the modifier is
+    found outside quotes or not at all.
 
 286. **A module whose deparsed statement this reader cannot cut is named and
     left out, never recorded with an empty body.** The declaration holds
@@ -5881,6 +5930,29 @@ SPEC is in sync with all of these.
     a view column default in `pg_attrdef`; a trigger's `tgenabled`; and the
     grants a *new* object would arrive with from `pg_default_acl`, which no
     comparison against the old object can see.
+
+    **Amended in review, twice, and both are the same sentence proving itself
+    again.** A fifth attribute: a grant on one *column* lives in
+    `pg_attribute.attacl`, and measured, `GRANT SELECT (a) ON v TO r` leaves
+    `pg_class.relacl` **NULL** — so an object-level ACL check reports nothing
+    carried, the rebuild goes ahead, and the column grant is gone. An object
+    with an empty ACL is the easiest case to wave through, for the second time
+    in this entry.
+
+    And the §4 half had the same shape one catalog over: the dependent
+    enumeration had an arm per catalog it had thought of, and measured, a
+    function behind a cast has its reverse edge in `pg_cast` and one behind an
+    operator in `pg_operator`. Neither had an arm, so the edge was dropped
+    entirely, `dependents` reported the rebuild unblocked, and the emitted
+    `DROP FUNCTION` failed at apply — the applyable-and-predictably-fails
+    outcome SPEC §7.5 exists to prevent. There is now a fallback arm, and the
+    class list the arms handle is one constant the fallback excludes, pinned to
+    the arms by a test.
+
+    **A list obeys "enumerate from the catalog, not from memory" only when it
+    has a fallback.** Three enumerations in this design have now been written
+    as the cases somebody thought of, and each was corrected by finding the next
+    one. What ends that sequence is not a longer list.
 
 289. **The rebind test is a name and a path, not a position on it.**
     ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
