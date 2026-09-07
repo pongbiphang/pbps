@@ -423,7 +423,7 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    references_as(definition, name, Case::Folded)
+    references_as(definition, name, Needles::all(Case::Folded))
 }
 
 /// How the scan compares letters, narrowest last.
@@ -459,13 +459,37 @@ fn qualified(name: &ObjectName, case: Case) -> String {
     format!("{}.{}", cased(&name.schema, case), cased(&name.name, case))
 }
 
-fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
-    let haystack = scannable(definition, case);
+/// The comparison each needle is searched under.
+///
+/// Two, because the needles collide independently. `dbo.t` beside `sales.T` is
+/// one bare name in two spellings and two qualified names in one spelling
+/// each: the bare needle has to narrow and the qualified one must not, or a
+/// definition writing the perfectly valid `DBO.T` loses its edge to `dbo.t`
+/// (DECISIONS 245).
+#[derive(Clone, Copy)]
+struct Needles {
+    qualified: Case,
+    bare: Case,
+}
+
+impl Needles {
+    /// Both needles under one comparison — what a caller without the
+    /// declarations in front of it can ask for.
+    fn all(case: Case) -> Self {
+        Needles {
+            qualified: case,
+            bare: case,
+        }
+    }
+}
+
+fn references_as(definition: &str, name: &ObjectName, needles: Needles) -> bool {
+    let found = |case: Case, needle: &str| contains_word(&scannable(definition, case), needle);
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
-    contains_word(&haystack, &qualified(name, case))
-        || contains_word(&haystack, &cased(&name.name, case))
+    found(needles.qualified, &qualified(name, needles.qualified))
+        || found(needles.bare, &cased(&name.name, needles.bare))
 }
 
 /// The definition with everything that is not code blanked out.
@@ -790,17 +814,25 @@ pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -
         .into_iter()
         .map(|case| (case, group(case, by_qualified), group(case, by_bare)))
         .collect();
-    let widest_that_separates = |name: &ObjectName| {
-        grouped
+    //
+    // Each needle is answered on its own. A collision is a reason to narrow the
+    // needle that collides and no reason at all to narrow the other: `dbo.t`
+    // beside `sales.T` collides on the bare name and not on the qualified one,
+    // and a case-insensitive database holds both happily. Narrowing the
+    // qualified needle with it would lose the edge from a definition that
+    // writes `DBO.T`, which is the very failure this scan folds case to avoid.
+    let alone = |folds: &BTreeMap<String, BTreeSet<String>>, key: &str| {
+        folds.get(key).is_none_or(|declared| declared.len() == 1)
+    };
+    let widest_that_separates = |name: &ObjectName| Needles {
+        qualified: grouped
             .iter()
-            .find(|(case, qualified_folds, bare_folds)| {
-                let alone = |folds: &BTreeMap<String, BTreeSet<String>>, key: &str| {
-                    folds.get(key).is_none_or(|declared| declared.len() == 1)
-                };
-                alone(qualified_folds, &qualified(name, *case))
-                    && alone(bare_folds, &cased(&name.name, *case))
-            })
-            .map_or(Case::Exact, |(case, _, _)| *case)
+            .find(|(case, qualified_folds, _)| alone(qualified_folds, &qualified(name, *case)))
+            .map_or(Case::Exact, |(case, _, _)| *case),
+        bare: grouped
+            .iter()
+            .find(|(case, _, bare_folds)| alone(bare_folds, &cased(&name.name, *case)))
+            .map_or(Case::Exact, |(case, _, _)| *case),
     };
 
     // needs[a] = the modules `a` must follow.
@@ -1189,7 +1221,7 @@ mod tests {
         assert!(!references_as(
             "SELECT * FROM dbo.\u{212a}TBL",
             &n("dbo.ktbl"),
-            Case::Ascii
+            Needles::all(Case::Ascii)
         ));
     }
 
@@ -1226,6 +1258,47 @@ mod tests {
         assert_eq!(
             creation_order(&m, &ModuleDeps::default()),
             vec![id("dbo.t"), id("sales.t"), id("sales.v")]
+        );
+    }
+
+    /// A collision narrows the needle that collides, and only that one.
+    ///
+    /// `warehouse.t` beside `app.T` is one bare name in two spellings and two
+    /// qualified names in one spelling each — a pair a case-insensitive
+    /// database holds without complaint, because the qualifiers differ. So the
+    /// bare needle has to narrow and the qualified one must not: `WAREHOUSE.T`
+    /// is a spelling of `warehouse.t` that any definition is free to write, and
+    /// answering the bare collision by narrowing both needles would drop that
+    /// edge and let `report.v` be created before the table it reads — the
+    /// failure of 239 again, reached through the guard meant to prevent it.
+    #[test]
+    fn a_bare_collision_does_not_narrow_the_qualified_needle() {
+        let m = modules(&[
+            ("warehouse.t", "SELECT 1"),
+            ("app.T", "SELECT 2"),
+            ("report.v", "SELECT * FROM WAREHOUSE.T"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.T"), id("warehouse.t"), id("report.v")],
+            "`report.v` follows the table it names, and sorts before it without \
+             that edge"
+        );
+
+        // The other half of the split: the bare needle really is narrowed, and
+        // stays narrowed. `report.w` writes plain `t`, which belongs to
+        // `warehouse.t` alone — attaching it to `app.T` as well would close a
+        // cycle with the module `app.T` names, and a cycle is emitted in name
+        // order, before what it depends on.
+        let m = modules(&[
+            ("warehouse.t", "SELECT 1"),
+            ("app.T", "SELECT * FROM report.w"),
+            ("report.w", "SELECT * FROM t"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("warehouse.t"), id("report.w"), id("app.T")],
+            "one bare edge, and no cycle to emit in name order"
         );
     }
 

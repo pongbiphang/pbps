@@ -4174,6 +4174,16 @@ SPEC is in sync with all of these.
     beside `sales.t` shares a bare name without differing in case — the scan's
     ordinary ambiguity, which a narrower fold does not help.
 
+    Each needle is then answered on its own, because they collide
+    independently. `warehouse.t` beside `app.T` is one bare name in two
+    spellings and two qualified names in one spelling each, and a
+    case-insensitive database holds that pair without complaint — the
+    qualifiers tell them apart. Narrowing the qualified needle along with the
+    bare one would lose the edge from any definition that writes
+    `WAREHOUSE.T`, which is 239's failure reached through the guard put there
+    to prevent it. The needle that collides narrows; the other keeps the
+    widest fold it is entitled to.
+
     Two prices are left, both of them the scan's ordinary over-reach and both
     with `depends_on:` for an escape hatch. A definition may name a spelling
     nothing declares, and the fold then attaches it to a declaration it does
