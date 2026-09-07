@@ -431,18 +431,63 @@ fn skip_ws(s: &str, mut i: usize) -> usize {
         let trimmed = rest.trim_start();
         i = s.len() - trimmed.len();
         if trimmed.starts_with("--") {
-            i += trimmed.find('\n').map_or(trimmed.len(), |n| n + 1);
+            // A bare carriage return ends a line comment on this engine, not
+            // just a line feed (PITFALLS, "A comment ends at a carriage
+            // return"). Waiting for `\n` alone swallowed the rest of a
+            // CR-terminated header, so the `AS` was never found and a module
+            // that reads perfectly well was inventoried as unmanageable.
+            i += trimmed.find(['\n', '\r']).map_or(trimmed.len(), |n| n + 1);
             continue;
         }
         if trimmed.starts_with("/*") {
-            match trimmed.find("*/") {
-                Some(end) => i += end + 2,
+            match block_comment(trimmed) {
+                Some(end) => i += end,
                 None => return s.len(),
             }
             continue;
         }
         return i;
     }
+}
+
+/// The length of the block comment `s` opens, both delimiters included, or
+/// `None` when it is never closed.
+///
+/// Block comments nest here — measured, and recorded in `pbps-dialect`'s own
+/// scanner: `SELECT /* a /* b */ c */ 1` returns 1 — so the outer comment ends
+/// at the terminator that matches its opener and not at the first `*/`. Ending
+/// early read the rest of the outer comment as code, where an `ON` inside a
+/// comment could be taken for a trigger's target.
+///
+/// Stepping two bytes past each delimiter is what keeps `/*/` from reading as
+/// an opener that also closes itself. Bytes rather than characters is safe
+/// because neither delimiter's bytes can occur inside a multi-byte character,
+/// so every offset it returns is a character boundary.
+fn block_comment(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                i += 2;
+            }
+            // `depth > 0` guards the subtraction rather than trusting the
+            // caller to have found an opener first: an unmatched `*/` makes
+            // this read no comment at all, where a wrapping subtraction would
+            // make it read to the end of the definition.
+            (b'*', b'/') if depth > 0 => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Matches one keyword case-insensitively, skipping whatever whitespace and
@@ -2158,6 +2203,53 @@ mod module_tests {
         assert_eq!(split, Some((None, "AFTER INSERT AS SELECT 1".to_owned())));
     }
 
+    /// A comment in the header is skipped as one however it is terminated and
+    /// however deeply it nests: what follows it is the definition, and reading
+    /// any of it as comment — or any of the comment as definition — reports a
+    /// readable module as one this tool cannot read.
+    #[test]
+    fn a_header_comment_ends_where_the_engine_ends_it() {
+        let plain = split_module(ModuleKind::View, "CREATE VIEW dbo.v AS SELECT 1", false);
+        assert_eq!(plain, Some((None, "SELECT 1".to_owned())));
+        for stored in [
+            // A carriage return ends a line comment here, so the `AS` after it
+            // is code. Ending the comment at `\n` alone took the whole rest of
+            // the definition with it.
+            "CREATE VIEW dbo.v -- note\rAS SELECT 1",
+            "CREATE VIEW dbo.v -- note\r\nAS SELECT 1",
+            "CREATE VIEW dbo.v -- note\nAS SELECT 1",
+            // Block comments nest: the outer one ends at its own terminator.
+            // Ending at the first `*/` left ` c */ AS SELECT 1` to be read as
+            // code, where the keyword scan meets `c` and refuses.
+            "CREATE VIEW dbo.v /* a /* b */ c */ AS SELECT 1",
+            "CREATE VIEW dbo.v /* a /* b /* c */ d */ e */ AS SELECT 1",
+            // The opener's own `*` must not also close it.
+            "CREATE VIEW dbo.v /*/ still inside */ AS SELECT 1",
+            // A line comment inside a block comment is comment, not a line
+            // ending that could end the block.
+            "CREATE VIEW dbo.v /* -- a */ AS SELECT 1",
+        ] {
+            assert_eq!(
+                split_module(ModuleKind::View, stored, false),
+                plain,
+                "{stored:?}"
+            );
+        }
+        // And the trigger target is read from the definition, not from an `ON`
+        // that a nested comment holds.
+        assert_eq!(
+            split_module(
+                ModuleKind::Trigger,
+                "CREATE TRIGGER dbo.trg /* /* ON wrong */ */ ON dbo.customer AFTER INSERT AS SELECT 1",
+                false,
+            ),
+            Some((
+                Some(TableName::new("dbo".to_owned(), "customer".to_owned())),
+                "AFTER INSERT AS SELECT 1".to_owned()
+            ))
+        );
+    }
+
     /// When the scan meets something it cannot account for it must return
     /// nothing rather than guess: a wrong split would silently drop part of the
     /// definition, and the next apply would recreate the object without it.
@@ -2169,6 +2261,13 @@ mod module_tests {
             // on: guessing a schema would attach the trigger to the wrong table.
             "CREATE TRIGGER trg ON customer AFTER INSERT AS SELECT 1",
             "ALTER VIEW dbo.v AS SELECT 1",
+            // An unterminated block comment swallows the definition on the
+            // server too. Reading past it would be guessing which half of the
+            // text the engine took as comment.
+            "CREATE VIEW dbo.v /* unterminated AS SELECT 1",
+            // And nesting does not rescue it: the inner `*/` closes the inner
+            // comment, leaving the outer one open to the end.
+            "CREATE VIEW dbo.v /* a /* b */ AS SELECT 1",
             "",
         ] {
             let kind = if stored.contains("TRIGGER") {
