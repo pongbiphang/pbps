@@ -18,18 +18,24 @@ use crate::introspect::{
 /// own state and lock tables — they must never enter the managed set, or the
 /// tool would plan changes to itself.
 ///
-/// **By name, not by prefix.** `NOT LIKE '\_\_pbps\_%'` also hid a project's
-/// own `app.__pbps_customers`, which nothing refuses at declaration time: the
-/// pull reported that table absent and the next plan tried to create one that
-/// was already there. The two names SPEC §8.1 defines are the two tables this
-/// tool owns, and they are what the PostgreSQL pull already lists; a step that
-/// adds a third adds it here, where a reader can see what the list is for.
+/// **By the qualified name, not by a prefix and not by the bare name.** Each
+/// widening of that filter hides a table the project itself declared, which
+/// nothing refuses: the pull reports it absent and the next plan tries to
+/// create an object that is already there. `NOT LIKE '\_\_pbps\_%'` hid
+/// `app.__pbps_customers`; `t.name NOT IN (…)` still hid `app.__pbps_state`.
+/// What this tool owns is the two *qualified* names SPEC §8.1 defines — the
+/// ledger lives in `dbo` and `pbps_db::ledger` spells it there — so the filter
+/// asks for the schema too, and a step that adds a third table adds it here,
+/// where a reader can see what the list is for.
+///
+/// The PostgreSQL pull lists the same two names unqualified, because the schema
+/// its ledger will live in is not decided until Phase 5 step 8 (#185).
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
-   AND t.name NOT IN ('__pbps_state', '__pbps_lock')
+   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
  ORDER BY s.name, t.name;";
 
 const COLUMNS: &str = "\
@@ -817,16 +823,20 @@ mod tests {
         assert_eq!(all.matches("UNION ALL").count() + 1, OWNABLE.len());
     }
 
-    /// The table filter names the ledger's own two tables, and names nothing
-    /// else: a pattern here hid a project's `dbo.__pbps_customers` and reported
-    /// a table that is there as absent (issue #170). Asking
-    /// [`pbps_db::ledger`] for the names rather than repeating them keeps a
-    /// rename of the ledger from leaving the filter behind.
+    /// The table filter names the ledger's own two tables *qualified*, and
+    /// nothing else: a pattern here hid a project's `dbo.__pbps_customers`, and
+    /// the bare names still hid its `app.__pbps_state` — both reported a table
+    /// that is there as absent (issue #170). Asking [`pbps_db::ledger`] for the
+    /// names rather than repeating them keeps a move of the ledger from leaving
+    /// the filter behind.
     #[test]
-    fn the_table_filter_names_the_ledgers_own_tables_and_matches_no_pattern() {
+    fn the_table_filter_names_the_ledgers_own_qualified_tables_and_matches_no_pattern() {
         for qualified in [pbps_db::ledger::STATE_TABLE, pbps_db::ledger::LOCK_TABLE] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
-            assert_eq!(schema, "dbo", "SPEC §8.1 puts the ledger in dbo");
+            assert!(
+                TABLES.contains(&format!("s.name = '{schema}'")),
+                "the schema is part of what this tool owns: {qualified}"
+            );
             assert!(TABLES.contains(&format!("'{name}'")), "{qualified}");
         }
         assert!(

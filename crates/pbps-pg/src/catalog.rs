@@ -57,7 +57,9 @@ const NOT_A_PROJECTS_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'informatio
 /// so the pull reported the table absent and the next plan tried to create one
 /// that was already there. The two names SPEC §8.1 defines are the two tables
 /// this tool owns; a step that adds a third adds it here, where a reader can
-/// see what the list is for. The SQL Server pull lists the same two names.
+/// see what the list is for. The SQL Server pull qualifies the two with the
+/// schema SPEC §8.1 puts them in; this one cannot until step 8 says where its
+/// own ledger lives, so `app.__pbps_state` is still hidden here (#185).
 const NOT_ONE_OF_OURS: &str = "c.relname NOT IN ('__pbps_state', '__pbps_lock')";
 
 /// `relkind = 'r'`, and the filter is the whole point: `pg_attribute` holds a
