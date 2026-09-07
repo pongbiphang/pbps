@@ -3531,13 +3531,16 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
     assert_eq!(rendered, "\\x0102 0.12345678901234568");
 }
 
-/// A column's new type goes in before a default written for it.
+/// A column with a default and a new type applies in three phases: the old
+/// default out, the type changed, the new default in.
 ///
-/// Both changes are class 9 and the tiebreaker there is the change's
-/// rendering, which sorted `AlterColumnDefault` first by the alphabet. Measured
-/// here, that plan cannot apply: this engine refuses `SET DEFAULT 'abc'` on an
-/// `integer` column outright, and the statement that would have made the column
-/// `text` is the next one.
+/// Both kinds are class 9 and the tiebreaker there is the change's rendering,
+/// which sorted `AlterColumnDefault` first by the alphabet. Measured here, that
+/// order cannot apply: this engine refuses `SET DEFAULT 'abc'` on an `integer`
+/// column outright, and the statement that would have made the column `text` is
+/// the next one. The other end is measured on the other engine — SQL Server
+/// refuses the type change itself while a default constraint stands — which is
+/// why the middle phase exists and why the ranks are three and not two.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
@@ -3552,6 +3555,9 @@ async fn a_default_written_for_the_new_type_is_set_after_the_type_is() {
     };
     let mut before = Table::default();
     before.columns.insert("n".into(), with("integer", "0"));
+    // A default on both sides, so the plan carries all three phases rather
+    // than only the two this engine can fail on.
+
     let mut a = Schema::default();
     a.tables.insert(table.clone(), before);
 

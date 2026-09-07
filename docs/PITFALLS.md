@@ -591,6 +591,11 @@ at once, no class is right for it, and the same plan is refused. So the
 replacement became two changes, one per direction, and the ordering question
 answers itself.
 
+Then it happened a third time, to `AlterColumnDefault`, which carries `from`
+and `to` the same way — a default *replaced* on a column that is also being
+retyped has to have the type change run between its halves, and one change
+cannot. Three instances is not a coincidence; it is the shape.
+
 The lesson is the second half, not the first. A variant with one entry per
 *object* rather than one per *direction* cannot be ordered by direction, and
 patching the case where one direction happens to be absent leaves the case
@@ -599,6 +604,29 @@ class does this belong in" but "does this change have one answer" — and if it
 does not, it is not one change. Splitting it costs the plan a line, and buys
 each half its own class, its own risk and its own place in what a reviewer
 reads.
+
+## An accidental order that was load-bearing
+
+`order_key` puts a column's type change and its default change in the same
+class, and within a class the tiebreaker is the change's `Debug` rendering. So
+`AlterColumnDefault` ran before `AlterColumnType` — by the alphabet, and by
+nothing else. Measured on SQL Server, that alphabet was holding a plan up: an
+`ALTER COLUMN` that changes a type is refused while a default constraint stands
+on the column (5074, with 4922 behind it), and the default's drop happening to
+sort first was the only reason a retyped defaulted column had ever worked.
+
+PostgreSQL needs the opposite for the other half — a default written for the new
+type cannot be set against the old one — so the rank went in as
+`AlterColumnType => -1`, measured on that engine, and quietly broke the other.
+Nothing in either suite covered a retyped column that has a default: the whole
+guarantee lived in a sort that nobody had written down as a guarantee.
+
+Two things to take from it. When you change an order, ask what was relying on
+the old one — including the parts that were relying on it by accident, which
+are exactly the parts no comment mentions. And when a fix is measured on one
+engine, measure the same statement on the other before believing the rank:
+here each engine refuses a *different* end of the same pair, and only running
+both says the answer is three phases rather than two.
 
 ## A guard built twice is a guard that fires early
 

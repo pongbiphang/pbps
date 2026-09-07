@@ -4827,31 +4827,61 @@ SPEC is in sync with all of these.
     the truth about what runs; the alternative is one line that hides a drop
     among the additions.
 
-271. **A column's new type is applied before a default written for it.** Both
-    changes are ordering class 9, so the tiebreaker decided which ran first,
-    and the tiebreaker is the change's `Debug` rendering — which puts
+271. **A column with a default and a new type is three phases, one rank each.**
+    Both change kinds are ordering class 9, so the tiebreaker decided which ran
+    first, and the tiebreaker is the change's `Debug` rendering — which puts
     `AlterColumnDefault` ahead of `AlterColumnType` by the alphabet and nothing
-    else. Measured, that is not an order the engine accepts:
+    else. Each end of that is refused, by a different engine, and both are
+    measured:
 
     ```text
-    ALTER TABLE t ALTER COLUMN n SET DEFAULT 'abc';
-        -> ERROR: invalid input syntax for type integer: "abc"
-    ALTER TABLE t ALTER COLUMN n TYPE text;   -- never reached
+    the default first, PostgreSQL:
+      ALTER TABLE t ALTER COLUMN n SET DEFAULT 'abc';
+          -> ERROR: invalid input syntax for type integer: "abc"
+    the type first, SQL Server:
+      ALTER TABLE t ALTER COLUMN n bigint NULL;
+          -> Msg 5074: the object 'df_dn2' is dependent on column 'n'
     ```
 
-    A declaration retyping `integer DEFAULT 0` to `text DEFAULT 'abc'` is
-    valid, reviewed, and could not be applied.
+    So neither order works and the answer is three phases: **drop the default
+    the old type gave meaning to, change the type, install the default written
+    for the new one.** `dependency_rank` answers `-2` for
+    `AlterColumnDefault { to: None }`, `-1` for `AlterColumnType` and `0` for
+    `AlterColumnDefault { to: Some(_) }` — the same instrument, and for the same
+    reason, as the foreign key's rank: the dependency is a layering rather than
+    a graph, so a constant says it exactly. No new class and no renumbering.
 
-    The fix is a rank inside the class rather than a new class:
-    `dependency_rank` answers `-1` for `AlterColumnType`, which is what it
-    already does for a foreign-key drop and for the same reason — the
-    dependency is a layering, not a graph, and a constant says it exactly. A
-    type change never needs a default that is already there, and the
-    nullability travels *inside* the type change rather than beside it
-    (`Change::AlterColumnType` carries both ends), so there is no third
-    direction to order.
+    A *replaced* default is two changes when the column is retyped, because the
+    type change has to run between the halves — the third instance of "one
+    variant carrying both directions cannot be ordered by direction"
+    (DECISIONS 270, PITFALLS). **Only** when the type moves: a default replaced
+    on a column that keeps its type needs no drop, since `SET DEFAULT` replaces
+    on PostgreSQL and the SQL Server emitter already drops and adds inside its
+    one statement, and splitting it would put two lines at opposite ends of a
+    plan where one says it better (SPEC §14.1).
 
-    The tiebreaker's own comment already said this would happen: "anything with
-    a real order between them belongs in separate classes; this tiebreaker
-    cannot express it." A rank is the third way, and it is the one that costs
-    no renumbering.
+    The nullability needs no rank of its own: `Change::AlterColumnType` carries
+    both ends, so the differ never emits a nullability change beside a type
+    change on one column — and measured, SQL Server accepts the nullability
+    form of `ALTER COLUMN` with a default standing, so the dependency is the
+    type's alone.
+
+    **The second measurement arrived by breaking it.** The rank went in with
+    only PostgreSQL's end measured, `AlterColumnType` at `-1`, and that reversed
+    an order SQL Server had been relying on by accident: with the default's drop
+    sorted first by the alphabet, a retyped column's constraint had always
+    happened to be gone. Nothing in the suite covered it. The regression test is
+    `a_retyped_column_gives_up_its_old_default_before_the_type_moves`, on the
+    engine that refuses it.
+
+    The tiebreaker's own comment said this would happen: "anything with a real
+    order between them belongs in separate classes; this tiebreaker cannot
+    express it." A rank is the third way, and it is the one that costs no
+    renumbering.
+
+    What this does not reach is a type change on a column whose default the
+    plan does not touch: there is no `AlterColumnDefault` to order, and SQL
+    Server refuses that statement too. It is that engine's emitter to fix —
+    issue #180 — because emitting a drop-and-re-add for an unchanged default
+    would put two lines in every plan that widens a defaulted column, on both
+    engines, for one engine's constraint model.

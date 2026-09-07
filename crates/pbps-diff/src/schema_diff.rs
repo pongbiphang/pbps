@@ -376,6 +376,7 @@ fn diff_columns(
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        let retyped = from_ty != to_ty;
         // A type change subsumes a nullability change rather than sitting beside
         // one: `ALTER COLUMN` restates the whole definition, so two changes would
         // mean two statements where the second undoes half of the first.
@@ -397,12 +398,35 @@ fn diff_columns(
             });
         }
         if base_col.default != col.default {
+            // A default that is *replaced* on a column this same plan retypes
+            // is two changes, because the type change has to run between them.
+            // Measured on SQL Server, an `ALTER COLUMN` that changes the type
+            // is refused while any default constraint stands — 5074, "the
+            // object 'df_dn2' is dependent on column 'n'", with 4922 behind it
+            // — and the nullability form of the same statement is accepted, so
+            // the dependency is the type's and not `ALTER COLUMN`'s.
+            //
+            // Only when the type moves, and only when there is an old default
+            // *and* a new one. A default replaced on a column that keeps its
+            // type needs no drop: `SET DEFAULT` replaces on PostgreSQL, and
+            // the SQL Server emitter already drops and adds inside its one
+            // statement. Splitting it there would put two lines at opposite
+            // ends of the plan where one says it better (SPEC §14.1).
+            let split = retyped && base_col.default.is_some() && col.default.is_some();
             changes.push(Change::AlterColumnDefault {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 from: base_col.default.clone(),
-                to: col.default.clone(),
+                to: if split { None } else { col.default.clone() },
             });
+            if split {
+                changes.push(Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: declared_ref.clone(),
+                    from: None,
+                    to: col.default.clone(),
+                });
+            }
         }
         if base_col.deprecated != col.deprecated {
             changes.push(Change::SetColumnDeprecated {
@@ -986,7 +1010,6 @@ fn dependency_rank(
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
@@ -1029,6 +1052,15 @@ fn dependency_rank(
         // a default that is already there, and the nullability travels inside
         // the type change rather than beside it.
         Change::AlterColumnType { .. } => -1,
+        // And the old default goes before the type, which makes the three
+        // phases a column can need one rank each: drop the default the old
+        // type gave meaning to, change the type, install the default written
+        // for the new one. Measured, SQL Server refuses the middle statement
+        // while the first one's constraint stands (5074 with 4922 behind it),
+        // and `diff_columns` splits a *replaced* default into these two halves
+        // when the type moves, so both ranks have something to order.
+        Change::AlterColumnDefault { to: None, .. } => -2,
+        Change::AlterColumnDefault { to: Some(_), .. } => 0,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -2780,17 +2812,25 @@ mod tests {
         );
     }
 
-    /// A column's new type goes in before a default that was written for it.
+    /// A column with a default and a new type is three phases, one rank each:
+    /// the old default out, the type changed, the new default in.
     ///
-    /// Both are class 9, so the tiebreaker decided, and the tiebreaker is the
-    /// change's rendering — which puts `AlterColumnDefault` ahead of
-    /// `AlterColumnType` by the alphabet and nothing else. Measured on 18.6,
-    /// `SET DEFAULT 'abc'` on an `integer` column is refused outright, "invalid
-    /// input syntax for type integer", so a declaration that retypes the column
-    /// to `text` and gives it a text default produced a plan that rolled back
-    /// on its first statement.
+    /// Both kinds are class 9, so the tiebreaker decided the order, and the
+    /// tiebreaker is the change's rendering — which puts `AlterColumnDefault`
+    /// ahead of `AlterColumnType` by the alphabet and nothing else. Each end of
+    /// that is refused by an engine, and both are measured:
+    ///
+    /// - the new default first: `SET DEFAULT 'abc'` on an `integer` column is
+    ///   "invalid input syntax for type integer" on PostgreSQL;
+    /// - the type first: `ALTER COLUMN n bigint` is refused by SQL Server while
+    ///   a default constraint stands on the column — 5074, with 4922 behind it.
+    ///   The nullability form of the same statement is *accepted*, so the
+    ///   dependency belongs to the type change and not to `ALTER COLUMN`.
+    ///
+    /// So a replaced default on a retyped column is split into its two halves
+    /// (`diff_columns`), and the three ranks put the type between them.
     #[test]
-    fn a_new_type_goes_in_before_a_default_written_for_it() {
+    fn a_retyped_column_drops_its_old_default_changes_type_then_takes_the_new_one() {
         let with = |t: &str, d: &str| Column {
             default: Some(d.to_owned()),
             ..Column::new(ty(t))
@@ -2804,9 +2844,45 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
         };
+        let out = at(|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
+        let retype = at(|c| matches!(c, Change::AlterColumnType { .. }));
+        let into = at(|c| matches!(c, Change::AlterColumnDefault { to: Some(_), .. }));
         assert!(
-            at(|c| matches!(c, Change::AlterColumnType { .. }))
-                < at(|c| matches!(c, Change::AlterColumnDefault { .. })),
+            out < retype && retype < into,
+            "out {out}, retype {retype}, into {into}: {:#?}",
+            cs.changes
+        );
+    }
+
+    /// The negative half: a default replaced on a column that keeps its type
+    /// stays one change. Nothing has to run between the halves, `SET DEFAULT`
+    /// replaces on PostgreSQL, and SQL Server's emitter already drops and adds
+    /// inside its own statement — so splitting would put two lines at opposite
+    /// ends of a plan where one says it better.
+    #[test]
+    fn a_default_replaced_without_a_retype_stays_one_change() {
+        let with = |t: &str, d: &str| Column {
+            default: Some(d.to_owned()),
+            ..Column::new(ty(t))
+        };
+        let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+        let declared = schema_of("dbo.t", table(&[("n", with("int", "1"))]));
+        let cs = run(&base, &declared, &[]);
+        assert_eq!(
+            cs.changes.len(),
+            1,
+            "one change, not two: {:#?}",
+            cs.changes
+        );
+        assert!(
+            matches!(
+                cs.changes[0].change,
+                Change::AlterColumnDefault {
+                    from: Some(_),
+                    to: Some(_),
+                    ..
+                }
+            ),
             "{:#?}",
             cs.changes
         );

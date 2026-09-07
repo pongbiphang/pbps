@@ -7132,3 +7132,53 @@ async fn the_pull_hides_this_tools_two_tables_and_not_a_projects_own() {
         "this tool's own tables must never enter the managed set: {names:?}"
     );
 }
+
+/// A column that has a default and changes type is three statements, in one
+/// order: the old default out, the type changed, the new default in.
+///
+/// This engine is where the middle phase is forced. **Measured**, `ALTER TABLE
+/// … ALTER COLUMN n bigint` is refused while any default constraint stands on
+/// the column — 5074, "the object 'df_dn2' is dependent on column 'n'", with
+/// 4922 behind it — and the *nullability* form of the same statement is
+/// accepted, so the dependency belongs to the type change rather than to
+/// `ALTER COLUMN`. PostgreSQL accepts the type change and refuses the other
+/// end, a default the old type cannot read, which is why the ordering is the
+/// differ's and not a dialect's (DECISIONS 271).
+///
+/// The plan is run through `try_apply`, in one transaction, because that is
+/// how a refusal reaches an operator: the statement and the engine's word, and
+/// nothing before it left standing.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_retyped_column_gives_up_its_old_default_before_the_type_moves() {
+    let with = |t: &str, d: &str| Column {
+        default: Some(d.to_owned()),
+        ..Column::new(ty(t))
+    };
+    let table_of = |c: Column| {
+        let mut t = Table::default();
+        t.columns.insert("n".into(), c);
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "retyped"), t);
+        s
+    };
+    let a = table_of(with("int", "40000"));
+    let b = table_of(with("smallint", "1"));
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+    let ids_b = mint_ids(&b, &ids_a, &[]);
+
+    let mut db = TestDb::create("retyped").await;
+    apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
+    let refused = try_apply(&mut db.conn, &plan(&a, &ids_a, &b, &ids_b)).await;
+    let state = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    assert_eq!(refused, Ok(()), "the plan has to apply");
+    assert_eq!(state.schema, normalized(&b));
+}
