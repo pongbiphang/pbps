@@ -1626,6 +1626,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         // `relkind` says so, and one whose does not.
         "partitioned table",
         "inherits from another",
+        // And the other end of it, which is no more an ordinary table.
+        "whose reads return their rows",
         // A key whose check can be put off to the end of the transaction.
         "DEFERRABLE INITIALLY DEFERRED",
         // A composite key that refuses a partly-null row where the default
@@ -1886,8 +1888,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             // `__pbps_lock` out names them, and a prefix would have reported a
             // project's own table as absent.
             pbps_model::TableName::new(&s, "__pbps_customers"),
-            // The inheritance parent is an ordinary table and stays.
-            pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "borrowing"),
             pbps_model::TableName::new(&s, "bounded"),
             pbps_model::TableName::new(&s, "cached"),
@@ -1935,6 +1935,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     assert_eq!(
         refused,
         vec![
+            pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "descendant"),
             pbps_model::TableName::new(&s, "dormant"),
             pbps_model::TableName::new(&s, "dotted"),

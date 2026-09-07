@@ -748,6 +748,17 @@ value that is actually stored: one function decides that value for both the
 guard and the construction, because a check on something *like* what is stored
 is a check on nothing.
 
+**One end of a relationship guarded, the other left open.** An inheritance
+child was refused — its columns are somebody else's — and the parent was pulled
+as an ordinary table. Measured, it is not one: a `SELECT` from the parent
+returns the children's rows as well as its own, and `ALTER TABLE parent ADD
+COLUMN` gives the column to every child. A managed parent would compare clean
+while a plan against it silently changed tables nobody had declared. The live
+test even asserted the wrong half, in a comment that stated the behaviour
+instead of justifying it: "the inheritance parent is an ordinary table and
+stays". **A relationship has two ends, and refusing one of them is a decision
+about the other that nobody wrote down.**
+
 **The shape both share:** the catalog answers "what kind of thing is this?" in
 one column and "and is it that kind of thing after all?" in another. A reader
 that switches on the first and never looks at the second is not reading the

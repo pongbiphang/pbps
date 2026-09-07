@@ -76,7 +76,8 @@ fn tables_query() -> String {
       WHERE c.relkind = 'r'
         AND {NOT_A_PROJECTS_SCHEMA}
         AND {NOT_ONE_OF_OURS}
-        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+                         WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
         AND NOT c.relrowsecurity
         AND NOT c.relforcerowsecurity
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid)
@@ -97,6 +98,13 @@ fn tables_query() -> String {
 /// tells it apart. Its inherited columns are `attislocal = false`, so a pull
 /// that took it for an ordinary table would declare somebody else's columns as
 /// its own and plan a table that has them locally instead of by inheritance.
+///
+/// **The parent is no more an ordinary table than the child is**, and it took a
+/// review round to see it: measured, a `SELECT` from the parent returns the
+/// children's rows as well as its own, and `ALTER TABLE parent ADD COLUMN`
+/// gives the column to every child. A managed parent would therefore compare
+/// clean while a plan against it silently changed tables nobody declared. Both
+/// ends of `pg_inherits` are excluded, and each is named for its own reason.
 fn partitioned_query() -> String {
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
@@ -106,7 +114,9 @@ fn partitioned_query() -> String {
               WHERE p.polrelid = c.oid)::int8 AS policies,
             c.relreplident::text AS replica_identity,
             c.relhasrules AS has_rules, am.amname AS access_method,
-            c.reloftype::regtype::text AS of_type
+            c.reloftype::regtype::text AS of_type,
+            EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)
+              AS inherited_from
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
@@ -114,7 +124,8 @@ fn partitioned_query() -> String {
         AND {NOT_ONE_OF_OURS}
         AND (c.relkind IN ('p', 'f')
              OR (c.relkind = 'r'
-                 AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)
+                 AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+                               WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
                       OR c.relrowsecurity
                       OR c.relforcerowsecurity
                       OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
@@ -479,6 +490,15 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             // with them. The model has one kind of table.
             "r" if optional_text(&row, "access_method")?.as_deref() != Some("heap") => {
                 "a table on a table access method other than `heap`"
+            }
+            // Both ends of an inheritance, because both are unusable and for
+            // different reasons. **Measured**: a `SELECT` from the parent
+            // returns the children's rows too, and `ALTER TABLE parent ADD
+            // COLUMN` gives the column to every child — so a plan that changes
+            // a managed parent changes tables nobody declared.
+            "r" if flag(&row, "inherited_from")? => {
+                "a table other tables inherit from, whose reads return their rows and whose \
+                 changes recurse into them"
             }
             "r" => "a table that inherits from another",
             other => &format!("a relation of kind `{other}`"),
