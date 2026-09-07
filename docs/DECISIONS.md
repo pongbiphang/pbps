@@ -5697,3 +5697,49 @@ SPEC is in sync with all of these.
     structure, independent of which types or callers happen to accept the
     expression today. Both upper- and lower-case openers are accepted, and
     neither gives backslashes escape semantics.
+283. **A routine argument type is its own text type, not a `ColumnType`.**
+    `RoutineId` held `Vec<ColumnType>`, which was right while the only dialect
+    was SQL Server, where a parameter's type is a column's type. PostgreSQL
+    identifies a routine by the types in `proargtypes`, printed through
+    `format_type` — the same text `oid::regprocedure` writes — and that text is
+    a wider language than a column type is.
+
+    Measured on 18.6, from the identity of two functions declared with ordinary
+    parameters:
+
+    ```text
+    id.a  ->  id.a(character varying,"char",integer,numeric,
+                   timestamp with time zone,integer[],text[])
+    id.d  ->  id.d(id.pos,time without time zone,interval,
+                   bit varying,character)
+    ```
+
+    Of those twelve, three parse as a `ColumnType`. The rest are arrays, a
+    quoted name (`"char"` is a real type and is *not* `character`), a
+    schema-qualified domain, and spellings a column type does not model. Making
+    them `ColumnType` would mean either widening `ColumnType` with things no
+    column declaration may hold, or refusing routines this tool must be able to
+    read back.
+
+    **The identity is text, and the text is compared.** `RoutineArg` is a
+    validated string: it must be writable into an identity string and readable
+    back out of one, so it refuses an empty argument, a top-level comma, and
+    unbalanced `()`, `[]` or `"`. It canonicalizes only what every engine
+    agrees on — outside double quotes, case folds down and the whitespace
+    beside `(`, `)`, `[`, `]` and `,` is dropped; inside them nothing is
+    touched, because `"char"` and `"CHAR"` are two types. So `INT` and `int`
+    and `decimal(10, 2)` and `decimal(10,2)` are one key, and the canonical
+    spelling is the one the identity string carries.
+
+    **`normalize_routine_arg` stays the dialect's.** A dialect that does model
+    its parameters as column types parses the text, normalizes it as a column
+    type, and prints it back; text that does not parse as one is left alone.
+    That keeps SQL Server's `INT` -> `int` folding (72) and lets PostgreSQL
+    answer with the catalog's own spelling.
+
+    Not a `ColumnType` extended with a "raw" variant: that variant would be
+    reachable from a column declaration, where none of these spellings is
+    valid, and the loader would have to refuse it there. A type that cannot
+    hold the bad value beats a branch that checks for it.
+
+    Closes the question 59 left open.

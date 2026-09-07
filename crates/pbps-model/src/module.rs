@@ -36,7 +36,6 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::name::TableName;
-use crate::types::ColumnType;
 
 /// The qualified name of a database object: `schema.object`.
 ///
@@ -45,6 +44,164 @@ use crate::types::ColumnType;
 /// named after a table" is not a rule to remember but a consequence of the two
 /// names having one type. [`check_names`] is that consequence made checkable.
 pub type ObjectName = TableName;
+
+/// One argument type of a routine's identity, in the engine's own spelling.
+///
+/// **Not a [`ColumnType`], and the difference is not a nicety.** Measured on
+/// PostgreSQL 18.6, a routine's identity is `proargtypes` rendered by
+/// `format_type` — the same list `oid::regprocedure` prints — and it holds
+/// spellings a column type cannot:
+///
+/// ```text
+/// CREATE FUNCTION id.a(varchar(10), "char", int[], id.pos) ...
+///   -> id.a(character varying,"char",integer[],id.pos)
+/// ```
+///
+/// An array, a quoted name whose case the engine keeps, and a schema-qualified
+/// user type. [`ColumnType`]'s base name admits ASCII alphanumerics, underscore
+/// and space and lowercases what it holds, so of those four one is refused for
+/// its brackets, one for its quotes, one for its dot, and the quoted one would
+/// have its case taken away as well. And a dialect's column normalizer is a
+/// closed catalogue of the engine's own type names, which refuses a domain the
+/// user declared — while a routine may take one.
+///
+/// So this holds text and compares as text, for the reason
+/// [`Module::definition`] does: **the engine is the normalizer.**
+/// `Dialect::normalize_routine_arg` turns a declared spelling into the one the
+/// catalog will show, and this type carries the result.
+///
+/// Modifiers are gone by then, not stripped here: the engine discards them
+/// when it identifies a routine (`f(varchar(10))` and `f(varchar(20))` are one
+/// function, ADR-0009 §1), which is the dialect's normalization to perform and
+/// this type's to record.
+///
+/// # The one opinion it does have
+///
+/// Inviolable constraint 1 says two semantically identical schemas must be
+/// `==`, and `app.f(int, text)` and `app.f(INT,text)` are one key, before any
+/// dialect is present to say so — the loader builds the map, and an offline
+/// `plan` compares two maps without a connection. So the text is canonicalized
+/// on the way in, and **only where every SQL engine agrees**: outside double
+/// quotes, ASCII case does not matter and whitespace around punctuation does
+/// not either. Inside them nothing is touched, which is the whole reason this
+/// is not a [`ColumnType`]: `"char"` is a type whose case the engine keeps,
+/// and lowercasing it would name a different type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutineArg(String);
+
+impl RoutineArg {
+    /// The spelling, unchanged.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a routine argument's text may not be.
+///
+/// Every rule here is about the *shape* the identity string needs, and none is
+/// about which types exist: a type this model has never heard of is a type the
+/// engine may still have, and refusing it here would refuse a valid routine
+/// because the model's catalogue is younger than the database.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RoutineArgError {
+    #[error("a routine argument type is empty")]
+    Empty,
+
+    /// Text that is not one type name: an unbalanced bracket, quote or
+    /// parenthesis; a comma outside all of them, which is the character that
+    /// separates one argument from the next; or, outside quotes, a character a
+    /// type name is not written with.
+    #[error("`{0}` is not one routine argument type")]
+    Shape(String),
+}
+
+impl FromStr for RoutineArg {
+    type Err = RoutineArgError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if t.is_empty() {
+            return Err(RoutineArgError::Empty);
+        }
+        // Structure and canonical form in one pass, because the second needs
+        // the first: whether a character is punctuation to fold around, or a
+        // byte of a quoted name to leave alone, is what the quote state says.
+        let mut out = String::with_capacity(t.len());
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        let mut quoted = false;
+        let mut pending_space = false;
+        let mut chars = t.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if quoted {
+                out.push(c);
+                if c == '"' {
+                    // A doubled quote is a quote inside the name, which is how
+                    // both engines spell one, so it does not close the region.
+                    if t[i + 1..].starts_with('"') {
+                        out.push('"');
+                        chars.next();
+                    } else {
+                        quoted = false;
+                    }
+                }
+                continue;
+            }
+            if c.is_whitespace() {
+                pending_space = !out.is_empty();
+                continue;
+            }
+            match c {
+                '(' => parens += 1,
+                ')' => parens = parens.checked_sub(1).ok_or_else(|| shape(t))?,
+                '[' => brackets += 1,
+                ']' => brackets = brackets.checked_sub(1).ok_or_else(|| shape(t))?,
+                ',' if parens == 0 && brackets == 0 => return Err(shape(t)),
+                ',' | '"' | '.' | '_' => {}
+                c if c.is_alphanumeric() => {}
+                // Everything else. A type name is written with letters,
+                // digits, `_`, `.`, and the punctuation above; a semicolon, an
+                // apostrophe or the start of a comment is not one, and this
+                // text is interpolated verbatim into `DROP FUNCTION` and
+                // `GRANT`. A whitelist makes that statement safe by
+                // construction instead of by review — and refusing an
+                // unwritable name costs nothing, because no catalog returns
+                // one.
+                _ => return Err(shape(t)),
+            }
+            // A space between two words is part of the name — `timestamp with
+            // time zone` — and a space beside punctuation is layout.
+            if pending_space
+                && !matches!(c, '(' | ')' | '[' | ']' | ',')
+                && !out.ends_with(['(', '[', ','])
+            {
+                out.push(' ');
+            }
+            pending_space = false;
+            if c == '"' {
+                quoted = true;
+                out.push(c);
+            } else {
+                out.extend(c.to_lowercase());
+            }
+        }
+        if quoted || parens != 0 || brackets != 0 {
+            return Err(shape(t));
+        }
+        Ok(RoutineArg(out))
+    }
+}
+
+fn shape(s: &str) -> RoutineArgError {
+    RoutineArgError::Shape(s.to_owned())
+}
+
+impl fmt::Display for RoutineArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// The identity of a routine: its qualified name **and** its argument types.
 ///
@@ -59,11 +216,11 @@ pub struct RoutineId {
     /// Empty for a routine declared `f()`. A routine that takes no arguments
     /// is still a routine — the parentheses in the declared name are what
     /// separate it from a view, not the presence of an argument.
-    pub args: Vec<ColumnType>,
+    pub args: Vec<RoutineArg>,
 }
 
 impl RoutineId {
-    pub fn new(name: ObjectName, args: Vec<ColumnType>) -> Self {
+    pub fn new(name: ObjectName, args: Vec<RoutineArg>) -> Self {
         Self { name, args }
     }
 }
@@ -177,7 +334,7 @@ impl ModuleId {
     }
 
     /// The declared argument types, where the kind has them.
-    pub fn args(&self) -> Option<&[ColumnType]> {
+    pub fn args(&self) -> Option<&[RoutineArg]> {
         match self {
             ModuleId::Routine(r) => Some(&r.args),
             ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
@@ -201,7 +358,7 @@ pub enum ModuleIdError {
         whole: String,
         argument: String,
         #[source]
-        source: crate::types::TypeParseError,
+        source: RoutineArgError,
     },
 }
 
@@ -1572,11 +1729,13 @@ mod tests {
             "app.v",
             "app.f(integer,text)",
             // A modifier with its own comma: the argument separator and the
-            // one inside `decimal(10, 2)` are the same character, and only
-            // nesting tells them apart. Spelled as `ColumnType` spells it,
-            // because that is what wrote the key.
-            "app.f(decimal(10, 2))",
-            "app.f(decimal(10, 2),text,numeric(38, 10))",
+            // one inside `decimal(10,2)` are the same character, and only
+            // nesting tells them apart. Spelled without the space, because
+            // `RoutineArg` folds whitespace beside punctuation — the same
+            // canonical form whichever way the declaration wrote it, which is
+            // the property `one_routine_written_two_ways_is_one_key` asserts.
+            "app.f(decimal(10,2))",
+            "app.f(decimal(10,2),text,numeric(38,10))",
             "app.f()",
             "app.orders.audit",
         ] {
@@ -1606,6 +1765,117 @@ mod tests {
             "app.f(,)",
         ] {
             assert!(bad.parse::<ModuleId>().is_err(), "`{bad}` must not parse");
+        }
+    }
+
+    /// Every spelling PostgreSQL 18.6 puts in a routine's identity, measured
+    /// from `proargtypes` through `format_type` — the same list
+    /// `oid::regprocedure` prints, and the reason a routine argument is not a
+    /// `ColumnType`: of these, only three would parse as one.
+    #[test]
+    fn every_identity_spelling_the_engine_writes_is_one_argument() {
+        for spelling in [
+            "character varying",
+            "\"char\"",
+            "integer",
+            "numeric",
+            "timestamp with time zone",
+            "integer[]",
+            "text[]",
+            "id.pos",
+            "time without time zone",
+            "interval",
+            "bit varying",
+            "character",
+            "double precision[]",
+            "\"My Type\"",
+            "s.\"Odd Name\"[]",
+        ] {
+            let arg: RoutineArg = spelling.parse().expect(spelling);
+            assert_eq!(arg.to_string(), spelling, "{spelling} did not survive");
+        }
+    }
+
+    /// The canonicalization is only what every SQL engine agrees on: outside
+    /// quotes, case and the whitespace beside punctuation do not matter.
+    /// Inside them nothing is touched — `"char"` is a real type on PostgreSQL
+    /// and `"CHAR"` is not the same one.
+    #[test]
+    fn an_argument_is_folded_outside_quotes_and_kept_inside_them() {
+        for (written, canonical) in [
+            ("INT", "int"),
+            ("  Integer  ", "integer"),
+            ("decimal(10, 2)", "decimal(10,2)"),
+            ("integer []", "integer[]"),
+            ("TIMESTAMP  WITH   TIME ZONE", "timestamp with time zone"),
+            ("Character Varying ( 10 )", "character varying(10)"),
+            ("ID.Pos", "id.pos"),
+            ("\"char\"", "\"char\""),
+            ("\"CHAR\"", "\"CHAR\""),
+            ("s.\"Odd Name\"", "s.\"Odd Name\""),
+            ("\"a\"\"b\"", "\"a\"\"b\""),
+        ] {
+            assert_eq!(
+                written.parse::<RoutineArg>().expect(written).to_string(),
+                canonical,
+                "{written}"
+            );
+        }
+        assert_ne!(
+            "\"char\"".parse::<RoutineArg>().unwrap(),
+            "\"CHAR\"".parse::<RoutineArg>().unwrap(),
+            "a quoted type name keeps its case, and these are two types"
+        );
+    }
+
+    /// The negative half, which is where a structural rule earns its place: an
+    /// argument that could not be written into an identity string and read
+    /// back out of one is refused rather than stored.
+    #[test]
+    fn text_that_is_not_one_argument_is_refused() {
+        for bad in [
+            "",
+            "   ",
+            // The character that separates one argument from the next.
+            "integer,text",
+            // Nothing closes them.
+            "integer[",
+            "\"unclosed",
+            "numeric(10",
+            "numeric)",
+            "integer]",
+            // Characters no type name is written with — and this text is
+            // interpolated into `DROP FUNCTION`.
+            "integer; DROP TABLE t",
+            "integer'",
+            "integer -- note",
+            "integer/*note*/",
+        ] {
+            assert!(
+                bad.parse::<RoutineArg>().is_err(),
+                "`{bad}` is not one argument"
+            );
+        }
+        // And a comma that is *inside* something is not a separator.
+        assert!("numeric(10,2)".parse::<RoutineArg>().is_ok());
+    }
+
+    /// The identity string carries them the same way, which is what makes the
+    /// map key and the JSON key the same text.
+    #[test]
+    fn an_identity_holding_an_array_and_a_quoted_name_round_trips() {
+        for spelling in [
+            "app.f(\"char\",integer[])",
+            "app.f(character varying,timestamp with time zone)",
+            "app.f(id.pos)",
+        ] {
+            let parsed: ModuleId = spelling.parse().unwrap();
+            assert_eq!(parsed.to_string(), spelling);
+            assert_eq!(
+                serde_json::from_str::<ModuleId>(&serde_json::to_string(&parsed).unwrap()).unwrap(),
+                parsed,
+                "{spelling} does not survive JSON"
+            );
         }
     }
 

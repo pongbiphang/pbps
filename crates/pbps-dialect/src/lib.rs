@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 
 use pbps_model::{
     Change, ChangeSet, ColumnType, Module, ModuleId, ModuleKind, ObjectName, RiskClass, Role,
-    Schema, Strategy, Table, TableName,
+    RoutineArg, Schema, Strategy, Table, TableName,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -725,20 +725,42 @@ pub trait Dialect {
         false
     }
 
-    /// This type as the engine spells it *for routine identity*.
+    /// This argument type as the engine spells it *in a routine's identity*.
     ///
-    /// Deliberately not [`Dialect::normalize_type`]. Measured on PostgreSQL 18
-    /// (ADR-0009 §1), `f(varchar(10))` and `f(varchar(20))` are one function,
-    /// identified as `f(character varying)`: the engine discards type
-    /// modifiers when it identifies a routine, and keeps them when it types a
-    /// column. Reusing the column normalizer would key one engine object as
-    /// two modules, and every `DROP` and `GRANT` the plan emitted would name a
-    /// signature the engine resolves to something else.
+    /// Deliberately not [`Dialect::normalize_type`], and deliberately not over
+    /// a [`ColumnType`] at all. Measured on PostgreSQL 18.6 (ADR-0009 §1):
     ///
-    /// The default defers to the column spelling, which is right for any
-    /// dialect where nothing overloads: nothing calls it there.
-    fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-        self.normalize_type(ty)
+    /// - `f(varchar(10))` and `f(varchar(20))` are one function, identified as
+    ///   `f(character varying)` — the engine discards type modifiers when it
+    ///   identifies a routine and keeps them when it types a column, so reusing
+    ///   the column normalizer would key one engine object as two modules and
+    ///   every `DROP` and `GRANT` the plan emitted would name a signature the
+    ///   engine resolves to something else; and
+    /// - an identity holds spellings a column type cannot — `"char"`,
+    ///   `integer[]`, a schema-qualified domain — which is why
+    ///   [`pbps_model::RoutineArg`] carries text and this returns text.
+    ///
+    /// The default reads the argument as a column type and spells it that way
+    /// where it can, and leaves it alone where it cannot. That is right for a
+    /// dialect whose routine arguments *are* column types — SQL Server's are,
+    /// and `dbo.f(int)` declared against `dbo.f(integer)` read back is one
+    /// routine there, which is the case this default exists to keep — and it
+    /// cannot damage the spellings a column type has no room for, because
+    /// those do not parse as one and come back unchanged.
+    ///
+    /// A dialect whose identities are not column types overrides it.
+    fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+        let Ok(ty) = arg.as_str().parse::<ColumnType>() else {
+            return Ok(arg.clone());
+        };
+        let spelled = self.normalize_type(&ty)?;
+        spelled
+            .to_string()
+            .parse()
+            .map_err(|_| DialectError::Unsupported {
+                dialect: self.name(),
+                feature: format!("`{spelled}` as a routine argument type"),
+            })
     }
 
     /// Whether this engine's roles are the tool's to create, rename and drop
@@ -1420,10 +1442,16 @@ mod tests {
             matches!(kind, ModuleKind::Function | ModuleKind::Procedure)
         }
         /// The modifiers a column keeps: `varchar(10)` and `varchar(20)` are
-        /// one function to this engine, and `f(character varying)` is what it
-        /// calls both.
-        fn normalize_routine_arg(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
-            Ok(ColumnType::simple(&ty.base))
+        /// one function to this engine, and `f(varchar)` is what it calls
+        /// both. Text in, text out — the argument of a routine identity is not
+        /// a column type (ADR-0009 §1).
+        fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+            let s = arg.as_str();
+            let base = s.split('(').next().unwrap_or(s).trim();
+            base.parse().map_err(|_| DialectError::Unsupported {
+                dialect: "overloading",
+                feature: format!("`{s}` as a routine argument"),
+            })
         }
     }
 
@@ -1567,17 +1595,18 @@ mod tests {
 
     /// Routine identity is not column identity: the modifiers `normalize_type`
     /// keeps are the ones the engine discards when it identifies a routine
-    /// (ADR-0009 §1, measured). The default defers to the column spelling,
-    /// which is only ever right where nothing overloads.
+    /// (ADR-0009 §1, measured). The default leaves the argument alone, which is
+    /// only ever asked where nothing overloads.
     #[test]
     fn routine_argument_normalization_is_not_column_normalization() {
+        let arg: RoutineArg = "varchar(10)".parse().unwrap();
         let ty: ColumnType = "varchar(10)".parse().unwrap();
         assert_eq!(
-            OverloadingDialect.normalize_routine_arg(&ty).unwrap(),
-            ColumnType::simple("varchar")
+            OverloadingDialect.normalize_routine_arg(&arg).unwrap(),
+            "varchar".parse::<RoutineArg>().unwrap()
         );
         assert_eq!(OverloadingDialect.normalize_type(&ty).unwrap(), ty);
-        assert_eq!(MinimalDialect.normalize_routine_arg(&ty).unwrap(), ty);
+        assert_eq!(MinimalDialect.normalize_routine_arg(&arg).unwrap(), arg);
     }
 }
 

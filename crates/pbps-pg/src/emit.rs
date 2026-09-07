@@ -36,13 +36,13 @@
 //!
 //! # What is not here
 //!
-//! Modules, roles and reference data, each of which is its own Phase 5 step and
-//! refuses by name through [`crate::Unbuilt`] until it arrives.
+//! Roles and reference data, each of which is its own Phase 5 step and refuses
+//! by name through [`crate::Unbuilt`] until it arrives.
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Change, Column, ColumnType, ForeignKey, Index, PrimaryKey, ReferentialAction, Strategy, Table,
-    TableName, UniqueConstraint,
+    Change, Column, ColumnType, ForeignKey, Index, Module, ModuleId, ModuleKind, PrimaryKey,
+    ReferentialAction, RoutineArg, Strategy, Table, TableName, UniqueConstraint,
 };
 
 use crate::types::DIALECT;
@@ -924,6 +924,190 @@ fn one(pg: &Postgres, table: &TableName, body: String) -> Sql {
     Ok(vec![on(pg, table, &body)?])
 }
 
+/// The engine's keyword for a module kind.
+const fn keyword(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::View => "VIEW",
+        ModuleKind::Procedure => "PROCEDURE",
+        ModuleKind::Function => "FUNCTION",
+        ModuleKind::Trigger => "TRIGGER",
+    }
+}
+
+/// The whole `CREATE` statement for a module, under its schema's write path.
+///
+/// The emitter composes the prefix and the declaration holds the body, so the
+/// SQL still appears exactly once (ADR-0002). Where the prefix ends is the
+/// engine's grammar, not a convention:
+///
+/// | Kind | Emitted prefix | So `definition:` starts at |
+/// |---|---|---|
+/// | view | `CREATE VIEW <name> AS` | the `SELECT` |
+/// | function, procedure | `CREATE FUNCTION <name>` | the parameter list |
+/// | trigger | `CREATE TRIGGER <name>` | `AFTER INSERT ON <table> …` |
+///
+/// **A trigger is the one that differs from the SQL Server side, and it is the
+/// grammar that decides it.** T-SQL writes `CREATE TRIGGER x ON t AFTER
+/// INSERT`, so the emitter can supply the table; PostgreSQL writes
+/// `CREATE TRIGGER x AFTER INSERT ON t`, where the table comes *after* text
+/// only the declaration holds. Splitting the prefix there would mean finding
+/// the end of the event list, which is parsing SQL (§8.2). So the table is in
+/// the identity **and** in the body, and [`validate_module`] refuses a
+/// declaration where the body does not name the table the identity does —
+/// because nothing else would catch it: **measured**, `CREATE TRIGGER audit
+/// AFTER INSERT ON app.other` under the key `app.t.audit` is accepted by the
+/// engine, and the mismatch only surfaces a plan later when
+/// `DROP TRIGGER audit ON app.t` cannot find it.
+///
+/// And **measured**, a trigger's own name is never schema-qualified:
+///
+/// ```text
+/// CREATE TRIGGER m1.audit AFTER INSERT ON m1.t …   syntax error at or near "."
+/// CREATE TRIGGER audit    AFTER INSERT ON m1.t …   accepted
+/// ```
+///
+/// which is the same fact ADR-0009 §1 records from the other side: the schema
+/// in `ModuleId::Trigger` is the table's, and there is nowhere else for it to
+/// come from.
+fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
+    let body = module.definition.trim();
+    if body.is_empty() {
+        return Err(empty_definition(id));
+    }
+    let sql = match module.kind {
+        // The `AS` is the emitter's, so a view's definition is just its query —
+        // which is what a reader of the declarations wants to see.
+        ModuleKind::View => format!("CREATE VIEW {} AS\n{body}", qualified(&id.object_name())?),
+        // A parameter list is part of the object's contract and modelling
+        // PostgreSQL's parameter syntax — modes, defaults, `VARIADIC` — would
+        // be parsing SQL. So everything after the name is the user's
+        // (ADR-0009 §1).
+        ModuleKind::Function | ModuleKind::Procedure => format!(
+            "CREATE {} {}\n{body}",
+            keyword(module.kind),
+            qualified(&id.object_name())?
+        ),
+        ModuleKind::Trigger => format!("CREATE TRIGGER {}\n{body}", quote(id.name())?),
+    };
+    scoped(pg, id.schema(), &sql)
+}
+
+/// The `DROP` for a module, under its schema's write path.
+///
+/// **Never `CASCADE`.** It is the shortest path out of every dependency
+/// refusal in ADR-0009 §4 and it destroys objects nobody reviewed; SPEC 14.3's
+/// guardrail is that the plan names every object it drops, or it does not drop.
+/// The dependents are the connected plan's to enumerate and to put in front of
+/// the approver.
+fn drop_module(pg: &Postgres, id: &ModuleId, kind: ModuleKind) -> Result<Statement, DialectError> {
+    let sql = match kind {
+        ModuleKind::View => format!("DROP VIEW {};", qualified(&id.object_name())?),
+        // With the signature, because the name alone is not the object: two
+        // overloads share it, and **measured**, `DROP FUNCTION app.f` is
+        // refused by name where more than one exists.
+        ModuleKind::Function | ModuleKind::Procedure => format!(
+            "DROP {} {}({});",
+            keyword(kind),
+            qualified(&id.object_name())?,
+            signature(id)?
+        ),
+        // `DROP TRIGGER audit` is a syntax error: the name is scoped to the
+        // table (ADR-0009 §1), so the table is not decoration here.
+        ModuleKind::Trigger => format!(
+            "DROP TRIGGER {} ON {};",
+            quote(id.name())?,
+            qualified(attached_to(id)?)?
+        ),
+    };
+    scoped(pg, id.schema(), &sql)
+}
+
+/// The argument types of a routine's identity, as the engine spells them.
+///
+/// Interpolated rather than quoted because they are type names, not
+/// identifiers — and safe to interpolate because [`RoutineArg`] admits only
+/// the characters a type name is written with.
+fn signature(id: &ModuleId) -> Result<String, DialectError> {
+    let args = id.args().ok_or_else(|| {
+        invalid(format!(
+            "`{id}` is a routine without an argument list, and this engine identifies a routine by \
+             its arguments: two overloads share the name, so `DROP FUNCTION` needs the signature \
+             to say which one (ADR-0009 §1)"
+        ))
+    })?;
+    Ok(args
+        .iter()
+        .map(RoutineArg::as_str)
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
+    id.attached_to().ok_or_else(|| {
+        invalid(format!(
+            "trigger `{id}` does not say which table it is on, and on this engine a trigger's \
+             name is scoped to its table rather than to a schema (ADR-0009 §1)"
+        ))
+    })
+}
+
+fn empty_definition(id: &ModuleId) -> DialectError {
+    invalid(format!("module `{id}` has an empty definition"))
+}
+
+/// What a module declaration must satisfy before anything connects.
+///
+/// Each of these is a refusal the engine would otherwise make at `CREATE`
+/// time — or, for the trigger's table, one it would **not** make at all.
+pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    if module.definition.trim().is_empty() {
+        found.push(empty_definition(id));
+    }
+    // The names first: `quote` refuses an identifier over the engine's byte
+    // limit, so a module this call passed would be one the emitter cannot
+    // spell. `validate` is the command that exists to say so offline.
+    if let Err(e) = quote(id.schema()).and_then(|_| quote(id.name())) {
+        found.push(e);
+    }
+    match module.kind {
+        ModuleKind::Function | ModuleKind::Procedure => {
+            if let Err(e) = signature(id) {
+                found.push(e);
+            }
+        }
+        ModuleKind::Trigger => match attached_to(id) {
+            Err(e) => found.push(e),
+            Ok(on) => {
+                if let Err(e) = qualified(on) {
+                    found.push(e);
+                }
+                // The body carries the `ON <table>` this engine's grammar puts
+                // after the event list, so the identity and the text can
+                // disagree — and the engine accepts the disagreement. A scan
+                // is best-effort by nature (ADR-0002), which is why it is used
+                // in the direction where a miss is loud: a declaration that
+                // does name its table and spells it in a way the scan cannot
+                // see is refused here and fixed by qualifying it, whereas a
+                // trigger created on the wrong table is discovered a plan
+                // later, by a `DROP` that finds nothing.
+                if !pbps_model::module::references(&module.definition, on) {
+                    found.push(invalid(format!(
+                        "trigger `{id}` is declared on `{on}`, and its definition does not name \
+                         that table. On this engine the table is part of the statement the \
+                         declaration holds — `CREATE TRIGGER {} AFTER INSERT ON {on} …` — so a \
+                         definition that names another table creates the trigger there, under \
+                         this key, and the next plan cannot find it",
+                        id.name()
+                    )));
+                }
+            }
+        },
+        ModuleKind::View => {}
+    }
+    found
+}
+
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
         // The first statement is the one that brings the table into being; it
@@ -1249,9 +1433,25 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // it implies are separate entries in this same plan.
         Change::SetDataMode { .. } => Ok(Vec::new()),
 
-        Change::CreateModule { .. } | Change::AlterModule { .. } | Change::DropModule { .. } => {
-            Err(Unbuilt::Modules.refuse())
-        }
+        // A module is created, never replaced. `CREATE OR REPLACE` exists on
+        // this engine and buys nothing: measured, it refuses a changed return
+        // type and a reordered view column, and it drops `reloptions` just as a
+        // rebuild does — so the cheap path is neither cheap nor complete, and
+        // *which* edits it can express is decided by text §8.2 forbids parsing.
+        // One shape, always (ADR-0009 §3).
+        Change::CreateModule { id, module } => Ok(vec![create_module(pg, id, module)?]),
+
+        // Two statements, not one, so that the plan a human approves says
+        // `DROP` where a `DROP` will run. Everything the catalog attached to
+        // the old object goes with it, and carrying that across is the
+        // connected plan's obligation, not the emitter's: only a connection can
+        // see an ACL, an owner or a `reloptions` (ADR-0009 §3).
+        Change::AlterModule { id, module } => Ok(vec![
+            drop_module(pg, id, module.kind)?,
+            create_module(pg, id, module)?,
+        ]),
+
+        Change::DropModule { id, kind } => Ok(vec![drop_module(pg, id, *kind)?]),
         Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
@@ -1402,6 +1602,230 @@ mod tests {
             .into_iter()
             .map(|s| s.sql)
             .collect()
+    }
+
+    fn module(kind: ModuleKind, definition: &str) -> Module {
+        Module {
+            kind,
+            description: None,
+            definition: definition.to_owned(),
+        }
+    }
+
+    fn id(s: &str) -> ModuleId {
+        s.parse().expect("a module id parses")
+    }
+
+    /// Each prefix ends where this engine's grammar puts the declaration's
+    /// first word, and a trigger's is the one that is not the SQL Server
+    /// shape — measured, `CREATE TRIGGER m1.audit` is a syntax error and the
+    /// table comes after the event list.
+    #[test]
+    fn each_kind_is_created_with_the_prefix_its_grammar_allows() {
+        let pg = Postgres::new();
+        let cases = [
+            (
+                id("app.v"),
+                module(ModuleKind::View, "SELECT id FROM app.t"),
+                "CREATE VIEW \"app\".\"v\" AS\nSELECT id FROM app.t",
+            ),
+            (
+                id("app.f(integer)"),
+                module(
+                    ModuleKind::Function,
+                    "(a integer) RETURNS integer AS $$ SELECT a $$",
+                ),
+                "CREATE FUNCTION \"app\".\"f\"\n(a integer) RETURNS integer AS $$ SELECT a $$",
+            ),
+            (
+                id("app.p(integer)"),
+                module(
+                    ModuleKind::Procedure,
+                    "(a integer) LANGUAGE sql AS $$ SELECT 1 $$",
+                ),
+                "CREATE PROCEDURE \"app\".\"p\"\n(a integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                id("app.t.audit"),
+                module(
+                    ModuleKind::Trigger,
+                    "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+                ),
+                "CREATE TRIGGER \"audit\"\nAFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION \
+                 app.trf()",
+            ),
+        ];
+        for (id, m, expected) in cases {
+            let sql = sql_of(
+                &pg,
+                &Change::CreateModule {
+                    id: id.clone(),
+                    module: Box::new(m),
+                },
+            );
+            assert_eq!(
+                sql,
+                vec![format!(
+                    "SET search_path = \"app\";\n{expected}\nRESET search_path;"
+                )],
+                "{id}"
+            );
+        }
+    }
+
+    /// `CREATE OR REPLACE` is never written, so a change is two statements and
+    /// the plan a human approves says `DROP` where a `DROP` will run
+    /// (ADR-0009 §3).
+    #[test]
+    fn a_module_change_is_a_drop_and_a_create_and_never_a_replace() {
+        let pg = Postgres::new();
+        let sql = sql_of(
+            &pg,
+            &Change::AlterModule {
+                id: id("app.f(integer, text)"),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    "(a integer, b text) RETURNS int",
+                )),
+            },
+        );
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert!(
+            sql[0].contains("DROP FUNCTION \"app\".\"f\"(integer, text);"),
+            "{}",
+            sql[0]
+        );
+        assert!(
+            sql[1].contains("CREATE FUNCTION \"app\".\"f\""),
+            "{}",
+            sql[1]
+        );
+        assert!(
+            !sql.iter().any(|s| s.to_uppercase().contains("OR REPLACE")),
+            "{sql:?}"
+        );
+    }
+
+    /// The name alone is not the object where routines overload — measured,
+    /// `DROP FUNCTION m3.f` is refused as not unique — and a trigger's name is
+    /// not an object at all without its table.
+    #[test]
+    fn a_drop_names_exactly_one_object_on_an_engine_that_overloads() {
+        let pg = Postgres::new();
+        let cases = [
+            (id("app.v"), ModuleKind::View, "DROP VIEW \"app\".\"v\";"),
+            (
+                id("app.f(character varying, integer[])"),
+                ModuleKind::Function,
+                "DROP FUNCTION \"app\".\"f\"(character varying, integer[]);",
+            ),
+            (
+                id("app.f()"),
+                ModuleKind::Procedure,
+                "DROP PROCEDURE \"app\".\"f\"();",
+            ),
+            (
+                id("app.t.audit"),
+                ModuleKind::Trigger,
+                "DROP TRIGGER \"audit\" ON \"app\".\"t\";",
+            ),
+        ];
+        for (id, kind, expected) in cases {
+            let sql = sql_of(
+                &pg,
+                &Change::DropModule {
+                    id: id.clone(),
+                    kind,
+                },
+            );
+            assert_eq!(sql.len(), 1, "{id}");
+            assert!(sql[0].contains(expected), "{id}: {}", sql[0]);
+        }
+    }
+
+    /// SPEC 14.3: the plan names every object it drops, or it does not drop.
+    /// `CASCADE` is the shortest way out of every ADR-0009 §4 refusal and it
+    /// destroys objects nobody reviewed, so no path here writes it.
+    #[test]
+    fn no_module_statement_offers_cascade() {
+        let pg = Postgres::new();
+        let changes = [
+            Change::DropModule {
+                id: id("app.v"),
+                kind: ModuleKind::View,
+            },
+            Change::DropModule {
+                id: id("app.f(integer)"),
+                kind: ModuleKind::Function,
+            },
+            Change::DropModule {
+                id: id("app.t.audit"),
+                kind: ModuleKind::Trigger,
+            },
+            Change::AlterModule {
+                id: id("app.v"),
+                module: Box::new(module(ModuleKind::View, "SELECT 1")),
+            },
+        ];
+        for change in changes {
+            for sql in sql_of(&pg, &change) {
+                assert!(!sql.to_uppercase().contains("CASCADE"), "{sql}");
+            }
+        }
+    }
+
+    /// The table is in the identity *and* in the text this engine's grammar
+    /// requires, and the engine accepts a disagreement between them: a trigger
+    /// created on another table sits under this key until a `DROP` a plan
+    /// later cannot find it.
+    #[test]
+    fn a_trigger_whose_body_names_another_table_is_refused_offline() {
+        let elsewhere = module(
+            ModuleKind::Trigger,
+            "AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.trf()",
+        );
+        let found = Postgres::new().validate_module(&id("app.t.audit"), &elsewhere);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].to_string().contains("app.t"), "{}", found[0]);
+
+        // Qualified or bare, a definition that does name its table passes: a
+        // declaration written inside its own schema very often omits the
+        // qualifier, and refusing that would refuse valid work.
+        for body in [
+            "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trf()",
+            "AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf()",
+        ] {
+            assert!(
+                Postgres::new()
+                    .validate_module(&id("app.t.audit"), &module(ModuleKind::Trigger, body))
+                    .is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    /// An empty definition is a module that would emit `CREATE VIEW app.v AS`
+    /// and nothing else. Refused where a user is looking at the declaration,
+    /// and again at emit time, because the emitter is handed a change and not
+    /// a schema.
+    #[test]
+    fn a_module_with_no_definition_is_refused_by_both_gates() {
+        let empty = module(ModuleKind::View, "  \n ");
+        let found = Postgres::new().validate_module(&id("app.v"), &empty);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].to_string().contains("empty definition"),
+            "{}",
+            found[0]
+        );
+        let refused = Postgres::new().emit(
+            &Change::CreateModule {
+                id: id("app.v"),
+                module: Box::new(empty),
+            },
+            Strategy::default(),
+        );
+        assert!(refused.is_err(), "an empty definition emitted a statement");
     }
 
     /// The scope is the object's own schema first and the extras after it, in

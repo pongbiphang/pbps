@@ -56,7 +56,8 @@ pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, Tombstone};
 pub use intent::Intent;
 pub use module::{
-    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineId,
+    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, RoutineArg,
+    RoutineArgError, RoutineId,
 };
 pub use name::{ColumnRef, NameError, TableName};
 pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};

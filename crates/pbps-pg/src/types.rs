@@ -36,7 +36,7 @@
 use std::ops::RangeInclusive;
 
 use pbps_dialect::{DialectError, TypeChangeRisk};
-use pbps_model::{ColumnType, TypeArg};
+use pbps_model::{ColumnType, RoutineArg, TypeArg};
 
 pub const DIALECT: &str = "postgres";
 
@@ -995,8 +995,177 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     }
 }
 
+/// The spelling this engine puts in a routine's identity, from a declared one
+/// (ADR-0009 §1, DECISIONS 283).
+///
+/// The rules and the measurements behind them are on
+/// `Postgres::normalize_routine_arg`, which is the only caller. Total by
+/// design: a spelling this catalogue does not know is the engine's to judge,
+/// and the text goes back unchanged.
+pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
+    let (element, array) = peel_array(arg.as_str());
+    let canonical = identity_element(element).unwrap_or_else(|| element.to_owned());
+    let spelled = if array {
+        format!("{canonical}[]")
+    } else {
+        canonical
+    };
+    // The parse cannot fail for anything this function builds — it folded a
+    // valid argument, and `[]` is not a character `RoutineArg` refuses — but
+    // "cannot fail" is not a reason to unwrap in a normalizer: the declared
+    // text is the safe answer to give back if it ever does.
+    spelled.parse().unwrap_or_else(|_| arg.clone())
+}
+
+/// `double precision[][]` -> `double precision`, and "it is an array".
+///
+/// One `[]` comes back however many went in, and a dimension is not part of
+/// the identity: **measured**, `text[][]` and `text[3]` are both `text[]`.
+fn peel_array(text: &str) -> (&str, bool) {
+    let mut element = text.trim_end();
+    let mut array = false;
+    while let Some(without) = element.strip_suffix(']') {
+        let Some(open) = without.rfind('[') else {
+            break;
+        };
+        // A `[` that is not opening a dimension is part of the name.
+        if without[open + 1..].chars().any(|c| !c.is_ascii_digit()) {
+            break;
+        }
+        element = without[..open].trim_end();
+        array = true;
+    }
+    (element, array)
+}
+
+/// One argument's element type as `format_type` prints it, or `None` where
+/// this catalogue has never heard of it.
+fn identity_element(element: &str) -> Option<String> {
+    // With the modifier first, because `float(24)` is `real` and `float` is
+    // `double precision`: which type the engine resolves depends on the
+    // argument, so throwing it away before asking would answer for the wrong
+    // one. Only the spellings that carry a modifier *inside* the name — issue
+    // #130's `timestamp(3) with time zone` — need the second attempt.
+    let normalized = folded(element).or_else(|| folded(&without_modifier(element)))?;
+    Some(normalized.base)
+}
+
+fn folded(text: &str) -> Option<ColumnType> {
+    normalize(&text.parse::<ColumnType>().ok()?).ok()
+}
+
+/// `timestamp(3) with time zone` -> `timestamp with time zone`.
+fn without_modifier(element: &str) -> String {
+    let (Some(open), Some(close)) = (element.find('('), element.rfind(')')) else {
+        return element.to_owned();
+    };
+    if close < open {
+        return element.to_owned();
+    }
+    let mut out = element[..open].trim_end().to_owned();
+    let rest = element[close + 1..].trim_start();
+    if !rest.is_empty() {
+        out.push(' ');
+        out.push_str(rest);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn arg(s: &str) -> String {
+        let declared: pbps_model::RoutineArg = s.parse().expect("a routine argument parses");
+        routine_arg(&declared).as_str().to_owned()
+    }
+
+    /// Measured on 18.6: one function's twelve parameters, declared one way
+    /// and identified another. The left column is what was written, the right
+    /// is what `oid::regprocedure` printed back under the empty search path.
+    #[test]
+    fn a_declared_argument_folds_to_the_spelling_the_identity_carries() {
+        for (declared, identity) in [
+            // A modifier is discarded: `f(varchar(10))` and `f(varchar(20))`
+            // are one function.
+            ("varchar(10)", "character varying"),
+            ("numeric(10,2)", "numeric"),
+            ("char", "character"),
+            ("timestamp(3) with time zone", "timestamp with time zone"),
+            // Aliases fold through the same table a column uses.
+            ("int4", "integer"),
+            ("int", "integer"),
+            ("timestamptz", "timestamp with time zone"),
+            ("bool", "boolean"),
+            // A dimension is not part of the identity, and neither is the
+            // number of them.
+            ("double precision[]", "double precision[]"),
+            ("text[][]", "text[]"),
+            ("int[3]", "integer[]"),
+            // `float(24)` is `real` and `float` is `double precision`, which is
+            // why the modifier is not thrown away before the catalogue is
+            // asked.
+            ("float(24)", "real"),
+            ("float", "double precision"),
+        ] {
+            assert_eq!(arg(declared), identity, "{declared}");
+        }
+    }
+
+    /// The engine is the normalizer, so a spelling this catalogue has never
+    /// heard of goes back unchanged rather than being refused: refusing would
+    /// refuse ADR-0009 §1's own example, and the model cannot tell a domain
+    /// from a mistake. A disagreement is caught by the engine, loudly, inside
+    /// the plan's transaction.
+    #[test]
+    fn a_spelling_the_catalogue_does_not_know_is_returned_unchanged() {
+        for text in [
+            // A quoted built-in whose case the engine keeps.
+            "\"char\"",
+            // A domain, an enum, a composite: qualified, because that is what
+            // `format_type` prints under the empty search path.
+            "m2.money_amount",
+            "m2.mood",
+            "m2.money_amount[]",
+            // A pseudo-type, which no column may ever be.
+            "anyelement",
+            "record",
+            // Types this catalogue does not carry, spelled as the engine
+            // spells them.
+            "bit varying",
+            "inet",
+            "tsvector",
+        ] {
+            assert_eq!(arg(text), text, "{text}");
+        }
+    }
+
+    /// Idempotent, because the identity read back out of the catalog is fed
+    /// through the same fold as the declared one — a normalizer that moved on
+    /// the second pass would report drift on an unchanged routine.
+    #[test]
+    fn folding_an_argument_twice_says_what_folding_it_once_says() {
+        for text in [
+            "varchar(10)",
+            "int4",
+            "text[][]",
+            "\"char\"",
+            "m2.money_amount",
+            "timestamp(3) with time zone",
+        ] {
+            assert_eq!(arg(&arg(text)), arg(text), "{text}");
+        }
+    }
+
+    /// `serial` is not a type (ADR-0011 Amendment 3), so the catalogue refuses
+    /// it and the text goes back untouched rather than becoming `integer`:
+    /// a routine argument spelled that way is one the engine will refuse, and
+    /// silently rewriting it would key the declaration as a routine that is
+    /// not the one the `CREATE` would make.
+    #[test]
+    fn a_spelling_that_is_not_a_type_is_not_quietly_made_into_one() {
+        assert_eq!(arg("serial"), "serial");
+        assert_eq!(arg("bigserial"), "bigserial");
+    }
     use super::*;
 
     fn ty(s: &str) -> ColumnType {

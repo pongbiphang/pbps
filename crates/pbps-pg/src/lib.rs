@@ -22,7 +22,9 @@
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
-use pbps_model::{Change, ColumnType, Strategy, Table, TableName};
+use pbps_model::{
+    Change, ColumnType, Module, ModuleId, ModuleKind, RoutineArg, Strategy, Table, TableName,
+};
 
 pub mod catalog;
 pub mod doctor;
@@ -40,7 +42,6 @@ mod types;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unbuilt {
     Introspection,
-    Modules,
     Roles,
     ReferenceData,
     Probes,
@@ -50,7 +51,6 @@ impl Unbuilt {
     const fn step(self) -> &'static str {
         match self {
             Unbuilt::Introspection => "reading a database back (Phase 5 step 3)",
-            Unbuilt::Modules => "views, functions, procedures and triggers (Phase 5 step 5)",
             Unbuilt::Roles => "roles and grants (Phase 5 step 6)",
             Unbuilt::ReferenceData => "reference data (Phase 5 step 7)",
             Unbuilt::Probes => "preflight probes (Phase 5 step 9)",
@@ -634,6 +634,106 @@ impl Dialect for Postgres {
         found
     }
 
+    /// Views share `pg_class` with tables; nothing else does.
+    ///
+    /// **Measured on 18.6**, all four halves of it:
+    ///
+    /// ```text
+    /// CREATE TABLE ns.x (...); CREATE VIEW ns.x AS ...
+    ///     refused: relation "x" already exists
+    /// CREATE TABLE ns.y (...); CREATE FUNCTION ns.y() ...       accepted
+    /// CREATE TABLE ns.z (...); CREATE PROCEDURE ns.z() ...      accepted
+    /// a trigger is named within its table, not within a schema  (ADR-0009 §1)
+    /// ```
+    ///
+    /// A function and a procedure of one identity *do* collide with each other,
+    /// which is not this question: they are two modules, not a module and a
+    /// table, and [`pbps_dialect::check_module_names`] asks about them under
+    /// [`Self::overloads`].
+    fn shares_namespace_with_tables(&self, kind: ModuleKind) -> bool {
+        match kind {
+            ModuleKind::View => true,
+            ModuleKind::Function | ModuleKind::Procedure | ModuleKind::Trigger => false,
+        }
+    }
+
+    /// Routines overload; views and triggers do not.
+    ///
+    /// This is the first `true` any dialect returns here — SQL Server answers
+    /// `false` for every kind — so it is the first time a declaration is
+    /// *required* to carry a signature. **Measured**, both directions:
+    ///
+    /// ```text
+    /// CREATE FUNCTION ov.f(int) ...; CREATE FUNCTION ov.f(text) ...   two objects
+    /// CREATE VIEW ov.v AS ...;       CREATE VIEW ov.v AS ...
+    ///     refused: relation "v" already exists
+    /// two triggers named `audit`, one per table                       two objects
+    /// ```
+    ///
+    /// A trigger is `false` because its overload-looking freedom is already in
+    /// its identity: `ModuleId::Trigger` holds the table, so two `audit`
+    /// triggers on two tables are two keys without anything overloading.
+    fn overloads(&self, kind: ModuleKind) -> bool {
+        match kind {
+            ModuleKind::Function | ModuleKind::Procedure => true,
+            ModuleKind::View | ModuleKind::Trigger => false,
+        }
+    }
+
+    /// The spelling this engine puts in a routine's identity (ADR-0009 §1).
+    ///
+    /// The canonical form is what `format_type` prints **under the empty
+    /// search path**, which is the path every read here pins (DECISIONS 253):
+    /// a built-in bare, a user type schema-qualified. **Measured on 18.6**, one
+    /// function's twelve parameters:
+    ///
+    /// ```text
+    /// declared   m2.money_amount  m2.mood  timestamp(3) with time zone  varchar(10)
+    /// identity   m2.money_amount  m2.mood  timestamp with time zone     character varying
+    ///
+    /// declared   char       numeric(10,2)  int4     bit varying(4)  double precision[]
+    /// identity   character  numeric        integer  bit varying     double precision[]
+    ///
+    /// declared   "char"  text[][]  interval hour to minute
+    /// identity   "char"  text[]    interval
+    /// ```
+    ///
+    /// Three rules come out of that, and they are applied in this order:
+    ///
+    /// 1. **A modifier is discarded.** `f(varchar(10))` and `f(varchar(20))`
+    ///    are one function, so keying them as two modules would name a
+    ///    signature the engine resolves to something else in every `DROP` and
+    ///    every `GRANT`. This is the whole reason the hook is not
+    ///    [`Dialect::normalize_type`], which keeps them on purpose.
+    /// 2. **An array collapses to one `[]`.** `text[][]` is `text[]`;
+    ///    PostgreSQL does not record a dimension count.
+    /// 3. **Everything else is the catalogue's**, so `int4` becomes `integer`
+    ///    and `char` becomes `character` by the same table a column uses.
+    ///
+    /// # What it passes through, and why that is not a gap
+    ///
+    /// A spelling the catalogue does not know — a domain, an enum, `"char"`,
+    /// a pseudo-type — is returned **unchanged**. Refusing it would refuse
+    /// ADR-0009 §1's own example, and the model has no way to tell a user type
+    /// this dialect has never heard of from a mistake. The user writes what
+    /// `pull` showed them, which is the engine's own text; a spelling that
+    /// disagrees produces a `CREATE` the engine refuses or an object the next
+    /// plan reports as one to drop and one to add, and ADR-0009 §1 accepts
+    /// exactly that bargain: *"Both are loud, both are inside the plan's
+    /// transaction, and neither is silent."*
+    fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
+        Ok(types::routine_arg(arg))
+    }
+
+    /// What a module declaration must satisfy before anything connects.
+    ///
+    /// Returns every problem rather than the first, for the reason
+    /// [`Dialect::validate_table`] does: a schema with three unspellable
+    /// modules should need one pass.
+    fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
+        emit::validate_module(id, module)
+    }
+
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
         emit::emit(self, change, strategy)
     }
@@ -650,7 +750,6 @@ mod tests {
     fn an_unbuilt_part_refuses_by_name_and_never_reads_as_nothing_to_do() {
         for part in [
             Unbuilt::Introspection,
-            Unbuilt::Modules,
             Unbuilt::Roles,
             Unbuilt::ReferenceData,
             Unbuilt::Probes,
@@ -672,13 +771,6 @@ mod tests {
     #[test]
     fn a_change_from_an_unbuilt_part_is_an_error_and_not_an_empty_plan() {
         let unbuilt = [
-            (
-                Change::DropModule {
-                    id: "app.v".parse().expect("a module id parses"),
-                    kind: pbps_model::ModuleKind::View,
-                },
-                "Phase 5 step 5",
-            ),
             (
                 Change::CreateRole {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
