@@ -1222,10 +1222,29 @@ fn order_key(c: &Change) -> u8 {
         // asking which columns a check's expression names, which this tool
         // deliberately never parses (DECISIONS 174). `DropForeignKey`'s rank
         // travels with them and still puts it ahead of the key it references.
+        //
+        // A primary key that is *only* dropped is one of these drops and
+        // travels with them. It was left in the addition class below because
+        // one variant carries both directions, and a key that is still there
+        // blocks the column changes every class from here down can make:
+        // measured, `DROP NOT NULL` on a key column is `42P16` on PostgreSQL
+        // and 5074 with 4922 behind it on SQL Server, and dropping the column
+        // outright is the same 5074. So a declaration that gives up a key and
+        // relaxes its column produced a plan neither engine would perform.
+        //
+        // Only `to: None`. A key being *replaced* carries its add along with
+        // it, and an add may name a column this plan is still adding at class
+        // 8 — so it stays below, and the replacement's own half of this
+        // problem is issue #178.
+        //
+        // `dependency_rank` already keeps a foreign-key drop ahead of it
+        // inside this class, which is the order the engine requires and the
+        // reason that rank exists.
         Change::DropIndex { .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. } => 2,
+        | Change::DropCheck { .. }
+        | Change::SetPrimaryKey { to: None, .. } => 2,
         // A class of its own, after the table renames: `sp_rename` on a column
         // names the table, and `resolve_columns` iterates the *declared*
         // schema, so a `RenameColumn` always carries the post-rename table.
@@ -2664,6 +2683,94 @@ mod tests {
                 .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
             "{blockers:?}"
         );
+    }
+
+    /// A declaration that gives up a primary key and relaxes the column it
+    /// held produces a plan that runs the key's drop first, because neither
+    /// engine will relax a column a key still names.
+    ///
+    /// Measured, both refuse: PostgreSQL answers `42P16`, "column \"id\" is in
+    /// a primary key", and SQL Server answers 5074 with 4922 behind it. The
+    /// plan was valid, reviewed and unapplicable — the shape this ordering
+    /// exists to prevent.
+    ///
+    /// The same class also puts the drop ahead of `DropColumn` at 5, which is
+    /// the other half: SQL Server refuses to drop a column its key names, with
+    /// the same 5074.
+    #[test]
+    fn a_key_is_dropped_before_the_column_it_held_is_relaxed() {
+        let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+        base_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let base = schema_of("dbo.t", base_t);
+        let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
+
+        let cs = run(&base, &declared, &[]);
+        let order: Vec<_> = cs
+            .changes
+            .iter()
+            .map(|p| std::mem::discriminant(&p.change))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                std::mem::discriminant(&Change::SetPrimaryKey {
+                    table: "dbo.t".parse().unwrap(),
+                    from: None,
+                    to: None,
+                }),
+                std::mem::discriminant(&Change::AlterColumnNullability {
+                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                    column: pbps_model::ColumnRef {
+                        table: "dbo.t".parse().unwrap(),
+                        name: "id".to_owned(),
+                    },
+                    ty: ty("int"),
+                    to_nullable: true,
+                }),
+            ],
+            "the key has to go first: {:#?}",
+            cs.changes
+        );
+    }
+
+    /// The negative half, and the reason the class is conditioned on `to`
+    /// rather than on the variant: a key being **replaced** carries its add
+    /// with it, and an add may name a column this same plan is still adding at
+    /// class 8. So a replacement stays below the column classes, where it
+    /// works, and the half of the problem that follows it is issue #178.
+    #[test]
+    fn a_key_being_replaced_stays_after_the_columns_its_new_shape_may_need() {
+        let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+        base_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["id".to_owned()],
+        });
+        let base = schema_of("dbo.t", base_t);
+        let mut declared_t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("other", Column::new(ty("int")).not_null()),
+        ]);
+        declared_t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".to_owned()),
+            columns: vec!["other".to_owned()],
+        });
+        let declared = schema_of("dbo.t", declared_t);
+
+        let cs = run(&base, &declared, &[]);
+        let key = cs
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::SetPrimaryKey { .. }))
+            .expect("the key is replaced");
+        let column = cs
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::AddColumn { .. }))
+            .expect("the column it will name is added");
+        assert!(column < key, "{:#?}", cs.changes);
     }
 
     /// A plan that renames a table **and** drops one of its columns names the

@@ -552,6 +552,29 @@ which reaches all five and says how to test a sixth. When a list is derived,
 write the derivation next to it — a list whose rule is left implicit gets
 extended by resemblance to its existing members.
 
+## One change carrying both directions, in a list that orders directions
+
+`order_key` sorts a plan by what each change *is*, and the classes are laid out
+by direction: drops early, so they stop blocking, and adds late, so what they
+name exists. `SetPrimaryKey` carries `from` and `to` in one variant, so it is a
+drop and an add at once — and a variant can only be in one class. It was in the
+addition class, which meant a key that was only being dropped was ordered as if
+it were being added, behind every column change it blocks. Measured, the plan
+that falls out is refused on both engines (DECISIONS 269).
+
+The tell is in `order_key`'s own comment, written for a different case: *"Anything
+with a real order between them belongs in separate classes; this tiebreaker
+cannot express it."* A change that is two directions at once has a real order
+against itself, and no class expresses that.
+
+The fix here was to key the class on the change's *contents* — `to: None` is a
+drop and travels with the drops — because it needed no new class and no
+renumbering. It closes the shape only where one direction is absent; a genuine
+both-directions change still sits in one place, and the residue is the issue
+that says so. When a model has one variant per *object* rather than one per
+*direction*, ordering is where it will surface, and the question to ask of each
+such variant is: what does this sort as when only half of it is real?
+
 ## A guard built twice is a guard that fires early
 
 `dev::Container::start` built its cleanup guard, then shadowed it with a second

@@ -4744,3 +4744,38 @@ SPEC is in sync with all of these.
     question, `types::depends_on_the_session_time_zone`, and refuses on it by
     name with the two-step remedy — add the column, fill it in a declared step
     with the zone written out, drop the old one.
+
+269. **A primary key that is only dropped is ordered with the constraint drops;
+    one that is replaced is not.** `order_key` had every `SetPrimaryKey` in the
+    addition class (13), below every column change, because one variant carries
+    both directions. So a declaration that gives up a key and relaxes the
+    column it held produced a plan whose first statement neither engine would
+    perform:
+
+    ```text
+    ALTER TABLE t ALTER COLUMN id DROP NOT NULL;   -- 42P16 on PostgreSQL:
+                                                   -- column "id" is in a primary key
+    ALTER TABLE t DROP CONSTRAINT pk_t;            -- never reached
+    ```
+
+    **Measured on both engines**, which is what makes this the differ's problem
+    and not a dialect's: SQL Server refuses the same shape with 5074, "the
+    object 'pk_pkord' is dependent on column 'id'", and 4922 behind it. A
+    valid, reviewed plan, refused.
+
+    The drop now sits in class 2 with `DropIndex`, `DropUnique`,
+    `DropForeignKey` and `DropCheck` — where a constraint drop belongs, and
+    where it also lands ahead of `DropColumn` at 5, the other statement a
+    standing key blocks. No new class and no renumbering: `dependency_rank`
+    already keeps a foreign-key drop ahead of the key it references *inside*
+    this class, which is the order the engine requires and the reason that rank
+    was written (DECISIONS 237).
+
+    **Conditioned on `to: None`, not on the variant.** A key being replaced
+    carries its add with it, and an add may name a column the same plan is
+    still adding at class 8, so a replacement in class 2 would fail the other
+    way. It stays below, and the half of the problem that follows it — a
+    replacement beside a nullability change on the column leaving the key — is
+    issue #178, whose fix is to emit the replacement as two changes. That
+    changes the shape of a plan a reviewer approves, so it belongs in a change
+    that is about it rather than in the one that found it.

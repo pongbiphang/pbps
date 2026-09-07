@@ -3342,3 +3342,65 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     assert!(message.contains("time zone"), "{message}");
     assert!(message.contains("AT TIME ZONE"), "{message}");
 }
+
+/// A declaration that gives up its primary key and relaxes the column it held
+/// applies, in the order the differ now puts the two changes in.
+///
+/// The plan was valid, reviewed and unapplicable: `DROP NOT NULL` ran first
+/// and this engine answered `42P16`, `column "id" is in a primary key`. SQL
+/// Server refuses the same shape with 5074 and 4922 behind it, so the ordering
+/// that fixes it belongs to the differ and not to either dialect
+/// (`a_key_is_dropped_before_the_column_it_held_is_relaxed`).
+///
+/// The half this does not cover is a key being *replaced*, which travels as
+/// one change because its add may name a column the same plan is adding —
+/// issue #178.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
+    let s = emit_schema("pkorder");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let table = TableName::new(&s, "t");
+
+    let mut with_key = Table::default();
+    with_key
+        .columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    with_key.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+    });
+    let mut a = Schema::default();
+    a.tables.insert(table.clone(), with_key);
+
+    let mut without = Table::default();
+    without
+        .columns
+        .insert("id".into(), Column::new(ty("integer")));
+    let mut b = Schema::default();
+    b.tables.insert(table.clone(), without);
+
+    let ids_a = mint_ids(&a, &IdsFile::default(), &[]);
+    let ids_b = mint_ids(&b, &ids_a, &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids_a),
+    )
+    .await;
+    // The whole migration, statement by statement, in the plan's own order —
+    // `apply` panics with the SQL and the engine's word if any of it is
+    // refused.
+    apply(&mut conn, &pg, &plan(&a, &ids_a, &b, &ids_b)).await;
+
+    let pulled = pull(&mut conn).await;
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    let state = ours_only(&pulled, &s);
+    assert_eq!(state, normalized(&b));
+    let again = plan(&state, &ids_b, &b, &ids_b);
+    assert!(again.is_empty(), "the plan after convergence: {again:#?}");
+}
