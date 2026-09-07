@@ -142,22 +142,32 @@ pub async fn before_a_rebuild(
 ) -> Result<Rebuild, DbError> {
     require_the_callers_transaction(conn).await?;
     conn.query(CANONICAL_PATH).await?;
-    let serialized = serialize(conn, id, kind).await?;
+    // Resolved **once**, and every read below is keyed by the oid rather than
+    // by the name again. Two independent name matches would be two chances to
+    // disagree, and the direction they fail in is the worst one available: a
+    // read that matched nothing returns no carried state, which reads exactly
+    // like an object that carries nothing and waves the rebuild through. An
+    // object that is not there is refused here instead, where it can only
+    // mean the caller asked about the wrong object.
+    let Some(oid) = module_oid(conn, id, kind).await? else {
+        return Err(not_in_the_catalog(id));
+    };
+    let serialized = serialize(conn, id, kind, oid).await?;
     let mut carries = Vec::new();
     match kind {
         ModuleKind::View => {
-            read_relation(conn, id, &mut carries).await?;
-            read_view_column_defaults(conn, id, &mut carries).await?;
+            read_relation(conn, oid, &mut carries).await?;
+            read_view_column_defaults(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "r", &mut carries).await?;
         }
         ModuleKind::Function | ModuleKind::Procedure => {
-            read_routine(conn, id, &mut carries).await?;
+            read_routine(conn, oid, &mut carries).await?;
             read_arriving_grants(conn, id, "f", &mut carries).await?;
         }
         // A trigger has no owner and no ACL of its own — it is not a grantable
         // object — and `pg_default_acl` has no entry kind that reaches one. Its
         // whole carried state is the switch an operator can turn off.
-        ModuleKind::Trigger => read_trigger_enabled(conn, id, &mut carries).await?,
+        ModuleKind::Trigger => read_trigger_enabled(conn, oid, &mut carries).await?,
     }
     Ok(Rebuild {
         id: id.clone(),
@@ -171,6 +181,7 @@ async fn serialize(
     conn: &mut Conn,
     id: &ModuleId,
     kind: ModuleKind,
+    oid: i64,
 ) -> Result<Serialized, DbError> {
     match kind {
         // A view is a relation, so its own lock is the right one.
@@ -206,9 +217,6 @@ async fn serialize(
         // `SELECT oid FROM pg_proc … FOR UPDATE` is `permission denied for
         // table pg_proc`, and as a superuser the same statement is accepted.
         ModuleKind::Function | ModuleKind::Procedure => {
-            let Some(oid) = module_oid(conn, id, kind).await? else {
-                return Ok(Serialized::Not(format!("`{id}` is not in the catalog")));
-            };
             // Inside a savepoint, because a failed statement dooms a
             // PostgreSQL transaction and this one is *expected* to fail for
             // the accounts this tool is built for. **Measured**, as the
@@ -263,10 +271,9 @@ async fn serialize(
 /// A view's owner, ACL and `reloptions`.
 async fn read_relation(
     conn: &mut Conn,
-    id: &ModuleId,
+    oid: i64,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
-    let name = id.object_name();
     let rows = conn
         .query_with(
             "SELECT pg_catalog.pg_get_userbyid(c.relowner) AS owner,
@@ -274,9 +281,8 @@ async fn read_relation(
                     COALESCE(pg_catalog.array_to_string(c.reloptions, ', '), '') AS reloptions,
                     CURRENT_USER::text AS deploying_as
                FROM pg_catalog.pg_class c
-               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'",
-            &[Param::Str(&name.schema), Param::Str(&name.name)],
+              WHERE c.oid = ($1::int8)::oid",
+            &[Param::I64(oid)],
         )
         .await?;
     let Some(row) = rows.first() else {
@@ -302,10 +308,9 @@ async fn read_relation(
 /// A routine's owner and ACL.
 async fn read_routine(
     conn: &mut Conn,
-    id: &ModuleId,
+    oid: i64,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
-    let name = id.object_name();
     let rows = conn
         .query_with(
             "SELECT pg_catalog.pg_get_userbyid(p.proowner) AS owner,
@@ -313,17 +318,8 @@ async fn read_routine(
                     p.prosecdef AS security_definer,
                     CURRENT_USER::text AS deploying_as
                FROM pg_catalog.pg_proc p
-               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-              WHERE n.nspname = $1 AND p.proname = $2
-                AND COALESCE((SELECT pg_catalog.string_agg(
-                                       pg_catalog.format_type(u.ty, NULL), ',' ORDER BY u.pos)
-                                FROM pg_catalog.unnest(p.proargtypes)
-                                       WITH ORDINALITY AS u(ty, pos)), '') = $3",
-            &[
-                Param::Str(&name.schema),
-                Param::Str(&name.name),
-                Param::Str(&signature(id)),
-            ],
+              WHERE p.oid = ($1::int8)::oid",
+            &[Param::I64(oid)],
         )
         .await?;
     let Some(row) = rows.first() else {
@@ -343,22 +339,19 @@ async fn read_routine(
 /// nothing, because nothing compares `pg_attrdef` either.
 async fn read_view_column_defaults(
     conn: &mut Conn,
-    id: &ModuleId,
+    oid: i64,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
-    let name = id.object_name();
     for row in conn
         .query_with(
             "SELECT a.attname AS column_name,
                     pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS expression
                FROM pg_catalog.pg_attrdef d
-               JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
                JOIN pg_catalog.pg_attribute a
                  ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'
+              WHERE d.adrelid = ($1::int8)::oid
               ORDER BY a.attnum",
-            &[Param::Str(&name.schema), Param::Str(&name.name)],
+            &[Param::I64(oid)],
         )
         .await?
     {
@@ -381,25 +374,15 @@ async fn read_view_column_defaults(
 /// behaviour an operator disabled.
 async fn read_trigger_enabled(
     conn: &mut Conn,
-    id: &ModuleId,
+    oid: i64,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
-    let Some(on) = id.attached_to() else {
-        return Ok(());
-    };
     for row in conn
         .query_with(
             "SELECT tg.tgenabled::text AS enabled
                FROM pg_catalog.pg_trigger tg
-               JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
-               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = $1 AND c.relname = $2 AND tg.tgname = $3
-                AND NOT tg.tgisinternal",
-            &[
-                Param::Str(&on.schema),
-                Param::Str(&on.name),
-                Param::Str(id.name()),
-            ],
+              WHERE tg.oid = ($1::int8)::oid",
+            &[Param::I64(oid)],
         )
         .await?
     {
@@ -542,6 +525,25 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
     })
 }
 
+/// The one thing these reads must never answer with silence.
+///
+/// A read that matched no row returns no carried state and no dependents,
+/// which is indistinguishable from an object that carries nothing and has
+/// none — and that answer waves a rebuild through. Absent, empty and
+/// unreadable are three different things, and only one of them is good news.
+fn not_in_the_catalog(id: &ModuleId) -> DbError {
+    DbError::Driver {
+        code: None,
+        message: format!(
+            "`{id}` is not in this database's catalog, and this read is about what a rebuild of \
+             it would destroy.\nAn answer of \"nothing\" here would mean \"nothing is attached to \
+             it\", which is what lets a rebuild go ahead — so a module that is not there is \
+             refused instead. If the plan means to create it, it is not being rebuilt and this \
+             question does not apply."
+        ),
+    }
+}
+
 fn quoted(name: &TableName) -> String {
     format!("{}.{}", one_quoted(&name.schema), one_quoted(&name.name))
 }
@@ -552,6 +554,13 @@ fn one_quoted(ident: &str) -> String {
 
 /// The argument types as `string_agg(…, ',')` joins them, which is how the
 /// identity is compared in SQL.
+///
+/// **One caller, deliberately.** The emitter has a `signature` of its own that
+/// joins with `", "` for a `DROP FUNCTION` a human reads, and the two must not
+/// be made to look interchangeable: this one's separator is chosen to match a
+/// SQL expression, and a `", "` here would match no routine at all. Everything
+/// downstream keys off the oid this resolves, so there is exactly one place
+/// where a name becomes an object.
 fn signature(id: &ModuleId) -> String {
     id.args().map_or_else(String::new, |args| {
         args.iter()
@@ -728,8 +737,10 @@ pub async fn dependents(
 ) -> Result<Vec<Dependent>, DbError> {
     require_the_callers_transaction(conn).await?;
     conn.query(CANONICAL_PATH).await?;
+    // Not an empty list: "nothing depends on it" and "it is not there" are two
+    // different answers, and only one of them says a rebuild is safe.
     let Some(oid) = module_oid(conn, id, kind).await? else {
-        return Ok(Vec::new());
+        return Err(not_in_the_catalog(id));
     };
     let refclass = match kind {
         ModuleKind::View => "pg_catalog.pg_class",

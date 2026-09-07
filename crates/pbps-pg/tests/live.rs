@@ -5491,6 +5491,29 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         }
     }
 
+    // A module that is not there is refused rather than answered with
+    // silence. "Nothing is attached to it" is what lets a rebuild go ahead,
+    // and a read that matched no row says exactly that.
+    let absent: pbps_model::ModuleId = format!("{s}.gone").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let missing = pbps_pg::modules::before_a_rebuild(&mut conn, &absent, View)
+        .await
+        .expect_err("a module that is not in the catalog");
+    rollback(&mut conn).await;
+    assert!(
+        format!("{missing}").contains("not in this database's catalog"),
+        "{missing}"
+    );
+    in_a_transaction(&mut conn).await;
+    let missing_deps = pbps_pg::modules::dependents(&mut conn, &absent, View)
+        .await
+        .expect_err("the same question, from the other reader");
+    rollback(&mut conn).await;
+    assert!(
+        format!("{missing_deps}").contains("not in this database's catalog"),
+        "{missing_deps}"
+    );
+
     // And outside a transaction the lock would be gone before the `DROP`, so
     // the read refuses rather than answering something that is true only while
     // it is being said.
