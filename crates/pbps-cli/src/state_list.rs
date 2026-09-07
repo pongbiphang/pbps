@@ -120,6 +120,22 @@ pub struct StateListData {
 
     /// How many rows were asked for, so a reader knows whether the list is the
     /// whole history or the head of it.
+    ///
+    /// At least one: an empty `entries` beside it means the ledger is empty,
+    /// not that nothing was asked for.
+    // The bound is what the payload means, not a range copied from the parser.
+    // `entries: []` renders as `state.no-entries` — "this database has no
+    // recorded state" — and that reading holds only because at least one row
+    // was asked for; a consumer taking `limit: 0` at face value would report an
+    // empty history for a query that asked for nothing.
+    //
+    // No upper bound, deliberately. The parser's ceiling is `i32::MAX` because
+    // T-SQL's `TOP (n)` takes a signed 32-bit count (DECISIONS 217), a fact
+    // about one dialect; the envelope is the cross-engine contract ADR-0015
+    // decision 1 rests on, and PostgreSQL's `LIMIT` takes a bigint. Publishing
+    // SQL Server's ceiling would make the document narrower than the tool it
+    // describes.
+    #[schemars(range(min = 1))]
     pub limit: u32,
 
     /// Newest first, like the ledger's own order.
