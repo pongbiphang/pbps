@@ -4356,3 +4356,36 @@ SPEC is in sync with all of these.
     implicit transaction before the statement's own clock starts. Measured with
     `psql`, which speaks the simple protocol, both looked like reliable
     detectors.
+
+252. **The pull's canonical scope pins how values print, not only how names
+    do.** 248 set `search_path` empty so that a rendered name does not depend on
+    the reader's session. The expressions this pull carries are carried verbatim
+    (ADR-0013 §4), and the same argument applies to every setting the deparser
+    consults: measured on 18.6, `quote_all_identifiers` turns `id > 0` into
+    `"id" > 0`, `DateStyle` turns `'2020-01-02'::date` into `'02.01.2020'::date`,
+    `TimeZone` moves a `timestamptz` default to another wall clock,
+    `IntervalStyle` turns `'1 day 02:00:00'` into `'1 2:00:00'`, and
+    `bytea_output` turns `'\x0102'` into `'\\001\\002'`. Two operators with
+    different sessions would otherwise see drift on an unchanged database, and a
+    plan would rebuild every constraint and index it touched.
+
+    `extra_float_digits` is pinned on the same argument without a case that
+    demonstrated it. `lc_monetary` is deliberately **not**: it belongs to the
+    same class, and `SET` fails outright on a locale the server does not have,
+    which would turn a readable database into an unreadable one for a difference
+    nobody has yet shown.
+
+253. **A name is round-tripped through the declaration format, not checked
+    against a rule.** `TableName` is written `schema.name` and read back by
+    splitting on every `.`; `ColumnRef` the same with three parts. PostgreSQL
+    will hand out a schema called `"a.b"`, and then a pull that succeeded
+    produces a schema whose own file does not load — or worse, one where
+    `a.b` + `t` and `a` + `b.t` write to the same key. The pull performs the
+    round trip on every table name and every column name it is about to record,
+    and a name that does not survive takes its whole table out with a warning.
+
+    Performing it rather than validating against a list of forbidden characters:
+    the format is what decides, the format changes, and a rule written here
+    would be a second opinion that can fall out of step with it. The whole table
+    goes, not the offending column, because a table missing one column is a
+    table a plan would add it to.

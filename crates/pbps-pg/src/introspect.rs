@@ -57,10 +57,11 @@
 //! and an index's filter — are carried through untouched.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
-    ReferentialAction, Schema, Table, TableName, UniqueConstraint,
+    CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
+    PrimaryKey, ReferentialAction, Schema, Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
@@ -185,6 +186,11 @@ pub struct RawConstraint {
     /// `connoinherit`. `true` is a check that applies to this table's own rows
     /// and to no table that inherits from it.
     pub no_inherit: bool,
+    /// `true` when some trigger that implements this constraint has a
+    /// `tgenabled` other than `O`. A foreign key is enforced by triggers, and
+    /// `ALTER TABLE ... DISABLE TRIGGER` stops them without touching
+    /// `convalidated` or `conenforced`.
+    pub triggers_not_ordinary: bool,
 }
 
 /// One row of `pg_index`, joined to what it needs from `pg_class` and `pg_am`.
@@ -380,6 +386,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let raw_columns = columns_by_table
             .get(&raw_table.oid)
             .map_or(&[][..], Vec::as_slice);
+        if let Some(detail) = a_name_the_declaration_cannot_write(&name, raw_columns) {
+            note(&mut pulled, &name, detail);
+            continue;
+        }
         let parts = Parts {
             name: name.clone(),
             by_attnum: raw_columns
@@ -424,6 +434,44 @@ fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Ve
         out.entry(key(item)).or_default().push(item);
     }
     out
+}
+
+/// The names of this table that the declaration format cannot write back, if
+/// any.
+///
+/// A `TableName` is written as `schema.name` and read back by splitting on
+/// every `.`, and a `ColumnRef` the same way with three parts. PostgreSQL will
+/// happily give a schema called `"a.b"`, and then a pull that succeeded
+/// produces a schema whose own file will not load — a table named `a.b.t`
+/// parses as three parts and is refused, or worse, collides with the table `t`
+/// in schema `a.b` reached the other way round.
+///
+/// So the round trip is *performed*, not reasoned about, and a name that does
+/// not survive it takes its table out of the pull with a warning. The column
+/// names are asked the same question, because a column is what a rename intent
+/// and an ids file address, and a table whose column cannot be written is no
+/// more usable than one whose own name cannot.
+fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn]) -> Option<String> {
+    if TableName::from_str(&name.to_string()).as_ref() != Ok(name) {
+        return Some(format!(
+            "`{name}` is a table whose name the declaration format cannot write back: it is \
+             stored as `schema.table` and read by splitting on every `.`, and this one does not \
+             survive that. It is left out of the pull entirely rather than pulled into a schema \
+             that will not load."
+        ));
+    }
+    columns.iter().find_map(|c| {
+        let reference = ColumnRef::new(name.clone(), &c.name);
+        (ColumnRef::from_str(&reference.to_string()).as_ref() != Ok(&reference)).then(|| {
+            format!(
+                "`{name}` has the column `{}`, whose name the declaration format cannot write \
+                 back: a column is addressed as `schema.table.column` and read by splitting on \
+                 every `.`. The whole table is left out of the pull, because a table missing one \
+                 column is a table a plan would add it to.",
+                c.name
+            )
+        })
+    })
 }
 
 /// The `CACHE` a sequence has when nothing asks for one — **measured**, and the
@@ -668,6 +716,26 @@ fn add_constraint(
                      rows and for no table that inherits from it. This model holds only the \
                      expression, so it is left out rather than read back as a check a plan would \
                      recreate on the children too. Its definition is `{}`.",
+                    raw.name, parts.name, raw.definition
+                ),
+            );
+        }
+
+        // A foreign key is not a fact in `pg_constraint`, it is triggers. A
+        // superuser's `DISABLE TRIGGER ALL` stops them and leaves the row
+        // saying `convalidated` and `conenforced` — so the pull would report
+        // referential integrity that is not being applied, and writes may
+        // already have left orphans behind it.
+        'p' | 'u' | 'f' | 'c' | 'x' if raw.triggers_not_ordinary => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "constraint `{}` on `{}` is implemented by triggers that are not in the \
+                     ordinary enable mode — `DISABLE TRIGGER` and the replica modes both land \
+                     here — while the catalog still calls the constraint validated and enforced. \
+                     This model holds only the constraint, so it is left out rather than read \
+                     back as one whose checks are running. Its definition is `{}`.",
                     raw.name, parts.name, raw.definition
                 ),
             );
@@ -1232,6 +1300,7 @@ mod tests {
             enforced: true,
             period: false,
             no_inherit: false,
+            triggers_not_ordinary: false,
         }
     }
 
@@ -2128,6 +2197,101 @@ mod tests {
             ..raw
         };
         assert!(assemble(&raw).warnings.is_empty());
+    }
+
+    /// A foreign key is triggers. `DISABLE TRIGGER` stops them and leaves the
+    /// catalog row saying the constraint is validated and enforced.
+    #[test]
+    fn a_constraint_whose_triggers_are_not_running_is_left_out_and_named() {
+        let mut fk = constraint(1, "t_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(1);
+        fk.definition = "FOREIGN KEY (a) REFERENCES app.t(a)".to_owned();
+        fk.triggers_not_ordinary = true;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            constraints: vec![fk],
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).foreign_keys.is_empty());
+        assert!(
+            pulled.warnings[0].contains("ordinary enable mode"),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // The negative case: the same key with its triggers running is an
+        // ordinary foreign key.
+        let mut running = constraint(1, "t_fk", 'f');
+        running.columns = vec![1];
+        running.ref_columns = vec![1];
+        running.ref_table = Some(1);
+        let raw = RawCatalog {
+            constraints: vec![running],
+            ..raw
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(only(&pulled).foreign_keys.len(), 1);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
+    }
+
+    /// A name the pull can read and the declaration format cannot write is a
+    /// schema that loads back as something else, or not at all.
+    #[test]
+    fn a_name_that_does_not_survive_the_declaration_format_takes_its_table_out() {
+        // A schema with a period in it. Legal in PostgreSQL as `"a.b"`, and
+        // `a.b.t` reads back as three parts.
+        let mut odd = table(1, "t");
+        odd.schema = "a.b".to_owned();
+        let raw = RawCatalog {
+            tables: vec![odd],
+            columns: vec![col(1, 1, "x", "integer")],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled.schema.tables.is_empty(),
+            "{:?}",
+            pulled.schema.tables
+        );
+        assert!(
+            pulled.warnings[0].contains("cannot write back"),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // And a column, addressed as `schema.table.column` by every rename
+        // intent and every ids file.
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a.b", "integer")],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let pulled = assemble(&raw);
+        assert!(
+            pulled.schema.tables.is_empty(),
+            "{:?}",
+            pulled.schema.tables
+        );
+        assert!(
+            pulled.warnings[0].contains("`a.b`"),
+            "{:?}",
+            pulled.warnings
+        );
+
+        // The negative case: ordinary names round-trip and earn nothing.
+        let raw = RawCatalog {
+            columns: vec![col(1, 1, "a", "integer")],
+            ..raw
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
 
     /// A `NO INHERIT` check stops at this table; an ordinary one reaches every

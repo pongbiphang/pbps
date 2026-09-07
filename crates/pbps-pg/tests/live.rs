@@ -1254,7 +1254,9 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
         &s,
         &format!(
             "CREATE TABLE {s}.p (id integer PRIMARY KEY);
-             CREATE TABLE {s}.c (pid integer REFERENCES {s}.p (id))"
+             CREATE TABLE {s}.c (pid integer REFERENCES {s}.p (id),
+                 born date DEFAULT '2020-01-02'::date,
+                 CONSTRAINT c_ck CHECK (pid > 0))"
         ),
     )
     .await;
@@ -1280,6 +1282,49 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
     let key = fk.values().next().expect("one foreign key");
     assert_eq!(key.references_table, pbps_model::TableName::new(&s, "p"));
     assert_eq!(key.references_columns, ["id"]);
+
+    // The same question about the settings that decide how a *value* is
+    // printed, not how a name is. The expressions are carried verbatim, so a
+    // session that prints them differently would manufacture drift.
+    for (setting, value) in [
+        ("quote_all_identifiers", "on"),
+        ("datestyle", "German, DMY"),
+        ("timezone", "Asia/Taipei"),
+        ("intervalstyle", "sql_standard"),
+        ("bytea_output", "escape"),
+    ] {
+        conn.execute(&format!("SET {setting} TO '{value}'"))
+            .await
+            .unwrap_or_else(|e| panic!("set {setting}: {e}"));
+    }
+    // Measured through the session itself: these are not settings the engine
+    // ignores.
+    let hostile = text(
+        &mut conn,
+        &format!(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+              WHERE conrelid = '{s}.c'::regclass AND contype = 'c'"
+        ),
+    )
+    .await;
+    assert_eq!(hostile, "CHECK ((\"pid\" > 0))");
+
+    let pulled = pull(&mut conn).await;
+    let c = &pulled.schema.tables[&pbps_model::TableName::new(&s, "c")];
+    assert_eq!(
+        c.checks.values().next().expect("one check").expression,
+        "(pid > 0)",
+        "the pull is taken under its own canonical scope, not the session's"
+    );
+    assert_eq!(
+        c.columns["born"].default.as_deref(),
+        Some("'2020-01-02'::date")
+    );
+    // And these come back too, for the same reason the path does.
+    assert_eq!(
+        text(&mut conn, "SELECT current_setting('quote_all_identifiers')").await,
+        "on"
+    );
 
     // And the session is handed back exactly as it was found — which is not a
     // restore this code performs but a consequence of the setting being local
@@ -1441,6 +1486,12 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
              CREATE TABLE {s}.published (id integer PRIMARY KEY);
              ALTER TABLE {s}.published REPLICA IDENTITY FULL;
+             CREATE TYPE {s}.shape AS (a integer, b text);
+             CREATE TABLE {s}.shaped OF {s}.shape;
+             CREATE TABLE {s}.pointed_at (a integer PRIMARY KEY);
+             CREATE TABLE {s}.silent (a integer,
+                 CONSTRAINT silent_fk FOREIGN KEY (a) REFERENCES {s}.pointed_at (a));
+             ALTER TABLE {s}.silent DISABLE TRIGGER ALL;
              CREATE TABLE {s}.rewritten (id integer);
              CREATE RULE rewritten_swallows AS ON INSERT TO {s}.rewritten DO INSTEAD NOTHING;
              CREATE TABLE {s}.stops (
@@ -1542,6 +1593,11 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "REPLICA IDENTITY FULL",
         // A table where an `INSERT` does whatever a rule says instead.
         "rewrite rules",
+        // A table whose row shape follows a composite type.
+        "composite type",
+        // A foreign key whose triggers are not running, while the catalog
+        // still calls it validated and enforced.
+        "ordinary enable mode",
         // A key constraint whose index covers more than its key.
         "INCLUDE",
         // The sequence a `serial` owns and this model cannot hold.
@@ -1612,6 +1668,12 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             .checks
             .is_empty(),
         "a check the engine never applies is not a check"
+    );
+    assert!(
+        pulled.schema.tables[&pbps_model::TableName::new(&s, "silent")]
+            .foreign_keys
+            .is_empty(),
+        "a foreign key whose triggers are not running is not a foreign key"
     );
     assert!(
         pulled.schema.tables[&pbps_model::TableName::new(&s, "stops")]
@@ -1716,6 +1778,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "nulls"),
             pbps_model::TableName::new(&s, "odd"),
             pbps_model::TableName::new(&s, "partly"),
+            pbps_model::TableName::new(&s, "pointed_at"),
             pbps_model::TableName::new(&s, "pointing"),
             pbps_model::TableName::new(&s, "quoted"),
             pbps_model::TableName::new(&s, "referenced"),
@@ -1723,6 +1786,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "restricted"),
             pbps_model::TableName::new(&s, "serialised"),
             pbps_model::TableName::new(&s, "setnull"),
+            pbps_model::TableName::new(&s, "silent"),
             pbps_model::TableName::new(&s, "stops"),
             pbps_model::TableName::new(&s, "temporal"),
             pbps_model::TableName::new(&s, "unchecked"),
@@ -1753,6 +1817,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "parted"),
             pbps_model::TableName::new(&s, "published"),
             pbps_model::TableName::new(&s, "rewritten"),
+            pbps_model::TableName::new(&s, "shaped"),
             pbps_model::TableName::new(&s, "volatile_"),
         ],
         "a limitation about a table that is in the pull must name it, and the \

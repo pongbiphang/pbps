@@ -64,6 +64,7 @@ fn tables_query() -> String {
         AND c.relpersistence = 'p'
         AND c.relreplident = 'd'
         AND NOT c.relhasrules
+        AND c.reloftype = 0
         AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')
       ORDER BY n.nspname, c.relname"
     )
@@ -82,7 +83,8 @@ fn partitioned_query() -> String {
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
             c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
             c.relreplident::text AS replica_identity,
-            c.relhasrules AS has_rules, am.amname AS access_method
+            c.relhasrules AS has_rules, am.amname AS access_method,
+            c.reloftype::regtype::text AS of_type
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
@@ -95,6 +97,7 @@ fn partitioned_query() -> String {
                       OR c.relpersistence <> 'p'
                       OR c.relreplident <> 'd'
                       OR c.relhasrules
+                      OR c.reloftype <> 0
                       OR c.relam <> (SELECT am.oid FROM pg_catalog.pg_am am
                                       WHERE am.amname = 'heap'))))
       ORDER BY n.nspname, c.relname"
@@ -185,7 +188,10 @@ fn constraints_query() -> String {
             pg_catalog.array_to_string(con.confdelsetcols, ',') AS delete_set_columns,
             con.conindid::int8 AS index_oid,
             con.conenforced AS enforced, con.conperiod AS period,
-            con.connoinherit AS no_inherit
+            con.connoinherit AS no_inherit,
+            EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
+                     WHERE tg.tgconstraint = con.oid AND tg.tgenabled <> 'O')
+              AS triggers_not_ordinary
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -288,7 +294,32 @@ const PROBE_READ: &str =
 
 /// `true` is `is_local`: the setting belongs to this transaction and goes back
 /// when it ends, whichever way it ends.
-const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true)";
+///
+/// `search_path` is the one that decides how a *name* is rendered. The rest
+/// decide how a **value** is, and they matter for the same reason: the
+/// expressions this pull carries are carried verbatim (ADR-0013 §4), so a
+/// setting that changes what the deparser prints manufactures drift between two
+/// pulls of the same unchanged database, and a rebuild of every constraint and
+/// index it touches.
+///
+/// **Measured**, each of these changes a rendered expression on 18.6:
+/// `quote_all_identifiers` turns `id > 0` into `"id" > 0`; `DateStyle` turns
+/// `'2020-01-02'::date` into `'02.01.2020'::date`; `TimeZone` moves a
+/// `timestamptz` default to another wall clock; `IntervalStyle` turns
+/// `'1 day 02:00:00'` into `'1 2:00:00'`; `bytea_output` turns `'\x0102'` into
+/// `'\\001\\002'`. `extra_float_digits` is here for the same class of reason
+/// without a case that showed it — it governs how many digits a float prints.
+///
+/// `lc_monetary` is deliberately absent: it belongs to the same class, and
+/// `SET` fails outright on a locale the server does not have, which would turn
+/// a readable database into an unreadable one.
+const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
+       pg_catalog.set_config('quote_all_identifiers', 'off', true),
+       pg_catalog.set_config('datestyle', 'ISO, MDY', true),
+       pg_catalog.set_config('intervalstyle', 'postgres', true),
+       pg_catalog.set_config('timezone', 'UTC', true),
+       pg_catalog.set_config('bytea_output', 'hex', true),
+       pg_catalog.set_config('extra_float_digits', '1', true)";
 
 /// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
@@ -376,6 +407,13 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             "r" if text(&row, "replica_identity")? == "i" => {
                 "a table whose `REPLICA IDENTITY` is a named index rather than its primary key"
             }
+            // `CREATE TABLE ... OF t`: the row shape is the composite type's,
+            // and `ALTER TYPE` changes the table. Read back as an ordinary
+            // table it is an independent one that no longer follows anything.
+            "r" if optional_text(&row, "of_type")?.as_deref() != Some("-") => &format!(
+                "a table of the composite type `{}`, whose shape follows it",
+                optional_text(&row, "of_type")?.unwrap_or_default()
+            ),
             // A `DO INSTEAD` rule decides what an `INSERT` on this table
             // actually does — including nothing at all.
             "r" if flag(&row, "has_rules")? => {
@@ -473,6 +511,7 @@ async fn read_all(conn: &mut Conn) -> Result<(RawCatalog, Vec<Limitation>), DbEr
             enforced: flag(&row, "enforced")?,
             period: flag(&row, "period")?,
             no_inherit: flag(&row, "no_inherit")?,
+            triggers_not_ordinary: flag(&row, "triggers_not_ordinary")?,
         });
     }
     for row in conn.query(&indexes_query()).await? {
@@ -675,6 +714,19 @@ mod tests {
         assert!(BEGIN.contains("REPEATABLE READ"));
         assert!(BEGIN.contains("READ ONLY"));
         assert!(CANONICAL_PATH.contains("'search_path', '', true"));
+        // How a value prints, not only how a name does (DECISIONS 252). Each
+        // was measured to change a rendered expression; pinned live by
+        // `the_pull_does_not_move_when_the_sessions_search_path_does`.
+        for setting in [
+            "quote_all_identifiers",
+            "datestyle",
+            "intervalstyle",
+            "timezone",
+            "bytea_output",
+            "extra_float_digits",
+        ] {
+            assert!(CANONICAL_PATH.contains(setting), "{setting}");
+        }
         // Asked of this backend, and of the statement rather than the
         // transaction: `xact_start = query_start` is what "no transaction was
         // open before this one" looks like. Pinned live by
