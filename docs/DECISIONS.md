@@ -4576,6 +4576,21 @@ SPEC is in sync with all of these.
     declaration with its types, and every command that hands statements to a
     database runs it (DECISIONS 141), so the change is never planned at all.
 
+    **Grouping parentheses are taken off first, and that is the boundary of
+    what this guard reads.** Measured, `DEFAULT ('01/02/2026')` on a `date`
+    stores `'2026-01-02'` under MDY and `'2026-02-01'` under DMY exactly as the
+    unparenthesised form does, with the parentheses dropped from what the
+    engine keeps — so a test that looked only at the first character let it
+    past. `without_grouping` strips balanced outer parentheses by a depth that
+    must not return to zero before the end, counting every parenthesis
+    including ones inside literals. Counting them is what keeps this from
+    becoming a parser: a stray parenthesis in a literal can only make the test
+    *fail*, which costs a refusal and never causes one, and stripping the first
+    and last characters can produce a single complete literal only if what was
+    there was `(` literal `)`. Anything more structural — a cast, a
+    concatenation, a function call — stays outside on purpose (DECISIONS 174),
+    covered by the settings the framing pins.
+
 262. **`online` builds an index concurrently only when it has no filter.**
     Measured, `CREATE INDEX CONCURRENTLY` cannot share a batch with anything at
     all — `cannot run inside a transaction block` — so it cannot carry the write

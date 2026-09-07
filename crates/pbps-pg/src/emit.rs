@@ -104,8 +104,66 @@ const SETTING_SENSITIVE: &[&str] = &[
 /// '!'` is the one form left over: it is two literals with a keyword between
 /// them, it answers `false`, and it is named here so that the gap is a recorded
 /// one rather than a spelling nobody thought of.
+/// The same expression with any number of grouping parentheses taken off.
+///
+/// `DEFAULT ('01/02/2026')` is the same declaration as `DEFAULT '01/02/2026'`
+/// and the engine reads it the same way — measured, it stores `'2026-01-02'`
+/// under `DateStyle` MDY and `'2026-02-01'` under DMY, with the parentheses
+/// dropped from what it keeps — so a guard that looked only at the first
+/// character let it past.
+///
+/// The test is a paren *depth* that never returns to zero before the end, and
+/// it counts every parenthesis, including ones inside string literals. That is
+/// deliberate rather than lazy, and the argument is what makes this not the
+/// beginning of an expression parser:
+///
+/// - A stray parenthesis in a literal can only push the depth up or down at
+///   the wrong moment, and either way the test *fails* and nothing is
+///   unwrapped. Failing to unwrap costs a refusal that would have been made,
+///   which is the direction this guard is allowed to be wrong in
+///   (`refuse_an_unresolved_default` explains why it refuses only what is
+///   *provably* unresolved).
+/// - It cannot unwrap wrongly in the direction that matters. Stripping the
+///   first and last characters can only produce a single complete literal if
+///   what was there was `(` literal `)` — so no expression that is not a
+///   parenthesised literal can be turned into one, and no valid declaration
+///   can be refused because of this.
+///
+/// Anything more structural — a cast, a concatenation, a function — stays
+/// outside the guard on purpose (DECISIONS 174: this tool does not parse
+/// expressions), covered instead by the settings the framing pins.
+fn without_grouping(expression: &str) -> &str {
+    let mut e = expression.trim();
+    loop {
+        let bytes = e.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return e;
+        }
+        let mut depth = 0usize;
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    // Back to nothing before the end: the leading `(` was
+                    // closed by something other than the last character, so
+                    // these two are not a pair.
+                    if depth == 0 && i + 1 != bytes.len() {
+                        return e;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return e;
+        }
+        e = e[1..e.len() - 1].trim();
+    }
+}
+
 fn is_a_bare_literal(expression: &str) -> bool {
-    let e = expression.trim();
+    let e = without_grouping(expression);
     if e.starts_with('$') {
         return is_one_dollar_quoted_literal(e);
     }
@@ -1133,6 +1191,11 @@ mod tests {
             // a mark. Measured, this is one dollar-quoted literal on 18.6, so
             // reading it as anything else leaves an ambiguous date unguarded.
             "$a\u{301}$01/02/2026$a\u{301}$",
+            // Grouping is not resolution: the engine drops the parentheses and
+            // reads the same text through the same setting.
+            "('01/02/2026')",
+            "  ( ( '01/02/2026' ) )  ",
+            "($$01/02/2026$$)",
             "U&'2026-01-02'",
         ] {
             assert!(is_a_bare_literal(yes), "{yes}");
@@ -1157,6 +1220,15 @@ mod tests {
             // A tag may not *start* with a digit even when every later
             // character is fine, and the byte rule does not change that.
             "$1a$b$1a$",
+            // Parenthesised, but not one literal: the first group closes
+            // before the end, so nothing is unwrapped and nothing is refused.
+            "('a') || ('b')",
+            "('a')::date",
+            "('a'",
+            // A literal's own parentheses cannot make a pair out of two
+            // groups; the depth never returns to zero between them, so the
+            // unwrap is refused rather than guessed.
+            "('(') || (b)",
             // The recorded gap: two literals with a keyword between them.
             "U&'a' UESCAPE '!'",
         ] {
