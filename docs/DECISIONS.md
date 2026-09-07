@@ -5697,6 +5697,13 @@ SPEC is in sync with all of these.
     structure, independent of which types or callers happen to accept the
     expression today. Both upper- and lower-case openers are accepted, and
     neither gives backslashes escape semantics.
+    **Amended by the module emitter (284).** A module's whole `definition` is
+    verbatim text, so the statement's own `;` is on a line of its own too. The
+    write scope puts a `RESET search_path;` after every statement, and a
+    definition ending in `-- note` swallowed the terminator and ran on into it.
+    The rule is not about expressions; it is about where the user's text ends
+    and this tool's begins.
+
 283. **A routine argument type is its own text type, not a `ColumnType`.**
     `RoutineId` held `Vec<ColumnType>`, which was right while the only dialect
     was SQL Server, where a parameter's type is a column's type. PostgreSQL
@@ -5743,3 +5750,161 @@ SPEC is in sync with all of these.
     hold the bad value beats a branch that checks for it.
 
     Closes the question 59 left open.
+
+284. **A PostgreSQL trigger's table is in its identity *and* in its
+    definition, and a declaration where the two disagree is refused.**
+    ADR-0002 fixed where a module's `definition:` begins by what the emitter
+    can derive, and for a trigger that was `CREATE OR ALTER TRIGGER <name> ON
+    <table>` — T-SQL's grammar. PostgreSQL's is not the same shape:
+
+    ```text
+    CREATE TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION …
+    ```
+
+    The table comes **after** the event list, which is text only the
+    declaration holds. Splitting the prefix there would mean finding the end of
+    the event list, and that is parsing SQL (§8.2). So the emitted prefix is
+    `CREATE TRIGGER <name>` and the table appears twice.
+
+    Measured, the duplication is not caught by anything else: the engine
+    accepts `CREATE TRIGGER audit AFTER INSERT ON app.other` under the key
+    `app.t.audit` without a word, and the mismatch surfaces a plan later as
+    `DROP TRIGGER audit ON app.t` finding nothing. So `validate_module` refuses
+    a trigger whose definition does not name the table its identity does, by
+    ADR-0002's own best-effort identifier scan.
+
+    **The scan is used in the direction where a miss is loud.** A declaration
+    that does name its table in a spelling the scan cannot see is refused here,
+    and the fix is to qualify the name; the alternative — accepting and
+    discovering it later — creates the trigger somewhere else and leaves the
+    key pointing at nothing.
+
+    Also measured, and the reason the trigger's own name is emitted bare:
+
+    ```text
+    CREATE TRIGGER m1.audit AFTER INSERT ON m1.t …   syntax error at or near "."
+    ```
+
+    A trigger name is not schema-qualified on this engine, which is the same
+    fact ADR-0009 §1 records from the other side — the schema in
+    `ModuleId::Trigger` is the table's, and there is nowhere else for it to
+    come from.
+
+285. **A routine argument this dialect's catalogue does not know is passed
+    through, not refused.** `Postgres::normalize_type` refuses an unknown
+    column type, and the obvious move was to answer the same way for a
+    routine's arguments. It is wrong here for a reason that does not apply
+    there: a column's type has to be one this tool can spell, and a routine's
+    argument only has to be the text the engine's identity carries.
+
+    Measured, of one function's twelve parameters the catalogue knows three by
+    name, and the rest are a domain, an enum, `"char"`, arrays and spellings a
+    column may not hold. Refusing them would refuse ADR-0009 §1's own example
+    and make the routines of an ordinary database unreadable.
+
+    The bargain is ADR-0009 §1's, stated there and taken here: *"the declared
+    signature is what the emitter writes into `DROP FUNCTION` … and a mismatch
+    produces a `CREATE` the engine refuses or an object the next plan reports
+    as one to drop and one to add. Both are loud, both are inside the plan's
+    transaction, and neither is silent."* The user writes what `pull` showed
+    them, which is the engine's own text.
+
+    What the fold does do is what every engine agrees on and ADR-0009 §1
+    measured: a modifier is discarded (`varchar(10)` is `character varying`),
+    an array collapses to one `[]` (`text[][]` is `text[]`), and everything
+    else goes through the column catalogue's alias table so `int4` is
+    `integer`. `float(24)` is why the modifier is not thrown away *before* the
+    catalogue is asked: it is `real`, and `float` is `double precision`.
+
+286. **A module whose deparsed statement this reader cannot cut is named and
+    left out, never recorded with an empty body.** The declaration holds
+    everything after the object's name, and PostgreSQL hands back the whole
+    statement, so the pull has to cut it. Measured, the three shapes:
+
+    ```text
+    CREATE OR REPLACE FUNCTION m4."odd Name"(a integer)⏎ RETURNS integer …
+    CREATE OR REPLACE PROCEDURE m4.p(a integer)⏎ LANGUAGE sql …
+    CREATE TRIGGER "audit x" AFTER INSERT ON m4.t FOR EACH ROW …
+    ```
+
+    The name is **stepped over**, not searched for: looking for the first `(`
+    finds the wrong one in `"f(x)"."g"`, and rebuilding the name to compare
+    against would mean reproducing the deparser's own quoting rules, which is
+    the deparser's job and not this reader's.
+
+    Where the text is not that shape, the module is left out with a warning
+    naming it. The alternative — an empty `definition` — is the failure mode
+    this project keeps finding: absent, empty and unreadable are three
+    different things, and an empty body is one the next plan writes back over a
+    working object.
+
+    The same round trip the tables are asked for applies to the identity: a
+    view called `f(int)` reads back as a routine with an argument list, so a
+    module id that does not survive `ModuleId::from_str(&id.to_string())` takes
+    its object out of the pull rather than into a schema that will not load.
+
+287. **Extension-owned objects are left out of the pull silently, and that is
+    not the "absent, empty and unreadable" failure.** `CREATE EXTENSION …
+    SCHEMA app` puts an extension's functions and views in a project's schema.
+    A reader without the `pg_depend deptype = 'e'` filter reports every one of
+    them as an undeclared module, and the next plan offers to drop objects
+    whose declaration lives in a `.sql` file the extension owns and this
+    project does not have.
+
+    Not reported as a limitation, unlike a materialized view: a limitation is
+    something the *model* cannot hold, and these are somebody else's objects.
+    `DROP EXTENSION` is how one goes away. Reporting them would put a line per
+    extension object in front of every reader, which is how a report stops
+    being read.
+
+288. **On this dialect every carried attribute refuses the rebuild today,
+    because there is no declared grant for one to come back from.**
+    ADR-0009 §3 decides that a grant to a **declared** role survives a module
+    replacement, by the machinery ADR-0005 built — and roles and grants are
+    Phase 5 step 6. Until that lands, `pbps-pg` has no `Grant` to emit, so an
+    object carrying anything at all is one this dialect cannot rebuild.
+
+    The conservative direction is the only one available, and it is also the
+    right one to start from: warning and proceeding would put "the application
+    lost access" behind a line of output nobody reads at 3am. The step that
+    adds grants narrows this to what the declarations still cannot reproduce;
+    it does not remove it, because ADR-0010 §5 records that pbps cannot express
+    "revoked from `PUBLIC`" and therefore must not take it away.
+
+    What is enumerated is the catalog and not a list — the ADR's own rule,
+    after three review rounds each found the same shape one attribute further
+    out. Measured on this branch, and each a refusal: a grant in `relacl` or
+    `proacl`; a revocation from `PUBLIC`, which is the *absence* of a row and
+    so invisible to a check that compares rows; an owner other than the
+    deploying account, which a `DROP` and `CREATE` silently transfers and which
+    turns a `SECURITY DEFINER` routine into a privileged one; `reloptions`;
+    a view column default in `pg_attrdef`; a trigger's `tgenabled`; and the
+    grants a *new* object would arrive with from `pg_default_acl`, which no
+    comparison against the old object can see.
+
+289. **The rebind test is a name and a path, not a position on it.**
+    ADR-0013 §3 requires that a same-named object a plan introduces rebuilds
+    the modules it could capture, in that same plan. The obvious
+    implementation asks which candidate is *earlier* on the write path than the
+    current binding, and it cannot be written: an overload in the same schema
+    captures a call without anything moving, and what an unchanged declaration
+    would bind to today cannot be computed without parsing it (§8.2 forbids) or
+    creating it (planning must not).
+
+    So the test is: this plan brings an object into a schema on that module's
+    effective write path, and the module's text mentions that object's bare
+    name. One rebuild, once. A declaration that qualified the name in full is
+    rebuilt too — deliberately conservative, and the ADR says so.
+
+    Measured, all three states, which is what makes "one plan late" a cost and
+    not a phrase:
+
+    ```text
+    before anything arrives:                    caller() = 'shared'
+    after the shadow arrives, with no rebuild:  caller() = 'shared'
+    after the rebuild:                          caller() = 'app'
+    ```
+
+    The middle line is a whole plan cycle in which the environment means one
+    thing and the declarations mean another, with nothing in the plan that
+    created the shadow having said so.

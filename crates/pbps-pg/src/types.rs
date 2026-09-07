@@ -996,7 +996,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
 }
 
 /// The spelling this engine puts in a routine's identity, from a declared one
-/// (ADR-0009 §1, DECISIONS 283).
+/// (ADR-0009 §1, DECISIONS 283 and 285).
 ///
 /// The rules and the measurements behind them are on
 /// `Postgres::normalize_routine_arg`, which is the only caller. Total by

@@ -5303,3 +5303,670 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
         "the drop with a signature took the wrong object, or both"
     );
 }
+
+/// Opens a transaction, because [`pbps_pg::modules::before_a_rebuild`] takes
+/// the object's lock and holds it through the rebuild — outside a transaction
+/// the lock would be released at the end of the statement that took it.
+async fn in_a_transaction(conn: &mut Conn) {
+    conn.execute("BEGIN").await.expect("begin");
+}
+
+async fn rollback(conn: &mut Conn) {
+    conn.execute("ROLLBACK").await.expect("rollback");
+}
+
+/// ADR-0009 §3's whole finding, measured end to end: `CREATE OR ALTER` was
+/// buying grant preservation, and this engine will not sell it — so an object
+/// carrying anything the declarations cannot reproduce refuses the rebuild
+/// **by name** rather than reporting success while quietly changing who may use
+/// it.
+///
+/// Six carried things, each measured on this branch and each in ADR-0009 §3's
+/// table: a grant, a revocation from `PUBLIC` (which is the *absence* of a row
+/// and the more dangerous of the two directions), `reloptions`, a view column
+/// default in `pg_attrdef`, a trigger's `tgenabled`, and grants the *new*
+/// object would arrive with from `pg_default_acl`. The last is the one every
+/// earlier version of the ADR missed: an object with no grants at all is the
+/// easiest case to wave through, and it is the one where a rebuild hands an
+/// unmanaged role `SELECT`.
+///
+/// Roles and grants are Phase 5 step 6, so today every one of these is a
+/// refusal; the step that adds them narrows this to what the declarations still
+/// cannot reproduce, and ADR-0010 §5 keeps `PUBLIC` on the refusing side for
+/// good.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
+    let s = emit_schema("carried");
+    let reader = format!("{s}_reader");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("DROP ROLE IF EXISTS {reader}"),
+        format!("CREATE ROLE {reader}"),
+        format!("CREATE TABLE {s}.t (id int primary key, a text)"),
+        format!("CREATE VIEW {s}.plain AS SELECT id FROM {s}.t"),
+        format!("CREATE VIEW {s}.granted AS SELECT id FROM {s}.t"),
+        format!("GRANT SELECT ON {s}.granted TO {reader}"),
+        format!("CREATE VIEW {s}.optioned WITH (security_invoker = true) AS SELECT id FROM {s}.t"),
+        format!("CREATE VIEW {s}.defaulted AS SELECT id, a FROM {s}.t"),
+        format!("ALTER VIEW {s}.defaulted ALTER COLUMN a SET DEFAULT 'from the view'"),
+        format!("CREATE FUNCTION {s}.open(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        format!("CREATE FUNCTION {s}.closed(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        format!("REVOKE EXECUTE ON FUNCTION {s}.closed(int) FROM PUBLIC"),
+        format!(
+            "CREATE FUNCTION {s}.trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!(
+            "CREATE TRIGGER live AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"
+        ),
+        format!("CREATE TRIGGER off AFTER UPDATE ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+        format!("ALTER TABLE {s}.t DISABLE TRIGGER off"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    use pbps_model::ModuleKind::{Function, Trigger, View};
+    let cases: Vec<(String, pbps_model::ModuleKind, Option<&str>)> = vec![
+        // Nothing attached: this is what a rebuild is allowed to do.
+        (format!("{s}.plain"), View, None),
+        (format!("{s}.granted"), View, Some(&reader)),
+        (format!("{s}.optioned"), View, Some("security_invoker")),
+        (format!("{s}.defaulted"), View, Some("from the view")),
+        (format!("{s}.open(integer)"), Function, None),
+        // A revocation is not a row in the ACL — it is the absence of the
+        // engine's default — so a rebuild restores the default and silently
+        // reopens a function somebody deliberately closed.
+        (format!("{s}.closed(integer)"), Function, Some("=X/")),
+        (format!("{s}.t.live"), Trigger, None),
+        (format!("{s}.t.off"), Trigger, Some("disabled")),
+    ];
+    for (id, kind, expected) in &cases {
+        let id: pbps_model::ModuleId = id.parse().expect("a module id");
+        in_a_transaction(&mut conn).await;
+        let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &id, *kind)
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        rollback(&mut conn).await;
+        match expected {
+            None => assert_eq!(
+                rebuild.refusal(),
+                None,
+                "`{id}` carries nothing and must not refuse: {:?}",
+                rebuild.carries
+            ),
+            Some(needle) => {
+                let refusal = rebuild
+                    .refusal()
+                    .unwrap_or_else(|| panic!("`{id}` must refuse, and did not"));
+                assert!(refusal.contains(needle), "`{id}`: {refusal}");
+            }
+        }
+    }
+
+    // The grant that arrives uninvited. Added after the objects exist, so the
+    // *old* ACL of every one of them is still what it was — which is exactly
+    // the gap a "reproduce the old ACL" check leaves.
+    conn.execute(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} GRANT SELECT ON TABLES TO {reader}"
+    ))
+    .await
+    .expect("default privileges");
+    let plain: pbps_model::ModuleId = format!("{s}.plain").parse().expect("a module id");
+    in_a_transaction(&mut conn).await;
+    let arriving = pbps_pg::modules::before_a_rebuild(&mut conn, &plain, View)
+        .await
+        .expect("read");
+    rollback(&mut conn).await;
+    let refusal = arriving
+        .refusal()
+        .expect("a view that would arrive granted must refuse");
+    assert!(refusal.contains("pg_default_acl"), "{refusal}");
+    assert!(refusal.contains(&reader), "{refusal}");
+
+    conn.execute(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA {s} REVOKE SELECT ON TABLES FROM {reader}"
+    ))
+    .await
+    .expect("undo the default privileges");
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.execute(&format!("DROP ROLE {reader}"))
+        .await
+        .expect("drop the role");
+}
+
+/// The read has to be serialized against a concurrent change, and **measured**,
+/// the mechanism differs by kind and one of them is out of reach: a view takes
+/// its own lock, a trigger takes its parent table's, and a routine's would be a
+/// row lock on `pg_proc` that the accounts this tool is built for cannot take.
+///
+/// Refusing instead would refuse every function edit, since §3 makes them all
+/// rebuilds — so the residual is named where the reviewer sees it. This suite
+/// connects as a superuser, so the routine's lock *is* reachable here; what is
+/// asserted is that each kind reports which of the four shapes applied, and
+/// never that a rebuild was serialized when it was not.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
+    let s = emit_schema("serialize");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!("CREATE FUNCTION {s}.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"),
+        format!(
+            "CREATE FUNCTION {s}.trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!("CREATE TRIGGER a AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+    ] {
+        conn.execute(&sql).await.expect("build");
+    }
+
+    use pbps_model::ModuleKind::{Function, Trigger, View};
+    for (id, kind, expected) in [
+        (format!("{s}.v"), View, "the view's own"),
+        (format!("{s}.t.a"), Trigger, "parent table"),
+        (format!("{s}.f(integer)"), Function, "pg_proc"),
+    ] {
+        let id: pbps_model::ModuleId = id.parse().expect("a module id");
+        in_a_transaction(&mut conn).await;
+        let rebuild = pbps_pg::modules::before_a_rebuild(&mut conn, &id, kind)
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        rollback(&mut conn).await;
+        match &rebuild.serialized {
+            pbps_pg::modules::Serialized::By(what) => {
+                assert!(what.contains(expected), "{id}: {what}");
+            }
+            pbps_pg::modules::Serialized::Not(why) => {
+                panic!("{id} was not serialized, and this account can: {why}")
+            }
+        }
+    }
+
+    // And outside a transaction the lock would be gone before the `DROP`, so
+    // the read refuses rather than answering something that is true only while
+    // it is being said.
+    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let refused = pbps_pg::modules::before_a_rebuild(&mut conn, &id, View)
+        .await
+        .expect_err("a read with no transaction to hold the lock");
+    assert!(
+        format!("{refused}").contains("inside the transaction"),
+        "{refused}"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0009 §4: on this engine the dependency refusal is the ordinary case, and
+/// the enumeration is over **every** reverse `pg_depend` edge and not only
+/// modules.
+///
+/// The four the ADR measured all hang off a function — a check constraint, a
+/// column default, a generated column and an expression index — and since §3
+/// makes every module change a rebuild, a function edit meets them every time.
+/// Two of the four are **not representable**: `Column` has no
+/// generated-expression field and `IndexColumn` is a name and a direction, so
+/// promising to restore them would be promising to emit a statement pbps cannot
+/// write. They take the unmanaged path with everything else the model cannot
+/// hold.
+///
+/// The engine's own refusal is asserted beside the reader's, because the plan a
+/// reviewer approves and the failure an operator would otherwise hit should
+/// name the same objects.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it() {
+    let s = emit_schema("dependents");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!(
+            "CREATE FUNCTION {s}.g(a int) RETURNS int IMMUTABLE LANGUAGE sql AS $$ SELECT a $$"
+        ),
+        format!(
+            "CREATE TABLE {s}.t (id int primary key, n int CONSTRAINT ck CHECK ({s}.g(n) > 0), \
+             d int DEFAULT {s}.g(1), gen int GENERATED ALWAYS AS ({s}.g(id)) STORED)"
+        ),
+        format!("CREATE INDEX ix ON {s}.t ({s}.g(n))"),
+        format!(
+            "CREATE FUNCTION {s}.atomic() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT {s}.g(1); END"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let g: pbps_model::ModuleId = format!("{s}.g(integer)").parse().expect("a module id");
+    let found = pbps_pg::modules::dependents(&mut conn, &g, pbps_model::ModuleKind::Function)
+        .await
+        .expect("read the dependents");
+    let described: Vec<&str> = found.iter().map(|d| d.described.as_str()).collect();
+    assert_eq!(
+        described,
+        vec![
+            format!("constraint ck on table {s}.t"),
+            format!("default value for column d of table {s}.t"),
+            format!("default value for column gen of table {s}.t"),
+            format!("function {s}.atomic()"),
+            format!("index {s}.ix"),
+        ],
+        "the enumeration is over every reverse edge"
+    );
+
+    // With nothing declared, every one of them is a refusal — and it names
+    // them all in one message, because an operator reading it is deciding what
+    // to do about the function.
+    let nothing = Schema::default();
+    let refusal = pbps_pg::modules::unmanaged_refusal(&g, &found, &nothing)
+        .expect("five undeclared dependents must refuse");
+    for one in &described {
+        assert!(refusal.contains(one), "{one} is missing from:\n{refusal}");
+    }
+    assert!(
+        !refusal.to_uppercase().contains("USE DROP ... CASCADE"),
+        "the plan names every object it drops, or it does not drop: {refusal}"
+    );
+
+    // Declared, the two representable table parts become the plan's to drop
+    // and restore around the rebuild. The generated column and the expression
+    // index stay refused whatever the project declares — the model has nothing
+    // to recreate them from.
+    let mut declared = Schema::default();
+    let mut t = Table::default();
+    t.columns
+        .insert("id".into(), Column::new(ty("integer")).not_null());
+    t.columns.insert("n".into(), Column::new(ty("integer")));
+    let mut d = Column::new(ty("integer"));
+    d.default = Some(format!("{s}.g(1)"));
+    t.columns.insert("d".into(), d);
+    t.checks.insert(
+        "ck".into(),
+        pbps_model::CheckConstraint {
+            expression: format!("{s}.g(n) > 0"),
+        },
+    );
+    declared.tables.insert(TableName::new(&s, "t"), t);
+    declared.modules.insert(
+        format!("{s}.atomic()").parse().expect("a module id"),
+        module(
+            pbps_model::ModuleKind::Function,
+            &format!("() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT {s}.g(1); END"),
+        ),
+    );
+
+    let still = pbps_pg::modules::unmanaged_refusal(&g, &found, &declared)
+        .expect("two of the four are not representable at all");
+    assert!(still.contains("column gen"), "{still}");
+    assert!(still.contains("ix"), "{still}");
+    assert!(!still.contains("constraint ck"), "{still}");
+    assert!(!still.contains("atomic"), "{still}");
+
+    let rebuilt: Vec<&str> = pbps_pg::modules::to_rebuild(&found, &declared)
+        .iter()
+        .map(|d| d.described.as_str())
+        .collect();
+    assert_eq!(
+        rebuilt,
+        vec![
+            format!("constraint ck on table {s}.t"),
+            format!("default value for column d of table {s}.t"),
+            format!("function {s}.atomic()"),
+        ],
+        "these are what a plan has to drop before the rebuild and create after it"
+    );
+
+    // And the engine names the same objects, which is the failure a plan
+    // without this reader would be applyable straight into.
+    let engine = conn
+        .execute(&format!("DROP FUNCTION {s}.g(int)"))
+        .await
+        .expect_err("the engine refuses too");
+    assert_eq!(sqlstate(&engine), "2BP01", "{engine:?}");
+
+    // A view's own edges are not its dependents, and this is the case that
+    // shows it: `pg_depend` holds an *internal* edge from a view's `_RETURN`
+    // rule and its row type to the view itself, so a reader that took every
+    // reverse edge would report every view as depending on itself and refuse
+    // to rebuild any of them.
+    for sql in [
+        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!("CREATE VIEW {s}.v2 AS SELECT id FROM {s}.v"),
+    ] {
+        conn.execute(&sql).await.expect("the views");
+    }
+    let v: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let on_the_view = pbps_pg::modules::dependents(&mut conn, &v, pbps_model::ModuleKind::View)
+        .await
+        .expect("read the dependents");
+    assert_eq!(
+        on_the_view
+            .iter()
+            .map(|d| d.described.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("rule _RETURN on view {s}.v2")],
+        "a view's own `_RETURN` rule and row type are internal edges, not dependents"
+    );
+    assert_eq!(
+        on_the_view[0].holds,
+        pbps_pg::modules::Holds::Module(format!("{s}.v2").parse().expect("a module id")),
+        "the dependent is the view that holds the rule, not the rule"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// The limit of "enumerate from the catalog", measured: `pg_depend` records an
+/// edge for a caller only when the calling body was **parsed at creation
+/// time**.
+///
+/// A `BEGIN ATOMIC` body records one; a plpgsql body and a SQL string-literal
+/// body record nothing. So a rebuild that changes a signature goes through, the
+/// apply commits, `verify` has nothing to report — and the caller fails the
+/// next time anybody calls it.
+///
+/// What is done about it is a **report**, never a refusal: the scan matches a
+/// name, and with overloading a name is not an identity, so a managed caller of
+/// `f(text)` would block every rebuild of `f(integer)` with no way to clear the
+/// block. The refusals in this design are for facts, and a name is not one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_it() {
+    let s = emit_schema("scan");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE FUNCTION {s}.dep_f(a int) RETURNS int LANGUAGE sql AS $$ SELECT a $$"),
+        format!(
+            "CREATE FUNCTION {s}.plpgsql_caller() RETURNS int LANGUAGE plpgsql AS $$ BEGIN \
+             RETURN {s}.dep_f(1); END $$"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let dep_f: pbps_model::ModuleId = format!("{s}.dep_f(integer)").parse().expect("a module id");
+    let edges = pbps_pg::modules::dependents(&mut conn, &dep_f, pbps_model::ModuleKind::Function)
+        .await
+        .expect("read the dependents");
+    assert!(
+        edges.is_empty(),
+        "the catalog records nothing for a plpgsql caller: {edges:?}"
+    );
+
+    // The scan does see it, and says so without blocking anything.
+    let mut declared = Schema::default();
+    let caller: pbps_model::ModuleId = format!("{s}.plpgsql_caller()")
+        .parse()
+        .expect("a module id");
+    declared.modules.insert(
+        caller.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            &format!("() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN {s}.dep_f(1); END $$"),
+        ),
+    );
+    declared
+        .modules
+        .insert(dep_f.clone(), module(pbps_model::ModuleKind::Function, "x"));
+    let by_name = pbps_pg::modules::callers_by_name(&declared, &dep_f);
+    assert_eq!(by_name, vec![caller.clone()]);
+    let report = pbps_pg::modules::callers_report(&dep_f, &by_name).expect("a report");
+    assert!(report.contains(&caller.to_string()), "{report}");
+    assert!(
+        !report.to_lowercase().contains("cannot be rebuilt"),
+        "a name match is reported, not refused: {report}"
+    );
+
+    // And the hazard the report exists for, measured end to end: the rebuild
+    // goes through and the caller is broken afterwards, with nothing in
+    // between having said so.
+    conn.execute(&format!("DROP FUNCTION {s}.dep_f(int)"))
+        .await
+        .expect("the rebuild's drop is accepted");
+    conn.execute(&format!(
+        "CREATE FUNCTION {s}.dep_f(a int, b int) RETURNS int LANGUAGE sql AS $$ SELECT a + b $$"
+    ))
+    .await
+    .expect("the rebuild's create is accepted");
+    let broken = match conn.query(&format!("SELECT {s}.plpgsql_caller()")).await {
+        Ok(_) => panic!("the caller answered, and this test needs it broken"),
+        Err(e) => e,
+    };
+    assert_eq!(sqlstate(&broken), "42883", "{broken:?}");
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
+/// ADR-0013 §3, and the issue's last named check: **a same-named object
+/// introduced earlier on the path by the same plan must rebuild the module
+/// once, rather than one plan late.**
+///
+/// The three states are measured here in order, and the middle one is the
+/// hazard:
+///
+/// ```text
+/// before anything arrives:                      caller() = 'shared'
+/// after the shadow arrives, with no rebuild:    caller() = 'shared'
+/// after the rebuild:                            caller() = 'app'
+/// ```
+///
+/// The middle line is what "one plan late" costs: the environment goes on
+/// meaning `shared.f` while the declarations now mean `app.f`, and nothing in
+/// the plan that created `app.f` said so. The differ cannot find it — the
+/// caller's declaration did not change — so the comparison is asked of the
+/// catalog **as this plan will leave it**, and the answer rebuilds the caller
+/// in the same plan.
+///
+/// The test is a name and a path, not a position, and deliberately so: a
+/// declaration that qualified the name in full is rebuilt too, once. What an
+/// unchanged declaration *would* bind to today cannot be computed without
+/// parsing it, and §8.2 says this tool does not.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
+    let s = emit_schema("binding");
+    let shared = format!("{s}_shared");
+    let pg = Postgres::with_write_path_extras(vec![shared.clone()]);
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    fresh(&mut conn, &shared).await;
+    conn.execute(&format!(
+        "CREATE FUNCTION {shared}.f(a int) RETURNS text LANGUAGE sql AS $$ SELECT 'shared' $$"
+    ))
+    .await
+    .expect("the shared function");
+
+    let caller: pbps_model::ModuleId = format!("{s}.caller()").parse().expect("a module id");
+    // `BEGIN ATOMIC`, because that is the body whose binding is fixed when it
+    // is created — the one kind ADR-0009 §4 measured as recording its
+    // dependency, and the kind this project's documentation recommends for
+    // exactly that reason.
+    let caller_body = "() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT f(1); END";
+    let mut a = Schema::default();
+    a.modules.insert(
+        caller.clone(),
+        module(pbps_model::ModuleKind::Function, caller_body),
+    );
+    let ids = mint_ids(&a, &IdsFile::default(), &[]);
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &a, &ids),
+    )
+    .await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT {s}.caller()")).await,
+        "shared",
+        "precondition: the caller binds through the path to the shared schema"
+    );
+
+    // B adds an overload earlier on the path, and changes nothing else.
+    let shadow: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
+    let mut b = a.clone();
+    b.modules.insert(
+        shadow.clone(),
+        module(
+            pbps_model::ModuleKind::Function,
+            "(a integer) RETURNS text LANGUAGE sql AS $$ SELECT 'app' $$",
+        ),
+    );
+    let cs = plan(&a, &ids, &b, &ids);
+    // The differ finds one change, because the caller's declaration did not
+    // move — which is the whole difficulty: nothing in this plan mentions the
+    // module whose meaning it is about to alter.
+    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
+    let pbps_model::Change::CreateModule { id: created, .. } = &cs.changes[0].change else {
+        panic!(
+            "the one change is the overload's creation: {:#?}",
+            cs.changes[0]
+        )
+    };
+    assert_eq!(created, &shadow);
+    let changed: std::collections::BTreeSet<pbps_model::ModuleId> =
+        [shadow.clone()].into_iter().collect();
+
+    let rebound = pbps_pg::modules::rebound_by_this_plan(
+        &b,
+        pg.write_path_extras(),
+        std::slice::from_ref(&shadow),
+        &changed,
+    );
+    assert_eq!(
+        rebound,
+        vec![pbps_pg::modules::Rebound {
+            module: caller.clone(),
+            arriving: shadow.clone(),
+        }],
+        "the caller has to be rebuilt by this plan"
+    );
+
+    // The plan as it must be applied: the change the differ found, and the
+    // rebuild this answer synthesized.
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(&mut conn, &format!("SELECT {s}.caller()")).await,
+        "shared",
+        "without the rebuild the environment still means the old binding — this is the line \
+         that costs a whole plan cycle"
+    );
+    for stmt in pg
+        .emit(
+            &pbps_model::Change::AlterModule {
+                id: caller.clone(),
+                module: Box::new(module(pbps_model::ModuleKind::Function, caller_body)),
+            },
+            pbps_model::Strategy::default(),
+        )
+        .expect("emit the synthesized rebuild")
+    {
+        conn.execute(&stmt.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{}\n{e}", stmt.sql));
+    }
+    assert_eq!(
+        text(&mut conn, &format!("SELECT {s}.caller()")).await,
+        "app",
+        "the binding moved in the same plan"
+    );
+
+    // Once. The next plan introduces nothing, so nothing is rebound.
+    assert!(
+        pbps_pg::modules::rebound_by_this_plan(
+            &b,
+            pg.write_path_extras(),
+            &[],
+            &std::collections::BTreeSet::new()
+        )
+        .is_empty(),
+        "a plan that introduces nothing rebuilds nothing"
+    );
+
+    for schema in [&s, &shared] {
+        conn.execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .expect("drop");
+    }
+}
+
+/// Absent, empty and unreadable are three different things, on the module side
+/// of the pull.
+///
+/// A materialized view, an aggregate and a window function are module-shaped
+/// objects the model does not hold. They are **named**, not silently missing —
+/// a module read as absent is a plan that creates it on top of the one that is
+/// already there — and they are not read back as the ordinary kind, which would
+/// make a plan that recreates a materialized view as a view.
+///
+/// The `prokind` filter that keeps them out is not tidiness: **measured**,
+/// `pg_get_functiondef` refuses an aggregate by name, so without it the whole
+/// pull fails rather than reporting one object.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_still_runs() {
+    let s = emit_schema("unheld");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("CREATE MATERIALIZED VIEW {s}.mv AS SELECT id FROM {s}.t"),
+        format!("CREATE AGGREGATE {s}.agg(int) (sfunc = int4pl, stype = int)"),
+        // The engine's own answer, and the reason the filter exists.
+        format!("CREATE VIEW {s}.ordinary AS SELECT id FROM {s}.t"),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let refused = conn
+        .query(&format!(
+            "SELECT pg_catalog.pg_get_functiondef(p.oid) FROM pg_catalog.pg_proc p
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = '{s}' AND p.prokind = 'a'"
+        ))
+        .await
+        .err()
+        .expect("an aggregate has no function definition");
+    assert_eq!(sqlstate(&refused), "42809", "{refused:?}");
+
+    let pulled = pull(&mut conn).await;
+    let ours = our_modules(&pulled, &s);
+    let named: Vec<&String> = pulled
+        .warnings
+        .iter()
+        .filter(|w| w.contains(&format!("{s}.")))
+        .collect();
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+
+    assert_eq!(
+        ours.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        vec![format!("{s}.ordinary")],
+        "only the kind the model holds is in the pull"
+    );
+    for (object, why) in [("mv", "materialized view"), ("agg", "aggregate")] {
+        assert!(
+            named
+                .iter()
+                .any(|w| w.contains(&format!("{s}.{object}")) && w.contains(why)),
+            "`{s}.{object}` was not named: {named:#?}"
+        );
+    }
+}

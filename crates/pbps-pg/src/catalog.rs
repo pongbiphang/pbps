@@ -111,7 +111,8 @@ fn tables_query() -> String {
 /// does not have.
 ///
 /// Left out rather than reported: they are not a limitation of the model, they
-/// are somebody else's objects. `DROP EXTENSION` is how one goes away.
+/// are somebody else's objects. `DROP EXTENSION` is how one goes away
+/// (DECISIONS 287).
 const NOT_AN_EXTENSIONS: &str = "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                     WHERE d.objid = %OID% AND d.classid = %CLASS%::regclass
                       AND d.deptype = 'e')";

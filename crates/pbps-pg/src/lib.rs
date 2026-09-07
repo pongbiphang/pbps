@@ -30,6 +30,7 @@ pub mod catalog;
 pub mod doctor;
 mod emit;
 pub mod introspect;
+pub mod modules;
 pub mod state;
 mod types;
 
