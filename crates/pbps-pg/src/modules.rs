@@ -285,9 +285,10 @@ async fn read_relation(
             &[Param::I64(oid)],
         )
         .await?;
-    let Some(row) = rows.first() else {
-        return Ok(());
-    };
+    // The oid was resolved for this kind, so exactly one row is due. No row
+    // means the object went between the two statements, and an `Ok` here would
+    // be the same silence `not_in_the_catalog` exists to refuse.
+    let row = rows.first().ok_or_else(|| vanished(oid))?;
     push_owner(row, carries)?;
     push_acl(row, carries)?;
     // Measured: `security_invoker`, `security_barrier` and `check_option` live
@@ -322,9 +323,7 @@ async fn read_routine(
             &[Param::I64(oid)],
         )
         .await?;
-    let Some(row) = rows.first() else {
-        return Ok(());
-    };
+    let row = rows.first().ok_or_else(|| vanished(oid))?;
     push_owner(row, carries)?;
     push_acl(row, carries)?;
     Ok(())
@@ -377,28 +376,28 @@ async fn read_trigger_enabled(
     oid: i64,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
-    for row in conn
+    let rows = conn
         .query_with(
             "SELECT tg.tgenabled::text AS enabled
                FROM pg_catalog.pg_trigger tg
               WHERE tg.oid = ($1::int8)::oid",
             &[Param::I64(oid)],
         )
-        .await?
-    {
-        let enabled = text(&row, "enabled")?;
-        if enabled != "O" {
-            carries.push(Carried {
-                what: "a trigger's enabled state in `pg_trigger.tgenabled`, which the \
-                       declarations cannot express",
-                detail: match enabled.as_str() {
-                    "D" => "the trigger is disabled".to_owned(),
-                    "R" => "the trigger fires only on a replica".to_owned(),
-                    "A" => "the trigger fires always, replica or not".to_owned(),
-                    other => format!("`tgenabled` is `{other}`"),
-                },
-            });
-        }
+        .await?;
+    let enabled = text(rows.first().ok_or_else(|| vanished(oid))?, "enabled")?;
+    // `O` is the ordinary state and the only one a `CREATE TRIGGER` produces,
+    // so it is the only one there is nothing to carry across.
+    if enabled != "O" {
+        carries.push(Carried {
+            what: "a trigger's enabled state in `pg_trigger.tgenabled`, which the declarations \
+                   cannot express",
+            detail: match enabled.as_str() {
+                "D" => "the trigger is disabled".to_owned(),
+                "R" => "the trigger fires only on a replica".to_owned(),
+                "A" => "the trigger fires always, replica or not".to_owned(),
+                other => format!("`tgenabled` is `{other}`"),
+            },
+        });
     }
     Ok(())
 }
@@ -531,6 +530,22 @@ async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError>
 /// which is indistinguishable from an object that carries nothing and has
 /// none — and that answer waves a rebuild through. Absent, empty and
 /// unreadable are three different things, and only one of them is good news.
+/// The same silence, one statement later: the oid resolved and then the row
+/// was gone. Only reachable where something dropped the object out from under
+/// this transaction, which the lock is there to stop — so it is reported
+/// rather than absorbed.
+fn vanished(oid: i64) -> DbError {
+    DbError::Driver {
+        code: None,
+        message: format!(
+            "the catalog entry for oid {oid} was there when this read resolved it and gone when \
+             it read what the object carries. Something dropped it between two statements of this \
+             transaction. Nothing is reported rather than \"it carries nothing\", because that \
+             answer is what lets a rebuild go ahead."
+        ),
+    }
+}
+
 fn not_in_the_catalog(id: &ModuleId) -> DbError {
     DbError::Driver {
         code: None,
