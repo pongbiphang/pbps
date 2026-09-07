@@ -423,13 +423,49 @@ pub struct Hints {
 /// and the environment is unchanged. The escape hatch for the cases it gets
 /// wrong is [`ModuleDeps`].
 pub fn references(definition: &str, name: &ObjectName) -> bool {
-    let haystack = scannable(definition);
-    let schema = name.schema.to_ascii_lowercase();
-    let object = name.name.to_ascii_lowercase();
+    references_as(definition, name, Case::Folded)
+}
+
+/// How the scan compares letters, narrowest last.
+///
+/// The scan asks with the widest, and `creation_order` re-asks with a narrower
+/// one where the answer made a cycle. Which one a database would use cannot be
+/// decided here — the scan runs in the loader, with nothing to ask — but a
+/// cycle the fold invented is evidence the loader does have (DECISIONS 245).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Case {
+    /// The usual answer: a database collation is case-insensitive far more
+    /// often than not, and it folds the whole alphabet when it is.
+    Folded,
+    /// The fold every case-insensitive collation performs, and no more. It is
+    /// what separates two declarations that only this scan reads as one — the
+    /// three measured characters it folds and the engine does not.
+    Ascii,
+    /// Two declarations that even an ASCII fold reads as one can only be held
+    /// by a case-sensitive database, which folds nothing.
+    Exact,
+}
+
+fn cased(text: &str, case: Case) -> String {
+    match case {
+        Case::Folded => folded(text),
+        Case::Ascii => text.to_ascii_lowercase(),
+        Case::Exact => text.to_owned(),
+    }
+}
+
+/// The needle for the qualified form of `name`.
+fn qualified(name: &ObjectName, case: Case) -> String {
+    format!("{}.{}", cased(&name.schema, case), cased(&name.name, case))
+}
+
+fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
+    let haystack = scannable(definition, case);
 
     // The qualified form, and the bare one — a definition written inside its
     // own schema very often omits the qualifier.
-    contains_word(&haystack, &format!("{schema}.{object}")) || contains_word(&haystack, &object)
+    contains_word(&haystack, &qualified(name, case))
+        || contains_word(&haystack, &cased(&name.name, case))
 }
 
 /// The definition with everything that is not code blanked out.
@@ -596,10 +632,56 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
     out
 }
 
+/// Case-folded for the dependency scan: simple lower-case, one character in
+/// and one character out.
+///
+/// # Why not `to_ascii_lowercase`
+///
+/// SQL Server folds the whole alphabet, not the ASCII part of it. Measured on
+/// SQL Server 2022 under `SQL_Latin1_General_CP1_CI_AS`, `Latin1_General_CI_AS`
+/// and `Latin1_General_100_CI_AS_SC` alike -- and by creating each object and
+/// selecting from the other spelling, which resolved exactly where the
+/// comparison said it would -- `CAFÉ` and `café` are one table, and so are `Σ`
+/// and `σ`. An ASCII fold left the accented halves untouched, so the scan found
+/// no edge and `creation_order` was free to put a view before the table it
+/// reads (DECISIONS 245).
+///
+/// It is an approximation, not the collation. Every single-character
+/// lower-case mapping in the BMP was put to the engine: this fold agrees with
+/// all three collations on 964 of the 1180, and of the 216 it does not, 149
+/// are pairs the three collations answer differently *from each other*. No
+/// offline rule can be right about those, which is why `creation_order` does
+/// not trust it alone: what a fold gets wrong it gets wrong by matching too
+/// much, and matching too much is what turns an ordering into a cycle.
+///
+/// # Why not `str::to_lowercase`
+///
+/// Full lower-casing is allowed to return more characters than it was given,
+/// and the two that matter here are the two that do. `İ` (U+0130) becomes `i`
+/// plus a combining dot, which the engine does *not* read as `i` -- measured
+/// `ne`, and the object did not resolve. Worse than the wrong answer is where
+/// it lands: the combining mark is not an identifier character, so
+/// `contains_word` sees a word boundary inside what was one letter and reports
+/// a match for the bare needle `i`. Folding character by character keeps `İ`
+/// whole and keeps the scan's boundaries where the text put them.
+fn folded(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(one), None) => one,
+                // Two or more: this is one of the expanding mappings, and the
+                // character stands as it is rather than become two.
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// Lower-cases, drops the quoting characters and closes the gaps around dots,
 /// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
-fn scannable(definition: &str) -> String {
-    let lowered = code_only(definition).to_ascii_lowercase();
+fn scannable(definition: &str, case: Case) -> String {
+    let lowered = cased(&code_only(definition), case);
     let unquoted: String = lowered.chars().filter(|c| !"[]\"`".contains(*c)).collect();
     let mut out = String::with_capacity(unquoted.len());
     for (i, ch) in unquoted.char_indices() {
@@ -673,74 +755,103 @@ pub(crate) fn is_regular_identifier_continue(ch: char) -> bool {
 pub fn creation_order(modules: &BTreeMap<ModuleId, Module>, deps: &ModuleDeps) -> Vec<ModuleId> {
     let names: Vec<ModuleId> = modules.keys().cloned().collect();
 
-    // needs[a] = the modules `a` must follow.
-    let mut needs: BTreeMap<&ModuleId, BTreeSet<&ModuleId>> = BTreeMap::new();
-    for name in &names {
-        let module = &modules[name];
-        let mut set: BTreeSet<&ModuleId> = BTreeSet::new();
-        for other in &names {
-            if other == name {
-                continue;
+    // The edges for one comparison. Only the scanned ones move with it:
+    // `depends_on:` and a trigger's target are identities, not text.
+    let needs_among = |pending: &[ModuleId], case: Case| {
+        let mut needs: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
+        for name in pending {
+            let module = &modules[name];
+            let mut set: BTreeSet<ModuleId> = BTreeSet::new();
+            for other in pending {
+                if other == name {
+                    continue;
+                }
+                let declared = deps.get(name).is_some_and(|d| d.contains(other));
+                // A trigger's target is not named in its definition — the
+                // emitter writes it into the `ON` clause — so the identity's
+                // own table has to be read directly. It matters only when the
+                // target is itself a module: a trigger on a view has to be
+                // created after that view.
+                let attached = name
+                    .attached_to()
+                    .is_some_and(|t| other.referenced_name().as_ref() == Some(t));
+                // The scan matches a *name*, and where a kind overloads a name
+                // is not an identity (ADR-0009 §1). So `app.f` in a routine's
+                // body matches every `app.f(...)`: between the overloads of one
+                // name an automatic edge would order each against all its
+                // siblings, and a body that mentions its own name — a recursive
+                // overload, or two that call each other one way — would make a
+                // cycle out of them. `depends_on:` could not repair that,
+                // because it adds an edge and cannot remove one. Among the
+                // modules that share a routine's name, therefore, only
+                // `depends_on:` orders (DECISIONS 212).
+                //
+                // A trigger is named by nothing, so nothing can reference it.
+                let sibling = matches!(name, ModuleId::Routine(_))
+                    && other.referenced_name() == name.referenced_name();
+                let referenced = !sibling
+                    && other
+                        .referenced_name()
+                        .is_some_and(|n| references_as(&module.definition, &n, case));
+                if declared || attached || referenced {
+                    set.insert(other.clone());
+                }
             }
-            let declared = deps.get(name).is_some_and(|d| d.contains(other));
-            // A trigger's target is not named in its definition — the emitter
-            // writes it into the `ON` clause — so the identity's own table has
-            // to be read directly. It matters only when the target is itself a
-            // module: a trigger on a view has to be created after that view.
-            let attached = name
-                .attached_to()
-                .is_some_and(|t| other.referenced_name().as_ref() == Some(t));
-            // The scan matches a *name*, and where a kind overloads a name is
-            // not an identity (ADR-0009 §1). So `app.f` in a routine's body
-            // matches every `app.f(...)`: between the overloads of one name an
-            // automatic edge would order each against all its siblings, and a
-            // body that mentions its own name — a recursive overload, or two
-            // that call each other one way — would make a cycle out of them.
-            // `depends_on:` could not repair that, because it adds an edge and
-            // cannot remove one. Among the modules that share a routine's name,
-            // therefore, only `depends_on:` orders (DECISIONS 212).
-            //
-            // A trigger is named by nothing, so nothing can reference it.
-            let sibling = matches!(name, ModuleId::Routine(_))
-                && other.referenced_name() == name.referenced_name();
-            let referenced = !sibling
-                && other
-                    .referenced_name()
-                    .is_some_and(|n| references(&module.definition, &n));
-            if declared || attached || referenced {
-                set.insert(other);
-            }
+            // A trigger on a *table* plays no part here: tables are created by
+            // an earlier ordering class in any case.
+            needs.insert(name.clone(), set);
         }
-        // A trigger on a *table* plays no part here: tables are created by an
-        // earlier ordering class in any case.
-        needs.insert(name, set);
-    }
+        needs
+    };
 
-    let mut done: BTreeSet<&ModuleId> = BTreeSet::new();
+    // Kahn's algorithm, emitting every ready module each round in name order so
+    // that two runs over the same declarations produce the same plan.
+    //
+    // Run up to three times, and only ever on what is left. The fold is wider
+    // than some collations and narrower than none, so what it gets wrong it
+    // gets wrong by saying *yes* too often: asked whether a definition names
+    // `dbo.CAFÉ` it answers yes to `dbo.café`, and two such over-answers make
+    // an ordering cycle out of modules that have none. A missing edge is
+    // invisible here and a false one is not — it is exactly what stops Kahn —
+    // so the place to narrow is the wreckage, not the whole schema
+    // (DECISIONS 245). Whatever is still unplaced is re-scanned under the
+    // ASCII fold, which every case-insensitive collation performs, and then
+    // under no fold at all, which only a case-sensitive database needs.
+    //
+    // Narrowing where a cycle appeared and nowhere else is what keeps the price
+    // proportionate: a module ordered by the wide fold keeps that ordering, and
+    // a pair the fold merged pays for it alone. There is nothing to ask the
+    // database — the scan runs in the loader, which is why `fold_ident` folds
+    // nothing there either — but a cycle is evidence the loader has in hand.
     let mut out: Vec<ModuleId> = Vec::new();
-    // Kahn's algorithm, taking the name-least ready module each round so that
-    // two runs over the same declarations produce the same plan.
-    loop {
-        let ready: Vec<&ModuleId> = names
-            .iter()
-            .filter(|n| !done.contains(n))
-            .filter(|n| needs[*n].iter().all(|d| done.contains(d)))
-            .collect();
-        if ready.is_empty() {
+    let mut pending: Vec<ModuleId> = names.clone();
+    for case in [Case::Folded, Case::Ascii, Case::Exact] {
+        if pending.is_empty() {
             break;
         }
-        for n in ready {
-            done.insert(n);
-            out.push(n.clone());
+        let needs = needs_among(&pending, case);
+        let mut done: BTreeSet<ModuleId> = BTreeSet::new();
+        loop {
+            let ready: Vec<ModuleId> = pending
+                .iter()
+                .filter(|n| !done.contains(*n))
+                .filter(|n| needs[*n].iter().all(|d| done.contains(d)))
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for n in ready {
+                out.push(n.clone());
+                done.insert(n);
+            }
         }
+        pending.retain(|n| !done.contains(n));
     }
-    // Whatever is left is in a cycle: deterministic order, and the engine
-    // decides.
-    for n in &names {
-        if !done.contains(n) {
-            out.push(n.clone());
-        }
-    }
+    // Whatever is left is a cycle no fold separates — a genuine one, or one
+    // `depends_on:` declared. Deterministic order, and the engine has the last
+    // word inside the plan's transaction.
+    out.extend(pending);
     out
 }
 
@@ -879,7 +990,7 @@ mod tests {
             "SELECT * FROM dbo\n  .\n  active_customer",
         ] {
             assert_eq!(
-                scannable(definition),
+                scannable(definition, Case::Folded),
                 "select * from dbo.active_customer",
                 "{definition:?}"
             );
@@ -890,7 +1001,7 @@ mod tests {
         }
         // Whitespace that is not beside a dot is a boundary and stays.
         assert_eq!(
-            scannable("select a\n  from dbo.t"),
+            scannable("select a\n  from dbo.t", Case::Folded),
             "select a\n  from dbo.t"
         );
     }
@@ -977,6 +1088,275 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(creation_order(&m, &ModuleDeps::default()), first);
         }
+    }
+
+    /// A case-sensitive database holds `dbo.CAF\u{c9}` beside `dbo.caf\u{e9}`, and
+    /// the fold that reads `DBO.CUSTOMER` as `dbo.customer` cannot tell those
+    /// two apart. Asked with the fold, the scan answers *both* — so a
+    /// definition naming one of them gets an edge to the other as well, and a
+    /// second such definition closes a cycle between modules that have none.
+    /// `creation_order` breaks a cycle by emitting its members in name order,
+    /// which is how a valid plan ends up with a `CREATE VIEW` that fails.
+    ///
+    /// The cycle is visible without a connection, so the modules left in it
+    /// are re-scanned with a narrower comparison — here the ASCII fold, which
+    /// every case-insensitive collation performs (DECISIONS 245).
+    #[test]
+    fn two_declarations_that_fold_to_one_name_are_told_apart() {
+        let upper = "dbo.CAF\u{c9}";
+        let lower = "dbo.caf\u{e9}";
+        // A chain, not a cycle: `lower` names nothing, `dbo.z` names `lower`,
+        // and `upper` names `dbo.z`. Folded, `dbo.z` reads as naming `upper`
+        // too, which closes a loop with it.
+        let m = modules(&[
+            (upper, "SELECT * FROM dbo.z"),
+            (lower, "SELECT 1"),
+            ("dbo.z", format!("SELECT * FROM {lower}").as_str()),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id(lower), id("dbo.z"), id(upper)],
+            "each module comes after the one it names, and there is no cycle"
+        );
+
+        // And the fold is still the answer for a name nothing collides with:
+        // the same three definitions with the accented pair spelled apart.
+        let m = modules(&[
+            ("dbo.caf\u{e9}", "SELECT 1"),
+            ("dbo.tea", "SELECT * FROM DBO.CAF\u{c9}"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.caf\u{e9}"), id("dbo.tea")]
+        );
+    }
+
+    /// A fold collision is not evidence of a case-sensitive database. The
+    /// Kelvin sign is one of the three characters this scan folds and the
+    /// engine does not, so a *case-insensitive* database can be holding
+    /// `dbo.ktbl` and `dbo.\u{212a}tbl` at once — and there `SELECT * FROM
+    /// DBO.KTBL` still means `dbo.ktbl`. Nothing here makes a cycle, so
+    /// nothing narrows: both edges stand, and the fold's over-answer costs an
+    /// order stricter than it needed to be rather than an edge.
+    #[test]
+    fn a_collision_this_scan_invents_keeps_the_case_insensitivity_the_engine_has() {
+        let kelvin = "dbo.\u{212a}tbl";
+        // `dbo.a` sorts first, so it comes out first if nothing orders it and
+        // last if something does: the assertion is about the edge, not about
+        // the tie-break.
+        let m = modules(&[
+            ("dbo.ktbl", "SELECT 1"),
+            (kelvin, "SELECT 2"),
+            ("dbo.a", "SELECT * FROM DBO.KTBL"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.ktbl"), id(kelvin), id("dbo.a")],
+            "`dbo.a` names `dbo.ktbl`, in the case a definition is free to use"
+        );
+
+        // And the Kelvin-signed one is still told apart, which is the whole
+        // reason the pair is not compared with the wide fold.
+        let m = modules(&[
+            ("dbo.ktbl", "SELECT 1"),
+            (kelvin, "SELECT 2"),
+            ("dbo.a", "SELECT * FROM dbo.\u{212a}TBL"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.ktbl"), id(kelvin), id("dbo.a")]
+        );
+        assert!(!references_as(
+            "SELECT * FROM dbo.\u{212a}TBL",
+            &n("dbo.ktbl"),
+            Case::Ascii
+        ));
+    }
+
+    /// The scan looks for the bare object name as well as the qualified one, so
+    /// the bare form can collide on its own: `s9.ktbl` and `s2.\u{212a}tbl` are
+    /// two names with one folded bare spelling, and a definition in `s9`
+    /// writing plain `ktbl` would be attached to both. One false edge and one
+    /// real one the other way is a cycle, and a cycle is emitted in name order.
+    /// The narrower scan the cycle asks for separates them again.
+    ///
+    /// Two schemas holding the same bare name is a different thing entirely —
+    /// `dbo.t` beside `sales.t` differ in no case at all — and the second half
+    /// pins that no narrowing is spent on it.
+    #[test]
+    fn a_bare_name_that_two_declarations_fold_onto_is_told_apart_too() {
+        let kelvin = "s2.\u{212a}tbl";
+        let m = modules(&[
+            (kelvin, "SELECT * FROM s9.a"),
+            ("s9.a", "SELECT * FROM ktbl"),
+            ("s9.ktbl", "SELECT 3"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("s9.ktbl"), id("s9.a"), id(kelvin)],
+            "the bare `ktbl` names `s9.ktbl` alone, so there is no cycle"
+        );
+
+        // Two schemas holding the same bare name is not this collision, and
+        // must keep the fold: `dbo.t` is what `SALES.V` means by `DBO.T`.
+        let m = modules(&[
+            ("dbo.t", "SELECT 1"),
+            ("sales.t", "SELECT 2"),
+            ("sales.v", "SELECT * FROM DBO.T"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.t"), id("sales.t"), id("sales.v")]
+        );
+    }
+
+    /// A bare name two schemas hold in two cases still costs no qualified edge.
+    ///
+    /// `warehouse.t` beside `app.T` is one bare name in two spellings and two
+    /// qualified names in one spelling each — a pair a case-insensitive
+    /// database holds without complaint, because the qualifiers differ. There
+    /// is no cycle here for a narrower fold to break, so `report.v` keeps the
+    /// edge it gets from the perfectly ordinary `WAREHOUSE.T`. An answer that
+    /// narrowed on the collision itself would drop that edge and emit the view
+    /// before the table it reads — the failure of 239, reached through a guard
+    /// meant to prevent it.
+    #[test]
+    fn a_bare_name_shared_in_two_cases_costs_no_qualified_edge() {
+        let m = modules(&[
+            ("warehouse.t", "SELECT 1"),
+            ("app.T", "SELECT 2"),
+            ("report.v", "SELECT * FROM WAREHOUSE.T"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("app.T"), id("warehouse.t"), id("report.v")],
+            "`report.v` follows the table it names, and sorts before it without \
+             that edge"
+        );
+
+        // And where the same pair *does* make a cycle, the narrowing that
+        // breaks it is the narrowing the cycle asked for: `report.w` writes
+        // plain `t`, which the fold offers to both, and only `warehouse.t`
+        // can have meant it.
+        let m = modules(&[
+            ("warehouse.t", "SELECT 1"),
+            ("app.T", "SELECT * FROM report.w"),
+            ("report.w", "SELECT * FROM t"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("warehouse.t"), id("report.w"), id("app.T")],
+            "one bare edge survives, and there is no cycle to emit in name order"
+        );
+    }
+
+    /// The fold's over-answers are narrowed where a cycle shows them, which is
+    /// the only place the loader can see one — including against a name it is
+    /// not ordering at all.
+    ///
+    /// `creation_order` is given the modules; the tables are ordered by an
+    /// earlier class and are not in it. So a view `dbo.ktbl` beside a *table*
+    /// `dbo.\u{212a}tbl` is a collision no map of the declarations passed here
+    /// could hold. The cycle is visible all the same: `dbo.z` reads the table,
+    /// the fold offers the view, and the view really does read `dbo.z`.
+    #[test]
+    fn a_fold_collision_with_something_unordered_is_narrowed_by_its_cycle() {
+        let m = modules(&[
+            ("dbo.ktbl", "SELECT * FROM dbo.z"),
+            ("dbo.z", "SELECT * FROM dbo.\u{212a}tbl"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.z"), id("dbo.ktbl")],
+            "the view follows the module it reads; the table is another class"
+        );
+    }
+
+    /// A bare name is offered to every declaration that can hold it, and
+    /// narrowing it on a collision would pick one by its spelling — which is
+    /// not how the engine picks.
+    ///
+    /// `sales.A` writing plain `t` means `sales.T` on a case-insensitive
+    /// database, and `dbo.t` is the one an exact comparison would find. There
+    /// is no cycle here, so both edges stand: over-answering costs an order
+    /// that is merely stricter than it needs to be, and under-answering costs
+    /// the apply.
+    #[test]
+    fn a_bare_name_is_offered_to_both_schemas_that_could_hold_it() {
+        let m = modules(&[
+            ("dbo.t", "SELECT 1"),
+            ("sales.T", "SELECT * FROM sales.z"),
+            ("sales.A", "SELECT * FROM t"),
+            ("sales.z", "SELECT 1"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.t"), id("sales.z"), id("sales.T"), id("sales.A")],
+            "`sales.A` follows both declarations its bare `t` could name"
+        );
+    }
+
+    /// A spelling nothing declares does not hold a cycle shut.
+    ///
+    /// The fold attaches `\u{e9}` — here a column alias, not a reference — to
+    /// the declared `dbo.\u{c9}`, which is the scan's ordinary over-reach. It
+    /// costs an edge back to a module that really does read `dbo.\u{3a9}`, and
+    /// that is a cycle: the narrower scan drops the invented half and keeps the
+    /// real one, so the table is still created before the view.
+    #[test]
+    fn a_spelling_nothing_declares_does_not_hold_a_cycle_shut() {
+        let m = modules(&[
+            ("dbo.\u{c9}", "SELECT * FROM dbo.\u{3a9}"),
+            ("dbo.\u{3a9}", "SELECT 1 AS \u{e9}"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.\u{3a9}"), id("dbo.\u{c9}")],
+            "the alias is not a reference, and the view follows what it reads"
+        );
+    }
+
+    /// A name beside a fold collision keeps the edges no cycle disputes.
+    ///
+    /// `caf\u{e9}.ktbl` and `caf\u{e9}.\u{212a}tbl` are two declarations this
+    /// scan folds onto one name and the engine does not. A definition writing
+    /// `CAF\u{c9}.KTBL` means the first of them, and differs from it in a part
+    /// of the name the collision has nothing to do with — the schema. Nothing
+    /// here is a cycle, so the wide fold stands and the edge is found.
+    #[test]
+    fn a_name_beside_a_fold_collision_keeps_the_edges_no_cycle_disputes() {
+        let m = modules(&[
+            ("caf\u{e9}.ktbl", "SELECT 1"),
+            ("caf\u{e9}.\u{212a}tbl", "SELECT 2"),
+            ("aa.v", "SELECT * FROM CAF\u{c9}.KTBL"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![
+                id("caf\u{e9}.ktbl"),
+                id("caf\u{e9}.\u{212a}tbl"),
+                id("aa.v")
+            ],
+            "`aa.v` follows what it names, and sorts first without that edge"
+        );
+    }
+
+    /// Two declarations that even the ASCII fold reads as one can only be held
+    /// by a case-sensitive database, which folds nothing — so nothing is lost
+    /// by comparing them exactly, and a cycle between modules that have none
+    /// is avoided.
+    #[test]
+    fn declarations_that_differ_only_in_ascii_case_are_compared_exactly() {
+        let m = modules(&[
+            ("dbo.Z", "SELECT * FROM dbo.y"),
+            ("dbo.y", "SELECT * FROM dbo.z"),
+            ("dbo.z", "SELECT 1"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.z"), id("dbo.y"), id("dbo.Z")],
+            "each module comes after the one it names, and there is no cycle"
+        );
     }
 
     /// The scan matches a name, and a name is not an identity where routines
@@ -1296,6 +1676,100 @@ mod tests {
             "SELECT * FROM \"dbo\".\"active_customer\"",
             &target
         ));
+    }
+
+    /// Measured on SQL Server 2022: under the server's own
+    /// `SQL_Latin1_General_CP1_CI_AS`, and under `Latin1_General_CI_AS` and
+    /// `Latin1_General_100_CI_AS_SC`, each of these pairs compares equal — and
+    /// creating the object under one spelling and selecting it under the other
+    /// resolved. The scan folded ASCII only, so it saw two names where the
+    /// engine sees one, found no edge, and let `creation_order` put a view
+    /// before the table it reads.
+    #[test]
+    fn a_case_the_engine_folds_beyond_ascii_is_one_name_to_the_scan() {
+        for (what, declared, written) in [
+            ("E acute", "dbo.caf\u{e9}", "dbo.CAF\u{c9}"),
+            ("sigma", "dbo.\u{3c3}um", "dbo.\u{3a3}UM"),
+            ("Cyrillic de", "dbo.\u{434}om", "dbo.\u{414}OM"),
+            ("fullwidth a", "dbo.\u{ff41}b", "dbo.\u{ff21}B"),
+            ("angstrom", "dbo.\u{e5}r", "dbo.\u{212b}R"),
+        ] {
+            let target: ObjectName = declared.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {written}"), &target),
+                "{what}: the engine reads {written} and {declared} as one name"
+            );
+            // And the other way round, because either side may be the one
+            // written in upper case.
+            let target: ObjectName = written.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {declared}"), &target),
+                "{what}: the fold has to be symmetric"
+            );
+        }
+    }
+
+    /// The other direction of the same measurement, and the reason the fold is
+    /// character for character rather than `str::to_lowercase`.
+    ///
+    /// `İ` (U+0130) is not `i` to the engine — measured unequal under all three
+    /// collations, and the object did not resolve. Full lower-casing returns
+    /// `i` *plus a combining dot* for it, and the combining dot is not an
+    /// identifier character: `contains_word` would find its boundary in the
+    /// middle of what was one letter and report a reference to `dbo.i` that
+    /// the engine does not have. A fold that returns one character per
+    /// character cannot do that, whatever the character folds to.
+    #[test]
+    fn an_expanding_fold_does_not_invent_a_reference() {
+        assert_eq!(folded("\u{130}"), "\u{130}", "one character in, one out");
+        assert_eq!(folded("CAF\u{c9}"), "caf\u{e9}");
+        assert_eq!(folded("Ab_1"), "ab_1", "ASCII is unchanged");
+
+        let target: ObjectName = "dbo.i".parse().unwrap();
+        assert!(
+            !references("SELECT * FROM dbo.\u{130}", &target),
+            "U+0130 is not `i` on the engine"
+        );
+        assert!(references("SELECT * FROM dbo.I", &target), "but `I` is");
+
+        // The dotless `ı` is the same measurement mirrored: `I` folds to `i`,
+        // and U+0131 is a third letter that neither of them reaches.
+        let target: ObjectName = "dbo.\u{131}".parse().unwrap();
+        assert!(!references("SELECT * FROM dbo.I", &target));
+        assert!(references("SELECT * FROM dbo.\u{131}", &target));
+    }
+
+    /// Where the fold is knowingly wider than the engine's, pinned so the next
+    /// reader sees the price rather than rediscovers it.
+    ///
+    /// Measured unequal on the engine, and equal after a simple lower-case:
+    /// the Kelvin sign, the Ohm sign, and capital sharp s — three of the 216
+    /// such pairs in the BMP, and three the sweep found all three collations
+    /// agreeing on. No fold short of the collation itself gets this right: the
+    /// engine folds U+212B to `å` and does *not* fold U+212A to `k`, and for
+    /// 149 of the 216 the three collations do not even agree with each other
+    /// (DECISIONS 245).
+    ///
+    /// `creation_order` narrows what this costs: an over-answer is free until
+    /// it makes an ordering cycle, and the modules in that cycle are re-scanned
+    /// with the ASCII fold, which separates the pair and keeps the
+    /// case-insensitivity the engine does have. An over-answer that orders
+    /// something more strictly than the engine would have is left alone, and
+    /// `depends_on:` is the escape hatch where a definition needs the edge the
+    /// narrowing removed.
+    #[test]
+    fn the_fold_is_wider_than_the_engines_in_measured_places() {
+        for (what, declared, written) in [
+            ("Kelvin sign", "dbo.ktbl", "dbo.\u{212a}tbl"),
+            ("Ohm sign", "dbo.\u{3c9}tbl", "dbo.\u{2126}tbl"),
+            ("capital sharp s", "dbo.\u{df}tbl", "dbo.\u{1e9e}tbl"),
+        ] {
+            let target: ObjectName = declared.parse().unwrap();
+            assert!(
+                references(&format!("SELECT * FROM {written}"), &target),
+                "{what}: the scan folds this and the engine does not"
+            );
+        }
     }
 
     /// The engine ends a `--` comment at a bare carriage return, so a scan

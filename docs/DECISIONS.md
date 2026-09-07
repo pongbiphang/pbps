@@ -4111,3 +4111,82 @@ SPEC is in sync with all of these.
     at the boundary — the largest value the source holds, and a value the target
     cannot represent — put through a real server, with `Safe` asserted as *the
     statement runs and the value does not change*.
+
+245. **The dependency scan folds case for the whole alphabet, character for
+    character, and is knowingly wider than the collation in three places.**
+    `references` lower-cased both sides with `to_ascii_lowercase`. The two
+    sides agreed with each other, so ASCII names were right; they did not
+    agree with SQL Server, whose collations fold the rest of the alphabet too.
+    Measured on SQL Server 2022 under `SQL_Latin1_General_CP1_CI_AS`,
+    `Latin1_General_CI_AS` and `Latin1_General_100_CI_AS_SC` alike, and
+    confirmed by creating each object under one spelling and selecting it
+    under the other: `CAFÉ` and `café` are one table, and so are `Σum` and
+    `σum`. The ASCII fold saw two names, found no edge, and let
+    `creation_order` place a view before the table it reads — the failure of
+    239 from another cause.
+
+    The fold is `char`-by-`char` simple lower-casing rather than
+    `str::to_lowercase` because full lower-casing may return more characters
+    than it was given. `İ` (U+0130) becomes `i` plus a combining dot, and the
+    engine does not read that as `i` — measured unequal, and the object did
+    not resolve. The combining dot is not an identifier character, so
+    `contains_word` finds a word boundary in the middle of what was one
+    letter: with `to_lowercase`, `SELECT * FROM dbo.İ` is a reference to
+    `dbo.i`, measured and pinned. One character in and one character out is
+    also what a collation does, which is the comparison being approximated.
+
+    The fold and the engine do not agree everywhere, and cannot be made to.
+    Every single-character lower-case mapping in the BMP — 1180 of them — was
+    put to SQL Server 2022: 216 are pairs the fold reads as one letter and at
+    least one of the three collations does not, and for 149 of those the three
+    collations disagree with *each other*. The Kelvin sign is not `k` and the
+    Ohm sign is not `ω` under any of them, while U+212B is `å` under all
+    three. There is no offline rule that gets this right, because the right
+    answer is a property of the database and the loader has none to ask
+    (§8.2). The fold is an approximation, and a much closer one than ASCII: it
+    agrees on 964 of the 1180.
+
+    What that costs is bounded by a question the loader *can* answer: did the
+    fold's answer make a cycle? A fold is wider than a collation or equal to
+    it and never narrower, so what it gets wrong it gets wrong by saying
+    *yes* too often — asked whether a definition names `dbo.CAFÉ` it says yes
+    to `dbo.café` as well, and two such over-answers make an ordering cycle
+    out of modules that have none. A missing edge is invisible to
+    `creation_order`; a false one is not, because a false one is exactly what
+    stops Kahn's algorithm. So the order is taken with the whole-alphabet
+    fold, whatever it leaves unplaced is re-scanned under the ASCII fold —
+    the one every case-insensitive collation performs — and what is still
+    unplaced is re-scanned under no fold at all, which only a case-sensitive
+    database needs. A cycle no comparison separates is emitted in name order,
+    as it was before.
+
+    Narrowing where a cycle appeared and nowhere else is what keeps the price
+    proportionate. An over-answer that merely orders two modules more
+    strictly than the engine would have costs nothing — the `CREATE` still
+    runs after everything it reads — and it is left alone. Only the pair
+    whose over-answers closed a loop pays, and it pays with the widest
+    comparison that opens the loop again, so a plan is never ordered by a
+    narrower fold than its own evidence calls for.
+
+    The obvious alternative — decide a comparison per name from the
+    declarations, before the scan, wherever two of them fold together — was
+    written first and gave up more than it bought. Two measured reasons. It
+    cannot see a collision with a name it is not ordering: `creation_order`
+    is given the modules, the tables are an earlier ordering class, and a
+    view `dbo.ktbl` beside a table `dbo.Ktbl` is a pair no map of its
+    arguments holds. And it narrows a name in every position because one
+    position collided: `dbo.t` beside `sales.T` is one bare name in two
+    spellings and two qualified names in one spelling each — a pair a
+    case-insensitive database holds without complaint — and comparing the
+    qualified form exactly loses the edge from any definition writing
+    `WAREHOUSE.T`, which is 239's failure reached through the guard meant to
+    prevent it. A cycle is later evidence than a collision, but it is
+    evidence about the answer rather than about the question.
+
+    One price is left, and it has `depends_on:` for an escape hatch. Where a
+    cycle is broken, the edge dropped is the one the narrower comparison does
+    not find, and on a case-insensitive database that edge may have been
+    real — two declarations the engine reads as one name are a schema this
+    tool cannot order correctly in any case, and the narrowing picks the
+    spelling rather than the meaning. Declaring the dependency says what the
+    scan cannot read.
